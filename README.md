@@ -8,7 +8,8 @@ It is early-stage software built around one production configuration. Test on
 alternate ports before using it elsewhere.
 
 httpjet powers [WindowsForum.com](https://windowsforum.com) in production.
-Learn more at [httpjet.net](https://httpjet.net).
+Learn more—or at least enjoy the animation—at
+[httpjet.net](https://httpjet.net).
 
 ## Build and try it
 
