@@ -7,6 +7,9 @@ static files, proxying, rewrites, compression, and an opt-in page cache.
 It is early-stage software built around one production configuration. Test on
 alternate ports before using it elsewhere.
 
+httpjet powers [WindowsForum.com](https://windowsforum.com) in production.
+Learn more at [httpjet.net](https://httpjet.net).
+
 ## Build and try it
 
 Requires Linux with io_uring and Rust 1.97+.
