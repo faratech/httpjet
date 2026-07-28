@@ -54,11 +54,16 @@ jobs:
         # The LSAPI supervisor suite signals and reaps detached descendants.
         # GitHub's runner blocks those operations for its unprivileged user.
         run: |
+          cargo_bin="$(rustup which cargo)"
+          rustc_bin="$(rustup which rustc)"
+          rustdoc_bin="$(rustup which rustdoc)"
           sudo env \
+            "HOME=$HOME" \
+            "CARGO_HOME=$HOME/.cargo" \
             "PATH=$PATH" \
-            "RUSTUP_HOME=$RUSTUP_HOME" \
-            "CARGO_HOME=$CARGO_HOME" \
-            cargo test --workspace --locked
+            "RUSTC=$rustc_bin" \
+            "RUSTDOC=$rustdoc_bin" \
+            "$cargo_bin" test --workspace --locked
 
   dco:
     if: github.event_name == 'pull_request'
