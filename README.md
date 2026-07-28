@@ -131,17 +131,13 @@ does not require a proprietary-relicensing CLA. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
-Third-party attributions are in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), with development provenance
-summarized in [PROVENANCE.md](PROVENANCE.md).
+Third-party attributions are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Sponsorship
 
-Sponsorship is optional recognition and support for maintenance. It does not
-buy private features, change support obligations, or restrict anyone's GPL
-rights. Available funding links appear in GitHub's **Sponsor** button when
-enabled. See [SPONSORSHIP.md](SPONSORSHIP.md) for the recognition-only policy
-and current enrollment status.
+Donations are optional support for maintenance. They do not buy private
+features, support obligations, or influence over the roadmap. Funding links
+will appear in GitHub's **Sponsor** button when enrollment is enabled.
 
 ## License and names
 
@@ -149,7 +145,7 @@ Copyright © FaraTech.
 
 FaraTech-owned code and documentation are licensed under
 [GNU GPL version 3 only](LICENSE). Third-party components retain their own
-licenses. See [TRADEMARKS.md](TRADEMARKS.md) for use of the httpjet name.
+licenses.
 
 LiteSpeed and OpenLiteSpeed are names of their respective owners. httpjet is
 an independent project and is not affiliated with or endorsed by LiteSpeed

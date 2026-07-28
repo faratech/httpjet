@@ -3,6 +3,10 @@
 httpjet includes and depends on third-party software. The project license does
 not replace those components' own license terms.
 
+Compatibility work used public documentation, black-box behavior, and review
+of GPL-licensed OpenLiteSpeed source. No OpenLiteSpeed source tree is vendored
+in this repository.
+
 ## Vendored source
 
 | Component | Version or basis | License | Location |
@@ -23,10 +27,10 @@ authors.
 
 ## Cargo dependencies
 
-The Rust dependency graph is pinned in `Cargo.lock`; its generated license
-inventory is in `DEPENDENCY_LICENSES.md`. Binary distributors must review the
-licenses for the exact graph they ship and reproduce every notice required by
-those dependencies. Optional features can change that graph.
+The Rust dependency graph is pinned in `Cargo.lock`. Run
+`python3 scripts/check-dependency-licenses.py` to inspect its generated license
+inventory. Binary distributors must review the exact graph they ship and
+reproduce every required notice. Optional features can change that graph.
 
 The `profiling` feature emits raw pprof protobuf data. Rendering is deliberately
 left to an external tool so the CDDL-licensed `inferno` renderer is not linked
