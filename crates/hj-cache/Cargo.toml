@@ -1,0 +1,21 @@
+[package]
+name = "hj-cache"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-config = { workspace = true }
+bytes = { workspace = true }
+httpdate = { workspace = true }
+memmap2 = { workspace = true }
+tracing = { workspace = true }
+# The shared sharded-LRU primitive (`sharded` module) shards a parking_lot::Mutex<Shard>.
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"

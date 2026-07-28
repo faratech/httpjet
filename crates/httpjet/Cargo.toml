@@ -1,0 +1,120 @@
+[package]
+name = "httpjet"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "httpjet"
+path = "src/main.rs"
+
+[features]
+# On-demand CPU profiles via a loopback+secret endpoint (raw pprof protobuf).
+# Default-OFF so plain `cargo build`/CI stays lean; the PGO/prod build opts in
+# with `--features profiling`. Zero runtime cost until the endpoint is hit.
+profiling = ["dep:pprof"]
+# Wrap the global allocator to COUNT allocation calls (h2 alloc-reduction campaign
+# measurement harness). Read/reset via the loopback /__alloc-count route. Default-OFF
+# (one Relaxed atomic per alloc); measurement builds only, never PGO/prod.
+allocount = []
+# Kernel-TLS egress on the monoio TLS path (STAGED, opt-in at BOTH build AND runtime).
+# The prod/PGO binary is built WITHOUT this, so its extra dep tree (ktls-sys/nix) and the
+# proven userspace TLS path are untouched; the `--ktls` runtime flag is inert unless this
+# feature is compiled in. After the rustls handshake on a monoio core the socket fd is
+# upgraded to a kTLS socket (kernel encrypt/decrypt) and H1/H2 serve plaintext over the raw
+# fd — killing the userspace AEAD copy on large-body egress. Validate on an alt port first.
+ktls = ["dep:ktls-sys", "dep:nix", "dep:aws-lc-rs"]
+
+[dependencies]
+# Optional: in-process sampling profiler → raw pprof protobuf (gated by `profiling`).
+# Rendering is intentionally left to `go tool pprof` or another external viewer,
+# keeping the CDDL-licensed inferno renderer out of httpjet's dependency graph.
+pprof = { version = "=0.15.0", features = ["prost-codec", "frame-pointer"], optional = true }
+# The pure-io_uring thread-per-core transport (monoio) is the ONLY transport, so its
+# runtime + the raw io_uring API + quinn's UDP datapath (GSO/GRO) for the quinn-on-monoio
+# H3 adapter are unconditional deps. quinn-udp 0.6 is API-compatible with the uring H3
+# datapath (Transmit/UdpSockRef/UdpSocketState/RecvMeta send/recv) — bumped from 0.5 cleanly.
+# `sync` feature = eventfd-based UnparkHandle so a cross-thread waker (the tokio bridge
+# completing a oneshot on another thread) interrupts this core's io_uring_enter wait.
+# Without it, a monoio task awaiting a cross-thread future deadlocks (the local-only waker
+# never unparks the io_uring loop).
+monoio = { workspace = true, features = ["sync"] }
+# TLS termination on the monoio io_uring path (rustls over monoio's owned-buffer I/O).
+# Pinned to exact 0.4.0, which requires rustls ~0.23.4 + monoio 0.2 — both already in the
+# lock; default-features=false keeps it on our process-wide aws-lc-rs.
+monoio-rustls = { version = "=0.4.0", default-features = false, features = ["tls12"] }
+io-uring = { version = "0.7" }
+quinn-udp = { version = "0.6" }
+# Per-core completion channel for the io_uring H3 driver: a spawned per-request task
+# (the bridge dispatch to PHP/pipeline) hands its finished response back to the
+# connection-owning driver loop over this channel, so a slow request never
+# head-of-line-blocks other streams. flume's recv_async is cancel-safe (a lost
+# select! race never drops a queued completion).
+flume = { version = "0.12" }
+# Sans-IO QUIC + TLS-1.3 + loss-recovery state machine, driven by our own monoio
+# io_uring UDP loop for H3 (quinn's high-level AsyncUdpSocket can't — its try_send
+# is synchronous). Reuses all QUIC logic; no fork. Pinned to the 0.11 line.
+# aws-lc-rs to match the process-wide provider.
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "log"] }
+# Zero-copy HTTP/1.1 request-head parser for the custom monoio H1 codec.
+httparse = { version = "1" }
+# Self-signed cert for the H3 driver dev-smoke entrypoint. default-features=false +
+# aws_lc_rs reuses the already-linked aws-lc-rs provider so `ring` is NOT pulled in.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+# rustls types for the quinn-proto QUIC server config + the monoio TLS path.
+rustls = { workspace = true }
+# Kernel-TLS (gated by `ktls`). We do NOT use the tokio-coupled `ktls` crate: instead
+# `ktls-sys` gives the kernel-ABI crypto_info structs/constants, `nix` parses the RX
+# TLS control messages (TlsGetRecordType) for KeyUpdate/alert handling, and `aws-lc-rs`
+# (already the rustls provider) does the TLS-1.3 HKDF-Expand-Label key/iv + traffic-upd
+# derivation so we can re-key the kernel socket on a peer KeyUpdate. The setsockopt /
+# sendmsg syscalls and the KtlsStream serve loop are ours.
+ktls-sys = { version = "1", optional = true }
+nix = { version = "0.31.3", optional = true, features = ["socket", "uio", "net"] }
+aws-lc-rs = { version = "1", optional = true }
+# libc: PR_SET_PDEATHSIG / fd passing in the lsphp supervisor + the monoio cores.
+libc = { version = "0.2" }
+hj-config = { workspace = true }
+hj-core = { workspace = true }
+hj-http = { workspace = true }
+hj-static = { workspace = true }
+hj-lsapi = { workspace = true }
+hj-proxy = { workspace = true }
+hj-rewrite = { workspace = true }
+hj-acl = { workspace = true }
+hj-cache = { workspace = true }
+hj-compress = { workspace = true }
+hj-pagecache = { workspace = true }
+hj-log = { workspace = true }
+hj-tls = { workspace = true }
+# The native HTTP/2 stack, with its monoio `serve_local` path (the io_uring h2 transport).
+hj-h2 = { workspace = true, features = ["monoio"] }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+socket2 = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
+http = { workspace = true }
+http-body-util = { workspace = true }
+http-body = { workspace = true }
+# hyper + hyper-util: the reverse-proxy upstream client path (hj-proxy / pipeline::proxy_glue).
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+httpdate = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+mimalloc = { workspace = true }
+libmimalloc-sys = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Decompress rotated production access logs for the rewrite-outcome-cache
+# differential replay test (pipeline/rewrite_differential.rs).
+flate2 = { workspace = true }

@@ -1,0 +1,63 @@
+# Out-of-workspace fuzz crate (its own [workspace] severs it from the parent), so
+# `cargo build`/`cargo test` over crates/* never see its nightly-only tooling.
+# Run with nightly only:  cargo +nightly fuzz run <target>
+[package]
+name = "httpjet-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.97"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+httparse = "1"
+# Light library crates with clean byte-parser entry points (no monoio/TLS pulled in).
+hj-h2 = { path = "../crates/hj-h2" }
+hj-lsapi = { path = "../crates/hj-lsapi" }
+# The H1 codec is reached via `#[path]` include in its targets (std-only source),
+# NOT a dep on the `httpjet` crate — that would drag monoio/quinn/aws-lc into the
+# ASan fuzz build. Same source file the server compiles, so no divergence.
+
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "hpack_decode"
+path = "fuzz_targets/hpack_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hpack_roundtrip"
+path = "fuzz_targets/hpack_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lsapi_resp_header"
+path = "fuzz_targets/lsapi_resp_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_chunked_decode"
+path = "fuzz_targets/h1_chunked_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "h1_request_framing"
+path = "fuzz_targets/h1_request_framing.rs"
+test = false
+doc = false
+bench = false

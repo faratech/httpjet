@@ -1,0 +1,25 @@
+[package]
+name = "hj-tls"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-config = { workspace = true }
+hj-core = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+arc-swap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+# The crate's own tests use the same ephemeral self-signed certs. Listed directly
+# (not via the optional dep) so the test build has `rcgen` in scope regardless of
+# whether the `test-util` feature is enabled.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

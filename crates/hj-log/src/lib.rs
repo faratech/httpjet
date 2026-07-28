@@ -1,0 +1,627 @@
+//! httpjet logging: non-blocking **access** and **error** logging.
+//!
+//! Both loggers push records onto a bounded-free `mpsc` channel that is drained
+//! by a single background tokio task owning the open file handle. The request
+//! path therefore never blocks on disk I/O — it only does a channel send.
+//!
+//! # Access logging
+//!
+//! [`AccessLogger::spawn`] starts the writer task and returns a cheap, clonable
+//! handle. Call [`AccessLogger::log`] from the request path (synchronous, never
+//! blocks). Records carry an **injectable timestamp** ([`AccessRecord::ts`]) so
+//! rendering is fully deterministic and unit-testable.
+//!
+//! Lines are rendered in the Apache/LiteSpeed **combined** or **common** log
+//! format. `logHeaders=7` in LiteSpeed corresponds to [`LogFormat::Combined`]
+//! (Referer + User-Agent appended).
+//!
+//! # Rolling
+//!
+//! When the live file grows past `rolling_size`, it is renamed to a timestamped
+//! sibling, optionally gzip-compressed (via `flate2`), and files older than
+//! `keep_days` are pruned. [`AccessLogger::reopen`] re-opens the path for
+//! `logrotate`/`SIGUSR1` compatibility.
+//!
+//! # Error logging
+//!
+//! [`ErrorLogger`] is a thin async appender over the same rolling writer,
+//! emitting LiteSpeed-style `YYYY-MM-DD HH:MM:SS.uuuuuu [LEVEL] msg` lines. It is
+//! handy for funnelling captured backend `stderr` into the server error log.
+//!
+//! ## Orchestrator usage
+//!
+//! ```no_run
+//! # async fn demo() {
+//! use hj_log::{AccessLogger, AccessRecord, LogFormat, ErrorLogger, LogLevel};
+//! use std::time::SystemTime;
+//!
+//! let access = AccessLogger::spawn(
+//!     "/usr/local/httpjet/logs/access.log",
+//!     LogFormat::Combined,
+//!     10 * 1024 * 1024, // roll at 10 MiB
+//!     30,               // keep 30 days
+//!     true,             // gzip archives
+//! );
+//!
+//! access.log(AccessRecord {
+//!     client_ip: "203.0.113.7".parse().unwrap(),
+//!     ts: SystemTime::now(),
+//!     method: "GET".into(),
+//!     uri: "/index.html".into(),
+//!     protocol: "HTTP/2".into(),
+//!     status: 200,
+//!     bytes: 1234,
+//!     referer: Some("https://example.com/".into()),
+//!     user_agent: Some("curl/8.0".into()),
+//!     host: Some("example.com".into()),
+//!     remote_user: None,
+//!     request_id: None,
+//! });
+//!
+//! let errlog = ErrorLogger::spawn(
+//!     "/usr/local/httpjet/logs/error.log",
+//!     20 * 1024 * 1024,
+//!     30,
+//!     true,
+//! );
+//! errlog.log(LogLevel::Notice, "server started");
+//!
+//! access.shutdown().await;
+//! errlog.shutdown().await;
+//! # }
+//! ```
+
+mod fmt;
+mod tracing_layer;
+mod writer;
+
+use std::borrow::Cow;
+use std::net::IpAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::SystemTime;
+
+use tokio::sync::{mpsc, oneshot};
+
+pub use tracing_layer::ErrorLogLayer;
+pub use writer::RollConfig;
+
+/// (#8) Cap on the number of in-flight log `Line` records buffered toward the
+/// writer task. A stalled writer (hung disk / multi-second gzip during a roll)
+/// would otherwise let the unbounded queue grow with request volume until OOM;
+/// past this cap we SHED lines (the request path must never block or OOM on
+/// logging). Control messages (Reopen/Shutdown) are never counted and never shed.
+const MAX_QUEUED_LINES: u64 = 65_536;
+
+/// Per-logger state shared between the logger handle and any supervisory code:
+/// the in-flight line depth counter and a gone-flag that fires exactly once when
+/// the writer task disappears. Stored per-logger (not process-wide) so that two
+/// independent loggers each track their own liveness independently — a dead
+/// error-log writer does not suppress the gone warning for the access-log writer.
+pub(crate) struct LoggerStateInner {
+    pub depth: AtomicU64,
+    pub gone: AtomicBool,
+    pub dropped: AtomicU64,
+}
+
+impl LoggerStateInner {
+    fn new() -> Self {
+        LoggerStateInner {
+            depth: AtomicU64::new(0),
+            gone: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
+        }
+    }
+}
+
+pub(crate) type LoggerState = Arc<LoggerStateInner>;
+
+/// Send a `Line` to the writer task; if it has gone away, emit ONE stderr line
+/// (per-logger `gone` flag inside `state`) so a dead logger is *noticed* rather
+/// than silently swallowing every subsequent record. Never blocks, never panics.
+/// (Logging must not take the request path down — so this only warns; it does not
+/// retry or error out.)
+///
+/// `state.0` tracks the in-flight line backlog: count BEFORE sending (so the
+/// writer's per-line decrement can never underflow it), and shed past
+/// `MAX_QUEUED_LINES` so a stalled writer can't grow the queue without bound.
+/// `state.1` is set once when the channel send fails (writer gone).
+fn send_or_warn(tx: &mpsc::UnboundedSender<Msg>, state: &LoggerState, msg: Msg, what: &str) {
+    if state.depth.load(Ordering::Relaxed) >= MAX_QUEUED_LINES {
+        state.dropped.fetch_add(1, Ordering::Relaxed);
+        return; // shed: writer backlogged at the cap — drop rather than risk OOM
+    }
+    state.depth.fetch_add(1, Ordering::Relaxed);
+    if tx.send(msg).is_err() {
+        state.depth.fetch_sub(1, Ordering::Relaxed);
+        state.dropped.fetch_add(1, Ordering::Relaxed);
+        if !state.gone.swap(true, Ordering::Relaxed) {
+            // The writer will never drain again, so any lines that were still queued
+            // when it died keep their never-decremented `depth` charge. Reset the
+            // gauge to 0 the first time we notice — else stale charge can pin `depth`
+            // at the shed cap and the count stops reflecting reality.
+            state.depth.store(0, Ordering::Relaxed);
+            eprintln!("hj-log: {what} writer task gone; subsequent {what} lines are dropped");
+        }
+    }
+}
+
+/// Watch a writer task: if it ends by PANIC (not a clean `Shutdown`), shout to
+/// stderr (→ the prod log) so the loss of logging is visible and names which file
+/// died. The panic hook also catches it; this adds the "which logger" context. A
+/// clean shutdown returns `Ok(())` and stays silent.
+fn supervise_writer(handle: tokio::task::JoinHandle<()>, what: &'static str) {
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                eprintln!(
+                    "hj-log: {what} writer task PANICKED ({e}); this log has STOPPED writing"
+                );
+            } else {
+                eprintln!("hj-log: {what} writer task ended unexpectedly ({e})");
+            }
+        }
+    });
+}
+
+/// Access-log line format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// `%h %l %u %t "%r" %>s %b` — the NCSA Common Log Format.
+    Common,
+    /// Common + `"%{Referer}i" "%{User-Agent}i"` — the Combined Log Format
+    /// (LiteSpeed `logHeaders=7`).
+    Combined,
+}
+
+/// One access-log event. Construct on the request path and hand to
+/// [`AccessLogger::log`].
+///
+/// The [`ts`](AccessRecord::ts) field is injectable so callers (and tests) fully
+/// control the rendered timestamp; nothing reads the wall clock during
+/// formatting.
+#[derive(Debug, Clone)]
+pub struct AccessRecord {
+    /// Client IP (already resolved, honoring trusted proxies). Formatted at render
+    /// time on the writer task, so the request path stores the value, not a String.
+    pub client_ip: IpAddr,
+    /// Event time. Use `SystemTime::now()` in production.
+    pub ts: SystemTime,
+    /// Request method, e.g. `GET`. `Cow::Borrowed(&'static str)` for the standard verbs
+    /// (every CF-fronted request) — no allocation; owned only for a custom method.
+    pub method: Cow<'static, str>,
+    /// Request target (path + query) exactly as it should appear in the log.
+    pub uri: String,
+    /// Protocol token, e.g. `HTTP/1.1`, `HTTP/2`, `HTTP/3` — a `&'static str` (no allocation).
+    pub protocol: &'static str,
+    /// Final response status code.
+    pub status: u16,
+    /// Response body bytes sent (the `%b` field).
+    pub bytes: u64,
+    /// `Referer` header, if present (combined format only).
+    pub referer: Option<String>,
+    /// `User-Agent` header, if present (combined format only).
+    pub user_agent: Option<String>,
+    /// `Host` header / vhost — retained for vhost-keyed splitting by callers.
+    pub host: Option<String>,
+    /// Authenticated remote user (the `%u` field), if any.
+    pub remote_user: Option<String>,
+    /// Per-request correlation id, rendered as a trailing ` reqid=<id>` token so a
+    /// line is joinable with the error/php-slow logs. `None` (e.g. tests / records
+    /// built without a `ReqCtx`) renders no token, keeping the legacy CLF/combined
+    /// layout byte-identical.
+    pub request_id: Option<String>,
+}
+
+impl AccessRecord {
+    /// Render this record into a single CLF/combined log line (no trailing
+    /// newline). Quotes and backslashes inside header values are escaped so a
+    /// crafted `User-Agent` cannot break the line structure.
+    pub fn render(&self, format: LogFormat) -> String {
+        use std::fmt::Write;
+        let mut line = format!(
+            "{} - {} [{}] \"{} {} {}\" {} {}",
+            self.client_ip,
+            field_or_dash(self.remote_user.as_deref()),
+            fmt::clf_time(self.ts),
+            escape(&self.method),
+            escape(&self.uri),
+            escape(self.protocol),
+            self.status,
+            self.bytes,
+        );
+        if format == LogFormat::Combined {
+            // Append directly into `line` rather than format!-ing a second String
+            // and copying it in (one fewer allocation per combined line on the
+            // writer task). `write!` to a String is infallible.
+            let _ = write!(
+                line,
+                " \"{}\" \"{}\"",
+                quoted_field(self.referer.as_deref()),
+                quoted_field(self.user_agent.as_deref()),
+            );
+        }
+        if let Some(id) = self.request_id.as_deref() {
+            // Trailing token in both formats so the line is joinable with the
+            // error/php-slow logs; absent ⇒ nothing appended (legacy layout).
+            let _ = write!(line, " reqid={}", escape(id));
+        }
+        line
+    }
+}
+
+/// Unquoted optional field: render `-` when absent/empty (the `%l`/`%u` fields).
+fn field_or_dash(v: Option<&str>) -> Cow<'_, str> {
+    match v {
+        Some(s) if !s.is_empty() => escape(s),
+        _ => Cow::Borrowed("-"),
+    }
+}
+
+/// Quoted optional header value: absent -> `-` (so it reads `"-"`).
+fn quoted_field(v: Option<&str>) -> Cow<'_, str> {
+    match v {
+        Some(s) if !s.is_empty() => escape(s),
+        _ => Cow::Borrowed("-"),
+    }
+}
+
+/// Escape control chars, `"` and `\` so log lines stay one-per-event and
+/// unambiguous (Apache uses the same `\xNN` / `\"` style escaping). Returns a
+/// borrow when nothing needs escaping (the common case for method/uri/protocol and
+/// well-behaved headers), allocating only when a special char is present. `render`
+/// now runs on the writer task (see [`AccessLogger::log`]), so this saves work on
+/// the writer rather than the request path, but the borrow-on-clean-input win stands.
+fn escape(s: &str) -> Cow<'_, str> {
+    let needs = s
+        .bytes()
+        .any(|b| b == b'"' || b == b'\\' || b < 0x20 || b >= 0x7f);
+    if !needs {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) == 0x7f || (0x80..=0x9f).contains(&(c as u32)) => {
+                out.push_str(&format!("\\x{:02x}", c as u32))
+            }
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Messages on the writer control channel.
+enum Msg {
+    /// A rendered log line (newline appended by the writer). Used by
+    /// [`ErrorLogger`] and [`AccessLogger::log_line`], which render up front.
+    Line(String),
+    /// An access record rendered by the **writer task** (off the request path).
+    /// Boxed so this variant doesn't bloat every `Line`/error-log node to the
+    /// record's ~220 bytes (and trip clippy's `large_enum_variant`).
+    Record(Box<AccessRecord>, LogFormat),
+    /// Close and re-open the underlying file (logrotate / SIGUSR1).
+    Reopen,
+    /// Flush and shut down; the writer replies on the oneshot.
+    Shutdown(oneshot::Sender<()>),
+}
+
+/// Non-blocking access logger handle. Cheap to [`Clone`]; all clones feed the
+/// same writer task.
+#[derive(Clone)]
+pub struct AccessLogger {
+    tx: mpsc::UnboundedSender<Msg>,
+    format: LogFormat,
+    /// Per-logger state: `(depth, gone)`. `depth` bounds the in-flight line
+    /// queue; `gone` fires once when the writer task disappears.
+    state: LoggerState,
+}
+
+impl AccessLogger {
+    /// Spawn the writer task and return a handle.
+    ///
+    /// * `path` — the live log file (created if missing, appended otherwise).
+    /// * `format` — [`LogFormat::Combined`] or [`LogFormat::Common`].
+    /// * `rolling_size` — roll when the file exceeds this many bytes (`0`
+    ///   disables size-based rolling).
+    /// * `keep_days` — prune rolled files older than this many days (`0`
+    ///   disables pruning).
+    /// * `compress_archive` — gzip rolled files with `flate2`.
+    ///
+    /// Must be called from within a tokio runtime.
+    pub fn spawn(
+        path: impl AsRef<Path>,
+        format: LogFormat,
+        rolling_size: u64,
+        keep_days: u64,
+        compress_archive: bool,
+    ) -> Self {
+        let cfg = RollConfig {
+            path: path.as_ref().to_path_buf(),
+            rolling_size,
+            keep_days,
+            compress_archive,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let state: LoggerState = Arc::new(LoggerStateInner::new());
+        supervise_writer(
+            tokio::spawn(writer::run(cfg, rx, state.clone())),
+            "access-log",
+        );
+        AccessLogger { tx, format, state }
+    }
+
+    /// Queue a record for writing. Never blocks and never panics; if the writer
+    /// task has stopped the record is silently dropped (logging must not take
+    /// the request path down).
+    ///
+    /// The record is rendered to a line on the **writer task**, not here — the
+    /// CLF-timestamp + `format!` + escape work stays off the request hot path; the
+    /// caller only boxes the record and does a channel send.
+    pub fn log(&self, record: AccessRecord) {
+        send_or_warn(
+            &self.tx,
+            &self.state,
+            Msg::Record(Box::new(record), self.format),
+            "access-log",
+        );
+    }
+
+    /// Queue a pre-rendered line (escape/format already applied by the caller).
+    pub fn log_line(&self, line: impl Into<String>) {
+        send_or_warn(&self.tx, &self.state, Msg::Line(line.into()), "access-log");
+    }
+
+    /// Request that the writer re-open the log file. Use from a SIGUSR1 handler
+    /// or after `logrotate` moves the file. Non-blocking.
+    pub fn reopen(&self) {
+        let _ = self.tx.send(Msg::Reopen);
+    }
+
+    /// The active line format.
+    pub fn format(&self) -> LogFormat {
+        self.format
+    }
+
+    /// Number of records shed because the writer queue was full or gone.
+    pub fn dropped_lines(&self) -> u64 {
+        self.state.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Flush all queued records and stop the writer task. Awaiting this returns
+    /// once everything queued before the call has hit disk.
+    pub async fn shutdown(self) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self.tx.send(Msg::Shutdown(ack_tx)).is_ok() {
+            let _ = ack_rx.await;
+        }
+    }
+}
+
+/// Severity tag for error-log lines, matching LiteSpeed's level names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Notice,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    /// The bracketed tag written to the log, e.g. `NOTICE`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Info => "INFO",
+            LogLevel::Notice => "NOTICE",
+            LogLevel::Warn => "WARN",
+            LogLevel::Error => "ERROR",
+        }
+    }
+}
+
+/// Async error/stderr appender, sharing the rolling writer used by the access
+/// logger. Emits `2026-05-31 13:55:36.000000 [LEVEL] message` lines.
+#[derive(Clone)]
+pub struct ErrorLogger {
+    tx: mpsc::UnboundedSender<Msg>,
+    /// Per-logger state: `(depth, gone)` (see [`AccessLogger`]).
+    state: LoggerState,
+}
+
+impl ErrorLogger {
+    /// Spawn an error-log writer task. Parameters mirror
+    /// [`AccessLogger::spawn`] (minus the line format).
+    pub fn spawn(
+        path: impl AsRef<Path>,
+        rolling_size: u64,
+        keep_days: u64,
+        compress_archive: bool,
+    ) -> Self {
+        let cfg = RollConfig {
+            path: path.as_ref().to_path_buf(),
+            rolling_size,
+            keep_days,
+            compress_archive,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let state: LoggerState = Arc::new(LoggerStateInner::new());
+        supervise_writer(
+            tokio::spawn(writer::run(cfg, rx, state.clone())),
+            "error-log",
+        );
+        ErrorLogger { tx, state }
+    }
+
+    /// Log a message at `level` using `SystemTime::now()` as the timestamp.
+    pub fn log(&self, level: LogLevel, msg: impl AsRef<str>) {
+        self.log_at(level, SystemTime::now(), msg);
+    }
+
+    /// Log a message with an explicit timestamp (deterministic; used in tests).
+    pub fn log_at(&self, level: LogLevel, ts: SystemTime, msg: impl AsRef<str>) {
+        let line = format!(
+            "{} [{}] {}",
+            fmt::error_time(ts),
+            level.as_str(),
+            sanitize_msg(msg.as_ref()),
+        );
+        send_or_warn(&self.tx, &self.state, Msg::Line(line), "error-log");
+    }
+
+    /// Append a captured backend `stderr` line verbatim at `INFO` level. Embedded
+    /// newlines are turned into separate records so each line is timestamped.
+    pub fn capture_stderr(&self, raw: impl AsRef<str>) {
+        for chunk in raw.as_ref().split('\n') {
+            let chunk = chunk.trim_end_matches('\r');
+            if !chunk.is_empty() {
+                self.log(LogLevel::Info, chunk);
+            }
+        }
+    }
+
+    /// Re-open the underlying file (logrotate / SIGUSR1). Non-blocking.
+    pub fn reopen(&self) {
+        let _ = self.tx.send(Msg::Reopen);
+    }
+
+    /// Number of records shed because the writer queue was full or gone.
+    pub fn dropped_lines(&self) -> u64 {
+        self.state.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Flush and stop the writer task.
+    pub async fn shutdown(self) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self.tx.send(Msg::Shutdown(ack_tx)).is_ok() {
+            let _ = ack_rx.await;
+        }
+    }
+}
+
+/// Keep error messages to a single physical line.
+fn sanitize_msg(s: &str) -> String {
+    s.replace('\r', "").replace('\n', " ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    fn sample() -> AccessRecord {
+        AccessRecord {
+            client_ip: "203.0.113.7".parse().unwrap(),
+            ts: UNIX_EPOCH + Duration::from_secs(971_186_136), // 2000-10-10T13:55:36Z
+            method: "GET".into(),
+            uri: "/index.html?x=1".into(),
+            protocol: "HTTP/1.1".into(),
+            status: 200,
+            bytes: 2326,
+            referer: Some("https://example.com/start".into()),
+            user_agent: Some("Mozilla/5.0".into()),
+            host: Some("example.com".into()),
+            remote_user: None,
+            request_id: None,
+        }
+    }
+
+    #[test]
+    fn combined_exact() {
+        let r = sample();
+        assert_eq!(
+            r.render(LogFormat::Combined),
+            "203.0.113.7 - - [10/Oct/2000:13:55:36 +0000] \"GET /index.html?x=1 HTTP/1.1\" 200 2326 \"https://example.com/start\" \"Mozilla/5.0\""
+        );
+    }
+
+    #[test]
+    fn common_exact() {
+        let r = sample();
+        assert_eq!(
+            r.render(LogFormat::Common),
+            "203.0.113.7 - - [10/Oct/2000:13:55:36 +0000] \"GET /index.html?x=1 HTTP/1.1\" 200 2326"
+        );
+    }
+
+    #[test]
+    fn request_id_appended_when_present() {
+        let mut r = sample();
+        r.request_id = Some("00000000deadbeef".into());
+        // Trailing token in both formats; absent in the None case (the exact tests above).
+        assert!(
+            r.render(LogFormat::Common)
+                .ends_with(" reqid=00000000deadbeef")
+        );
+        assert!(
+            r.render(LogFormat::Combined)
+                .ends_with(" reqid=00000000deadbeef")
+        );
+    }
+
+    #[test]
+    fn remote_user_rendered() {
+        let mut r = sample();
+        r.remote_user = Some("alice".into());
+        assert!(
+            r.render(LogFormat::Common)
+                .starts_with("203.0.113.7 - alice [")
+        );
+    }
+
+    #[test]
+    fn missing_headers_become_dash() {
+        let mut r = sample();
+        r.referer = None;
+        r.user_agent = None;
+        assert!(
+            r.render(LogFormat::Combined)
+                .ends_with("200 2326 \"-\" \"-\"")
+        );
+    }
+
+    #[test]
+    fn injection_is_escaped() {
+        let mut r = sample();
+        r.user_agent = Some("evil\" 500 0 \"\ninjected".into());
+        let line = r.render(LogFormat::Combined);
+        // exactly one line, quotes/newlines neutralized
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.contains("\\\""));
+        assert!(line.contains("\\n"));
+        assert!(!line.contains("injected\n"));
+    }
+
+    #[test]
+    fn error_line_format() {
+        let ts = UNIX_EPOCH + Duration::new(971_186_136, 0);
+        let line = format!(
+            "{} [{}] {}",
+            fmt::error_time(ts),
+            LogLevel::Notice.as_str(),
+            sanitize_msg("server\nstarted"),
+        );
+        assert_eq!(line, "2000-10-10 13:55:36.000000 [NOTICE] server started");
+    }
+
+    #[test]
+    fn shed_lines_increment_drop_counter() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(LoggerStateInner::new());
+        state.depth.store(MAX_QUEUED_LINES, Ordering::Relaxed);
+        send_or_warn(&tx, &state, Msg::Line("dropped".into()), "access-log");
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 1);
+        assert!(
+            rx.try_recv().is_err(),
+            "shed line must not enter the writer queue"
+        );
+    }
+}

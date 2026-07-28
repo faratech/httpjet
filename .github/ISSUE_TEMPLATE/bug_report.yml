@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible httpjet defect
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not disclose vulnerabilities here. Use the private reporting instructions in SECURITY.md.
+  - type: input
+    id: revision
+    attributes:
+      label: Version or revision
+      description: Release, commit SHA, and Rust version.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, kernel, architecture, and relevant optional features.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use sanitized configuration and data only.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

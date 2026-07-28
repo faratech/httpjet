@@ -1,0 +1,9 @@
+title = "httpjet secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "RFC 6455 example WebSocket nonce used by protocol tests"
+targetRules = ["generic-api-key"]
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']

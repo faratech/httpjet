@@ -1,0 +1,25 @@
+[package]
+name = "hj-compress"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-core = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+http-body = { workspace = true }
+bytes = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+brotli = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }

@@ -1,0 +1,27 @@
+[package]
+name = "hj-lsapi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-core = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+rustix = { workspace = true, features = ["fs", "net", "process", "stdio", "thread"] }
+# libc: async-signal-safe `_exit` in the lsphp supervisor's post-fork pre_exec closure.
+libc = { version = "0.2" }
+http = { workspace = true }
+http-body-util = { workspace = true, features = ["channel"] }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

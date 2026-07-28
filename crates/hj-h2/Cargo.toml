@@ -1,0 +1,41 @@
+[package]
+name = "hj-h2"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Custom HTTP/2 framing + connection state machine for httpjet (plan Phase 4),
+# built on the io_uring reactor with pooled stream state and zero-copy DATA frames
+# straight from page-cache Bytes. Plugs into the frozen `Fn(Request)->Future<Response>`
+# service closure exactly like the h3 transport. Keeps hj-core unchanged.
+[features]
+# Additive monoio io_uring serve path (`serve_local`) for the pure-io_uring build.
+# Default-OFF: the prod tokio `serve` is unchanged + untouched when this is off.
+monoio = ["dep:monoio", "dep:libc"]
+
+[dependencies]
+# Optional (gated by `monoio`): pure-io_uring thread-per-core runtime for serve_local.
+monoio = { workspace = true, optional = true }
+# Direct `writev(2)` on a kTLS socket fd (zero-copy flush from the OutQueue segments).
+libc = { version = "0.2", optional = true }
+hj-core = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+# FuturesUnordered multiplexes all of a connection's stream handlers concurrently
+# inside the one connection task (no per-stream spawn).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# FxHashMap/FxHashSet for the per-connection stream maps (keyed by u32 stream IDs);
+# SipHash is pure overhead on a trusted integer key. Internal-only — see workspace dep note.
+rustc-hash = { workspace = true }
+# posix_fadvise(SEQUENTIAL) on large uncached file streams (kernel readahead).
+rustix = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "time"] }

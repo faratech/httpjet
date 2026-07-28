@@ -1,0 +1,23 @@
+[package]
+name = "hj-core"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-config = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+# FxHashMap for the vhost router's per-request lookups. Stored keys are trusted config
+# domains (a small fixed set), so non-DoS-resistant hashing is safe even though the lookup
+# key is the untrusted Host header (an attacker cannot insert colliding entries).
+rustc-hash = { workspace = true }
+httpdate = { workspace = true }
+tracing = { workspace = true }

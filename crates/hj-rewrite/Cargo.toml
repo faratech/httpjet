@@ -1,0 +1,16 @@
+[package]
+name = "hj-rewrite"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fancy-regex = { workspace = true }
+regex = { workspace = true }
+regex-automata = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }

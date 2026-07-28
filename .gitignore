@@ -1,0 +1,26 @@
+/target
+/run/
+# runtime telemetry + access/error logs the running server writes into the tree
+# (telemetry.tsv is rotated to *.tsv.1 on startup; *.log already ignored below).
+# This is node-local output, never committed — see the b4026dd "Fixes" data dump.
+/logs/
+# Cargo.lock IS committed: httpjet ships as a binary/application, so pinning the exact
+# dependency graph makes prod builds (and the per-arch PGO binaries) reproducible.
+**/*.rs.bk
+conf.test/
+*.log
+# prod binary rollback backups (large ELF artifacts; never commit)
+*.bak
+/httpjet-*.bak
+# stable prod install path — deployed per-arch ELF binaries (httpjet + .prev); never commit
+/bin/
+# local agent/MCP tooling dirs
+/.claude/
+/.playwright-mcp/
+
+# runtime, host-local configuration and secrets — never commit
+conf/
+
+# The public, synthetic quick-start fixture is safe and intentionally versioned.
+!examples/litespeed/conf/
+!examples/litespeed/conf/**

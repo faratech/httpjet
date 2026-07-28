@@ -1,0 +1,15 @@
+[package]
+name = "hj-acl"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-core = { workspace = true }
+http = { workspace = true }
+ipnet = { workspace = true }
+globset = { workspace = true }
+tracing = { workspace = true }

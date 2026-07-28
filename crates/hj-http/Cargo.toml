@@ -1,0 +1,12 @@
+[package]
+name = "hj-http"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# `ServeConfig` is derived from the LiteSpeed `<tuning>` block.
+hj-core = { workspace = true }

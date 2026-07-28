@@ -1,0 +1,41 @@
+[Unit]
+Description=httpjet static example
+Documentation=https://github.com/faratech/httpjet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=httpjet
+WorkingDirectory=/var/lib/httpjet
+ExecStartPre=/usr/bin/httpjet --root /etc/httpjet/litespeed check --strict
+ExecStart=/usr/bin/httpjet --root /etc/httpjet/litespeed serve --http-addr 127.0.0.1:8080 --https-addr= --workers 1 --no-php
+Environment=RUST_LOG=httpjet=info
+Restart=on-failure
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=httpjet
+LimitNOFILE=65536
+UMask=0027
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[package]
+name = "hj-pagecache"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+dashmap = { workspace = true }
+hashbrown = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+# The page-cache index is the shared `hj_cache::sharded::ShardedCache` byte-weighted LRU
+# primitive (the file cache uses it too); the page-specific teardown side-effects
+# (tmpfs-unlink + hot-drop + tag-GC) ride the `OnEvict` hook. `hj-cache` does NOT depend on
+# `hj-pagecache`, so there is no cycle.
+hj-cache = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"

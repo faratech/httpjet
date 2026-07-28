@@ -1,0 +1,33 @@
+[package]
+name = "hj-proxy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-core = { workspace = true }
+tokio = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+parking_lot = { workspace = true }
+# TCP keepalive on dialed-upstream + WebSocket sockets so a silently dead peer
+# is reaped instead of pinning a maxConns permit / relay task / fds forever.
+socket2 = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+# Upstream TLS for https:// / wss:// proxy targets — cert verified against the webpki
+# Mozilla root store, SNI = the target authority host.
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+http-body-util = { workspace = true }

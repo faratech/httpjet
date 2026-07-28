@@ -1,0 +1,141 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = [
+    "vendor/dashmap",
+    "vendor/monoio",
+    "vendor/monoio-rustls",
+    "vendor/pprof",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+rust-version = "1.97"
+license = "GPL-3.0-only"
+repository = "https://github.com/faratech/httpjet"
+homepage = "https://github.com/faratech/httpjet"
+
+# Shared dependency versions. Crates opt in with `dep = { workspace = true }`.
+# Entries listed here but unreferenced are NOT resolved or built.
+[workspace.dependencies]
+# internal crates
+hj-config = { path = "crates/hj-config" }
+hj-core = { path = "crates/hj-core" }
+hj-tls = { path = "crates/hj-tls" }
+hj-http = { path = "crates/hj-http" }
+hj-static = { path = "crates/hj-static" }
+hj-cache = { path = "crates/hj-cache" }
+hj-compress = { path = "crates/hj-compress" }
+hj-log = { path = "crates/hj-log" }
+hj-acl = { path = "crates/hj-acl" }
+hj-lsapi = { path = "crates/hj-lsapi" }
+hj-rewrite = { path = "crates/hj-rewrite" }
+hj-proxy = { path = "crates/hj-proxy" }
+hj-pagecache = { path = "crates/hj-pagecache" }
+# native HTTP/2 stack
+hj-h2 = { path = "crates/hj-h2" }
+
+# async runtime + io
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "signal", "sync", "time", "macros", "process"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+monoio = { version = "=0.2.4" }
+socket2 = "0.6"
+rustix = { version = "1", features = ["fs", "net", "process"] }
+
+# http
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+# The proxy needs Hyper's HTTP/1 client. Request serving itself lives in the io_uring
+# transport, and h2-over-TLS is the native hj-h2 stack, so NO http2 feature is needed.
+# `upgrade`/`service`/`body::Incoming` come with these features.
+hyper = { version = "1", features = ["http1", "server", "client"] }
+# Only the tokio rt adapters (TokioIo/TokioTimer) are used; not the `auto` h1/h2
+# negotiator (removed with hyper's h2) nor any server-graceful/client helpers.
+hyper-util = { version = "0.1", features = ["tokio"] }
+httpdate = "1"
+
+# tls
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+webpki-roots = "1.0"
+
+# config / parsing
+quick-xml = "0.41"
+serde = { version = "1", features = ["derive"] }
+fancy-regex = "0.18"
+regex = "1"
+regex-automata = "0.4"
+ipnet = "2"
+globset = "0.4"
+dashmap = { version = "=7.0.0-rc2", features = ["inline-more"] }
+hashbrown = "0.17.1"
+# Fast non-cryptographic hasher (FxHash) for INTERNAL maps keyed by trusted values
+# (h2 stream IDs, etc.) — SipHash's DoS resistance is wasted on a u32 key. Never use
+# for maps keyed by untrusted external input.
+rustc-hash = "2"
+
+# caching / compression
+memmap2 = "0.9"
+flate2 = "1"
+zstd = "0.13"
+brotli = "8"
+
+# utility
+async-trait = "0.1"
+arc-swap = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+# No `ansi` feature: the server logs to journald/files, never a color TTY, so the
+# nu-ansi-term color machinery is dead weight. Explicit feature list = defaults
+# minus `ansi`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "registry", "env-filter", "smallvec", "tracing-log"] }
+# default-features off drops color/suggestions (anstream/anstyle/strsim) — the server is
+# non-interactive; keep help/usage/error-context so `--help` + arg errors still render.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+parking_lot = "0.12"
+
+# global allocator — cuts glibc arena lock/futex contention under the multi-thread
+# tokio runtime (Pingora ships jemalloc for the same reason; httpjet's bottleneck
+# analysis named futex ~75% of syscall time).
+mimalloc = "0.1"
+# Direct handle on mimalloc's C API (mi_collect / mi_stats_print_out) for the
+# periodic OS-trim task + the loopback /__mimalloc-stats diagnostics. Already in
+# the tree as a transitive dep of `mimalloc`; the version unifies to the SAME
+# compiled libmimalloc that backs #[global_allocator] (one allocator, not two —
+# a second copy would make mi_collect a silent no-op). The `mimalloc` wrapper
+# re-exports only the allocator type, so the FFI must come from here directly.
+# `extended` exposes mi_collect / mi_stats_print_out; feature unification means
+# libmimalloc-sys still builds ONCE (union of features), same allocator. Leave the
+# C tree at its v3 default (no `v2`) so option numbering matches the linked source.
+libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
+
+# Vendored monoio-rustls fork: a REAL `writev` (upstream 0.4.0 ships a first-iovec-only
+# stub marked "TODO: use real writev"). Lets the io_uring h2 flush writev straight into
+# rustls (1 plaintext copy, like tokio's write_vectored) instead of coalescing into a
+# scratch buffer first. The io_uring transport is unconditional, so this fork is always
+# selected. Re-sync on any upstream bump.
+# Other exact-release dependency lifts are documented in vendor/PATCHES.md.
+[patch.crates-io]
+dashmap = { path = "vendor/dashmap" }
+monoio = { path = "vendor/monoio" }
+monoio-rustls = { path = "vendor/monoio-rustls" }
+pprof = { path = "vendor/pprof" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+# Strip DWARF debug info but KEEP the .symtab symbol table (~+1.5 MiB) so the
+# built-in pprof profile endpoint (and perf/coredumps) can symbolize the LIVE
+# prod binary. Build scripts add `-C force-frame-pointers=yes` for accurate
+# sampled stacks. No .text/RSS/perf effect — purely a file-size vs profileability
+# trade-off (chosen: profileable).
+strip = "debuginfo"

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<httpServerConfig>
+  <serverName>example.test</serverName>
+  <user>nobody</user>
+  <group>nobody</group>
+  <indexFiles>index.html</indexFiles>
+
+  <tuning>
+    <maxConnections>256</maxConnections>
+    <keepAliveTimeout>5</keepAliveTimeout>
+    <maxKeepAliveReq>100</maxKeepAliveReq>
+  </tuning>
+
+  <virtualHostList>
+    <virtualHost>
+      <name>example.test</name>
+      <vhRoot>$SERVER_ROOT/example</vhRoot>
+      <configFile>$SERVER_ROOT/conf/vhosts/example.test.xml</configFile>
+      <allowSymbolLink>0</allowSymbolLink>
+      <enableScript>0</enableScript>
+    </virtualHost>
+  </virtualHostList>
+
+  <listenerList>
+    <listener>
+      <name>http</name>
+      <address>127.0.0.1:8080</address>
+      <secure>0</secure>
+      <vhostMapList>
+        <vhostMap>
+          <vhost>example.test</vhost>
+          <domain>example.test,www.example.test</domain>
+        </vhostMap>
+      </vhostMapList>
+    </listener>
+  </listenerList>
+</httpServerConfig>

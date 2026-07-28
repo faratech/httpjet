@@ -1,0 +1,23 @@
+[package]
+name = "hj-static"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-core = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+httpdate = { workspace = true }
+async-trait = { workspace = true }
+rustix = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust 1.97
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt
+          rustup default 1.97.0
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check default build
+        run: cargo check -p httpjet --bin httpjet --locked
+
+      - name: Check profiling build
+        run: cargo check -p httpjet --bin httpjet --features profiling --locked
+
+      - name: Reject the CDDL flamegraph dependency
+        run: |
+          if cargo tree --all-features -i inferno >/tmp/inferno-tree 2>&1; then
+            cat /tmp/inferno-tree
+            echo "inferno must not be linked into the distributed build"
+            exit 1
+          fi
+
+      - name: Check dependency license policy and inventory
+        run: python3 scripts/check-dependency-licenses.py --check DEPENDENCY_LICENSES.md
+
+      - name: Validate bundled configuration
+        run: cargo run -p httpjet --locked -- --root "$GITHUB_WORKSPACE/examples/litespeed" check --strict
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+  dco:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Verify DCO sign-offs
+        run: scripts/check-dco.sh "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
