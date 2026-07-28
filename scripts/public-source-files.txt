@@ -2,7 +2,6 @@
 .github
 .gitleaks.toml
 .gitignore
-ARCHITECTURE.md
 Cargo.lock
 Cargo.toml
 CONTRIBUTING.md
