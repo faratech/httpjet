@@ -51,7 +51,14 @@ jobs:
         run: cargo run -p httpjet --locked -- --root "$GITHUB_WORKSPACE/examples/litespeed" check --strict
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        # The LSAPI supervisor suite signals and reaps detached descendants.
+        # GitHub's runner blocks those operations for its unprivileged user.
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "RUSTUP_HOME=$RUSTUP_HOME" \
+            "CARGO_HOME=$CARGO_HOME" \
+            cargo test --workspace --locked
 
   dco:
     if: github.event_name == 'pull_request'
