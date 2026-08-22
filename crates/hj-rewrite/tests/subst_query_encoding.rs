@@ -22,7 +22,9 @@ fn capture_with_decoded_space_is_encoded_in_query_tail() {
         "/dl/a%20b",
     );
     match outcome {
-        RewriteOutcome::Rewritten { new_uri, new_query, .. } => {
+        RewriteOutcome::Rewritten {
+            new_uri, new_query, ..
+        } => {
             assert_eq!(new_uri, "/files/a%20b.txt");
             assert_eq!(
                 new_query.as_deref(),
@@ -44,7 +46,9 @@ fn query_structure_and_existing_escapes_survive() {
         "/x/z%20q",
     );
     match outcome {
-        RewriteOutcome::Rewritten { new_uri, new_query, .. } => {
+        RewriteOutcome::Rewritten {
+            new_uri, new_query, ..
+        } => {
             assert_eq!(new_uri, "/y%FAz", "existing %XX escapes stay verbatim");
             assert_eq!(
                 new_query.as_deref(),
