@@ -189,7 +189,16 @@ impl HtaccessCache {
                 Ok(h) => Some(Arc::new(h)),
                 Err(e) => {
                     tracing::warn!(path = %file.display(), error = %e, "failed to parse .htaccess");
-                    None
+                    // Fail CLOSED like Apache (which 500s the request): `parse`
+                    // is all-or-nothing, so memoizing a failure as "no access
+                    // file" would silently strip the directory's deny rules for
+                    // as long as the typo stands. The sentinel is cached like a
+                    // real parse and self-heals when the fixed file's mtime
+                    // changes.
+                    Some(Arc::new(
+                        Htaccess::parse("Require all denied")
+                            .expect("built-in deny-all sentinel must parse"),
+                    ))
                 }
             },
             _ => None,

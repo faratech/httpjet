@@ -27,6 +27,15 @@ pub(super) fn seed_server_env(ctx: &mut ReqCtx) {
 /// (#8b) Evaluate the chain's `SetEnvIf`/`SetEnvIfNoCase` and merge the results
 /// into `ctx.env` (later entries win) BEFORE the rewrite runs, so RewriteConds
 /// (`%{ENV:NAME}`) and `Header ... env=` guards observe them.
+/// Reserved env namespace shared by every config-driven env writer: names under
+/// `HJ_` are request-identity plumbing (e.g. `HJ_REQUEST_PATH_QUERY` feeding the
+/// redirect-decache transform, seeded by `set_redirect_guard_env` BEFORE config
+/// evaluation runs) that a vhost/.htaccess rule must never be able to overwrite
+/// — doing so would spoof what `deny_labeled_self_redirect` compares against.
+pub(super) fn env_key_allowed(k: &str) -> bool {
+    !k.starts_with("HJ_")
+}
+
 pub(super) fn apply_set_env(
     ctx: &mut ReqCtx,
     chain: &[Arc<Htaccess>],
@@ -83,6 +92,14 @@ pub(super) fn apply_set_env(
     };
     for ht in chain {
         for (k, v) in ht.eval_set_env(&attrs) {
+            if !env_key_allowed(&k) {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    key = %k,
+                    "SetEnvIf targets the reserved HJ_ env prefix; ignored"
+                );
+                continue;
+            }
             ctx.set_env(k, v);
         }
     }
@@ -181,6 +198,55 @@ fn apply_header_op(resp: &mut Response, op: &HeaderOp) {
 mod tests {
     use super::super::rewrite_glue::resolved_rel_path;
     use super::*;
+
+    #[test]
+    fn set_env_if_cannot_overwrite_reserved_hj_env() {
+        let ht = hj_rewrite::Htaccess::parse(
+            "SetEnvIf Request_URI ^.*$ HJ_REQUEST_PATH_QUERY=/spoofed\n\
+             SetEnvIf Request_URI ^.*$ PLAIN_OK=yes\n",
+        )
+        .unwrap();
+        let chain = vec![Arc::new(ht)];
+        let req = http::Request::builder()
+            .uri("/x")
+            .body(hj_core::empty_incoming())
+            .unwrap();
+
+        let server = Arc::new(hj_core::config::ServerConfig::default());
+        let vhost = Arc::new(hj_core::config::VHostConfig::default());
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let mut ctx = ReqCtx {
+            server,
+            vhost_name: "test.example".into(),
+            vhost,
+            peer_ip: loopback,
+            client_ip: loopback,
+            is_tls: false,
+            protocol: hj_core::Proto::Http1,
+            trusted_proxy: false,
+            env: Vec::new(),
+            local_addr: "127.0.0.1:80".parse().unwrap(),
+            peer_port: 40000,
+            tls: None,
+            request_time: std::time::SystemTime::UNIX_EPOCH,
+            request_id: Default::default(),
+            upstream_id: None,
+        };
+        ctx.set_env("HJ_REQUEST_PATH_QUERY", "/original");
+
+        apply_set_env(&mut ctx, &chain, &req, "/x", "");
+
+        assert_eq!(
+            ctx.get_env("HJ_REQUEST_PATH_QUERY"),
+            Some("/original"),
+            "SetEnvIf must not overwrite the reserved request-identity env"
+        );
+        assert_eq!(
+            ctx.get_env("PLAIN_OK"),
+            Some("yes"),
+            "non-reserved SetEnvIf vars still apply"
+        );
+    }
 
     #[test]
     fn dotdot_through_missing_dir_loads_protected_htaccess_and_denies() {

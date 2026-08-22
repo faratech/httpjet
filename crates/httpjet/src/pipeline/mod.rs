@@ -53,8 +53,8 @@ use response_util::{
     matching_static_context, redirect, status_response,
 };
 use rewrite_glue::{
-    RwResult, build_uri, decode_request_path, normalized_request_path, percent_encode_path,
-    resolved_rel_path, run_rewrite, url_parent_dir,
+    RwResult, build_uri, decode_request_path, needs_encoding, normalized_request_path,
+    percent_encode_path, resolved_rel_path, run_rewrite, url_parent_dir,
 };
 use suffix_routing::split_script_path;
 
@@ -125,13 +125,17 @@ impl Drop for RequestGuard<'_> {
 /// `None` for anything that needs the backend (miss / stale-refresh / dynamic / no
 /// cache / ACL deny), which the caller then bridges to the full pipeline.
 ///
-/// Correctness: this reuses `cache_lookup` verbatim, so the cacheability + private
-/// routing + identity-guard + variant-negotiation decisions cannot diverge from the
-/// tokio path. The `.htaccess` chain is intentionally EMPTY here (no per-dir I/O on
-/// the io_uring core): a HIT implies the store side already deemed the path
-/// cacheable, and a chain-normalized query simply computes a different key → misses
-/// → bridges. The cache key embeds `is_tls`, so a cross-scheme request also just
-/// misses. Net: the fast path can only ever serve a byte-correct hit or fall through.
+/// Correctness: this reuses `cache_lookup` verbatim against the SAME mtime-cached
+/// `.htaccess` chain `dispatch()` would load, AFTER running the sync prefix
+/// (`seed_server_env`/`apply_set_env` + the per-dir/accessDenyDir gates), so
+/// request-side state cannot diverge from the tokio path: a `CacheDisable`,
+/// `CacheLookup off`, `CacheKeyModify -qs:` strip or `[E=no-cache]` SetEnvIf mark
+/// applies here exactly as it does at store time / slow-path lookup, a directory
+/// denied AFTER an entry was stored bridges to the 403 instead of serving the stale
+/// hit, and the query-normalized key matches the store-side key byte-for-byte. The
+/// chain load costs only cached per-dir stats on the hot hit path. The cache key
+/// embeds `is_tls`, so a cross-scheme request just misses. Net: the fast path can
+/// only ever serve a byte-correct hit or fall through.
 /// Adopt Cloudflare's `cf-ray` as the upstream correlation id — but only from a
 /// `trusted_proxy`. An untrusted direct-to-origin peer could otherwise forge or
 /// collide the id and poison cross-log joins, the same trust reasoning applied to
@@ -175,6 +179,16 @@ pub(crate) async fn fast_serve(
     req: &Request,
 ) -> Option<Response> {
     let req_start = std::time::Instant::now();
+    // Reserved cache endpoints (`/__hj_cache_purge|_get|_ready`) are intercepted
+    // before vhost routing on BOTH entry points: `handle()` checks them below the
+    // bridge, but this on-core fast path runs FIRST — without the same gate here,
+    // any GET/HEAD probe could be answered by vhost content instead of the
+    // endpoint contract (`classify()` accepts every method by design).
+    if let Some(pp) = state.peer_purge.as_ref() {
+        if let Some(resp) = pp.handle_inbound(req, peer_ip, state) {
+            return Some(resp);
+        }
+    }
     let method = req.method().clone();
     if method != http::Method::GET && method != http::Method::HEAD {
         return None;
@@ -243,10 +257,56 @@ pub(crate) async fn fast_serve(
     };
     let orig_query = req.uri().query().unwrap_or("").to_string();
 
+    // ---- SYNC PREFIX (shared by both branches): reproduce dispatch()'s pre-backend
+    // state with the SAME helpers in the SAME order — per-dir `.htaccess` chain
+    // (mtime-cached), REAL client IP, server env + SetEnvIf (`[E=no-cache]` included),
+    // then the per-dir deny + accessDenyDir gates — so neither on-core branch can serve
+    // content the tokio path would refuse. A deny declines (None) and dispatch() renders.
+    let htaccess_enabled = ctx.vhost.htaccess_allowed() || ctx.vhost.rewrite.auto_load_htaccess;
+    let chain_with_dirs: Vec<(std::path::PathBuf, std::sync::Arc<Htaccess>)> = if htaccess_enabled {
+        state.rewrite_cache.load_chain_with_dirs(
+            &ctx.vhost.doc_root,
+            &orig_path,
+            ctx.vhost.access_file_name_or_default(),
+        )
+    } else {
+        Vec::new()
+    };
+    let chain: Vec<std::sync::Arc<Htaccess>> =
+        chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
+    // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
+    // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
+    // path judges the SAME identity the tokio `handle()` path does — not the raw socket
+    // peer (the Cloudflare edge IP). Mirrors `record_fast_serve` / `handle()`; honors
+    // the mtls-ok-vs-real-IP invariant (no client cert required under a non-mTLS vhost).
+    let mtls_ok = if state.mtls_required_vhosts.contains(&ctx.vhost_name) {
+        ctx.tls
+            .as_ref()
+            .map(|t| t.client_cert.is_some())
+            .unwrap_or(false)
+    } else {
+        is_tls
+    };
+    ctx.client_ip = state.acl.resolve_client_ip(
+        peer_ip,
+        req.headers(),
+        state.server.use_ip_in_proxy_header,
+        mtls_ok,
+    );
+    seed_server_env(&mut ctx);
+    apply_set_env(&mut ctx, &chain, req, &orig_path, &orig_query);
+    let orig_rel = resolved_rel_path(&orig_path);
+    if access_denied(&chain, &orig_rel, method.as_str())
+        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
+    {
+        return None;
+    }
+
     // ---- Branch 1: GUEST cookieless page-cache HIT (B1) ----
-    // Any Cookie may carry membership (`xf_user` → the `.htaccess [E=no-cache]` bypass
-    // this on-core path does not run) or a vary dimension; bridge cookied requests so
-    // the full pipeline decides (the cache_private gate catches a leak without this).
+    // Any Cookie may carry membership (`xf_user`) or a vary dimension; bridge cookied
+    // requests so the full pipeline decides (the cache_private gate catches a leak
+    // without this). The lookup sees the SAME loaded chain `dispatch()` uses, so
+    // request-side cache policy cannot diverge from the store/slow-path decisions.
     if state.page_cache.is_some() && !req.headers().contains_key(http::header::COOKIE) {
         let identity = cache_identity_for(ctx.is_tls, &ctx.vhost_name, &orig_path);
         let render_epoch = state
@@ -265,7 +325,7 @@ pub(crate) async fn fast_serve(
             identity: &identity,
             req_path: &orig_path,
             req_query: &orig_query,
-            chain: &[],
+            chain: &chain,
             render_epoch,
             has_range: req.headers().contains_key(http::header::RANGE),
             host_foreign,
@@ -296,45 +356,6 @@ pub(crate) async fn fast_serve(
     // status (so a `.htaccess` ErrorDocument, possibly a .php subrequest, renders on
     // the tokio path). dispatch() itself is untouched (this is an additive uring path).
     if host_foreign {
-        return None;
-    }
-    let htaccess_enabled = ctx.vhost.htaccess_allowed() || ctx.vhost.rewrite.auto_load_htaccess;
-    let chain_with_dirs: Vec<(std::path::PathBuf, std::sync::Arc<Htaccess>)> = if htaccess_enabled {
-        state.rewrite_cache.load_chain_with_dirs(
-            &ctx.vhost.doc_root,
-            &orig_path,
-            ctx.vhost.access_file_name_or_default(),
-        )
-    } else {
-        Vec::new()
-    };
-    let chain: Vec<std::sync::Arc<Htaccess>> =
-        chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
-    // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
-    // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
-    // static path judges the SAME identity the tokio `handle()` path does — not the raw
-    // socket peer (the Cloudflare edge IP). Mirrors `record_fast_serve` / `handle()`; honors
-    // the mtls-ok-vs-real-IP invariant (no client cert required under a non-mTLS vhost).
-    let mtls_ok = if state.mtls_required_vhosts.contains(&ctx.vhost_name) {
-        ctx.tls
-            .as_ref()
-            .map(|t| t.client_cert.is_some())
-            .unwrap_or(false)
-    } else {
-        is_tls
-    };
-    ctx.client_ip = state.acl.resolve_client_ip(
-        peer_ip,
-        req.headers(),
-        state.server.use_ip_in_proxy_header,
-        mtls_ok,
-    );
-    seed_server_env(&mut ctx);
-    apply_set_env(&mut ctx, &chain, req, &orig_path, &orig_query);
-    let orig_rel = resolved_rel_path(&orig_path);
-    if access_denied(&chain, &orig_rel, method.as_str())
-        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
-    {
         return None;
     }
     // Only an unchanged (no-op) rewrite stays on-core; any rewrite/redirect/status/
@@ -1893,8 +1914,23 @@ async fn dispatch(
     // would be double-decoded by the handler. A single decode then recovers the
     // exact `cur_path` the access check and rewrite engine already saw (#1).
     if rewritten && cur_path.as_ref() != orig_path.as_str() {
-        if let Some(uri) = build_uri(&percent_encode_path(&cur_path), &cur_query) {
-            *req.uri_mut() = uri;
+        let encoded;
+        let target = if needs_encoding(cur_path.as_ref()) {
+            encoded = percent_encode_path(cur_path.as_ref());
+            encoded.as_str()
+        } else {
+            cur_path.as_ref()
+        };
+        match build_uri(target, &cur_query) {
+            Some(uri) => *req.uri_mut() = uri,
+            // Fail closed: an unparsable rewritten target must not silently
+            // keep the PRE-rewrite URI in `req` — the static handler would
+            // then serve a file other than the one whose access checks just
+            // passed. Render 400 like any other rejected request target.
+            None => {
+                return error_doc_or_page(state, ctx, &chain, &orig_path, StatusCode::BAD_REQUEST)
+                    .await;
+            }
         }
     }
     state
@@ -2221,7 +2257,7 @@ fn cache_optimizer_allows_redirect_cdn_cache(label: &str) -> bool {
 /// with a warning instead of poisoning the transform's view of the request.
 fn merge_rewrite_env(ctx: &mut ReqCtx, env: Vec<(String, String)>) {
     for (k, v) in env {
-        if k.starts_with("HJ_") {
+        if !htaccess_apply::env_key_allowed(&k) {
             tracing::warn!(
                 request_id = %ctx.request_id,
                 key = %k,

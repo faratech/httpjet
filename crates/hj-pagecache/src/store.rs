@@ -2944,13 +2944,27 @@ impl PageStore {
         }
     }
 
-    fn purge_tagged_id(&self, tag: &Arc<str>, id: CacheKeyId, purge_epoch: u64) {
+    /// Tear one tag-carrying entry down under its shard lock and return the
+    /// `(key, max_version_seq)` whose OLDER tmpfs versions still need unlinking.
+    /// The index teardown stays synchronous under the lock (file-tier rule 3);
+    /// the older-version sweep is deliberately returned to the caller so it can
+    /// run OUTSIDE `page_commit`/the shard mutex — a hot tag's fanout bucket can
+    /// hold many `{hash}-{seq}.pc` files and the readdir+header walk must not
+    /// stall unrelated stores. Filename seq disambiguation plus the boot scan
+    /// tolerate their transient presence while the sweep runs unlocked.
+    fn purge_tagged_id(
+        &self,
+        tag: &Arc<str>,
+        id: CacheKeyId,
+        purge_epoch: u64,
+    ) -> Option<(PageCacheKey, u64)> {
         enum Action {
             None,
             KeepFresh,
             Remove(Option<(PageCacheKey, u64)>),
         }
 
+        let mut sweep = None;
         self.inner.with_shard(&id, |acc| {
             let action = match acc.get(&id).and_then(CacheEntry::as_page) {
                 None => Action::None,
@@ -2974,18 +2988,31 @@ impl PageStore {
                     self.tag_index.insert(tag.clone(), id);
                 }
                 Action::Remove(version) => {
-                    if let (Some(disk), Some((key, max_version_seq))) = (&self.disk, version) {
-                        disk.remove_key_versions_through(&key, max_version_seq);
-                    }
                     acc.teardown(&id, EvictCause::Explicit);
+                    sweep = version;
                 }
             }
         });
+        sweep
     }
 
     /// Purge every entry carrying any of the given tags.
     pub fn purge_tags(&self, tags: &[&str]) {
+        let sweeps = self.purge_tags_locked(tags);
+        // Deferred older-version unlinks: outside `page_commit` and the shard
+        // locks (see `purge_tagged_id`). The referenced body file itself was
+        // already unlinked by the synchronous teardown above; this clears the
+        // superseded versions left in the bucket.
+        if let Some(disk) = &self.disk {
+            for (key, max_version_seq) in sweeps {
+                disk.remove_key_versions_through(&key, max_version_seq);
+            }
+        }
+    }
+
+    fn purge_tags_locked(&self, tags: &[&str]) -> Vec<(PageCacheKey, u64)> {
         let _page_commit = self.page_commit.lock();
+        let mut sweeps: Vec<(PageCacheKey, u64)> = Vec::new();
         let wall_ms = wall_now_ms();
         let epoch = self.purge_seq.fetch_add(1, Ordering::AcqRel) + 1;
         if self.disk.is_some() {
@@ -3020,7 +3047,9 @@ impl PageStore {
             if let Some(set) = self.tag_index.remove_tag(&ta) {
                 let ids: Vec<CacheKeyId> = set.iter().copied().collect();
                 for id in ids {
-                    self.purge_tagged_id(&ta, id, epoch);
+                    if let Some(sweep) = self.purge_tagged_id(&ta, id, epoch) {
+                        sweeps.push(sweep);
+                    }
                 }
             }
         }
@@ -3036,6 +3065,7 @@ impl PageStore {
             self.persist_peer_tag_purge_state_locked();
         }
         self.purges.fetch_add(1, Ordering::Relaxed);
+        sweeps
     }
 
     /// Purge everything (handles `X-LiteSpeed-Purge: *`).

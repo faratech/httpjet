@@ -493,13 +493,16 @@ impl ServerState {
         });
 
         // Spawn the access logger (we are inside the tokio runtime here).
+        // keep_days=7: this is by far the highest-volume log (~GBs/day at prod
+        // traffic); forensic value past a week is low, and disk headroom on the
+        // single node matters more than deep access history.
         let access_log = {
             let path = server.server_root.join("logs/httpjet_access.log");
             Some(Arc::new(AccessLogger::spawn(
                 path,
                 LogFormat::Combined,
                 10 * 1024 * 1024,
-                30,
+                7,
                 true,
             )))
         };

@@ -12,6 +12,7 @@
 //! `/usr/local/lsws/extapp-sock/php8.sock`. This module never touches the live
 //! LiteSpeed sockets.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -222,6 +223,11 @@ struct Inner {
     /// Markers whose direct master died outside a controlled drain. Detached
     /// listener holders remain owned until the next lifecycle pass reaps them.
     retired_markers: Vec<String>,
+    /// Consecutive failed forced-cleanup passes per retired marker. A marker
+    /// that keeps failing (a worker wedged in TASK_UNINTERRUPTIBLE never leaves
+    /// the `all(!alive())` quiescence gate) stops blocking lifecycle ops once
+    /// this reaches the skip threshold; the marker stays queued and is retried.
+    retired_cleanup_failures: HashMap<String, u32>,
     state: WorkerState,
     /// Monotonic counter bumped on every successful (re)start; lets callers
     /// detect that the worker behind the socket was replaced.
@@ -385,6 +391,7 @@ impl LsphpSupervisor {
                 child: None,
                 child_marker: None,
                 retired_markers: Vec::new(),
+                retired_cleanup_failures: HashMap::new(),
                 state: WorkerState::NotStarted,
                 generation: 0,
                 // Far enough in the past that the first restart is never
@@ -1313,16 +1320,57 @@ impl LsphpSupervisor {
     }
 
     async fn cleanup_retired_markers_with_timeout(&self, timeout: Duration) -> io::Result<()> {
+        // A marker whose forced cleanup keeps timing out must not wedge every
+        // lifecycle op forever: a worker stuck in TASK_UNINTERRUPTIBLE defers
+        // SIGKILL indefinitely, so `all(!alive())` quiescence never converges
+        // and the old `?`-propagation turned one wedged member into a permanent
+        // start/drain/reload failure loop (PHP down until human intervention).
+        // The first failures still surface (transient drains keep their
+        // semantics); past the threshold the marker is skipped — left queued
+        // with its pidfds intact for later passes — and the lifecycle proceeds.
+        const MAX_CLEANUP_FAILURES_PER_MARKER: u32 = 3;
+        let mut skipped: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
-            let marker = self.inner.lock().retired_markers.first().cloned();
+            let marker = self
+                .inner
+                .lock()
+                .retired_markers
+                .iter()
+                .find(|pending| !skipped.contains(*pending))
+                .cloned();
             let Some(marker) = marker else {
                 return Ok(());
             };
-            force_cleanup_marker_with_timeout(&marker, timeout).await?;
-            self.inner
-                .lock()
-                .retired_markers
-                .retain(|pending| pending != &marker);
+            match force_cleanup_marker_with_timeout(&marker, timeout).await {
+                Ok(()) => {
+                    let mut inner = self.inner.lock();
+                    inner.retired_markers.retain(|pending| pending != &marker);
+                    inner.retired_cleanup_failures.remove(&marker);
+                }
+                Err(error) => {
+                    let failures = {
+                        let mut inner = self.inner.lock();
+                        let failures = inner
+                            .retired_cleanup_failures
+                            .entry(marker.clone())
+                            .or_default();
+                        *failures += 1;
+                        *failures
+                    };
+                    if failures < MAX_CLEANUP_FAILURES_PER_MARKER {
+                        return Err(error);
+                    }
+                    tracing::error!(
+                        marker = %marker,
+                        failures,
+                        error = %error,
+                        "retired lsphp generation still not quiesced after repeated forced \
+                         cleanups; proceeding without it — members keep their pidfds and the \
+                         marker is retried on later passes"
+                    );
+                    skipped.insert(marker);
+                }
+            }
         }
     }
 }
@@ -2537,6 +2585,7 @@ impl Drop for LsphpSupervisor {
         // surviving an owner that drops the supervisor without draining it.
         let mut g = self.inner.lock();
         let mut markers = std::mem::take(&mut g.retired_markers);
+        g.retired_cleanup_failures.clear();
         if let Some(marker) = g.child_marker.take() {
             markers.push(marker);
         }
@@ -2970,6 +3019,69 @@ while True:
             .await
             .unwrap();
         assert!(supervisor.inner.lock().retired_markers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stuck_retired_marker_stops_blocking_lifecycle_after_repeated_failures() {
+        let supervisor = LsphpSupervisor::new(SupervisorConfig::from_php_config(
+            &sample_php(),
+            "/tmp/x.sock",
+            "",
+            "",
+        ));
+        let marker = format!("stuck-retired-{}", rand_suffix());
+        // A live member carrying the marker, respawned before each failing pass:
+        // the quiesce-test pause is consumed by the pass it blocks, and a plain
+        // /bin/sleep really dies once a pass's SIGKILL lands, so every pass gets
+        // a fresh pause + fresh member to stay a deterministic "never converges"
+        // stand-in for a worker wedged in TASK_UNINTERRUPTIBLE.
+        let mut members = Vec::new();
+        let mut spawn_member = || {
+            let mut command = Command::new("/bin/sleep");
+            command
+                .arg("30")
+                .env(GENERATION_MARKER_ENV, &marker)
+                .kill_on_drop(true);
+            members.push(command.spawn().unwrap());
+        };
+        spawn_member();
+        supervisor.inner.lock().retired_markers.push(marker.clone());
+        let tiny = Duration::from_millis(60);
+
+        install_quiesce_test_pause(&marker);
+        supervisor
+            .cleanup_retired_markers_with_timeout(tiny)
+            .await
+            .expect_err("first failure still surfaces");
+        spawn_member();
+        install_quiesce_test_pause(&marker);
+        supervisor
+            .cleanup_retired_markers_with_timeout(tiny)
+            .await
+            .expect_err("second failure still surfaces");
+        spawn_member();
+        install_quiesce_test_pause(&marker);
+
+        // The third consecutive failure is absorbed: the wedged generation no
+        // longer blocks start/drain/reload and stays queued for later passes.
+        supervisor
+            .cleanup_retired_markers_with_timeout(tiny)
+            .await
+            .expect("repeatedly failing marker must not wedge lifecycle ops");
+        assert_eq!(
+            supervisor.inner.lock().retired_markers,
+            vec![marker.clone()],
+            "skipped marker remains owned"
+        );
+
+        // All pauses are consumed; the final pass converges for real.
+        supervisor
+            .cleanup_retired_markers_with_timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(supervisor.inner.lock().retired_markers.is_empty());
+        assert!(supervisor.inner.lock().retired_cleanup_failures.is_empty());
+        drop(members);
     }
 
     #[tokio::test]

@@ -527,10 +527,11 @@ fn apply_rule(
             &state.last_cond_caps,
         );
         // Apache percent-encodes the substitution by default; `[NE]`
-        // (`noescape`) disables it. We escape only the path portion (everything
-        // before the first `?`) with the URI-path-safe set, leaving an existing
-        // `%XX` triplet untouched (no double-encoding). The `?query` part is
-        // left as-is so QSA merges / `?`-stripping below behave unchanged.
+        // (`noescape`) disables it. We escape the path portion (everything
+        // before the first `?`) with the URI-path-safe set and the `?query`
+        // tail with the query-safe set — leaving existing `%XX` triplets
+        // untouched (no double-encoding) so QSA merges / pre-encoded targets
+        // behave unchanged.
         let escaped = if rule.flags.noescape {
             expanded
         } else {
@@ -605,19 +606,19 @@ fn apply_rule(
     })
 }
 
-/// What the rule pattern is matched against. At the per-directory level Apache
-/// strips the directory prefix and the leading slash; we emulate that when a
-/// `per_directory_prefix` is supplied, otherwise match the path with leading
-/// slash removed (the common `.htaccess` convention used by all our fixtures,
-/// whose patterns are written like `^threads/...` without a leading slash —
-/// except the inline mcp rules which are written with a leading slash, so we
-/// try both).
 /// Pick the target a rule's pattern is matched against. Apache `.htaccess` rules
 /// match the per-directory-relative path with the leading slash stripped
 /// (`^threads/...`), while LiteSpeed inline vhost rules in this install anchor with
-/// a leading slash (`^/tools\.json$`); we choose by the pattern's own shape. Borrows
-/// `uri` where possible (no per-rule allocation in the common case).
+/// a leading slash (`^/tools\.json$`). In a PER-DIRECTORY context the strip always
+/// happens first — for every pattern shape, `^/...` included — because matching a
+/// nested file's slashed pattern against the FULL URI makes its deny/front-controller
+/// rules inert or capture the wrong span. The slashed form is only honored for
+/// vhost-level rulesets (no prefix). Borrows `uri` where possible (no per-rule
+/// allocation in the common case).
 fn select_match_target<'a>(rule: &Rule, input: &RewriteInput, uri: &'a str) -> Cow<'a, str> {
+    if input.per_directory_prefix.is_some() {
+        return rule_match_target(input, uri);
+    }
     if pattern_expects_leading_slash(&rule.pattern_src) {
         if uri.starts_with('/') {
             Cow::Borrowed(uri)
@@ -937,8 +938,11 @@ fn has_scheme(s: &str) -> bool {
 
 /// Percent-encode a substitution the way Apache `mod_rewrite` does by default
 /// (i.e. when `[NE]` is absent). Only the **path** portion (everything before
-/// the first `?`) is escaped; the `?query` tail — if any — is passed through
-/// untouched because the engine handles QSA / `?`-stripping separately on it.
+/// the first `?`) is escaped with the path-safe set; the `?query` tail — if
+/// any — keeps its `&`/`=`/existing-`%XX` structure but gets URI-forbidden
+/// bytes (space/controls/non-ASCII/`#`/delimiters) percent-encoded, since `$N`
+/// captures expand from the DECODED request path and must not yield an
+/// unparsable target downstream.
 ///
 /// Escaping rules (mirroring Apache's `T_ESCAPE_PATH` / `ap_escape_path_segment`
 /// applied across the whole path, so reserved path delimiters survive):
@@ -978,9 +982,56 @@ fn escape_subst(subst: &str) -> String {
     }
     if let Some(q) = query {
         out.push('?');
-        out.push_str(q);
+        // The query tail is no longer raw: `$N` captures expand from the
+        // DECODED request path, so a capture can carry a literal space/control
+        // byte into the query — an unparsable URI that used to fall back to
+        // serving the PRE-rewrite target at the static terminal. Encode only
+        // what the URI grammar forbids there; `&`/`=`/existing `%XX` survive
+        // so QSA merges and pre-encoded targets behave unchanged.
+        for b in q.bytes() {
+            if is_query_safe(b) {
+                out.push(b as char);
+            } else {
+                out.push('%');
+                out.push(hex_upper(b >> 4));
+                out.push(hex_upper(b & 0xf));
+            }
+        }
     }
     out
+}
+
+/// Characters left verbatim in a rewrite-substitution's `?query` tail: RFC3986
+/// unreserved + the query-meaningful delimiters (`&` `=` `+` `;` `,` `$` `:`
+/// `@` `/` `?` `!` `*` `'` `(` `)` and a preserved `%`). Everything else —
+/// space, controls, non-ASCII, `"`, `<`, `>`, `\`, `^`, `` ` ``, `{`, `|`,
+/// `}`, `#`, `[`, `]` — is percent-encoded.
+fn is_query_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'_'
+                | b'.'
+                | b'~'
+                | b'&'
+                | b'='
+                | b'+'
+                | b';'
+                | b','
+                | b'$'
+                | b':'
+                | b'@'
+                | b'/'
+                | b'?'
+                | b'!'
+                | b'*'
+                | b'\''
+                | b'('
+                | b')'
+                | b'%'
+                | b'['
+                | b']'
+        )
 }
 
 /// Characters Apache leaves unescaped in a rewrite-substitution path: the

@@ -680,6 +680,49 @@ pub(super) fn percent_encode_path(path: &str) -> String {
     out
 }
 
+/// Whether a rewritten target still needs [`percent_encode_path`] before it can
+/// ride in `req.uri()`. The engine's substitution output is ALREADY escaped
+/// (`escape_subst`) — and `%<digit>` in a substitution is a backreference, so
+/// re-encoding it would double-encode (`%20` -> `%2520`, a file that does not
+/// exist). Only a raw `[NE]` (noescape) target carries URI-forbidden bytes.
+pub(super) fn needs_encoding(path: &str) -> bool {
+    let b = path.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'/'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@' => i += 1,
+            b'%' if i + 2 < b.len()
+                && b[i + 1].is_ascii_hexdigit()
+                && b[i + 2].is_ascii_hexdigit() =>
+            {
+                i += 3;
+            }
+            _ => return true,
+        }
+    }
+    false
+}
+
 /// The directory portion of a normalized URL path: everything up to and INCLUDING the last `/`.
 /// `/a/b/file` → `/a/b/`, `/index.php` → `/`, `/` → `/`. Used to detect when a rewrite routes the
 /// request into a different directory (so the destination `.htaccess` chain must be reloaded).

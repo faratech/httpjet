@@ -123,7 +123,7 @@ struct PooledConn {
 }
 
 impl PurgeForwarder {
-    fn new(peers: Vec<SocketAddr>) -> Self {
+    pub(crate) fn new(peers: Vec<SocketAddr>) -> Self {
         let allowed = peers.iter().map(|a| a.ip().to_canonical()).collect();
         Self {
             peers,

@@ -99,18 +99,13 @@ impl PreCapture {
 
 impl PhpSlowLog {
     /// Spawn the writer task and return the shared handle. Must be called inside
-    /// the tokio runtime. Rolls at 64 MiB, gzips archives, prunes after 30 days
+    /// the tokio runtime. Rolls at 64 MiB, gzips archives, prunes after 7 days
     /// (~5 MB/day at 2026-06 production volume; benchmarks add bursts but those
     /// lines carry `lb=1` and the roll bounds the damage).
     pub fn spawn(path: impl AsRef<Path>, threshold_ms: u64) -> Arc<Self> {
         // Format field is unused — every line goes through `log_line` pre-rendered.
-        let logger = hj_log::AccessLogger::spawn(
-            path,
-            hj_log::LogFormat::Common,
-            64 * 1024 * 1024,
-            30,
-            true,
-        );
+        let logger =
+            hj_log::AccessLogger::spawn(path, hj_log::LogFormat::Common, 64 * 1024 * 1024, 7, true);
         Arc::new(PhpSlowLog {
             logger,
             threshold_us: threshold_ms.saturating_mul(1000),

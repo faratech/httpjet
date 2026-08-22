@@ -122,7 +122,7 @@ const OWNER_BASIS_A: u64 = 0xcbf2_9ce4_8422_2325; // standard FNV-1a offset basi
 const OWNER_BASIS_B: u64 = 0x6c62_272e_07bb_0142; // FNV-0 of "chongo <Landon ..." tail — independent start
 
 /// How the private tier routes a request.
-enum PrivateRoute {
+pub(crate) enum PrivateRoute {
     /// Not a private-tier request (tier off / no logged-in marker), or a logged-in
     /// request for an allowlisted visitor-invariant endpoint
     /// (`--page-cache-shared-paths`, canary-admitted): public path.
@@ -1122,7 +1122,7 @@ fn is_capsule_reserved_path(path: &str) -> bool {
     path.starts_with(CAPSULE_KEY_PREFIX)
 }
 
-fn build_cache_key(
+pub(crate) fn build_cache_key(
     ctx: &ReqCtx,
     cc: &CacheCtx<'_>,
     store: &hj_pagecache::PageStore,

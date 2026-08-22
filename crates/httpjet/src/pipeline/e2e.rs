@@ -22,7 +22,7 @@ use hj_core::config::{
 use hj_core::{Body, Proto, Request, Response};
 use http::header;
 
-use crate::pipeline::handle;
+use crate::pipeline::{fast_serve, handle};
 use crate::state::ServerState;
 
 const LISTENER: &str = "http";
@@ -59,11 +59,23 @@ fn build_state_with(
     contexts: Vec<Context>,
     access_deny_dir: Vec<String>,
 ) -> Arc<ServerState> {
+    build_state_full(doc_root, contexts, access_deny_dir, None, None)
+}
+
+/// [`build_state_with`] with an origin page-cache attached (the `--page-cache`
+/// mode); the vhost gets a cache-enabled policy so store-side eligibility holds.
+fn build_state_full(
+    doc_root: PathBuf,
+    contexts: Vec<Context>,
+    access_deny_dir: Vec<String>,
+    page_cache: Option<Arc<hj_pagecache::PageStore>>,
+    peer_purge: Option<crate::peer_purge::PurgeForwarder>,
+) -> Arc<ServerState> {
     // AccessLogger writes under server_root/logs; give it a real writable dir.
     let server_root = temp_root("srv");
     std::fs::create_dir_all(server_root.join("logs")).unwrap();
 
-    let vhost_cfg = VHostConfig {
+    let mut vhost_cfg = VHostConfig {
         doc_root: doc_root.clone(),
         index_files: vec!["index.html".into()],
         allow_symbol_link: true,
@@ -75,6 +87,16 @@ fn build_state_with(
         }],
         ..VHostConfig::default()
     };
+    if page_cache.is_some() {
+        vhost_cfg.cache_policy = Some(hj_core::config::VhostCachePolicy {
+            enable_cache: true,
+            enable_public: true,
+            enable_private: false,
+        });
+        // The cache-parity tests write per-dir `.htaccess` files (CacheDisable /
+        // Require); the vhost must load them like a prod standards vhost does.
+        vhost_cfg.allow_override = 1;
+    }
     let decl = VHostDecl {
         name: VHOST.into(),
         vh_root: doc_root.clone(),
@@ -122,13 +144,13 @@ fn build_state_with(
 
     ServerState::new(
         Arc::new(server),
-        None,                                             // lsapi
-        None,                                             // alt_svc
-        None,                                             // page_cache
+        None, // lsapi
+        None, // alt_svc
+        page_cache,
         Arc::new(hj_compress::PageDictRegistry::empty()), // page_cache_dicts
         1,                                                // admit base
         crate::state::XfCapsuleConfig::disabled(),
-        None,  // peer_purge
+        peer_purge,
         false, // cf_send_zstd
         None,  // php_slow
         false, // request_id_header
@@ -347,4 +369,224 @@ async fn foreign_host_response_is_decached_end_to_end() {
         cc != Some("private, no-store"),
         "canonical host must not be force-decached"
     );
+}
+
+// ─── fast_serve parity: request-side `.htaccess` state gates on-core hits ───
+// Regression for the empty-chain Branch-1 lookup: a stored entry kept being
+// served on-core to cookieless guests after an operator added `CacheDisable`
+// or a directory deny, because only dispatch() saw the chain. Both must bridge.
+
+async fn fast_serve_get(state: &Arc<ServerState>, path: &str) -> Option<Response> {
+    let req = get(CANON_HOST, path, None);
+    fast_serve(
+        state,
+        LISTENER,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        SocketAddr::from(([127, 0, 0, 1], 80)),
+        40000,
+        false,
+        Proto::Http1,
+        None,
+        &req,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
+    let doc_root = temp_root("fastserve");
+    std::fs::create_dir_all(doc_root.join("admin")).unwrap();
+    std::fs::write(doc_root.join("admin/index.html"), "<h1>admin</h1>\n").unwrap();
+
+    let mut cfg = hj_pagecache::StoreConfig::default();
+    // Standards-mode default-cache policy for this vhost (the prod posture):
+    // unspecified CacheLookup defaults ON, explicit off/CacheDisable still wins.
+    cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+    let state = build_state_full(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        Some(store.clone()),
+        None,
+    );
+
+    // Populate exactly as a store-side render would (no .htaccess yet ⇒ empty chain).
+    let method = http::Method::GET;
+    let identity = format!("http\n{VHOST}\n/admin/index.html");
+    let chain: Vec<std::sync::Arc<hj_rewrite::Htaccess>> = Vec::new();
+    let resolved = state.router.resolve(LISTENER, Some(CANON_HOST)).unwrap();
+    let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let rctx = hj_core::ReqCtx {
+        server: state.server.clone(),
+        vhost_name: resolved.name.clone(),
+        vhost: resolved.config,
+        peer_ip: loopback,
+        client_ip: loopback,
+        is_tls: false,
+        protocol: Proto::Http1,
+        trusted_proxy: false,
+        env: Vec::new(),
+        local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
+        peer_port: 40000,
+        tls: None,
+        request_time: std::time::SystemTime::UNIX_EPOCH,
+        request_id: Default::default(),
+        upstream_id: None,
+    };
+    let cc = crate::lscache::CacheCtx {
+        method: &method,
+        host: CANON_HOST,
+        cookie: None,
+        identity: &identity,
+        req_path: "/admin/index.html",
+        req_query: "",
+        chain: &chain,
+        render_epoch: store.purge_epoch(),
+        has_range: false,
+        host_foreign: false,
+    };
+    let key =
+        crate::lscache::build_cache_key(&rctx, &cc, &store, &crate::lscache::PrivateRoute::Public);
+    state
+        .page_cache_admission
+        .record(crate::lscache::hash_key(&key));
+    let resp = http::Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "text/html")
+        .header(header::CACHE_CONTROL, "public,max-age=600")
+        .body(Body::Full(bytes::Bytes::from_static(b"<h1>admin</h1>\n")))
+        .unwrap();
+    crate::lscache::cache_store(&state, &rctx, &cc, resp).await;
+
+    // Baseline: the cookieless GET is served ON-CORE from the stored entry.
+    let hit = fast_serve_get(&state, "/admin/index.html")
+        .await
+        .expect("baseline cookieless request must serve from the page cache");
+    assert_eq!(
+        hit.headers()
+            .get("x-litespeed-cache")
+            .map(|v| v.to_str().unwrap()),
+        Some("hit"),
+        "expected a Branch-1 cache hit"
+    );
+
+    // An .htaccess added AFTER storing must gate the on-core hit: the lookup
+    // bypasses (no `x-litespeed-cache: hit`); this static fixture then serves
+    // fresh from disk on-core, while a PHP-rendered entry would bridge to
+    // dispatch() at the script-suffix check. Either way: no stale cached serve.
+    std::fs::write(
+        doc_root.join("admin/.htaccess"),
+        "CacheDisable public /admin\n",
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await; // outlast the 1s HtaccessCache revalidate window
+    let served = fast_serve_get(&state, "/admin/index.html").await;
+    assert_ne!(
+        served
+            .as_ref()
+            .and_then(|r| r.headers().get("x-litespeed-cache"))
+            .map(|v| v.to_str().unwrap()),
+        Some("hit"),
+        "CacheDisable public must stop the stale entry being served on-core"
+    );
+
+    // A directory ACL deny must likewise never serve the stale hit on-core.
+    std::fs::write(doc_root.join("admin/.htaccess"), "Require all denied\n").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await; // outlast the 1s HtaccessCache revalidate window
+    assert!(
+        fast_serve_get(&state, "/admin/index.html").await.is_none(),
+        "Require all denied must bridge instead of serving the stale entry"
+    );
+
+    let _ = std::fs::remove_dir_all(doc_root);
+}
+
+// ─── R5: an unparsable REWRITTEN target must fail closed, not serve the
+// pre-rewrite file. `[NE]` skips substitution escaping so a decoded capture's
+// literal space reaches the static terminal's Uri construction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewritten_static_target_with_unparsable_query_fails_closed() {
+    let doc_root = temp_root("failclosed400");
+    std::fs::create_dir_all(doc_root.join("files")).unwrap();
+    std::fs::write(doc_root.join("files").join("a b.txt"), b"target body\n").unwrap();
+    // allow_override comes with the page-cache variant; the store itself stays idle here.
+    let mut cfg = hj_pagecache::StoreConfig::default();
+    cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+    let state = build_state_full(doc_root.clone(), Vec::new(), Vec::new(), Some(store), None);
+
+    // [NE]: noescape keeps the raw space → build_uri fails → 400 (never the
+    // original /q/... file or a silent fall-through).
+    std::fs::write(
+        doc_root.join(".htaccess"),
+        "RewriteEngine On\nRewriteRule ^q/(.*)$ /files/$1.txt?v=$1 [L,NE]\n",
+    )
+    .unwrap();
+
+    let resp = run(&state, get(CANON_HOST, "/q/a%20b", None)).await;
+    assert_eq!(
+        resp.status(),
+        400,
+        "an unparsable rewritten target must fail closed"
+    );
+
+    // Without [NE] the same rule encodes cleanly and serves the target file.
+    std::fs::write(
+        doc_root.join(".htaccess"),
+        "RewriteEngine On\nRewriteRule ^q/(.*)$ /files/$1.txt?v=$1 [L]\n",
+    )
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let resp = run(&state, get(CANON_HOST, "/q/a%20b", None)).await;
+    let status = resp.status();
+    let body = body_bytes(resp.into_body());
+    assert_eq!(
+        (status, body.as_ref()),
+        (http::StatusCode::OK, b"target body\n".as_ref()),
+        "unexpected response"
+    );
+
+    let _ = std::fs::remove_dir_all(doc_root);
+}
+
+// ─── R6: reserved cache endpoints are intercepted BEFORE the on-core fast path.
+// A docroot file sitting at the reserved name must not answer a GET probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_paths_are_intercepted_before_the_fast_path() {
+    let doc_root = temp_root("reserved");
+    std::fs::write(doc_root.join("__hj_cache_ready"), b"vhost imposter\n").unwrap();
+    let forwarder = crate::peer_purge::PurgeForwarder::new(Vec::new());
+    let state = build_state_full(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        Some(forwarder),
+    );
+
+    // GET (the method the fast path serves) at the reserved name must return
+    // the endpoint contract, not the docroot file. With no persisted store the
+    // boot warm-scan is trivially complete -> 200 + ready:1.
+    let resp = fast_serve_get(&state, "/__hj_cache_ready")
+        .await
+        .expect("reserved path intercepted on-core");
+    assert_eq!(
+        resp.status(),
+        200,
+        "endpoint contract, never the imposter file"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-hj-cache-ready")
+            .and_then(|v| v.to_str().ok()),
+        Some("1")
+    );
+    assert_ne!(
+        body_bytes(resp.into_body()).as_ref(),
+        b"vhost imposter\n".as_ref(),
+        "the docroot file at the reserved name must not be served"
+    );
+
+    let _ = std::fs::remove_dir_all(doc_root);
 }

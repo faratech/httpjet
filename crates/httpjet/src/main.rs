@@ -601,6 +601,8 @@ fn init_logging(root: &std::path::Path) -> (LogReloadHandle, hj_log::ErrorLogger
     use tracing_subscriber::prelude::*;
     let (filter_layer, reload_handle) =
         tracing_subscriber::reload::Layer::new(default_env_filter());
+    // keep_days=30 (unlike access/php-slow at 7): errors are low-volume but
+    // high-value — postmortems reach back weeks, so they get the deeper window.
     let err_logger = hj_log::ErrorLogger::spawn(
         root.join("logs/httpjet_error.log"),
         20 * 1024 * 1024,
