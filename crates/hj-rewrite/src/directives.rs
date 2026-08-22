@@ -482,7 +482,7 @@ impl Htaccess {
 
 /// Expand `$0`..`$9` in a `SetEnvIf` value template from regex captures.
 /// Unknown / absent groups expand to empty. `$$` is a literal `$`.
-fn expand_backrefs(template: &str, caps: &fancy_regex::Captures<'_>) -> String {
+fn expand_backrefs(template: &str, caps: &fancy_regex::Captures<'_, str>) -> String {
     if !template.contains('$') {
         return template.to_string();
     }

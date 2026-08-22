@@ -66,9 +66,9 @@ rustls-pki-types = "1"
 webpki-roots = "1.0"
 
 # config / parsing
-quick-xml = "0.41"
+quick-xml = "0.42"
 serde = { version = "1", features = ["derive"] }
-fancy-regex = "0.18"
+fancy-regex = "0.19"
 regex = "1"
 regex-automata = "0.4"
 ipnet = "2"

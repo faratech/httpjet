@@ -598,7 +598,7 @@ pub(crate) enum Caps<'t> {
         groups: [Option<(usize, usize)>; 10],
         text: &'t str,
     },
-    Fancy(fancy_regex::Captures<'t>),
+    Fancy(fancy_regex::Captures<'t, str>),
 }
 
 impl<'t> Caps<'t> {
