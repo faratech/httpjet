@@ -1131,6 +1131,10 @@ pub struct CacheStats {
     pub misses: u64,
     pub stores: u64,
     pub purges: u64,
+    /// Store-path `page_commit` hold telemetry (µs total + call count) — the
+    /// measure-first signal for narrowing the store-vs-purge critical section.
+    pub store_commit_hold_us: u64,
+    pub store_commit_calls: u64,
     /// Store attempts rejected because a relevant tag/global purge happened
     /// after the backend render began.
     pub store_purge_rejections: u64,
@@ -1480,10 +1484,18 @@ pub struct PageStore {
     /// Hot-tier key allocator — unique per body version within this process.
     body_id_seq: AtomicU64,
 
-    hits: AtomicU64,
-    misses: AtomicU64,
-    stores: AtomicU64,
-    purges: AtomicU64,
+    // The four per-request counters are cache-line padded: packed together they
+    // shared one 64-byte line, so every worker's increment invalidated it across
+    // cores on EVERY request (true ping-pong under load).
+    hits: CachePaddedAtomic,
+    misses: CachePaddedAtomic,
+    stores: CachePaddedAtomic,
+    purges: CachePaddedAtomic,
+    /// Cumulative `page_commit` hold time on the STORE path (µs) + call count.
+    /// Measure-first telemetry for the store-vs-purge serialization: optimize the
+    /// critical section only if real hold times justify cutting into it.
+    store_commit_hold_us: CachePaddedAtomic,
+    store_commit_calls: CachePaddedAtomic,
     store_purge_rejections: AtomicU64,
     /// `Arc`-shared with [`StoreEvict`] (bumped on a disk-budget eviction).
     disk_evictions: Arc<AtomicU64>,
@@ -1499,6 +1511,18 @@ pub struct PageStore {
     disk_full_errors: AtomicU64,
     meta_decode_errors: AtomicU64,
     key_id_collisions: AtomicU64,
+}
+
+/// One cache line (64 B) of storage for an [`AtomicU64`], so hot per-request
+/// counters never share a line with each other.
+#[repr(align(64))]
+struct CachePaddedAtomic(AtomicU64);
+
+impl std::ops::Deref for CachePaddedAtomic {
+    type Target = AtomicU64;
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
 }
 
 impl PageStore {
@@ -1640,10 +1664,12 @@ impl PageStore {
             store_publish_probe: Mutex::new(None),
             scan_loaded: AtomicU64::new(0),
             body_id_seq: AtomicU64::new(1),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            stores: AtomicU64::new(0),
-            purges: AtomicU64::new(0),
+            hits: CachePaddedAtomic(AtomicU64::new(0)),
+            misses: CachePaddedAtomic(AtomicU64::new(0)),
+            stores: CachePaddedAtomic(AtomicU64::new(0)),
+            purges: CachePaddedAtomic(AtomicU64::new(0)),
+            store_commit_hold_us: CachePaddedAtomic(AtomicU64::new(0)),
+            store_commit_calls: CachePaddedAtomic(AtomicU64::new(0)),
             store_purge_rejections: AtomicU64::new(0),
             disk_evictions,
             disk_evict_ages,
@@ -2100,6 +2126,10 @@ impl PageStore {
             }
         };
         let mut new_file: Option<Arc<Path>> = None;
+        // Hold-time measurement spans from just before the lock to just after the
+        // shard closure returns (lock still held): µs-resolution accounting of the
+        // store-vs-purge serialization window without a Drop-guard in every path.
+        let commit_hold_start = std::time::Instant::now();
         let _page_commit = self.page_commit.lock();
 
         // (2) FAST PART, UNDER THE SHARD LOCK (via `with_shard`). Returns `true` on a committed
@@ -2227,6 +2257,11 @@ impl PageStore {
             }
             true
         });
+        self.store_commit_hold_us.fetch_add(
+            commit_hold_start.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        self.store_commit_calls.fetch_add(1, Ordering::Relaxed);
         if !installed {
             if let Some(p) = new_file {
                 DiskStore::remove(&p);
@@ -2882,13 +2917,20 @@ impl PageStore {
                     let _ = snapshot.meta.with_listing_fields(|status, identity| {
                         total_entries += 1;
                         total_bytes += weight;
-                        let path = identity.rsplit('\n').next().unwrap_or("");
+                        // identity is "scheme\nhost\npath": bucket per HOST too, or
+                        // two vhosts' same-named paths silently share one class and
+                        // hide which site actually owns the entries.
+                        let mut identity_parts = identity.splitn(3, '\n');
+                        let _scheme = identity_parts.next();
+                        let host = identity_parts.next().unwrap_or("");
+                        let path = identity_parts.next().unwrap_or("");
                         let segment = path.split('/').nth(1).unwrap_or("");
-                        if let Some(class) = classes.get_mut(segment) {
+                        let class_key = format!("{host}/{segment}");
+                        if let Some(class) = classes.get_mut(&class_key) {
                             class.0 += 1;
                             class.1 += weight;
                         } else {
-                            classes.insert(segment.to_owned(), (1, weight));
+                            classes.insert(class_key, (1, weight));
                         }
 
                         let qualifies = top_n > 0
@@ -2926,13 +2968,12 @@ impl PageStore {
         });
         let mut classes: Vec<(String, u64, u64)> = classes
             .into_iter()
-            .map(|(segment, (count, bytes))| {
-                let class = if segment.is_empty() {
-                    "/".to_owned()
-                } else {
-                    format!("/{segment}")
-                };
-                (class, count, bytes)
+            .map(|(class_key, (count, bytes))| {
+                // class_key is "host/segment"; render as host + /segment.
+                let (host, segment) = class_key
+                    .split_once('/')
+                    .unwrap_or((class_key.as_str(), ""));
+                (format!("{host}/{segment}"), count, bytes)
             })
             .collect();
         classes.sort_by(|a, b| b.2.cmp(&a.2));
@@ -3178,6 +3219,8 @@ impl PageStore {
             misses: self.misses.load(Ordering::Relaxed),
             stores: self.stores.load(Ordering::Relaxed),
             purges: self.purges.load(Ordering::Relaxed),
+            store_commit_hold_us: self.store_commit_hold_us.load(Ordering::Relaxed),
+            store_commit_calls: self.store_commit_calls.load(Ordering::Relaxed),
             store_purge_rejections: self.store_purge_rejections.load(Ordering::Relaxed),
             entries,
             memory_bytes,

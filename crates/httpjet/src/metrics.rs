@@ -837,7 +837,7 @@ fn render_cache_entries(state: &ServerState) -> String {
         s.expired_misses,
     ));
     out.push_str(&format!(
-        "health: hits={} misses={} stores={} purges={} store_purge_rejects={} disk_read_err={} disk_write_err={} disk_full_err={} meta_decode_err={} key_id_collisions={} poisoned_locks={}\n",
+        "health: hits={} misses={} stores={} purges={} store_purge_rejects={} disk_read_err={} disk_write_err={} disk_full_err={} meta_decode_err={} key_id_collisions={} poisoned_locks={} store_commit_hold_us={} store_commit_calls={}\n",
         s.hits,
         s.misses,
         s.stores,
@@ -848,7 +848,9 @@ fn render_cache_entries(state: &ServerState) -> String {
         s.disk_full_errors,
         s.meta_decode_errors,
         s.key_id_collisions,
-        s.poisoned_locks
+        s.poisoned_locks,
+        s.store_commit_hold_us,
+        s.store_commit_calls
     ));
     out.push_str(&format!(
         "capsule: dedicated_stores={} hits_dedicated={} hits_public_fallback={} misses={} disk_evictions={}\n",

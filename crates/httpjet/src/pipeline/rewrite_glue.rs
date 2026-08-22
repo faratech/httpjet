@@ -18,6 +18,12 @@ use http::Uri;
 
 use crate::state::ServerState;
 
+/// Process-start instant anchoring [`RewriteOutcomeCache::last_prune`] millis.
+fn prune_epoch() -> &'static std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum RwResult {
     Proxy {
@@ -97,9 +103,12 @@ pub(crate) struct RewriteOutcomeCache {
     /// are never removed (TTL expiry replaces in place), so a counter bumped on
     /// new-key insert is exact up to insert races.
     count: AtomicUsize,
-    /// (L3) Last time `prune_expired` ran. Gates the O(N) sweep so a flood of distinct new keys
-    /// at the cap triggers a full-map prune at most once per TTL instead of on every insert.
-    last_prune: std::sync::Mutex<Instant>,
+    /// (L3) Last time `prune_expired` ran, in millis since the process-start epoch
+    /// ([`prune_epoch`]). Gates the O(N) sweep so a flood of distinct new keys at the
+    /// cap triggers a full-map prune at most once per TTL instead of on every insert.
+    /// An atomic (not a Mutex): the gate is checked on the REQUEST path at cap, and a
+    /// global lock there serializes every worker under a crawler flood.
+    last_prune: std::sync::atomic::AtomicU64,
 }
 
 impl RewriteOutcomeCache {
@@ -109,7 +118,7 @@ impl RewriteOutcomeCache {
             ttl,
             cap: 65_536,
             count: AtomicUsize::new(0),
-            last_prune: std::sync::Mutex::new(Instant::now()),
+            last_prune: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -120,7 +129,7 @@ impl RewriteOutcomeCache {
             ttl,
             cap,
             count: AtomicUsize::new(0),
-            last_prune: std::sync::Mutex::new(Instant::now()),
+            last_prune: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -148,7 +157,7 @@ impl RewriteOutcomeCache {
 
     /// Store `outcome` for `key` (refreshing an existing entry; otherwise only
     /// when below the cap, so memory is bounded without an eviction sweep).
-    fn insert(&self, key: OutcomeKey, outcome: RwResult) {
+    fn insert(self: &Arc<Self>, key: OutcomeKey, outcome: RwResult) {
         if self.ttl.is_zero() {
             return;
         }
@@ -156,7 +165,14 @@ impl RewriteOutcomeCache {
             self.maybe_prune_expired();
         }
         if !self.map.contains_key(&key) && self.count.load(Ordering::Relaxed) >= self.cap {
-            return;
+            // The triggered sweep is asynchronous; if it hasn't freed a slot for
+            // THIS insert yet, prune synchronously here rather than dropping the
+            // entry (the pre-async behavior). The CAS gate makes this a once-per-
+            // TTL path, so only one request per TTL pays the O(N) walk.
+            self.prune_expired();
+            if self.count.load(Ordering::Relaxed) >= self.cap {
+                return;
+            }
         }
         if self.map.insert(key, (Instant::now(), outcome)).is_none() {
             self.count.fetch_add(1, Ordering::Relaxed);
@@ -165,19 +181,28 @@ impl RewriteOutcomeCache {
 
     /// Run `prune_expired` at most once per TTL (L3). Between sweeps the cap simply keeps
     /// rejecting cold new keys (unchanged behavior), so this only bounds the sweep frequency,
-    /// never correctness. The timestamp is advanced before the sweep so a concurrent burst of
-    /// inserts doesn't each launch their own O(N) prune.
-    fn maybe_prune_expired(&self) {
-        let mut last = self
-            .last_prune
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if last.elapsed() < self.ttl {
+    /// never correctness. The gate is a lock-free CAS on an atomic; the winner hands the
+    /// O(N) sweep to a DETACHED THREAD so no request thread ever iterates the whole map
+    /// while holding DashMap shard locks (a crawler flood at cap must not stall serving).
+    fn maybe_prune_expired(self: &Arc<Self>) {
+        let now = prune_epoch().elapsed().as_millis() as u64;
+        let last = self.last_prune.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < self.ttl.as_millis() as u64 {
             return;
         }
-        *last = Instant::now();
-        drop(last);
-        self.prune_expired();
+        if self
+            .last_prune
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let sweeper = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("rewrite-outcome-prune".into())
+            .spawn(move || sweeper.prune_expired())
+            .map(|_| ())
+            .unwrap_or_else(|_| self.prune_expired());
     }
 
     fn prune_expired(&self) {
@@ -923,7 +948,7 @@ mod tests {
 
     #[test]
     fn outcome_cache_hit_miss_and_disable() {
-        let c = RewriteOutcomeCache::new(DEFAULT_REWRITE_OUTCOME_TTL);
+        let c = Arc::new(RewriteOutcomeCache::new(DEFAULT_REWRITE_OUTCOME_TTL));
         assert!(c.get(&okey("/a")).is_none(), "cold miss");
         c.insert(
             okey("/a"),
@@ -939,7 +964,7 @@ mod tests {
         assert!(c.get(&okey("/b")).is_none());
 
         // ttl=0 disables caching entirely (insert is a no-op, get always misses).
-        let off = RewriteOutcomeCache::new(Duration::ZERO);
+        let off = Arc::new(RewriteOutcomeCache::new(Duration::ZERO));
         off.insert(okey("/a"), RwResult::Forbidden);
         assert!(off.get(&okey("/a")).is_none());
     }
@@ -953,7 +978,7 @@ mod tests {
             key_vars: ua.into(),
             ..okey(path)
         };
-        let c = RewriteOutcomeCache::new(DEFAULT_REWRITE_OUTCOME_TTL);
+        let c = Arc::new(RewriteOutcomeCache::new(DEFAULT_REWRITE_OUTCOME_TTL));
         c.insert(okey_ua("/p", "Googlebot"), RwResult::Forbidden);
         // Same path, different UA fragment -> MISS (no cross-UA bleed).
         assert!(
@@ -969,7 +994,7 @@ mod tests {
 
     #[test]
     fn outcome_cache_respects_ttl_expiry() {
-        let c = RewriteOutcomeCache::new(Duration::from_millis(20));
+        let c = Arc::new(RewriteOutcomeCache::new(Duration::from_millis(20)));
         c.insert(okey("/a"), RwResult::Gone);
         assert!(c.get(&okey("/a")).is_some(), "fresh hit");
         std::thread::sleep(Duration::from_millis(35));
@@ -978,12 +1003,19 @@ mod tests {
 
     #[test]
     fn outcome_cache_prunes_expired_entries_at_cap() {
-        let c = RewriteOutcomeCache::with_cap(Duration::from_millis(20), 2);
+        let c = Arc::new(RewriteOutcomeCache::with_cap(Duration::from_millis(20), 2));
         c.insert(okey("/a"), RwResult::Gone);
         c.insert(okey("/b"), RwResult::Forbidden);
         std::thread::sleep(Duration::from_millis(35));
         c.insert(okey("/c"), RwResult::Gone);
         assert!(matches!(c.get(&okey("/c")), Some(RwResult::Gone)));
+        // The prune now runs on a detached thread; wait briefly for it to land.
+        for _ in 0..200 {
+            if c.get(&okey("/a")).is_none() && c.get(&okey("/b")).is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(c.get(&okey("/a")).is_none());
         assert!(c.get(&okey("/b")).is_none());
     }
