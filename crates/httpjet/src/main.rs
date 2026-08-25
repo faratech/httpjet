@@ -957,6 +957,21 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         let page_cache = if args.page_cache.enabled {
             let cc = &server.cache;
             let store_path = resolve_page_cache_store_path(&args.page_cache.store_path);
+            // (security #260) Integrity key for persisted HJPC containers: a same-uid
+            // writer (compromised lsphp) can no longer forge/relocate entries that the
+            // boot scan adopts. Best-effort — if /run/httpjet is unusable we log loudly
+            // and run untagged rather than refuse to serve.
+            if store_path.is_some() {
+                // Persistent, pre-provisioned (root:0400 nobody) so the tag survives
+                // reboots; uid nobody must read it to tag writes. Same-uid lsphp can
+                // read it too — an accepted residual documented in issue #260 (the
+                // full fix is a dedicated PHP uid).
+                if let Err(e) = hj_pagecache::diskstore::init_integrity_key(
+                    &PathBuf::from("/usr/local/httpjet/conf/.jetcache.key"),
+                ) {
+                    tracing::warn!(error = %e, "jetcache integrity key unavailable; persisted containers run WITHOUT integrity tags");
+                }
+            }
             let static_caps = hj_cache::CacheCaps::from_tuning(&server.tuning);
             let store_cfg = hj_pagecache::StoreConfig {
                 max_mem_bytes: args.page_cache.mem,

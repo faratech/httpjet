@@ -403,6 +403,27 @@ fn build_deny_globs(dirs: &[String]) -> GlobSet {
     add_glob_ci(&mut builder, "**/.ht*");
     add_glob_ci(&mut builder, ".ht*");
 
+    // (security #262) Credential/config file classes that must never be served even
+    // when an app drops them inside a docroot without its own protection. Same
+    // basename-matched, any-depth, case-insensitive treatment as the `.ht*` family.
+    add_glob_ci(&mut builder, "**/.env");
+    add_glob_ci(&mut builder, ".env");
+    add_glob_ci(&mut builder, "**/*.pem");
+    add_glob_ci(&mut builder, "*.pem");
+    add_glob_ci(&mut builder, "**/*.key");
+    add_glob_ci(&mut builder, "*.key");
+    add_glob_ci(&mut builder, "**/token*.json");
+    add_glob_ci(&mut builder, "token*.json");
+    add_glob_ci(&mut builder, "**/client_secret*.json");
+    add_glob_ci(&mut builder, "client_secret*.json");
+    // Whole-directory classes (basename match on the directory component): the OCI
+    // CLI layout and VCS metadata. `**/.oci/**` covers every path under it at any
+    // depth; `**/.git` alone would miss files INSIDE, hence the recursive form.
+    add_glob_ci(&mut builder, "**/.oci/**");
+    add_glob_ci(&mut builder, ".oci/**");
+    add_glob_ci(&mut builder, "**/.git/**");
+    add_glob_ci(&mut builder, ".git/**");
+
     for raw in dirs {
         let spec = raw.trim();
         if spec.is_empty() {
@@ -926,6 +947,39 @@ mod tests {
         assert!(!acl.deny_dir_match(Path::new("/web/public_html/index.html")));
         assert!(!acl.deny_dir_match(Path::new("/web/public_html/normal.htm")));
         assert!(!acl.deny_dir_match(Path::new("/web/.htfoo/bar.txt")));
+    }
+
+    #[test]
+    fn deny_dir_credential_file_classes_default() {
+        // (security #262) Credential/config classes dropped into a docroot are denied
+        // like the .ht* family: .env anywhere, key/pem material, token/client_secret
+        // JSON, and the .oci / .git directory trees — at any depth, case-insensitively.
+        let acl = AccessControl::from_security(&Security::default());
+        for p in [
+            "/web/stats/.env",
+            "/web/ai/sub/.ENV",
+            "/web/public_html/server.pem",
+            "/web/public_html/deep/host.key",
+            "/web/ai/token.json",
+            "/web/ai/TOKEN2.json",
+            "/web/ai/client_secret.json",
+            "/web/ai/nested/client_secret_app.json",
+            "/web/.oci/config",
+            "/rootish/.git/config",
+            "/web/app/.git/objects/ab/cdef",
+        ] {
+            assert!(acl.deny_dir_match(Path::new(p)), "{p} must be denied");
+        }
+        // Ordinary content is untouched.
+        for p in [
+            "/web/public_html/index.html",
+            "/web/ai/tokens.txt",
+            "/web/public_html/tokenizer.php",
+            "/web/stats/envelope.png",
+            "/web/public_html/keynote.html",
+        ] {
+            assert!(!acl.deny_dir_match(Path::new(p)), "{p} must NOT be denied");
+        }
     }
 
     #[test]

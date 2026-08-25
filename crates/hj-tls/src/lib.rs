@@ -825,14 +825,46 @@ pub fn build_ktls_template(
         cfg, listener,
     )?));
     let resolver = Arc::new(ReloadableResolver(cert_swap.clone()));
+    // (security #267) Same rule as the TCP builder: NO session storage on a
+    // client-cert-verifying listener — a resumed handshake reinstates the stored
+    // client-cert chain and defeats the app-layer mTLS gate. kTLS's ticket/sequence
+    // accounting (see `server_config_with_key_log`) is unaffected by leaving the
+    // default (no) storage; there are simply no tickets to emit.
+    let session_storage: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
+        if tls.client_verify != 0 {
+            Arc::new(NoServerSessions)
+        } else {
+            ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE)
+        };
     let template = KtlsConfigTemplate {
         provider,
         verifier,
         resolver,
         alpn: ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect(),
-        session_storage: ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE),
+        session_storage,
     };
     Ok((template, CertReloadHandle(cert_swap)))
+}
+
+/// A `StoresServerSessions` implementation that stores nothing — used instead of
+/// the shared memory cache on client-cert-verifying listeners so resumption is
+/// impossible (see [`build_ktls_template`]).
+#[derive(Debug)]
+struct NoServerSessions;
+
+impl rustls::server::StoresServerSessions for NoServerSessions {
+    fn put(&self, _id: Vec<u8>, _value: Vec<u8>) -> bool {
+        false
+    }
+    fn get(&self, _id: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn take(&self, _id: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn can_cache(&self) -> bool {
+        false
+    }
 }
 
 /// QUIC/HTTP3 entry point. Like [`build_server_config`] (the TCP entry), uses

@@ -75,7 +75,7 @@ pub(super) fn split_script_path(
         hj_rewrite::php_handler_forced(chain, url, base)
     };
 
-    resolve_script(
+    let resolved = resolve_script(
         &ctx.vhost.doc_root,
         path,
         &php_suffixes,
@@ -89,7 +89,24 @@ pub(super) fn split_script_path(
         },
         force_active,
         &force_php,
-    )
+    )?;
+    // (security #266) The symlink policy must hold on the PHP routing path too, not
+    // just hj-static's file serving: when this vhost does not follow symlinks, a
+    // chosen script that resolves (through symlinks) outside the docroot is refused
+    // — one canonicalize on the FINAL candidate only, so the hot path pays nothing
+    // for allow_symlink vhosts or non-PHP requests.
+    if !ctx.vhost.allow_symbol_link {
+        let doc_canon = std::fs::canonicalize(&ctx.vhost.doc_root).ok()?;
+        let script_canon = std::fs::canonicalize(&resolved.0).ok()?;
+        if !script_canon.starts_with(&doc_canon) {
+            tracing::debug!(
+                script = %resolved.0.display(),
+                "php dir-index/script candidate escapes docroot via symlink; refusing"
+            );
+            return None;
+        }
+    }
+    Some(resolved)
 }
 
 /// Pure core of [`split_script_path`]: independent of `ServerState`/`ReqCtx` so it

@@ -488,26 +488,34 @@ fn record_fast_serve(
         remote_user: None,
         request_id: Some(ctx.request_id.to_string()),
     };
-    // (#248) LSWS `logHeaders`: a vhost that opts in gets its request headers
-    // appended as a bounded, CRLF-sanitized continuation line after the record.
-    if vhost_log_headers != 0 {
-        log.log_line(render_request_headers(req));
-    }
-    log_access(log, resp, record)
+    // (#248 + #261) LSWS `logHeaders`: a vhost that opts in gets its request headers
+    // as a redacted continuation line carried in the SAME channel message as the
+    // record (can never mis-align), with credential-class values hashed.
+    let headers_extra = (vhost_log_headers != 0).then(|| render_request_headers(req));
+    log_access(log, resp, record, headers_extra)
+}
+
+/// Request headers whose VALUES are credentials — captured only as a salted-length +
+/// short hash so correlation survives but a reader of the log file never sees a live
+/// session token (security #261: the vhost log is readable by the same uid PHP runs as).
+fn header_value_is_credential(name: &str) -> bool {
+    matches!(
+        name,
+        "cookie" | "authorization" | "proxy-authorization" | "x-wf-capsule"
+    )
 }
 
 /// (#248) Render the request's headers for the per-vhost `logHeaders` line: one
 /// line, CRLF/NUL-escaped (the access file is line-oriented — raw CR/LF would let
-/// a client forge extra "records"), capped at 4 KiB.
+/// a client forge extra "records"), capped at 4 KiB. Credential-class values are
+/// replaced by `<len>:<sha256[:12]>` (see [`header_value_is_credential`]).
 fn render_request_headers(req: &hj_core::Request) -> String {
+    use std::fmt::Write as _;
     const CAP: usize = 4 * 1024;
     let mut line = String::with_capacity(256);
     line.push_str("+headers ");
     for (n, v) in req.headers() {
         if line.len() >= CAP {
-            break;
-        }
-        if line.len() + n.as_str().len() + v.len() + 2 > CAP {
             break;
         }
         let ok_name = n
@@ -517,14 +525,28 @@ fn render_request_headers(req: &hj_core::Request) -> String {
         if !ok_name {
             continue;
         }
+        if line.len() + n.as_str().len() + v.len() + 2 > CAP {
+            break;
+        }
         line.push_str(n.as_str());
         line.push('=');
-        for &b in v.as_bytes() {
-            match b {
-                b'\r' => line.push_str("%0D"),
-                b'\n' => line.push_str("%0A"),
-                0..=0x1F | 0x7F => {}
-                _ => line.push(b as char),
+        if header_value_is_credential(n.as_str()) {
+            // <len>:<first 12 hex of sha256> — enough to correlate identical
+            // tokens across lines, useless for replay.
+            let digest = <sha2::Sha256 as sha2::Digest>::digest(v.as_bytes());
+            let mut hex = String::with_capacity(24);
+            for b in &digest[..6] {
+                let _ = write!(hex, "{b:02x}");
+            }
+            let _ = write!(line, "{}:{hex}", v.len());
+        } else {
+            for &b in v.as_bytes() {
+                match b {
+                    b'\r' => line.push_str("%0D"),
+                    b'\n' => line.push_str("%0A"),
+                    0..=0x1F | 0x7F => {}
+                    _ => line.push(b as char),
+                }
             }
         }
         line.push(';');
@@ -751,7 +773,7 @@ pub async fn handle(
                     // even a :80 mTLS-bounce probe is joinable across the logs.
                     request_id: Some(hj_core::reqid::next().to_string()),
                 };
-                resp = log_access(log, resp, record);
+                resp = log_access(log, resp, record, None);
             }
             // Mirror the main response funnel (see below): record this 301 in the
             // per-protocol/status/latency telemetry too, not just `requests_total`
@@ -938,7 +960,7 @@ pub async fn handle(
         if let Some((errlog, line)) = err_line {
             errlog.log_line(line);
         }
-        resp = log_access(log, resp, record);
+        resp = log_access(log, resp, record, None);
     }
 
     resp
@@ -960,10 +982,11 @@ fn log_access(
     log: &Arc<hj_log::AccessLogger>,
     resp: Response,
     mut record: hj_log::AccessRecord,
+    extra: Option<String>,
 ) -> Response {
     if let Some(len) = resp.body().content_length() {
         record.bytes = len;
-        log.log(record);
+        log.log_with_extra(record, extra);
         return resp;
     }
     let log = log.clone();
@@ -971,12 +994,14 @@ fn log_access(
     let body = match body {
         Body::Stream(inner) => hj_core::CountingBody::wrap(inner, move |n| {
             record.bytes = n;
-            log.log(record);
+            // `extra` moves with the record: the +headers continuation stays glued to
+            // its line even when logging is deferred to stream end.
+            log.log_with_extra(record, extra);
         }),
         // content_length() is None only for Body::Stream; this arm can't run today
         // but keeps a future Body variant from silently logging a wrong size.
         other => {
-            log.log(record);
+            log.log_with_extra(record, extra);
             other
         }
     };
@@ -1399,10 +1424,18 @@ async fn dispatch(
     // value; dropped unused when the cache is off (cache_host stays empty as before).
     let cache_host = if cache_on { req_host } else { String::new() };
     let cache_cookie = if cache_on {
-        req.headers()
-            .get(http::header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
+        // (security #267) Join EVERY Cookie line with ", " before classification —
+        // exactly how PHP/lsphp reassembles multi-line Cookie headers. Reading only
+        // the first line let a request present as guest to the cache tier while PHP
+        // saw the logged-in cookie on a second line (tier desync).
+        let joined = req
+            .headers()
+            .get_all(http::header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join(", ");
+        (!joined.is_empty()).then_some(joined)
     } else {
         None
     };
@@ -2044,7 +2077,22 @@ fn allowed_script_target(acl: &hj_acl::AccessControl, script: &Path) -> Option<P
 }
 
 fn opened_target_path(path: &Path) -> std::io::Result<PathBuf> {
-    let file = std::fs::File::open(path)?;
+    // (security #266) NONBLOCK + regular-file check: `path` is attacker-nameable
+    // (.htaccess-derived script target), so a planted FIFO must fail fast here
+    // instead of parking the executor thread inside open(2) — same treatment as
+    // hj-static's open_beneath.
+    let file = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let meta = rustix::fs::fstat(&file).map_err(std::io::Error::from)?;
+    // S_IFMT type bits: 0100000 = regular file (Linux).
+    const S_IFREG: u32 = 0o100000;
+    if meta.st_mode & 0o170000 != S_IFREG {
+        return Err(std::io::Error::from(rustix::io::Errno::NXIO));
+    }
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -2052,6 +2100,7 @@ fn opened_target_path(path: &Path) -> std::io::Result<PathBuf> {
             return Ok(target);
         }
     }
+    drop(file);
     path.canonicalize()
 }
 
@@ -2184,13 +2233,37 @@ pub(super) async fn run_handler<H: Handler>(h: &H, ctx: &mut ReqCtx, req: Reques
 /// must stay reachable over plaintext for certificate issuance), otherwise the
 /// `https://host/path[?query]` location to 301-redirect to. Pure for testing.
 fn mtls_https_redirect_target(host: &str, path: &str, query: Option<&str>) -> Option<String> {
-    if path.starts_with("/.well-known/acme-challenge/") {
+    // (security #259) The ACME http-01 exemption applies ONLY when the path, AFTER the
+    // same dot-segment normalization dispatch() performs, is exactly
+    // /.well-known/acme-challenge/<token> with a single RFC 8555 token segment. The old
+    // RAW-prefix check combined with dispatch's later normalization let
+    // /acme-challenge/x/../../../threads serve backend content over plaintext :80,
+    // bypassing the mTLS trust boundary (and every Cloudflare control) for all vhosts.
+    if acme_challenge_token(path).is_some() {
         return None;
     }
     Some(match query {
         Some(q) if !q.is_empty() => format!("https://{host}{path}?{q}"),
         _ => format!("https://{host}{path}"),
     })
+}
+
+/// The ACME challenge token iff `path` normalizes to exactly one token under
+/// /.well-known/acme-challenge/ — else None (the caller must redirect).
+fn acme_challenge_token(path: &str) -> Option<String> {
+    let rest = normalized_request_path(path)
+        .strip_prefix("/.well-known/acme-challenge/")?
+        .to_string();
+    if rest.is_empty()
+        || rest.contains('/')
+        || rest.starts_with('.')
+        || !rest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(rest)
 }
 
 /// (#2) Whether the mTLS trust-boundary gate should force a plaintext request to
@@ -3176,6 +3249,62 @@ mod tests {
                 None
             ),
             None
+        );
+    }
+
+    #[test]
+    fn mtls_acme_exemption_confined_to_normalized_single_token() {
+        // (security #259) The exemption is decided on the NORMALIZED path with a strict
+        // single-token shape: traversal that would escape the prefix after dispatch's
+        // dot-segment collapse must REDIRECT (Some), never serve over plaintext.
+        for escape in [
+            "/.well-known/acme-challenge/x/../../../threads",
+            "/.well-known/acme-challenge/../index.php",
+            "/.well-known/acme-challenge/%2e%2e%2findex.php",
+            "/.well-known/acme-challenge/a/b",
+            "/.well-known/acme-challenge/.hidden",
+            "/.well-known/acme-challenge/",
+            "/.well-known/acme-challenge/token/../../admin",
+        ] {
+            assert!(
+                mtls_https_redirect_target("forum.example", escape, None).is_some(),
+                "traversal shape {escape} must not be exempt from the mTLS gate"
+            );
+        }
+        // Legit tokens still exempt.
+        assert!(acme_challenge_token("/.well-known/acme-challenge/t0kEn-_9").is_some());
+    }
+
+    #[test]
+    fn logheaders_redacts_credential_values() {
+        // (security #261) Credential-class header VALUES must never reach the log
+        // file verbatim — only <len>:<sha256[:12]>. Ordinary headers stay intact.
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("cookie", "xf_session=SECRETTOKEN123; xf_user=7")
+            .header("authorization", "Bearer sk-supersecret")
+            .header("user-agent", "TestAgent/1.0")
+            .body(hj_core::empty_incoming())
+            .unwrap();
+        let line = render_request_headers(&req);
+        assert!(
+            !line.contains("SECRETTOKEN123"),
+            "raw cookie leaked: {line}"
+        );
+        assert!(!line.contains("sk-supersecret"), "raw authorization leaked");
+        assert!(line.contains("user-agent=TestAgent/1.0"), "{line}");
+        let cookie_val = "xf_session=SECRETTOKEN123; xf_user=7";
+        assert!(
+            line.contains(&format!("cookie={}:", cookie_val.len())),
+            "cookie value must be replaced by len:hash, got {line}"
+        );
+        let authz = line.split("authorization=").nth(1).unwrap_or("");
+        let hex = authz.split(';').next().unwrap_or("").split(':').nth(1);
+        assert_eq!(
+            hex.map(|h| h.len()),
+            Some(12),
+            "hash truncated to 12 hex chars"
         );
     }
 

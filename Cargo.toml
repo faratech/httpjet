@@ -22,6 +22,8 @@ homepage = "https://github.com/faratech/httpjet"
 [workspace.dependencies]
 # internal crates
 hj-config = { path = "crates/hj-config" }
+sha2 = "0.10"
+hmac = "0.12"
 hj-core = { path = "crates/hj-core" }
 hj-tls = { path = "crates/hj-tls" }
 hj-http = { path = "crates/hj-http" }

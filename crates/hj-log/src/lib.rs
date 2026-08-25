@@ -307,7 +307,10 @@ enum Msg {
     /// An access record rendered by the **writer task** (off the request path).
     /// Boxed so this variant doesn't bloat every `Line`/error-log node to the
     /// record's ~220 bytes (and trip clippy's `large_enum_variant`).
-    Record(Box<AccessRecord>, LogFormat),
+    /// The optional third element is a continuation line emitted IMMEDIATELY after
+    /// the record (#248 logHeaders): same channel message, so it can never mis-align
+    /// with its record under load.
+    Record(Box<AccessRecord>, LogFormat, Option<String>),
     /// Close and re-open the underlying file (logrotate / SIGUSR1).
     Reopen,
     /// Flush and shut down; the writer replies on the oneshot.
@@ -367,10 +370,16 @@ impl AccessLogger {
     /// CLF-timestamp + `format!` + escape work stays off the request hot path; the
     /// caller only boxes the record and does a channel send.
     pub fn log(&self, record: AccessRecord) {
+        self.log_with_extra(record, None);
+    }
+
+    /// Queue a record plus an optional continuation line emitted immediately after
+    /// it (#248 logHeaders) — one channel message, so the pair can never mis-align.
+    pub fn log_with_extra(&self, record: AccessRecord, extra: Option<String>) {
         send_or_warn(
             &self.tx,
             &self.state,
-            Msg::Record(Box::new(record), self.format),
+            Msg::Record(Box::new(record), self.format, extra),
             "access-log",
         );
     }

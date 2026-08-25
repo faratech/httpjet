@@ -251,9 +251,14 @@ pub async fn run(cfg: RollConfig, mut rx: mpsc::UnboundedReceiver<Msg>, state: c
                     depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     Some(line)
                 }
-                Some(Msg::Record(record, format)) => {
+                Some(Msg::Record(record, format, extra)) => {
                     depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    Some(record.render(format))
+                    match extra {
+                        // Continuation rides in the SAME message as its record so the
+                        // pair is always adjacent and ordered in the file.
+                        Some(line) => Some(format!("{}\n{line}", record.render(format))),
+                        None => Some(record.render(format)),
+                    }
                 }
                 Some(Msg::Reopen) => {
                     if let Some(w) = writer.as_mut() {
@@ -415,7 +420,7 @@ mod tests {
             request_id: None,
         };
         // The line is rendered by the writer task from the structured record.
-        tx.send(Msg::Record(Box::new(record), LogFormat::Combined))
+        tx.send(Msg::Record(Box::new(record), LogFormat::Combined, None))
             .unwrap();
         shutdown(&tx).await;
         h.await.unwrap();

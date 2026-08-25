@@ -14,6 +14,8 @@ dashmap = { workspace = true }
 hashbrown = { workspace = true }
 tracing = { workspace = true }
 zstd = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
 # The page-cache index is the shared `hj_cache::sharded::ShardedCache` byte-weighted LRU
 # primitive (the file cache uses it too); the page-specific teardown side-effects
 # (tmpfs-unlink + hot-drop + tag-GC) ride the `OnEvict` hook. `hj-cache` does NOT depend on

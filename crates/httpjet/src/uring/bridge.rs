@@ -128,6 +128,12 @@ const STREAM_CHANNEL_DEPTH: usize = 8;
 /// creating an unbounded number of pipeline futures.
 pub(crate) const MAX_IN_FLIGHT_REQUESTS: usize = 2048;
 
+/// (security #263/M-2) Upper bound on how long a request waits for a bridge
+/// admission slot before being shed with 503. Generous enough that a genuinely
+/// busy server queues briefly; short enough that a slow-stream flood cannot park
+/// unbounded numbers of waiters.
+const BRIDGE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub(crate) fn capacity_for_connection_limit(max_connections: u32) -> usize {
     match max_connections {
         0 => MAX_IN_FLIGHT_REQUESTS,
@@ -281,7 +287,24 @@ impl Bridge {
     /// Send `req` (+ its connection context) to the tokio side-runtime and await
     /// the buffered response. `None` if the side-runtime is gone.
     pub(crate) async fn dispatch(&self, req: Request, ctx: BridgeCtx) -> Option<BridgeResp> {
-        let permit = self.admission.acquire().await;
+        // (security #263/M-2) Bound the WAIT for admission. A flood of slow streaming
+        // responses otherwise parks every new request on this gate forever — each
+        // waiter holds a monoio task + transport buffers while slots drain at the
+        // upstream's pace. Try non-blocking first (the common case pays nothing),
+        // then wait at most [`BRIDGE_ADMISSION_WAIT`] before shedding 503.
+        let permit = match self.admission.try_acquire() {
+            Some(p) => p,
+            None => {
+                let wait = async { self.admission.acquire().await };
+                tokio::select! {
+                    p = wait => p,
+                    _ = tokio::time::sleep(BRIDGE_ADMISSION_WAIT) => {
+                        tracing::debug!("bridge admission wait exceeded; shedding request");
+                        return Some(service_unavailable_resp());
+                    }
+                }
+            }
+        };
         let (rtx, rrx) = oneshot::channel();
         let cancel = CancellationToken::new();
         let mut cancel_on_drop = CancelOnDrop::new(cancel.clone());
@@ -418,6 +441,16 @@ pub(crate) fn bad_gateway() -> BridgeResp {
         status: http::StatusCode::BAD_GATEWAY,
         headers: http::HeaderMap::new(),
         body: BridgeBody::Full(Bytes::from_static(b"upstream body truncated\n")),
+    }
+}
+
+/// (security #263/M-2) Shed with 503 when admission can't be obtained in time —
+/// server capacity, not a client error.
+pub(crate) fn service_unavailable_resp() -> BridgeResp {
+    BridgeResp {
+        status: http::StatusCode::SERVICE_UNAVAILABLE,
+        headers: http::HeaderMap::new(),
+        body: BridgeBody::Full(Bytes::from_static(b"server busy\n")),
     }
 }
 

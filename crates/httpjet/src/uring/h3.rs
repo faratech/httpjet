@@ -262,6 +262,13 @@ struct H3State {
     /// frames may arrive across several datagrams); drained + handled on stream fin.
     req_buf: std::collections::HashMap<StreamId, Vec<u8>>,
     req_frames: std::collections::HashMap<StreamId, H3FrameCounter>,
+    /// (security #263) Server-wide buffered-body budget shared with H1/H2/LSAPI,
+    /// installed by the connection driver. Accumulated request bytes reserve
+    /// against it so pre-dispatch buffering stays server-bounded.
+    body_budget: Option<std::sync::Arc<hj_core::budget::BodyBufferBudget>>,
+    /// Per-stream reservation outstanding against `body_budget`; released exactly
+    /// when the stream's buffer is reclaimed (`reclaim_request`/dispatch).
+    budget_charged: std::collections::HashMap<StreamId, u64>,
     /// Every accepted peer unidirectional stream remains here until FIN/reset. HTTP/3
     /// control and QPACK streams are critical and must be continuously drained; accepting
     /// and reading them once loses split stream-type/SETTINGS delivery and hides closure.
@@ -687,9 +694,18 @@ where
 /// returning whatever was buffered. Used when a stream is gone (reset/closed),
 /// oversize, or fully received — every removal from `requests` goes through here so a
 /// stream can never be dropped from one map but left in the other.
+fn release_stream_budget(st: &mut H3State, id: StreamId) {
+    if let Some(n) = st.budget_charged.remove(&id) {
+        if let Some(b) = &st.body_budget {
+            b.release(n);
+        }
+    }
+}
+
 fn reclaim_request(st: &mut H3State, id: StreamId) -> Vec<u8> {
     st.requests.remove(&id);
     st.req_frames.remove(&id);
+    release_stream_budget(st, id);
     let bytes = st.req_buf.remove(&id).unwrap_or_default();
     st.total_req_bytes
         .set(st.total_req_bytes.get().saturating_sub(bytes.len()));
@@ -699,6 +715,7 @@ fn reclaim_request(st: &mut H3State, id: StreamId) -> Vec<u8> {
 fn take_request_for_dispatch(st: &mut H3State, id: StreamId) -> Vec<u8> {
     st.requests.remove(&id);
     st.req_frames.remove(&id);
+    release_stream_budget(st, id);
     st.req_buf.remove(&id).unwrap_or_default()
 }
 
@@ -847,6 +864,16 @@ fn append_request_bytes(
         .entry(id)
         .or_default()
         .consume(bytes, limits)?;
+    // (security #263) Reserve against the server-wide budget BEFORE extending, so
+    // pre-dispatch accumulation is bounded by the same cap as H1/H2/LSAPI. The
+    // reservation is released when the stream's buffer is reclaimed.
+    if let Some(budget) = st.body_budget.clone() {
+        if budget.try_acquire(bytes.len() as u64) {
+            *st.budget_charged.entry(id).or_insert(0) += bytes.len() as u64;
+        } else {
+            return Err(RequestFrameError::Limit);
+        }
+    }
     let buffer = st.req_buf.entry(id).or_default();
     buffer.extend_from_slice(bytes);
     st.total_req_bytes.set(total);
@@ -2242,6 +2269,7 @@ async fn recv_drain(
                                         H3State {
                                             _connection_permit: Some(permit),
                                             epoch: *epoch_ctr,
+                                            body_budget: Some(runtime.body_budget.clone()),
                                             ..Default::default()
                                         },
                                     );

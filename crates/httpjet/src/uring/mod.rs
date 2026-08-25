@@ -1106,17 +1106,35 @@ async fn handle_h1_bridged<S>(
                     write_status_close(&mut stream, 413, "Payload Too Large").await;
                     return;
                 }
-                if content_length > 0
-                    && !body_lease
-                        .get_or_insert_with(|| {
-                            hj_core::budget::BodyBufferLease::new(state.body_budget.clone())
-                        })
-                        .reserve(content_length as u64)
-                {
-                    // Server capacity, not client error — same status collect_to_cap uses.
-                    tracing::debug!(%ctx.peer, "uring h1: body buffer budget exhausted");
-                    write_status_close(&mut stream, 503, "Service Unavailable").await;
-                    return;
+                // (security #263) Reserve INCREMENTALLY: only the first 64 KiB is
+                // committed before any byte arrives. Reserving the whole declared
+                // length up front let ~6 slow connections pin the entire server-wide
+                // budget and 503 every POST/upload server-wide.
+                const UPFRONT_RESERVE: u64 = 64 * 1024;
+                let mut reserved: u64 = 0;
+                let mut ensure_reserved =
+                    |lease: &mut Option<hj_core::budget::BodyBufferLease>, buffered: u64| -> bool {
+                        if buffered <= reserved {
+                            return true;
+                        }
+                        let ok = lease
+                            .get_or_insert_with(|| {
+                                hj_core::budget::BodyBufferLease::new(state.body_budget.clone())
+                            })
+                            .reserve(buffered - reserved);
+                        if ok {
+                            reserved = buffered;
+                        }
+                        ok
+                    };
+                if content_length > 0 {
+                    let upfront = (content_length as u64).min(UPFRONT_RESERVE);
+                    if !ensure_reserved(&mut body_lease, upfront) {
+                        // Server capacity, not client error — same status collect_to_cap uses.
+                        tracing::debug!(%ctx.peer, "uring h1: body buffer budget exhausted");
+                        write_status_close(&mut stream, 503, "Service Unavailable").await;
+                        return;
+                    }
                 }
                 let total = head_len.saturating_add(content_length);
                 // Send the interim 100 only if we still need to wait for body bytes (a
@@ -1126,7 +1144,20 @@ async fn handle_h1_bridged<S>(
                 }
                 while acc.len() < total {
                     match read_timeout(&mut stream, header_read_timeout).await {
-                        Ok(chunk) if !chunk.is_empty() => acc.extend_from_slice(&chunk),
+                        Ok(chunk) if !chunk.is_empty() => {
+                            acc.extend_from_slice(&chunk);
+                            // Top the reservation up to the bytes actually buffered.
+                            let buffered =
+                                (acc.len().saturating_sub(head_len)).min(content_length) as u64;
+                            if !ensure_reserved(&mut body_lease, buffered) {
+                                tracing::debug!(
+                                    %ctx.peer,
+                                    "uring h1: body buffer budget exhausted mid-body"
+                                );
+                                write_status_close(&mut stream, 503, "Service Unavailable").await;
+                                return;
+                            }
+                        }
                         _ => return,
                     }
                 }

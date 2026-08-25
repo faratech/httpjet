@@ -29,6 +29,7 @@ allocount = []
 ktls = ["dep:ktls-sys", "dep:nix", "dep:aws-lc-rs"]
 
 [dependencies]
+sha2 = { workspace = true }
 # Optional: in-process sampling profiler → raw pprof protobuf (gated by `profiling`).
 # Rendering is intentionally left to `go tool pprof` or another external viewer,
 # keeping the CDDL-licensed inferno renderer out of httpjet's dependency graph.

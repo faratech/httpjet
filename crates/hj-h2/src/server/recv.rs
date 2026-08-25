@@ -700,6 +700,11 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
     let is_trailers = st.headers_done;
     let mut seen_regular = false;
     let mut malformed = false;
+    // (security #264) Track the regular `host` field: a second line is malformed
+    // (mirrors the H1 dup-Host reject) and a host disagreeing with :authority is
+    // malformed per RFC 9113 §8.3.1 — build_request REPLACES Host with :authority,
+    // so forwarding both verbatim would inject a second HTTP_HOST value downstream.
+    let mut host_value: Option<http::HeaderValue> = None;
     let mut seen = [false; 4]; // :method, :scheme, :path, :authority
     let ok = dec
         .decode(block, |name, value| {
@@ -785,16 +790,25 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
                         malformed = true; // §8.1.2.2: TE may only be "trailers"
                         return;
                     }
-                    "content-length" => match value.parse::<u64>() {
-                        // A second, conflicting content-length is malformed (§8.1.2.6).
-                        Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
-                            st.content_length = Some(cl)
-                        }
-                        _ => {
+                    "content-length" => {
+                        // (security #264) Digit-only, mirroring hj-core/H1's #232 strict
+                        // resolver: Rust's unsigned parse() accepts a leading '+', which
+                        // H1/H3 reject for the same bytes — a per-protocol divergence.
+                        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                             malformed = true;
                             return;
                         }
-                    },
+                        match value.parse::<u64>() {
+                            // A second, conflicting content-length is malformed (§8.1.2.6).
+                            Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
+                                st.content_length = Some(cl)
+                            }
+                            _ => {
+                                malformed = true;
+                                return;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 // §8.2.1 (RFC 9113): a field name/value that fails validation makes the message
@@ -811,6 +825,13 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
                     http::HeaderValue::from_str(value),
                 ) {
                     (Ok(n), Ok(v)) if !edge_ws => {
+                        if n == http::header::HOST {
+                            if host_value.is_some() {
+                                malformed = true; // duplicate Host line
+                                return;
+                            }
+                            host_value = Some(v.clone());
+                        }
                         st.headers.append(n, v);
                     }
                     _ => malformed = true,
@@ -828,6 +849,14 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
         // Required request pseudo-headers (§8.1.2.3).
         if !seen[0] || !seen[1] || !seen[2] {
             return Decoded::Malformed;
+        }
+        // (security #264) :authority + Host must agree when both are present
+        // (RFC 9113 §8.3.1); build_request replaces Host with :authority, so a
+        // disagreeing pair would smuggle two different hosts downstream.
+        if let (Some(a), Some(h)) = (&st.authority, &host_value) {
+            if a.as_bytes() != h.as_bytes() {
+                return Decoded::Malformed;
+            }
         }
         st.headers_done = true;
     }

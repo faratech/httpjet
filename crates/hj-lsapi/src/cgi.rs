@@ -183,25 +183,12 @@ impl<'a> CgiEnvBuilder<'a> {
             push("REQUEST_TIME_FLOAT", format!("{:.6}", since.as_secs_f64()));
         }
 
-        // AUTH_TYPE / REMOTE_USER from the Authorization header.
-        if let Some(auth) = req
-            .headers()
-            .get(http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-        {
-            let (scheme, rest) = match auth.split_once(' ') {
-                Some((s, r)) => (s, r.trim()),
-                None => (auth, ""),
-            };
-            if scheme.eq_ignore_ascii_case("Basic") {
-                push("AUTH_TYPE", "Basic".to_string());
-                if let Some(user) = basic_user(rest) {
-                    push("REMOTE_USER", user);
-                }
-            } else if !scheme.is_empty() {
-                push("AUTH_TYPE", scheme.to_string());
-            }
-        }
+        // (security #269) AUTH_TYPE / REMOTE_USER are SERVER-ASSERTED identity vars.
+        // httpjet has no HTTP authentication module, so echoing the raw client
+        // `Authorization` header into them let ANY unauthenticated request forge
+        // `$_SERVER['REMOTE_USER']` for apps that trust it. They are now emitted only
+        // from an authenticated source: a VERIFIED TLS client certificate (see the
+        // SSL_CLIENT_* block below — apps check `SSL_CLIENT_VERIFY === 'SUCCESS'`).
 
         // TLS / SSL_* vars (present on TLS/QUIC connections).
         if let Some(tls) = &ctx.tls {
@@ -514,56 +501,6 @@ fn host_without_default_port(host: &str, is_tls: bool) -> &str {
     }
 }
 
-/// Decode the username from a `Basic` Authorization credential (base64 of
-/// `user:pass`). Returns the part before the first `:`.
-fn basic_user(b64: &str) -> Option<String> {
-    let decoded = base64_decode(b64.trim())?;
-    let text = String::from_utf8(decoded).ok()?;
-    let user = match text.split_once(':') {
-        Some((user, _)) => user,
-        None => &text,
-    };
-    // REMOTE_USER is the one CGI var sourced from base64-decoded bytes rather than an
-    // http::HeaderValue, so it would otherwise bypass the NUL/CR/LF rejection every other
-    // header-derived var inherits. Refuse any control byte (matches HeaderValue's bar) so an
-    // attacker can't smuggle CR/LF/NUL into $_SERVER['REMOTE_USER'] (log/header injection).
-    if user.bytes().any(|b| b < 0x20 || b == 0x7F) {
-        return None;
-    }
-    Some(user.to_string())
-}
-
-/// Minimal standard-alphabet base64 decoder (no padding required). Returns
-/// `None` on any invalid character.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    fn val(c: u8) -> Option<u8> {
-        match c {
-            b'A'..=b'Z' => Some(c - b'A'),
-            b'a'..=b'z' => Some(c - b'a' + 26),
-            b'0'..=b'9' => Some(c - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for &c in s.as_bytes() {
-        if c == b'=' {
-            break;
-        }
-        let v = val(c)? as u32;
-        acc = (acc << 6) | v;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,17 +518,6 @@ mod tests {
         // Plain host / host:port still work.
         assert_eq!(strip_port("example.com:80"), "example.com");
         assert_eq!(strip_port("example.com"), "example.com");
-    }
-
-    #[test]
-    fn basic_user_rejects_control_bytes() {
-        // REMOTE_USER from base64-decoded Basic creds must reject NUL/CR/LF — it is the one CGI
-        // var not sourced from an http::HeaderValue, so it would otherwise bypass the CR/LF/NUL
-        // sanitation every other header-derived var inherits (log/response-header injection).
-        assert_eq!(basic_user("YWRtaW46c2VjcmV0"), Some("admin".to_string())); // admin:secret
-        assert_eq!(basic_user("anVzdHVzZXI="), Some("justuser".to_string())); // no ':' -> whole text
-        assert_eq!(basic_user("YWRtaW4NCkluamVjdGVkOiAxOnB3"), None); // admin\r\nInjected: 1:pw
-        assert_eq!(basic_user("YWRtaW4Acm9vdDpwdw=="), None); // admin\x00root:pw
     }
 
     use hj_core::Proto;
@@ -694,8 +620,12 @@ mod tests {
         assert_eq!(m["REDIRECT_STATUS"], "200");
         assert_eq!(m["REQUEST_TIME"], "1700000000");
         assert_eq!(m["REQUEST_TIME_FLOAT"], "1700000000.123456");
-        assert_eq!(m["AUTH_TYPE"], "Basic");
-        assert_eq!(m["REMOTE_USER"], "aladdin");
+        // (security #269) AUTH_TYPE/REMOTE_USER are no longer derived from the raw
+        // client Authorization header — they are server-asserted identity vars, and
+        // httpjet has no HTTP authn module. The header stays available as HTTP_AUTHORIZATION.
+        assert!(!m.contains_key("AUTH_TYPE"));
+        assert!(!m.contains_key("REMOTE_USER"));
+        assert_eq!(m["HTTP_AUTHORIZATION"], "Basic YWxhZGRpbjpvcGVuc2VzYW1l");
         assert_eq!(m["CONTENT_TYPE"], "application/x-www-form-urlencoded");
         assert_eq!(m["CONTENT_LENGTH"], "9");
         // HTTP_HOST drops the scheme-default :443 (matches SERVER_NAME + XF boardUrl);
@@ -953,7 +883,8 @@ mod tests {
         let req = http::Request::builder()
             .uri("/secure.php")
             .header("Host", "forum.example")
-            // A non-Basic scheme just sets AUTH_TYPE (no REMOTE_USER).
+            // (security #269) A client-supplied Authorization header must NOT become
+            // AUTH_TYPE/REMOTE_USER anymore.
             .header("Authorization", "Bearer abc.def.ghi")
             .body(empty_incoming())
             .unwrap();
@@ -983,8 +914,8 @@ mod tests {
         assert_eq!(m["SSL_CLIENT_M_SERIAL"], "0A1B2C");
         assert_eq!(m["SSL_CLIENT_V_START"], "Jan  1 00:00:00 2026 GMT");
         assert_eq!(m["SSL_CLIENT_V_END"], "Jan  1 00:00:00 2027 GMT");
-        // Non-Basic auth: AUTH_TYPE is the scheme, no REMOTE_USER.
-        assert_eq!(m["AUTH_TYPE"], "Bearer");
+        // Non-Basic auth: neither var may be forged from the client header.
+        assert!(!m.contains_key("AUTH_TYPE"));
         assert!(!m.contains_key("REMOTE_USER"));
     }
 

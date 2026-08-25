@@ -546,9 +546,21 @@ fn apply_rule(
         subst_target = Some(escaped);
     }
 
-    // `[P]` proxy: substitution is the upstream URL.
+    // `[P]` proxy: substitution is the upstream URL. (security #268) Apache merges
+    // the original query into the proxied target unless the substitution carries its
+    // own `?`; a trailing bare `?` DISCARDS it ([QSD]-style). The old code silently
+    // dropped every inbound query, breaking token-bearing proxied URLs.
     if rule.flags.proxy {
         let target = subst_target.unwrap_or_else(|| state.uri.clone());
+        let effective_query = if rule.flags.qsd { "" } else { &state.query };
+        let target = if effective_query.is_empty()
+            || target.contains('?')
+            || (target.ends_with('?') && !rule.flags.qsa)
+        {
+            target
+        } else {
+            format!("{target}?{effective_query}")
+        };
         return Some(RuleApply::Terminal(RewriteOutcome::Proxy {
             target_url: target,
             env: state.env_vec(),

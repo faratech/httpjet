@@ -36,13 +36,20 @@ use crate::key::PageCacheKey;
 use crate::store::{CachedResponse, FileId, PageScope};
 
 const MAGIC: [u8; 4] = *b"HJPC";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 /// Boot-scan walker thread cap: tmpfs metadata reads parallelize well but the
 /// win flattens past a few cores, and prod boxes share cores with live serving.
 const SCAN_MAX_THREADS: usize = 8;
 /// Fixed header: magic, version, flags, meta_len, body_len, status, reserved,
 /// dict_gen, stored_unix_ms, ttl_ms, swr_ms, sie_ms, private_owner.
-const HEADER_LEN: u64 = 64;
+/// ALL containers (page AND static) carry an 80-byte header: the historical 64
+/// bytes PLUS a 16-byte integrity tag (security #260): HMAC-SHA256(key,
+/// header-fields || meta), truncated. The tag authenticates the identity-bearing
+/// metadata so a same-uid writer cannot forge or relocate entries; body bytes are
+/// bound by the authenticated lengths plus the serve-time identity guard. A
+/// UNIFORM layout keeps every reader/writer/streaming-offset on one constant.
+const HEADER_LEN: u64 = 80;
+const TAG_LEN: usize = 16;
 const FLAG_PRIVATE: u16 = 1 << 0;
 const FLAG_STATIC: u16 = 1 << 1;
 /// Parse-time sanity bounds (the real caps are the store's max_obj_bytes; these
@@ -253,6 +260,9 @@ impl DiskStore {
         header[40..48].copy_from_slice(&ms_u64(entry.swr).to_le_bytes());
         header[48..56].copy_from_slice(&ms_u64(entry.sie).to_le_bytes());
         header[56..64].copy_from_slice(&key.private_owner.to_le_bytes());
+        // (security #260) Integrity tag over the identity-bearing fields + meta.
+        let tag = integrity_tag(&header[..64], &meta);
+        header[64..80].copy_from_slice(&tag);
 
         let write = (|| -> io::Result<()> {
             let mut f = fs::File::create(&tmp_path)?;
@@ -345,6 +355,15 @@ impl DiskStore {
         if HEADER_LEN + meta_len as u64 + body_len as u64 != bytes.len() as u64 {
             return Err(corrupt("HJPC length mismatch"));
         }
+        // (security #260) Adopted blobs must carry a valid integrity tag over their
+        // identity-bearing header fields + meta.
+        if !verify_integrity(
+            &bytes[64..80],
+            &bytes[..64],
+            &bytes[HEADER_LEN as usize..HEADER_LEN as usize + meta_len as usize],
+        ) {
+            return Err(corrupt("HJPC integrity tag mismatch"));
+        }
 
         let hex = format!("{key_hash:016x}");
         let dir = self.root.join(&hex[0..1]).join(&hex[1..2]).join(&hex[2..3]);
@@ -418,6 +437,9 @@ impl DiskStore {
         header[6..8].copy_from_slice(&FLAG_STATIC.to_le_bytes());
         header[8..12].copy_from_slice(&(meta.len() as u32).to_le_bytes());
         header[12..16].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        // (security #260) Same integrity treatment + uniform tag slot as pages.
+        let tag = integrity_tag(&header[..64], &meta);
+        header[64..80].copy_from_slice(&tag);
 
         let write = (|| -> io::Result<()> {
             let mut f = fs::File::create(&tmp_path)?;
@@ -473,7 +495,7 @@ impl DiskStore {
         let file_len = f.metadata()?.len();
         let mut header = [0u8; HEADER_LEN as usize];
         f.read_exact(&mut header)?;
-        let (meta_len, body_len) = validate_header(&header, file_len)?;
+        let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
         if body_len != expected_len {
             return Err(ReadError::Corrupt("body length disagrees with index"));
         }
@@ -492,7 +514,7 @@ impl DiskStore {
         let file_len = f.metadata()?.len();
         let mut header = [0u8; HEADER_LEN as usize];
         f.read_exact(&mut header)?;
-        let (meta_len, body_len) = validate_header(&header, file_len)?;
+        let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
         if body_len != expected_len {
             return Err(ReadError::Corrupt("body length disagrees with index"));
         }
@@ -824,7 +846,7 @@ pub fn read_meta(path: &Path) -> Result<ScannedEntry, ReadError> {
     let file_len = md.len();
     let mut header = [0u8; HEADER_LEN as usize];
     f.read_exact(&mut header)?;
-    let (meta_len, body_len) = validate_header(&header, file_len)?;
+    let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
     let disk_total = allocated_bytes_from_metadata(&md, file_len);
     let flags = u16::from_le_bytes([header[6], header[7]]);
     let status = u16::from_le_bytes([header[16], header[17]]);
@@ -837,6 +859,11 @@ pub fn read_meta(path: &Path) -> Result<ScannedEntry, ReadError> {
 
     let mut meta = vec![0u8; meta_len as usize];
     f.read_exact(&mut meta)?;
+    // (security #260) The identity-bearing meta block must carry a valid integrity
+    // tag; an adopted/forged container without one is corrupt and gets removed.
+    if !verify_integrity(&header[64..80], &header[..64], &meta) {
+        return Err(ReadError::Corrupt("integrity tag mismatch"));
+    }
     let mut c = Cursor { buf: &meta, pos: 0 };
 
     let vhost_id = c.u32()?;
@@ -910,7 +937,7 @@ pub fn read_static_meta(path: &Path) -> Result<ScannedStaticEntry, ReadError> {
     let file_len = md.len();
     let mut header = [0u8; HEADER_LEN as usize];
     f.read_exact(&mut header)?;
-    let (meta_len, body_len) = validate_header(&header, file_len)?;
+    let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
     let disk_total = allocated_bytes_from_metadata(&md, file_len);
     let flags = u16::from_le_bytes([header[6], header[7]]);
     if flags & FLAG_STATIC == 0 {
@@ -919,6 +946,10 @@ pub fn read_static_meta(path: &Path) -> Result<ScannedStaticEntry, ReadError> {
 
     let mut meta = vec![0u8; meta_len as usize];
     f.read_exact(&mut meta)?;
+    // (security #260) Uniform tag location: header[64..80] over [0..64] || meta.
+    if !verify_integrity(&header[64..80], &header[..64], &meta) {
+        return Err(ReadError::Corrupt("integrity tag mismatch"));
+    }
     let mut c = Cursor { buf: &meta, pos: 0 };
 
     let vhost_id = c.u32()?;
@@ -1066,10 +1097,7 @@ fn encode_static_meta(
 }
 
 /// The validation invariant: magic + version + `file size == 64 + meta + body`.
-fn validate_header(
-    header: &[u8; HEADER_LEN as usize],
-    file_len: u64,
-) -> Result<(u32, u32), ReadError> {
+fn validate_header(header: &[u8], hlen: u64, file_len: u64) -> Result<(u32, u32), ReadError> {
     if header[0..4] != MAGIC {
         return Err(ReadError::Corrupt("bad magic"));
     }
@@ -1081,10 +1109,73 @@ fn validate_header(
     if meta_len > MAX_META_LEN || body_len > MAX_BODY_LEN {
         return Err(ReadError::Corrupt("length over format bound"));
     }
-    if file_len != HEADER_LEN + meta_len as u64 + body_len as u64 {
+    if file_len != hlen + meta_len as u64 + body_len as u64 {
         return Err(ReadError::Corrupt("file size disagrees with header"));
     }
     Ok((meta_len, body_len))
+}
+
+/// Process-lifetime integrity key (security #260). Installed once at startup from
+/// a 0600 keyfile; when absent (tests / opt-out) tags are written as ZEROS and
+/// verification is skipped, preserving the old behavior for ephemeral test stores.
+static INTEGRITY_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// Create-or-load the 32-byte jetcache integrity key at `path` (created 0600 from
+/// /dev/urandom). Best-effort: on failure the store runs WITHOUT integrity tags
+/// (zeros) and this returns Err for the caller to log.
+pub fn init_integrity_key(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut key = [0u8; 32];
+    match std::fs::File::open(path) {
+        Ok(mut f) => f.read_exact(&mut key)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut ur = std::fs::File::open("/dev/urandom")?;
+            ur.read_exact(&mut key)?;
+            // Create with a tight mode regardless of umask; the dir may not exist yet.
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            std::fs::write(path, key)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    let _ = INTEGRITY_KEY.set(key);
+    Ok(())
+}
+
+/// Truncated HMAC-SHA256 over (header_fields || meta). Zeros when no key installed.
+fn integrity_tag(prefix: &[u8], meta: &[u8]) -> [u8; TAG_LEN] {
+    let Some(key) = INTEGRITY_KEY.get() else {
+        return [0u8; TAG_LEN];
+    };
+    use hmac::{Mac, SimpleHmac};
+    type HmacSha256 = SimpleHmac<sha2::Sha256>;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key len");
+    mac.update(prefix);
+    mac.update(meta);
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; TAG_LEN];
+    tag.copy_from_slice(&out[..TAG_LEN]);
+    tag
+}
+
+fn verify_integrity(tag: &[u8], prefix: &[u8], meta: &[u8]) -> bool {
+    // No key installed: accept anything (test / ephemeral stores).
+    if INTEGRITY_KEY.get().is_none() {
+        return true;
+    }
+    let expect = integrity_tag(prefix, meta);
+    tag.len() == TAG_LEN
+        && tag
+            .iter()
+            .zip(expect.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
