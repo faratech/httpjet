@@ -428,9 +428,39 @@ impl RuleSet {
             set.cache_key_vars = Vec::new();
             set.assumed_empty_env = Vec::new();
         }
+        // (audit) Does anything read %{THE_REQUEST}? The pipeline only then pays to
+        // attach the verbatim pre-decode target to the rewrite input.
+        set.uses_the_request = rules_reference_the_request(&set.rules);
         set.assign_id();
         Ok(set)
     }
+}
+
+/// True when any rule's substitution, `[E=]` sets, pattern or cond text references
+/// `%{THE_REQUEST}` (audit): lets the pipeline attach the verbatim raw target only
+/// when a ruleset actually reads it.
+fn rules_reference_the_request(rules: &[Rule]) -> bool {
+    fn mentions(s: &str) -> bool {
+        // Case-insensitive: %{THE_REQUEST} / %{the_request}.
+        s.to_ascii_uppercase().contains("%{THE_REQUEST}")
+    }
+    rules.iter().any(|r| {
+        mentions(&r.subst)
+            || mentions(&r.pattern_src)
+            || r.flags
+                .env_sets
+                .iter()
+                .any(|(k, v)| mentions(k) || mentions(v))
+            || r.conds.iter().any(|c| {
+                mentions(&c.test_string)
+                    || match &c.pattern {
+                        CondPattern::Regex(_, s)
+                        | CondPattern::Lexical(_, s)
+                        | CondPattern::Numeric(_, s) => mentions(s),
+                        CondPattern::FileTest(_) => false,
+                    }
+            })
+    })
 }
 
 /// Iterate over logical lines, joining backslash continuations. Yields
@@ -526,22 +556,36 @@ fn parse_cond(rest: &str, line: usize) -> Result<Cond, RewriteError> {
     let test_string = args[0].clone();
     let mut pattern_raw = args[1].clone();
 
-    // (#240) Spaced numeric form: `RewriteCond X -eq 200` — Apache/OLS consume the
-    // operator token then the operand as SEPARATE tokens. Without this branch the
-    // operand landed in the flags position (`parse_cond_flags` silently swallowed
-    // it as an unknown flag) and the comparison ran against "" → 0.
+    // (#240 + residual) Spaced numeric form, optionally NEGATED: both
+    // `RewriteCond X -eq 200` AND `RewriteCond X !-eq 200` consume the operator
+    // token then the operand as SEPARATE tokens (OLS parseCondPattern strips the
+    // '!' first, THEN matches '-eq'). Without this branch the negated variant left
+    // the operand in the flags position (`parse_cond_flags` silently swallowed it)
+    // and the comparison ran against "" → 0 under negation.
     let mut flag_idx = 2;
-    if matches!(pattern_raw.as_str(), "-eq" | "-ne" | "-gt" | "-lt" | "-ge" | "-le") {
+    let negated = pattern_raw.starts_with('!');
+    let bare_op = if negated {
+        &pattern_raw[1..]
+    } else {
+        pattern_raw.as_str()
+    };
+    if matches!(bare_op, "-eq" | "-ne" | "-gt" | "-lt" | "-ge" | "-le") {
         let operand = args.get(2).ok_or_else(|| RewriteError::Malformed {
             line,
             msg: format!(
                 "RewriteCond numeric operator '{}' requires an operand",
-                pattern_raw
+                bare_op
             ),
         })?;
-        // Rejoin as the compact `-eq <operand>` shape classify_cond_pattern already
-        // parses (it strips the 3-char operator and trims the rest).
-        pattern_raw = format!("{} {}", pattern_raw, operand.trim());
+        // Rejoin as the compact `[!]-eq <operand>` shape classify_cond_pattern
+        // already parses (the later strip_prefix('!') removes the negation and
+        // classify strips the 3-char operator, trimming the rest).
+        pattern_raw = format!(
+            "{}{} {}",
+            if negated { "!" } else { "" },
+            bare_op,
+            operand.trim()
+        );
         flag_idx = 3;
     }
 
@@ -753,7 +797,15 @@ fn parse_rule_flags(field: &str) -> RuleFlags {
             // OLS uses strtol; a non-numeric value is a parse error there, but
             // we degrade to 0 (no skip) rather than failing the whole set.
             flags.skip = n.trim().parse().unwrap_or(0);
-        } else if let Some(spec) = tok.strip_prefix("E=").or_else(|| tok.strip_prefix("env=")) {
+        } else if let Some(spec) = tok
+            .strip_prefix("E=")
+            .or_else(|| tok.strip_prefix("e="))
+            .or_else(|| upper.strip_prefix("ENV="))
+        {
+            // (audit) Apache accepts any case for the env-set spelling ([E=], [e=],
+            // [ENV=]); matching only the exact mixed-case forms silently DROPPED a
+            // valid lowercase flag — the rule matched and stopped but never set the
+            // env var its guards depended on.
             if let Some((k, v)) = parse_env_set(spec) {
                 flags.env_sets.push((k, v));
             }

@@ -567,6 +567,18 @@ fn run_rewrite_inner(
         rulesets.push((&ht.rules, per_dir_prefix(&ctx.vhost.doc_root, dir)));
     }
 
+    // (audit) %{THE_REQUEST} must resolve from the VERBATIM pre-decode target.
+    // `req.uri()` still carries the raw percent-encoded bytes — attach them only
+    // when some ruleset actually reads the variable (zero cost otherwise).
+    if rulesets.iter().any(|(rs, _)| rs.uses_the_request) {
+        let raw = req
+            .uri()
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| req.uri().path().to_string());
+        input.raw_request_target = Some(raw);
+    }
+
     let mut merged_env: Vec<(String, String)> = Vec::new();
     for (rs, prefix) in rulesets {
         input.per_directory_prefix = prefix;

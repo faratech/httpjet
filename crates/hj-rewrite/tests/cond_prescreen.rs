@@ -132,10 +132,9 @@ fn spaced_numeric_cond_operand_parses() {
     // as separate tokens. Before the fix the operand was swallowed as an unknown
     // flag and the comparison ran against "" (→ 0), so a TRUE comparison evaluated
     // false and the rule silently never fired.
-    let rs = RuleSet::parse(
-        "RewriteEngine On\nRewriteCond 5 -lt 10\nRewriteRule ^/spaced$ /hit [L]\n",
-    )
-    .expect("parse");
+    let rs =
+        RuleSet::parse("RewriteEngine On\nRewriteCond 5 -lt 10\nRewriteRule ^/spaced$ /hit [L]\n")
+            .expect("parse");
     let input = RewriteInput::new("/spaced".to_string(), "/tmp/doc").method("GET");
     match evaluate(&rs, &input) {
         RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/hit"),
@@ -143,18 +142,34 @@ fn spaced_numeric_cond_operand_parses() {
     }
 
     // Negative control: the same shape with a false comparison stays Unchanged.
+    let rs =
+        RuleSet::parse("RewriteEngine On\nRewriteCond 5 -gt 10\nRewriteRule ^/spaced$ /hit [L]\n")
+            .expect("parse");
+    let input = RewriteInput::new("/spaced".to_string(), "/tmp/doc").method("GET");
+    assert!(matches!(
+        evaluate(&rs, &input),
+        RewriteOutcome::Unchanged { .. }
+    ));
+
+    // (#240 residual) NEGATED spaced form: `!-eq` used to swallow the operand too,
+    // evaluating `X != 0` instead of `X != 200` — with an unset var the intended
+    // TRUE became FALSE, so an [F,L] gate behind it silently never fired.
     let rs = RuleSet::parse(
-        "RewriteEngine On\nRewriteCond 5 -gt 10\nRewriteRule ^/spaced$ /hit [L]\n",
+        "RewriteEngine On\nRewriteCond %{ENV:X} !-eq 200\nRewriteRule ^/neg$ /hit [L]\n",
     )
     .expect("parse");
-    let input = RewriteInput::new("/spaced".to_string(), "/tmp/doc").method("GET");
-    assert!(matches!(evaluate(&rs, &input), RewriteOutcome::Unchanged { .. }));
+    let input = RewriteInput::new("/neg".to_string(), "/tmp/doc").method("GET");
+    // X is unset → "" != 200 → cond TRUE (not-negated sense inverted correctly),
+    // so the rule fires; under the old parse the compare was `"" != 0` → FALSE.
+    match evaluate(&rs, &input) {
+        RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/hit"),
+        other => panic!("negated spaced -eq must fire on empty env, got {other:?}"),
+    }
 
     // Compact single-token form (-lt10) keeps working.
-    let rs = RuleSet::parse(
-        "RewriteEngine On\nRewriteCond 5 -lt10\nRewriteRule ^/spaced$ /hit [L]\n",
-    )
-    .expect("parse");
+    let rs =
+        RuleSet::parse("RewriteEngine On\nRewriteCond 5 -lt10\nRewriteRule ^/spaced$ /hit [L]\n")
+            .expect("parse");
     let input = RewriteInput::new("/spaced".to_string(), "/tmp/doc").method("GET");
     match evaluate(&rs, &input) {
         RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/hit"),

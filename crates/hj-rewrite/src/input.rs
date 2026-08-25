@@ -149,6 +149,12 @@ pub struct RewriteInput<'a> {
     /// `None` for server/vhost-level rules. Example: rules from
     /// `/web/app/sub/.htaccess` with docroot `/web/app` -> `Some("sub/")`.
     pub per_directory_prefix: Option<String>,
+    /// The VERBATIM request target (`path[?query]`, still percent-encoded) as the
+    /// client sent it, attached only when a ruleset reads `%{THE_REQUEST}` (audit:
+    /// the var used to resolve from the DECODED canonical path, so e.g. `/a%2Eb`
+    /// compared unequal where Apache sees `/a%2Eb`). `None` -> falls back to
+    /// `uri`/`query`.
+    pub raw_request_target: Option<String>,
 }
 
 impl<'a> RewriteInput<'a> {
@@ -174,6 +180,7 @@ impl<'a> RewriteInput<'a> {
             env: BTreeMap::new(),
             env_seed: None,
             per_directory_prefix: None,
+            raw_request_target: None,
         }
     }
 
@@ -226,6 +233,13 @@ impl<'a> RewriteInput<'a> {
     }
     /// Builder: set `%{SERVER_PROTOCOL}` / the `THE_REQUEST` version token
     /// (`HTTP/1.1`, `HTTP/2`, `HTTP/3`).
+    /// Attach the verbatim pre-decode request target (path + query as sent).
+    /// Only worth building when the ruleset reads `%{THE_REQUEST}`.
+    pub fn raw_request_target(mut self, t: impl Into<String>) -> Self {
+        self.raw_request_target = Some(t.into());
+        self
+    }
+
     pub fn protocol(mut self, p: impl Into<Cow<'a, str>>) -> Self {
         self.protocol = p.into();
         self

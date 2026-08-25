@@ -30,6 +30,19 @@ pub(super) fn follow_symlink_value(s: &Option<String>) -> bool {
     matches!(s.as_deref().map(str::trim), Some(v) if v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
+/// LSWS tri-state for `<allowSymbolLink>`-class knobs: `Some(explicit)` only when the
+/// tag is PRESENT (`0` → false; `1`/`true` → true; `2` → false per [`follow_symlink_value`]'s
+/// fail-closed #90 mapping); `None` when absent = INHERIT the server-wide default.
+/// The old merge OR-ed this bool into the server value, so an explicit hardening `0`
+/// could never disable following (audit M4).
+pub(super) fn symlink_override(s: &Option<String>) -> Option<bool> {
+    if s.is_some() {
+        Some(follow_symlink_value(s))
+    } else {
+        None
+    }
+}
+
 pub(super) fn u8_of(s: &Option<String>) -> u8 {
     s.as_deref()
         .and_then(|v| v.trim().parse().ok())
@@ -39,6 +52,26 @@ pub(super) fn u8_of(s: &Option<String>) -> u8 {
 pub(super) fn u32_of(s: &Option<String>, default: u32) -> u32 {
     s.as_deref()
         .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// LiteSpeed size literal (`50M`, `2G`, `10K`, bare bytes; trailing `B` allowed).
+/// Unparsable/absent ⇒ `default`.
+pub(super) fn lsws_size(s: &Option<String>, default: u64) -> u64 {
+    let Some(v) = s.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    let (digits, mult) = match v.as_bytes().last() {
+        Some(b'M' | b'm') => (&v[..v.len() - 1], 1u64 << 20),
+        Some(b'G' | b'g') => (&v[..v.len() - 1], 1u64 << 30),
+        Some(b'K' | b'k') => (&v[..v.len() - 1], 1u64 << 10),
+        Some(b'B' | b'b') if v.len() > 1 => (&v[..v.len() - 1], 1u64),
+        _ => (v, 1u64),
+    };
+    digits
+        .trim()
+        .parse::<u64>()
+        .map(|n| n.saturating_mul(mult))
         .unwrap_or(default)
 }
 

@@ -169,7 +169,9 @@ fn private_route(
         Some(p) => p.enable_cache && p.enable_private,
         None => false,
     };
-    if !vhost_private {
+    // (#249) A context-level `<cachePolicy>` disabling PRIVATE caching denies it
+    // for requests under its URI prefix, same as the public pair.
+    if !vhost_private || context_denies_cache(ctx, cc.req_path, true) {
         return PrivateRoute::Bypass;
     }
     match cookie_value(cookie, &cfg.private_session_cookie) {
@@ -263,11 +265,32 @@ fn no_cache_env(ctx: &ReqCtx) -> bool {
 /// "default cache policy" (the server cache module's default — OLS's inherited
 /// behavior) only when `default_vhost_public` is configured. This is the gate-1
 /// that lets a blockless vhost (e.g. moontimenow) cache at all.
-fn vhost_allows_public(ctx: &ReqCtx, store: &hj_pagecache::PageStore) -> bool {
-    match ctx.vhost.cache_policy.as_ref() {
+/// (#249) A CONTEXT-level `<cachePolicy>` that disables public caching forbids
+/// entries under its URI prefix on top of the vhost decision (the live search/ai
+/// proxy contexts declare all six flags 0).
+fn vhost_allows_public(ctx: &ReqCtx, store: &hj_pagecache::PageStore, path: &str) -> bool {
+    let vhost_ok = match ctx.vhost.cache_policy.as_ref() {
         Some(p) => p.enable_cache && p.enable_public,
         None => store.config().is_standards_vhost(&ctx.vhost_name),
-    }
+    };
+    vhost_ok && !context_denies_cache(ctx, path, false)
+}
+
+/// (#249) True when a `<context>` whose `<cachePolicy>` disables caching matches
+/// `path` (segment-boundary match, same matcher as routing). `private=true`
+/// checks the private pair; false the public pair.
+fn context_denies_cache(ctx: &ReqCtx, path: &str, private: bool) -> bool {
+    ctx.vhost.contexts.iter().any(|c| {
+        let Some(p) = c.cache_policy else {
+            return false;
+        };
+        let disabled = if private {
+            !p.enable_private_cache || !p.check_private_cache
+        } else {
+            !p.enable_cache || !p.check_public_cache
+        };
+        disabled && crate::pipeline::context_uri_matches(path, &c.uri)
+    })
 }
 
 /// Collect the chain's `CacheKeyModify` ops into the page-cache key's qs-strip set, in a single
@@ -490,7 +513,7 @@ pub fn cache_lookup(
     }
     // Vhost must opt into (public) caching; the private path carries its own
     // per-vhost `enable_private` gate inside `private_route`.
-    if matches!(route, PrivateRoute::Public) && !vhost_allows_public(ctx, store) {
+    if matches!(route, PrivateRoute::Public) && !vhost_allows_public(ctx, store, req_path) {
         return CacheOutcome::Bypass;
     }
     // Per-request no-cache marker (logged-in / AJAX): always hit the backend.
@@ -1425,7 +1448,7 @@ fn capsule_lookup_allowed(
         // the plain public tier obeys — a vhost (or request) that opted out of public
         // caching must not be cached through the side door.
         && !no_cache_env(ctx)
-        && vhost_allows_public(ctx, store)
+        && vhost_allows_public(ctx, store, cc.req_path)
         && capsule_vhost_allowed(state, ctx)
         && capsule_path_allowed(state, cc.req_path, cc.req_query)
         && capsule_cookie_safe(cc.cookie)
@@ -1461,7 +1484,7 @@ fn capsule_store_allowed(
         // request that produced this response, and the vhost must allow public
         // caching — a capsule shell is a public entry.
         && !no_cache_env(ctx)
-        && vhost_allows_public(ctx, store)
+        && vhost_allows_public(ctx, store, cc.req_path)
         && capsule_vhost_allowed(state, ctx)
         && capsule_path_allowed(state, cc.req_path, cc.req_query)
         && capsule_cookie_safe(cc.cookie)
@@ -1484,14 +1507,22 @@ struct CapsuleControl {
 /// forced SWR window is entry-level and would override these directives for the
 /// plain public entry too — so it must not be injected when they are present.
 fn stored_cc_forbids_stale(headers: &HeaderMap) -> bool {
-    headers.get_all(http::header::CACHE_CONTROL).iter().any(|v| {
-        v.to_str().is_ok_and(|s| {
-            let s = s.to_ascii_lowercase();
-            ["must-revalidate", "proxy-revalidate", "no-store", "no-cache"]
+    headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .any(|v| {
+            v.to_str().is_ok_and(|s| {
+                let s = s.to_ascii_lowercase();
+                [
+                    "must-revalidate",
+                    "proxy-revalidate",
+                    "no-store",
+                    "no-cache",
+                ]
                 .iter()
                 .any(|d| s.contains(d))
+            })
         })
-    })
 }
 
 fn parse_capsule_control(headers: &HeaderMap, fallback_ttl_secs: u32) -> Option<CapsuleControl> {
@@ -2076,7 +2107,7 @@ fn stale_if_error_fallback(
         || (method != Method::GET && method != Method::HEAD)
         || !matches!(route, PrivateRoute::Public)
         || no_cache_env(ctx)
-        || !vhost_allows_public(ctx, store)
+        || !vhost_allows_public(ctx, store, req_path)
         || !chain_cacheable_for_default(
             chain,
             req_path,
@@ -2426,7 +2457,7 @@ pub async fn cache_store(
     // (#11) Honor the per-vhost cache policy on the STORE path too, mirroring
     // cache_lookup — otherwise a caching-disabled vhost fills the shared store with
     // dead entries that evict another vhost's live ones.
-    let vhost_caches = vhost_allows_public(ctx, store);
+    let vhost_caches = vhost_allows_public(ctx, store, req_path);
     let route = private_route(state, ctx, store, cc, false);
     // Conditions EVERY stored entry must meet, public or private:
     let base_eligible =
@@ -3115,7 +3146,6 @@ mod tests {
         listed.insert("forum.example".to_string());
         assert!(capsule_vhost_allowed(&mk_state(listed), &ctx));
     }
-
 
     // Regression (F15): the capsule safe-GET classifier must match an UNSAFE_PREFIXES entry at
     // a route boundary, not only on a trailing `/`. The old `{prefix}/`-only test let hyphen/dot

@@ -185,6 +185,13 @@ pub(crate) fn sanitize_response_headers(headers: &mut HeaderMap, keep_upgrade: b
     // CacheOptimizer addon) may assert them — a proxied upstream must not be
     // able to mark its redirects edge-cacheable.
     headers.remove("x-cache-optimizer");
+    // Same trust boundary for the page-cache protocol labels (audit): a proxied
+    // upstream carrying `X-LiteSpeed-Purge: *` would wipe the ENTIRE shared cache
+    // store, and `X-LiteSpeed-Cache-Control` would opt arbitrary responses into
+    // it. Only the LSAPI origin drives the cache.
+    headers.remove("x-litespeed-purge");
+    headers.remove("x-litespeed-cache-control");
+    headers.remove("x-litespeed-vary");
 }
 
 #[cfg(test)]

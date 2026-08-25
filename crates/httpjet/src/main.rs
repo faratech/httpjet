@@ -440,7 +440,8 @@ struct XfCapsuleArgs {
     /// Enable XenForo public-shell capsules. Requires --page-cache; otherwise inert.
     #[arg(long = "xf-capsule")]
     capsule_enabled: bool,
-    /// Comma-separated resolved vhost names allowed to serve capsules. Empty = all vhosts.
+    /// Comma-separated resolved vhost names allowed to serve capsules. Empty
+    /// DISABLES the capsule tier for every vhost (#239 fail-closed default).
     #[arg(long = "xf-capsule-vhosts", default_value = "")]
     vhosts: String,
     /// Comma-separated request-path prefixes eligible for capsule lookup/store.
@@ -1371,9 +1372,22 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                         },
                                     );
                                 }
+                                // (audit) Be precise about what "certs" means: only the
+                                // SNI/default SERVER certs are swapped. The client-cert
+                                // verifier (CA trust store) is baked into the immutable
+                                // rustls config at boot — a renewed/rotated origin-pull CA
+                                // needs a restart, and the log must not claim otherwise.
+                                let has_ca_listener = new_server.listeners.iter().any(|l| {
+                                    l.tls.as_ref().is_some_and(|t| t.ca_cert_file.is_some())
+                                });
+                                if has_ca_listener {
+                                    tracing::warn!(
+                                        "SIGHUP: client-CA trust stores are BOOT-frozen; if an origin-pull CA changed, RESTART httpjet"
+                                    );
+                                }
                                 holder.store(ServerState::reload(&cur, new_server));
                                 bridge_admission.limit_changed();
-                                tracing::info!("SIGHUP: config hot-reloaded (config + certs; cache + lsphp + connections preserved)");
+                                tracing::info!("SIGHUP: config hot-reloaded (config + SNI server certs; client-CA stores boot-frozen; cache + lsphp + connections preserved)");
                             }
                         }
                         Err(e) => {
@@ -1387,6 +1401,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                     tracing::info!("SIGUSR1: reopening access + error logs");
                     if let Some(log) = &state.access_log {
                         log.reopen();
+                    }
+                    // (#248) Per-vhost access + error writers rotate with everything else.
+                    for v in state.vhost_access_logs.values() {
+                        v.logger.reopen();
+                    }
+                    for e in state.vhost_error_logs.values() {
+                        e.reopen();
                     }
                     if let Some(sl) = &state.php_slow {
                         sl.reopen();

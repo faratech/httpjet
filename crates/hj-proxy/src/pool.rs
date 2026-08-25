@@ -149,12 +149,20 @@ impl Upstream {
         })
     }
 
+    /// Upper bound on how long a request PARKS waiting for a `maxConns` slot.
+    /// `connect_timeout` doubles as this wait for extProcessor targets, and prod
+    /// configures `initTimeout=600s` there — parking every new request ~10 minutes
+    /// while holding bridge admission slots (audit) is worse than shedding. Cap the
+    /// QUEUE wait at 10 s; the CONNECT itself still gets the full `connect_timeout`.
+    const MAX_QUEUE_WAIT: Duration = Duration::from_secs(10);
+
     /// Acquire a concurrency permit (LiteSpeed `maxConns`): at most `max_conns` requests may
-    /// be in flight to this upstream concurrently. Waits up to `connect_timeout` for a free
-    /// slot; `None` means the upstream is saturated and the caller should return `503`. The
+    /// be in flight to this upstream concurrently. Waits up to [`Self::MAX_QUEUE_WAIT`] for a
+    /// free slot; `None` means the upstream is saturated and the caller should return `503`. The
     /// returned permit is held for the whole request+response lifetime (see [`crate::Proxy::forward`]).
     pub(crate) async fn acquire(&self) -> Option<OwnedSemaphorePermit> {
-        match tokio::time::timeout(self.connect_timeout, self.sem.clone().acquire_owned()).await {
+        let wait = self.connect_timeout.min(Self::MAX_QUEUE_WAIT);
+        match tokio::time::timeout(wait, self.sem.clone().acquire_owned()).await {
             Ok(Ok(permit)) => Some(permit),
             _ => None,
         }

@@ -502,7 +502,147 @@ mod tests {
         assert_eq!(bounded_u8(&Some("garbage".into()), 0, 4, 2), 2);
     }
 
-    // ----- origin page cache (<cache>) -----
+    // ----- allowSymbolLink tri-state (audit M4) -----
+
+    #[test]
+    fn vhost_symlink_override_is_explicit_only_when_present() {
+        // An explicit 0 must survive as an override (Some(false)) so load_vhost_files
+        // can DENY following on this vhost while the server allows it; absent = None.
+        let vh = |sym: &str| {
+            format!(
+                r#"<virtualHostConfig>
+                    <docRoot>$VH_ROOT/html</docRoot>
+                    {sym}
+                </virtualHostConfig>"#
+            )
+        };
+        let vc0 = parse_vhost_config(
+            &vh("<allowSymbolLink>0</allowSymbolLink>"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(vc0.allow_symbol_link_override, Some(false));
+        let vc1 = parse_vhost_config(
+            &vh("<allowSymbolLink>1</allowSymbolLink>"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(vc1.allow_symbol_link_override, Some(true));
+        let vcn = parse_vhost_config(&vh(""), &Default::default()).unwrap();
+        assert_eq!(
+            vcn.allow_symbol_link_override, None,
+            "absent tag must inherit the server default, not force-deny"
+        );
+        // And the effective merge: explicit 0 beats a follow-everything server.
+        assert!(!vc0.allow_symbol_link);
+    }
+
+    // ----- per-vhost <logging> (#248) -----
+
+    #[test]
+    fn vhost_logging_use_server_zero_yields_own_files() {
+        // Modeled on the live windowsforum.com.xml block: useServer=0 + fileName
+        // means THIS vhost writes its own files; logHeaders rides the access spec.
+        let text = r#"<virtualHostConfig>
+            <logging>
+                <log>
+                    <useServer>0</useServer>
+                    <fileName>$SERVER_ROOT/logs/vh_error.log</fileName>
+                    <logLevel>INFO</logLevel>
+                    <rollingSize>50M</rollingSize>
+                </log>
+                <accessLog>
+                    <useServer>0</useServer>
+                    <fileName>/usr/local/lsws/logs/vh_access.log</fileName>
+                    <logHeaders>7</logHeaders>
+                    <rollingSize>50M</rollingSize>
+                    <keepDays>3</keepDays>
+                </accessLog>
+            </logging>
+        </virtualHostConfig>"#;
+        let vc = parse_vhost_config(
+            text,
+            &crate::parse::SubstCtx {
+                server_root: "/usr/local/lsws".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let acc = vc.access_log_file.expect("own access log parsed");
+        assert_eq!(
+            acc.path,
+            PathBuf::from("/usr/local/lsws/logs/vh_access.log")
+        );
+        assert_eq!(acc.rolling_bytes, 50 * 1024 * 1024);
+        assert_eq!(acc.keep_days, 3);
+        assert_eq!(acc.log_headers, 7, "logHeaders must ride along");
+        let err = vc.error_log_file.expect("own error log parsed");
+        assert_eq!(
+            err.path,
+            PathBuf::from("/usr/local/lsws/logs/vh_error.log"),
+            "$SERVER_ROOT must substitute"
+        );
+    }
+
+    #[test]
+    fn vhost_logging_absent_or_use_server_uses_unified() {
+        let mk = |inner: &str| format!("<virtualHostConfig>{inner}</virtualHostConfig>");
+        // Absent block entirely.
+        let vc = parse_vhost_config(&mk("<docRoot>/web</docRoot>"), &Default::default()).unwrap();
+        assert!(vc.access_log_file.is_none() && vc.error_log_file.is_none());
+        // useServer=1 ⇒ inherit the unified logs; no separate file.
+        let vc = parse_vhost_config(
+            &mk(
+                "<logging><accessLog><useServer>1</useServer><fileName>/tmp/a.log</fileName></accessLog></logging>",
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(
+            vc.access_log_file.is_none(),
+            "useServer=1 must NOT create an own file"
+        );
+    }
+
+    // ----- context <cachePolicy> (#249) -----
+
+    #[test]
+    fn context_cache_policy_six_flags_parse_with_lsws_defaults() {
+        // Modeled on the live search.windowsforum.com.xml proxy context: all six
+        // flags explicit 0 = "never check/enable any caching in this context".
+        let text = r#"<virtualHostConfig>
+            <contextList>
+                <context>
+                    <type>proxy</type>
+                    <uri>/</uri>
+                    <handler>fastapi</handler>
+                    <cachePolicy>
+                        <checkPublicCache>0</checkPublicCache>
+                        <checkPrivateCache>0</checkPrivateCache>
+                        <respectCacheable>0</respectCacheable>
+                        <enableCache>0</enableCache>
+                        <enablePrivateCache>0</enablePrivateCache>
+                        <enablePostCache>0</enablePostCache>
+                    </cachePolicy>
+                </context>
+                <context>
+                    <type>static</type>
+                    <uri>/assets/</uri>
+                    <location>/web/assets</location>
+                </context>
+            </contextList>
+        </virtualHostConfig>"#;
+        let vc = parse_vhost_config(text, &crate::parse::SubstCtx::default()).unwrap();
+        assert_eq!(vc.contexts.len(), 2);
+        let p = vc.contexts[0]
+            .cache_policy
+            .expect("cachePolicy parsed for the proxy context");
+        assert!(!p.enable_cache && !p.check_public_cache);
+        assert!(!p.enable_private_cache && !p.check_private_cache);
+        assert!(!p.enable_post_cache);
+        // Absent block ⇒ None (inherit vhost policy), not a deny-all.
+        assert!(vc.contexts[1].cache_policy.is_none());
+    }
 
     #[test]
     fn cacheable_status_parse() {

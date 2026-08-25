@@ -71,16 +71,26 @@ impl H3RequestLimits {
 pub(crate) struct H3RuntimeConfig {
     config: Arc<dyn Fn() -> (H3RequestLimits, u32) + Send + Sync>,
     active_conns: Arc<AtomicU64>,
+    /// (#236 residual) Server-wide buffered-body cap shared with H1/H2/LSAPI. H3 commits
+    /// the whole request-stream buffer before parse, so the reservation is taken when a
+    /// finished request is taken for dispatch (per-connection wire bytes are already
+    /// bounded separately by `total_req_bytes`).
+    body_budget: std::sync::Arc<hj_core::budget::BodyBufferBudget>,
 }
 
 impl H3RuntimeConfig {
-    pub(crate) fn new<F>(config: F, active_conns: Arc<AtomicU64>) -> Self
+    pub(crate) fn new<F>(
+        config: F,
+        active_conns: Arc<AtomicU64>,
+        body_budget: std::sync::Arc<hj_core::budget::BodyBufferBudget>,
+    ) -> Self
     where
         F: Fn() -> (H3RequestLimits, u32) + Send + Sync + 'static,
     {
         Self {
             config: Arc::new(config),
             active_conns,
+            body_budget,
         }
     }
 
@@ -503,6 +513,33 @@ struct RequestChargeGuard {
 impl Drop for RequestChargeGuard {
     fn drop(&mut self) {
         self.total.set(self.total.get().saturating_sub(self.bytes));
+    }
+}
+
+/// RAII reservation of a finished request's committed bytes against the server-wide
+/// buffered-body cap shared with H1/H2/LSAPI (#236 residual). Held for the life of the
+/// dispatched task; released on completion, drop, or panic.
+struct BudgetGuard {
+    budget: std::sync::Arc<hj_core::budget::BodyBufferBudget>,
+    bytes: u64,
+}
+
+impl BudgetGuard {
+    fn acquire(budget: &std::sync::Arc<hj_core::budget::BodyBufferBudget>, n: u64) -> Option<Self> {
+        if n == 0 || budget.try_acquire(n) {
+            Some(Self {
+                budget: budget.clone(),
+                bytes: n,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
     }
 }
 
@@ -1890,6 +1927,7 @@ async fn drive_one_conn(
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     comp_tx: &flume::Sender<Completion>,
     request_limits: H3RequestLimits,
+    body_budget: &std::sync::Arc<hj_core::budget::BodyBufferBudget>,
     accepting_requests: bool,
     tx_scratch: &mut Vec<u8>,
 ) -> bool {
@@ -2008,6 +2046,17 @@ async fn drive_one_conn(
         }
         inflight.set(inflight.get() + 1);
         let guard = InflightGuard(inflight.clone());
+        // (#236 residual) Reserve the request's committed bytes against the server-wide
+        // cap before spawning its work; the guard releases them when the task ends.
+        let Some(budget_guard) = BudgetGuard::acquire(body_budget, req_charge as u64) else {
+            if let Some(c) = conns.get_mut(&hd) {
+                let mut ss = c.send_stream(id);
+                let _ = ss.write(&h3_error(http::StatusCode::SERVICE_UNAVAILABLE));
+                let _ = ss.finish();
+            }
+            release_request_charge(st, req_charge);
+            continue;
+        };
         let charge = RequestChargeGuard {
             total: st.total_req_bytes.clone(),
             bytes: req_charge,
@@ -2019,6 +2068,7 @@ async fn drive_one_conn(
         // spawn() is synchronous (no await) — `st`'s borrow of `h3` is not held across an await.
         let work = async move {
             let _g = guard; // frees the in-flight slot on completion / drop / panic
+            let _bg = budget_guard; // releases the server-wide body reservation likewise
             let send = |kind| {
                 tx.send_async(Completion {
                     conn: hd,
@@ -2279,6 +2329,7 @@ async fn pump(
                 inflight,
                 comp_tx,
                 runtime.request_limits(),
+                &runtime.body_budget,
                 accepting,
                 tx_scratch,
             )
@@ -2963,16 +3014,21 @@ async fn handle_h3_request(
         return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
     }
     // (N2) §4.1.2: a Content-Length that disagrees with the DATA length is malformed.
-    for (n, v) in &regular {
-        if n.as_slice() == b"content-length" {
-            match std::str::from_utf8(v)
-                .ok()
-                .and_then(|s| s.trim().parse::<usize>().ok())
-            {
-                Some(cl) if cl == parsed.body.len() => {}
-                _ => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
-            }
+    // Parsed with the SAME strict resolver as H1 (#232 residual): ASCII-OWS trim,
+    // digit-only — the old `trim().parse()` accepted "+5" (unsigned FromStr sign) and
+    // obs-text-padded values that every conformant stack rejects.
+    let declared_cl = {
+        let values = regular
+            .iter()
+            .filter(|(n, _)| n.as_slice() == b"content-length")
+            .map(|(_, v)| v.as_slice());
+        match super::codec::resolve_content_length(values) {
+            Ok(cl) => cl,
+            Err(()) => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
         }
+    };
+    if declared_cl.is_some_and(|cl| cl != parsed.body.len()) {
+        return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
     }
     let body_b = parsed.body;
     let inbody: hj_core::IncomingBody = if body_b.is_empty() {
@@ -3492,6 +3548,9 @@ mod h3_codec_tests {
                 )
             },
             Arc::new(AtomicU64::new(0)),
+            Arc::new(hj_core::budget::BodyBufferBudget::new(
+                hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
+            )),
         );
         assert_eq!(runtime.max_connections(), 2);
         assert_eq!(runtime.request_limits().max_header_bytes, 16_380);

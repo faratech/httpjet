@@ -45,6 +45,10 @@ pub struct ProxyTarget {
     pub max_conns: Option<u32>,
     pub keep_alive: Option<Duration>,
     pub connect_timeout: Option<Duration>,
+    /// LiteSpeed `retryTimeout`: bounds the ONE transparent retry of a bodyless
+    /// idempotent request whose pooled connection died between checkout and send
+    /// (audit: parsed for years, consumed nowhere). `None`/zero → a 5 s cap.
+    pub retry_timeout: Option<Duration>,
 }
 
 impl ProxyTarget {
@@ -105,6 +109,7 @@ impl ProxyTarget {
                 max_conns: None,
                 keep_alive: None,
                 connect_timeout: None,
+                retry_timeout: None,
             });
         }
 
@@ -141,6 +146,7 @@ impl ProxyTarget {
             max_conns: None,
             keep_alive: None,
             connect_timeout: None,
+            retry_timeout: None,
         })
     }
 
@@ -166,6 +172,7 @@ impl ProxyTarget {
             max_conns: Some(ep.max_conns),
             keep_alive: Some(ep.pc_keep_alive_timeout),
             connect_timeout: Some(ep.init_timeout),
+            retry_timeout: Some(ep.retry_timeout),
         }
     }
 
@@ -192,6 +199,7 @@ impl ProxyTarget {
             max_conns: None,
             keep_alive: None,
             connect_timeout: None,
+            retry_timeout: None,
         }
     }
 }

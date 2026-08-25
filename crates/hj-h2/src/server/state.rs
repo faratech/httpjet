@@ -64,12 +64,28 @@ pub(super) struct Recv {
     pub(super) max_request_body: usize,
     /// Per-connection SUM cap = `4 × max_request_body`; over it ⇒ GOAWAY(ENHANCE_YOUR_CALM).
     pub(super) per_conn_request_body: usize,
+    /// Server-wide buffered-body budget shared with the H1/H3 transports (#236 residual).
+    /// Reservations mirror `total_buffered` exactly; released at every site that un-buffers.
+    pub(super) body_budget: Option<std::sync::Arc<hj_core::budget::BodyBufferBudget>>,
     /// (CVE-2019-9512/9515/9518 class) Count of frames processed since the last forward
     /// progress on this connection. Bounds a "no-progress" frame flood — empty DATA / non-ACK
     /// PING / non-ACK SETTINGS / PRIORITY churn that resets the idle timer and forces parse+ACK
     /// work without ever advancing a request. Reset to 0 on any progress (a dispatched request,
     /// a non-empty DATA byte, a window grant); over `NO_PROGRESS_BUDGET` ⇒ GOAWAY.
     pub(super) no_progress_frames: u32,
+}
+
+impl Recv {
+    /// Drop `n` buffered request-body bytes: the per-connection counter AND the
+    /// server-wide budget reservation taken when they were buffered (#236 residual).
+    /// Every site that un-buffers a body must go through here so the two ledgers
+    /// can never drift.
+    pub(super) fn buffer_sub(&mut self, n: usize) {
+        self.total_buffered = self.total_buffered.saturating_sub(n);
+        if let Some(b) = &self.body_budget {
+            b.release(n as u64);
+        }
+    }
 }
 
 /// Per-stream accumulation until the request is complete. Request headers are decoded

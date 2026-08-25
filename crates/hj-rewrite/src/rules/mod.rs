@@ -71,6 +71,11 @@ pub struct RuleSet {
     /// instead of the raw UA string, collapsing real-world UA diversity onto a
     /// handful of cache entries.
     ua_classify_eligible: bool,
+    /// Precomputed at parse time: any cond/rule reads `%{THE_REQUEST}`. The
+    /// pipeline then attaches the VERBATIM pre-decode request target to the
+    /// RewriteInput so the variable resolves from raw bytes (Apache documents
+    /// THE_REQUEST as the original request line, never percent-decoded).
+    pub uses_the_request: bool,
 }
 
 /// Monotonic id source for [`RuleSet::id`] (0 is reserved for `RuleSet::default()`,

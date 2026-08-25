@@ -3,6 +3,7 @@
 //! vhost [`Router`]. Other crates implement handlers/transforms against these.
 
 pub mod body;
+pub mod budget;
 pub mod context;
 pub mod handler;
 pub mod http_util;

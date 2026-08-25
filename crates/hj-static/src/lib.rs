@@ -986,10 +986,12 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 /// escape the docroot through [`open_beneath`]'s follow-symlink `openat` arm,
 /// whose safety rests on the caller having already cleaned `..` away. Reject
 /// any index name that is not a safe root-confined relative path.
-fn safe_index_name(idx: &str) -> bool {
-    !idx.is_empty()
-        && !idx.starts_with('/')
-        && !idx.split(['/', '\\']).any(|seg| seg == "..")
+///
+/// Also consumed by the pipeline's PHP dir-index resolver (`suffix_routing`),
+/// which joins the same untrusted tokens onto docroot-relative paths — keep
+/// both call sites on this one guard so they can never drift apart.
+pub fn safe_index_name(idx: &str) -> bool {
+    !idx.is_empty() && !idx.starts_with('/') && !idx.split(['/', '\\']).any(|seg| seg == "..")
 }
 
 fn open_beneath(
@@ -997,7 +999,11 @@ fn open_beneath(
     rel: &str,
     allow_symlink: bool,
 ) -> io::Result<(OwnedFd, MetaInfo)> {
-    let oflags = OFlags::RDONLY | OFlags::CLOEXEC;
+    // NONBLOCK: the path components here come from request URLs (or .htaccess
+    // config), so an attacker able to plant files in the served tree (e.g. via a
+    // PHP write bug) could otherwise park this executor thread FOREVER inside
+    // open(2) by naming a FIFO — one stalled thread per request.
+    let oflags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
 
     let fd = if allow_symlink {
         // Follow symlinks; lexical cleaning already removed any `..` escape.
@@ -1025,6 +1031,18 @@ fn open_beneath(
     // Use std metadata for portable size/mtime/type extraction.
     let file = File::from(fd);
     let meta = file.metadata()?;
+    // The NONBLOCK open above returns instantly whatever the name resolves to;
+    // now fstat tells us what that IS. Only plain files/dirs continue — every
+    // other type (fifo, socket, device) is refused here rather than at the
+    // caller, because holding the fd would keep the kernel object alive.
+    if !meta.is_file() && !meta.is_dir() {
+        return Err(io::Error::from(rustix::io::Errno::NXIO));
+    }
+    // Real files must not carry NONBLOCK into serving (device/pipe semantics
+    // leaking into the async file path); regular-file reads ignore the flag,
+    // but clear it anyway so the fd behaves exactly as before.
+    let fl = rustix::fs::fcntl_getfl(&file).map_err(io::Error::from)?;
+    rustix::fs::fcntl_setfl(&file, fl.difference(OFlags::NONBLOCK)).map_err(io::Error::from)?;
     let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
     let info = MetaInfo {
         len: meta.len(),

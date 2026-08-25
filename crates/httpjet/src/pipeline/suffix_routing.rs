@@ -185,6 +185,14 @@ fn resolve_script(
     let rel = clean_rel(path)?;
     let abs = doc_root.join(&rel);
     for idx in index_files {
+        // (#244) DirectoryIndex tokens come from .htaccess verbatim, NOT from the
+        // lexically-cleaned request path; `abs.join` would happily escape the
+        // docroot for "../x" (or replace it outright for an absolute "/x"). Same
+        // guard hj-static applies to its own dir-index arm — fail closed by
+        // skipping the candidate.
+        if !hj_static::safe_index_name(idx) {
+            continue;
+        }
         let cand = abs.join(idx);
         if is_file(&cand) {
             // The index file may be PHP by extension OR forced via a handler-override
@@ -298,6 +306,47 @@ mod tests {
                 &no_force
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn dir_index_traversal_tokens_fail_closed() {
+        // (#244 residual) `.htaccess` DirectoryIndex tokens reach the dir-index join
+        // verbatim. A "../" escape or absolute token used to be joined straight onto
+        // the docroot-relative dir (PathBuf::join even REPLACES the base for an
+        // absolute token), so an attacker-writable .htaccess could route PHP execution
+        // at files outside the served tree. Bad tokens must be skipped, and the first
+        // SAFE candidate must still win.
+        let root = TempRoot::new();
+        let sub = root.0.join("community");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("index.php"), b"<?php // safe\n").unwrap();
+        // The escape target exists and IS php-extensioned, so the unguarded join would
+        // have selected it.
+        std::fs::write(root.0.join("escaped.php"), b"<?php // outside\n").unwrap();
+        let sfx = php_suffixes();
+        let index = vec![
+            "../escaped.php".to_string(),
+            "/etc/passwd".to_string(),
+            "..\\..\\escaped.php".to_string(),
+            "index.php".to_string(),
+        ];
+        let is_file = |p: &Path| p.is_file();
+
+        let (script, _name, _path_info) = resolve_script(
+            &root.0,
+            "/community/",
+            &sfx,
+            &index,
+            &is_file,
+            false,
+            &no_force,
+        )
+        .expect("the safe trailing candidate must still route");
+        assert_eq!(
+            script,
+            sub.join("index.php"),
+            "traversal/absolute DirectoryIndex tokens must be skipped, never joined"
         );
     }
 

@@ -84,6 +84,7 @@ use std::time::SystemTime;
 
 use tokio::sync::{mpsc, oneshot};
 
+pub use fmt::clf_time;
 pub use tracing_layer::ErrorLogLayer;
 pub use writer::RollConfig;
 

@@ -1888,8 +1888,13 @@ impl PageStore {
                         return None;
                     }
                     if stored_key != *key {
-                        self.key_id_collisions.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!("hj-pagecache: compact key-id collision — refusing cached entry");
+                        // Rate-limit the warn (audit): an attacker who can force FNV
+                        // second preimages can otherwise spam one line PER REQUEST.
+                        // Log at collision counts 1, 2, 4, 8... — O(log n) total.
+                        let prev = self.key_id_collisions.fetch_add(1, Ordering::Relaxed);
+                        if prev == 0 || prev.is_power_of_two() {
+                            tracing::warn!(count = prev + 1, "hj-pagecache: compact key-id collision — refusing cached entry");
+                        }
                         None
                     } else if resp.identity != identity {
                         tracing::warn!(
@@ -2158,10 +2163,14 @@ impl PageStore {
                             if decoded_populated {
                                 acc.reconcile_weights(&id, &id);
                             }
-                            self.key_id_collisions.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
-                                "hj-pagecache: compact key-id collision on store — skipping new entry"
-                            );
+                            // Same power-of-two rate limit as the lookup-side warn (audit).
+                            let prev = self.key_id_collisions.fetch_add(1, Ordering::Relaxed);
+                            if prev == 0 || prev.is_power_of_two() {
+                                tracing::warn!(
+                                    count = prev + 1,
+                                    "hj-pagecache: compact key-id collision on store — skipping new entry"
+                                );
+                            }
                             return false;
                         }
                     }

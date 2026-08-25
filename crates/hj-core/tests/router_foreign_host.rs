@@ -44,7 +44,8 @@ fn make_vhost_decl(name: &str) -> VHostDecl {
         name: name.into(),
         vh_root: PathBuf::from("/tmp"),
         config_file: PathBuf::from("/tmp/vhost.xml"),
-        allow_symbol_link: false,
+        allow_symbol_link: None,
+        restrained: false,
         enable_script: false,
         config: Some(Arc::new(VHostConfig::default())),
     }

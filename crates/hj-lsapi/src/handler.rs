@@ -61,7 +61,6 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -267,82 +266,10 @@ pub struct Lsapi {
 }
 
 /// Server-wide byte budget for request bodies that must be fully buffered into
-/// heap before pool admission (the chunked / no-Content-Length path). Without it,
-/// aggregate buffered memory is attacker-controlled: N slow connections each
-/// streaming up to `max_body` commit `N x max_body` of heap regardless of worker
-/// count. Reservation happens incrementally AS FRAMES ARRIVE, so small bodies
-/// always admit and only genuinely large concurrent uploads contend.
-#[derive(Debug)]
-pub struct BodyBufferBudget {
-    max_bytes: u64,
-    in_flight: AtomicU64,
-}
-
-/// Default server-wide budget for buffered bodies: generous against real
-/// chunked-upload traffic, hard against memory-exhaustion floods.
-pub const DEFAULT_BODY_BUFFER_MEM: u64 = 512 * 1024 * 1024;
-
-impl BodyBufferBudget {
-    pub fn new(max_bytes: u64) -> Self {
-        Self { max_bytes, in_flight: AtomicU64::new(0) }
-    }
-
-    /// Reserve `n` more bytes if the budget allows; false when exhausted.
-    fn try_acquire(&self, n: u64) -> bool {
-        if self.max_bytes == 0 {
-            return true; // 0 = accounting disabled
-        }
-        let mut cur = self.in_flight.load(Ordering::Relaxed);
-        loop {
-            if cur.saturating_add(n) > self.max_bytes {
-                return false;
-            }
-            match self.in_flight.compare_exchange_weak(
-                cur,
-                cur + n,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(c) => cur = c,
-            }
-        }
-    }
-
-    fn release(&self, n: u64) {
-        if self.max_bytes == 0 || n == 0 {
-            return;
-        }
-        let prev = self.in_flight.fetch_sub(n, Ordering::AcqRel);
-        debug_assert!(prev >= n, "body-budget underflow");
-    }
-
-    /// Bytes currently reserved by live buffered bodies.
-    pub fn in_flight(&self) -> u64 {
-        self.in_flight.load(Ordering::Relaxed)
-    }
-}
-
-/// RAII lease on bytes reserved from a [`BodyBufferBudget`]. Held alongside the
-/// collected buffer for the rest of the request so the reservation tracks the
-/// buffer's actual lifetime; released exactly once on drop (including error paths).
-#[derive(Debug)]
-struct BodyBufferLease {
-    budget: Arc<BodyBufferBudget>,
-    held: u64,
-}
-
-impl BodyBufferLease {
-    fn new(budget: Arc<BodyBufferBudget>) -> Self {
-        Self { budget, held: 0 }
-    }
-}
-
-impl Drop for BodyBufferLease {
-    fn drop(&mut self) {
-        self.budget.release(self.held);
-    }
-}
+/// heap before pool admission. Lives in hj-core so the io_uring transports share
+/// the ONE instance (they commit body bytes before this handler ever runs); see
+/// `hj_core::budget`.
+pub use hj_core::budget::{BodyBufferBudget, BodyBufferLease, DEFAULT_BODY_BUFFER_MEM};
 
 impl Lsapi {
     /// Create a handler over an existing pool.
@@ -490,13 +417,19 @@ impl Handler for Lsapi {
         // the buffered body's lifetime, not just the collection loop. Never read —
         // held purely for its Drop.
         #[allow(unused_variables, unused_assignments)]
-        let mut body_lease: Option<BodyBufferLease> = None;
+        // Held to the END of this fn (never read, only dropped): the RAII lease
+        // keeps the server-wide buffered-body reservation alive while the buffer
+        // is handed to lsphp.
+        let _body_lease: Option<BodyBufferLease>;
         let buffered: Option<Bytes> = match declared_len {
-            Some(_) => None,
+            Some(_) => {
+                _body_lease = None;
+                None
+            }
             None => {
                 let (b, lease) =
                     collect_to_cap(req.body_mut(), self.max_body, &self.body_budget).await?;
-                body_lease = Some(lease);
+                _body_lease = Some(lease);
                 Some(b)
             }
         };
@@ -1819,10 +1752,9 @@ async fn collect_to_cap(
             if (buf.len() as u64) + (data.len() as u64) > max_body {
                 return Err(HandlerError::PayloadTooLarge);
             }
-            if !lease.budget.try_acquire(data.len() as u64) {
+            if !lease.reserve(data.len() as u64) {
                 return Err(HandlerError::ServiceUnavailable);
             }
-            lease.held += data.len() as u64;
             buf.extend_from_slice(data);
         }
     }
@@ -2103,8 +2035,8 @@ mod body_budget_tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use http_body_util::BodyExt;
     use hj_core::{HandlerError, IncomingBody};
+    use http_body_util::BodyExt;
 
     use super::{BodyBufferBudget, collect_to_cap};
 
@@ -2151,8 +2083,9 @@ mod body_budget_tests {
     #[tokio::test]
     async fn small_body_admits_and_releases() {
         let budget = Arc::new(BodyBufferBudget::new(64 * 1024));
-        let (buf, lease) =
-            collect_to_cap(&mut body_of(16 * 1024), 1024 * 1024, &budget).await.unwrap();
+        let (buf, lease) = collect_to_cap(&mut body_of(16 * 1024), 1024 * 1024, &budget)
+            .await
+            .unwrap();
         assert_eq!(buf.len(), 16 * 1024);
         assert_eq!(budget.in_flight(), 16 * 1024);
         drop(lease);

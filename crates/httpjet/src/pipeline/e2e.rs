@@ -101,7 +101,8 @@ fn build_state_full(
         name: VHOST.into(),
         vh_root: doc_root.clone(),
         config_file: PathBuf::new(),
-        allow_symbol_link: true,
+        allow_symbol_link: Some(true),
+        restrained: false,
         enable_script: true,
         config: Some(Arc::new(vhost_cfg)),
     };
@@ -295,6 +296,7 @@ async fn static_context_resolved_location_in_access_deny_dir_is_forbidden() {
     std::fs::create_dir_all(&target_dir).unwrap();
     std::fs::write(target_dir.join("secret.txt"), b"must not be served").unwrap();
     let context = Context {
+        cache_policy: None,
         kind: ContextKind::Static,
         uri: "/assets".into(),
         location: Some(context_root),
@@ -328,6 +330,7 @@ async fn static_context_default_charset_applies_without_other_overrides() {
         extra_headers: Vec::new(),
         add_default_charset: true,
         charset: Some("ISO-8859-1".into()),
+        cache_policy: None,
     };
     let state = build_state_with(doc_root, vec![context], Vec::new());
 

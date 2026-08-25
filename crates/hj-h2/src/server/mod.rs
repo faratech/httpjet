@@ -94,7 +94,7 @@ impl Drop for ConnGuard {
 }
 
 /// Server-side HTTP/2 connection parameters we advertise + enforce.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub header_table_size: u32,
     pub max_concurrent_streams: u32,
@@ -109,6 +109,9 @@ pub struct Config {
     /// buffers the whole request body before dispatch, so an over-cap stream is RST'd
     /// (REFUSED_STREAM). The per-connection aggregate is bounded at `4 ×` this value.
     pub max_request_body: usize,
+    /// Server-wide buffered-body budget shared with the other transports (#236 residual).
+    /// `None` (default) skips global accounting — per-stream/per-connection caps still apply.
+    pub body_budget: Option<std::sync::Arc<hj_core::budget::BodyBufferBudget>>,
     /// Connection-idle timeout: if no frame arrives within this window, send a graceful GOAWAY
     /// and drain (defense-in-depth against slowloris-style holds — e.g. a HEADERS block left
     /// open without END_STREAM pinning its decoded map). `None` disables the timer.
@@ -131,6 +134,7 @@ impl Default for Config {
             max_frame_size: 16384,
             header_list_size: 131072,
             max_request_body: 64 * 1024 * 1024,
+            body_budget: None,
             conn_idle_timeout: Some(std::time::Duration::from_secs(60)),
             preface_timeout: None,
         }
@@ -343,6 +347,7 @@ where
         total_buffered: 0,
         max_request_body: config.max_request_body,
         per_conn_request_body: config.max_request_body.saturating_mul(4),
+        body_budget: config.body_budget.clone(),
         no_progress_frames: 0,
     };
     // Pre-size the per-stream maps to the multiplex degree we advertise (capped, so a large
@@ -1142,6 +1147,7 @@ where
         total_buffered: 0,
         max_request_body: config.max_request_body,
         per_conn_request_body: config.max_request_body.saturating_mul(4),
+        body_budget: config.body_budget.clone(),
         no_progress_frames: 0,
     };
     let stream_cap = (config.max_concurrent_streams as usize).min(32);
@@ -1703,6 +1709,7 @@ mod tests {
             total_buffered: 0,
             max_request_body: 1 << 20,
             per_conn_request_body: 4 << 20,
+            body_budget: None,
             no_progress_frames: 0,
         }
     }
@@ -1991,6 +1998,7 @@ mod tests {
             total_buffered: body_len,
             max_request_body: 1 << 20,
             per_conn_request_body: 4 << 20,
+            body_budget: None,
             no_progress_frames: 0,
         };
         let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
@@ -2035,5 +2043,91 @@ mod tests {
             recv.total_buffered, 0,
             "the buffered request body must be un-accounted (it was leaking)"
         );
+    }
+
+    #[test]
+    fn data_frame_respects_server_wide_body_budget() {
+        // (#236 residual) The per-stream and per-connection caps leave the SERVER-WIDE
+        // aggregate unbounded; the shared budget must refuse a reservation once exhausted
+        // (GOAWAY ENHANCE_YOUR_CALM) and release exactly what was buffered when a stream
+        // un-buffers, so the H1/H2/H3/LSAPI layers share one honest ledger.
+        let budget = std::sync::Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        use super::recv::process_frame;
+        use crate::frame::{flags, kind};
+        let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
+        streams.insert(
+            1,
+            StreamState {
+                headers_done: true,
+                body: vec![0u8; 8],
+                recv_window: 65535,
+                ..Default::default()
+            },
+        );
+        let mut dec = Decoder::new(4096, 8192);
+        let mut enc = Encoder::new();
+        let mut out = OutQueue::default();
+        let mut peer = PeerSettings::default();
+        let mut recv = Recv {
+            last_client_stream: 1,
+            open_header_block: None,
+            discarding_header_block: false,
+            discard_header_block: Vec::new(),
+            discard_rst_code: error_code::STREAM_CLOSED,
+            max_concurrent: 100,
+            conn_recv_window: 65535,
+            our_initial_window: 65535,
+            rst_unanswered: 0,
+            total_buffered: 8,
+            max_request_body: 1 << 20,
+            per_conn_request_body: 4 << 20,
+            body_budget: Some(budget.clone()),
+            no_progress_frames: 0,
+        };
+        let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
+        let mut cancelled: FxHashSet<u32> = FxHashSet::default();
+        let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
+        let service = |_req: Request| std::future::ready(Response::new(hj_core::Body::Empty));
+        // The stream's already-buffered 8 bytes were reserved before the test (as the
+        // connection would have); reflect that on the ledger.
+        assert!(budget.try_acquire(8));
+
+        // A DATA frame that fits every per-stream/per-conn cap but exhausts the global one.
+        let data = [0u8; 32];
+        let hdr = FrameHeader {
+            length: data.len() as u32,
+            kind: kind::DATA,
+            flags: 0,
+            stream_id: 1,
+        };
+        let outcome = process_frame(
+            hdr,
+            &data,
+            &mut streams,
+            &mut dec,
+            &mut enc,
+            &mut out,
+            &mut peer,
+            &mut recv,
+            0,
+            true,
+            &service,
+            &mut inflight,
+            &mut cancelled,
+            &mut inflight_sids,
+        );
+        assert!(
+            matches!(outcome, FrameOutcome::StopReading),
+            "exhausting the server-wide budget must GOAWAY the connection"
+        );
+        assert_eq!(
+            budget.in_flight(),
+            8,
+            "the refused reservation must not have mutated the ledger"
+        );
+
+        // Un-buffering releases exactly what was reserved.
+        recv.buffer_sub(8);
+        assert_eq!(budget.in_flight(), 0, "buffer_sub must release the budget");
     }
 }

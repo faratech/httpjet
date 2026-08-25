@@ -9,10 +9,11 @@ use crate::model::*;
 use crate::subst::SubstCtx;
 use crate::units::split_list;
 
-use super::raw::{RawVHostConfig, RawVHostList};
+use super::raw::{RawLogFileSpec, RawVHostConfig, RawVHostList};
+use super::scalar::u32_of;
 use super::scalar::{
-    bounded_u8, charset_on, context_kind, follow_symlink_value, nonempty, parse_extra_headers,
-    truthy,
+    bounded_u8, charset_on, context_kind, follow_symlink_value, lsws_size, nonempty,
+    parse_extra_headers, symlink_override, truthy,
 };
 // convert_ext_list / convert_expires / convert_namespace live in the parent mod
 use super::{convert_expires, convert_ext_list, convert_namespace};
@@ -78,7 +79,8 @@ pub(super) fn convert_vhost_decls(
                 name,
                 vh_root: PathBuf::from(vctx.vh_root.clone()),
                 config_file,
-                allow_symbol_link: follow_symlink_value(&v.allow_symbol_link),
+                allow_symbol_link: symlink_override(&v.allow_symbol_link),
+                restrained: v.restrained.as_deref().map(str::trim) == Some("1"),
                 enable_script: v
                     .enable_script
                     .as_ref()
@@ -98,12 +100,13 @@ pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
     let follow_symlink = cfg.security.follow_symlink;
     let names: Vec<String> = cfg.vhost_order.clone();
     for name in names {
-        let (config_file, vh_root, decl_allow_symlink) = {
+        let (config_file, vh_root, decl_symlink_override, decl_restrained) = {
             let decl = &cfg.vhosts[&name];
             (
                 decl.config_file.clone(),
                 decl.vh_root.clone(),
                 decl.allow_symbol_link,
+                decl.restrained,
             )
         };
         let text = match std::fs::read_to_string(&config_file) {
@@ -121,9 +124,16 @@ pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
         };
         match parse_vhost_config(&text, &vctx) {
             Ok(mut vc) => {
-                // Effective symlink policy: server-wide followSymbolLink OR the
-                // vhost declaration's allowSymbolLink OR the vhost file's own.
-                vc.allow_symbol_link = vc.allow_symbol_link || decl_allow_symlink || follow_symlink;
+                // Effective symlink policy (LSWS tri-state, audit M4): the vhost FILE's
+                // explicit <allowSymbolLink> overrides, else the DECLARATION's, else the
+                // server-wide followSymbolLink. The old OR-merge made an explicit
+                // hardening `0` impossible to express. (#249) A RESTRAINED vhost never
+                // follows symlinks: the follow arm cannot confine targets to vhRoot.
+                vc.allow_symbol_link = !decl_restrained
+                    && vc
+                        .allow_symbol_link_override
+                        .or(decl_symlink_override)
+                        .unwrap_or(follow_symlink);
                 if let Some(decl) = cfg.vhosts.get_mut(&name) {
                     decl.config = Some(Arc::new(vc));
                 }
@@ -177,6 +187,27 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
                             .unwrap_or_default(),
                         add_default_charset: charset_on(&c.add_default_charset),
                         charset: nonempty(c.charset),
+                        cache_policy: c.cache_policy.map(|p| {
+                            // A present-but-absent FLAG defaults ON (LSWS
+                            // getLongValue(..,default) semantics), except
+                            // enablePostCache which OLS defaults off.
+                            let f = |v: &Option<String>, d: bool| {
+                                v.as_deref()
+                                    .map(|s| {
+                                        let t = s.trim();
+                                        t == "1" || t == "2" || t.eq_ignore_ascii_case("true")
+                                    })
+                                    .unwrap_or(d)
+                            };
+                            ContextCachePolicy {
+                                check_public_cache: f(&p.check_public_cache, true),
+                                check_private_cache: f(&p.check_private_cache, true),
+                                respect_cacheable: f(&p.respect_cacheable, true),
+                                enable_cache: f(&p.enable_cache, true),
+                                enable_private_cache: f(&p.enable_private_cache, true),
+                                enable_post_cache: f(&p.enable_post_cache, false),
+                            }
+                        }),
                     })
                 })
                 .collect()
@@ -247,8 +278,13 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         .unwrap_or_default();
 
     // `<htAccess>`: allowOverride bitmask + accessFileName. Absent block => off.
-    let (allow_override, access_file_name) = raw
-        .htaccess
+    // An EXPLICIT `0` is recorded separately (audit): it FORBIDS overrides, while a
+    // merely-absent block defers to `<rewrite><autoLoadHtaccess>`.
+    let ht_access = raw.htaccess;
+    let allow_override_explicit = ht_access
+        .as_ref()
+        .is_some_and(|h| h.allow_override.is_some());
+    let (allow_override, access_file_name) = ht_access
         .map(|h| {
             let bits = h
                 .allow_override
@@ -262,6 +298,47 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         })
         .unwrap_or((0, String::new()));
 
+    // (#248) Per-vhost `<logging>`: only an explicit `useServer=0` + fileName means
+    // "this vhost writes its OWN file"; useServer=1/absent rides the unified logs.
+    let own_file = |spec: Option<&RawLogFileSpec>| -> Option<VhostLogFile> {
+        let s = spec?;
+        if !s
+            .use_server
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("1")
+            .eq_ignore_ascii_case("0")
+        {
+            return None;
+        }
+        let path = nonempty(s.file_name.clone())?;
+        Some(VhostLogFile {
+            path: PathBuf::from(ctx.expand(&path)),
+            rolling_bytes: lsws_size(&s.rolling_size, 50 * 1024 * 1024),
+            keep_days: u32_of(&s.keep_days, 30) as u64,
+            log_headers: 0,
+        })
+    };
+    let mut access_log_file = raw
+        .logging
+        .as_ref()
+        .and_then(|l| l.access_log.as_ref())
+        .and_then(|a| {
+            own_file(Some(&RawLogFileSpec {
+                use_server: a.use_server.clone(),
+                file_name: a.file_name.clone(),
+                rolling_size: a.rolling_size.clone(),
+                keep_days: a.keep_days.clone(),
+            }))
+        });
+    if let (Some(f), Some(a)) = (
+        access_log_file.as_mut(),
+        raw.logging.as_ref().and_then(|l| l.access_log.as_ref()),
+    ) {
+        f.log_headers = u32_of(&a.log_headers, 0) as u8;
+    }
+    let error_log_file = own_file(raw.logging.as_ref().and_then(|l| l.log.as_ref()));
+
     Ok(VHostConfig {
         doc_root: PathBuf::from(ctx.expand(raw.doc_root.as_deref().unwrap_or(""))),
         index_files: raw
@@ -270,6 +347,7 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
             .map(split_list)
             .unwrap_or_default(),
         allow_symbol_link: follow_symlink_value(&raw.allow_symbol_link),
+        allow_symbol_link_override: symlink_override(&raw.allow_symbol_link),
         rewrite,
         contexts,
         script_handlers,
@@ -280,6 +358,9 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         extra_ext_processors: convert_ext_list(raw.ext_processor_list, ctx),
         isolation,
         allow_override,
+        allow_override_explicit,
+        access_log_file,
+        error_log_file,
         access_file_name,
     })
 }

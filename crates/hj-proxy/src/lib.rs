@@ -210,6 +210,25 @@ impl Proxy {
         // only `chunked` or a real positive Content-Length do (#14).
         let has_request_body = body_is_present(&req);
 
+        // (audit) A pooled keep-alive connection can die between checkout()'s
+        // `is_ready()` check and send(). For a BODYLESS IDEMPOTENT request the
+        // retry is safe (nothing reached the upstream — send_request only
+        // resolves on response headers) and turns the classic monit-vs-uvicorn
+        // idle-close race from a 502 into an invisible fresh-connection retry.
+        // Snapshot the PRE-rewrite head so the rebuild re-runs the full header
+        // rewrite exactly once more; proxy legs are low-volume internal backends,
+        // so the clones are noise. Bounded by the upstream's LiteSpeed
+        // `retryTimeout` when configured, else 5 s.
+        let retry_head = if !has_request_body && req.method().is_idempotent() {
+            Some((
+                req.method().clone(),
+                req.uri().clone(),
+                req.headers().clone(),
+            ))
+        } else {
+            None
+        };
+
         // Build the upstream request (URI/headers) from the inbound request.
         let out_req = build_forward_request(ctx, req, target, &upstream.authority)
             .map_err(|e| HandlerError::Other(e.to_string()))?;
@@ -266,7 +285,61 @@ impl Proxy {
                 .await
             {
                 Ok(Ok(r)) => r,
-                Ok(Err(e)) => return Err(ProxyError::Request(e.to_string()).into()),
+                Ok(Err(e)) => {
+                    if let Some((m, u, _h)) = retry_head {
+                        // Bound the WHOLE retry (fresh dial + headers) by the
+                        // upstream's LiteSpeed `retryTimeout`, floor 5 s.
+                        let bound = target
+                            .retry_timeout
+                            .unwrap_or_default()
+                            .max(std::time::Duration::from_secs(5));
+                        tracing::debug!(
+                            error = %e,
+                            "hj-proxy: pooled connection died before send — retrying once on a fresh connection"
+                        );
+                        // The dead connection is discarded, NEVER re-pooled.
+                        drop(sender);
+                        let attempt = async {
+                            let mut sender2 = match upstream.checkout().await {
+                                Ok(s) => s,
+                                Err(err) => return Err((None, err.to_string())),
+                            };
+                            let inbound2 = match http::Request::builder()
+                                .method(m)
+                                .uri(u)
+                                .version(http::Version::HTTP_11)
+                                .body(hj_core::empty_incoming())
+                            {
+                                Ok(r) => r,
+                                Err(err) => return Err((Some(sender2), err.to_string())),
+                            };
+                            let out_req2 = match build_forward_request(
+                                ctx,
+                                inbound2,
+                                target,
+                                &upstream.authority,
+                            ) {
+                                Ok(r) => r,
+                                Err(err) => return Err((Some(sender2), err.to_string())),
+                            };
+                            match sender2.send_request(out_req2).await {
+                                Ok(resp) => Ok((sender2, resp)),
+                                Err(err) => Err((Some(sender2), err.to_string())),
+                            }
+                        };
+                        match tokio::time::timeout(bound, attempt).await {
+                            // Retry succeeded: hand the LIVE connection to the
+                            // normal drain/pool path below by replacing `sender`.
+                            Ok(Ok((sender2, resp))) => {
+                                sender = sender2;
+                                resp
+                            }
+                            _ => return Err(ProxyError::Request(e.to_string()).into()),
+                        }
+                    } else {
+                        return Err(ProxyError::Request(e.to_string()).into());
+                    }
+                }
                 Err(_) => return Err(ProxyError::ResponseTimeout.into()),
             }
         };

@@ -323,6 +323,9 @@ pub(super) struct RawVHostDecl {
     pub(super) allow_symbol_link: Option<String>,
     #[serde(rename = "enableScript", default)]
     pub(super) enable_script: Option<String>,
+    /// (#249 drift class) LSWS `restrained`: confine the vhost to its vhRoot.
+    #[serde(default)]
+    pub(super) restrained: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -414,6 +417,49 @@ pub(super) struct RawVHostConfig {
     /// the server policy.
     #[serde(default)]
     pub(super) namespace: Option<RawNamespace>,
+    /// (#248) Per-vhost `<logging>` block (error `<log>` + `<accessLog>`).
+    #[serde(default)]
+    pub(super) logging: Option<RawLogging>,
+}
+
+/// (#248) One `<logging>` block: an error-log spec plus an access-log spec, each
+/// carrying `useServer` (0 = this vhost's OWN file), a file path, and LiteSpeed
+/// rolling parameters.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawLogging {
+    #[serde(rename = "log", default)]
+    pub(super) log: Option<RawLogFileSpec>,
+    #[serde(rename = "accessLog", default)]
+    pub(super) access_log: Option<RawAccessLogSpec>,
+}
+
+/// Shared shape of `<log>` / `<accessLog>` children.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawLogFileSpec {
+    #[serde(rename = "useServer", default)]
+    pub(super) use_server: Option<String>,
+    #[serde(rename = "fileName", default)]
+    pub(super) file_name: Option<String>,
+    #[serde(rename = "rollingSize", default)]
+    pub(super) rolling_size: Option<String>,
+    #[serde(rename = "keepDays", default)]
+    pub(super) keep_days: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawAccessLogSpec {
+    #[serde(rename = "useServer", default)]
+    pub(super) use_server: Option<String>,
+    #[serde(rename = "fileName", default)]
+    pub(super) file_name: Option<String>,
+    #[serde(rename = "rollingSize", default)]
+    pub(super) rolling_size: Option<String>,
+    #[serde(rename = "keepDays", default)]
+    pub(super) keep_days: Option<String>,
+    /// LSWS bitmask; bit 0 = request line + Referer/UA, higher bits add header
+    /// capture. Nonzero ⇒ httpjet emits the request headers with each record.
+    #[serde(rename = "logHeaders", default)]
+    pub(super) log_headers: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -476,6 +522,25 @@ pub(super) struct RawContext {
     pub(super) add_default_charset: Option<String>,
     #[serde(rename = "addDefaultCharsetCustomized", default)]
     pub(super) charset: Option<String>,
+    /// (#249) LSWS six-flag context `<cachePolicy>` (+ microCache5xx).
+    #[serde(rename = "cachePolicy", default)]
+    pub(super) cache_policy: Option<RawContextCachePolicy>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawContextCachePolicy {
+    #[serde(rename = "checkPublicCache", default)]
+    pub(super) check_public_cache: Option<String>,
+    #[serde(rename = "checkPrivateCache", default)]
+    pub(super) check_private_cache: Option<String>,
+    #[serde(rename = "respectCacheable", default)]
+    pub(super) respect_cacheable: Option<String>,
+    #[serde(rename = "enableCache", default)]
+    pub(super) enable_cache: Option<String>,
+    #[serde(rename = "enablePrivateCache", default)]
+    pub(super) enable_private_cache: Option<String>,
+    #[serde(rename = "enablePostCache", default)]
+    pub(super) enable_post_cache: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

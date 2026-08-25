@@ -175,7 +175,7 @@ where
         ($sid:expr_2021) => {{
             if let Some(st) = streams.remove(&$sid) {
                 recv.no_progress_frames = 0; // a dispatched request is forward progress
-                recv.total_buffered = recv.total_buffered.saturating_sub(st.body.len());
+                recv.buffer_sub(st.body.len());
                 if st.content_length.is_some_and(|cl| cl != st.body.len() as u64) {
                     // §8.1.2.6: declared content-length must equal the DATA bytes received.
                     out.frames(|b| frame::write_rst_stream(b, $sid, error_code::PROTOCOL_ERROR));
@@ -405,7 +405,7 @@ where
                     goaway!(error_code::COMPRESSION_ERROR);
                 }
                 if let Some(s) = streams.remove(&sid) {
-                    recv.total_buffered = recv.total_buffered.saturating_sub(s.body.len());
+                    recv.buffer_sub(s.body.len());
                 }
                 if hdr.flags & flags::END_HEADERS != 0 {
                     if !decode_discard_header_block(dec, block) {
@@ -479,7 +479,7 @@ where
                         // length for the connection's life, eventually tripping a spurious
                         // GOAWAY(ENHANCE_YOUR_CALM) on a later legitimate DATA byte.
                         if let Some(s) = streams.remove(&sid) {
-                            recv.total_buffered = recv.total_buffered.saturating_sub(s.body.len());
+                            recv.buffer_sub(s.body.len());
                         }
                         rst!(sid, error_code::PROTOCOL_ERROR);
                     }
@@ -532,7 +532,7 @@ where
                         // Same as the HEADERS arm: un-account any buffered body before dropping the
                         // stream so a CONTINUATION-spanning malformed trailer can't leak the budget.
                         if let Some(s) = streams.remove(&sid) {
-                            recv.total_buffered = recv.total_buffered.saturating_sub(s.body.len());
+                            recv.buffer_sub(s.body.len());
                         }
                         rst!(sid, error_code::PROTOCOL_ERROR);
                     }
@@ -578,7 +578,7 @@ where
             st.recv_window -= flow;
             if st.recv_window < 0 {
                 if let Some(s) = streams.remove(&sid) {
-                    recv.total_buffered = recv.total_buffered.saturating_sub(s.body.len());
+                    recv.buffer_sub(s.body.len());
                 }
                 rst!(sid, error_code::FLOW_CONTROL_ERROR);
             }
@@ -586,7 +586,7 @@ where
                 // Buffered request body exceeds the per-stream cap (LiteSpeed maxReqBodySize) —
                 // the custom stack buffers the body before dispatch, so cap it and reset.
                 if let Some(s) = streams.remove(&sid) {
-                    recv.total_buffered = recv.total_buffered.saturating_sub(s.body.len());
+                    recv.buffer_sub(s.body.len());
                 }
                 rst!(sid, error_code::REFUSED_STREAM);
             }
@@ -597,6 +597,14 @@ where
             }
             if !data.is_empty() {
                 recv.no_progress_frames = 0; // a non-empty DATA byte is forward progress
+            }
+            // (#236 residual) Server-wide cap shared with the H1/H3 transports and LSAPI:
+            // reserve BEFORE extending/accounting so aggregate buffered bodies stay bounded
+            // even when every connection is individually under its per-stream/per-conn caps.
+            if let Some(b) = &recv.body_budget
+                && !b.try_acquire(data.len() as u64)
+            {
+                goaway!(error_code::ENHANCE_YOUR_CALM);
             }
             recv.total_buffered = recv.total_buffered.saturating_add(data.len());
             st.body.extend_from_slice(data);
@@ -620,7 +628,7 @@ where
                 goaway!(error_code::PROTOCOL_ERROR);
             }
             if let Some(s) = streams.remove(&sid) {
-                recv.total_buffered = recv.total_buffered.saturating_sub(s.body.len());
+                recv.buffer_sub(s.body.len());
             }
             // If the handler future is still running in `inflight`, cancel it and mark the stream
             // so the aborted completion is discarded. ONLY record sids with a live future:

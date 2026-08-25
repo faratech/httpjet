@@ -262,7 +262,9 @@ pub(crate) async fn fast_serve(
     // (mtime-cached), REAL client IP, server env + SetEnvIf (`[E=no-cache]` included),
     // then the per-dir deny + accessDenyDir gates — so neither on-core branch can serve
     // content the tokio path would refuse. A deny declines (None) and dispatch() renders.
-    let htaccess_enabled = ctx.vhost.htaccess_allowed() || ctx.vhost.rewrite.auto_load_htaccess;
+    let htaccess_enabled = ctx
+        .vhost
+        .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess);
     let chain_with_dirs: Vec<(std::path::PathBuf, std::sync::Arc<Htaccess>)> = if htaccess_enabled {
         state.rewrite_cache.load_chain_with_dirs(
             &ctx.vhost.doc_root,
@@ -445,9 +447,14 @@ fn record_fast_serve(
         req_start.elapsed(),
         state.telemetry.vhost_idx(&ctx.vhost_name),
     );
-    let Some(log) = &state.access_log else {
+    let Some(log) = state.access_logger_for(&ctx.vhost_name) else {
         return resp;
     };
+    let vhost_log_headers = state
+        .vhost_access_logs
+        .get(&ctx.vhost_name)
+        .map(|v| v.log_headers)
+        .unwrap_or(0);
     let mtls_required = state.mtls_required_vhosts.contains(&ctx.vhost_name);
     let mtls_ok = if mtls_required {
         ctx.tls
@@ -481,7 +488,48 @@ fn record_fast_serve(
         remote_user: None,
         request_id: Some(ctx.request_id.to_string()),
     };
+    // (#248) LSWS `logHeaders`: a vhost that opts in gets its request headers
+    // appended as a bounded, CRLF-sanitized continuation line after the record.
+    if vhost_log_headers != 0 {
+        log.log_line(render_request_headers(req));
+    }
     log_access(log, resp, record)
+}
+
+/// (#248) Render the request's headers for the per-vhost `logHeaders` line: one
+/// line, CRLF/NUL-escaped (the access file is line-oriented — raw CR/LF would let
+/// a client forge extra "records"), capped at 4 KiB.
+fn render_request_headers(req: &hj_core::Request) -> String {
+    const CAP: usize = 4 * 1024;
+    let mut line = String::with_capacity(256);
+    line.push_str("+headers ");
+    for (n, v) in req.headers() {
+        if line.len() >= CAP {
+            break;
+        }
+        if line.len() + n.as_str().len() + v.len() + 2 > CAP {
+            break;
+        }
+        let ok_name = n
+            .as_str()
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+        if !ok_name {
+            continue;
+        }
+        line.push_str(n.as_str());
+        line.push('=');
+        for &b in v.as_bytes() {
+            match b {
+                b'\r' => line.push_str("%0D"),
+                b'\n' => line.push_str("%0A"),
+                0..=0x1F | 0x7F => {}
+                _ => line.push(b as char),
+            }
+        }
+        line.push(';');
+    }
+    line
 }
 
 /// Turn a static `Body::File` response into an in-memory `Body::Full` on the calling
@@ -846,7 +894,29 @@ pub async fn handle(
     );
 
     // ---- Access log ------------------------------------------------------
-    if let Some(log) = &state.access_log {
+    // (#248) A vhost declaring its own `<logging><accessLog>` records there;
+    // everyone else rides the unified log.
+    if let Some(log) = state.access_logger_for(&ctx.vhost_name) {
+        // (#248) Mirror 5xx responses into the vhost's own error file when it
+        // declares one — the closest per-vhost analogue of LSWS's error log
+        // (httpjet has no per-vhost stderr stream to route). Built before the
+        // record consumes `log_uri`.
+        let err_line = match (
+            resp.status().is_server_error(),
+            state.vhost_error_logger(&ctx.vhost_name),
+        ) {
+            (true, Some(errlog)) => Some((
+                errlog,
+                format!(
+                    "[{}] error status={} uri={} request_id={}",
+                    hj_log::clf_time(ctx.request_time),
+                    resp.status().as_u16(),
+                    log_uri,
+                    ctx.request_id
+                ),
+            )),
+            _ => None,
+        };
         let record = hj_log::AccessRecord {
             client_ip,
             // CLF `%t` is the time the request was RECEIVED — reuse the arrival stamp
@@ -863,6 +933,11 @@ pub async fn handle(
             remote_user: None,
             request_id: Some(ctx.request_id.to_string()),
         };
+        // (#248) Mirror 5xx responses into the vhost's own error file when it
+        // declares one.
+        if let Some((errlog, line)) = err_line {
+            errlog.log_line(line);
+        }
         resp = log_access(log, resp, record);
     }
 
@@ -1096,7 +1171,10 @@ async fn dispatch(
     // Vhosts that set neither policy get an
     // empty chain and run inline rules only, exactly as before. Each entry
     // carries its source directory so we can derive the per-directory prefix (#6).
-    let htaccess_enabled = ctx.vhost.htaccess_allowed() || ctx.vhost.rewrite.auto_load_htaccess;
+    // An EXPLICIT `<allowOverride>0` still forbids the chain outright (overrides_enabled).
+    let htaccess_enabled = ctx
+        .vhost
+        .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess);
     let chain_with_dirs: Vec<(PathBuf, Arc<Htaccess>)> = if htaccess_enabled {
         state.rewrite_cache.load_chain_with_dirs(
             &ctx.vhost.doc_root,
@@ -2672,6 +2750,9 @@ impl ResponseTransform for CacheStaticTransform {
 /// Apply `expiresByType` Cache-Control/Expires to cacheable static responses.
 pub(crate) struct ExpiresTransform {
     pub expires: std::sync::Arc<hj_compress::ExpiresRules>,
+    /// Per-vhost `<expires>` overrides (audit): a vhost with its own enabled block
+    /// replaces the server-wide rules for its requests; everyone else falls back.
+    pub vhost_expires: std::collections::HashMap<String, std::sync::Arc<hj_compress::ExpiresRules>>,
 }
 #[async_trait]
 impl ResponseTransform for ExpiresTransform {
@@ -2683,7 +2764,11 @@ impl ResponseTransform for ExpiresTransform {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or_else(|_| unix_now());
-        apply_expires(&self.expires, now, resp);
+        let rules = self
+            .vhost_expires
+            .get(&ctx.vhost_name)
+            .unwrap_or(&self.expires);
+        apply_expires(rules, now, resp);
     }
 }
 
@@ -2993,6 +3078,7 @@ mod tests {
     fn static_context_charset_defaults_and_customizes() {
         use hj_core::config::{Context, ContextKind};
         let mut context = Context {
+            cache_policy: None,
             kind: ContextKind::Static,
             uri: "/assets".into(),
             location: None,

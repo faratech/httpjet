@@ -113,16 +113,22 @@ fn resolve_var_into(
         "DOCUMENT_ROOT" => out.push_str(&input.docroot.to_string_lossy()),
         "SERVER_PROTOCOL" => out.push_str(&input.protocol),
         // %{THE_REQUEST} is the VERBATIM original request line — Apache documents it as NOT
-        // modified by any rewriting. Use the FROZEN `input.uri`/`input.query`, never the evolving
-        // `cur_uri`/`cur_query` (a non-[L] rewrite mutates those, so a later pass would otherwise
-        // see the rewritten URI here).
+        // modified by any rewriting. Use the FROZEN raw target when the pipeline attached
+        // one (audit: the decoded canonical path turned `/a%2Eb` into `/a.b` and broke
+        // verbatim-line rules like the live rss `.htaccess`), else the frozen
+        // `input.uri`/`input.query` — never the evolving `cur_uri`/`cur_query`.
         "THE_REQUEST" => {
             out.push_str(&input.method);
             out.push(' ');
-            out.push_str(&input.uri);
-            if !input.query.is_empty() {
-                out.push('?');
-                out.push_str(&input.query);
+            match &input.raw_request_target {
+                Some(raw) => out.push_str(raw),
+                None => {
+                    out.push_str(&input.uri);
+                    if !input.query.is_empty() {
+                        out.push('?');
+                        out.push_str(&input.query);
+                    }
+                }
             }
             out.push(' ');
             out.push_str(&input.protocol);
@@ -911,16 +917,25 @@ fn split_subst(subst: &str) -> (&str, Option<&str>) {
 
 /// Resolve a substitution path into the new URI. Absolute (`/...`) and
 /// scheme-bearing targets are used as-is; relative targets are joined to
-/// `RewriteBase` (or `/`).
-fn resolve_subst_path(path: &str, rs: &RuleSet, _input: &RewriteInput) -> String {
+/// `RewriteBase`, or — when no base is set — to the rule set's OWN directory
+/// (the per-directory prefix), exactly as Apache resolves a relative
+/// substitution in a `.htaccess`. Ignoring the per-directory context here made
+/// every relative substitution in a nested ruleset resolve against `/`.
+fn resolve_subst_path(path: &str, rs: &RuleSet, input: &RewriteInput) -> String {
     if path.is_empty() {
         return "/".to_string();
     }
     if path.starts_with('/') || has_scheme(path) {
         return path.to_string();
     }
-    // Relative: prepend RewriteBase.
-    let base = rs.base.as_deref().unwrap_or("/");
+    let base = match rs.base.as_deref() {
+        Some(b) => b.to_string(),
+        None => match input.per_directory_prefix.as_deref() {
+            // "sub/" (relative to docroot, no leading slash) -> URL space "/sub".
+            Some(prefix) if !prefix.is_empty() => format!("/{}", prefix),
+            _ => "/".to_string(),
+        },
+    };
     let base = base.trim_end_matches('/');
     format!("{base}/{path}")
 }

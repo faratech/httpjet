@@ -408,7 +408,13 @@ pub struct VHostDecl {
     pub name: String,
     pub vh_root: PathBuf,
     pub config_file: PathBuf,
-    pub allow_symbol_link: bool,
+    /// LSWS tri-state `<allowSymbolLink>` on the DECLARATION: `Some(v)` = explicit
+    /// override, `None` = inherit the server-wide `followSymbolLink`.
+    pub allow_symbol_link: Option<bool>,
+    /// (#249 drift class) LSWS `restrained`: confine this vhost's file access to
+    /// vhRoot. httpjet enforces it by refusing symlink-following (the follow arm
+    /// cannot confine targets), i.e. restrained ⇒ allow_symbol_link=false.
+    pub restrained: bool,
     pub enable_script: bool,
     /// The loaded per-vhost configuration (filled by `parse::load`).
     pub config: Option<Arc<VHostConfig>>,
@@ -420,6 +426,10 @@ pub struct VHostConfig {
     pub doc_root: PathBuf,
     pub index_files: Vec<String>,
     pub allow_symbol_link: bool,
+    /// The vhost FILE's explicit `<allowSymbolLink>` (tri-state), collapsed into the
+    /// effective `allow_symbol_link` by `load_vhost_files`: file override → decl
+    /// override → server `followSymbolLink`.
+    pub allow_symbol_link_override: Option<bool>,
     pub rewrite: InlineRewrite,
     pub contexts: Vec<Context>,
     pub script_handlers: Vec<ScriptHandler>,
@@ -438,10 +448,34 @@ pub struct VHostConfig {
     /// for this vhost; `31` ("all", the live install) = fully enabled. Default 0
     /// (off) so a vhost with no `<htAccess>` block never loads `.htaccess`.
     pub allow_override: u32,
+    /// True when the vhost XML carried an EXPLICIT `<allowOverride>` value. An explicit
+    /// `0` forbids ALL override processing outright — `autoLoadHtaccess` must not
+    /// re-enable the chain behind an operator's hardening (audit).
+    pub allow_override_explicit: bool,
+    /// (#248) The vhost's OWN `<logging><accessLog>` file (`useServer=0` + a
+    /// fileName). `None` ⇒ the vhost rides the unified access log.
+    pub access_log_file: Option<VhostLogFile>,
+    /// (#248) The vhost's OWN `<logging><log>` error file. Backend/handler errors
+    /// for this vhost are mirrored here; `None` ⇒ unified error log only.
+    pub error_log_file: Option<VhostLogFile>,
     /// `<htAccess><accessFileName>`. The per-directory override file name; the
     /// parser fills `.htaccess` when the element is absent/empty. Derived
     /// `Default` is `""` — consult [`VHostConfig::access_file_name_or_default`].
     pub access_file_name: String,
+}
+
+/// A per-vhost log file declared in `<logging>` (#248), with LiteSpeed rolling
+/// parameters. `$VAR`s are already substituted at parse time.
+#[derive(Debug, Clone)]
+pub struct VhostLogFile {
+    pub path: PathBuf,
+    /// Roll the live file once it exceeds this many bytes (LSWS `rollingSize`;
+    /// 50M default). `0` disables size rolling.
+    pub rolling_bytes: u64,
+    /// Prune rolled files older than this many days (LSWS `keepDays`; 0 disables).
+    pub keep_days: u64,
+    /// LSWS `logHeaders` bitmask. Nonzero ⇒ request headers accompany each record.
+    pub log_headers: u8,
 }
 
 impl VHostConfig {
@@ -458,6 +492,16 @@ impl VHostConfig {
     /// Whether `.htaccess` (`allowOverride`) is enabled for this vhost.
     pub fn htaccess_allowed(&self) -> bool {
         self.allow_override != 0
+    }
+
+    /// Whether ANY per-directory override processing may run. An EXPLICIT
+    /// `<allowOverride>0</allowOverride>` forbids it outright; a merely-absent
+    /// block defers to `<rewrite><autoLoadHtaccess>`.
+    pub fn overrides_enabled(&self, auto_load_htaccess: bool) -> bool {
+        if self.allow_override == 0 && self.allow_override_explicit {
+            return false;
+        }
+        self.htaccess_allowed() || auto_load_htaccess
     }
 }
 
@@ -486,6 +530,25 @@ pub struct Context {
     pub add_default_charset: bool,
     /// `addDefaultCharsetCustomized`; `None` = server default (UTF-8).
     pub charset: Option<String>,
+    /// (#249) Context-level `<cachePolicy>` (LSWS six-flag set). A context whose
+    /// `enable_cache=0` or `check_public_cache=0` FORBIDS public page-cache
+    /// entries under its URI prefix regardless of the vhost policy; the private
+    /// pair gates the private tier the same way. `None` = block absent ⇒ inherit.
+    pub cache_policy: Option<ContextCachePolicy>,
+}
+
+/// The LSWS per-context cache flags. All six are modeled for fidelity; httpjet's
+/// enforcement uses the public pair (`enable_cache` + `check_public_cache`) and
+/// the private pair (`enable_private_cache` + `check_private_cache`);
+/// `respect_cacheable`/`enable_post_cache` are recorded for parity/diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct ContextCachePolicy {
+    pub check_public_cache: bool,
+    pub check_private_cache: bool,
+    pub respect_cacheable: bool,
+    pub enable_cache: bool,
+    pub enable_private_cache: bool,
+    pub enable_post_cache: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

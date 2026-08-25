@@ -19,6 +19,14 @@ use hj_static::StaticFiles;
 
 use crate::statcache::{DEFAULT_STAT_TTL, StatCache};
 
+/// (#248) A vhost's own access logger plus its `logHeaders` bitmask.
+#[derive(Clone)]
+pub struct VhostAccessLogger {
+    pub logger: Arc<AccessLogger>,
+    /// Nonzero ⇒ request headers accompany each record (LSWS `logHeaders`).
+    pub log_headers: u8,
+}
+
 #[derive(Debug, Clone)]
 pub struct XfCapsuleConfig {
     pub enabled: bool,
@@ -77,6 +85,10 @@ pub struct ServerState {
     pub server: Arc<ServerConfig>,
     pub router: Arc<Router>,
     pub serve_config: ServeConfig,
+    /// Server-wide byte budget shared by every layer that buffers request bodies
+    /// into heap (io_uring H1/H2/H3 transport buffering + hj-lsapi collect_to_cap).
+    /// Process-lifetime: carried across SIGHUP so reservations never straddle two caps.
+    pub body_budget: Arc<hj_core::budget::BodyBufferBudget>,
     /// Terminal static-file handler.
     pub static_handler: StaticFiles,
     /// Per-vhost lsphp pool registry (None if PHP is disabled or the default
@@ -105,6 +117,14 @@ pub struct ServerState {
     pub transforms: Vec<Arc<dyn hj_core::ResponseTransform>>,
     /// Access logger (None if logging could not be set up).
     pub access_log: Option<Arc<AccessLogger>>,
+    /// (#248) Per-vhost access loggers for vhosts declaring their OWN
+    /// `<logging><accessLog useServer=0>` file, with the LSWS `logHeaders` bitmask
+    /// (nonzero = emit request headers with each record). A vhost absent here
+    /// rides the unified [`ServerState::access_log`].
+    pub vhost_access_logs: HashMap<String, VhostAccessLogger>,
+    /// (#248) Per-vhost rolling ERROR writers for vhosts declaring their own
+    /// `<logging><log useServer=0>` file. Receives mirrored 5xx/handler errors.
+    pub vhost_error_logs: HashMap<String, Arc<AccessLogger>>,
     /// Static-file body cache. Shares the page-cache store when `--page-cache` is enabled;
     /// otherwise this is a static-only RAM store with the static tuning caps.
     pub static_cache: Arc<hj_pagecache::PageStore>,
@@ -433,6 +453,7 @@ fn configured_proxy_targets(server: &ServerConfig) -> Vec<ProxyTarget> {
 fn build_transforms(
     static_cache: &Arc<hj_pagecache::PageStore>,
     expires: &Arc<ExpiresRules>,
+    vhost_expires: &HashMap<String, Arc<ExpiresRules>>,
     compress: &Arc<Compress>,
     alt_svc: &Option<http::HeaderValue>,
 ) -> Vec<Arc<dyn hj_core::ResponseTransform>> {
@@ -445,6 +466,7 @@ fn build_transforms(
         }),
         Arc::new(ExpiresTransform {
             expires: expires.clone(),
+            vhost_expires: vhost_expires.clone(),
         }),
         compress.clone(),
         Arc::new(DenyRedirectCdnTransform),
@@ -452,6 +474,27 @@ fn build_transforms(
             alt_svc: alt_svc.clone(),
         }),
     ]
+}
+
+/// Per-vhost `<expires>` blocks (audit): parsed into `VHostConfig.expires` for years
+/// but never consulted — only the server-level `expiresByType` applied. A vhost with
+/// its OWN enabled block overrides the server rules entirely (LSWS semantics).
+fn build_vhost_expires(server: &ServerConfig) -> HashMap<String, Arc<ExpiresRules>> {
+    let mut out = HashMap::new();
+    for (name, decl) in &server.vhosts {
+        let Some(cfg) = &decl.config else { continue };
+        let Some(ex) = &cfg.expires else { continue };
+        if !ex.enabled {
+            continue;
+        }
+        out.insert(
+            name.clone(),
+            Arc::new(ExpiresRules::from_pairs(
+                ex.by_type.iter().map(|(t, v)| (t.clone(), v.clone())),
+            )),
+        );
+    }
+    out
 }
 
 fn static_store_config(server: &ServerConfig) -> hj_pagecache::StoreConfig {
@@ -468,6 +511,20 @@ fn static_store_config(server: &ServerConfig) -> hj_pagecache::StoreConfig {
 }
 
 impl ServerState {
+    /// (#248) The access logger for a request served by `vhost_name`: the vhost's
+    /// own `<logging><accessLog>` file when it declares one, else the unified log.
+    pub fn access_logger_for(&self, vhost_name: &str) -> Option<&Arc<AccessLogger>> {
+        self.vhost_access_logs
+            .get(vhost_name)
+            .map(|v| &v.logger)
+            .or(self.access_log.as_ref())
+    }
+
+    /// (#248) The vhost's own error-log writer, if its `<logging><log>` declares one.
+    pub fn vhost_error_logger(&self, vhost_name: &str) -> Option<&Arc<AccessLogger>> {
+        self.vhost_error_logs.get(vhost_name)
+    }
+
     // Boot-time constructor; the params mirror the CLI flags one-to-one.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -498,11 +555,11 @@ impl ServerState {
         // single node matters more than deep access history.
         let access_log = {
             let path = server.server_root.join("logs/httpjet_access.log");
-            // (#248) This combined log is the ONLY access record (per-vhost
-            // <logging> blocks are parsed nowhere yet), and it rolled at just
-            // 10MB x 7 days — too thin for incident forensics (cache-poisoning
-            // reports, Cloudflare disputes). Defaults raised; env-overridable
-            // without a CLI surface change.
+            // This combined log is the unified access record for every vhost that
+            // does not declare its OWN <logging><accessLog> (#248), and it rolled
+            // at just 10MB x 7 days — too thin for incident forensics
+            // (cache-poisoning reports, Cloudflare disputes). Defaults raised;
+            // env-overridable without a CLI surface change.
             let rolling_bytes = std::env::var("HTTPJET_ACCESS_ROLLING_BYTES")
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
@@ -520,9 +577,60 @@ impl ServerState {
             )))
         };
 
+        // (#248) One rolling writer per vhost declaring its own access file.
+        let mut vhost_access_logs: HashMap<String, VhostAccessLogger> = HashMap::new();
+        let mut vhost_error_logs: HashMap<String, Arc<AccessLogger>> = HashMap::new();
+        for (name, decl) in &server.vhosts {
+            let Some(cfg) = decl.config.as_deref() else {
+                continue;
+            };
+            let Some(spec) = cfg.access_log_file.as_ref() else {
+                continue;
+            };
+            tracing::info!(
+                vhost = %name,
+                path = %spec.path.display(),
+                "per-vhost access log active (LSWS <logging><accessLog useServer=0>)"
+            );
+            vhost_access_logs.insert(
+                name.clone(),
+                VhostAccessLogger {
+                    logger: Arc::new(AccessLogger::spawn(
+                        &spec.path,
+                        LogFormat::Combined,
+                        spec.rolling_bytes,
+                        spec.keep_days,
+                        false,
+                    )),
+                    log_headers: spec.log_headers,
+                },
+            );
+            // (#248) The matching per-vhost error file (rolling writer reused for
+            // arbitrary error lines).
+            if let Some(err) = cfg.error_log_file.as_ref() {
+                vhost_error_logs.insert(
+                    name.clone(),
+                    Arc::new(AccessLogger::spawn(
+                        &err.path,
+                        LogFormat::Combined,
+                        err.rolling_bytes,
+                        err.keep_days,
+                        false,
+                    )),
+                );
+            }
+        }
+
         // Parse Alt-Svc once (unparseable degrades to none) and build the transform pipeline.
         let alt_svc = alt_svc.and_then(|s| http::HeaderValue::from_str(&s).ok());
-        let transforms = build_transforms(&static_cache, &cd.expires, &cd.compress, &alt_svc);
+        let vhost_expires = build_vhost_expires(&server);
+        let transforms = build_transforms(
+            &static_cache,
+            &cd.expires,
+            &vhost_expires,
+            &cd.compress,
+            &alt_svc,
+        );
         // Bound on concurrent stale-while-revalidate background renders. Kept small so a
         // burst of stale hits can't starve live traffic of lsphp workers; excess refreshes
         // are skipped (the stale entry stays servable and the next hit retries).
@@ -558,6 +666,13 @@ impl ServerState {
             page_cache_admit_base,
             xf_capsule,
             serve_config: cd.serve_config,
+            // One server-wide buffered-body cap shared with the LSAPI handlers'
+            // collect_to_cap (when PHP is enabled); transports reserve here too.
+            body_budget: lsapi.as_ref().map(|r| r.body_budget()).unwrap_or_else(|| {
+                Arc::new(hj_core::budget::BodyBufferBudget::new(
+                    hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
+                ))
+            }),
             static_handler: cd.static_handler,
             lsapi,
             proxy: Arc::new(Proxy::new()),
@@ -569,6 +684,8 @@ impl ServerState {
             compress: cd.compress,
             transforms,
             access_log,
+            vhost_access_logs,
+            vhost_error_logs,
             static_cache,
             stat_cache: Arc::new(StatCache::new(DEFAULT_STAT_TTL)),
             rewrite_outcomes: Arc::new(crate::pipeline::RewriteOutcomeCache::new(
@@ -624,8 +741,14 @@ impl ServerState {
         old.ua_classify.clear();
         // Rebuild the transform pipeline from the NEW expires/compress + carried-over
         // static cache/alt_svc, so the reloaded generation behaves identically.
-        let transforms =
-            build_transforms(&old.static_cache, &cd.expires, &cd.compress, &old.alt_svc);
+        let transforms = build_transforms(
+            &old.static_cache,
+            &cd.expires,
+            // Per-vhost <expires> is config-derived: a SIGHUP re-reads it live.
+            &build_vhost_expires(&server),
+            &cd.compress,
+            &old.alt_svc,
+        );
         let proxy = Arc::new(old.proxy.next_generation(configured_proxy_targets(&server)));
         // (#234) The PageStore freezes its `StoreConfig` at BOOT (main.rs builds it
         // exactly once and this reload carries the same Arc forward), so a SIGHUP
@@ -649,11 +772,38 @@ impl ServerState {
                      apply it (per-vhost <cache> blocks hot-apply; this warning does not)"
                 );
             }
+            // (#234 residual) The boot-frozen fields are NOT only those four: the
+            // static-cache object caps are derived from <tuning> once at boot, so a
+            // SIGHUP tuning edit also silently keeps the old behavior. Say so.
+            let (ot, nt) = (&old.server.tuning, &server.tuning);
+            if ot.max_mmap_file_size != nt.max_mmap_file_size
+                || ot.max_cached_file_size != nt.max_cached_file_size
+                || ot.total_in_mem_cache_size != nt.total_in_mem_cache_size
+                || ot.total_mmap_cache_size != nt.total_mmap_cache_size
+            {
+                tracing::warn!(
+                    "SIGHUP: <tuning> cache-size caps changed but maxStaticObjBytes was \
+                     frozen from them at BOOT — RESTART httpjet to apply"
+                );
+            }
+        }
+        // (#234 residual) quicEnable is read exactly once at boot to build the H3
+        // listener; a SIGHUP flip neither applies nor warns — make it loud instead.
+        if old.server.quic_enable != server.quic_enable {
+            tracing::warn!(
+                old = old.server.quic_enable,
+                new = server.quic_enable,
+                "SIGHUP: <quic><quicEnable> changed but the QUIC/H3 listener is fixed at \
+                 BOOT — RESTART httpjet to apply"
+            );
         }
         Arc::new(ServerState {
             server,
             router: cd.router,
             serve_config: cd.serve_config,
+            // Process-lifetime budget: reservations in flight when a SIGHUP lands must
+            // release against the SAME cap they were admitted under.
+            body_budget: old.body_budget.clone(),
             static_handler: cd.static_handler,
             inline_rules: cd.inline_rules,
             ext_by_name: cd.ext_by_name,
@@ -672,6 +822,11 @@ impl ServerState {
             rewrite_ua_classify: old.rewrite_ua_classify,
             ua_classify: old.ua_classify.clone(),
             access_log: old.access_log.clone(),
+            // (#248) Per-vhost log writers are process-lifetime like the unified one:
+            // a SIGHUP that adds/removes a vhost log file takes effect on RESTART
+            // (spawning duplicate writers per generation would double-write).
+            vhost_access_logs: old.vhost_access_logs.clone(),
+            vhost_error_logs: old.vhost_error_logs.clone(),
             page_cache: old.page_cache.clone(),
             page_cache_dicts: old.page_cache_dicts.clone(),
             page_cache_inflight: old.page_cache_inflight.clone(),
@@ -756,7 +911,8 @@ mod tests {
                     name: name.into(),
                     vh_root: root.to_path_buf(),
                     config_file: PathBuf::new(),
-                    allow_symbol_link: true,
+                    allow_symbol_link: Some(true),
+                    restrained: false,
                     enable_script: true,
                     config: Some(Arc::new(vhost)),
                 },

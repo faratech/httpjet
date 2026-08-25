@@ -835,7 +835,11 @@ async fn directory_index_traversal_rejected() {
     assert_eq!(resp.status(), StatusCode::OK);
     let (path, _) = body_is_file(resp.body()).unwrap();
     assert_eq!(path, root.join("sub/index.html"));
-    assert!(!read_file_body(resp.body()).windows(10).any(|w| w == b"TOP SECRET"));
+    assert!(
+        !read_file_body(resp.body())
+            .windows(10)
+            .any(|w| w == b"TOP SECRET")
+    );
 
     // Root-dir request with the same hostile list: still serves index.html.
     let vhost = Arc::new(VHostConfig {
@@ -1513,6 +1517,32 @@ fn open_beneath_refuses_intermediate_symlink() {
         res.is_err(),
         "open_beneath must refuse an intermediate symlink when allow_symlink=false"
     );
+    fs::remove_dir_all(&root).ok();
+}
+
+/// (audit M3) A FIFO planted in the served tree must not block the caller: the
+/// resolver opens with O_NONBLOCK, fstats what actually came back, and refuses
+/// non-regular files. Without NONBLOCK a reader-less FIFO parks the thread inside
+/// open(2) forever — one stalled executor thread per request. This test doubles as
+/// that regression gate: a hang here IS the bug.
+#[test]
+fn open_beneath_refuses_fifo_without_blocking() {
+    let root = temp_root("fifo_unit");
+    // std's mkfifo is still unstable and rustix doesn't expose mknod here; the
+    // coreutils binary is fine for a test fixture.
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(root.join("stall"))
+            .status()
+            .expect("mkfifo")
+            .success()
+    );
+    let root_fd = open_dir(&root).unwrap();
+
+    // allow_symlink=true exercises the plain-openat arm (the one that used to
+    // block); no writer exists, so a blocking open would never return.
+    let res = open_beneath(&root_fd, "stall", true);
+    assert!(res.is_err(), "a FIFO must be refused, not served");
     fs::remove_dir_all(&root).ok();
 }
 

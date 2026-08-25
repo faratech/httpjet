@@ -375,6 +375,14 @@ impl LsapiRegistry {
         })
     }
 
+    /// The server-wide buffered-body budget every handler built from this
+    /// registry reserves against. The server state adopts this SAME instance for
+    /// its io_uring transport buffering paths (#236 residual), so one cap bounds
+    /// the whole pipeline instead of one per layer.
+    pub fn body_budget(&self) -> Arc<BodyBufferBudget> {
+        self.params.body_budget.clone()
+    }
+
     /// Attach the process-independent epoch used by an EXTERNAL client pool.
     /// Call before [`Self::start_default`]. A missing or malformed file is
     /// deliberately non-fatal so the static/cache web tier can still start.

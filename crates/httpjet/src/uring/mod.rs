@@ -444,6 +444,11 @@ pub(crate) fn spawn_uring_h3(
                 )
             },
             active_conns,
+            // (#236 residual) process-lifetime budget shared with H1/H2/LSAPI.
+            {
+                let b = holder.load();
+                b.body_budget.clone()
+            },
         )
     };
     let bridge = build_pipeline_bridge(holder, listener_name, admission);
@@ -843,6 +848,8 @@ async fn serve_h2_bridged<S>(
     h2_cfg.preface_timeout = state.serve_config.header_read_timeout;
     h2_cfg.header_list_size = state.serve_config.max_req_header_size as u32;
     h2_cfg.max_request_body = state.serve_config.max_req_body_size;
+    // (#236 residual) share the server-wide buffered-body cap with H1/H3/LSAPI.
+    h2_cfg.body_budget = Some(state.body_budget.clone());
 
     let service = move |req: hj_core::Request| {
         let core = core.clone();
@@ -909,6 +916,11 @@ async fn handle_h1_bridged<S>(
         // finishes. (A read cancelled here is harmless: we close immediately, so the
         // non-cancel-safe TLS read buffer is never touched again.)
         if acc.is_empty() {
+            // (audit M2) One huge upload used to pin its peak `acc` capacity on this
+            // keep-alive connection forever; hand it back at the request boundary.
+            if acc.capacity() > 256 * 1024 {
+                acc = Vec::with_capacity(8192);
+            }
             let keep_alive_timeout = state.serve_config.keep_alive_timeout;
             monoio::select! {
                 biased;
@@ -940,6 +952,7 @@ async fn handle_h1_bridged<S>(
                         let mut cl_values: Vec<&[u8]> = Vec::new();
                         let mut chunked = false;
                         let mut te_other = false;
+                        let mut host_count = 0usize;
                         let mut conn_close = req.version == Some(0);
                         // RFC 7231 §5.1.1: honor `Expect: 100-continue` (HTTP/1.1 only) by
                         // sending an interim 100 before reading the body, so a client that
@@ -963,6 +976,8 @@ async fn handle_h1_bridged<S>(
                                     te_other = true;
                                 }
                                 continue;
+                            } else if h.name.eq_ignore_ascii_case("host") {
+                                host_count += 1;
                             } else if h.name.eq_ignore_ascii_case("connection") {
                                 // RFC 7230 §6.1: Connection is a comma-separated token list
                                 // (e.g. `close, Upgrade`). Match each token, not the whole
@@ -989,8 +1004,15 @@ async fn handle_h1_bridged<S>(
                         // duplicate CL values. (A malformed/duplicate CL silently coerced to a length
                         // would frame the body short and leak the trailing bytes as the next request.)
                         // Decided by `codec::classify_framing` so the served path and the fuzzers agree.
-                        let framing =
-                            classify_framing(cl_values.iter().copied(), chunked, te_other);
+                        let framing = if host_count > 1 {
+                            // RFC 9112 §3.2: a request with multiple Host lines is malformed
+                            // (MUST reject or replace). Routing, foreign-host protection and
+                            // cache keys read only the first while hj-proxy forwards BOTH —
+                            // so reject rather than forward the ambiguity.
+                            BodyFraming::Reject
+                        } else {
+                            classify_framing(cl_values.iter().copied(), chunked, te_other)
+                        };
                         ParsedReq::Done {
                             method,
                             path,
@@ -1067,6 +1089,11 @@ async fn handle_h1_bridged<S>(
         if keepalive_exhausted(served, max_keepalive) {
             keep_alive = false;
         }
+        // Server-wide buffered-body reservation (#236 residual): the transport commits
+        // body bytes to heap BEFORE any handler runs, so the cap must be enforced here,
+        // not only in hj-lsapi's collect_to_cap. The lease is held for the rest of this
+        // keep-alive iteration (the buffered Bytes live exactly that long).
+        let mut body_lease: Option<hj_core::budget::BodyBufferLease> = None;
         let body_bytes: bytes::Bytes = match framing {
             BodyFraming::Reject => {
                 write_status_close(&mut stream, 400, "Bad Request").await;
@@ -1077,6 +1104,18 @@ async fn handle_h1_bridged<S>(
                 // up front (413) instead of reading gigabytes into `acc`.
                 if content_length > max_body {
                     write_status_close(&mut stream, 413, "Payload Too Large").await;
+                    return;
+                }
+                if content_length > 0
+                    && !body_lease
+                        .get_or_insert_with(|| {
+                            hj_core::budget::BodyBufferLease::new(state.body_budget.clone())
+                        })
+                        .reserve(content_length as u64)
+                {
+                    // Server capacity, not client error — same status collect_to_cap uses.
+                    tracing::debug!(%ctx.peer, "uring h1: body buffer budget exhausted");
+                    write_status_close(&mut stream, 503, "Service Unavailable").await;
                     return;
                 }
                 let total = head_len.saturating_add(content_length);
@@ -1106,8 +1145,26 @@ async fn handle_h1_bridged<S>(
                 if expect_continue {
                     write_continue(&mut stream).await;
                 }
+                // Reserve incrementally AS BYTES DECODE (never trust the client's framing
+                // to pre-declare anything): the decoded length is the heap we commit.
+                let mut decoded_prev = 0usize;
                 let end = loop {
-                    match dec.advance(&acc) {
+                    let step = dec.advance(&acc);
+                    let grown = dec.body.len() - decoded_prev;
+                    if grown > 0 {
+                        let ok = body_lease
+                            .get_or_insert_with(|| {
+                                hj_core::budget::BodyBufferLease::new(state.body_budget.clone())
+                            })
+                            .reserve(grown as u64);
+                        if !ok {
+                            tracing::debug!(%ctx.peer, "uring h1: body buffer budget exhausted");
+                            write_status_close(&mut stream, 503, "Service Unavailable").await;
+                            return;
+                        }
+                        decoded_prev = dec.body.len();
+                    }
+                    match step {
                         ChunkStep::Done(end) => break end,
                         ChunkStep::Bad => {
                             write_status_close(&mut stream, 400, "Bad Request").await;
@@ -1150,7 +1207,14 @@ async fn handle_h1_bridged<S>(
         }
         let mut req = match builder.body(body) {
             Ok(r) => r,
-            Err(_) => return,
+            // (#233 residual) httparse accepts request-target bytes that `http::Uri`
+            // rejects (`"`, `<`, `\`, `^`, `{`, `|`, `}`, DEL, raw >=0x80): the builder
+            // records the URI error and surfaces it here. Silent-close repeats the
+            // original defect one layer down — answer 400 + close.
+            Err(_) => {
+                write_status_close(&mut stream, 400, "Bad Request").await;
+                return;
+            }
         };
         let mut upgrade_ready = None;
         if hj_proxy::is_websocket_upgrade(req.headers()) {
@@ -2157,6 +2221,40 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         assert_eq!(parse_chunk_size(b"FF;name=value"), Some(255));
         assert_eq!(parse_chunk_size(b""), None);
         assert_eq!(parse_chunk_size(b"zz"), None);
+        // (#232 class) 1*HEXDIG only: from_str_radix would accept a leading '+'.
+        assert_eq!(parse_chunk_size(b"+2"), None);
+        // ASCII-OWS padding is fine; Unicode whitespace is not.
+        assert_eq!(parse_chunk_size(b" 2 "), Some(2));
+        assert_eq!(parse_chunk_size(b"\xc2\xa02"), None);
+    }
+
+    #[test]
+    fn resolve_content_length_rejects_signed_padded_forms() {
+        // (#232 + residual) digit-only after an ASCII-OWS trim: no '+', no obs-text.
+        assert_eq!(
+            resolve_content_length([b"5".as_slice()].into_iter()),
+            Ok(Some(5))
+        );
+        assert_eq!(
+            resolve_content_length([b" 7 ".as_slice()].into_iter()),
+            Ok(Some(7))
+        );
+        assert_eq!(
+            resolve_content_length([b"+5".as_slice()].into_iter()),
+            Err(())
+        );
+        // U+00A0 (0xC2 0xA0) padding survives httparse header values but must not
+        // be stripped by a Unicode-aware trim into a "valid" length.
+        assert_eq!(
+            resolve_content_length([b"\xc2\xa05".as_slice()].into_iter()),
+            Err(())
+        );
+        assert_eq!(resolve_content_length([].into_iter()), Ok(None));
+        assert_eq!(
+            resolve_content_length([b"5".as_slice(), b"6".as_slice()].into_iter()),
+            Err(()),
+            "conflicting duplicates are unframable"
+        );
     }
 
     #[test]

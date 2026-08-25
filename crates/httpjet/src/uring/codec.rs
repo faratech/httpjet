@@ -91,7 +91,11 @@ pub fn resolve_content_length<'a>(
         // from every conformant stack framing the same bytes.
         let parsed = std::str::from_utf8(v)
             .ok()
-            .map(str::trim)
+            // (#232 residual) Trim ASCII OWS ONLY: str::trim is Unicode-aware, so
+            // obs-text padding bytes (httparse passes 0x80..=0xFF header values)
+            // would be stripped here and a non-conformant length like "\xc2\xa05"
+            // would frame as 5 where hyper/LiteSpeed return 400.
+            .map(|s| s.trim_matches([' ', '\t']))
             .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
             .and_then(|s| s.parse::<usize>().ok())
             .ok_or(())?;
@@ -138,11 +142,16 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
 /// Parse a chunk-size line (hex size, optional `;ext`). Returns None on garbage.
 pub fn parse_chunk_size(line: &[u8]) -> Option<usize> {
     let hex = line.split(|&b| b == b';').next().unwrap_or(line);
-    let s = std::str::from_utf8(hex).ok()?.trim();
-    if s.is_empty() {
+    // (#232 class) Validate 1*HEXDIG ourselves after trimming ASCII OWS:
+    // `usize::from_str_radix` accepts a leading '+' ("+2" → 2), which RFC 9112
+    // §7.1 forbids and conformant stacks reject.
+    let start = hex.iter().position(|b| *b != b' ' && *b != b'\t')?;
+    let end = hex.iter().rposition(|b| *b != b' ' && *b != b'\t')?;
+    let trimmed = &hex[start..=end];
+    if trimmed.is_empty() || !trimmed.iter().all(u8::is_ascii_hexdigit) {
         return None;
     }
-    usize::from_str_radix(s, 16).ok()
+    usize::from_str_radix(std::str::from_utf8(trimmed).ok()?, 16).ok()
 }
 
 pub enum ChunkStep {

@@ -691,7 +691,20 @@ fn build_server_config_inner(
     // SO_REUSEPORT worker tasks in this process (one `ServerConfig` Arc). It is per
     // process: a restart (deploy) starts cold and cannot resume the post-restart burst —
     // this lifts steady-state churn, not the cold-start reconnect.
-    config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
+    //
+    // (audit) NOT for a client-cert-verifying listener: rustls persists the presented
+    // client-cert chain INSIDE the stored session value and reinstalls it as
+    // peer_certificates on a RESUMED handshake — an actor holding any earlier ticket
+    // would pass the app-layer mTLS gate (`has_client_cert`) without presenting a
+    // certificate at all. rustls resumes ONLY through this store (no bare session-ID
+    // path), so leaving the default here disables resumption outright on that
+    // listener and forces the full handshake, which presents (or omits) the cert
+    // fresh every time.
+    if tls.client_verify != 0 {
+        // keep the rustls default (no session storage ⇒ no resumption)
+    } else {
+        config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
+    }
 
     Ok((Arc::new(config), CertReloadHandle(cert_swap)))
 }
@@ -994,7 +1007,8 @@ mod tests {
             name: name.to_string(),
             vh_root: PathBuf::from("/tmp"),
             config_file: PathBuf::from("/tmp/x.xml"),
-            allow_symbol_link: false,
+            allow_symbol_link: None,
+            restrained: false,
             enable_script: false,
             config: Some(Arc::new(vhconf)),
         }
