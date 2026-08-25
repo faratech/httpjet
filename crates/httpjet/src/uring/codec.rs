@@ -85,9 +85,15 @@ pub fn resolve_content_length<'a>(
 ) -> Result<Option<usize>, ()> {
     let mut out: Option<usize> = None;
     for v in values {
+        // (#232) Digit-only: Rust's unsigned FromStr accepts a leading '+'
+        // ("+5" → 5), but RFC 9110 §8.6 defines field-length as 1*DIGIT and
+        // hyper/LiteSpeed reject the signed form — admitting it here diverges
+        // from every conformant stack framing the same bytes.
         let parsed = std::str::from_utf8(v)
             .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|s| s.parse::<usize>().ok())
             .ok_or(())?;
         if out.is_some_and(|prev| prev != parsed) {
             return Err(());

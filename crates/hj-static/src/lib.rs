@@ -783,6 +783,10 @@ fn resolve_file(
         // SC_404 (NOT 403). 403 is reserved for EACCES on open/stat, which
         // `map_open_err` already produces.
         for idx in index_files {
+            if !safe_index_name(idx) {
+                // (#244) Fail closed: skip the entry entirely, never open it.
+                continue;
+            }
             let child_rel = if rel_str.is_empty() {
                 idx.clone()
             } else {
@@ -976,6 +980,18 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 ///     inside the tree. The request path has already been lexically cleaned of
 ///     `..`, so the only escape vector is an intentional in-tree symlink, which
 ///     the operator opted into. A plain `openat` (following symlinks) is used.
+/// (#244) A `.htaccess` `DirectoryIndex` entry reaches this module verbatim —
+/// it is operator/app-controlled config, NOT the lexically-cleaned request
+/// path. An entry like `../../../etc/passwd` formatted into `child_rel` would
+/// escape the docroot through [`open_beneath`]'s follow-symlink `openat` arm,
+/// whose safety rests on the caller having already cleaned `..` away. Reject
+/// any index name that is not a safe root-confined relative path.
+fn safe_index_name(idx: &str) -> bool {
+    !idx.is_empty()
+        && !idx.starts_with('/')
+        && !idx.split(['/', '\\']).any(|seg| seg == "..")
+}
+
 fn open_beneath(
     root_fd: &OwnedFd,
     rel: &str,

@@ -806,6 +806,52 @@ async fn traversal_rejected() {
 }
 
 #[tokio::test]
+async fn directory_index_traversal_rejected() {
+    // (#244) A .htaccess/vhost DirectoryIndex entry is config-controlled, not
+    // the lexically-cleaned request path. Entries carrying `..` (or absolute)
+    // must be skipped fail-closed, never opened beneath-or-beyond the docroot.
+    let root = temp_root("idxtv");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::write(root.join("sub/index.html"), b"safe").unwrap();
+    fs::write(root.join("index.html"), b"root-safe").unwrap();
+    fs::write(root.join("secret.txt"), b"TOP SECRET").unwrap();
+
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.join("sub"),
+        index_files: vec![
+            "../../secret.txt".to_string(),
+            "../secret.txt".to_string(),
+            "/etc/passwd".to_string(),
+            "..\\secret.txt".to_string(),
+            "index.html".to_string(),
+        ],
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+
+    // doc_root IS the "sub" dir: GET / resolves its index. Hostile entries must
+    // be skipped; only index.html may answer.
+    let resp = serve(&mut ctx, req(Method::GET, "/")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (path, _) = body_is_file(resp.body()).unwrap();
+    assert_eq!(path, root.join("sub/index.html"));
+    assert!(!read_file_body(resp.body()).windows(10).any(|w| w == b"TOP SECRET"));
+
+    // Root-dir request with the same hostile list: still serves index.html.
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        index_files: vec!["../sub/index.html".to_string(), "index.html".to_string()],
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    let resp = serve(&mut ctx, req(Method::GET, "/")).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (path, _) = body_is_file(resp.body()).unwrap();
+    assert_eq!(path, root.join("index.html"));
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn no_symlink_vhost_serves_from_verified_bytes_not_path_reopen() {
     // (#10) With followSymbolLink off, the response body must carry bytes read through a fresh
     // symlink-safe open (FileBody.cached), so the transport never re-opens the followable path —

@@ -498,11 +498,24 @@ impl ServerState {
         // single node matters more than deep access history.
         let access_log = {
             let path = server.server_root.join("logs/httpjet_access.log");
+            // (#248) This combined log is the ONLY access record (per-vhost
+            // <logging> blocks are parsed nowhere yet), and it rolled at just
+            // 10MB x 7 days — too thin for incident forensics (cache-poisoning
+            // reports, Cloudflare disputes). Defaults raised; env-overridable
+            // without a CLI surface change.
+            let rolling_bytes = std::env::var("HTTPJET_ACCESS_ROLLING_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(50 * 1024 * 1024);
+            let keep_days = std::env::var("HTTPJET_ACCESS_KEEP_DAYS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30);
             Some(Arc::new(AccessLogger::spawn(
                 path,
                 LogFormat::Combined,
-                10 * 1024 * 1024,
-                7,
+                rolling_bytes,
+                keep_days,
                 true,
             )))
         };
@@ -614,6 +627,29 @@ impl ServerState {
         let transforms =
             build_transforms(&old.static_cache, &cd.expires, &cd.compress, &old.alt_svc);
         let proxy = Arc::new(old.proxy.next_generation(configured_proxy_targets(&server)));
+        // (#234) The PageStore freezes its `StoreConfig` at BOOT (main.rs builds it
+        // exactly once and this reload carries the same Arc forward), so a SIGHUP
+        // edit to the server-level `<cache>` block silently keeps the boot-time
+        // TTL/status/POST policy even though the reload logs success. Per-vhost
+        // `<cache>` blocks DO hot-apply (`vhost_allows_public` reads them live) —
+        // only these four boot-frozen fields can diverge. Say so loudly instead of
+        // letting an operator believe a mitigation took effect.
+        if old.page_cache.is_some() {
+            let (o, n) = (&old.server.cache, &server.cache);
+            if o.default_ttl_secs != n.default_ttl_secs
+                || o.default_private_ttl_secs != n.default_private_ttl_secs
+                || o.cacheable_status != n.cacheable_status
+                || o.enable_post_cache != n.enable_post_cache
+            {
+                tracing::warn!(
+                    old_ttl = o.default_ttl_secs,
+                    new_ttl = n.default_ttl_secs,
+                    "SIGHUP: server-level <cache> policy changed but the running page-cache \
+                     store keeps its BOOT-time TTL/status/POST settings — RESTART httpjet to \
+                     apply it (per-vhost <cache> blocks hot-apply; this warning does not)"
+                );
+            }
+        }
         Arc::new(ServerState {
             server,
             router: cd.router,

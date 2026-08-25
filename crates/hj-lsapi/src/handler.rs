@@ -61,6 +61,7 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -260,6 +261,87 @@ pub struct Lsapi {
     /// Tier 1 total processing-time deadline across the response read. `None`
     /// disables it (only the per-read idle `read_timeout` applies).
     max_process_time: Option<Duration>,
+    /// Server-wide cap on heap currently held by buffered (chunked / no-CL)
+    /// request bodies (#236). Shared by every handler built from the registry.
+    body_budget: Arc<BodyBufferBudget>,
+}
+
+/// Server-wide byte budget for request bodies that must be fully buffered into
+/// heap before pool admission (the chunked / no-Content-Length path). Without it,
+/// aggregate buffered memory is attacker-controlled: N slow connections each
+/// streaming up to `max_body` commit `N x max_body` of heap regardless of worker
+/// count. Reservation happens incrementally AS FRAMES ARRIVE, so small bodies
+/// always admit and only genuinely large concurrent uploads contend.
+#[derive(Debug)]
+pub struct BodyBufferBudget {
+    max_bytes: u64,
+    in_flight: AtomicU64,
+}
+
+/// Default server-wide budget for buffered bodies: generous against real
+/// chunked-upload traffic, hard against memory-exhaustion floods.
+pub const DEFAULT_BODY_BUFFER_MEM: u64 = 512 * 1024 * 1024;
+
+impl BodyBufferBudget {
+    pub fn new(max_bytes: u64) -> Self {
+        Self { max_bytes, in_flight: AtomicU64::new(0) }
+    }
+
+    /// Reserve `n` more bytes if the budget allows; false when exhausted.
+    fn try_acquire(&self, n: u64) -> bool {
+        if self.max_bytes == 0 {
+            return true; // 0 = accounting disabled
+        }
+        let mut cur = self.in_flight.load(Ordering::Relaxed);
+        loop {
+            if cur.saturating_add(n) > self.max_bytes {
+                return false;
+            }
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                cur + n,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    fn release(&self, n: u64) {
+        if self.max_bytes == 0 || n == 0 {
+            return;
+        }
+        let prev = self.in_flight.fetch_sub(n, Ordering::AcqRel);
+        debug_assert!(prev >= n, "body-budget underflow");
+    }
+
+    /// Bytes currently reserved by live buffered bodies.
+    pub fn in_flight(&self) -> u64 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+}
+
+/// RAII lease on bytes reserved from a [`BodyBufferBudget`]. Held alongside the
+/// collected buffer for the rest of the request so the reservation tracks the
+/// buffer's actual lifetime; released exactly once on drop (including error paths).
+#[derive(Debug)]
+struct BodyBufferLease {
+    budget: Arc<BodyBufferBudget>,
+    held: u64,
+}
+
+impl BodyBufferLease {
+    fn new(budget: Arc<BodyBufferBudget>) -> Self {
+        Self { budget, held: 0 }
+    }
+}
+
+impl Drop for BodyBufferLease {
+    fn drop(&mut self) {
+        self.budget.release(self.held);
+    }
 }
 
 impl Lsapi {
@@ -274,7 +356,15 @@ impl Lsapi {
             monitor: None,
             retry: true,
             max_process_time: None,
+            body_budget: Arc::new(BodyBufferBudget::new(DEFAULT_BODY_BUFFER_MEM)),
         }
+    }
+
+    /// Share a server-wide buffered-body [`BodyBufferBudget`] (the registry wires
+    /// one instance so every pool's handlers draw from the same cap).
+    pub fn body_buffer_budget(mut self, budget: Arc<BodyBufferBudget>) -> Self {
+        self.body_budget = budget;
+        self
     }
 
     /// Attach the resilience [`Monitor`]. Enables pre-flush retry, fast-503 on a
@@ -396,9 +486,19 @@ impl Handler for Lsapi {
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok());
+        // (#236) The lease lives to the end of `handle` so the reservation tracks
+        // the buffered body's lifetime, not just the collection loop. Never read —
+        // held purely for its Drop.
+        #[allow(unused_variables, unused_assignments)]
+        let mut body_lease: Option<BodyBufferLease> = None;
         let buffered: Option<Bytes> = match declared_len {
             Some(_) => None,
-            None => Some(collect_to_cap(req.body_mut(), self.max_body).await?),
+            None => {
+                let (b, lease) =
+                    collect_to_cap(req.body_mut(), self.max_body, &self.body_budget).await?;
+                body_lease = Some(lease);
+                Some(b)
+            }
         };
         if let Some(b) = &buffered {
             let value = http::HeaderValue::from_str(&b.len().to_string())
@@ -1693,11 +1793,19 @@ fn parse_response_content_length(
 /// (returns `PayloadTooLarge` the moment the accumulated size exceeds the cap, so
 /// a runaway chunked body cannot OOM us). Used for the chunked (no Content-Length)
 /// path where we must learn the length before sending a concrete `m_reqBodyLen`.
+///
+/// (#236) Every frame also reserves against the server-wide [`BodyBufferBudget`]
+/// before it enters heap, so aggregate buffered memory across concurrent chunked
+/// uploads is bounded by the budget rather than `connections x max_body`. Returns
+/// the buffer plus its [`BodyBufferLease`] — keep the lease alive alongside the
+/// buffer and exhaustion maps to 503 (server capacity), not 413.
 async fn collect_to_cap(
     body: &mut hj_core::IncomingBody,
     max_body: u64,
-) -> Result<Bytes, HandlerError> {
+    budget: &Arc<BodyBufferBudget>,
+) -> Result<(Bytes, BodyBufferLease), HandlerError> {
     use http_body_util::BodyExt;
+    let mut lease = BodyBufferLease::new(Arc::clone(budget));
     // (L8) Pre-size the collector instead of growing an empty BytesMut frame by frame: an 8 KiB
     // floor covers the common small chunked POST without the 0→8→…→8 KiB realloc chain, bounded
     // by `max_body` so a tiny cap can't over-allocate. (This is the chunked / no-Content-Length
@@ -1711,13 +1819,17 @@ async fn collect_to_cap(
             if (buf.len() as u64) + (data.len() as u64) > max_body {
                 return Err(HandlerError::PayloadTooLarge);
             }
+            if !lease.budget.try_acquire(data.len() as u64) {
+                return Err(HandlerError::ServiceUnavailable);
+            }
+            lease.held += data.len() as u64;
             buf.extend_from_slice(data);
         }
     }
     if buf.len() > i32::MAX as usize {
         return Err(HandlerError::PayloadTooLarge);
     }
-    Ok(buf.freeze())
+    Ok((buf.freeze(), lease))
 }
 
 /// (#3) The BEGIN_REQUEST frame length-prefixes every env key/value (and every
@@ -1983,6 +2095,84 @@ mod overflow_tests {
     fn oversized_key_overflows() {
         let fields = vec![("X".repeat(70000), "v".to_string())];
         assert!(lsapi_fields_overflow_u16(&fields));
+    }
+}
+
+#[cfg(test)]
+mod body_budget_tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
+    use hj_core::{HandlerError, IncomingBody};
+
+    use super::{BodyBufferBudget, collect_to_cap};
+
+    /// A single-frame body of `len` bytes (one data frame => one budget acquire).
+    fn body_of(len: usize) -> IncomingBody {
+        http_body_util::Full::<Bytes>::new(vec![0u8; len].into())
+            .map_err(|e| Box::new(e) as hj_core::BoxError)
+            .boxed()
+    }
+
+    // (#236) Concurrent chunked uploads must be bounded by the server-wide
+    // budget, not by connections x max_body.
+    #[tokio::test]
+    async fn concurrent_bodies_respect_global_budget() {
+        let budget = Arc::new(BodyBufferBudget::new(1024 * 1024)); // 1 MiB total
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let b = budget.clone();
+            tasks.push(tokio::spawn(async move {
+                // Each upload wants 512 KiB against a 1 MiB shared budget: at
+                // most two can ever be resident at once.
+                collect_to_cap(&mut body_of(512 * 1024), 16 * 1024 * 1024, &b).await
+            }));
+        }
+        let (mut ok, mut unavailable) = (0usize, 0usize);
+        let mut leases = Vec::new();
+        for t in tasks {
+            match t.await.unwrap() {
+                Ok((_, lease)) => {
+                    ok += 1;
+                    leases.push(lease);
+                }
+                Err(HandlerError::ServiceUnavailable) => unavailable += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert_eq!(ok + unavailable, 8);
+        assert!(unavailable >= 1, "budget must reject when exhausted");
+        assert!(ok >= 1, "budget must still admit under the cap");
+        drop(leases);
+        assert_eq!(budget.in_flight(), 0, "leases must release exactly once");
+    }
+
+    #[tokio::test]
+    async fn small_body_admits_and_releases() {
+        let budget = Arc::new(BodyBufferBudget::new(64 * 1024));
+        let (buf, lease) =
+            collect_to_cap(&mut body_of(16 * 1024), 1024 * 1024, &budget).await.unwrap();
+        assert_eq!(buf.len(), 16 * 1024);
+        assert_eq!(budget.in_flight(), 16 * 1024);
+        drop(lease);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn per_request_cap_still_wins_over_budget() {
+        let budget = Arc::new(BodyBufferBudget::new(u64::MAX));
+        let err = collect_to_cap(&mut body_of(2 * 1024 * 1024), 1024 * 1024, &budget)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HandlerError::PayloadTooLarge));
+    }
+
+    #[test]
+    fn zero_budget_disables_accounting() {
+        let budget = BodyBufferBudget::new(0);
+        assert!(budget.try_acquire(u64::MAX / 2));
+        assert_eq!(budget.in_flight(), 0);
     }
 }
 

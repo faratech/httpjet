@@ -693,7 +693,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     let workers = args
         .workers
         .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
-        .unwrap_or(4);
+        .unwrap_or(4)
+        .max(1);
+    // (#235) tokio panics on worker_threads(0); an explicit --workers 0 used to take
+    // the whole process down at startup. Clamp to 1 and tell the operator.
+    if args.workers == Some(0) {
+        eprintln!("--workers 0 is invalid; running with 1 worker");
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
@@ -1080,12 +1086,14 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 stale_secs = xf_capsule.stale_secs,
                 "XenForo hot capsule tier ENABLED (--xf-capsule)"
             );
-            // (#96) Surface the silent-footgun configs: an empty vhost set applies the capsule
-            // tier to EVERY vhost (fail-open scope), and allow_members with a 0% member canary
-            // looks enabled but serves no members at all.
+            // (#96/#239) Surface the silent-footgun configs: since the closed-default
+            // fix, an empty vhost set DISABLES the capsule tier entirely — warn so an
+            // operator who expected it on understands why nothing is served. Also:
+            // allow_members with a 0% member canary looks enabled but serves no
+            // members at all.
             if xf_capsule.vhosts.is_empty() {
                 tracing::warn!(
-                    "xf-capsule: --xf-capsule-vhosts is empty — the capsule tier applies to ALL vhosts; set an explicit list to scope it"
+                    "xf-capsule: --xf-capsule-vhosts is empty — the capsule tier is DISABLED for every vhost; pass an explicit list (e.g. windowsforum.com) to enable it"
                 );
             }
             if xf_capsule.allow_members && xf_capsule.member_canary_percent == 0 {

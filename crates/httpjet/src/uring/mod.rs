@@ -1026,7 +1026,15 @@ async fn handle_h1_bridged<S>(
                         expect_continue,
                     );
                 }
-                ParsedReq::Bad => return,
+                ParsedReq::Bad => {
+                    // (#233) An unparsable head (bad method/target/header token) used to
+                    // close the connection with zero response bytes: clients see "empty
+                    // reply", Cloudflare retries against the peer, and nothing reaches the
+                    // access log because the funnel is never entered. Answer 400 + close
+                    // like every sibling refusal path (and hyper/LiteSpeed) instead.
+                    write_status_close(&mut stream, 400, "Bad Request").await;
+                    return;
+                }
                 ParsedReq::HeadersTooLarge => {
                     write_status_close(&mut stream, 431, "Request Header Fields Too Large").await;
                     return;

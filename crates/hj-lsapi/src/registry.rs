@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::handler::Lsapi;
+use crate::handler::{BodyBufferBudget, DEFAULT_BODY_BUFFER_MEM, Lsapi};
 use crate::jail::{Credentials, JailConfig, NamespaceFlags};
 use crate::monitor::{Monitor, MonitorConfig};
 use crate::pool::{ExternalGeneration, LsapiPool, PoolStats};
@@ -262,6 +262,9 @@ struct PoolParams {
     max_conns: u32,
     /// Max request body fed to lsphp.
     max_body: u64,
+    /// Server-wide budget shared by ALL pools' handlers bounding heap held by
+    /// buffered (chunked) request bodies (#236).
+    body_budget: Arc<BodyBufferBudget>,
     /// Extra env appended to every request (PHP_VALUE/ext env).
     base_env: Vec<(String, String)>,
 }
@@ -357,6 +360,7 @@ impl LsapiRegistry {
                 (template.children * 2).max(2)
             },
             max_body,
+            body_budget: Arc::new(BodyBufferBudget::new(DEFAULT_BODY_BUFFER_MEM)),
             base_env: template.env.clone(),
         };
         Arc::new(LsapiRegistry {
@@ -665,6 +669,7 @@ impl LsapiRegistry {
             let handler = Arc::new(
                 Lsapi::new(pool.clone())
                     .max_body(self.params.max_body)
+                    .body_buffer_budget(self.params.body_budget.clone())
                     .base_env(self.params.base_env.clone())
                     // EXTERNAL mode has no Monitor to source the Tier-1 deadline from
                     // (supervised mode gets it via `.monitor(...)`), so apply the
@@ -735,6 +740,7 @@ impl LsapiRegistry {
         let handler = Arc::new(
             Lsapi::new(pool.clone())
                 .max_body(self.params.max_body)
+                .body_buffer_budget(self.params.body_budget.clone())
                 .base_env(self.params.base_env.clone())
                 .monitor(monitor),
         );

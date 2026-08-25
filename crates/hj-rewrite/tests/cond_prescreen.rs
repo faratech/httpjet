@@ -125,3 +125,39 @@ fn cond_n_backref_excludes_www() {
         other => panic!("www should be excluded (Unchanged), got {other:?}"),
     }
 }
+
+#[test]
+fn spaced_numeric_cond_operand_parses() {
+    // (#240) `RewriteCond 5 -lt 10` — Apache/OLS consume the operator and operand
+    // as separate tokens. Before the fix the operand was swallowed as an unknown
+    // flag and the comparison ran against "" (→ 0), so a TRUE comparison evaluated
+    // false and the rule silently never fired.
+    let rs = RuleSet::parse(
+        "RewriteEngine On\nRewriteCond 5 -lt 10\nRewriteRule ^/spaced$ /hit [L]\n",
+    )
+    .expect("parse");
+    let input = RewriteInput::new("/spaced".to_string(), "/tmp/doc").method("GET");
+    match evaluate(&rs, &input) {
+        RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/hit"),
+        other => panic!("spaced -lt must fire, got {other:?}"),
+    }
+
+    // Negative control: the same shape with a false comparison stays Unchanged.
+    let rs = RuleSet::parse(
+        "RewriteEngine On\nRewriteCond 5 -gt 10\nRewriteRule ^/spaced$ /hit [L]\n",
+    )
+    .expect("parse");
+    let input = RewriteInput::new("/spaced".to_string(), "/tmp/doc").method("GET");
+    assert!(matches!(evaluate(&rs, &input), RewriteOutcome::Unchanged { .. }));
+
+    // Compact single-token form (-lt10) keeps working.
+    let rs = RuleSet::parse(
+        "RewriteEngine On\nRewriteCond 5 -lt10\nRewriteRule ^/spaced$ /hit [L]\n",
+    )
+    .expect("parse");
+    let input = RewriteInput::new("/spaced".to_string(), "/tmp/doc").method("GET");
+    match evaluate(&rs, &input) {
+        RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/hit"),
+        other => panic!("compact -lt10 must still fire, got {other:?}"),
+    }
+}

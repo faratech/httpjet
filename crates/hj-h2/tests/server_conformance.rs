@@ -877,6 +877,66 @@ async fn no_progress_frame_flood_goaways_enhance_your_calm() {
 }
 
 #[tokio::test]
+async fn stream_window_update_flood_still_goaways() {
+    // Regression (#241): a stream-level WINDOW_UPDATE used to reset the no-progress
+    // counter UNCONDITIONALLY, so alternating +1 grants on an idle/never-blocked
+    // stream deferred the flood GOAWAY forever (CVE-2019-9518 class). Only a grant
+    // that genuinely unblocks a window-blocked response may clear it — a grant on a
+    // stream with no blocked outbound data must count toward the budget like any
+    // other no-progress frame.
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+    let (mut rd, mut wr) = tokio::io::split(client);
+
+    wr.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut f = Vec::new();
+    frame::write_settings(&mut f, &[]);
+    wr.write_all(&f).await.unwrap();
+    // Open stream 1 and hold the request open (no response body in flight, so no
+    // stream send-window is ever blocked).
+    let mut enc = Encoder::new();
+    let mut hb = Vec::new();
+    frame::write_frame(
+        &mut hb,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get(&mut enc, "/hold"),
+    );
+    wr.write_all(&hb).await.unwrap();
+    wr.flush().await.unwrap();
+
+    let writer = tokio::spawn(async move {
+        let mut wu = Vec::new();
+        frame::write_frame(&mut wu, frame::kind::WINDOW_UPDATE, 0, 1, &[0, 0, 0, 1]);
+        for _ in 0..15_000u32 {
+            if wr.write_all(&wu).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let (hdr, payload) = read_frame(&mut rd).await;
+            if hdr.kind == frame::kind::GOAWAY {
+                return u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("a stream WINDOW_UPDATE flood must still GOAWAY, not hang");
+    assert_eq!(
+        code,
+        frame::error_code::ENHANCE_YOUR_CALM,
+        "unblocked-stream WINDOW_UPDATE flood → GOAWAY(ENHANCE_YOUR_CALM)"
+    );
+    let _ = writer.await;
+    let _ = srv.await;
+}
+
+#[tokio::test]
 async fn refused_stream_keeps_hpack_decoder_in_sync() {
     // Regression (#1): a stream refused for exceeding MAX_CONCURRENT_STREAMS must STILL have its
     // HPACK header block decoded, so the connection-wide decoder dynamic table stays in sync with

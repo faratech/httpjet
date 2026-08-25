@@ -370,6 +370,19 @@ pub struct CacheCtx<'a> {
 /// AE, keeping the stored variant + served encoding in lockstep with the transform. CF
 /// decodes the zstd and re-encodes per browser at its edge; untrusted (direct) clients
 /// always use their real AE, so none is ever handed an unrequested encoding.
+/// (#237) A private body must never be storable by a SHARED cache. Cloudflare
+/// gives `Cloudflare-CDN-Cache-Control` (then `CDN-Cache-Control`) priority over
+/// `Cache-Control`, so a backend that sent e.g.
+/// `Cloudflare-CDN-Cache-Control: max-age=86400` alongside the app's own
+/// Cache-Control would have that directive replayed from the stored headers on
+/// every private hit — letting CF pin one member's page at the shared edge even
+/// though we force `private, no-store` on Cache-Control itself. Strip the
+/// CDN-priority variants wherever we force the private guarantee.
+fn strip_shared_cdn_cache_directives(headers: &mut http::HeaderMap) {
+    headers.remove("cloudflare-cdn-cache-control");
+    headers.remove("cdn-cache-control");
+}
+
 fn egress_ae<'a>(state: &ServerState, ctx: &'a ReqCtx) -> &'a str {
     if state.compress.cf_send_zstd() && ctx.trusted_proxy {
         "zstd"
@@ -583,6 +596,7 @@ pub fn cache_lookup(
                     http::header::CACHE_CONTROL,
                     HeaderValue::from_static("private, no-store"),
                 );
+                strip_shared_cdn_cache_directives(resp.headers_mut());
             }
             return CacheOutcome::Hit(resp);
         }
@@ -642,6 +656,7 @@ pub fn cache_lookup(
                     http::header::CACHE_CONTROL,
                     HeaderValue::from_static("private, no-store"),
                 );
+                strip_shared_cdn_cache_directives(resp.headers_mut());
             }
             CacheOutcome::Hit(resp)
         }
@@ -1200,11 +1215,14 @@ fn capsule_public_vary_value(cookie: Option<&str>, store: &hj_pagecache::PageSto
 }
 
 fn capsule_vhost_allowed(state: &ServerState, ctx: &ReqCtx) -> bool {
-    state.xf_capsule.vhosts.is_empty()
-        || state
-            .xf_capsule
-            .vhosts
-            .contains(&ctx.vhost_name.to_ascii_lowercase())
+    // (#239) CLOSED by default: the capsule tier is XenForo-specific, so an empty
+    // --xf-capsule-vhosts list must DISABLE it, not silently enable it on every
+    // vhost (including apps that have never heard of X-Acapsule headers). Deployed
+    // configs pass an explicit list.
+    state
+        .xf_capsule
+        .vhosts
+        .contains(&ctx.vhost_name.to_ascii_lowercase())
 }
 
 fn capsule_path_allowed(state: &ServerState, path: &str, query: &str) -> bool {
@@ -1402,6 +1420,12 @@ fn capsule_lookup_allowed(
         && !cc.host_foreign
         && !cc.has_range
         && (cc.method == Method::GET || cc.method == Method::HEAD)
+        // (#239) The capsule tier stores PUBLIC shells, so it must respect the same
+        // per-request `.htaccess` no-cache marker and the per-vhost cache-policy gate
+        // the plain public tier obeys — a vhost (or request) that opted out of public
+        // caching must not be cached through the side door.
+        && !no_cache_env(ctx)
+        && vhost_allows_public(ctx, store)
         && capsule_vhost_allowed(state, ctx)
         && capsule_path_allowed(state, cc.req_path, cc.req_query)
         && capsule_cookie_safe(cc.cookie)
@@ -1433,6 +1457,11 @@ fn capsule_store_allowed(
         && !cc.has_range
         && *cc.method == Method::GET
         && status == 200
+        // (#239) Same gates as lookup: no `.htaccess` no-cache marker on the
+        // request that produced this response, and the vhost must allow public
+        // caching — a capsule shell is a public entry.
+        && !no_cache_env(ctx)
+        && vhost_allows_public(ctx, store)
         && capsule_vhost_allowed(state, ctx)
         && capsule_path_allowed(state, cc.req_path, cc.req_query)
         && capsule_cookie_safe(cc.cookie)
@@ -1447,6 +1476,22 @@ fn capsule_store_allowed(
 #[derive(Debug, Clone, Copy)]
 struct CapsuleControl {
     ttl_secs: u32,
+}
+
+/// (#238) True when the stored response's Cache-Control explicitly forbids
+/// stale-with-revalidation serving (`must-revalidate`, `proxy-revalidate`) or
+/// storage/staleness outright (`no-store`, `no-cache`). The capsule shell's
+/// forced SWR window is entry-level and would override these directives for the
+/// plain public entry too — so it must not be injected when they are present.
+fn stored_cc_forbids_stale(headers: &HeaderMap) -> bool {
+    headers.get_all(http::header::CACHE_CONTROL).iter().any(|v| {
+        v.to_str().is_ok_and(|s| {
+            let s = s.to_ascii_lowercase();
+            ["must-revalidate", "proxy-revalidate", "no-store", "no-cache"]
+                .iter()
+                .any(|d| s.contains(d))
+        })
+    })
 }
 
 fn parse_capsule_control(headers: &HeaderMap, fallback_ttl_secs: u32) -> Option<CapsuleControl> {
@@ -2487,7 +2532,15 @@ pub async fn cache_store(
     } else {
         None
     };
-    if capsule_control.is_some() {
+    if capsule_control.is_some()
+        // (#238) The forced SWR window is entry-level, so it applies to the PLAIN
+        // public entry as well as the capsule shell. An app that explicitly demands
+        // revalidation (must-revalidate / proxy-revalidate) or forbids staleness
+        // (no-store / no-cache) must not get a 3600s stale window bolted on over
+        // its objection — only raise the window when the stored CC permits stale
+        // serving at all.
+        && !stored_cc_forbids_stale(&parts.headers)
+    {
         stale_secs = stale_secs
             .max(state.xf_capsule.stale_secs)
             .min(cfg.max_stale_secs);
@@ -2976,6 +3029,93 @@ fn error_502() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression (#237): private-hit egress forces `private, no-store` onto
+    // Cache-Control, but Cloudflare gives `Cloudflare-CDN-Cache-Control` /
+    // `CDN-Cache-Control` priority — if the backend's directive survived in the
+    // stored headers it would be replayed on every private hit and CF could pin a
+    // member page at the shared edge. Both variants must be stripped.
+    #[test]
+    fn strip_shared_cdn_cache_directives_removes_priority_variants() {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            "cloudflare-cdn-cache-control",
+            http::HeaderValue::from_static("max-age=86400"),
+        );
+        h.insert(
+            "cdn-cache-control",
+            http::HeaderValue::from_static("max-age=3600"),
+        );
+        h.insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("private, must-revalidate"),
+        );
+        strip_shared_cdn_cache_directives(&mut h);
+        assert!(h.get("cloudflare-cdn-cache-control").is_none());
+        assert!(h.get("cdn-cache-control").is_none());
+        assert_eq!(h[http::header::CACHE_CONTROL], "private, must-revalidate");
+    }
+
+    // Regression (#239): the xf-capsule vhost allowlist is CLOSED by default — an
+    // empty list must disable the capsule tier everywhere, not enable it on all
+    // vhosts (the old fail-open default).
+    #[tokio::test]
+    async fn capsule_vhost_allowlist_is_closed_by_default() {
+        let mk_state = |vhosts: std::collections::HashSet<String>| {
+            let server = Arc::new(hj_core::config::ServerConfig::default());
+            ServerState::new(
+                server,
+                None,
+                None,
+                None,
+                Arc::new(hj_compress::PageDictRegistry::empty()),
+                1,
+                {
+                    let mut xf = crate::state::XfCapsuleConfig::disabled();
+                    xf.enabled = true;
+                    xf.vhosts = vhosts;
+                    xf
+                },
+                None,
+                false,
+                None,
+                false,
+                crate::state::RewriteTuning::default(),
+            )
+        };
+        let server2 = Arc::new(hj_core::config::ServerConfig::default());
+        let vhost = Arc::new(hj_core::config::VHostConfig {
+            cache_policy: Some(hj_core::config::VhostCachePolicy {
+                enable_cache: true,
+                enable_public: true,
+                enable_private: false,
+            }),
+            ..Default::default()
+        });
+        let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let ctx = ReqCtx {
+            vhost_name: "forum.example".into(),
+            vhost,
+            peer_ip: loopback,
+            client_ip: loopback,
+            is_tls: true,
+            protocol: hj_core::Proto::Http2,
+            trusted_proxy: false,
+            env: Vec::new(),
+            local_addr: "127.0.0.1:443".parse().unwrap(),
+            peer_port: 12345,
+            request_time: std::time::SystemTime::UNIX_EPOCH,
+            request_id: Default::default(),
+            upstream_id: None,
+            tls: None,
+            server: server2,
+        };
+        assert!(!capsule_vhost_allowed(&mk_state(Default::default()), &ctx));
+        let mut listed = std::collections::HashSet::new();
+        listed.insert("forum.example".to_string());
+        assert!(capsule_vhost_allowed(&mk_state(listed), &ctx));
+    }
+
 
     // Regression (F15): the capsule safe-GET classifier must match an UNSAFE_PREFIXES entry at
     // a route boundary, not only on a trailing `/`. The old `{prefix}/`-only test let hyphen/dot
@@ -3817,7 +3957,16 @@ mod tests {
             Some(store.clone()),
             Arc::new(hj_compress::PageDictRegistry::empty()),
             1,
-            xf_capsule,
+            {
+                // (#239) The capsule allowlist is CLOSED by default now; tests here
+                // exercise capsule MECHANICS against vhost forum.example, so an
+                // explicitly-empty list is scoped to that vhost.
+                let mut xf = xf_capsule;
+                if xf.vhosts.is_empty() {
+                    xf.vhosts.insert("forum.example".into());
+                }
+                xf
+            },
             None,
             false,
             None,

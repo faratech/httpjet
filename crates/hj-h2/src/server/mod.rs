@@ -455,6 +455,9 @@ where
                     stream_id: 0,
                     increment,
                 } => {
+                    // (#241) Only a grant that unblocks genuinely-blocked credit is
+                    // forward progress; an unblocked conn window absorbing +1s is not.
+                    let was_blocked = send_conn <= 0;
                     send_conn += increment as i64;
                     if send_conn > i32::MAX as i64 {
                         out.frames(|b| frame::write_goaway(b, 0, error_code::FLOW_CONTROL_ERROR));
@@ -463,12 +466,16 @@ where
                         draining = false;
                         break;
                     }
+                    if was_blocked && send_conn > 0 {
+                        recv.no_progress_frames = 0;
+                    }
                 }
                 FrameOutcome::WindowUpdate {
                     stream_id,
                     increment,
                 } => {
                     if let Some(st) = outstreams.get_mut(&stream_id) {
+                        let was_blocked = st.window <= 0;
                         st.window += increment as i64;
                         if st.window > i32::MAX as i64 {
                             out.frames(|b| {
@@ -479,6 +486,11 @@ where
                                 )
                             });
                             st.done = true;
+                        } else if was_blocked && st.window > 0 {
+                            // (#241) Real forward progress: a blocked response body can
+                            // now write again. Grants on idle/closed/never-blocked
+                            // streams do NOT clear the flood counter.
+                            recv.no_progress_frames = 0;
                         }
                     } else {
                         // Credit granted before the response exists — remember it for when
@@ -1213,6 +1225,9 @@ where
                     stream_id: 0,
                     increment,
                 } => {
+                    // (#241) Only a grant that unblocks genuinely-blocked credit is
+                    // forward progress; see the matching arm in the main loop.
+                    let was_blocked = send_conn <= 0;
                     send_conn += increment as i64;
                     if send_conn > i32::MAX as i64 {
                         out.frames(|b| frame::write_goaway(b, 0, error_code::FLOW_CONTROL_ERROR));
@@ -1220,12 +1235,16 @@ where
                         accepting = false;
                         break;
                     }
+                    if was_blocked && send_conn > 0 {
+                        recv.no_progress_frames = 0;
+                    }
                 }
                 FrameOutcome::WindowUpdate {
                     stream_id,
                     increment,
                 } => {
                     if let Some(st) = outstreams.get_mut(&stream_id) {
+                        let was_blocked = st.window <= 0;
                         st.window += increment as i64;
                         if st.window > i32::MAX as i64 {
                             out.frames(|b| {
@@ -1236,6 +1255,10 @@ where
                                 )
                             });
                             st.done = true;
+                        } else if was_blocked && st.window > 0 {
+                            // (#241) Real forward progress; grants on idle/closed/
+                            // never-blocked streams do NOT clear the flood counter.
+                            recv.no_progress_frames = 0;
                         }
                     } else if pending_window.len() < 4096 || pending_window.contains_key(&stream_id)
                     {
@@ -1727,7 +1750,7 @@ mod tests {
             &mut cancelled,
             &mut inflight_sids,
         );
-        assert!(matches!(outcome, FrameOutcome::Continue));
+        assert!(matches!(outcome, FrameOutcome::ResetStream(1)));
         assert_eq!(
             recv.last_client_stream, 1,
             "a rejected new stream id must still be marked seen"
@@ -1755,7 +1778,9 @@ mod tests {
             &mut cancelled,
             &mut inflight_sids,
         );
-        assert!(matches!(outcome, FrameOutcome::Continue));
+        // (#242) The reused-closed-id rejection now surfaces as ResetStream (with
+        // outbound teardown) instead of a bare Continue — still no connection error.
+        assert!(matches!(outcome, FrameOutcome::ResetStream(1)));
         assert_eq!(inflight.len(), 0, "the reset id cannot be reopened");
 
         let next = request_block_referencing_first_dynamic_entry();
@@ -1898,7 +1923,9 @@ mod tests {
             &mut cancelled,
             &mut inflight_sids,
         );
-        assert!(matches!(outcome, FrameOutcome::Continue));
+        // (#242) The self-priority stream error now returns ResetStream so the
+        // session tears down outbound state — still a STREAM reset, not GOAWAY.
+        assert!(matches!(outcome, FrameOutcome::ResetStream(1)));
 
         let next = request_block_referencing_first_dynamic_entry();
         let outcome = process_frame(
@@ -1997,8 +2024,8 @@ mod tests {
             &mut inflight_sids,
         );
         assert!(
-            matches!(outcome, FrameOutcome::Continue),
-            "a malformed trailer resets the stream, not the connection"
+            matches!(outcome, FrameOutcome::ResetStream(1)),
+            "a malformed trailer resets the stream (#242: with outbound teardown), not the connection"
         );
         assert!(
             !streams.contains_key(&1),

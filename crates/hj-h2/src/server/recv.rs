@@ -99,7 +99,8 @@ pub(super) enum FrameOutcome {
         stream_id: u32,
         increment: u32,
     },
-    /// Peer reset a stream (RST_STREAM): drop any in-flight outgoing body for it.
+    /// A stream was reset — received RST_STREAM, or WE emitted one (#242): drop
+    /// its in-flight outgoing body so no further frames are sent on the dead id.
     ResetStream(u32),
     /// Peer changed SETTINGS_INITIAL_WINDOW_SIZE (§6.9.2): every active stream's send
     /// window must shift by this (signed) delta. Applied to `outstreams` in `serve`.
@@ -142,7 +143,19 @@ where
     macro_rules! rst {
         ($sid:expr_2021, $code:expr_2021) => {{
             out.frames(|b| frame::write_rst_stream(b, $sid, $code));
-            return FrameOutcome::Continue;
+            // (#242) After WE emit RST_STREAM for a stream, RFC 9113 §5.1 forbids
+            // sending ANY further frames on it. Tear down the outbound side (a
+            // half-written response body would otherwise keep streaming past the
+            // RST) and, when a request handler is still in flight, abort it and
+            // record the sid so its late completion cannot `begin_response` fresh
+            // frames on the dead id. Mirrors the peer-RST arm below.
+            if let Some(abort) = inflight_sids.remove(&$sid) {
+                abort.abort();
+                if cancelled.len() < recv.max_concurrent.saturating_mul(2) {
+                    cancelled.insert($sid);
+                }
+            }
+            return FrameOutcome::ResetStream($sid);
         }};
     }
     // A stream marked `refused` (over the concurrency cap) is reset only AFTER its header block
@@ -334,13 +347,13 @@ where
                 rst!(sid, error_code::PROTOCOL_ERROR);
             }
             Some(increment) => {
-                // Only a STREAM-level grant (sid != 0) can unblock a blocked response body =
-                // real forward progress. A connection-level WINDOW_UPDATE (sid == 0) flood
-                // (CVE-2019-9512 class) must NOT reset the no-progress counter, or an attacker
-                // sending endless +1 conn-window updates indefinitely defers the idle-abuse GOAWAY.
-                if sid != 0 {
-                    recv.no_progress_frames = 0;
-                }
+                // (#241) A stream-level grant is NOT automatically forward progress:
+                // whether it actually unblocks a window-blocked response body is only
+                // known where send windows are applied (the session loop in mod.rs),
+                // which clears `no_progress_frames` when a blocked window genuinely
+                // crosses back above 0. Resetting here for ANY sid != 0 let an
+                // attacker alternate stream-level WINDOW_UPDATEs on idle/closed
+                // streams to defer the flood GOAWAY forever (CVE-2019-9518 class).
                 return FrameOutcome::WindowUpdate {
                     stream_id: sid,
                     increment,

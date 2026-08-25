@@ -526,11 +526,29 @@ fn parse_cond(rest: &str, line: usize) -> Result<Cond, RewriteError> {
     let test_string = args[0].clone();
     let mut pattern_raw = args[1].clone();
 
+    // (#240) Spaced numeric form: `RewriteCond X -eq 200` — Apache/OLS consume the
+    // operator token then the operand as SEPARATE tokens. Without this branch the
+    // operand landed in the flags position (`parse_cond_flags` silently swallowed
+    // it as an unknown flag) and the comparison ran against "" → 0.
+    let mut flag_idx = 2;
+    if matches!(pattern_raw.as_str(), "-eq" | "-ne" | "-gt" | "-lt" | "-ge" | "-le") {
+        let operand = args.get(2).ok_or_else(|| RewriteError::Malformed {
+            line,
+            msg: format!(
+                "RewriteCond numeric operator '{}' requires an operand",
+                pattern_raw
+            ),
+        })?;
+        // Rejoin as the compact `-eq <operand>` shape classify_cond_pattern already
+        // parses (it strips the 3-char operator and trims the rest).
+        pattern_raw = format!("{} {}", pattern_raw, operand.trim());
+        flag_idx = 3;
+    }
+
     // Optional trailing flag list `[NC,OR]`.
-    let (nocase, or_next) = if let Some(flag_field) = args.get(2) {
-        parse_cond_flags(flag_field)
-    } else {
-        (false, false)
+    let (nocase, or_next) = match args.get(flag_idx) {
+        Some(flag_field) => parse_cond_flags(flag_field),
+        None => (false, false),
     };
 
     let negate = if let Some(stripped) = pattern_raw.strip_prefix('!') {
