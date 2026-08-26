@@ -494,6 +494,50 @@ fn build_optional_client_verifier(
 struct DepthLimitedClientVerifier {
     inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     max_intermediates: usize,
+    /// (#301) Positive-verdict memo for validated client-cert chains. The mTLS
+    /// listener disables session resumption (#300), so every connection runs a
+    /// full webpki chain build + signature verification (RSA-4096 for the
+    /// Cloudflare origin-pull CA) for what is in practice ONE long-lived client
+    /// certificate. A chain that verified is remembered by its exact DER bytes
+    /// (byte-compare, no hashing — no collision surface) for [`CHAIN_MEMO_TTL`],
+    /// bounding how long an expiring certificate can keep riding a cached
+    /// verdict. Rejections are never cached (and only CA-signed chains can
+    /// enter, so an attacker cannot grow or thrash the memo). Config reloads
+    /// rebuild the verifier, so the memo can never outlive a CA change.
+    chain_memo: std::sync::Mutex<Vec<ChainMemo>>,
+}
+
+struct ChainMemo {
+    key: Vec<u8>,
+    valid_until: std::time::Instant,
+}
+
+impl std::fmt::Debug for ChainMemo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChainMemo").finish_non_exhaustive()
+    }
+}
+
+/// How long a validated chain's verdict may be reused before webpki re-runs in
+/// full. Also the upper bound on how late a certificate expiry is noticed.
+const CHAIN_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Distinct concurrently-remembered chains (prod sees one, plus a rotation
+/// overlap); oldest entry is dropped beyond this.
+const CHAIN_MEMO_CAP: usize = 8;
+
+/// Unambiguous memo key: each chain certificate length-prefixed, leaf first.
+fn chain_memo_key(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+) -> Vec<u8> {
+    let total: usize =
+        4 + end_entity.len() + intermediates.iter().map(|c| 4 + c.len()).sum::<usize>();
+    let mut key = Vec::with_capacity(total);
+    for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
+        key.extend_from_slice(&(cert.len() as u32).to_le_bytes());
+        key.extend_from_slice(cert.as_ref());
+    }
+    key
 }
 
 impl DepthLimitedClientVerifier {
@@ -504,6 +548,7 @@ impl DepthLimitedClientVerifier {
         Arc::new(DepthLimitedClientVerifier {
             inner,
             max_intermediates,
+            chain_memo: std::sync::Mutex::new(Vec::new()),
         })
     }
 }
@@ -524,10 +569,9 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        let verified = self
-            .inner
-            .verify_client_cert(end_entity, intermediates, now)?;
         // OLS verifyDepth N == at most N intermediate CAs between the leaf and the trust anchor.
+        // Checked FIRST (before webpki AND before the memo): a too-deep chain is rejected for
+        // free, and a cached verdict can never bypass the depth limit.
         if intermediates.len() > self.max_intermediates {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::Other(rustls::OtherError(Arc::new(std::io::Error::new(
@@ -540,6 +584,26 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
                 )))),
             ));
         }
+        let key = chain_memo_key(end_entity, intermediates);
+        let mono_now = std::time::Instant::now();
+        {
+            let mut memo = self.chain_memo.lock().expect("chain memo poisoned");
+            memo.retain(|m| m.valid_until > mono_now);
+            if memo.iter().any(|m| m.key == key) {
+                return Ok(rustls::server::danger::ClientCertVerified::assertion());
+            }
+        }
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        let mut memo = self.chain_memo.lock().expect("chain memo poisoned");
+        if memo.len() >= CHAIN_MEMO_CAP {
+            memo.remove(0);
+        }
+        memo.push(ChainMemo {
+            key,
+            valid_until: mono_now + CHAIN_MEMO_TTL,
+        });
         Ok(verified)
     }
     fn verify_tls12_signature(
@@ -697,14 +761,17 @@ fn build_server_config_inner(
     // peer_certificates on a RESUMED handshake — an actor holding any earlier ticket
     // would pass the app-layer mTLS gate (`has_client_cert`) without presenting a
     // certificate at all. rustls resumes ONLY through this store (no bare session-ID
-    // path), so leaving the default here disables resumption outright on that
-    // listener and forces the full handshake, which presents (or omits) the cert
-    // fresh every time.
-    if tls.client_verify != 0 {
-        // keep the rustls default (no session storage ⇒ no resumption)
+    // path), so a no-op store disables resumption outright on that listener and forces
+    // the full handshake, which presents (or omits) the cert fresh every time.
+    // (#300) The former "keep the rustls default" branch did NOT do that: ServerConfig's
+    // default session_storage IS a stateful ServerSessionMemoryCache(256), so TLS 1.3
+    // tickets were stored and resumed with the old chain reinstated. Explicit no-op,
+    // mirroring the kTLS builder below.
+    config.session_storage = if tls.client_verify != 0 {
+        Arc::new(NoServerSessions)
     } else {
-        config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
-    }
+        ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE)
+    };
 
     Ok((Arc::new(config), CertReloadHandle(cert_swap)))
 }
@@ -939,11 +1006,7 @@ pub fn tls_params_from_parts(
     cipher: String,
     leaf: Option<&CertificateDer<'_>>,
 ) -> TlsParams {
-    TlsParams {
-        protocol,
-        cipher,
-        client_cert: leaf.and_then(parse_client_cert),
-    }
+    TlsParams::new(protocol, cipher, leaf.and_then(parse_client_cert))
 }
 
 /// Parse a verified client leaf certificate (DER) into a [`ClientCert`].
@@ -1470,6 +1533,7 @@ mod tests {
         let v = DepthLimitedClientVerifier {
             inner: Arc::new(AlwaysOkVerifier),
             max_intermediates: 1,
+            chain_memo: std::sync::Mutex::new(Vec::new()),
         };
         let now = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
             1_700_000_000,
@@ -1924,6 +1988,140 @@ mod tests {
         assert_eq!(
             built.alpn_protocols,
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod resumption_tests {
+    use super::*;
+    use rustls::server::StoresServerSessions as _;
+
+    // (#300) The no-op store must genuinely store nothing: a resumed handshake can only
+    // reinstate a client-cert chain if the store returned one. Pins the type the
+    // client_verify branch now installs.
+    #[test]
+    fn no_server_sessions_stores_nothing() {
+        let s = NoServerSessions;
+        assert!(
+            !s.put(b"k".to_vec(), b"v".to_vec()),
+            "put must refuse to store"
+        );
+        assert!(s.get(b"k").is_none(), "store must never return a session");
+        assert!(s.take(b"k").is_none(), "take must never return a session");
+        assert!(!s.can_cache());
+    }
+
+    /// (#301) The depth-limited verifier memoizes POSITIVE chain verdicts by
+    /// exact DER bytes: the second handshake with the same chain skips webpki
+    /// entirely, while a rejected chain is re-verified every time (negatives
+    /// never enter the memo).
+    #[test]
+    fn client_chain_memo_dedups_positive_verifications() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+
+        #[derive(Debug)]
+        struct CountingVerifier {
+            inner: Arc<dyn ClientCertVerifier>,
+            calls: AtomicUsize,
+        }
+        impl ClientCertVerifier for CountingVerifier {
+            fn offer_client_auth(&self) -> bool {
+                self.inner.offer_client_auth()
+            }
+            fn client_auth_mandatory(&self) -> bool {
+                self.inner.client_auth_mandatory()
+            }
+            fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+                self.inner.root_hint_subjects()
+            }
+            fn verify_client_cert(
+                &self,
+                end_entity: &CertificateDer<'_>,
+                intermediates: &[CertificateDer<'_>],
+                now: rustls::pki_types::UnixTime,
+            ) -> Result<ClientCertVerified, rustls::Error> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .verify_client_cert(end_entity, intermediates, now)
+            }
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                self.inner.verify_tls12_signature(message, cert, dss)
+            }
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                self.inner.verify_tls13_signature(message, cert, dss)
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                self.inner.supported_verify_schemes()
+            }
+            fn requires_raw_public_keys(&self) -> bool {
+                self.inner.requires_raw_public_keys()
+            }
+        }
+
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert");
+
+        let client_key = KeyPair::generate().expect("client key");
+        let mut client_params =
+            CertificateParams::new(vec!["client.test".to_string()]).expect("client params");
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = client_params
+            .signed_by(&client_key, &ca)
+            .expect("client cert");
+
+        let mut roots = RootCertStore::empty();
+        roots.add(ca.der().clone()).expect("add ca root");
+        let webpki = WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider().expect("provider"),
+        )
+        .build()
+        .expect("webpki verifier");
+        let counting = Arc::new(CountingVerifier {
+            inner: webpki,
+            calls: AtomicUsize::new(0),
+        });
+        let verifier = DepthLimitedClientVerifier::wrap(counting.clone(), 3);
+
+        let now = rustls::pki_types::UnixTime::now();
+        let leaf = client_cert.der().clone();
+        assert!(verifier.verify_client_cert(&leaf, &[], now).is_ok());
+        assert!(verifier.verify_client_cert(&leaf, &[], now).is_ok());
+        assert_eq!(
+            counting.calls.load(Ordering::Relaxed),
+            1,
+            "second identical chain must be served from the memo"
+        );
+
+        let bad_key = KeyPair::generate().expect("bad key");
+        let bad_params = CertificateParams::new(vec!["bad.test".to_string()]).expect("bad params");
+        let bad_cert = bad_params.self_signed(&bad_key).expect("bad cert");
+        let bad_leaf = bad_cert.der().clone();
+        let before = counting.calls.load(Ordering::Relaxed);
+        assert!(verifier.verify_client_cert(&bad_leaf, &[], now).is_err());
+        assert!(verifier.verify_client_cert(&bad_leaf, &[], now).is_err());
+        assert_eq!(
+            counting.calls.load(Ordering::Relaxed) - before,
+            2,
+            "a rejected chain is re-verified every time (negatives never memoized)"
         );
     }
 }

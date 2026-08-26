@@ -35,6 +35,8 @@
 
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
+
+use rustc_hash::FxBuildHasher;
 use std::hash::Hash;
 use std::time::Instant;
 
@@ -137,6 +139,15 @@ pub enum EvictCause {
 /// of the same store from here.
 pub trait OnEvict<K, V> {
     fn on_evict(&self, key: &K, value: &V, cause: EvictCause);
+
+    /// (#293) Called on the SAME thread immediately after a shard mutex under
+    /// which at least one [`Self::on_evict`] fired has been released. Lets a
+    /// hook defer pure syscall side-effects (file unlink) out of the critical
+    /// section while all bookkeeping stays synchronous under the lock. Every
+    /// [`ShardedCache`] entry point that can tear nodes down calls this;
+    /// sections that evict nothing never do.
+    #[inline]
+    fn after_unlock(&self) {}
 }
 
 /// A no-op eviction hook (the static file cache: the value's RAII drop — `Bytes` /
@@ -207,7 +218,10 @@ struct Node<K, V> {
 /// re-insert or mutation bumps `next_gen`, orphaning old heap entries so a stale heap
 /// pop can never tear down a fresh node).
 struct Shard<K, V> {
-    map: HashMap<K, Box<Node<K, V>>>,
+    // FxBuildHasher: K is an internal u64-ish key derived from our own hashing, never
+    // raw client input (the ShardKey contract) — a multiply-xor hash beats SipHash for
+    // the 5-7 probes a hit pays across probe + LRU touches.
+    map: HashMap<K, Box<Node<K, V>>, FxBuildHasher>,
     ram_head: K,
     ram_tail: K,
     disk_head: K,
@@ -221,7 +235,7 @@ struct Shard<K, V> {
 impl<K: ShardKey, V: CacheValue> Shard<K, V> {
     fn new() -> Self {
         Shard {
-            map: HashMap::new(),
+            map: HashMap::with_hasher(FxBuildHasher),
             ram_head: K::nil(),
             ram_tail: K::nil(),
             disk_head: K::nil(),
@@ -477,15 +491,60 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
     /// (decode, identity check) atomically under the lock. The closure returns a
     /// value to the caller.
     pub fn with_shard<R>(&self, id: &K, f: impl FnOnce(&mut ShardAccess<'_, K, V, E>) -> R) -> R {
-        let mut s = self.shard_for(id).lock();
-        let mut acc = ShardAccess {
-            shard: &mut s,
-            on_evict: &self.on_evict,
-            ram_budget_per_shard: self.ram_budget_per_shard,
-            disk_budget_per_shard: self.disk_budget_per_shard,
-            global_budget: &self.global_budget,
+        let (r, evicted) = {
+            let mut s = self.shard_for(id).lock();
+            let mut acc = ShardAccess {
+                shard: &mut s,
+                on_evict: &self.on_evict,
+                ram_budget_per_shard: self.ram_budget_per_shard,
+                disk_budget_per_shard: self.disk_budget_per_shard,
+                global_budget: &self.global_budget,
+                evicted: false,
+            };
+            let r = f(&mut acc);
+            (r, acc.evicted)
         };
-        f(&mut acc)
+        if evicted {
+            self.on_evict.after_unlock();
+        }
+        r
+    }
+
+    /// Run `f` once per DISTINCT owning shard of `ids` (grouped in place; `ids`
+    /// is reordered), with that shard locked, passing the subset of ids it
+    /// owns. A multi-id sweep (tag purge) otherwise locks a shard once per
+    /// member id (#293).
+    pub fn with_shard_groups(
+        &self,
+        ids: &mut [K],
+        mut f: impl FnMut(&mut ShardAccess<'_, K, V, E>, &[K]),
+    ) {
+        ids.sort_unstable_by_key(|id| id.shard_index(SHARDS));
+        let mut start = 0;
+        while start < ids.len() {
+            let shard_idx = ids[start].shard_index(SHARDS);
+            let mut end = start + 1;
+            while end < ids.len() && ids[end].shard_index(SHARDS) == shard_idx {
+                end += 1;
+            }
+            let evicted = {
+                let mut s = self.shards[shard_idx].lock();
+                let mut acc = ShardAccess {
+                    shard: &mut s,
+                    on_evict: &self.on_evict,
+                    ram_budget_per_shard: self.ram_budget_per_shard,
+                    disk_budget_per_shard: self.disk_budget_per_shard,
+                    global_budget: &self.global_budget,
+                    evicted: false,
+                };
+                f(&mut acc, &ids[start..end]);
+                acc.evicted
+            };
+            if evicted {
+                self.on_evict.after_unlock();
+            }
+            start = end;
+        }
     }
 
     /// Get a clone of the value for `id` if present and fresh, bumping recency.
@@ -542,29 +601,36 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
         let now = Instant::now();
         let mut swept = 0u64;
         for sh in self.shards.iter() {
-            let mut s = sh.lock();
-            let mut acc = ShardAccess {
-                shard: &mut s,
-                on_evict: &self.on_evict,
-                ram_budget_per_shard: self.ram_budget_per_shard,
-                disk_budget_per_shard: self.disk_budget_per_shard,
-                global_budget: &self.global_budget,
+            let evicted = {
+                let mut s = sh.lock();
+                let mut acc = ShardAccess {
+                    shard: &mut s,
+                    on_evict: &self.on_evict,
+                    ram_budget_per_shard: self.ram_budget_per_shard,
+                    disk_budget_per_shard: self.disk_budget_per_shard,
+                    global_budget: &self.global_budget,
+                    evicted: false,
+                };
+                while let Some(Reverse(top)) = acc.shard.expiry.peek() {
+                    if top.deadline > now {
+                        break;
+                    }
+                    let (id, g) = (top.key.clone(), top.generation);
+                    acc.shard.expiry.pop();
+                    let due = acc
+                        .shard
+                        .map
+                        .get(&id)
+                        .is_some_and(|n| n.generation == g && !n.value.is_fresh(now));
+                    if due {
+                        acc.teardown(&id, EvictCause::Expired);
+                        swept += 1;
+                    }
+                }
+                acc.evicted
             };
-            while let Some(Reverse(top)) = acc.shard.expiry.peek() {
-                if top.deadline > now {
-                    break;
-                }
-                let (id, g) = (top.key.clone(), top.generation);
-                acc.shard.expiry.pop();
-                let due = acc
-                    .shard
-                    .map
-                    .get(&id)
-                    .is_some_and(|n| n.generation == g && !n.value.is_fresh(now));
-                if due {
-                    acc.teardown(&id, EvictCause::Expired);
-                    swept += 1;
-                }
+            if evicted {
+                self.on_evict.after_unlock();
             }
         }
         swept
@@ -653,23 +719,31 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
     /// resources are released). Used by the page cache's `purge_all`.
     pub fn clear(&self) {
         for sh in self.shards.iter() {
-            let mut s = sh.lock();
-            // Drain the map first so a node is gone from the index before its hook
-            // runs (the hook never re-enters this shard).
-            let drained: Vec<(K, Box<Node<K, V>>)> = s.map.drain().collect();
-            for (k, n) in &drained {
-                self.on_evict.on_evict(k, &n.value, EvictCause::Explicit);
+            let evicted = {
+                let mut s = sh.lock();
+                // Drain the map first so a node is gone from the index before its hook
+                // runs (the hook never re-enters this shard).
+                let drained: Vec<(K, Box<Node<K, V>>)> = s.map.drain().collect();
+                for (k, n) in &drained {
+                    self.on_evict.on_evict(k, &n.value, EvictCause::Explicit);
+                }
+                let ram = s.ram_used;
+                let disk = s.disk_used;
+                s.ram_used = 0;
+                s.disk_used = 0;
+                s.expiry.clear();
+                s.ram_head = K::nil();
+                s.ram_tail = K::nil();
+                s.disk_head = K::nil();
+                s.disk_tail = K::nil();
+                self.global_budget.lock().release(ram, disk);
+                !drained.is_empty()
+            };
+            // Per shard (not once at the end) so a deferred-unlink hook's
+            // pending list holds at most one shard's worth of paths.
+            if evicted {
+                self.on_evict.after_unlock();
             }
-            let ram = s.ram_used;
-            let disk = s.disk_used;
-            s.ram_used = 0;
-            s.disk_used = 0;
-            s.expiry.clear();
-            s.ram_head = K::nil();
-            s.ram_tail = K::nil();
-            s.disk_head = K::nil();
-            s.disk_tail = K::nil();
-            self.global_budget.lock().release(ram, disk);
         }
     }
 }
@@ -683,6 +757,10 @@ pub struct ShardAccess<'a, K: ShardKey, V: CacheValue, E: OnEvict<K, V>> {
     ram_budget_per_shard: u64,
     disk_budget_per_shard: u64,
     global_budget: &'a Mutex<GlobalBudget>,
+    /// True once any teardown fired [`OnEvict::on_evict`] in this critical
+    /// section; the owning entry point calls [`OnEvict::after_unlock`] after
+    /// releasing the shard mutex iff set (#293).
+    evicted: bool,
 }
 
 impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
@@ -763,6 +841,7 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
         if release_global {
             self.global_budget.lock().release(ram_w, disk_w);
         }
+        self.evicted = true;
         self.on_evict.on_evict(id, &node.value, cause);
     }
 

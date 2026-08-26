@@ -328,6 +328,7 @@ pub(crate) fn spawn_uring_http(
             .name(format!("hj-uring-{core_i}"))
             .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
             .spawn(move || {
+                maybe_pin_core_thread(core_i, worker_count);
                 per_core_bridged(
                     core_i,
                     std_listener,
@@ -342,6 +343,41 @@ pub(crate) fn spawn_uring_http(
     drop(ready_tx);
     wait_for_worker_readiness("HTTP", worker_count, ready_rx)?;
     Ok(())
+}
+
+/// (#296) Kill switch for per-core thread pinning (`--no-core-pinning`).
+pub(crate) static CORE_PINNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// (#296) Pin the CALLING per-core transport thread to `core` — only when the
+/// worker count equals the machine's CPU count, so each runtime owns exactly
+/// one core (any other shape and the kernel's own placement beats a partial
+/// pin). Gives the per-core io_uring state + SO_REUSEPORT socket L1/L2
+/// locality and stops migration stalls. HISTORY: the per-core single-thread
+/// RUNTIME change was reverted for uneven keepalive distribution — pinning
+/// keeps today's runtime model but makes any placement unevenness permanent,
+/// hence the self-gating condition, the `--no-core-pinning` kill switch, and
+/// the pre-registered p99 watch in the campaign notes.
+pub(crate) fn maybe_pin_core_thread(core: usize, workers: usize) {
+    if !CORE_PINNING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    if workers != cpus || core >= cpus {
+        return;
+    }
+    // SAFETY: a zeroed cpu_set_t is a valid empty mask; CPU_SET stays in
+    // bounds (core < cpus <= CPU_SETSIZE on any host this runs on); pid 0
+    // targets the calling thread.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(core, &mut set);
+        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+            tracing::warn!(core, "uring: sched_setaffinity failed; running unpinned");
+        }
+    }
 }
 
 /// The per-core listener set for an io_uring transport: the inherited
@@ -376,7 +412,9 @@ fn build_pipeline_bridge(
     // Same hazard class for hj-h2's file-body streaming: its chunks are pulled on the
     // monoio connection threads, so plant the tokio runtime its blocking reads run on.
     hj_h2::server::set_io_handle(tokio::runtime::Handle::current());
-    let lname = listener_name.to_string();
+    // The pipeline only reads the name; share the Arc instead of re-allocating a String
+    // for every bridged request (the closure runs concurrently across tokio workers).
+    let lname = listener_name;
     bridge::spawn_on_current_with_admission(admission, move |req, ctx: BridgeCtx| {
         let state = holder.load_full();
         let lname = lname.clone();
@@ -505,6 +543,7 @@ pub(crate) fn spawn_uring_https(
             .name(format!("hj-uring-tls-{core_i}"))
             .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
             .spawn(move || {
+                maybe_pin_core_thread(core_i, worker_count);
                 per_core_https(
                     core_i,
                     std_listener,
@@ -783,6 +822,7 @@ async fn handle_conn_bridged(
     let header_read_timeout = state.serve_config.header_read_timeout;
     let request_start = std::time::Instant::now();
     let mut acc: Vec<u8> = Vec::with_capacity(8192);
+    let mut read_scratch: Vec<u8> = Vec::new();
     let is_h2 = loop {
         let n = acc.len().min(H2_PREFACE.len());
         if acc[..n] != H2_PREFACE[..n] {
@@ -799,8 +839,8 @@ async fn handle_conn_bridged(
                 return;
             }
         }
-        match read_timeout(&mut stream, remaining).await {
-            Ok(chunk) if !chunk.is_empty() => acc.extend_from_slice(&chunk),
+        match read_timeout(&mut stream, remaining, &mut read_scratch).await {
+            Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
             _ => return,
         }
     };
@@ -901,6 +941,7 @@ async fn handle_h1_bridged<S>(
 {
     // Requests served on this keep-alive connection (LiteSpeed maxKeepAliveReq enforcement).
     let mut served: u32 = 0;
+    let mut read_scratch: Vec<u8> = Vec::new();
     loop {
         let state = core.holder.load();
         // Request-size caps from the LiteSpeed config (maxReqHeaderSize/maxReqBodySize),
@@ -921,12 +962,19 @@ async fn handle_h1_bridged<S>(
             if acc.capacity() > 256 * 1024 {
                 acc = Vec::with_capacity(8192);
             }
-            let keep_alive_timeout = state.serve_config.keep_alive_timeout;
+            // (#303) Same proxy-padding floor the H2 idle window applies: CF's edge
+            // keeps idle origin connections well past a 5s keepAliveTimeout, and an
+            // unpadded H1 idle wait closes them almost immediately (constant
+            // reconnect + TLS-handshake churn). H2 has padded to >=90s for a while.
+            let keep_alive_timeout = state
+                .serve_config
+                .keep_alive_timeout
+                .map(|t| t.max(std::time::Duration::from_secs(90)));
             monoio::select! {
                 biased;
-                res = read_timeout(&mut stream, keep_alive_timeout) => {
+                res = read_timeout(&mut stream, keep_alive_timeout, &mut read_scratch) => {
                     match res {
-                        Ok(chunk) if !chunk.is_empty() => acc.extend_from_slice(&chunk),
+                        Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
                         _ => return, // EOF, error, or keep-alive timeout
                     }
                 }
@@ -944,85 +992,7 @@ async fn handle_h1_bridged<S>(
                 let mut headers = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
                 let mut req = httparse::Request::new(&mut headers);
                 match request_head_progress(req.parse(&acc), acc.len(), max_head) {
-                    RequestHeadProgress::Complete(head_len) => {
-                        let method = req.method.unwrap_or("GET").to_string();
-                        let path = req.path.unwrap_or("/").to_string();
-                        let mut hdrs: Vec<(http::HeaderName, http::HeaderValue)> =
-                            Vec::with_capacity(req.headers.len());
-                        let mut cl_values: Vec<&[u8]> = Vec::new();
-                        let mut chunked = false;
-                        let mut te_other = false;
-                        let mut host_count = 0usize;
-                        let mut conn_close = req.version == Some(0);
-                        // RFC 7231 §5.1.1: honor `Expect: 100-continue` (HTTP/1.1 only) by
-                        // sending an interim 100 before reading the body, so a client that
-                        // withholds the body pending it isn't stalled to the header timeout.
-                        let mut expect_continue = false;
-                        for h in req.headers.iter() {
-                            if h.name.eq_ignore_ascii_case("expect") {
-                                expect_continue =
-                                    req.version == Some(1) && expect_is_100_continue(h.value);
-                            }
-                            if h.name.eq_ignore_ascii_case("content-length") {
-                                cl_values.push(h.value);
-                            } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                                // We frame the body ourselves; Transfer-Encoding is hop-by-hop and
-                                // is never forwarded downstream. Only a lone `chunked` is framable
-                                // here — any other coding (or a non-final/compound TE) we cannot
-                                // length-frame, so flag it for rejection rather than guess.
-                                if te_is_chunked(h.value) {
-                                    chunked = true;
-                                } else {
-                                    te_other = true;
-                                }
-                                continue;
-                            } else if h.name.eq_ignore_ascii_case("host") {
-                                host_count += 1;
-                            } else if h.name.eq_ignore_ascii_case("connection") {
-                                // RFC 7230 §6.1: Connection is a comma-separated token list
-                                // (e.g. `close, Upgrade`). Match each token, not the whole
-                                // value — a whole-value compare misses `close` in a multi-token
-                                // header and mis-frames keep-alive.
-                                for tok in h.value.split(|&b| b == b',') {
-                                    let tok = tok.trim_ascii();
-                                    if tok.eq_ignore_ascii_case(b"close") {
-                                        conn_close = true;
-                                    } else if tok.eq_ignore_ascii_case(b"keep-alive") {
-                                        conn_close = false;
-                                    }
-                                }
-                            }
-                            if let (Ok(n), Ok(v)) = (
-                                http::HeaderName::from_bytes(h.name.as_bytes()),
-                                http::HeaderValue::from_bytes(h.value),
-                            ) {
-                                hdrs.push((n, v));
-                            }
-                        }
-                        // RFC 7230 §3.3.3: reject smuggling-prone framing — both TE and CL present,
-                        // a non-chunked/compound TE, a non-numeric/overflowing CL, or conflicting
-                        // duplicate CL values. (A malformed/duplicate CL silently coerced to a length
-                        // would frame the body short and leak the trailing bytes as the next request.)
-                        // Decided by `codec::classify_framing` so the served path and the fuzzers agree.
-                        let framing = if host_count > 1 {
-                            // RFC 9112 §3.2: a request with multiple Host lines is malformed
-                            // (MUST reject or replace). Routing, foreign-host protection and
-                            // cache keys read only the first while hj-proxy forwards BOTH —
-                            // so reject rather than forward the ambiguity.
-                            BodyFraming::Reject
-                        } else {
-                            classify_framing(cl_values.iter().copied(), chunked, te_other)
-                        };
-                        ParsedReq::Done {
-                            method,
-                            path,
-                            hdrs,
-                            head_len,
-                            framing,
-                            keep_alive: !conn_close,
-                            expect_continue,
-                        }
-                    }
+                    RequestHeadProgress::Complete(head_len) => materialize_head(&req, head_len),
                     RequestHeadProgress::Partial => ParsedReq::Partial,
                     RequestHeadProgress::TooLarge => ParsedReq::HeadersTooLarge,
                     RequestHeadProgress::Bad => ParsedReq::Bad,
@@ -1031,8 +1001,8 @@ async fn handle_h1_bridged<S>(
             match step {
                 ParsedReq::Done {
                     method,
-                    path,
-                    hdrs,
+                    uri,
+                    headers,
                     head_len,
                     framing,
                     keep_alive,
@@ -1040,8 +1010,8 @@ async fn handle_h1_bridged<S>(
                 } => {
                     break (
                         method,
-                        path,
-                        hdrs,
+                        uri,
+                        headers,
                         head_len,
                         framing,
                         keep_alive,
@@ -1075,14 +1045,14 @@ async fn handle_h1_bridged<S>(
                             return;
                         }
                     }
-                    match read_timeout(&mut stream, remaining).await {
-                        Ok(chunk) if !chunk.is_empty() => acc.extend_from_slice(&chunk),
+                    match read_timeout(&mut stream, remaining, &mut read_scratch).await {
+                        Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
                         _ => return,
                     }
                 }
             }
         };
-        let (method, path, mut hdrs, head_len, framing, mut keep_alive, expect_continue) = parsed;
+        let (method, uri, mut headers, head_len, framing, mut keep_alive, expect_continue) = parsed;
         // maxKeepAliveReq: once this connection has served the configured number of requests,
         // signal close on this (final) response so the client opens a fresh connection.
         served = served.saturating_add(1);
@@ -1143,9 +1113,9 @@ async fn handle_h1_bridged<S>(
                     write_continue(&mut stream).await;
                 }
                 while acc.len() < total {
-                    match read_timeout(&mut stream, header_read_timeout).await {
-                        Ok(chunk) if !chunk.is_empty() => {
-                            acc.extend_from_slice(&chunk);
+                    match read_timeout(&mut stream, header_read_timeout, &mut read_scratch).await {
+                        Ok(n) if n > 0 => {
+                            acc.extend_from_slice(&read_scratch[..n]);
                             // Top the reservation up to the bytes actually buffered.
                             let buffered =
                                 (acc.len().saturating_sub(head_len)).min(content_length) as u64;
@@ -1202,8 +1172,10 @@ async fn handle_h1_bridged<S>(
                             return;
                         }
                         ChunkStep::NeedMore => {
-                            match read_timeout(&mut stream, header_read_timeout).await {
-                                Ok(chunk) if !chunk.is_empty() => acc.extend_from_slice(&chunk),
+                            match read_timeout(&mut stream, header_read_timeout, &mut read_scratch)
+                                .await
+                            {
+                                Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
                                 _ => return,
                             }
                         }
@@ -1213,8 +1185,9 @@ async fn handle_h1_bridged<S>(
                 acc.drain(..end);
                 // Transfer-Encoding was stripped; hand the backend an explicit length so
                 // CONTENT_LENGTH/$_SERVER and LSAPI framing are correct.
+                // classify_framing already rejected TE+CL, so no CL exists to shadow.
                 if let Ok(v) = http::HeaderValue::from_str(&bb.len().to_string()) {
-                    hdrs.push((http::header::CONTENT_LENGTH, v));
+                    headers.insert(http::header::CONTENT_LENGTH, v);
                 }
                 bb
             }
@@ -1229,24 +1202,16 @@ async fn handle_h1_bridged<S>(
                 .map_err(|n| match n {})
                 .boxed()
         };
-        let mut builder = http::Request::builder()
-            .method(method.as_str())
-            .uri(path.as_str())
-            .version(http::Version::HTTP_11);
-        for (n, v) in hdrs {
-            builder = builder.header(n, v);
-        }
-        let mut req = match builder.body(body) {
-            Ok(r) => r,
-            // (#233 residual) httparse accepts request-target bytes that `http::Uri`
-            // rejects (`"`, `<`, `\`, `^`, `{`, `|`, `}`, DEL, raw >=0x80): the builder
-            // records the URI error and surfaces it here. Silent-close repeats the
-            // original defect one layer down — answer 400 + close.
-            Err(_) => {
-                write_status_close(&mut stream, 400, "Bad Request").await;
-                return;
-            }
-        };
+        // (#277) Direct construction — the Method/Uri/HeaderMap were fully
+        // validated + materialized ONCE at intake (an httparse-accepted-but-
+        // Uri-rejected target answered 400+close there, preserving #233), so
+        // the builder's per-header revalidation loop and its late error path
+        // have nothing left to do.
+        let mut req = http::Request::new(body);
+        *req.method_mut() = method.clone();
+        *req.uri_mut() = uri;
+        *req.version_mut() = http::Version::HTTP_11;
+        *req.headers_mut() = headers;
         let mut upgrade_ready = None;
         if hj_proxy::is_websocket_upgrade(req.headers()) {
             let (upgrade, ready) = bridge::UringUpgradeRequest::channel();
@@ -1299,7 +1264,7 @@ async fn handle_h1_bridged<S>(
             relay_h1_upgrade(stream, std::mem::take(&mut acc), upgrade).await;
             return;
         }
-        let is_head = method.eq_ignore_ascii_case("HEAD");
+        let is_head = method == http::Method::HEAD;
         // Full → one vectored head/body write; Stream → head then drained chunks.
         let must_close = write_h1_response(&mut stream, resp, is_head, keep_alive).await;
         if must_close {
@@ -1311,9 +1276,9 @@ async fn handle_h1_bridged<S>(
 
 enum ParsedReq {
     Done {
-        method: String,
-        path: String,
-        hdrs: Vec<(http::HeaderName, http::HeaderValue)>,
+        method: http::Method,
+        uri: http::Uri,
+        headers: http::HeaderMap,
         head_len: usize,
         framing: BodyFraming,
         keep_alive: bool,
@@ -1323,6 +1288,100 @@ enum ParsedReq {
     Bad,
     /// Configured byte cap or `MAX_REQUEST_HEADERS` field slots exceeded — answer 431.
     HeadersTooLarge,
+}
+
+/// (#277) Materialize a completed `httparse::Request` head ONCE into typed
+/// `Method`/`Uri`/`HeaderMap` plus the framing/keep-alive/expect decisions.
+/// The old intake built method/path Strings and a `Vec<(HeaderName,
+/// HeaderValue)>`, then re-inserted every header through `Request::builder`
+/// (which re-validated each name/value and re-parsed the URI); this builds the
+/// pre-sized map and parses the URI a single time. An httparse-accepted-but-
+/// `http::Uri`-rejected target returns `Bad` here (answered 400+close), exactly
+/// as the builder's late URI error did (#233); dup-Host and TE/CL smuggling
+/// shapes still resolve to `BodyFraming::Reject` via the unchanged
+/// `classify_framing`. Pure over the parsed head so it can be tested directly.
+fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedReq {
+    let method = match http::Method::from_bytes(req.method.unwrap_or("GET").as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return ParsedReq::Bad,
+    };
+    let uri = match req.path.unwrap_or("/").parse::<http::Uri>() {
+        Ok(u) => u,
+        Err(_) => return ParsedReq::Bad,
+    };
+    let mut hdr_map = http::HeaderMap::with_capacity(req.headers.len());
+    let mut cl_values: Vec<&[u8]> = Vec::new();
+    let mut chunked = false;
+    let mut te_other = false;
+    let mut host_count = 0usize;
+    let mut conn_close = req.version == Some(0);
+    // RFC 7231 §5.1.1: honor `Expect: 100-continue` (HTTP/1.1 only) by
+    // sending an interim 100 before reading the body, so a client that
+    // withholds the body pending it isn't stalled to the header timeout.
+    let mut expect_continue = false;
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("expect") {
+            expect_continue = req.version == Some(1) && expect_is_100_continue(h.value);
+        }
+        if h.name.eq_ignore_ascii_case("content-length") {
+            cl_values.push(h.value);
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            // We frame the body ourselves; Transfer-Encoding is hop-by-hop and
+            // is never forwarded downstream. Only a lone `chunked` is framable
+            // here — any other coding (or a non-final/compound TE) we cannot
+            // length-frame, so flag it for rejection rather than guess.
+            if te_is_chunked(h.value) {
+                chunked = true;
+            } else {
+                te_other = true;
+            }
+            continue;
+        } else if h.name.eq_ignore_ascii_case("host") {
+            host_count += 1;
+        } else if h.name.eq_ignore_ascii_case("connection") {
+            // RFC 7230 §6.1: Connection is a comma-separated token list
+            // (e.g. `close, Upgrade`). Match each token, not the whole
+            // value — a whole-value compare misses `close` in a multi-token
+            // header and mis-frames keep-alive.
+            for tok in h.value.split(|&b| b == b',') {
+                let tok = tok.trim_ascii();
+                if tok.eq_ignore_ascii_case(b"close") {
+                    conn_close = true;
+                } else if tok.eq_ignore_ascii_case(b"keep-alive") {
+                    conn_close = false;
+                }
+            }
+        }
+        if let (Ok(n), Ok(v)) = (
+            http::HeaderName::from_bytes(h.name.as_bytes()),
+            http::HeaderValue::from_bytes(h.value),
+        ) {
+            hdr_map.append(n, v);
+        }
+    }
+    // RFC 7230 §3.3.3: reject smuggling-prone framing — both TE and CL present,
+    // a non-chunked/compound TE, a non-numeric/overflowing CL, or conflicting
+    // duplicate CL values. (A malformed/duplicate CL silently coerced to a length
+    // would frame the body short and leak the trailing bytes as the next request.)
+    // Decided by `codec::classify_framing` so the served path and the fuzzers agree.
+    let framing = if host_count > 1 {
+        // RFC 9112 §3.2: a request with multiple Host lines is malformed
+        // (MUST reject or replace). Routing, foreign-host protection and
+        // cache keys read only the first while hj-proxy forwards BOTH —
+        // so reject rather than forward the ambiguity.
+        BodyFraming::Reject
+    } else {
+        classify_framing(cl_values.iter().copied(), chunked, te_other)
+    };
+    ParsedReq::Done {
+        method,
+        uri,
+        headers: hdr_map,
+        head_len,
+        framing,
+        keep_alive: !conn_close,
+        expect_continue,
+    }
 }
 
 // The pure request-framing primitives (`BodyFraming`, `classify_framing`,
@@ -1418,6 +1477,51 @@ fn h1_response_framing(
 /// values are written as raw bytes (a non-visible-ASCII value is valid in an `HeaderValue` and
 /// must not be silently dropped). Hop-by-hop + the backend's own content-length are stripped;
 /// the transport emits status-appropriate framing itself.
+/// Decimal digits appended in place — the per-response head serializer used to pay two
+/// `format!` heap temporaries for exactly these numbers.
+#[inline]
+fn push_u64_decimal(out: &mut Vec<u8>, v: u64) {
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    let mut v = v;
+    loop {
+        i -= 1;
+        tmp[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&tmp[i..]);
+}
+
+/// Lowercase hex digits appended in place (chunked-transfer size prefixes).
+#[inline]
+fn push_u64_hex(out: &mut Vec<u8>, v: u64) {
+    let mut tmp = [0u8; 16];
+    let mut i = tmp.len();
+    let mut v = v;
+    loop {
+        i -= 1;
+        tmp[i] = b"0123456789abcdef"[(v & 0xF) as usize];
+        v >>= 4;
+        if v == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&tmp[i..]);
+}
+
+/// Status line bytes ("HTTP/1.1 <code> <reason>\r\n") appended without format! temporaries.
+#[inline]
+fn push_h1_status_line(out: &mut Vec<u8>, status: http::StatusCode, reason: &str) {
+    out.extend_from_slice(b"HTTP/1.1 ");
+    push_u64_decimal(out, status.as_u16() as u64);
+    out.push(b' ');
+    out.extend_from_slice(reason.as_bytes());
+    out.extend_from_slice(b"\r\n");
+}
+
 fn serialize_h1_response_head(
     status: http::StatusCode,
     headers: &http::HeaderMap,
@@ -1427,7 +1531,7 @@ fn serialize_h1_response_head(
 ) -> Vec<u8> {
     let reason = status.canonical_reason().unwrap_or("");
     let mut out: Vec<u8> = Vec::with_capacity(256);
-    out.extend_from_slice(format!("HTTP/1.1 {} {reason}\r\n", status.as_u16()).as_bytes());
+    push_h1_status_line(&mut out, status, reason);
     for (n, v) in headers.iter() {
         if n == http::header::CONTENT_LENGTH || is_hop_by_hop_response(n) {
             continue;
@@ -1439,7 +1543,9 @@ fn serialize_h1_response_head(
     }
     match h1_response_framing(status, headers, Some(body_len as u64), is_head) {
         H1ResponseFraming::ContentLength(n) => {
-            out.extend_from_slice(format!("content-length: {n}\r\n").as_bytes())
+            out.extend_from_slice(b"content-length: ");
+            push_u64_decimal(&mut out, n);
+            out.extend_from_slice(b"\r\n");
         }
         H1ResponseFraming::Chunked => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
         H1ResponseFraming::None => {}
@@ -1464,7 +1570,7 @@ where
 fn serialize_h1_upgrade_response(status: http::StatusCode, headers: &http::HeaderMap) -> Vec<u8> {
     let reason = status.canonical_reason().unwrap_or("");
     let mut out = Vec::with_capacity(256);
-    out.extend_from_slice(format!("HTTP/1.1 {} {reason}\r\n", status.as_u16()).as_bytes());
+    push_h1_status_line(&mut out, status, reason);
     let mut has_connection = false;
     let mut has_upgrade = false;
     for (name, value) in headers {
@@ -1617,7 +1723,9 @@ where
                     continue;
                 }
                 let result = if chunked {
-                    let prefix = format!("{:x}\r\n", b.len()).into_bytes();
+                    let mut prefix = Vec::with_capacity(20);
+                    push_u64_hex(&mut prefix, b.len() as u64);
+                    prefix.extend_from_slice(b"\r\n");
                     write_h1_vectored(
                         stream,
                         vec![
@@ -1660,7 +1768,7 @@ fn serialize_h1_stream_head(
 ) -> Vec<u8> {
     let reason = status.canonical_reason().unwrap_or("");
     let mut out: Vec<u8> = Vec::with_capacity(256);
-    out.extend_from_slice(format!("HTTP/1.1 {} {reason}\r\n", status.as_u16()).as_bytes());
+    push_h1_status_line(&mut out, status, reason);
     for (n, v) in headers.iter() {
         if n == http::header::CONTENT_LENGTH || is_hop_by_hop_response(n) {
             continue;
@@ -1727,10 +1835,10 @@ pub(crate) fn serve_smoke(addr: SocketAddr, workers: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// One pinned core's runtime: a monoio io_uring runtime running an accept loop
-/// that spawns a per-connection task. (TODO Phase 1: pin this thread to `core`
-/// via `sched_setaffinity` for true thread-per-core locality — functionally
-/// correct unpinned; pinning is a perf refinement.)
+/// One core's runtime for the SMOKE stub: a monoio io_uring runtime running an
+/// accept loop that spawns a per-connection task. (The production transports
+/// pin their per-core threads via `maybe_pin_core_thread` (#296); the smoke
+/// stub stays unpinned.)
 fn per_core(core: usize, std_listener: std::net::TcpListener) {
     let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
         .enable_timer()
@@ -1917,32 +2025,37 @@ fn h2_service(_req: hj_core::Request) -> impl std::future::Future<Output = hj_co
     async { hj_core::text_response(http::StatusCode::OK, "httpjet-uring-h2\n") }
 }
 
+/// One read into the CONNECTION-OWNED scratch (reused across every read of the
+/// connection — monoio's rent API hands the Vec back after each op). Previously this
+/// allocated a fresh 8 KiB Vec per read, including each idle keep-alive timeout tick.
+/// Returns the number of bytes read; data lands in `scratch[..n]`.
 async fn read_timeout<S>(
     stream: &mut S,
     timeout: Option<std::time::Duration>,
-) -> io::Result<Vec<u8>>
+    scratch: &mut Vec<u8>,
+) -> io::Result<usize>
 where
     S: monoio::io::AsyncReadRent,
 {
-    let buf = vec![0u8; 8192];
+    scratch.clear();
+    if scratch.capacity() == 0 {
+        scratch.reserve(8192);
+    }
+    let buf = std::mem::take(scratch);
     match timeout {
         Some(d) => match monoio::time::timeout(d, stream.read(buf)).await {
-            Ok((Ok(n), mut buf)) => {
-                buf.truncate(n);
-                Ok(buf)
+            Ok((Ok(n), b)) => {
+                *scratch = b;
+                Ok(n)
             }
+            // The rented buffer died with the timed-out future; the next read re-reserves.
             Ok((Err(e), _)) => Err(e),
             Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "read timed out")),
         },
         None => {
-            let (res, mut buf) = stream.read(buf).await;
-            match res {
-                Ok(n) => {
-                    buf.truncate(n);
-                    Ok(buf)
-                }
-                Err(e) => Err(e),
-            }
+            let (res, b) = stream.read(buf).await;
+            *scratch = b;
+            res
         }
     }
 }
@@ -2810,5 +2923,112 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         assert_eq!(r(&[b"nope" as &[u8]]), Err(())); // non-numeric
         assert_eq!(r(&[b"99999999999999999999999999" as &[u8]]), Err(())); // overflow
         assert_eq!(r(&[b"4" as &[u8], b"0"]), Err(())); // conflicting duplicates
+    }
+
+    /// (#277) Differential coverage for the single-materialization intake: the
+    /// same wire bytes that the old builder-based path classified must classify
+    /// identically now that Method/Uri/HeaderMap are built once. Drives
+    /// `materialize_head` directly (the pure core of the intake).
+    #[test]
+    fn materialize_head_preserves_framing_and_uri_rejection() {
+        fn parse(wire: &[u8]) -> ParsedReq {
+            let mut headers = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
+            let mut req = httparse::Request::new(&mut headers);
+            match req.parse(wire) {
+                Ok(httparse::Status::Complete(head_len)) => materialize_head(&req, head_len),
+                other => panic!("fixture must parse-complete, got {other:?}"),
+            }
+        }
+        let done = |p: &ParsedReq| matches!(p, ParsedReq::Done { .. });
+        let framing = |p: &ParsedReq| match p {
+            ParsedReq::Done { framing, .. } => Some(*framing),
+            _ => None,
+        };
+
+        // Plain GET: accepted, empty framing, keep-alive, Method/Uri/headers materialized.
+        let p = parse(b"GET /a?b=c HTTP/1.1\r\nHost: x\r\nAccept: */*\r\n\r\n");
+        match &p {
+            ParsedReq::Done {
+                method,
+                uri,
+                headers,
+                framing,
+                keep_alive,
+                ..
+            } => {
+                assert_eq!(method, http::Method::GET);
+                assert_eq!(uri.path(), "/a");
+                assert_eq!(uri.query(), Some("b=c"));
+                assert_eq!(headers.get("host").unwrap(), "x");
+                assert_eq!(headers.get("accept").unwrap(), "*/*");
+                assert_eq!(*framing, BodyFraming::Length(0));
+                assert!(*keep_alive);
+            }
+            ParsedReq::Bad => panic!("expected Done, got Bad"),
+            _ => panic!("expected Done"),
+        }
+
+        // #233 class: an httparse-accepted target that http::Uri rejects → Bad (400+close),
+        // NOT a Done that would panic downstream.
+        assert!(matches!(
+            parse(b"GET /a<b HTTP/1.1\r\nHost: x\r\n\r\n"),
+            ParsedReq::Bad
+        ));
+        assert!(matches!(
+            parse(b"GET /a`b HTTP/1.1\r\nHost: x\r\n\r\n"),
+            ParsedReq::Bad
+        ));
+
+        // Duplicate Host → Reject (smuggling / routing ambiguity).
+        assert_eq!(
+            framing(&parse(b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n")),
+            Some(BodyFraming::Reject)
+        );
+
+        // TE + CL together → Reject.
+        assert_eq!(
+            framing(&parse(
+                b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )),
+            Some(BodyFraming::Reject)
+        );
+        // Lone chunked → Chunked.
+        assert_eq!(
+            framing(&parse(
+                b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+            )),
+            Some(BodyFraming::Chunked)
+        );
+        // Conflicting duplicate CL → Reject.
+        assert_eq!(
+            framing(&parse(
+                b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n"
+            )),
+            Some(BodyFraming::Reject)
+        );
+        // Well-formed CL → Length(n).
+        assert_eq!(
+            framing(&parse(
+                b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"
+            )),
+            Some(BodyFraming::Length(5))
+        );
+
+        // Connection: close in a multi-token list flips keep_alive off.
+        match parse(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n") {
+            ParsedReq::Done { keep_alive, .. } => assert!(!keep_alive),
+            ParsedReq::Bad => panic!("expected Done, got Bad"),
+            _ => panic!("expected Done"),
+        }
+        // Duplicate header names are preserved as multiple values (append, not insert).
+        match parse(b"GET / HTTP/1.1\r\nHost: x\r\nX-H: 1\r\nX-H: 2\r\n\r\n") {
+            ParsedReq::Done { headers, .. } => {
+                let vals: Vec<_> = headers.get_all("x-h").iter().collect();
+                assert_eq!(vals.len(), 2, "both X-H values retained");
+            }
+            ParsedReq::Bad => panic!("expected Done, got Bad"),
+            _ => panic!("expected Done"),
+        }
+        assert!(done(&parse(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")));
     }
 }

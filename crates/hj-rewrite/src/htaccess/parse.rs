@@ -837,9 +837,14 @@ fn parse_set_env_if(rest: &str, nocase: bool, line: usize) -> Option<SetEnvIf> {
             tracing::debug!(line, error = %e, "invalid SetEnvIf regex; skipping");
         })
         .ok()?;
+    // (#312) Same literal-prefix extraction the RewriteRule prefilter uses; for
+    // SetEnvIfNoCase the (?i) wrapper makes any prefix case-sensitive-invalid,
+    // so pass nocase through (extractor returns empty for it).
+    let literal_prefix = crate::rules::extract_literal_prefix(&regex_src, false, nocase);
     Some(SetEnvIf {
         attribute,
         regex,
+        literal_prefix,
         var,
         value,
     })

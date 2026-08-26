@@ -28,10 +28,11 @@ pub(super) fn seed_server_env(ctx: &mut ReqCtx) {
 /// into `ctx.env` (later entries win) BEFORE the rewrite runs, so RewriteConds
 /// (`%{ENV:NAME}`) and `Header ... env=` guards observe them.
 /// Reserved env namespace shared by every config-driven env writer: names under
-/// `HJ_` are request-identity plumbing (e.g. `HJ_REQUEST_PATH_QUERY` feeding the
-/// redirect-decache transform, seeded by `set_redirect_guard_env` BEFORE config
-/// evaluation runs) that a vhost/.htaccess rule must never be able to overwrite
-/// — doing so would spoof what `deny_labeled_self_redirect` compares against.
+/// `HJ_` are internal pipeline plumbing (e.g. `HJ_CACHE_REFRESH`) that a
+/// vhost/.htaccess rule must never be able to overwrite. (The redirect-decache
+/// request identity moved off env onto the dedicated `ReqCtx.redirect_guard`
+/// field (#318), out of config reach by construction; the prefix stays reserved
+/// for the remaining and any future internal keys.)
 pub(super) fn env_key_allowed(k: &str) -> bool {
     !k.starts_with("HJ_")
 }
@@ -228,9 +229,9 @@ mod tests {
             local_addr: "127.0.0.1:80".parse().unwrap(),
             peer_port: 40000,
             tls: None,
+            redirect_guard: None,
             request_time: std::time::SystemTime::UNIX_EPOCH,
             request_id: Default::default(),
-            upstream_id: None,
         };
         ctx.set_env("HJ_REQUEST_PATH_QUERY", "/original");
 

@@ -86,8 +86,8 @@ fn ctx(doc_root: &str) -> ReqCtx {
         peer_port: 0,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
-        upstream_id: None,
         tls: None,
+        redirect_guard: None,
     }
 }
 

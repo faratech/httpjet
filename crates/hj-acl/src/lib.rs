@@ -332,6 +332,34 @@ impl AccessControl {
     /// trusted proxies. Returns `None` if the header is absent or contains no
     /// parseable address.
     fn leftmost_untrusted_xff(&self, headers: &HeaderMap) -> Option<IpAddr> {
+        // (#283) Fast paths before the per-entry trusted scans. (a) When EVERY
+        // network is trusted there is no untrusted hop by construction: the
+        // left-most entry is the answer and no CIDR scan may run at all.
+        // (b) The Cloudflare shape is exactly ONE XFF entry — resolve it with a
+        // single is_trusted check instead of entering the general walk.
+        if self.all_trusted {
+            return headers
+                .get_all("x-forwarded-for")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|s| s.split(','))
+                .filter_map(|p| parse_ip(p.trim()))
+                .next();
+        }
+        {
+            // Exactly one header VALUE that parses to exactly one IP: whether that
+            // hop is trusted or not, it is both the only candidate and the
+            // left-most — one is_trusted check replaces the general walk.
+            let mut values = headers.get_all("x-forwarded-for").iter();
+            if let (Some(v), None) = (values.next(), values.next()) {
+                if let Ok(s) = v.to_str() {
+                    let mut parts = s.split(',').filter_map(|p| parse_ip(p.trim()));
+                    if let (Some(only), None) = (parts.next(), parts.next()) {
+                        return Some(only);
+                    }
+                }
+            }
+        }
         let mut first_parsed: Option<IpAddr> = None;
 
         for value in headers.get_all("x-forwarded-for").iter() {
@@ -365,6 +393,14 @@ impl AccessControl {
     /// descendant. See [`build_deny_globs`].
     pub fn deny_dir_match(&self, resolved_path: &Path) -> bool {
         self.deny_globs.is_match(resolved_path)
+    }
+
+    /// True when any `accessDenyDir` rule is configured. Callers use this to decide
+    /// whether the canonical (fd-verified) target path must be computed at all: with no
+    /// rules the deny check can never fire, so hj-static can skip the per-resolve
+    /// `/proc/self/fd` readlink entirely.
+    pub fn has_deny_dirs(&self) -> bool {
+        !self.deny_globs.is_empty()
     }
 }
 

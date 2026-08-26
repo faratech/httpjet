@@ -796,12 +796,10 @@ dependencies = [
 name = "hj-cache"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "hj-config",
- "httpdate",
- "memmap2",
  "parking_lot",
  "proptest",
+ "rustc-hash",
  "tempfile",
  "tracing",
 ]
@@ -913,6 +911,7 @@ dependencies = [
  "hj-cache",
  "hmac",
  "http",
+ "memmap2",
  "parking_lot",
  "proptest",
  "sha2",
@@ -1075,7 +1074,6 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
- "io-uring 0.7.14",
  "ktls-sys",
  "libc",
  "libmimalloc-sys",
@@ -1087,6 +1085,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rcgen",
+ "rustc-hash",
  "rustix",
  "rustls",
  "sha2",
@@ -1149,17 +1148,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "595a0399f411a508feb2ec1e970a4a30c249351e30208960d58298de8660b0e5"
 dependencies = [
  "bitflags 1.3.2",
- "libc",
-]
-
-[[package]]
-name = "io-uring"
-version = "0.7.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
-dependencies = [
- "bitflags 2.13.1",
- "cfg-if",
  "libc",
 ]
 
@@ -1349,7 +1337,7 @@ dependencies = [
  "bytes",
  "flume",
  "fxhash",
- "io-uring 0.6.4",
+ "io-uring",
  "libc",
  "memchr",
  "mio 0.8.11",

@@ -64,7 +64,8 @@ use hj_core::{Body, ReqCtx, Response, ResponseTransform};
 
 pub use dict::{DEFAULT_DICT_LEVEL, PageDict, PageDictRegistry};
 pub use encoding::{
-    DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, decode_bytes, encode_bytes, negotiate_with,
+    AcceptEncoding, DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, decode_bytes, encode_bytes,
+    negotiate_with,
 };
 pub use expires::{ExpiresBase, ExpiresHeaders, ExpiresRule, ExpiresRules};
 pub(crate) use stream::CompressStream;
@@ -213,10 +214,9 @@ impl Compress {
             return None;
         }
 
-        // Client negotiation (server priority, bounded by what the client accepts).
-        let enc = negotiate_with(accept_encoding, &self.priority)?;
-
-        // Never double-encode.
+        // Never double-encode. Checked BEFORE negotiation so a precompressed page-cache
+        // hit (Content-Encoding already present — the prod-dominant shape) never pays an
+        // Accept-Encoding parse just to no-op.
         if resp.headers().contains_key(CONTENT_ENCODING) {
             return None;
         }
@@ -249,6 +249,10 @@ impl Compress {
         if !self.compressible.matches(ct) {
             return None;
         }
+
+        // Client negotiation (server priority, bounded by what the client accepts) LAST:
+        // the most expensive gate, reached only for compressible uncached bodies.
+        let enc = negotiate_with(accept_encoding, &self.priority)?;
 
         // Honor `Cache-Control: no-transform` (RFC 9111 §5.2.2.6).
         // Scan ALL Cache-Control header lines (a proxied upstream may split
@@ -594,14 +598,20 @@ impl CompressibleSet {
         if self.any {
             return true;
         }
-        let base = ct_base(content_type).to_ascii_lowercase();
+        // Allocation-free: set entries are lowercased at construction, so compare the
+        // borrowed (possibly mixed-case) base with ascii-case-insensitive equality.
+        let base = ct_base(content_type);
         if base.is_empty() {
             return false;
         }
-        if self.exact.contains(&base) {
+        if self.exact.iter().any(|t| t.eq_ignore_ascii_case(base)) {
             return true;
         }
-        self.prefixes.iter().any(|p| base.starts_with(p.as_str()))
+        self.prefixes.iter().any(|p| {
+            base.len() >= p.len()
+                && p.as_bytes()
+                    .eq_ignore_ascii_case(&base.as_bytes()[..p.len()])
+        })
     }
 }
 
@@ -1175,8 +1185,8 @@ mod tests {
             peer_port: 0,
             request_time: std::time::SystemTime::now(),
             request_id: Default::default(),
-            upstream_id: None,
             tls: None,
+            redirect_guard: None,
         };
         ctx.set_env(ACCEPT_ENCODING_ENV, accept);
         ctx

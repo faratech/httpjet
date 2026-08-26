@@ -136,21 +136,6 @@ impl Drop for RequestGuard<'_> {
 /// chain load costs only cached per-dir stats on the hot hit path. The cache key
 /// embeds `is_tls`, so a cross-scheme request just misses. Net: the fast path can
 /// only ever serve a byte-correct hit or fall through.
-/// Adopt Cloudflare's `cf-ray` as the upstream correlation id — but only from a
-/// `trusted_proxy`. An untrusted direct-to-origin peer could otherwise forge or
-/// collide the id and poison cross-log joins, the same trust reasoning applied to
-/// `cf-visitor`/`x-forwarded-proto`. We always also mint our own `request_id`, so
-/// internal joins never depend on CF.
-fn upstream_request_id(trusted_proxy: bool, headers: &http::HeaderMap) -> Option<String> {
-    if !trusted_proxy {
-        return None;
-    }
-    headers
-        .get("cf-ray")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-}
-
 const X_REQUEST_ID: http::HeaderName = http::HeaderName::from_static("x-request-id");
 
 /// Echo the correlation id as `X-Request-Id` when `--request-id-header` is set, so a
@@ -238,7 +223,7 @@ pub(crate) async fn fast_serve(
         tls,
         request_time: std::time::SystemTime::now(),
         request_id: hj_core::reqid::next(),
-        upstream_id: upstream_request_id(trusted_proxy, req.headers()),
+        redirect_guard: None,
     };
     if let Some(ae) = req
         .headers()
@@ -250,7 +235,7 @@ pub(crate) async fn fast_serve(
     let req_host = lscache::request_host(req, &ctx);
     let host_foreign = !req_host.eq_ignore_ascii_case(&ctx.vhost_name)
         && !state.router.host_is_exact(listener, &req_host);
-    set_redirect_guard_env(&mut ctx, req.uri(), &req_host);
+    set_redirect_guard(&mut ctx, req.uri(), &req_host);
     let orig_path = match decode_request_path(req.uri().path()) {
         Some(p) => normalized_request_path(&p),
         None => return None, // malformed path → let the bridge render the error
@@ -331,13 +316,15 @@ pub(crate) async fn fast_serve(
             render_epoch,
             has_range: req.headers().contains_key(http::header::RANGE),
             host_foreign,
+            // Cookieless by branch precondition ⇒ the public vary value is "".
+            vary_value: Some(""),
         };
         let inm = req
             .headers()
             .get(http::header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok());
         if let lscache::CacheOutcome::Hit(mut resp) =
-            lscache::cache_lookup(state, &ctx, &cc, inm, false)
+            lscache::cache_lookup(state, &ctx, &cc, inm, false, None)
         {
             for t in &state.transforms {
                 t.transform(&ctx, &mut resp).await;
@@ -464,12 +451,10 @@ fn record_fast_serve(
     } else {
         is_tls
     };
-    let client_ip = state.acl.resolve_client_ip(
-        peer_ip,
-        req.headers(),
-        state.server.use_ip_in_proxy_header,
-        mtls_ok,
-    );
+    // (#283) fast_serve already resolved the real client IP into ctx; re-resolving
+    // here repeated the trusted-peer scan (incl. per-XFF-entry CIDR checks) for the
+    // log record only.
+    let client_ip = ctx.client_ip;
     let log_uri = match req.uri().query() {
         Some(q) => format!("{}?{}", req.uri().path(), q),
         None => req.uri().path().to_string(),
@@ -840,7 +825,7 @@ pub async fn handle(
         tls,
         request_time: std::time::SystemTime::now(),
         request_id: hj_core::reqid::next(),
-        upstream_id: upstream_request_id(trusted_proxy, req.headers()),
+        redirect_guard: None,
     };
 
     // A Host is FOREIGN to its resolved vhost when it reached the vhost only via the `*`
@@ -867,7 +852,7 @@ pub async fn handle(
         {
             ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
         }
-        set_redirect_guard_env(&mut ctx, req.uri(), &req_host);
+        set_redirect_guard(&mut ctx, req.uri(), &req_host);
         dispatch(&state, host_foreign, req_host, &mut ctx, req).await
     };
 
@@ -1428,14 +1413,28 @@ async fn dispatch(
         // exactly how PHP/lsphp reassembles multi-line Cookie headers. Reading only
         // the first line let a request present as guest to the cache tier while PHP
         // saw the logged-in cookie on a second line (tier desync).
-        let joined = req
+        // (#319) The overwhelmingly common single-line case borrows the header value
+        // instead of building a Vec + joined String.
+        let mut lines = req
             .headers()
             .get_all(http::header::COOKIE)
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect::<Vec<_>>()
-            .join(", ");
-        (!joined.is_empty()).then_some(joined)
+            .filter_map(|v| v.to_str().ok());
+        match (lines.next(), lines.next()) {
+            (Some(first), None) => (!first.is_empty()).then(|| first.to_string()),
+            (None, _) => None,
+            (Some(first), Some(second)) => {
+                let mut joined = String::with_capacity(first.len() + second.len() + 16);
+                joined.push_str(first);
+                joined.push_str(", ");
+                joined.push_str(second);
+                for line in lines {
+                    joined.push_str(", ");
+                    joined.push_str(line);
+                }
+                Some(joined)
+            }
+        }
     } else {
         None
     };
@@ -1486,6 +1485,20 @@ async fn dispatch(
         .page_cache
         .as_ref()
         .map(|pc| pc.begin_render(cache_render_epoch));
+    // (#275) The public vary discriminant, computed ONCE for the lookup + all
+    // store sites (build_cache_key/capsule_key otherwise re-split the Cookie
+    // header per call).
+    let cache_vary = if cache_on {
+        state
+            .page_cache
+            .as_ref()
+            .map(|pc| {
+                hj_pagecache::compute_vary_value(cache_cookie.as_deref(), &pc.config().vary_cookies)
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Built once, threaded unchanged to the lookup + all three store sites so their
     // keys + identity guard can never drift apart (see lscache::CacheCtx).
     let cc = lscache::CacheCtx {
@@ -1499,6 +1512,7 @@ async fn dispatch(
         render_epoch: cache_render_epoch,
         has_range: cache_has_range,
         host_foreign: cache_host_foreign,
+        vary_value: (cache_on && state.page_cache.is_some()).then_some(cache_vary.as_str()),
     };
 
     // ---- 4d. Deferred terminal `[P]` proxy, with page-cache participation ------------
@@ -1516,7 +1530,7 @@ async fn dispatch(
                 .get(http::header::IF_NONE_MATCH)
                 .and_then(|v| v.to_str().ok());
             if let lscache::CacheOutcome::Hit(hit) =
-                lscache::cache_lookup(state, ctx, &cc, inm, false)
+                lscache::cache_lookup(state, ctx, &cc, inm, false, None)
             {
                 state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
                 return hit;
@@ -1585,8 +1599,13 @@ async fn dispatch(
             .telemetry
             .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE)
             .then(std::time::Instant::now);
+        // (#320) Evaluate the shared cache gates ONCE for both sequential lookups.
+        let shared_gates = state
+            .page_cache
+            .as_ref()
+            .map(|store| lscache::compute_shared_gates(ctx, &cc, store));
         if !is_refresh {
-            match lscache::capsule_lookup(state, ctx, &cc, inm) {
+            match lscache::capsule_lookup(state, ctx, &cc, inm, shared_gates.as_ref()) {
                 lscache::CacheOutcome::Hit(hit) => {
                     state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
                     return hit;
@@ -1608,7 +1627,8 @@ async fn dispatch(
                 lscache::CacheOutcome::Miss(_) | lscache::CacheOutcome::Bypass => {}
             }
         }
-        let cache_outcome = lscache::cache_lookup(state, ctx, &cc, inm, is_refresh);
+        let cache_outcome =
+            lscache::cache_lookup(state, ctx, &cc, inm, is_refresh, shared_gates.as_ref());
         if let Some(t) = _lt {
             state
                 .telemetry
@@ -1681,7 +1701,7 @@ async fn dispatch(
                         tokio::pin!(notified);
                         notified.as_mut().enable();
                         if let lscache::CacheOutcome::Hit(hit) =
-                            lscache::cache_lookup(state, ctx, &cc, inm, false)
+                            lscache::cache_lookup(state, ctx, &cc, inm, false, None)
                         {
                             // Follower served the leader's freshly-stored entry: a HIT, not a miss.
                             state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
@@ -1689,7 +1709,7 @@ async fn dispatch(
                         }
                         let _ = tokio::time::timeout(SINGLEFLIGHT_WAIT, notified).await;
                         if let lscache::CacheOutcome::Hit(hit) =
-                            lscache::cache_lookup(state, ctx, &cc, inm, false)
+                            lscache::cache_lookup(state, ctx, &cc, inm, false, None)
                         {
                             // Follower served the leader's freshly-stored entry: a HIT, not a miss.
                             state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
@@ -2395,17 +2415,11 @@ fn cache_optimizer_allows_redirect_cdn_cache(label: &str) -> bool {
         .is_some_and(|code| matches!(code, "301" | "308"))
 }
 
-/// Stash the request identity the redirect-decache transform needs (it only
-/// sees `ctx`): the ORIGINAL raw path+query and the request host (already
-/// lowercased + port-stripped by `lscache::request_host`). Called on BOTH
-/// entry paths — `handle` and `fast_serve` — the labeled-self-redirect
-/// hard-deny is inert without it. An empty query is dropped so the paths that
-/// don't run `strip_empty_query` still agree with the ones that do.
 /// Merge rewrite-chain `[E=…]` sets into `ctx.env`. Names under the internal
-/// `HJ_` prefix are reserved — request-identity plumbing (e.g.
-/// `HJ_REQUEST_PATH_QUERY` feeding the redirect-decache transform) that a
-/// config rule must never be able to overwrite. Reserved keys are skipped
-/// with a warning instead of poisoning the transform's view of the request.
+/// `HJ_` prefix are reserved for request-identity plumbing (e.g.
+/// `HJ_CACHE_REFRESH`) that a config rule must never be able to overwrite.
+/// Reserved keys are skipped with a warning instead of poisoning the
+/// pipeline's view of the request.
 fn merge_rewrite_env(ctx: &mut ReqCtx, env: Vec<(String, String)>) {
     for (k, v) in env {
         if !htaccess_apply::env_key_allowed(&k) {
@@ -2420,13 +2434,16 @@ fn merge_rewrite_env(ctx: &mut ReqCtx, env: Vec<(String, String)>) {
     }
 }
 
-fn set_redirect_guard_env(ctx: &mut ReqCtx, uri: &http::Uri, req_host: &str) {
-    let pq = match uri.query() {
-        Some(q) if !q.is_empty() => format!("{}?{}", uri.path(), q),
-        _ => uri.path().to_string(),
-    };
-    ctx.set_env("HJ_REQUEST_PATH_QUERY", pq);
-    ctx.set_env("HJ_REQUEST_HOST", req_host.to_string());
+/// Stash the request identity the redirect-decache transform needs (it only
+/// sees `ctx`): the ORIGINAL raw path+query (Bytes-backed, rendered lazily on
+/// 3xx) and the request host (already lowercased + port-stripped by
+/// `lscache::request_host`). Called on BOTH entry paths — `handle` and
+/// `fast_serve` — the labeled-self-redirect hard-deny is inert without it.
+fn set_redirect_guard(ctx: &mut ReqCtx, uri: &http::Uri, req_host: &str) {
+    ctx.redirect_guard = Some(hj_core::RedirectGuard::new(
+        req_host.to_string(),
+        uri.path_and_query().cloned(),
+    ));
 }
 
 /// True when an absolute redirect target's host matches NEITHER the serving
@@ -2874,14 +2891,15 @@ fn deny_redirect_cdn_headers(ctx: &ReqCtx, resp: &mut Response) {
             .and_then(|v| v.to_str().ok())
             .and_then(redirect_target_host)
         {
-            if location_host_is_foreign(&host, &ctx.vhost_name, ctx.get_env("HJ_REQUEST_HOST")) {
+            let req_host = ctx.redirect_guard.as_ref().map(|g| g.host.as_str());
+            if location_host_is_foreign(&host, &ctx.vhost_name, req_host) {
                 return;
             }
         }
         // Same-host from here down. A labeled self-redirect is de-cached
         // unconditionally (see deny_labeled_self_redirect) — the label
         // allow-list below must never be able to re-cache a loop.
-        if let Some(req_pq) = ctx.get_env("HJ_REQUEST_PATH_QUERY") {
+        if let Some(req_pq) = ctx.redirect_guard.as_ref().and_then(|g| g.path_query()) {
             if deny_labeled_self_redirect(req_pq, resp) {
                 return;
             }
@@ -3693,23 +3711,25 @@ mod tests {
     }
 
     #[test]
-    fn redirect_guard_env_set_on_ctx() {
+    fn redirect_guard_set_on_ctx() {
         let mut ctx = bare_ctx_for_headers();
         let uri: http::Uri = "https://forum.example/tags/x?a=b".parse().unwrap();
-        set_redirect_guard_env(&mut ctx, &uri, "alias.example");
-        assert_eq!(ctx.get_env("HJ_REQUEST_PATH_QUERY"), Some("/tags/x?a=b"));
-        assert_eq!(ctx.get_env("HJ_REQUEST_HOST"), Some("alias.example"));
+        set_redirect_guard(&mut ctx, &uri, "alias.example");
+        let guard = ctx.redirect_guard.as_ref().unwrap();
+        assert_eq!(guard.path_query(), Some("/tags/x?a=b"));
+        assert_eq!(guard.host, "alias.example");
 
         // An empty query is dropped — parity with strip_empty_query on the
         // path that doesn't normalize the URI (fast_serve).
         let mut ctx = bare_ctx_for_headers();
         let uri: http::Uri = "/tags/x?".parse().unwrap();
-        set_redirect_guard_env(&mut ctx, &uri, "forum.example");
-        assert_eq!(ctx.get_env("HJ_REQUEST_PATH_QUERY"), Some("/tags/x"));
+        set_redirect_guard(&mut ctx, &uri, "forum.example");
+        let guard = ctx.redirect_guard.as_ref().unwrap();
+        assert_eq!(guard.path_query(), Some("/tags/x"));
     }
 
     #[tokio::test]
-    async fn deny_redirect_transform_needs_the_guard_env() {
+    async fn deny_redirect_transform_needs_the_guard() {
         use http::header::{CACHE_CONTROL, LOCATION};
         let labeled_self = || {
             let mut resp: Response = Response::new(Body::Empty);
@@ -3727,10 +3747,10 @@ mod tests {
             resp
         };
 
-        // With the guard env (both entry paths set it): the labeled
+        // With the guard (both entry paths set it): the labeled
         // self-redirect is hard-denied at egress.
         let mut ctx = bare_ctx_for_headers();
-        set_redirect_guard_env(
+        set_redirect_guard(
             &mut ctx,
             &"/tags/x".parse::<http::Uri>().unwrap(),
             "forum.example",
@@ -3748,7 +3768,7 @@ mod tests {
 
         // Without it the allow-listed label keeps CDN headers — the transform
         // is BLIND to self-loops, which is why every serve path (handle AND
-        // fast_serve) must call set_redirect_guard_env.
+        // fast_serve) must call set_redirect_guard.
         let ctx = bare_ctx_for_headers();
         let mut resp = labeled_self();
         DenyRedirectCdnTransform.transform(&ctx, &mut resp).await;
@@ -3959,9 +3979,9 @@ mod tests {
             local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
             peer_port: 12345,
             tls: None,
+            redirect_guard: None,
             request_time: std::time::SystemTime::now(),
             request_id: Default::default(),
-            upstream_id: None,
         }
     }
 
@@ -4013,15 +4033,15 @@ mod tests {
                 is_tls
             }
         };
-        let tls_no_cert = Some(hj_core::TlsParams {
-            protocol: "TLSv1.3",
-            cipher: "TLS_AES_256_GCM_SHA384".into(),
-            client_cert: None,
-        });
-        let tls_cert = Some(hj_core::TlsParams {
-            protocol: "TLSv1.3",
-            cipher: "TLS_AES_256_GCM_SHA384".into(),
-            client_cert: Some(hj_core::ClientCert {
+        let tls_no_cert = Some(hj_core::TlsParams::new(
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384".into(),
+            None,
+        ));
+        let tls_cert = Some(hj_core::TlsParams::new(
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384".into(),
+            Some(hj_core::ClientCert {
                 subject_dn: "CN=origin".into(),
                 issuer_dn: "CN=CF".into(),
                 serial_hex: "01".into(),
@@ -4029,7 +4049,7 @@ mod tests {
                 not_before: "".into(),
                 not_after: "".into(),
             }),
-        });
+        ));
 
         // Listener requires client auth (clientVerify>=1): cert presence is decisive.
         assert!(!mtls_ok(true, false, &None)); // plaintext: never ok

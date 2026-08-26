@@ -62,20 +62,76 @@ pub struct ReqCtx {
     /// Per-request correlation id, minted once at the transport boundary and
     /// emitted into every log sink so one request is joinable across them.
     pub request_id: crate::reqid::ReqId,
-    /// Trusted upstream correlation id (Cloudflare `cf-ray`) when the peer is a
-    /// `trusted_proxy`; lets a request be joined to CF's edge logs. `None` for
-    /// direct/untrusted peers (an untrusted `cf-ray` is never honored).
-    pub upstream_id: Option<String>,
     /// TLS parameters, `Some` on TLS/QUIC connections.
     pub tls: Option<TlsParams>,
+    /// Request identity consumed by the redirect-decache transform (see the
+    /// pipeline's `deny_redirect_cdn_headers`), reached only on 3xx responses.
+    /// (#318) A dedicated field — not `env` — so setting it costs one host
+    /// String plus a `Bytes` refcount bump (the old env plumbing materialized
+    /// four Strings per request), and a config rule can never overwrite it
+    /// (the reserved `HJ_` env-prefix guard existed for exactly that).
+    pub redirect_guard: Option<RedirectGuard>,
+}
+
+/// The ORIGINAL request identity stashed for redirect-response evaluation:
+/// path+query as received (Bytes-backed, cheap to clone) and the request host
+/// pre-normalized the same way the page-cache keys it (lowercased,
+/// port-stripped).
+#[derive(Clone)]
+pub struct RedirectGuard {
+    pub host: String,
+    pq: Option<http::uri::PathAndQuery>,
+}
+
+impl RedirectGuard {
+    pub fn new(host: String, pq: Option<http::uri::PathAndQuery>) -> Self {
+        RedirectGuard { host, pq }
+    }
+
+    /// `path?query` rendered lazily from the stored [`http::uri::PathAndQuery`],
+    /// with an empty query dropped (`/x?` → `/x`) so the entry paths that don't
+    /// run `strip_empty_query` still agree with the ones that do. `None` for
+    /// the URI forms that have no path (authority-form CONNECT).
+    pub fn path_query(&self) -> Option<&str> {
+        let pq = self.pq.as_ref()?;
+        match pq.query() {
+            Some(q) if !q.is_empty() => Some(pq.as_str()),
+            _ => Some(pq.path()),
+        }
+    }
 }
 
 /// TLS connection parameters exposed to handlers (`HTTPS`, `SSL_*` env vars).
+///
+/// (#302) The heap payload is Arc-shared: built once per CONNECTION, but cloned
+/// per request (every `ReqCtx`/`BridgeCtx` copy on the fast path carries one, and
+/// prod's mTLS listener populates all six `ClientCert` strings). `Deref` keeps
+/// every read site field-access identical; a clone is an refcount bump.
 #[derive(Debug, Clone)]
-pub struct TlsParams {
+pub struct TlsParams(std::sync::Arc<TlsParamsInner>);
+
+impl std::ops::Deref for TlsParams {
+    type Target = TlsParamsInner;
+    fn deref(&self) -> &TlsParamsInner {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
+pub struct TlsParamsInner {
     pub protocol: &'static str,
     pub cipher: String,
     pub client_cert: Option<ClientCert>,
+}
+
+impl TlsParams {
+    pub fn new(protocol: &'static str, cipher: String, client_cert: Option<ClientCert>) -> Self {
+        TlsParams(std::sync::Arc::new(TlsParamsInner {
+            protocol,
+            cipher,
+            client_cert,
+        }))
+    }
 }
 
 /// Verified client certificate details (mTLS / Cloudflare authenticated origin pull).

@@ -413,15 +413,31 @@ impl PendingPart {
         }
     }
 
+    /// Write until the part is complete (`Ok(true)`) or the stream reports
+    /// `Err(Blocked)`. MUST NOT stop after a partial write while another
+    /// `write()` call would still be accepted: quinn-proto registers the
+    /// CONNECTION-flow-control waker (`Streams::connection_blocked`, the only
+    /// source of a `StreamEvent::Writable` after MAX_DATA arrives) exclusively
+    /// inside a `write()` call that finds the window at zero and returns
+    /// `Blocked`. Returning early after a partial write that landed exactly on
+    /// the connection window left the stream unregistered and the response
+    /// stalled forever — any body larger than the client's initial MAX_DATA
+    /// (aioquic/Chrome default 1 MiB) hung mid-transfer (found by
+    /// h3_transfer_check.sh: stall at exactly 1 MiB of stream bytes).
+    /// `Ok(false)` remains only as a defensive can't-spin exit for a
+    /// zero-progress `Ok(0)`, which quinn-proto never produces for non-empty
+    /// input.
     fn write(&mut self, stream: &mut quinn_proto::SendStream<'_>) -> Result<bool, WriteError> {
         match self {
             Self::Contiguous { data, off, .. } => {
-                if *off == data.len() {
-                    return Ok(true);
+                while *off < data.len() {
+                    let n = stream.write(&data[*off..])?;
+                    *off += n;
+                    if n == 0 {
+                        return Ok(false);
+                    }
                 }
-                let n = stream.write(&data[*off..])?;
-                *off += n;
-                Ok(*off == data.len())
+                Ok(true)
             }
             Self::DataFrame {
                 header,
@@ -431,17 +447,17 @@ impl PendingPart {
                 data_off,
                 ..
             } => {
-                if *header_off < *header_len {
+                while *header_off < *header_len {
                     let n = stream.write(&header[*header_off..*header_len])?;
                     *header_off += n;
-                    if *header_off < *header_len || n == 0 {
+                    if n == 0 {
                         return Ok(false);
                     }
                 }
-                if *data_off < data.len() {
+                while *data_off < data.len() {
                     let n = stream.write(&data[*data_off..])?;
                     *data_off += n;
-                    if *data_off < data.len() || n == 0 {
+                    if n == 0 {
                         return Ok(false);
                     }
                 }
@@ -611,6 +627,52 @@ fn qpack_literal(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     out.extend_from_slice(name);
     qpack_int(out, 0x00, 7, value.len() as u64); // H=0 + 7-bit value len
     out.extend_from_slice(value);
+}
+
+/// (#287) Encode-side view of [`QPACK_STATIC`]: header name → (lowest static
+/// index carrying that name, the table's non-empty (value, index) pairs for
+/// it). Derived once from the decode table so the two can never diverge.
+struct QpackNameEntry {
+    name_idx: u8,
+    values: Vec<(&'static str, u8)>,
+}
+
+fn qpack_encode_map() -> &'static std::collections::HashMap<&'static str, QpackNameEntry> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, QpackNameEntry>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut by_name = std::collections::HashMap::new();
+        for (i, (name, value)) in QPACK_STATIC.iter().enumerate() {
+            let entry = by_name.entry(*name).or_insert(QpackNameEntry {
+                name_idx: i as u8,
+                values: Vec::new(),
+            });
+            if !value.is_empty() {
+                entry.values.push((*value, i as u8));
+            }
+        }
+        by_name
+    })
+}
+
+/// (#287) Emit one response field line using the static table where it helps:
+/// an exact (name, value) match becomes an Indexed Field Line (RFC 9204
+/// §4.5.2, 1-2 bytes); a known name becomes a Literal Field Line With Name
+/// Reference (§4.5.4); anything else keeps the always-valid
+/// literal-with-literal-name form. Static references only — no dynamic table,
+/// no Huffman, no encoder state.
+fn qpack_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    if let Some(entry) = qpack_encode_map().get(name) {
+        if let Some((_, idx)) = entry.values.iter().find(|(v, _)| v.as_bytes() == value) {
+            qpack_int(out, 0b1100_0000, 6, *idx as u64); // 1 T=1 + 6-bit index
+            return;
+        }
+        qpack_int(out, 0b0101_0000, 4, entry.name_idx as u64); // 01 N=0 T=1 + 4-bit name index
+        qpack_int(out, 0x00, 7, value.len() as u64); // H=0 + 7-bit value len
+        out.extend_from_slice(value);
+        return;
+    }
+    qpack_literal(out, name.as_bytes(), value);
 }
 
 /// The fixed HTTP/3 response (HEADERS frame with a QPACK field section + DATA
@@ -2879,22 +2941,38 @@ fn prepare_h3_response_headers(
     hj_core::response_body_forbidden(is_head, status)
 }
 
-/// Encode an HTTP/3 response HEADERS frame (QPACK literal field section). Split out so the
+/// Encode an HTTP/3 response HEADERS frame (QPACK field section using static-table
+/// references where they help, literals otherwise — see [`qpack_field`]). Split out so the
 /// streaming path can send the head before the body and frame each DATA chunk separately.
 fn encode_h3_headers_frame(status: http::StatusCode, headers: &http::HeaderMap) -> Vec<u8> {
-    let mut field = Vec::new();
-    field.extend_from_slice(&[0x00, 0x00]); // field section prefix: RIC=0, Base=0
-    qpack_literal(&mut field, b":status", status.as_str().as_bytes());
-    for (name, value) in headers {
-        qpack_literal(&mut field, name.as_str().as_bytes(), value.as_bytes());
-    }
-    let mut out = Vec::new();
-    write_varint(&mut out, 0x01); // HEADERS
-    write_varint(&mut out, field.len() as u64);
-    out.extend_from_slice(&field);
-    out
+    // (#288) The field section goes into a REUSED per-thread scratch (cleared per
+    // call, capacity retained) so a response allocates only its final wire buffer;
+    // QUIC/H3 varints must be minimally encoded, so the HEADERS length cannot be
+    // backfilled into a fixed-size slot.
+    FIELD_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let field: &mut Vec<u8> = scratch.get_or_insert_with(Vec::new);
+        field.clear();
+        let cap = 2 + 16 + headers.len() * 24;
+        if field.capacity() < cap {
+            field.reserve(cap);
+        }
+        field.extend_from_slice(&[0x00, 0x00]); // RIC=0, Base=0
+        qpack_field(field, ":status", status.as_str().as_bytes());
+        for (name, value) in headers {
+            qpack_field(field, name.as_str(), value.as_bytes());
+        }
+        let mut out = Vec::with_capacity(field.len() + 12);
+        write_varint(&mut out, 0x01); // HEADERS
+        write_varint(&mut out, field.len() as u64);
+        out.extend_from_slice(field);
+        out
+    })
 }
 
+thread_local! {
+    static FIELD_SCRATCH: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
 /// Frame one DATA chunk (`0x00` type + length + payload). Concatenated DATA frames
 /// reassemble byte-identically to one big DATA frame, so the streaming path is wire-equal
 /// to the buffered path for the same body.
@@ -3195,6 +3273,7 @@ pub(crate) fn serve_h3_pipeline(
             .name(format!("hj-uring-h3p-{core}"))
             .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
             .spawn(move || {
+                super::maybe_pin_core_thread(core, worker_count);
                 per_core_h3_pipeline(
                     core,
                     std_sock,
@@ -3452,6 +3531,62 @@ mod h3_codec_tests {
         let decoded_size = b"accept-encoding".len() + value.len() + 32;
         assert!(qpack_decode_limited(&field, decoded_size).is_some());
         assert!(qpack_decode_limited(&field, decoded_size - 1).is_none());
+    }
+
+    /// (#287) The response encoder's static-table forms (indexed field line,
+    /// literal with name reference) must decode back to exactly the input head
+    /// — checked against the in-tree decoder, which already decodes every real
+    /// client's use of those forms — and must actually shrink the wire bytes
+    /// vs the old literal-only encoding.
+    #[test]
+    fn qpack_response_static_references_roundtrip_and_shrink() {
+        fn read_vi(buf: &[u8], pos: &mut usize) -> u64 {
+            let b0 = buf[*pos];
+            let len = 1usize << (b0 >> 6);
+            let mut v = (b0 & 0x3f) as u64;
+            for i in 1..len {
+                v = (v << 8) | buf[*pos + i] as u64;
+            }
+            *pos += len;
+            v
+        }
+
+        let mut headers = http::HeaderMap::new();
+        // Exact (name, value) static hits -> indexed field lines.
+        headers.insert("content-encoding", "gzip".parse().unwrap());
+        headers.insert("accept-ranges", "bytes".parse().unwrap());
+        headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+        // Known name, novel value -> literal with name reference.
+        headers.insert("etag", "\"abc123\"".parse().unwrap());
+        headers.insert("content-length", "152034".parse().unwrap());
+        // Unknown name -> literal with literal name (unchanged form).
+        headers.insert("x-litespeed-cache", "hit".parse().unwrap());
+
+        let frame = encode_h3_headers_frame(http::StatusCode::OK, &headers);
+        let mut pos = 0usize;
+        assert_eq!(read_vi(&frame, &mut pos), 0x01, "HEADERS frame type");
+        let flen = read_vi(&frame, &mut pos) as usize;
+        let field = &frame[pos..pos + flen];
+        assert_eq!(pos + flen, frame.len());
+
+        let decoded = qpack_decode(field).expect("decoder accepts our static references");
+        let mut expect = vec![(b":status".to_vec(), b"200".to_vec())];
+        for (n, v) in &headers {
+            expect.push((n.as_str().as_bytes().to_vec(), v.as_bytes().to_vec()));
+        }
+        assert_eq!(decoded, expect, "byte-exact head after roundtrip");
+
+        let mut literal_only = vec![0x00, 0x00];
+        qpack_literal(&mut literal_only, b":status", b"200");
+        for (n, v) in &headers {
+            qpack_literal(&mut literal_only, n.as_str().as_bytes(), v.as_bytes());
+        }
+        assert!(
+            field.len() < literal_only.len(),
+            "static references shrink the field section ({} vs {})",
+            field.len(),
+            literal_only.len()
+        );
     }
 
     // A dynamic-table reference (we advertise capacity 0) must be rejected, not misdecoded.

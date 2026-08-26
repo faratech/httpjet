@@ -454,10 +454,12 @@ pub(crate) fn service_unavailable_resp() -> BridgeResp {
     }
 }
 
-fn full_resp(parts: &http::response::Parts, body: Bytes) -> BridgeResp {
+fn full_resp(parts: http::response::Parts, body: Bytes) -> BridgeResp {
+    // The Full arms own `parts` outright — move the header map instead of cloning it per
+    // bridged response.
     BridgeResp {
         status: parts.status,
-        headers: parts.headers.clone(),
+        headers: parts.headers,
         body: BridgeBody::Full(body),
     }
 }
@@ -490,16 +492,16 @@ async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>) {
     let (parts, body) = r.into_parts();
     match body {
         Body::Empty => {
-            let _ = resp.send(full_resp(&parts, Bytes::new()));
+            let _ = resp.send(full_resp(parts, Bytes::new()));
         }
         Body::Full(b) => {
-            let _ = resp.send(full_resp(&parts, b));
+            let _ = resp.send(full_resp(parts, b));
         }
         Body::File(f) if f.cached.is_some() => {
             // `cached` holds the WHOLE file; apply the range (single-sourced, bounds-clamped) so a
             // 206 served here matches the native-H2 path — previously this emitted the whole file
             // under a partial Content-Range.
-            let _ = resp.send(full_resp(&parts, f.cached_ranged().unwrap_or_default()));
+            let _ = resp.send(full_resp(parts, f.cached_ranged().unwrap_or_default()));
         }
         Body::File(f) => forward_file(parts, f, resp).await,
         Body::Stream(s) => forward_stream(parts, s, resp).await,

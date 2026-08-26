@@ -76,7 +76,7 @@ const MAX_MEMO_UA_BYTES: usize = 1024;
 /// Cache key for a memoizable rewrite outcome. Only used for rulesets whose
 /// [`hj_rewrite::RuleSet::path_cacheable`] is true, so the outcome is a pure
 /// function of exactly these fields (plus filesystem state, bounded by the TTL).
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OutcomeKey {
     vhost: String,
     https: bool,
@@ -94,8 +94,19 @@ struct OutcomeKey {
 /// rulesets — lets repeated requests skip full ruleset evaluation. Mirrors
 /// `StatCache`: cap-gated inserts (cold entries skip caching once full) and a
 /// lazy per-read TTL check.
+#[derive(Debug, Clone)]
+struct OutcomeSlot {
+    at: Instant,
+    outcome: RwResult,
+    key: OutcomeKey,
+}
+
 pub(crate) struct RewriteOutcomeCache {
-    map: DashMap<OutcomeKey, (Instant, RwResult)>,
+    /// (#313) Hash-first: keyed by an FxHash over the borrowed key parts so a
+    /// lookup never builds the 7-String OutcomeKey; the stored full key verifies
+    /// equality on hit (a rare hash collision degrades to a miss / replaces on
+    /// insert — an efficiency loss, never wrong content).
+    map: DashMap<u64, OutcomeSlot>,
     ttl: Duration,
     cap: usize,
     /// Approximate entry count for the cap gate — `DashMap::len()` sweeps every
@@ -109,6 +120,11 @@ pub(crate) struct RewriteOutcomeCache {
     /// An atomic (not a Mutex): the gate is checked on the REQUEST path at cap, and a
     /// global lock there serializes every worker under a crawler flood.
     last_prune: std::sync::atomic::AtomicU64,
+    /// (#313) Gate for the BOUNDED synchronous rescue in `insert_hashed`: when the
+    /// async sweep hasn't freed a slot in time, ONE caller per 10x TTL may run the
+    /// O(N) walk inline so a legitimately-expired-at-cap cache keeps admitting;
+    /// everyone else skips the insert instead of re-walking.
+    last_sync_prune: std::sync::atomic::AtomicU64,
 }
 
 impl RewriteOutcomeCache {
@@ -119,6 +135,7 @@ impl RewriteOutcomeCache {
             cap: 65_536,
             count: AtomicUsize::new(0),
             last_prune: std::sync::atomic::AtomicU64::new(0),
+            last_sync_prune: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -130,6 +147,7 @@ impl RewriteOutcomeCache {
             cap,
             count: AtomicUsize::new(0),
             last_prune: std::sync::atomic::AtomicU64::new(0),
+            last_sync_prune: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -144,37 +162,112 @@ impl RewriteOutcomeCache {
 
     /// Fresh cached outcome for `key`, or `None` if absent/expired/disabled.
     fn get(&self, key: &OutcomeKey) -> Option<RwResult> {
+        self.probe(Self::key_hash(key), &|k| k == key)
+    }
+
+    /// Borrowed-parts probe (#313): hashes without allocating, then verifies the
+    /// stored full key against the caller's borrows.
+    fn probe(&self, hash: u64, matches: &dyn Fn(&OutcomeKey) -> bool) -> Option<RwResult> {
         if self.ttl.is_zero() {
             return None;
         }
-        let e = self.map.get(key)?;
-        if e.0.elapsed() < self.ttl {
-            Some(e.1.clone())
+        let e = self.map.get(&hash)?;
+        if e.at.elapsed() < self.ttl && matches(&e.key) {
+            Some(e.outcome.clone())
         } else {
             None
         }
     }
 
+    /// FxHash over every key component (domain-separated by length-prefixed
+    /// writes via Hasher::write's internal scheme? No — write() is raw bytes, so
+    /// separators are written explicitly).
+    fn key_hash(key: &OutcomeKey) -> u64 {
+        Self::parts_hash(
+            &key.vhost,
+            key.https,
+            &key.method,
+            &key.host,
+            &key.path,
+            &key.query,
+            &key.key_vars,
+        )
+    }
+
+    fn parts_hash(
+        vhost: &str,
+        https: bool,
+        method: &str,
+        host: &str,
+        path: &str,
+        query: &str,
+        key_vars: &str,
+    ) -> u64 {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        for part in [vhost, method, host, path, query, key_vars] {
+            h.write(&(part.len() as u32).to_le_bytes());
+            h.write(part.as_bytes());
+        }
+        h.write(&[https as u8]);
+        h.finish()
+    }
+
     /// Store `outcome` for `key` (refreshing an existing entry; otherwise only
     /// when below the cap, so memory is bounded without an eviction sweep).
     fn insert(self: &Arc<Self>, key: OutcomeKey, outcome: RwResult) {
+        let hash = Self::key_hash(&key);
+        self.insert_hashed(hash, key, outcome);
+    }
+
+    /// Store under a caller-computed hash with the borrowed parts verified at probe
+    /// time (#313). At cap for a NEW key: trigger the (detached, once-per-TTL)
+    /// sweep and otherwise SKIP the insert — the cache is best-effort. The removed
+    /// synchronous fallback re-ran the full O(N) walk ON THE REQUEST THREAD for
+    /// every cold insert while the map stayed full of LIVE entries (nothing to
+    /// expire), so a crawler flood at cap stalled every worker on DashMap shard
+    /// walks between the once-per-TTL async sweeps.
+    fn insert_hashed(self: &Arc<Self>, hash: u64, key: OutcomeKey, outcome: RwResult) {
         if self.ttl.is_zero() {
             return;
         }
-        if self.count.load(Ordering::Relaxed) >= self.cap && !self.map.contains_key(&key) {
+        if self.count.load(Ordering::Relaxed) >= self.cap && !self.map.contains_key(&hash) {
             self.maybe_prune_expired();
-        }
-        if !self.map.contains_key(&key) && self.count.load(Ordering::Relaxed) >= self.cap {
-            // The triggered sweep is asynchronous; if it hasn't freed a slot for
-            // THIS insert yet, prune synchronously here rather than dropping the
-            // entry (the pre-async behavior). The CAS gate makes this a once-per-
-            // TTL path, so only one request per TTL pays the O(N) walk.
-            self.prune_expired();
             if self.count.load(Ordering::Relaxed) >= self.cap {
-                return;
+                // The detached sweep hasn't landed yet. ONE caller per 10x TTL may
+                // run the walk inline so an expired-at-cap cache keeps admitting;
+                // every other cold insert just skips (best-effort).
+                let now = prune_epoch().elapsed().as_millis() as u64;
+                let window = (self.ttl.as_millis() as u64).saturating_mul(10).max(100);
+                let last = self.last_sync_prune.load(Ordering::Relaxed);
+                // last == 0 means never run: allow immediately regardless of the
+                // (process-uptime based) clock being younger than the window.
+                if last == 0
+                    || now.saturating_sub(last) >= window
+                        && self
+                            .last_sync_prune
+                            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                {
+                    self.prune_expired();
+                }
+                if self.count.load(Ordering::Relaxed) >= self.cap {
+                    return;
+                }
             }
         }
-        if self.map.insert(key, (Instant::now(), outcome)).is_none() {
+        if self
+            .map
+            .insert(
+                hash,
+                OutcomeSlot {
+                    at: Instant::now(),
+                    outcome,
+                    key,
+                },
+            )
+            .is_none()
+        {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -207,13 +300,13 @@ impl RewriteOutcomeCache {
 
     fn prune_expired(&self) {
         let ttl = self.ttl;
-        let expired: Vec<OutcomeKey> = self
+        let expired: Vec<u64> = self
             .map
             .iter()
-            .filter_map(|e| (e.value().0.elapsed() >= ttl).then(|| e.key().clone()))
+            .filter_map(|e| (e.value().at.elapsed() >= ttl).then(|| *e.key()))
             .collect();
-        for key in expired {
-            if self.map.remove(&key).is_some() {
+        for hash in expired {
+            if self.map.remove(&hash).is_some() {
                 self.count.fetch_sub(1, Ordering::Relaxed);
             }
         }
@@ -420,26 +513,20 @@ pub(super) fn run_rewrite(
             }
         }
     }
-    let key = OutcomeKey {
-        vhost: ctx.vhost_name.clone(),
-        https: ctx.is_tls,
-        method: req.method().as_str().to_string(),
-        host: rewrite_host(ctx, req).into_owned(),
-        path: path.to_string(),
-        query: query.to_string(),
-        key_vars,
-    };
+    // (#313) Borrow every key part for the size guard and the hash-first probe;
+    // the owned OutcomeKey is built only on the miss path that inserts.
+    let host = rewrite_host(ctx, req);
+    let https = ctx.is_tls;
+    let method = req.method().as_str();
+    let vhost = ctx.vhost_name.as_str();
+    let host_s: &str = &host;
     // Every key component except the vhost is client-controlled (path, query,
     // Host, UA, Origin, method). Unbounded, a flood of distinct oversized keys
     // holds cap × tens-of-KiB resident (the Rewritten value echoes path+query
     // again) while rejecting legitimate cold keys. Oversized requests bypass
     // the cache — fail closed to a fresh eval, same as an uncacheable chain.
-    let key_bytes = key.vhost.len()
-        + key.method.len()
-        + key.host.len()
-        + key.path.len()
-        + key.query.len()
-        + key.key_vars.len();
+    let key_bytes =
+        vhost.len() + method.len() + host_s.len() + path.len() + query.len() + key_vars.len();
     if key_bytes > MAX_OUTCOME_KEY_BYTES {
         state
             .metrics
@@ -447,7 +534,17 @@ pub(super) fn run_rewrite(
             .fetch_add(1, Ordering::Relaxed);
         return run_rewrite_inner(state, ctx, req, chain, path, query);
     }
-    if let Some(hit) = state.rewrite_outcomes.get(&key) {
+    let hash =
+        RewriteOutcomeCache::parts_hash(vhost, https, method, host_s, path, query, &key_vars);
+    if let Some(hit) = state.rewrite_outcomes.probe(hash, &|k| {
+        k.vhost == vhost
+            && k.https == https
+            && k.method == method
+            && k.host == host_s
+            && k.path == path
+            && k.query == query
+            && k.key_vars == key_vars
+    }) {
         state
             .metrics
             .rewrite_outcome_hits
@@ -459,7 +556,18 @@ pub(super) fn run_rewrite(
         .rewrite_outcome_misses
         .fetch_add(1, Ordering::Relaxed);
     let result = run_rewrite_inner(state, ctx, req, chain, path, query);
-    state.rewrite_outcomes.insert(key, result.clone());
+    let key = OutcomeKey {
+        vhost: vhost.to_string(),
+        https,
+        method: method.to_string(),
+        host: host_s.to_string(),
+        path: path.to_string(),
+        query: query.to_string(),
+        key_vars,
+    };
+    state
+        .rewrite_outcomes
+        .insert_hashed(hash, key, result.clone());
     result
 }
 
@@ -677,14 +785,10 @@ pub(super) fn ip_to_string(ip: std::net::IpAddr) -> String {
 /// its leading `/`; `.`/`..` collapsing is done later by `resolved_rel_path`),
 /// or `None` to signal a 400 for a request the filesystem layer would also
 /// refuse. Idempotent for already-decoded paths with no `%`.
-pub(super) fn decode_request_path(raw: &str) -> Option<String> {
-    // Shared RFC 3986 decode (single-sourced with hj-static); then this path's
-    // own post-conditions: reject an embedded NUL and require valid UTF-8.
-    let out = hj_core::percent_decode(raw)?;
-    if out.contains(&0) {
-        return None;
-    }
-    String::from_utf8(out).ok()
+pub(super) fn decode_request_path(raw: &str) -> Option<Cow<'_, str>> {
+    // Shared RFC 3986 decode (single-sourced with hj-static); post-conditions:
+    // reject an embedded NUL and require valid UTF-8. The no-% case borrows (#319).
+    hj_core::percent_decode_cow(raw)
 }
 
 /// Percent-encode a decoded path so a single decode by a terminal handler
@@ -932,9 +1036,9 @@ mod tests {
             local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
             peer_port: 12345,
             tls: None,
+            redirect_guard: None,
             request_time: std::time::SystemTime::now(),
             request_id: Default::default(),
-            upstream_id: None,
         };
         let mk = |host: Option<&str>| {
             let mut b = http::Request::builder().method("GET").uri("/");

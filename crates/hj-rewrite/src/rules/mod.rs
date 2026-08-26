@@ -203,7 +203,7 @@ pub(crate) struct Rule {
 /// `^` up to the first regex metacharacter; `/` is treated as literal. This is a
 /// pure necessary-condition filter: any target that matches the anchored pattern
 /// must start with these bytes, so rejecting on them never changes which rules match.
-fn extract_literal_prefix(pattern_src: &str, negate: bool, nocase: bool) -> Box<[u8]> {
+pub(crate) fn extract_literal_prefix(pattern_src: &str, negate: bool, nocase: bool) -> Box<[u8]> {
     if negate || nocase || !pattern_src.starts_with('^') {
         return Box::from(&b""[..]);
     }
@@ -252,18 +252,25 @@ fn extract_literal_prefix(pattern_src: &str, negate: bool, nocase: bool) -> Box<
 
 /// Recognize a pattern that matches ANY target as a whole-string match, from a
 /// CONSERVATIVE literal allowlist only — `.*` / `^.*$` (no group) and `(.*)` /
-/// `^(.*)$` (one group). Negated or case-insensitive forms return `None` (the
-/// `nocase` guard is belt-and-suspenders; these patterns are case-independent).
+/// `^(.*)$` (one group). Negated forms return `None` (a negated whole-match can
+/// never fire). `[NC]` is accepted: these patterns are case-INdependent by
+/// construction (#314d), so front-controller `[NC] ^.*$` catch-alls stop paying a
+/// real regex per request.
 /// Anything else (anchored prefixes, alternations, character classes) returns
 /// `None` and takes the normal regex path. The empty pattern is intentionally
 /// excluded (it is a zero-length match at pos 0, not a whole-string match).
 fn recognize_total_match(src: &str, negate: bool, nocase: bool) -> Option<TotalMatch> {
-    if negate || nocase {
+    // (#314d) [NC] is admitted for the WHOLE-MATCH forms: `.*` matches every byte
+    // sequence (including empty) regardless of case, so synthesizing the slots is
+    // semantically identical to running `(?i)^.*$`. Negation still bails (a total
+    // NEGATED match never fires). The literal `^.*` variants are matched exactly;
+    // anything else takes the normal regex path.
+    if negate {
         return None;
     }
     match src {
-        ".*" | "^.*$" => Some(TotalMatch::NoGroup),
-        "(.*)" | "^(.*)$" => Some(TotalMatch::OneGroup),
+        ".*" | "^.*$" | "^.*" => Some(TotalMatch::NoGroup),
+        "(.*)" | "^(.*)$" | "^(.*)" => Some(TotalMatch::OneGroup),
         _ => None,
     }
 }

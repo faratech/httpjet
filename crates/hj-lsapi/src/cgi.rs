@@ -108,79 +108,93 @@ impl<'a> CgiEnvBuilder<'a> {
         // Static constants: push once at the start (zero-alloc).
         env.push((Cow::Borrowed("GATEWAY_INTERFACE"), Cow::Borrowed("CGI/1.1")));
 
-        let method = req.method().as_str().to_string();
+        macro_rules! push {
+            ($k:expr, $v:expr) => {
+                env.push((Cow::Borrowed($k), Cow::Owned($v)))
+            };
+        }
+        // Fixed/constructed vars BORROW their sources wherever the source outlives the
+        // encode (`req`/`ctx` are 'r; builder fields are 'a: 'r) — the former clones
+        // here were ~10 owned Strings per PHP request (#282). Only true concats
+        // (path?query / PATH_TRANSLATED) remain owned.
+        macro_rules! push_borrow {
+            ($k:expr, $v:expr) => {
+                env.push((Cow::Borrowed($k), Cow::Borrowed($v)))
+            };
+        }
         let uri = req.uri();
-        let path = uri.path().to_string();
-        let query = uri.query().unwrap_or("").to_string();
-        let request_uri = match uri.query() {
-            Some(q) => format!("{path}?{q}"),
-            None => path.clone(),
-        };
-
-        let script_name = self.script_name.clone().unwrap_or_else(|| path.clone());
-
-        // Fixed/constructed vars push owned values; the per-header values + a few
-        // request-derived fields borrow `req`/`ctx` directly (the alloc win). Both
-        // arms are `Cow<'r, str>`; the encode reads them as `&str`.
-        let mut push = |k: &'static str, v: String| env.push((Cow::Borrowed(k), Cow::Owned(v)));
-        push("REQUEST_METHOD", method);
-        push(
+        let path = uri.path();
+        let query = uri.query().unwrap_or("");
+        push_borrow!("REQUEST_METHOD", req.method().as_str());
+        // Builder-owned fields are cloned (build consumes `self`, so they cannot
+        // borrow out of it); everything sourced from `req`/`ctx` borrows.
+        push!(
             "SCRIPT_FILENAME",
             self.script_filename
                 .to_str()
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| self.script_filename.to_string_lossy().into_owned()),
+                .unwrap_or_else(|| self.script_filename.to_string_lossy().into_owned())
         );
-        push("SCRIPT_NAME", script_name);
-        push("QUERY_STRING", query);
-        push("REQUEST_URI", request_uri);
-        let has_path_info = self
-            .path_info
-            .as_deref()
-            .map(|pi| !pi.is_empty())
-            .unwrap_or(false);
-        if let Some(pi) = &self.path_info {
-            if !pi.is_empty() {
-                push("PATH_INFO", pi.clone());
-            }
+        push!(
+            "SCRIPT_NAME",
+            self.script_name.clone().unwrap_or_else(|| path.to_string())
+        );
+        push_borrow!("QUERY_STRING", query);
+        if let Some(q) = uri.query() {
+            env.push((
+                Cow::Borrowed("REQUEST_URI"),
+                Cow::Owned(format!("{path}?{q}")),
+            ));
+        } else {
+            push_borrow!("REQUEST_URI", path);
+        }
+        let has_path_info = self.path_info.as_deref().is_some_and(|pi| !pi.is_empty());
+        if has_path_info {
+            push!("PATH_INFO", self.path_info.clone().unwrap_or_default());
         }
 
         let doc_root = self
             .document_root
             .clone()
             .unwrap_or_else(|| ctx.vhost.doc_root.to_string_lossy().into_owned());
-        push("DOCUMENT_ROOT", doc_root.clone());
+        push!("DOCUMENT_ROOT", doc_root.clone());
 
         // PATH_TRANSLATED = doc root + PATH_INFO (only when PATH_INFO is set).
         if has_path_info {
-            if let Some(pi) = &self.path_info {
-                push("PATH_TRANSLATED", format!("{doc_root}{pi}"));
-            }
+            env.push((
+                Cow::Borrowed("PATH_TRANSLATED"),
+                Cow::Owned(format!(
+                    "{doc_root}{}",
+                    self.path_info.as_deref().unwrap_or_default()
+                )),
+            ));
         }
 
         // Client / remote. REMOTE_ADDR is the proxy-resolved client IP;
         // REMOTE_PORT is the directly-connected peer's TCP port.
-        push("REMOTE_ADDR", ctx.client_ip.to_string());
-        push("REMOTE_PORT", ctx.peer_port.to_string());
+        push!("REMOTE_ADDR", ctx.client_ip.to_string());
+        push!("REMOTE_PORT", ctx.peer_port.to_string());
 
-        // Server identity.
-        let server_name = host_header(req).unwrap_or_else(|| ctx.vhost_name.clone());
-        let server_name = strip_port(&server_name).to_string();
-        push("SERVER_NAME", server_name);
-        push("SERVER_SOFTWARE", self.server_software.clone());
-        push("SERVER_ADDR", ctx.local_addr.ip().to_string());
+        // Server identity — SERVER_NAME/SOFTWARE now borrow (#282).
+        let server_name = match host_header(req) {
+            Some(h) => strip_port(h),
+            None => ctx.vhost_name.as_str(),
+        };
+        env.push((Cow::Borrowed("SERVER_NAME"), Cow::Borrowed(server_name)));
+        push!("SERVER_SOFTWARE", self.server_software.clone());
+        push!("SERVER_ADDR", ctx.local_addr.ip().to_string());
 
         // Port: from the Host header if present, else the listener's bound port.
         let server_port = host_header(req)
             .and_then(|h| port_of(&h))
             .unwrap_or_else(|| ctx.local_addr.port());
-        push("SERVER_PORT", server_port.to_string());
+        push!("SERVER_PORT", server_port.to_string());
 
         // Request arrival time. REQUEST_TIME is whole seconds; the _FLOAT variant
         // carries microsecond precision (e.g. "1700000000.123456").
         if let Ok(since) = ctx.request_time.duration_since(std::time::UNIX_EPOCH) {
-            push("REQUEST_TIME", since.as_secs().to_string());
-            push("REQUEST_TIME_FLOAT", format!("{:.6}", since.as_secs_f64()));
+            push!("REQUEST_TIME", since.as_secs().to_string());
+            push!("REQUEST_TIME_FLOAT", format!("{:.6}", since.as_secs_f64()));
         }
 
         // (security #269) AUTH_TYPE / REMOTE_USER are SERVER-ASSERTED identity vars.
@@ -192,18 +206,36 @@ impl<'a> CgiEnvBuilder<'a> {
 
         // TLS / SSL_* vars (present on TLS/QUIC connections).
         if let Some(tls) = &ctx.tls {
-            push("SSL_PROTOCOL", tls.protocol.to_string());
-            push("SSL_CIPHER", tls.cipher.clone());
+            env.push((Cow::Borrowed("SSL_PROTOCOL"), Cow::Borrowed(tls.protocol)));
+            env.push((
+                Cow::Borrowed("SSL_CIPHER"),
+                Cow::Borrowed(tls.cipher.as_str()),
+            ));
             if let Some(cc) = &tls.client_cert {
-                push(
-                    "SSL_CLIENT_VERIFY",
-                    if cc.verified { "SUCCESS" } else { "NONE" }.to_string(),
-                );
-                push("SSL_CLIENT_S_DN", cc.subject_dn.clone());
-                push("SSL_CLIENT_I_DN", cc.issuer_dn.clone());
-                push("SSL_CLIENT_M_SERIAL", cc.serial_hex.clone());
-                push("SSL_CLIENT_V_START", cc.not_before.clone());
-                push("SSL_CLIENT_V_END", cc.not_after.clone());
+                env.push((
+                    Cow::Borrowed("SSL_CLIENT_VERIFY"),
+                    Cow::Borrowed(if cc.verified { "SUCCESS" } else { "NONE" }),
+                ));
+                env.push((
+                    Cow::Borrowed("SSL_CLIENT_S_DN"),
+                    Cow::Borrowed(cc.subject_dn.as_str()),
+                ));
+                env.push((
+                    Cow::Borrowed("SSL_CLIENT_I_DN"),
+                    Cow::Borrowed(cc.issuer_dn.as_str()),
+                ));
+                env.push((
+                    Cow::Borrowed("SSL_CLIENT_M_SERIAL"),
+                    Cow::Borrowed(cc.serial_hex.as_str()),
+                ));
+                env.push((
+                    Cow::Borrowed("SSL_CLIENT_V_START"),
+                    Cow::Borrowed(cc.not_before.as_str()),
+                ));
+                env.push((
+                    Cow::Borrowed("SSL_CLIENT_V_END"),
+                    Cow::Borrowed(cc.not_after.as_str()),
+                ));
             }
         }
 
@@ -446,12 +478,13 @@ fn http_var_name(header: &str) -> String {
     s
 }
 
-fn host_header(req: &Request) -> Option<String> {
+fn host_header<'r>(req: &'r Request) -> Option<&'r str> {
+    // Borrowed end-to-end (#282): the Host header value or the URI authority — no
+    // per-request String for either arm.
     req.headers()
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or_else(|| req.uri().host().map(|h| h.to_string()))
+        .or_else(|| req.uri().host())
 }
 
 fn strip_port(host: &str) -> &str {
@@ -575,8 +608,8 @@ mod tests {
             request_time: std::time::UNIX_EPOCH
                 + std::time::Duration::new(1_700_000_000, 123_456_000),
             request_id: Default::default(),
-            upstream_id: None,
             tls: None,
+            redirect_guard: None,
         }
     }
 
@@ -889,10 +922,10 @@ mod tests {
             .body(empty_incoming())
             .unwrap();
         let mut c = ctx(true);
-        c.tls = Some(TlsParams {
-            protocol: "TLSv1.3",
-            cipher: "TLS_AES_256_GCM_SHA384".to_string(),
-            client_cert: Some(ClientCert {
+        c.tls = Some(TlsParams::new(
+            "TLSv1.3",
+            "TLS_AES_256_GCM_SHA384".to_string(),
+            Some(ClientCert {
                 subject_dn: "CN=client".to_string(),
                 issuer_dn: "CN=Cloudflare Origin CA".to_string(),
                 serial_hex: "0A1B2C".to_string(),
@@ -900,7 +933,7 @@ mod tests {
                 not_before: "Jan  1 00:00:00 2026 GMT".to_string(),
                 not_after: "Jan  1 00:00:00 2027 GMT".to_string(),
             }),
-        });
+        ));
         let env = build_cgi_env(&req, &c, Path::new("/web/public_html/secure.php"));
         let m: std::collections::HashMap<String, String> = env
             .into_iter()

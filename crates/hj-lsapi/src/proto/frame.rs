@@ -150,7 +150,12 @@ impl Decoder for LsapiCodec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RespHeader {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    /// Decoded STRAIGHT into `http` types (#316): the former `Vec<(String, String)>`
+    /// forced a second parse+alloc pass in the handler, which discarded invalid
+    /// entries anyway. Lines that are not valid UTF-8 or carry an invalid
+    /// name/value are dropped here (a malformed value previously survived only as
+    /// U+FFFD-mangled bytes and is now dropped with the line).
+    pub headers: Vec<(http::HeaderName, http::HeaderValue)>,
 }
 
 /// Parse a RESP_HEADER packet body (everything after the 8-byte packet header).
@@ -218,12 +223,24 @@ pub fn parse_resp_header(mut body: &[u8], little_endian: bool) -> std::io::Resul
             Some(0) => &line[..line.len() - 1],
             _ => line,
         };
-        let line = String::from_utf8_lossy(line);
-        if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
-        } else if !line.trim().is_empty() {
-            // tolerate a bare line by treating it as a header with empty value
-            headers.push((line.trim().to_string(), String::new()));
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        let (name, value) = match line.split_once(':') {
+            Some((name, value)) => (name.trim(), value.trim()),
+            None => {
+                // tolerate a bare line by treating it as a header with empty value
+                if line.trim().is_empty() {
+                    continue;
+                }
+                (line.trim(), "")
+            }
+        };
+        if let (Ok(hn), Ok(hv)) = (
+            http::header::HeaderName::from_bytes(name.as_bytes()),
+            http::header::HeaderValue::from_str(value),
+        ) {
+            headers.push((hn, hv));
         }
     }
 
@@ -354,9 +371,9 @@ mod tests {
         let parsed = parse_resp_header(&body, true).unwrap();
         assert_eq!(parsed.status, 200);
         assert_eq!(parsed.headers.len(), 2);
-        assert_eq!(parsed.headers[0].0, "Content-Type");
+        assert_eq!(parsed.headers[0].0.as_str(), "content-type");
         assert_eq!(parsed.headers[0].1, "text/html; charset=UTF-8");
-        assert_eq!(parsed.headers[1].0, "X-Powered-By");
+        assert_eq!(parsed.headers[1].0.as_str(), "x-powered-by");
         assert_eq!(parsed.headers[1].1, "PHP/8");
     }
 
@@ -375,7 +392,9 @@ mod tests {
         // mirroring the codec's length decode, which also compares to HOST_LSAPI_ENDIAN.
         let h = RespHeader::parse_flagged(&body, HOST_LSAPI_ENDIAN).unwrap();
         assert_eq!(h.status, 200);
-        assert_eq!(h.headers, vec![("X-Test".to_string(), "ok".to_string())]);
+        assert_eq!(h.headers.len(), 1);
+        assert_eq!(h.headers[0].0.as_str(), "x-test");
+        assert_eq!(h.headers[0].1, "ok");
 
         // A genuinely cross-endian peer flag flips the decode to big-endian: the LE body then
         // reads as an implausible count (an error), proving the flag is honored, not ignored.

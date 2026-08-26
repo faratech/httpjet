@@ -12,12 +12,13 @@ pub mod reqid;
 pub mod router;
 
 pub use body::{Body, BoxError, CountingBody, FileBody, IncomingBody, StreamBody, empty_incoming};
-pub use context::{ClientCert, Proto, ReqCtx, TlsParams};
+pub use context::{ClientCert, Proto, RedirectGuard, ReqCtx, TlsParams};
 pub use handler::{Handler, HandlerError, Request, Response, ResponseTransform, text_response};
 pub use http_util::{
     CONNECTION_SPECIFIC_REQUEST_HEADERS, body_forbidden_status, coalesce_cookie_crumbs,
     http_date_now, if_none_match_matches, is_connection_specific_request_header, percent_decode,
-    response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date, strip_hop_by_hop_response,
+    percent_decode_cow, response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date,
+    strip_hop_by_hop_response,
 };
 pub use net::{host_without_port, is_trusted_internal_peer, set_exempt_peers};
 pub use reqid::ReqId;

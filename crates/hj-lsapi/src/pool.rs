@@ -1032,6 +1032,19 @@ impl LsapiPool {
     /// complete. Idle entries older than the idle TTL or stamped against a stale
     /// generation are discarded (looping to a fresh dial).
     pub async fn acquire(&self) -> Result<PooledConn, PoolError> {
+        self.acquire_probed(true).await
+    }
+
+    /// (#315) `acquire` with the per-reuse health probe SKIPPED. For bodyless
+    /// idempotent requests (GET/HEAD) the handler's IdempotentReset replay already
+    /// covers a dead reuse with a fresh dial, so the probe's nonblocking recv is a
+    /// pure extra syscall on the hottest PHP path. The stale-TTL and
+    /// wrong-generation filters below are NOT skipped — only the recv probe.
+    pub async fn acquire_unprobed(&self) -> Result<PooledConn, PoolError> {
+        self.acquire_probed(false).await
+    }
+
+    async fn acquire_probed(&self, probe_reuse: bool) -> Result<PooledConn, PoolError> {
         let permit =
             match tokio::time::timeout(self.init_timeout, self.sem.clone().acquire_owned()).await {
                 Ok(Ok(p)) => p,
@@ -1055,8 +1068,9 @@ impl LsapiPool {
         // probe (`is_socket_healthy`) discards those dead sockets here so we fall
         // through to a fresh dial. This shrinks but cannot fully close the race: a
         // socket lsphp closes in the window between the probe and the handler's
-        // write/read still resets — that residual is the domain of an idempotent
-        // retry-on-reused-reset (a separate change).
+        // write/read still resets — that residual is exactly what the handler's
+        // IdempotentReset replay covers (shipped; bodyless-idempotent acquires now
+        // even skip this probe entirely, see acquire_unprobed).
         // Wrong-generation entries are only collected here: their teardown
         // (UNIX_DIAG attribution + pidfd retirement) does blocking syscalls, so
         // it runs after the idle lock is released, like refresh/prune do.
@@ -1079,7 +1093,9 @@ impl LsapiPool {
                 }
             };
             match candidate {
-                Some(entry) if is_socket_healthy(&entry.stream) => break Some(entry),
+                Some(entry) if !probe_reuse || is_socket_healthy(&entry.stream) => {
+                    break Some(entry);
+                }
                 // Half-closed or protocol-desynced: discard and try the next idle entry.
                 Some(_dead) => continue,
                 None => break None,

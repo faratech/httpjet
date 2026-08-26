@@ -263,6 +263,7 @@ impl StaticFiles {
         wants_dir: bool,
         index_files: &[String],
         allow_symlink: bool,
+        want_resolved: bool,
     ) -> Result<Resolved, HandlerError> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         doc_root.hash(&mut h);
@@ -290,7 +291,14 @@ impl StaticFiles {
                 }
             }
         }
-        let resolved = resolve_file(doc_root, rel, wants_dir, index_files, allow_symlink)?;
+        let resolved = resolve_file(
+            doc_root,
+            rel,
+            wants_dir,
+            index_files,
+            allow_symlink,
+            want_resolved,
+        )?;
         if allow_symlink {
             if let Resolved::File(ref f) = resolved {
                 // Cap-gated like the header caches, but always allow refreshing an
@@ -320,7 +328,6 @@ impl StaticFiles {
 }
 
 /// Metadata about a resolved, openable regular file.
-#[derive(Clone)]
 struct ResolvedFile {
     /// Absolute path on disk (doc_root joined with the cleaned request path).
     path: PathBuf,
@@ -333,6 +340,27 @@ struct ResolvedFile {
     /// `accessDenyDir` and the transport; `path` remains the lexical identity for
     /// URI-derived metadata and resolve-memo revalidation.
     resolved_path: PathBuf,
+    /// The verified fd from resolution, pinned into the response (`FileBody.file`)
+    /// so the transport streams it WITHOUT re-opening by path — one open/close pair
+    /// per uncached static serve removed, and for followSymbolLink-off vhosts the
+    /// TOCTOU window between verify-by-fd and re-open-by-path disappears entirely
+    /// (the served bytes ARE the verified inode). Single-owner: a fresh resolve
+    /// carries `Some`; clones (the resolve memo's stored copy) drop to `None`.
+    file: Option<std::fs::File>,
+}
+
+impl Clone for ResolvedFile {
+    fn clone(&self) -> Self {
+        ResolvedFile {
+            path: self.path.clone(),
+            len: self.len,
+            mtime: self.mtime,
+            inode: self.inode,
+            dev: self.dev,
+            resolved_path: self.resolved_path.clone(),
+            file: None,
+        }
+    }
 }
 
 impl ResolvedFile {
@@ -482,21 +510,31 @@ impl Handler for StaticFiles {
             None => &ctx.vhost.index_files,
         };
 
-        let resolved =
-            match self.resolve_cached(&doc_root, &rel, wants_dir, index_files, allow_symlink)? {
-                Resolved::File(f) => f,
-                // DirectorySlash: the request maps to an existing directory but has
-                // no trailing slash → 301 to the canonical slashed URL (Apache
-                // mod_dir / LiteSpeed redirectDir). Done across the board so a bare
-                // /dir never serves un-canonicalized or, behind a front-controller
-                // `!-d` rule, gets routed into the app and 404s.
-                Resolved::DirectorySlash(path) => {
-                    return Ok(with_resolved_target(
-                        directory_slash_redirect(req.uri()),
-                        path,
-                    ));
-                }
-            };
+        // Only compute the canonical fd path when an accessDenyDir rule could ask
+        // for it (#285): with no deny rules the per-resolve /proc readlink is pure
+        // waste on the uncached static path.
+        let want_resolved = !ctx.server.security.access_deny_dir.is_empty();
+        let mut resolved = match self.resolve_cached(
+            &doc_root,
+            &rel,
+            wants_dir,
+            index_files,
+            allow_symlink,
+            want_resolved,
+        )? {
+            Resolved::File(f) => f,
+            // DirectorySlash: the request maps to an existing directory but has
+            // no trailing slash → 301 to the canonical slashed URL (Apache
+            // mod_dir / LiteSpeed redirectDir). Done across the board so a bare
+            // /dir never serves un-canonicalized or, behind a front-controller
+            // `!-d` rule, gets routed into the app and 404s.
+            Resolved::DirectorySlash(path) => {
+                return Ok(with_resolved_target(
+                    directory_slash_redirect(req.uri()),
+                    path,
+                ));
+            }
+        };
         let resolved_target = resolved.resolved_path.clone();
 
         // Static response headers are formatted once per file version / extension
@@ -612,7 +650,7 @@ impl Handler for StaticFiles {
                         // between the resolve stat and the verified read.
                         Body::File(FileBody {
                             path: resolved_target.clone(),
-                            file: None,
+                            file: resolved.file.take(),
                             len: resolved.len,
                             range: Some((start, end)),
                             cached: verified_cached.clone(),
@@ -657,7 +695,7 @@ impl Handler for StaticFiles {
         } else {
             Body::File(FileBody {
                 path: resolved_target.clone(),
-                file: None,
+                file: resolved.file.take(),
                 len: resolved.len,
                 range: None,
                 cached: verified_cached,
@@ -746,6 +784,7 @@ fn resolve_file(
     wants_dir: bool,
     index_files: &[String],
     allow_symlink: bool,
+    want_resolved: bool,
 ) -> Result<Resolved, HandlerError> {
     // Open the document root directory once; all lookups are beneath it.
     let root_fd = open_dir(doc_root).map_err(|_| HandlerError::NotFound)?;
@@ -774,7 +813,13 @@ fn resolve_file(
         // into the app and 404.
         if !wants_dir {
             let lexical = doc_root.join(rel);
-            let resolved = resolved_fd_path(&fd, &lexical).map_err(map_open_err)?;
+            let resolved = if want_resolved {
+                resolved_fd_path(&fd, &lexical).map_err(map_open_err)?
+            } else {
+                // No deny rules => no canonical-path consumer; the lexical join is
+                // only a redirect-building hint here.
+                lexical
+            };
             return Ok(Resolved::DirectorySlash(resolved));
         }
         // With the trailing slash: serve an index file if one exists; otherwise
@@ -795,7 +840,14 @@ fn resolve_file(
             if let Ok((cfd, cstat)) = open_beneath(&root_fd, &child_rel, allow_symlink) {
                 if cstat.is_file() {
                     let abs = doc_root.join(&child_rel);
-                    let resolved_path = resolved_fd_path(&cfd, &abs).map_err(map_open_err)?;
+                    let resolved_path = if want_resolved {
+                        resolved_fd_path(&cfd, &abs).map_err(map_open_err)?
+                    } else {
+                        // Deny check unreachable without rules; transports that must
+                        // re-open use FileBody.path (the lexical target), following
+                        // symlinks only on allow_symlink vhosts where that is allowed.
+                        abs.clone()
+                    };
                     return Ok(Resolved::File(ResolvedFile {
                         path: abs,
                         len: cstat.len,
@@ -803,6 +855,7 @@ fn resolve_file(
                         inode: cstat.inode,
                         dev: cstat.dev,
                         resolved_path,
+                        file: Some(std::fs::File::from(cfd)),
                     }));
                 }
             }
@@ -817,7 +870,12 @@ fn resolve_file(
     }
 
     let abs = doc_root.join(rel);
-    let resolved_path = resolved_fd_path(&fd, &abs).map_err(map_open_err)?;
+    let resolved_path = if want_resolved {
+        resolved_fd_path(&fd, &abs).map_err(map_open_err)?
+    } else {
+        // See above: without accessDenyDir nothing consumes the canonical form.
+        abs.clone()
+    };
     Ok(Resolved::File(ResolvedFile {
         path: abs,
         len: stat.len,
@@ -825,6 +883,7 @@ fn resolve_file(
         inode: stat.inode,
         dev: stat.dev,
         resolved_path,
+        file: Some(std::fs::File::from(fd)),
     }))
 }
 

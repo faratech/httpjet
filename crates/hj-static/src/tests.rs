@@ -212,6 +212,7 @@ fn etag_format_litespeed_28() {
         inode: 0x4db0_94e9_ecec_531e,
         dev: 0,
         resolved_path: PathBuf::from("/tmp/x"),
+        file: None,
     };
     // Mirrors the deployed server's observed `"4a-69b4b394-4db094e9ecec531e;;;"`.
     assert_eq!(rf.etag(28).unwrap(), "\"4a-69b4b394-4db094e9ecec531e;;;\"");
@@ -226,6 +227,7 @@ fn etag_format_bitmask_variants() {
         inode: 0xabcd,
         dev: 0,
         resolved_path: PathBuf::from("/tmp/x"),
+        file: None,
     };
     // Size only (16).
     assert_eq!(rf.etag(16).unwrap(), "\"ff;;;\"");
@@ -315,8 +317,8 @@ fn make_ctx(server: Arc<ServerConfig>, vhost: Arc<VHostConfig>) -> ReqCtx {
         peer_port: 0,
         request_time: SystemTime::now(),
         request_id: Default::default(),
-        upstream_id: None,
         tls: None,
+        redirect_guard: None,
     }
 }
 
@@ -943,7 +945,12 @@ async fn symlink_followed_when_allowed() {
         allow_symbol_link: true,
         ..Default::default()
     });
-    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    // One deny rule (never matched here) keeps the canonical fd path computation on —
+    // this test asserts the symlink-resolved target, which the (#285) skip elides when
+    // no accessDenyDir is configured.
+    let mut server = make_server();
+    server.security.access_deny_dir = vec!["/nonexistent-denied/*".into()];
+    let mut ctx = make_ctx(Arc::new(server), vhost);
     let resp = serve(&mut ctx, req(Method::GET, "/alias.txt"))
         .await
         .unwrap();
@@ -975,7 +982,9 @@ async fn symlink_target_is_pinned_into_file_body_before_consumption() {
         allow_symbol_link: true,
         ..Default::default()
     });
-    let server = Arc::new(make_server());
+    let mut server = make_server();
+    server.security.access_deny_dir = vec!["/nonexistent-denied/*".into()];
+    let server = Arc::new(server);
     let handler = StaticFiles::new();
     let mut first_ctx = make_ctx(server.clone(), vhost.clone());
     let first = handler

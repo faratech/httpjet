@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+memmap2 = { workspace = true }
 http = { workspace = true }
 dashmap = { workspace = true }
 hashbrown = { workspace = true }

@@ -11,6 +11,7 @@
 //! so only keys that show reuse are admitted. It estimates frequency only — the caller picks
 //! the (size-weighted) admission threshold.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Count-min depth (probes per key). 4 is the classic TinyLFU choice.
@@ -23,15 +24,32 @@ const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
 /// 256 steps), instead of one unlucky request sweeping the whole sketch inline.
 const AGE_CHUNK: u64 = 4096;
 
+/// Per-thread record() calls accumulated before one flush to the shared `ops` counter.
+/// record() runs on EVERY cacheable lookup on every worker; without batching, the `ops`
+/// RMW plus `age_remaining`'s probe line are the two hottest cross-core cache lines in
+/// the process. Batching shifts aging-cadence accuracy by at most one batch per thread,
+/// which the sketch's documented approximation tolerance covers.
+const OPS_FLUSH_EVERY: u32 = 128;
+
+thread_local! {
+    /// Per-thread count of record() calls not yet flushed to the shared op counter.
+    /// Cell — never leaves the thread, zero synchronization on the common path.
+    static OPS_BATCH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// One cache line, so hot atomics never share a line with a neighbor.
+#[repr(align(64))]
+struct Padded(AtomicU64);
+
 /// A frequency sketch over 64-bit page-cache key hashes.
 pub struct AdmissionFilter {
     counters: Box<[AtomicU8]>,
     mask: u64,   // counters.len() - 1 (len is a power of two)
     sample: u64, // age (halve every counter) after this many record() ops
-    ops: AtomicU64,
+    ops: Padded,
     /// Counters still to halve in the in-flight aging pass (0 = no pass active).
-    /// Claimed in [`AGE_CHUNK`] slices by subsequent `record()` calls.
-    age_remaining: AtomicU64,
+    /// Claimed in [`AGE_CHUNK`] slices by flushing `record()` calls.
+    age_remaining: Padded,
 }
 
 impl AdmissionFilter {
@@ -52,8 +70,8 @@ impl AdmissionFilter {
             counters,
             mask: width as u64 - 1,
             sample: est_entries.saturating_mul(10).max(10_000),
-            ops: AtomicU64::new(0),
-            age_remaining: AtomicU64::new(0),
+            ops: Padded(AtomicU64::new(0)),
+            age_remaining: Padded(AtomicU64::new(0)),
         }
     }
 
@@ -78,20 +96,41 @@ impl AdmissionFilter {
                 }
             }
         }
-        // Approximate aging: the op that crosses `sample` wins a CAS to reset the counter and
-        // ARMS an incremental halving pass; this and subsequent record() calls each claim one
-        // AGE_CHUNK slice until the pass drains. Concurrent records during the halve are fine
-        // (a sketch is an estimate); no lock, and no single request sweeps the whole sketch.
-        let n = self.ops.fetch_add(1, Ordering::Relaxed) + 1;
+        // Approximate aging, batched per thread: only every OPS_FLUSH_EVERY-th record()
+        // touches the shared `ops`/`age_remaining` lines (the counter CAS loops above stay
+        // exact). The op that crosses `sample` wins a CAS to reset the counter and ARMS an
+        // incremental halving pass; flushing callers each claim one AGE_CHUNK slice until
+        // the pass drains. Concurrent records during the halve are fine (a sketch is an
+        // estimate); no lock, and no single request sweeps the whole sketch.
+        OPS_BATCH.with(|b| {
+            let n = b.get() + 1;
+            if n < OPS_FLUSH_EVERY {
+                b.set(n);
+                return;
+            }
+            b.set(0);
+            self.flush_ops();
+        });
+    }
+
+    /// Account OPS_FLUSH_EVERY batched records against the shared op counter and run the
+    /// aging trigger/claim step once for the whole batch.
+    fn flush_ops(&self) {
+        let n = self
+            .ops
+            .0
+            .fetch_add(OPS_FLUSH_EVERY as u64, Ordering::Relaxed)
+            + OPS_FLUSH_EVERY as u64;
         if n >= self.sample
             && self
                 .ops
+                .0
                 .compare_exchange(n, 0, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
             // No-op if a previous pass is still draining: the sketch decays a touch later,
             // which the estimate tolerates; overlapping passes would double-halve instead.
-            let _ = self.age_remaining.compare_exchange(
+            let _ = self.age_remaining.0.compare_exchange(
                 0,
                 self.counters.len() as u64,
                 Ordering::Relaxed,
@@ -102,16 +141,16 @@ impl AdmissionFilter {
     }
 
     /// Claim and halve one [`AGE_CHUNK`] slice of the in-flight aging pass, if any.
-    /// Concurrent callers claim disjoint slices (the `age_remaining` CAS hands out
+    /// Concurrent flushing callers claim disjoint slices (the `age_remaining` CAS hands out
     /// ranges back-to-front), so the pass parallelizes safely.
     fn age_step(&self) {
-        let mut rem = self.age_remaining.load(Ordering::Relaxed);
+        let mut rem = self.age_remaining.0.load(Ordering::Relaxed);
         loop {
             if rem == 0 {
                 return;
             }
             let claim = rem.min(AGE_CHUNK);
-            match self.age_remaining.compare_exchange_weak(
+            match self.age_remaining.0.compare_exchange_weak(
                 rem,
                 rem - claim,
                 Ordering::Relaxed,
@@ -190,26 +229,29 @@ mod tests {
             f.record(7);
         }
         assert_eq!(f.estimate(7), 4);
-        // 4 more ops on other keys -> the 8th record() crosses `sample` and arms the
-        // (now incremental) halving pass; drain it and every counter must be halved.
-        for k in 100..104u64 {
-            f.record(k);
+        // Drive one ops FLUSH (records land thread-locally until the batch fills): the flush
+        // crosses `sample` and arms the incremental halving pass. Extra records only pad the
+        // batch — the trigger is >=, and key 7's counters stay untouched.
+        for _ in 0..(2 * OPS_FLUSH_EVERY) {
+            f.record(101);
         }
-        while f.age_remaining.load(Ordering::Relaxed) > 0 {
+        while f.age_remaining.0.load(Ordering::Relaxed) > 0 {
             f.age_step();
         }
         assert_eq!(f.estimate(7), 2, "aged: 4 >> 1 == 2");
     }
 
     #[test]
-    fn aging_is_incremental_per_record() {
+    fn aging_is_incremental_per_flush() {
         let mut f = AdmissionFilter::new(128 * 1024 * 1024);
-        f.sample = 1; // every record arms/advances an aging pass
-        f.record(7);
+        f.sample = 1; // any flush arms/advances an aging pass
+        for _ in 0..OPS_FLUSH_EVERY {
+            f.record(7); // exactly one flush fires (batch full)
+        }
         let width = f.counters.len() as u64;
-        let rem = f.age_remaining.load(Ordering::Relaxed);
-        // The arming record() also claimed the first chunk — but no more: the rest
-        // of the pass is paid by later records, never one inline full sweep.
+        let rem = f.age_remaining.0.load(Ordering::Relaxed);
+        // The arming flush also claimed the first chunk — but no more: the rest
+        // of the pass is paid by later flushes, never one inline full sweep.
         assert_eq!(
             rem,
             width - AGE_CHUNK.min(width),

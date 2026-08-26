@@ -3,12 +3,18 @@
 //! body.
 //!
 //! Each codec drives a `std::io::Write` encoder whose sink is an internal
-//! `Vec<u8>`. For every upstream data frame the frame is written into the
-//! encoder and flushed (so a decodable block is produced promptly), and
-//! whatever the encoder emitted is forwarded downstream. On upstream
-//! end-of-stream the encoder is *finished* — writing the codec's trailer /
-//! epilogue — and the final bytes flushed. The concatenation of all emitted
-//! chunks is a single, complete stream in the chosen coding.
+//! `Vec<u8>`. Upstream data frames are accumulated into a small input buffer
+//! and written into the encoder + flushed once the buffer reaches
+//! [`FLUSH_THRESHOLD`] (#326) — closing a compression block per upstream frame
+//! wrecked the ratio and burned encoder CPU on small frames (a 4 KiB-framed
+//! render compressed ~30-80% larger than one flushed in 32 KiB batches). SSE
+//! (`text/event-stream`) is never compressed (`Compress::plan` refuses it), so
+//! this streaming encoder only ever handles bodies — large HTML/JSON renders,
+//! proxied downloads — that no client consumes block-by-block, making the
+//! bounded batching a pure win with no interactivity regression. On upstream
+//! end-of-stream any buffered input is written and the encoder is *finished*
+//! (its trailer/epilogue emitted). The concatenation of all emitted chunks is
+//! a single, complete stream in the chosen coding.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -26,6 +32,12 @@ use brotli::CompressorWriter as BrotliCompressor;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 use crate::encoding::{Encoding, Levels};
+
+/// (#326) Accumulate this many bytes of upstream input before writing them into
+/// the encoder and flushing a block. Bounds both the compression-block size
+/// (ratio) and the worst-case latency added while a slow upstream fills the
+/// buffer; the terminal `finish()` always flushes whatever remains.
+const FLUSH_THRESHOLD: usize = 32 * 1024;
 
 /// A codec-agnostic incremental encoder over a `Vec<u8>` sink. Each call to
 /// [`BlockEncoder::write_block`] compresses + flushes a chunk and returns the
@@ -112,6 +124,9 @@ enum EncState {
 pub struct CompressStream {
     inner: StreamBody,
     state: EncState,
+    /// (#326) Upstream bytes accumulated but not yet written to the encoder;
+    /// flushed as one block once it reaches [`FLUSH_THRESHOLD`] or at EOF.
+    pending_in: Vec<u8>,
 }
 
 impl CompressStream {
@@ -136,6 +151,7 @@ impl CompressStream {
         CompressStream {
             inner,
             state: EncState::Active(encoder),
+            pending_in: Vec::new(),
         }
     }
 
@@ -170,20 +186,37 @@ impl Body for CompressStream {
                                     // its epilogue, and stash the trailers for the next poll —
                                     // never forward them with the encoder still open (which would
                                     // truncate the body and emit an illegal post-trailers DATA).
-                                    let EncState::Active(enc) =
+                                    let EncState::Active(mut enc) =
                                         std::mem::replace(&mut self.state, EncState::Done)
                                     else {
                                         unreachable!("state is Active in this arm");
                                     };
-                                    match enc.finish() {
-                                        Ok(buf) if buf.is_empty() => {
-                                            // No epilogue bytes ⇒ send the trailers now, then EOF.
-                                            return Poll::Ready(Some(Ok(non_data)));
+                                    // (#326) Drain any buffered input into the encoder, then
+                                    // finish; concatenate both outputs into the single terminal
+                                    // chunk ([final block][epilogue]) before the trailers.
+                                    let pending = std::mem::take(&mut self.pending_in);
+                                    let mut out = if pending.is_empty() {
+                                        Vec::new()
+                                    } else {
+                                        match enc.write_block(&pending) {
+                                            Ok(b) => b,
+                                            Err(e) => {
+                                                return Poll::Ready(Some(Err(
+                                                    Box::new(e) as BoxError
+                                                )));
+                                            }
                                         }
+                                    };
+                                    match enc.finish() {
                                         Ok(buf) => {
+                                            out.extend_from_slice(&buf);
+                                            if out.is_empty() {
+                                                // Nothing to emit ⇒ send the trailers now, then EOF.
+                                                return Poll::Ready(Some(Ok(non_data)));
+                                            }
                                             self.state = EncState::PendingTrailers(non_data);
                                             return Poll::Ready(Some(Ok(Frame::data(
-                                                Bytes::from(buf),
+                                                Bytes::from(out),
                                             ))));
                                         }
                                         Err(e) => {
@@ -195,10 +228,18 @@ impl Body for CompressStream {
                             if data.is_empty() {
                                 continue;
                             }
+                            // (#326) Accumulate upstream frames; only compress + flush a block
+                            // once FLUSH_THRESHOLD is reached (or at EOF/trailers). SSE is never
+                            // routed here, so no client is waiting on a sub-threshold frame.
+                            self.pending_in.extend_from_slice(&data);
+                            if self.pending_in.len() < FLUSH_THRESHOLD {
+                                continue;
+                            }
+                            let batch = std::mem::take(&mut self.pending_in);
                             let EncState::Active(enc) = &mut self.state else {
                                 unreachable!("state is Active in this arm");
                             };
-                            match enc.write_block(&data) {
+                            match enc.write_block(&batch) {
                                 Ok(buf) if buf.is_empty() => continue, // encoder buffering
                                 Ok(buf) => {
                                     return Poll::Ready(Some(Ok(Frame::data(Bytes::from(buf)))));
@@ -207,17 +248,30 @@ impl Body for CompressStream {
                             }
                         }
                         Poll::Ready(None) => {
-                            // Upstream done: finish the compressed stream.
-                            if let EncState::Active(enc) =
+                            // Upstream done: drain buffered input, then finish the compressed
+                            // stream; the terminal chunk is [final block][epilogue] concatenated.
+                            if let EncState::Active(mut enc) =
                                 std::mem::replace(&mut self.state, EncState::Done)
                             {
+                                let pending = std::mem::take(&mut self.pending_in);
+                                let mut out = if pending.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    match enc.write_block(&pending) {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
+                                        }
+                                    }
+                                };
                                 match enc.finish() {
                                     Ok(buf) => {
-                                        if buf.is_empty() {
+                                        out.extend_from_slice(&buf);
+                                        if out.is_empty() {
                                             return Poll::Ready(None);
                                         }
                                         return Poll::Ready(Some(Ok(Frame::data(Bytes::from(
-                                            buf,
+                                            out,
                                         )))));
                                     }
                                     Err(e) => {
@@ -347,6 +401,53 @@ mod tests {
     #[tokio::test]
     async fn brotli_multi_frame_round_trips() {
         multi_frame(Encoding::Brotli).await;
+    }
+
+    /// (#326) Many small upstream frames must (a) still round-trip exactly, and
+    /// (b) compress better than the old per-frame-flush shape did, because the
+    /// input is now batched into >=FLUSH_THRESHOLD blocks before a flush.
+    #[tokio::test]
+    async fn small_frames_are_batched_before_flush() {
+        use futures_like::iter_body;
+        // ~256 KiB of compressible HTML delivered in 1 KiB frames — the shape
+        // (small LSAPI DATA frames) that made per-frame flush expensive.
+        let unit = b"<div class=\"message\"><a href=\"/t/x.1/\">reply</a> user time</div>\n";
+        let mut whole = Vec::new();
+        while whole.len() < 256 * 1024 {
+            whole.extend_from_slice(unit);
+        }
+        let chunks: Vec<Bytes> = whole.chunks(1024).map(Bytes::copy_from_slice).collect();
+        let frame_count = chunks.len();
+
+        for enc in [Encoding::Gzip, Encoding::Zstd, Encoding::Brotli] {
+            let inner = into_stream_body(iter_body(chunks.clone()));
+            let comp = compress(enc, inner).await;
+            assert_eq!(decode(enc, &comp), whole, "batched round-trip {enc:?}");
+
+            // Reference: the pre-#326 per-frame-flush encoding of the same frames.
+            let mut per_frame: Box<dyn BlockEncoder> = match enc {
+                Encoding::Gzip => {
+                    Box::new(GzipEnc(GzEncoder::new(Vec::new(), Compression::new(6))))
+                }
+                Encoding::Zstd => Box::new(ZstdEnc(ZstdEncoder::new(Vec::new(), 3).unwrap())),
+                Encoding::Brotli => {
+                    Box::new(BrotliEnc(BrotliCompressor::new(Vec::new(), 4096, 5, 19)))
+                }
+            };
+            let mut ref_len = 0usize;
+            for c in &chunks {
+                ref_len += per_frame.write_block(c).unwrap().len();
+            }
+            ref_len += per_frame.finish().unwrap().len();
+
+            assert!(
+                comp.len() < ref_len,
+                "{enc:?}: batched {} B should beat per-frame {} B over {} frames",
+                comp.len(),
+                ref_len,
+                frame_count
+            );
+        }
     }
 
     #[derive(Debug)]

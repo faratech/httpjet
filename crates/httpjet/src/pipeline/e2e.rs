@@ -433,9 +433,9 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
         local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
         peer_port: 40000,
         tls: None,
+        redirect_guard: None,
         request_time: std::time::SystemTime::UNIX_EPOCH,
         request_id: Default::default(),
-        upstream_id: None,
     };
     let cc = crate::lscache::CacheCtx {
         method: &method,
@@ -448,6 +448,7 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
         render_epoch: store.purge_epoch(),
         has_range: false,
         host_foreign: false,
+        vary_value: None,
     };
     let key =
         crate::lscache::build_cache_key(&rctx, &cc, &store, &crate::lscache::PrivateRoute::Public);

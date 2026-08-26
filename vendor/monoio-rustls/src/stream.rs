@@ -538,6 +538,40 @@ where
         // every slice into its plaintext buffer in a single call) — matching tokio-rustls.
         // SAFETY: the IoVecBuf contract guarantees `cnt` valid iovecs at `ptr`, each over
         // initialized bytes valid for this call; IoSlice is repr-compatible.
+        // (#322) Typical H1/H2 flushes carry <=4 iovecs; keep those on the stack and
+        // only heap-allocate for pathological counts.
+        if cnt <= 8 {
+            let mut slices = [
+                std::io::IoSlice::new(&[]),
+                std::io::IoSlice::new(&[]),
+                std::io::IoSlice::new(&[]),
+                std::io::IoSlice::new(&[]),
+                std::io::IoSlice::new(&[]),
+                std::io::IoSlice::new(&[]),
+                std::io::IoSlice::new(&[]),
+                std::io::IoSlice::new(&[]),
+            ];
+            for (i, slot) in slices.iter_mut().enumerate().take(cnt) {
+                // SAFETY: same IoVecBuf contract as above — cnt valid iovecs at ptr.
+                *slot = std::io::IoSlice::new(unsafe {
+                    let iov = &*ptr.add(i);
+                    std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
+                });
+            }
+            let total = match self.session.writer().write_vectored(&slices[..cnt]) {
+                Ok(n) => n,
+                Err(e) => return (Err(e), buf_vec),
+            };
+            while self.session.wants_write() {
+                match self.write_io().await {
+                    Ok(0) => break,
+                    Ok(_) => (),
+                    Err(e) => return (Err(e), buf_vec),
+                }
+            }
+            self.w_buffer.shrink_to_idle();
+            return (Ok(total), buf_vec);
+        }
         let slices: Vec<std::io::IoSlice> = (0..cnt)
             .map(|i| unsafe {
                 let iov = &*ptr.add(i);

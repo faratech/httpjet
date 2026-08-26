@@ -471,6 +471,16 @@ impl Htaccess {
             let Some(subject) = attrs.resolve(&s.attribute) else {
                 continue;
             };
+            // (#312) Literal-prefix prefilter (fail open): a ^-anchored pattern's
+            // leading literal run must be a prefix of the subject.
+            if !s.literal_prefix.is_empty()
+                && !subject
+                    .as_ref()
+                    .as_bytes()
+                    .starts_with(s.literal_prefix.as_ref())
+            {
+                continue;
+            }
             if let Ok(Some(caps)) = s.regex.captures(subject.as_ref()) {
                 let value = expand_backrefs(&s.value, &caps);
                 out.push((s.var.clone(), value));

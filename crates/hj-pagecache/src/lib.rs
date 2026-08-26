@@ -33,6 +33,7 @@ pub mod store;
 
 pub use admission::AdmissionFilter;
 pub use classify::{Disposition, classify_response};
+pub use diskstore::key_hash;
 pub use key::{
     PageCacheKey, QsStrip, compute_vary_value, normalize_query, public_with_vary,
     vary_value_from_request,

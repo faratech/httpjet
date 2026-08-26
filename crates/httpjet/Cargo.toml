@@ -47,7 +47,6 @@ monoio = { workspace = true, features = ["sync"] }
 # Pinned to exact 0.4.0, which requires rustls ~0.23.4 + monoio 0.2 — both already in the
 # lock; default-features=false keeps it on our process-wide aws-lc-rs.
 monoio-rustls = { version = "=0.4.0", default-features = false, features = ["tls12"] }
-io-uring = { version = "0.7" }
 quinn-udp = { version = "0.6" }
 # Per-core completion channel for the io_uring H3 driver: a spawned per-request task
 # (the bridge dispatch to PHP/pipeline) hands its finished response back to the
@@ -93,6 +92,8 @@ hj-log = { workspace = true }
 hj-tls = { workspace = true }
 # The native HTTP/2 stack, with its monoio `serve_local` path (the io_uring h2 transport).
 hj-h2 = { workspace = true, features = ["monoio"] }
+# (#313) Hash-first probe for the rewrite-outcome cache.
+rustc-hash = { workspace = true }
 async-trait = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }

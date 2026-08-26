@@ -19,6 +19,7 @@
 //! between page entries (bit 63 = 0) and static files (bit 63 = 1). Both route
 //! to the same `ShardedCache` with unified eviction and disk backing.
 
+use std::borrow::Cow;
 /// One query-string modifier derived from a `CacheKeyModify` directive.
 ///
 /// LiteSpeed's `CacheKeyModify -qs:NAME` drops a named query parameter from the
@@ -89,9 +90,14 @@ impl PageCacheKey {
 /// token, `Some(v)` = had `=` (even `Some("")` for `a=`) — and `=` is emitted
 /// whenever the value is `Some`. The path-only identity guard cannot catch such
 /// a collision, so the distinction must live in the key itself.
-pub fn normalize_query(raw_query: &str, modifiers: &[QsStrip]) -> String {
+pub fn normalize_query<'q>(raw_query: &'q str, modifiers: &[QsStrip]) -> Cow<'q, str> {
+    // (#319) Nothing to strip => the raw query IS the normal form: borrow instead of
+    // collecting pairs and re-rendering an identical string.
     if raw_query.is_empty() {
-        return String::new();
+        return Cow::Borrowed("");
+    }
+    if modifiers.is_empty() {
+        return Cow::Borrowed(raw_query);
     }
     let pairs: Vec<(&str, Option<&str>)> = raw_query
         .split('&')
@@ -112,7 +118,7 @@ pub fn normalize_query(raw_query: &str, modifiers: &[QsStrip]) -> String {
             out.push_str(v);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn should_strip(name: &str, modifiers: &[QsStrip]) -> bool {
@@ -145,7 +151,12 @@ fn bounded_vary_value(v: &str) -> String {
     format!("#h{:016x}", h.finish())
 }
 
-pub fn compute_vary_value(cookie_header: Option<&str>, vary_cookies: &[String]) -> String {
+pub fn compute_vary_value<S: AsRef<str>>(
+    cookie_header: Option<&str>,
+    vary_cookies: &[S],
+) -> String {
+    let vary_cookies: Vec<&str> = vary_cookies.iter().map(|s| s.as_ref()).collect();
+    let vary_cookies: &[&str] = &vary_cookies;
     let Some(cookies) = cookie_header else {
         return String::new();
     };
@@ -159,10 +170,10 @@ pub fn compute_vary_value(cookie_header: Option<&str>, vary_cookies: &[String]) 
     for configured_name in vary_cookies {
         let value = cookies.split(';').find_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
-            (name.trim() == configured_name).then_some(value.trim())
+            (name.trim() == *configured_name).then_some(value.trim())
         });
         if let Some(value) = value {
-            found.push((configured_name.as_str(), bounded_vary_value(value)));
+            found.push((configured_name, bounded_vary_value(value)));
         }
     }
     if found.is_empty() {

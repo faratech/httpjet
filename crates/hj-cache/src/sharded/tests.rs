@@ -73,6 +73,7 @@ struct CountingEvict {
     disk_evictions: AtomicU64,
     explicit: AtomicU64,
     expired: AtomicU64,
+    after_unlock: AtomicU64,
 }
 
 impl OnEvict<TestKey, Arc<TestValue>> for Arc<CountingEvict> {
@@ -90,6 +91,10 @@ impl OnEvict<TestKey, Arc<TestValue>> for Arc<CountingEvict> {
             }
             EvictCause::Size => {}
         }
+    }
+
+    fn after_unlock(&self) {
+        self.after_unlock.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -430,5 +435,55 @@ fn with_shard_in_place_mutate() {
     });
     assert!(did);
     assert_eq!(c.ram_bytes(), 400, "mutate reconciled the weight");
+    assert_accounting(&c);
+}
+
+/// (#293) `after_unlock` fires exactly once per critical section that tore at
+/// least one node down — never for eviction-free sections, and once (not once
+/// per member) for a grouped multi-id sweep or an expiry sweep of one shard.
+#[test]
+fn after_unlock_fires_once_per_evicting_critical_section() {
+    let (c, hook) = cache(1 << 20, 0);
+    let drains = || hook.after_unlock.load(Ordering::Relaxed);
+
+    // Eviction-free sections never call it.
+    c.insert(TestKey(1), Arc::new(TestValue::ram(10)));
+    let _ = c.get(&TestKey(1));
+    let _ = c.get(&TestKey(999));
+    assert_eq!(drains(), 0);
+
+    // Explicit remove: one call.
+    c.remove(&TestKey(1));
+    assert_eq!(drains(), 1);
+
+    // Same-key replace tears the old node down under one section: one call.
+    c.insert(TestKey(2), Arc::new(TestValue::ram(10)));
+    c.insert(TestKey(2), Arc::new(TestValue::ram(11)));
+    assert_eq!(drains(), 2);
+
+    // Grouped sweep: 4 ids in the SAME shard torn down under one lock hold
+    // drain once, not four times.
+    let ids: Vec<TestKey> = (0..4).map(|i| TestKey(3 + 256 * i)).collect();
+    for id in &ids {
+        c.insert(*id, Arc::new(TestValue::ram(5)));
+    }
+    let before = drains();
+    let mut group_ids = ids.clone();
+    c.with_shard_groups(&mut group_ids, |acc, group| {
+        assert_eq!(group.len(), 4, "all four ids share shard 3");
+        for id in group {
+            acc.teardown(id, EvictCause::Explicit);
+        }
+    });
+    assert_eq!(drains(), before + 1, "one drain per locked shard group");
+
+    // Expiry sweep: several expired entries in one shard drain once.
+    let past = Instant::now() - Duration::from_millis(10);
+    for i in 0..3u64 {
+        c.insert(TestKey(7 + 256 * i), Arc::new(TestValue::expiring(5, past)));
+    }
+    let before = drains();
+    assert_eq!(c.sweep_expired(), 3);
+    assert_eq!(drains(), before + 1, "one drain for the swept shard");
     assert_accounting(&c);
 }

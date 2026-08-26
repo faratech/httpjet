@@ -156,6 +156,11 @@ pub struct SetEnvIf {
     /// header / `Remote_Addr`).
     pub(crate) attribute: String,
     pub(crate) regex: Regex,
+    /// (#312) Literal prefix fast path: when the pattern is `^`-anchored and
+    /// case-sensitive, the leading literal run (same extractor as RewriteRule's
+    /// prefilter) lets evaluation skip the fancy_regex backtracker for subjects
+    /// that cannot match. Empty = no fast path (fail open, always execute).
+    pub(crate) literal_prefix: Box<[u8]>,
     /// Variable to set and its value template (`$0`, `$1` allowed).
     pub(crate) var: String,
     pub(crate) value: String,

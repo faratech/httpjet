@@ -95,7 +95,14 @@ const IDEMPOTENT_RETRY_MAX: u32 = 2;
 /// spawning the streaming pump. Bounds the inline buffering; anything larger (or
 /// not fully buffered yet) falls back to the streaming channel. 64 KiB covers the
 /// vast majority of dynamic pages while keeping a hard ceiling on inline memory.
-const INLINE_BODY_CAP: usize = 64 * 1024;
+// (#317a) Buffered-only inline ceiling: a response FULLY buffered after the header
+// read returns Body::Full with no Channel + spawned pump. 256 KiB covers real page
+// renders (the old 64 KiB streamed every large render despite it being entirely in
+// the reader buffer). Memory stays bounded because draining is try_parse-only —
+// dispatch NEVER awaits un-buffered body bytes (see the D1 barrier contract) — and
+// declared-length truncation/over-delivery enforcement applies to the inlined body
+// exactly as before.
+const INLINE_BODY_CAP: usize = 256 * 1024;
 
 /// Short backoff before each idempotent-reset retry. During a recycle BURST the
 /// first retry's fresh dial can ALSO re-hit a pool still mid-respawn; a brief pause
@@ -553,6 +560,21 @@ thread_local! {
 /// grew it past this is encoded then the oversized buffer is dropped, not cached).
 const BEGIN_BUF_KEEP_CAP: usize = 16 * 1024;
 
+// (#280) Spare `PacketReader` read buffer for THIS thread. A fresh
+// `BytesMut::with_capacity(64 KiB)` per dispatch zeroed 64 KiB on every PHP render's
+// TTFB path; recycling via Drop hands the allocation to the next reader on this
+// thread instead (same pattern as BEGIN_BUF).
+thread_local! {
+    static PACKET_BUF: std::cell::RefCell<Option<bytes::BytesMut>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn take_packet_buf(alloc: usize) -> bytes::BytesMut {
+    PACKET_BUF
+        .with(|b| b.borrow_mut().take())
+        .unwrap_or_else(|| bytes::BytesMut::with_capacity(alloc))
+}
+
 /// Take the thread-local begin buffer (or a fresh one). The borrow is synchronous
 /// (never held across an `.await`), so it cannot conflict with another task that
 /// the runtime parks onto this thread.
@@ -805,7 +827,13 @@ impl Lsapi {
         // PRE-FLUSH (replayable): pool acquire. On failure, hand the (untouched)
         // body back so the caller can retry on a fresh connection.
         let acq_start = Instant::now();
-        let mut conn = match self.pool.acquire().await {
+        // (#315) GET/HEAD with no body: skip the pool's reuse probe — the
+        // IdempotentReset replay below covers a dead reuse.
+        let mut conn = match if idempotent && body_len == 0 {
+            self.pool.acquire_unprobed().await
+        } else {
+            self.pool.acquire().await
+        } {
             Ok(c) => c,
             Err(e) => match &e {
                 // Capacity (semaphore timed out) / pool closed / breaker open. Retrying
@@ -857,7 +885,7 @@ impl Lsapi {
         // retry this replaces the prior attempt's guard.
         *inflight = self.monitor.as_ref().map(|m| m.inflight().begin());
 
-        let (read_half, write_half, guard) = conn.into_split();
+        let (read_half, mut write_half, guard) = conn.into_split();
         let guard = Arc::new(guard);
 
         // Cancellation shared between the two halves. The response side notifies
@@ -879,18 +907,33 @@ impl Lsapi {
         // Bound for an idle/stalled writer: if neither a body frame nor a socket
         // write makes progress for this long, abandon the upload (free the permit).
         let write_timeout = self.read_timeout;
-        tokio::spawn(async move {
-            pump_request_body(PumpArgs {
-                body,
-                write_half,
-                guard: body_guard,
-                cancel: body_cancel,
-                body_len: body_len as i64,
-                max_body,
-                idle_timeout: write_timeout,
-            })
-            .await;
-        });
+        if body_len == 0 {
+            // (#281) ZERO-LENGTH BODY (every GET/HEAD): the spawned pump would
+            // immediately observe end-of-body and take the Complete path — flush +
+            // deposit. Do it inline: one task spawn + Notify Arc pair + a scheduler
+            // round-trip per PHP GET removed. No frame can arrive (the request has
+            // no body to stream), so there is nothing the task would have raced;
+            // the response side never waits on this task, and a later
+            // `cancel.notify_*` with no listener is a harmless stored permit.
+            if write_half.flush().await.is_err() {
+                guard.poison();
+            } else {
+                guard.deposit_write(write_half);
+            }
+        } else {
+            tokio::spawn(async move {
+                pump_request_body(PumpArgs {
+                    body,
+                    write_half,
+                    guard: body_guard,
+                    cancel: body_cancel,
+                    body_len: body_len as i64,
+                    max_body,
+                    idle_timeout: write_timeout,
+                })
+                .await;
+            });
+        }
 
         // (b) RESPONSE TASK is THIS function continuing on the read half. We read
         //     the first response packet immediately (no await on the writer), then
@@ -940,7 +983,12 @@ impl Lsapi {
         // PRE-FLUSH (replayable): pool acquire. Hand the buffered body back on a
         // failure so the caller can replay it on a fresh connection.
         let acq_start = Instant::now();
-        let mut conn = match self.pool.acquire().await {
+        // (#315) Same skip as dispatch_streaming for a BUFFERED empty body.
+        let mut conn = match if idempotent && body.is_empty() {
+            self.pool.acquire_unprobed().await
+        } else {
+            self.pool.acquire().await
+        } {
             Ok(c) => c,
             Err(e) => match &e {
                 // Capacity (semaphore timed out) / pool closed / breaker open. Retrying
@@ -1035,7 +1083,7 @@ impl Lsapi {
         // Split so the response pump owns a read half + a ReturnGuard like the
         // streaming path. The write half is already done; deposit it immediately
         // so a clean read can re-pool the socket.
-        let (read_half, write_half, guard) = conn.into_split();
+        let (read_half, mut write_half, guard) = conn.into_split();
         guard.deposit_write(write_half);
         // No concurrent body pump here, so the cancel notify has no listener; pass
         // a fresh one to keep one read_response signature.
@@ -1187,10 +1235,11 @@ impl Lsapi {
         let mut has_status_header = None;
         for (name, value) in &resp_header.headers {
             // PHP may emit a "Status: 404 Not Found" header.
-            if name.eq_ignore_ascii_case("status") {
+            if name.as_str().eq_ignore_ascii_case("status") {
                 if let Some(code) = value
-                    .split_whitespace()
-                    .next()
+                    .to_str()
+                    .ok()
+                    .and_then(|v| v.split_whitespace().next())
                     .and_then(|c| c.parse::<u16>().ok())
                     .and_then(|c| http::StatusCode::from_u16(c).ok())
                 {
@@ -1200,15 +1249,10 @@ impl Lsapi {
             }
             // Parsed and normalized once above. Re-emitting every upstream field
             // would preserve ambiguous duplicates in the downstream HeaderMap.
-            if name.eq_ignore_ascii_case("content-length") {
+            if name == http::header::CONTENT_LENGTH {
                 continue;
             }
-            if let (Ok(hn), Ok(hv)) = (
-                http::header::HeaderName::from_bytes(name.as_bytes()),
-                http::header::HeaderValue::from_str(value),
-            ) {
-                builder = builder.header(hn, hv);
-            }
+            builder = builder.header(name.clone(), value.clone());
         }
         if let Some(code) = has_status_header {
             builder = builder.status(code);
@@ -1699,14 +1743,17 @@ async fn feed_chunk(
 }
 
 fn parse_response_content_length(
-    headers: &[(String, String)],
+    headers: &[(http::HeaderName, http::HeaderValue)],
 ) -> Result<Option<u64>, &'static str> {
     let mut declared = None;
-    for (_, value) in headers
+    for (_, raw_value) in headers
         .iter()
-        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .filter(|(name, _)| name.as_str().eq_ignore_ascii_case("content-length"))
     {
-        for raw in value.split(',') {
+        let Ok(value_str) = raw_value.to_str() else {
+            return Err("malformed value");
+        };
+        for raw in value_str.split(',') {
             let value = raw.trim();
             if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
                 return Err("malformed value");
@@ -1743,12 +1790,18 @@ async fn collect_to_cap(
     // floor covers the common small chunked POST without the 0→8→…→8 KiB realloc chain, bounded
     // by `max_body` so a tiny cap can't over-allocate. (This is the chunked / no-Content-Length
     // path, so there is no declared length to size from — a modest fixed floor is the lever.)
-    let initial = (8 * 1024).min(max_body) as usize;
-    let mut buf = bytes::BytesMut::with_capacity(initial);
+    // (#317b) Allocate on the FIRST data frame instead of up front: this path also runs
+    // for bodyless GET/HEAD (no Content-Length), which previously paid an unused 8 KiB.
+    let mut buf = bytes::BytesMut::new();
     while let Some(frame) = body.frame().await {
         let frame =
             frame.map_err(|e| HandlerError::BadGateway(format!("read request body: {e}")))?;
         if let Some(data) = frame.data_ref() {
+            if buf.is_empty() && !data.is_empty() {
+                // (L8 floor, deferred) 8 KiB covers the common small chunked POST without
+                // the 0->8->... realloc chain; still bounded by `max_body`.
+                buf.reserve((8 * 1024).min(max_body.max(1)) as usize);
+            }
             if (buf.len() as u64) + (data.len() as u64) > max_body {
                 return Err(HandlerError::PayloadTooLarge);
             }
@@ -1858,6 +1911,16 @@ struct PacketReader {
 }
 
 impl PacketReader {
+    /// Clear + park the read buffer for reuse on this thread. Runs on EVERY drop
+    /// path (inline drain, pump completion, client abort): clearing guarantees no
+    /// cross-request byte survives into the next reader.
+    fn recycle_buf(&mut self) {
+        if self.buf.capacity() <= Self::READ_CHUNK {
+            self.buf.clear();
+            PACKET_BUF.with(|slot| *slot.borrow_mut() = Some(std::mem::take(&mut self.buf)));
+        }
+    }
+
     /// Build a reader with a per-read idle `timeout` and an optional Tier 1
     /// total-processing `deadline` (`None` = only the idle timeout applies).
     /// Per-read target: lsphp delivers a whole response in one socket write on the
@@ -1871,7 +1934,7 @@ impl PacketReader {
 
     fn with_deadline(timeout: Duration, deadline: Option<Instant>) -> Self {
         PacketReader {
-            buf: bytes::BytesMut::with_capacity(Self::READ_CHUNK),
+            buf: take_packet_buf(Self::READ_CHUNK),
             timeout,
             deadline,
         }
@@ -1990,6 +2053,12 @@ impl PacketReader {
             body: packet.freeze(),
             flag,
         }))
+    }
+}
+
+impl Drop for PacketReader {
+    fn drop(&mut self) {
+        self.recycle_buf();
     }
 }
 
@@ -2143,10 +2212,15 @@ mod wire_header_tests {
 mod response_length_tests {
     use super::parse_response_content_length;
 
-    fn headers(values: &[&str]) -> Vec<(String, String)> {
+    fn headers(values: &[&str]) -> Vec<(http::HeaderName, http::HeaderValue)> {
         values
             .iter()
-            .map(|value| ("Content-Length".to_string(), (*value).to_string()))
+            .map(|value| {
+                (
+                    http::header::HeaderName::from_static("content-length"),
+                    http::HeaderValue::from_str(value).unwrap(),
+                )
+            })
             .collect()
     }
 

@@ -143,6 +143,12 @@ struct ServeArgs {
     /// valid client cert are rejected — the production fail-closed behavior).
     #[arg(long)]
     no_mtls: bool,
+    /// (#296) Do not pin the per-core io_uring transport threads to their CPU
+    /// cores. Pinning is automatic (and only) when the worker count equals the
+    /// machine's CPU count; this flag is the kill switch if pinned placement
+    /// worsens tail latency.
+    #[arg(long)]
+    no_core_pinning: bool,
     /// Do not spawn lsphp; PHP requests fall back to static serving.
     #[arg(long)]
     no_php: bool,
@@ -718,6 +724,11 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     };
 
     let mut cfg = hj_config::load(root)?;
+
+    if args.no_core_pinning {
+        uring::CORE_PINNING.store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("--no-core-pinning: per-core transport threads left unpinned");
+    }
 
     // Local-test override: relax the mandatory client-cert check so TLS can be
     // tested locally without a Cloudflare-issued client cert.

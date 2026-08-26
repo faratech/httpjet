@@ -89,52 +89,95 @@ impl Default for Levels {
 /// pick). Codings absent from `priority` (e.g. one disabled by config) are
 /// never selected.
 pub fn negotiate_with(accept_encoding: &str, priority: &[Encoding]) -> Option<Encoding> {
-    // q for each coding if named explicitly; q for "*" if a wildcard appears.
-    let mut zstd_q: Option<f32> = None;
-    let mut br_q: Option<f32> = None;
-    let mut gzip_q: Option<f32> = None;
-    let mut star_q: Option<f32> = None;
+    AcceptEncoding::parse(accept_encoding).negotiate(priority)
+}
 
-    let trimmed = accept_encoding.trim();
-    if trimmed.is_empty() {
-        // No preference expressed: do not compress (safe default).
-        return None;
+/// (#275) One-pass `Accept-Encoding` verdicts for the codings the server can
+/// produce. [`negotiate_with`] re-parses the header on every call, and the
+/// page-cache hit/store paths invoked it up to ~6× per request over the same
+/// bytes (3× inside `pick_variant` alone); parsing once into this `Copy`
+/// struct makes every subsequent check O(1). Semantics are IDENTICAL to the
+/// original `negotiate_with` — the parity test checks a corpus against a
+/// verbatim reference copy of the old implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptEncoding {
+    zstd: bool,
+    brotli: bool,
+    gzip: bool,
+    /// Header absent/blank: [`Self::negotiate`] yields `None` (serve
+    /// identity), while the page-cache store path's brotli default keys off
+    /// this distinct state.
+    empty: bool,
+}
+
+impl AcceptEncoding {
+    pub fn parse(accept_encoding: &str) -> Self {
+        let trimmed = accept_encoding.trim();
+        if trimmed.is_empty() {
+            // No preference expressed: do not compress (safe default).
+            return AcceptEncoding {
+                zstd: false,
+                brotli: false,
+                gzip: false,
+                empty: true,
+            };
+        }
+
+        // q for each coding if named explicitly; q for "*" if a wildcard appears.
+        let mut zstd_q: Option<f32> = None;
+        let mut br_q: Option<f32> = None;
+        let mut gzip_q: Option<f32> = None;
+        let mut star_q: Option<f32> = None;
+
+        for part in trimmed.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            let (coding, q) = parse_coding(part);
+            let coding = coding.trim();
+            // Keep the most permissive q if a coding is duplicated (rare/malformed).
+            if coding.eq_ignore_ascii_case("zstd") {
+                zstd_q = Some(zstd_q.map_or(q, |prev| prev.max(q)));
+            } else if coding.eq_ignore_ascii_case("br") {
+                br_q = Some(br_q.map_or(q, |prev| prev.max(q)));
+            } else if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
+                gzip_q = Some(gzip_q.map_or(q, |prev| prev.max(q)));
+            } else if coding == "*" {
+                star_q = Some(star_q.map_or(q, |prev| prev.max(q)));
+            }
+        }
+
+        // A coding is acceptable iff its effective q (explicit, else wildcard) > 0.
+        let acceptable =
+            |explicit: Option<f32>| -> bool { matches!(explicit.or(star_q), Some(q) if q > 0.0) };
+
+        AcceptEncoding {
+            zstd: acceptable(zstd_q),
+            brotli: acceptable(br_q),
+            gzip: acceptable(gzip_q),
+            empty: false,
+        }
     }
 
-    for part in trimmed.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let (coding, q) = parse_coding(part);
-        let coding = coding.trim();
-        // Keep the most permissive q if a coding is duplicated (rare/malformed).
-        if coding.eq_ignore_ascii_case("zstd") {
-            zstd_q = Some(zstd_q.map_or(q, |prev| prev.max(q)));
-        } else if coding.eq_ignore_ascii_case("br") {
-            br_q = Some(br_q.map_or(q, |prev| prev.max(q)));
-        } else if coding.eq_ignore_ascii_case("gzip") || coding.eq_ignore_ascii_case("x-gzip") {
-            gzip_q = Some(gzip_q.map_or(q, |prev| prev.max(q)));
-        } else if coding == "*" {
-            star_q = Some(star_q.map_or(q, |prev| prev.max(q)));
+    /// Header was absent or blank.
+    pub fn is_empty(&self) -> bool {
+        self.empty
+    }
+
+    pub fn accepts(&self, enc: Encoding) -> bool {
+        match enc {
+            Encoding::Zstd => self.zstd,
+            Encoding::Brotli => self.brotli,
+            Encoding::Gzip => self.gzip,
         }
     }
 
-    // A coding is acceptable iff its effective q (explicit, else wildcard) > 0.
-    let acceptable =
-        |explicit: Option<f32>| -> bool { matches!(explicit.or(star_q), Some(q) if q > 0.0) };
-
-    for &enc in priority {
-        let ok = match enc {
-            Encoding::Zstd => acceptable(zstd_q),
-            Encoding::Brotli => acceptable(br_q),
-            Encoding::Gzip => acceptable(gzip_q),
-        };
-        if ok {
-            return Some(enc);
-        }
+    /// First coding in `priority` the client accepts — see [`negotiate_with`]
+    /// for the selection semantics.
+    pub fn negotiate(&self, priority: &[Encoding]) -> Option<Encoding> {
+        priority.iter().copied().find(|enc| self.accepts(*enc))
     }
-    None
 }
 
 /// Split a single `Accept-Encoding` element into `(coding, q)`. A missing
@@ -230,17 +273,56 @@ pub fn decode_bytes(enc: Encoding, input: &[u8]) -> Option<Vec<u8>> {
 /// gzip stream. Thin wrapper over `flate2` used by the buffered (`Body::Full`)
 /// path and tests.
 pub(crate) fn gzip_bytes_level(input: &[u8], level: u32) -> Vec<u8> {
-    use flate2::Compression;
-    use flate2::write::GzEncoder;
-    use std::io::Write;
+    use flate2::{Compress, Compression, FlushCompress, Status};
 
-    let mut enc = GzEncoder::new(
-        Vec::with_capacity(input.len() / 2 + 32),
-        Compression::new(level),
-    );
-    // Writing to a Vec is infallible.
-    let _ = enc.write_all(input);
-    enc.finish().unwrap_or_default()
+    // (#309) The raw-deflate workspace is pooled per thread (zstd already pooled
+    // its context; GzEncoder built a fresh one per call). We emit the 10-byte gzip
+    // header ourselves, run a Finish pass against a pre-reserved output bound,
+    // then append CRC32 + ISIZE. Output is a standard RFC 1952 stream.
+    let mut out = Vec::with_capacity(input.len() + input.len() / 8 + 286);
+    out.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]);
+    let mut crc = flate2::Crc::new();
+    crc.update(input);
+
+    GZIP_CCTX.with(|cell| {
+        let mut pool = cell.borrow_mut();
+        let idx = match pool.iter().position(|(l, _)| *l == level) {
+            Some(i) => i,
+            None => {
+                pool.push((level, Compress::new(Compression::new(level), false)));
+                pool.len() - 1
+            }
+        };
+        let comp = &mut pool[idx].1;
+        // reset() rewinds the stream (total_in back to 0) while keeping the
+        // allocated workspace — reusing an ended stream is corrupt/panic.
+        comp.reset();
+
+        loop {
+            let consumed = comp.total_in() as usize;
+            let status = comp
+                .compress_vec(&input[consumed..], &mut out, FlushCompress::Finish)
+                .expect("raw deflate into a Vec cannot fail");
+            match status {
+                Status::StreamEnd => break,
+                // Out of output room (Ok mid-stream, or BufError with no spare
+                // capacity): grow and continue from total_in.
+                Status::Ok | Status::BufError => out.reserve(out.capacity().max(128)),
+            }
+        }
+    });
+    out.extend_from_slice(&crc.sum().to_le_bytes());
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out
+}
+
+thread_local! {
+    /// (#309) Per-thread reused raw-deflate workspaces for the gzip container
+    /// path, one per compression level (the miniz backend fixes the level at
+    /// construction — no `set_level`). The level set is config-bounded (the
+    /// per-serve `Levels.gzip` plus the variant-fill 9), so the pool stays tiny.
+    static GZIP_CCTX: std::cell::RefCell<Vec<(u32, flate2::Compress)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -296,6 +378,102 @@ mod tests {
     use super::*;
     use flate2::read::GzDecoder;
     use std::io::Read;
+
+    /// (#275) `AcceptEncoding::parse(..).negotiate(..)` (and the
+    /// `negotiate_with` wrapper) must agree with a VERBATIM reference copy of
+    /// the pre-#275 single-pass implementation across a corpus of real,
+    /// malformed, and adversarial header shapes — content negotiation feeds
+    /// the page cache's variant selection, so a divergence is a wrong-encoding
+    /// serve, not just a perf bug.
+    #[test]
+    fn accept_encoding_parse_matches_reference() {
+        fn reference(accept_encoding: &str, priority: &[Encoding]) -> Option<Encoding> {
+            let mut zstd_q: Option<f32> = None;
+            let mut br_q: Option<f32> = None;
+            let mut gzip_q: Option<f32> = None;
+            let mut star_q: Option<f32> = None;
+            let trimmed = accept_encoding.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            for part in trimmed.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let (coding, q) = parse_coding(part);
+                let coding = coding.trim();
+                if coding.eq_ignore_ascii_case("zstd") {
+                    zstd_q = Some(zstd_q.map_or(q, |prev| prev.max(q)));
+                } else if coding.eq_ignore_ascii_case("br") {
+                    br_q = Some(br_q.map_or(q, |prev| prev.max(q)));
+                } else if coding.eq_ignore_ascii_case("gzip")
+                    || coding.eq_ignore_ascii_case("x-gzip")
+                {
+                    gzip_q = Some(gzip_q.map_or(q, |prev| prev.max(q)));
+                } else if coding == "*" {
+                    star_q = Some(star_q.map_or(q, |prev| prev.max(q)));
+                }
+            }
+            let acceptable = |explicit: Option<f32>| -> bool {
+                matches!(explicit.or(star_q), Some(q) if q > 0.0)
+            };
+            for &enc in priority {
+                let ok = match enc {
+                    Encoding::Zstd => acceptable(zstd_q),
+                    Encoding::Brotli => acceptable(br_q),
+                    Encoding::Gzip => acceptable(gzip_q),
+                };
+                if ok {
+                    return Some(enc);
+                }
+            }
+            None
+        }
+
+        let corpus = [
+            "",
+            "   ",
+            "gzip",
+            "GZIP",
+            "x-gzip",
+            "br",
+            "zstd",
+            "identity",
+            "deflate",
+            "gzip, deflate, br",
+            "gzip, deflate, br, zstd",
+            "gzip;q=0, *",
+            "*;q=0",
+            "*",
+            "br;q=0.001",
+            "gzip;q=0.000",
+            "zstd;q=0.5, br;q=0.8, gzip",
+            "gzip;q=badvalue",
+            ";,;",
+            "br;Q=0",
+            "gzip ; q=0.5",
+            "*;q=1, gzip;q=0",
+            "gzip, gzip;q=0",
+            "zstd;q=0, br;q=0, gzip;q=0, *;q=1",
+        ];
+        let priorities: &[&[Encoding]] = &[
+            &[Encoding::Zstd, Encoding::Brotli, Encoding::Gzip],
+            &[Encoding::Brotli, Encoding::Gzip],
+            &[Encoding::Gzip],
+            &[Encoding::Zstd],
+            &[Encoding::Brotli],
+            &[],
+        ];
+        for ae in corpus {
+            let parsed = AcceptEncoding::parse(ae);
+            for p in priorities {
+                assert_eq!(parsed.negotiate(p), reference(ae, p), "ae={ae:?} p={p:?}");
+                assert_eq!(negotiate_with(ae, p), reference(ae, p), "wrapper ae={ae:?}");
+            }
+            assert_eq!(parsed.is_empty(), ae.trim().is_empty(), "ae={ae:?}");
+        }
+    }
 
     #[test]
     fn zstd_bytes_pooled_matches_oneshot() {
@@ -392,6 +570,48 @@ mod tests {
             "expected compression to shrink data"
         );
         assert_eq!(gunzip(&comp), original);
+    }
+
+    #[test]
+    fn gzip_bytes_pooled_repeated_calls_round_trip() {
+        // (#309) regression: the pooled deflate context must be reset between
+        // calls — without reset() a second same-thread call reuses an ENDED
+        // stream (cumulative total_in slices the input wrong / compress errors).
+        // Exercise many repeats with interleaved levels and varied inputs,
+        // validating the full RFC 1952 container each time (magic + CRC32 +
+        // ISIZE trailer), not just the decoder's tolerance.
+        let inputs: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"x".to_vec(),
+            b"the quick brown fox jumps over the lazy dog ".repeat(64),
+            (0..5000u32).flat_map(|i| i.to_le_bytes()).collect(),
+            vec![0u8; 70_000],
+        ];
+        for round in 0..3 {
+            for level in [1u32, 6, 9] {
+                for inp in &inputs {
+                    let comp = gzip_bytes_level(inp, level);
+                    assert_eq!(
+                        &comp[..3],
+                        &[0x1f, 0x8b, 8],
+                        "gzip magic/method (round {round}, level {level})"
+                    );
+                    let n = comp.len();
+                    let isize_field = u32::from_le_bytes(comp[n - 4..].try_into().unwrap());
+                    assert_eq!(isize_field, inp.len() as u32, "ISIZE trailer");
+                    let mut crc = flate2::Crc::new();
+                    crc.update(inp);
+                    let crc_field = u32::from_le_bytes(comp[n - 8..n - 4].try_into().unwrap());
+                    assert_eq!(crc_field, crc.sum(), "CRC32 trailer");
+                    assert_eq!(
+                        gunzip(&comp),
+                        *inp,
+                        "round-trip (len {}, level {level})",
+                        inp.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

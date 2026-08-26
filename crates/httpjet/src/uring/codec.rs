@@ -43,6 +43,7 @@ pub fn request_head_progress(
 }
 
 /// How the request body is framed on the wire (decided from the request head).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyFraming {
     /// `Content-Length: n` (n may be 0).
     Length(usize),

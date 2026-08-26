@@ -229,10 +229,30 @@ pub struct ServerState {
 /// across a SIGHUP reload by a single `Arc` clone (so every config generation, every
 /// `ConnGuard`/`RequestGuard`, and the drain loop share the same atomics). Each field is
 /// itself an `Arc<AtomicU64>` so the guards capture exactly the handle they need.
+/// One full cache line, so a hot atomic never shares its line with neighbors.
+#[repr(align(64))]
+#[derive(Default)]
+pub struct PaddedAtomic(pub AtomicU64);
+
+impl PaddedAtomic {
+    pub fn new(v: u64) -> Self {
+        PaddedAtomic(AtomicU64::new(v))
+    }
+}
+
+impl std::ops::Deref for PaddedAtomic {
+    type Target = AtomicU64;
+    fn deref(&self) -> &AtomicU64 {
+        &self.0
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
     /// (OPS1) Total requests served, incremented at the access-log point.
-    pub requests_total: Arc<AtomicU64>,
+    /// (#321) Cache-line padded: incremented by EVERY worker at the access-log
+    /// point, so an unpadded line ping-pongs across cores on every request.
+    pub requests_total: Arc<PaddedAtomic>,
     /// (OPS1) Currently-open connections (the io_uring accept loop does ±1 around each
     /// connection task); the graceful-drain loop waits on this reaching the in-flight count.
     pub active_conns: Arc<AtomicU64>,

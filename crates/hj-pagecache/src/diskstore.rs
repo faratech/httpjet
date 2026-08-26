@@ -49,6 +49,11 @@ const SCAN_MAX_THREADS: usize = 8;
 /// bound by the authenticated lengths plus the serve-time identity guard. A
 /// UNIFORM layout keeps every reader/writer/streaming-offset on one constant.
 const HEADER_LEN: u64 = 80;
+
+/// (#323) Bodies at or above this are served as a zero-copy mmap view of the
+/// immutable container; below it one read(2) into spare capacity is cheaper
+/// than map + minor faults + TLB shootdown on drop.
+const MMAP_BODY_MIN: u64 = 16 * 1024;
 const TAG_LEN: usize = 16;
 const FLAG_PRIVATE: u16 = 1 << 0;
 const FLAG_STATIC: u16 = 1 << 1;
@@ -490,6 +495,12 @@ impl DiskStore {
     /// invariant) so a truncated, replaced, or foreign file yields an error —
     /// never partial bytes. `expected_len` is the length the index recorded at
     /// persist time; any disagreement is corruption.
+    ///
+    /// (#323) Bodies at or above [`MMAP_BODY_MIN`] are memory-mapped instead of
+    /// copied: the returned `Bytes` is a zero-copy view of the tmpfs page-cache
+    /// pages themselves. Smaller bodies stay on the read(2) path (one syscall
+    /// beats map+fault+TLB-shootdown at that size) but skip the zero-fill by
+    /// appending into spare capacity.
     pub fn read_body(path: &Path, expected_len: u32) -> Result<Bytes, ReadError> {
         let mut f = fs::File::open(path)?;
         let file_len = f.metadata()?.len();
@@ -499,9 +510,25 @@ impl DiskStore {
         if body_len != expected_len {
             return Err(ReadError::Corrupt("body length disagrees with index"));
         }
-        f.seek(SeekFrom::Start(HEADER_LEN + meta_len as u64))?;
-        let mut body = vec![0u8; body_len as usize];
-        f.read_exact(&mut body)?;
+        let body_start = HEADER_LEN + meta_len as u64;
+        if body_len as u64 >= MMAP_BODY_MIN {
+            // SAFETY: an HJPC container is immutable once hard-linked into the
+            // fanout — bodies are written to a `.tmp` then linked, dict
+            // recompression writes a NEW file and unlinks the old one, and
+            // teardown UNLINKS (never truncates), which leaves already-mapped
+            // pages intact until the map drops. `validate_header` has proven
+            // `file_len` covers the mapped range, so no access can fault past
+            // EOF.
+            let map = unsafe { memmap2::Mmap::map(&f) }?;
+            let start = body_start as usize;
+            return Ok(Bytes::from_owner(map).slice(start..start + body_len as usize));
+        }
+        f.seek(SeekFrom::Start(body_start))?;
+        let mut body = Vec::with_capacity(body_len as usize);
+        let read = f.take(body_len as u64).read_to_end(&mut body)?;
+        if read != body_len as usize {
+            return Err(ReadError::Corrupt("body shorter than header declared"));
+        }
         Ok(Bytes::from(body))
     }
 
@@ -1396,6 +1423,32 @@ mod tests {
 
         let bytes = DiskStore::read_body(&path, body.len() as u32).expect("read_body");
         assert_eq!(&bytes[..], body);
+    }
+
+    /// (#323) A body at/above `MMAP_BODY_MIN` is served as an mmap view of the
+    /// immutable container: it must round-trip exactly, reject a length
+    /// disagreement, and stay readable after the file is UNLINKED while the
+    /// `Bytes` is still held (the teardown funnel unlinks; POSIX keeps mapped
+    /// pages alive until the map drops).
+    #[test]
+    fn read_body_mmap_path_round_trips_and_survives_unlink() {
+        let (_td, ds) = store();
+        let k = key();
+        let e = entry(PageScope::Public);
+        let body: Vec<u8> = (0..(MMAP_BODY_MIN as usize + 4096))
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let (path, _disk_total) = ds.write_entry(&k, &e, 0, &body, 1_750_000_000_123).unwrap();
+
+        assert!(matches!(
+            DiskStore::read_body(&path, body.len() as u32 + 1),
+            Err(ReadError::Corrupt(_))
+        ));
+        let bytes = DiskStore::read_body(&path, body.len() as u32).expect("read_body");
+        assert_eq!(&bytes[..], &body[..]);
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(&bytes[..], &body[..], "mapped view survives the unlink");
     }
 
     #[test]

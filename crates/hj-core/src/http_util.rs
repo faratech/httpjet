@@ -4,6 +4,7 @@
 //! [`hj-h2`]: ../../hj_h2/index.html
 //! [`hj-http`]: ../../hj_http/index.html
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -128,6 +129,21 @@ pub fn percent_decode(input: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// (#319) Path-context decode: BORROWS the input when it contains no `%` at all
+/// (the overwhelming case) instead of copying byte-for-byte, else decodes. Post-
+/// conditions for path use are folded in: `None` on a bad escape, embedded NUL,
+/// or non-UTF-8 result. Single-sourced with [`percent_decode`].
+pub fn percent_decode_cow(input: &str) -> Option<Cow<'_, str>> {
+    if !input.as_bytes().contains(&b'%') {
+        return Some(Cow::Borrowed(input));
+    }
+    let bytes = percent_decode(input)?;
+    if bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok().map(Cow::Owned)
 }
 
 fn hex_val(b: u8) -> Option<u8> {

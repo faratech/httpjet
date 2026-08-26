@@ -40,7 +40,7 @@ use http::{HeaderName, HeaderValue};
 use parking_lot::Mutex;
 
 use hj_cache::sharded::{
-    CacheValue, EvictCause, OnEvict, SHARDS, ShardCacheConfig, ShardKey, ShardedCache,
+    CacheValue, EvictCause, OnEvict, SHARDS, ShardAccess, ShardCacheConfig, ShardKey, ShardedCache,
 };
 
 use crate::diskstore::{
@@ -525,6 +525,21 @@ fn decoded_meta_heap_bytes(decoded: &DecodedMeta) -> u64 {
         + string_heap_bytes(&decoded.vary_value)
 }
 
+/// Resident heap of the shared serve snapshot (body/variants are accounted by their own
+/// `body_ram_bytes`/`variants_ram_bytes` terms; this covers only the rebuilt response shell).
+fn snapshot_heap_bytes(r: &CachedResponse) -> u64 {
+    size_of::<CachedResponse>() as u64
+        + string_heap_bytes(&r.identity)
+        + vec_heap_bytes(&r.headers)
+        + r.headers
+            .iter()
+            .map(|(name, value)| name.as_str().len() as u64 + value.as_bytes().len() as u64)
+            .sum::<u64>()
+        + tag_vec_ram_bytes(&r.tags)
+        + string_heap_bytes(&r.vary_cookie_name)
+        + string_heap_bytes(&r.vary_value)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CacheKeyId(u64);
 
@@ -539,6 +554,14 @@ impl CacheKeyId {
         // the mask is applied consistently; the on-disk filename uses the raw `key_hash`
         // independently. Masking also makes a page key unable to alias the NIL terminator.
         CacheKeyId(stable_key_hash(key) & !(1u64 << 63))
+    }
+
+    /// Derive from an ALREADY-COMPUTED raw page hash (`crate::key_hash`) — the glue layer
+    /// hashes each key once per request for single-flight/admission and hands it down, so
+    /// the storage id costs a mask, not a second pass over every key field. Must stay the
+    /// exact inverse of `CacheKeyId::new`: same FNV, same bit-63 mask (see `new`).
+    fn from_raw_page_hash(raw: u64) -> Self {
+        CacheKeyId(raw & !(1u64 << 63))
     }
 
     /// Create a key for a static file entry. Uses bit 63 as a type discriminant.
@@ -597,6 +620,13 @@ struct Node {
     /// shard and only ever touched under the shard lock, so the `OnceLock` need not be behind
     /// an `Arc`.
     decoded: OnceLock<DecodedMeta>,
+    /// Per-node SERVE SNAPSHOT: the fully built `CachedResponse` shared by every hit of
+    /// this node version. Built eagerly at store time and after any invalidation; a hit
+    /// costs an Arc refcount bump instead of rebuilding + cloning headers/identity/tags/
+    /// vary strings under the shard lock. INVARIANT: any post-install mutation of
+    /// `body`/`variants`/`variants_filled`/`dict_gen` MUST call `invalidate_snapshot`
+    /// (the next hit rebuilds from the mutated fields); missing it serves stale bytes.
+    resp_snapshot: OnceLock<Arc<CachedResponse>>,
     /// Plaintext copy of the purge tags, denormalized off the encoded `meta` so [`StoreEvict`]
     /// can drop this key from the tag index WITHOUT decoding `meta` (a decode failure on a corrupt
     /// blob would otherwise strand the key in its tag sets forever).
@@ -621,12 +651,18 @@ impl CacheValue for Node {
     /// hash-table bucket overhead is reported separately as process/RSS gap metrics.
     fn ram_weight(&self) -> u64 {
         let decoded = self.decoded.get().map(decoded_meta_heap_bytes).unwrap_or(0);
+        let snap = self
+            .resp_snapshot
+            .get()
+            .map(|r| snapshot_heap_bytes(r))
+            .unwrap_or(0);
         size_of::<Node>() as u64
             + self.meta.compressed_len() as u64
             + tag_vec_ram_bytes(&self.tags)
             + body_ram_bytes(&self.body)
             + variants_ram_bytes(&self.variants)
             + decoded
+            + snap
     }
 
     /// Disk (tmpfs) bytes: the charged file-tier footprint of a File body, else 0.
@@ -661,9 +697,10 @@ impl Node {
         render_epoch: u64,
     ) -> Result<Self, MetaError> {
         let meta = MetaBlob::encode(key, &entry)?;
-        Ok(Node {
+        let node = Node {
             meta,
             decoded: OnceLock::new(),
+            resp_snapshot: OnceLock::new(),
             tags: entry.tags.clone(),
             body: entry.body,
             variants: entry.variants,
@@ -674,7 +711,43 @@ impl Node {
             ttl: entry.ttl,
             swr: entry.swr,
             sie: entry.sie,
-        })
+        };
+        // The serve snapshot stays LAZY (built on the first hit): cold / rarely-served
+        // entries must keep their compressed-only resident footprint — eagerly decoding
+        // at store time would re-inflate the whole long tail's RAM for no serving benefit.
+        Ok(node)
+    }
+
+    /// Build (and install) the shared serve snapshot from current fields. Caller holds the
+    /// shard lock. Returns a clone for immediate use.
+    fn build_snapshot(&self) -> Result<Arc<CachedResponse>, MetaError> {
+        let decoded = match self.decoded.get() {
+            Some(d) => d,
+            None => {
+                let d = self.meta.decode()?;
+                let _ = self.decoded.set(d);
+                self.decoded.get().expect("OnceLock populated after set")
+            }
+        };
+        let resp = Arc::new(decoded.to_cached_response(
+            self.body.clone(),
+            self.variants.clone(),
+            self.variants_filled,
+            self.dict_gen,
+            self.stored_at,
+            self.ttl,
+            self.swr,
+            self.sie,
+        ));
+        let _ = self.resp_snapshot.set(Arc::clone(&resp));
+        Ok(resp)
+    }
+
+    /// Drop the shared snapshot after mutating body/variants/dict_gen/variants_filled;
+    /// the next hit rebuilds it from the mutated fields (one rebuild per mutation —
+    /// mutations are rare relative to hits).
+    fn invalidate_snapshot(&mut self) {
+        self.resp_snapshot = OnceLock::new();
     }
 
     fn retention(&self) -> Duration {
@@ -1374,10 +1447,22 @@ fn evict_age_bucket(age: Duration) -> usize {
     }
 }
 
+thread_local! {
+    /// (#293) File paths whose unlink(2) is deferred out of the shard-lock
+    /// critical section: [`StoreEvict::on_evict`] queues them under the lock,
+    /// [`StoreEvict::after_unlock`] drains them on the SAME thread immediately
+    /// after the mutex is released. Bookkeeping (index, hot tier, tags,
+    /// budgets) stays synchronous under the lock; only the syscall moves.
+    /// Paths are unique per body VERSION, so a queued unlink can never hit a
+    /// successor file from a same-key re-store.
+    static PENDING_UNLINKS: std::cell::RefCell<Vec<Arc<Path>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl StoreEvict {
     fn unlink_body(&self, body: &PageBody, cause: EvictCause) {
         if let PageBody::File { path, body_id, .. } = body {
-            DiskStore::remove(path);
+            PENDING_UNLINKS.with(|q| q.borrow_mut().push(path.clone()));
             if let Some(h) = &self.hot {
                 h.invalidate(*body_id);
             }
@@ -1405,6 +1490,18 @@ impl OnEvict<CacheKeyId, CacheEntry> for StoreEvict {
             CacheEntry::Static(node) => self.unlink_body(&node.body, cause),
         }
         self.evictions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn after_unlock(&self) {
+        PENDING_UNLINKS.with(|q| {
+            let mut q = q.borrow_mut();
+            for path in q.drain(..) {
+                DiskStore::remove(&path);
+            }
+            // A purge-all drains one shard's worth of paths at a time; don't
+            // let that burst pin its capacity on the thread forever.
+            q.shrink_to(64);
+        });
     }
 }
 
@@ -1819,6 +1916,25 @@ impl PageStore {
             }
         }
     }
+    /// (#311) DECODED-IDENTITY hot-tier namespace: bit 63 tags ids whose cached
+    /// Bytes are the IDENTITY form of a dict-compressed body (real `body_id`s come
+    /// from a monotonic counter and can never reach bit 63). Lets an AE-mismatch
+    /// identity serve pay ONE dict decode instead of one per request.
+    const HOT_IDENTITY_TAG: u64 = 0x8000_0000_0000_0000;
+
+    /// Cached decoded identity for a dict-compressed file-backed body, if warm.
+    pub fn hot_identity_get(&self, body_id: u64) -> Option<Bytes> {
+        let hot = self.hot.as_ref()?;
+        hot.get(body_id | Self::HOT_IDENTITY_TAG, Instant::now())
+    }
+
+    /// Park a freshly decoded identity so later serves skip the dict decode.
+    pub fn hot_identity_put(&self, body_id: u64, bytes: Bytes) {
+        if let Some(hot) = self.hot.as_ref() {
+            hot.insert(body_id | Self::HOT_IDENTITY_TAG, bytes, Instant::now());
+        }
+    }
+
     /// Drop a key whose file-backed body failed to resolve (the fail-closed
     /// follow-up to a `body_bytes() == None`), so subsequent requests re-render
     /// instead of re-attempting a dead file.
@@ -1840,7 +1956,27 @@ impl PageStore {
     /// for the exact URL it was built for. A key collision degrades to a miss,
     /// never the wrong page. A fully-gone entry is invalidated lazily.
     pub fn get_entry(&self, key: &PageCacheKey, identity: &str, now: Instant) -> EntryState {
-        self.get_entry_inner(key, identity, now, true)
+        self.get_entry_inner(key, CacheKeyId::new(key), identity, now, true)
+    }
+
+    /// [`get_entry`](Self::get_entry) with a caller-supplied raw page hash (`crate::key_hash`)
+    /// — the glue layer computed it for single-flight/admission, so the storage id costs a
+    /// mask instead of a second pass over every key field. `key_hash` MUST be `key_hash(key)`
+    /// for this very key; anything else is a wrong-key probe (identity guard still fail-closes).
+    pub fn get_entry_hashed(
+        &self,
+        key_hash: u64,
+        key: &PageCacheKey,
+        identity: &str,
+        now: Instant,
+    ) -> EntryState {
+        self.get_entry_inner(
+            key,
+            CacheKeyId::from_raw_page_hash(key_hash),
+            identity,
+            now,
+            true,
+        )
     }
 
     /// Like [`get_entry`](Self::get_entry) but does NOT bump the global hit/miss counters.
@@ -1852,69 +1988,84 @@ impl PageStore {
         identity: &str,
         now: Instant,
     ) -> EntryState {
-        self.get_entry_inner(key, identity, now, false)
+        self.get_entry_inner(key, CacheKeyId::new(key), identity, now, false)
     }
 
     fn get_entry_inner(
         &self,
         key: &PageCacheKey,
+        id: CacheKeyId,
         identity: &str,
         now: Instant,
         count: bool,
     ) -> EntryState {
-        let id = CacheKeyId::new(key);
-        // ONE shard lock across the get + freshness + collision guard + recency touch (via
-        // `with_shard`); the classification/decode happens on the cloned `CachedResponse` either
-        // inside (cheap OnceLock) or — for the Arc-wrapped result — outside the lock.
-        let outcome: Option<(Freshness, CachedResponse)> = self.inner.with_shard(&id, |acc| {
-            let node = acc.get(&id)?.as_page()?;
-            let fresh = node.freshness(now);
-            if fresh == Freshness::Gone {
-                if count {
-                    self.expired_misses.fetch_add(1, Ordering::Relaxed);
-                }
-                acc.teardown(&id, EvictCause::Expired);
-                return None;
-            }
-            match node.to_cached_with_decode_state() {
-                Err(e) => {
-                    self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(error = ?e, "hj-pagecache: resident metadata decode failed — invalidating entry");
-                    acc.teardown(&id, EvictCause::Explicit);
-                    None
-                }
-                Ok((stored_key, resp, decoded_populated)) => {
-                    if decoded_populated && !acc.reconcile_weights(&id, &id) {
-                        return None;
+        // ONE shard lock across the get + freshness + guards + recency touch (via
+        // `with_shard`). The shared serve snapshot makes the hit O(1)-ish: an Arc clone
+        // replaces the former rebuild+clone of the whole CachedResponse under this lock
+        // (headers/identity/tags/vary strings); a first-hit or post-mutation hit pays the
+        // rebuild once and re-shares it.
+        let outcome: Option<(Freshness, Arc<CachedResponse>)> =
+            self.inner.with_shard(&id, |acc| {
+                let node = acc.get(&id)?.as_page()?;
+                let fresh = node.freshness(now);
+                if fresh == Freshness::Gone {
+                    if count {
+                        self.expired_misses.fetch_add(1, Ordering::Relaxed);
                     }
-                    if stored_key != *key {
-                        // Rate-limit the warn (audit): an attacker who can force FNV
-                        // second preimages can otherwise spam one line PER REQUEST.
-                        // Log at collision counts 1, 2, 4, 8... — O(log n) total.
-                        let prev = self.key_id_collisions.fetch_add(1, Ordering::Relaxed);
-                        if prev == 0 || prev.is_power_of_two() {
-                            tracing::warn!(count = prev + 1, "hj-pagecache: compact key-id collision — refusing cached entry");
-                        }
-                        None
-                    } else if resp.identity != identity {
-                        tracing::warn!(
-                            stored = %resp.identity,
-                            requested = %identity,
-                            "hj-pagecache: key/identity mismatch — refusing to serve cached entry (collision guard)"
-                        );
-                        None
-                    } else {
-                        acc.touch_ram(&id);
-                        if matches!(resp.body, PageBody::File { .. })
-                            && matches!(fresh, Freshness::Fresh | Freshness::Stale)
-                        {
-                            acc.touch_disk(&id);
-                        }
-                        Some((fresh, resp))
-                    }
+                    acc.teardown(&id, EvictCause::Expired);
+                    return None;
                 }
-            }
-        });
+                // Scoped node reads: build the shared snapshot on first use, then lift an
+                // owned Arc + guard verdicts out so the node borrow ends before any `acc`
+                // mutation below.
+                let freshly_built = node.resp_snapshot.get().is_none();
+                let (snap, key_matches, identity_ok, body_is_file) = {
+                    if node.resp_snapshot.get().is_none() {
+                        // First hit / post-mutation rebuild: decode-once + build-once.
+                        if let Err(e) = node.build_snapshot() {
+                            self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(error = ?e, "hj-pagecache: resident metadata decode failed — invalidating entry");
+                            acc.teardown(&id, EvictCause::Explicit);
+                            return None;
+                        }
+                    }
+                    let snap = node.resp_snapshot.get().expect("snapshot built above");
+                    (
+                        Arc::clone(snap),
+                        &node.decoded.get().expect("decoded during build").key == key,
+                        snap.identity == identity,
+                        matches!(snap.body, PageBody::File { .. }),
+                    )
+                };
+                // Reconcile BEFORE any guard rejection: a first-hit that goes on to fail
+                // a guard still had its residency grow (decode+snapshot), so the shard
+                // budget must see it or the charge leaks.
+                if freshly_built && !acc.reconcile_weights(&id, &id) {
+                    return None;
+                }
+                if !key_matches {
+                    // Rate-limit the warn (audit): an attacker who can force FNV
+                    // second preimages can otherwise spam one line PER REQUEST.
+                    // Log at collision counts 1, 2, 4, 8... — O(log n) total.
+                    let prev = self.key_id_collisions.fetch_add(1, Ordering::Relaxed);
+                    if prev == 0 || prev.is_power_of_two() {
+                        tracing::warn!(count = prev + 1, "hj-pagecache: compact key-id collision — refusing cached entry");
+                    }
+                    return None;
+                }
+                if !identity_ok {
+                    tracing::warn!(
+                        requested = %identity,
+                        "hj-pagecache: key/identity mismatch — refusing to serve cached entry (collision guard)"
+                    );
+                    return None;
+                }
+                acc.touch_ram(&id);
+                if body_is_file && matches!(fresh, Freshness::Fresh | Freshness::Stale) {
+                    acc.touch_disk(&id);
+                }
+                Some((fresh, snap))
+            });
         match outcome {
             None => {
                 if count {
@@ -1926,19 +2077,19 @@ impl PageStore {
                 if count {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                 }
-                EntryState::Fresh(Arc::new(r))
+                EntryState::Fresh(r)
             }
             Some((Freshness::Stale, r)) => {
                 if count {
                     self.hits.fetch_add(1, Ordering::Relaxed);
                 }
-                EntryState::Stale(Arc::new(r))
+                EntryState::Stale(r)
             }
             Some((Freshness::ErrorOnly, r)) => {
                 if count {
                     self.misses.fetch_add(1, Ordering::Relaxed);
                 }
-                EntryState::ErrorOnly(Arc::new(r))
+                EntryState::ErrorOnly(r)
             }
             Some((Freshness::Gone, _)) => unreachable!("Gone handled under the lock"),
         }
@@ -2100,10 +2251,23 @@ impl PageStore {
         entry: CachedResponse,
         render_epoch: u64,
     ) -> bool {
+        self.store_if_not_purged_since_hashed(stable_key_hash(&key), key, entry, render_epoch)
+    }
+
+    /// Caller-supplied raw page hash variant (the glue layer already computed it for
+    /// single-flight/admission) — skips the second pass over the key fields. `key_hash`
+    /// MUST be `key_hash(key)` for this very key.
+    pub fn store_if_not_purged_since_hashed(
+        &self,
+        key_hash: u64,
+        key: PageCacheKey,
+        entry: CachedResponse,
+        render_epoch: u64,
+    ) -> bool {
         if entry.body.len() as u64 > self.config.max_obj_bytes {
             return false;
         }
-        let id = CacheKeyId::new(&key);
+        let id = CacheKeyId::from_raw_page_hash(key_hash);
 
         // (1) SLOW PART, OFF THE LOCK: write the complete container under a private temp name.
         // Final publication waits until the key's shard is locked and tag membership is visible,
@@ -2208,6 +2372,7 @@ impl PageStore {
                     Ok((path, disk_total)) => {
                         let path: Arc<Path> = Arc::from(path);
                         let body_id = self.body_id_seq.fetch_add(1, Ordering::Relaxed);
+                        node.invalidate_snapshot();
                         node.body = PageBody::File {
                             path: path.clone(),
                             len: body_len,
@@ -2353,6 +2518,7 @@ impl PageStore {
                     .push((DICT_ATTEMPT_VARIANT_TOKEN.to_owned(), Bytes::new()));
             }
             n.variants_filled = true;
+            n.invalidate_snapshot();
             // VARIANT-PRIMARY: drop the redundant identity body when the caller verified a stored
             // variant losslessly round-trips to it. Only for an InMem body (RAM-only mode — a
             // file-tier body keeps its tmpfs identity). dict_gen → 0.
@@ -2415,6 +2581,7 @@ impl PageStore {
             }
             n.body = PageBody::InMem(compressed);
             n.dict_gen = dict_gen;
+            n.invalidate_snapshot();
             true
         })
     }
@@ -2564,6 +2731,7 @@ impl PageStore {
                 let CacheEntry::Page(n) = entry else {
                     return false;
                 };
+                n.invalidate_snapshot();
                 n.body = PageBody::File {
                     path: Arc::from(new_path),
                     len: new_len,
@@ -3002,11 +3170,15 @@ impl PageStore {
     /// hold many `{hash}-{seq}.pc` files and the readdir+header walk must not
     /// stall unrelated stores. Filename seq disambiguation plus the boot scan
     /// tolerate their transient presence while the sweep runs unlocked.
-    fn purge_tagged_id(
+    /// The per-member body of a tag purge, run under the member's OWNING shard
+    /// lock (the caller groups members by shard so each shard locks once per
+    /// purge, #293).
+    fn purge_tagged_id_locked(
         &self,
         tag: &Arc<str>,
         id: CacheKeyId,
         purge_epoch: u64,
+        acc: &mut ShardAccess<'_, CacheKeyId, CacheEntry, StoreEvict>,
     ) -> Option<(PageCacheKey, u64)> {
         enum Action {
             None,
@@ -3014,36 +3186,33 @@ impl PageStore {
             Remove(Option<(PageCacheKey, u64)>),
         }
 
-        let mut sweep = None;
-        self.inner.with_shard(&id, |acc| {
-            let action = match acc.get(&id).and_then(CacheEntry::as_page) {
-                None => Action::None,
-                Some(node) if !node.tags.iter().any(|t| t == tag) => Action::None,
-                Some(node) if node.render_epoch >= purge_epoch => Action::KeepFresh,
-                Some(node) => match node.to_cached() {
-                    Ok((full_key, _)) => Action::Remove(
-                        file_body_disk_version(&node.body)
-                            .map(|(_, version_seq)| (full_key, version_seq)),
-                    ),
-                    Err(_) => {
-                        self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
-                        Action::Remove(None)
-                    }
-                },
-            };
+        let action = match acc.get(&id).and_then(CacheEntry::as_page) {
+            None => Action::None,
+            Some(node) if !node.tags.iter().any(|t| t == tag) => Action::None,
+            Some(node) if node.render_epoch >= purge_epoch => Action::KeepFresh,
+            Some(node) => match node.to_cached() {
+                Ok((full_key, _)) => Action::Remove(
+                    file_body_disk_version(&node.body)
+                        .map(|(_, version_seq)| (full_key, version_seq)),
+                ),
+                Err(_) => {
+                    self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
+                    Action::Remove(None)
+                }
+            },
+        };
 
-            match action {
-                Action::None => {}
-                Action::KeepFresh => {
-                    self.tag_index.insert(tag.clone(), id);
-                }
-                Action::Remove(version) => {
-                    acc.teardown(&id, EvictCause::Explicit);
-                    sweep = version;
-                }
+        match action {
+            Action::None => None,
+            Action::KeepFresh => {
+                self.tag_index.insert(tag.clone(), id);
+                None
             }
-        });
-        sweep
+            Action::Remove(version) => {
+                acc.teardown(&id, EvictCause::Explicit);
+                version
+            }
+        }
     }
 
     /// Purge every entry carrying any of the given tags.
@@ -3093,14 +3262,17 @@ impl PageStore {
                 }
             }
             // Remove the tag set FIRST (lock-order rule: never lock a shard while holding a
-            // tag_index lock). Collect the ids, then dispatch each to its shard.
+            // tag_index lock). Collect the ids, then dispatch them grouped by
+            // owning shard so a hot tag locks each shard once, not once per id.
             if let Some(set) = self.tag_index.remove_tag(&ta) {
-                let ids: Vec<CacheKeyId> = set.iter().copied().collect();
-                for id in ids {
-                    if let Some(sweep) = self.purge_tagged_id(&ta, id, epoch) {
-                        sweeps.push(sweep);
+                let mut ids: Vec<CacheKeyId> = set.iter().copied().collect();
+                self.inner.with_shard_groups(&mut ids, |acc, group| {
+                    for id in group {
+                        if let Some(sweep) = self.purge_tagged_id_locked(&ta, *id, epoch, acc) {
+                            sweeps.push(sweep);
+                        }
                     }
-                }
+                });
             }
         }
         if self.disk.is_some() && self.peer_tag_purge_wall.len() > MAX_PEER_TAG_PURGE_TOMBSTONES {
@@ -3505,6 +3677,73 @@ mod tests {
             assert_ne!(s.0 & (1u64 << 63), 0, "static key must have bit 63 set");
             assert_ne!(s, NIL, "static key must not be the NIL sentinel");
             assert_ne!(id, s, "page and static keys must never collide");
+        }
+    }
+
+    #[test]
+    fn hits_share_one_snapshot_and_mutation_rebuilds_it() {
+        // (#271) A hit must serve the node's SHARED snapshot (Arc refcount bump) instead of
+        // rebuilding the CachedResponse under the shard lock — and a post-install mutation
+        // must invalidate so the next hit reflects the mutated fields.
+        let s = PageStore::new(cfg());
+        let k = PageCacheKey::public(1, true, "example.com", "/snap", "");
+        let id = "example.com\n/snap";
+        s.store(
+            k.clone(),
+            entry_id(b"body", &["T1"], Duration::from_secs(60), id),
+        );
+        let now = Instant::now();
+        let first = s.lookup(&k, id, now).expect("fresh after store");
+        let second = s.lookup(&k, id, now).expect("second fresh lookup");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "consecutive hits must share one snapshot Arc"
+        );
+        assert!(first.variants.is_empty());
+
+        // Simulate the PC2 variant fill: mutate + invalidate under the same guards it uses.
+        assert!(s.mutate_if_matches(&k, id, second.stored_at, |n| {
+            n.variants
+                .push(("br".to_string(), bytes::Bytes::from_static(b"v")));
+            n.invalidate_snapshot();
+            true
+        }));
+        let third = s.lookup(&k, id, now).expect("fresh after fill");
+        assert!(
+            !Arc::ptr_eq(&first, &third),
+            "post-mutation hit must observe a rebuilt snapshot"
+        );
+        assert_eq!(third.variants.len(), 1, "fill result visible on next hit");
+    }
+
+    #[test]
+    fn from_raw_page_hash_matches_new_and_never_nil() {
+        // The glue layer computes the raw FNV once per request (single-flight/admission)
+        // and hands it to `*_hashed` store methods; that derivation MUST stay the exact
+        // inverse of `CacheKeyId::new` — same hash, same bit-63 mask, same NIL guard.
+        for (vh, host, path, q) in [
+            (1u32, "forum.example", "/help/", ""),
+            (2, "example.com", "/forums/thread-1", "page=2"),
+            (3, "a.b.c", "/", "utm=x&vary=style-9"),
+        ] {
+            let k = PageCacheKey {
+                vhost_id: vh,
+                secure: false,
+                host: host.into(),
+                path: path.into(),
+                normalized_query: q.into(),
+                vary_value: "guest".into(),
+                private_owner: 7,
+            };
+            let raw = crate::key_hash(&k);
+            assert_eq!(
+                CacheKeyId::from_raw_page_hash(raw),
+                CacheKeyId::new(&k),
+                "hashed derivation diverged from CacheKeyId::new"
+            );
+            let id = CacheKeyId::from_raw_page_hash(raw);
+            assert_eq!(id.0 & (1u64 << 63), 0, "masked id must keep bit 63 clear");
+            assert_ne!(id, NIL, "the bit-63 mask already prevents NIL");
         }
     }
 
@@ -5650,9 +5889,12 @@ mod tests {
             entry(b"fresh", &["T"], Duration::from_secs(60)),
             purge_epoch,
         ));
-        for id in ids {
-            store.purge_tagged_id(&tag, id, purge_epoch);
-        }
+        let mut ids = ids;
+        store.inner.with_shard_groups(&mut ids, |acc, group| {
+            for id in group {
+                store.purge_tagged_id_locked(&tag, *id, purge_epoch, acc);
+            }
+        });
 
         let fresh = store
             .lookup(&key, "id", Instant::now())

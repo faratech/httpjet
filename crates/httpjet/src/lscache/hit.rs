@@ -11,8 +11,8 @@ use http::header::{
 use http::{HeaderMap, HeaderValue, StatusCode};
 
 use hj_compress::{
-    DEFAULT_MIN_SIZE, DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, PageDict, decode_bytes,
-    encode_bytes, negotiate_with,
+    AcceptEncoding, DEFAULT_MIN_SIZE, DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, PageDict,
+    decode_bytes, encode_bytes,
 };
 use hj_core::{Body, FileBody, Response};
 use hj_pagecache::CachedResponse;
@@ -27,12 +27,15 @@ use super::HDR_CACHE_STATUS;
 /// (Content-Encoding token, body) or `None` to serve the identity body (and let the
 /// per-serve compress transform run, as before). Only ever returns a variant that BOTH
 /// exists in the entry AND the client's `Accept-Encoding` accepts, so it's never mislabeled.
-fn pick_variant<'e>(entry: &'e CachedResponse, accept_encoding: &str) -> Option<(&'e str, Bytes)> {
+fn pick_variant<'e>(
+    entry: &'e CachedResponse,
+    accept_encoding: AcceptEncoding,
+) -> Option<(&'e str, Bytes)> {
     if entry.variants.is_empty() {
         return None;
     }
     DEFAULT_PRIORITY.iter().copied().find_map(|enc| {
-        negotiate_with(accept_encoding, &[enc])?;
+        accept_encoding.accepts(enc).then_some(())?;
         entry
             .variants
             .iter()
@@ -86,9 +89,10 @@ fn file_body_len(f: &FileBody) -> u64 {
 pub(super) fn build_hit_response(
     entry: &CachedResponse,
     now: Instant,
-    accept_encoding: &str,
+    accept_encoding: AcceptEncoding,
     is_head: bool,
     dict: Option<&PageDict>,
+    store: Option<&hj_pagecache::PageStore>,
     stored: impl FnOnce() -> Option<Bytes>,
     stored_file: impl FnOnce() -> Option<FileBody>,
 ) -> Option<Response> {
@@ -99,7 +103,10 @@ pub(super) fn build_hit_response(
     // bytes and still fail closed on a missing/corrupt file.
     let (body, encoding) = match pick_variant(entry, accept_encoding) {
         Some((tok, b)) => (HitBody::Bytes(b), Some(tok)),
-        None => (resolve_identity(entry, dict, stored, stored_file)?, None),
+        None => (
+            resolve_identity(entry, dict, store, stored, stored_file)?,
+            None,
+        ),
     };
     if body.is_empty() && body_required(entry.status) {
         tracing::error!(
@@ -177,6 +184,7 @@ pub(super) fn body_required(status: u16) -> bool {
 fn resolve_identity(
     entry: &CachedResponse,
     dict: Option<&PageDict>,
+    store: Option<&hj_pagecache::PageStore>,
     stored: impl FnOnce() -> Option<Bytes>,
     stored_file: impl FnOnce() -> Option<FileBody>,
 ) -> Option<HitBody> {
@@ -193,15 +201,37 @@ fn resolve_identity(
             return Some(HitBody::File(file));
         }
     }
-    identity_body(entry, stored()?, dict).map(HitBody::Bytes)
+    identity_body(entry, stored()?, dict, store).map(HitBody::Bytes)
 }
 
-fn identity_body(entry: &CachedResponse, stored: Bytes, dict: Option<&PageDict>) -> Option<Bytes> {
+fn identity_body(
+    entry: &CachedResponse,
+    stored: Bytes,
+    dict: Option<&PageDict>,
+    store: Option<&hj_pagecache::PageStore>,
+) -> Option<Bytes> {
     if entry.dict_gen == 0 {
         return Some(stored);
     }
+    // (#311) Decode ONCE per body generation into the tagged hot tier: without this,
+    // every AE-mismatch identity serve ran a full-page zstd-dict decode (~50-150us
+    // for a large page) on the serving thread.
+    let body_id = match &entry.body {
+        hj_pagecache::PageBody::File { body_id, .. } => Some(*body_id),
+        _ => None,
+    };
+    if let (Some(id), Some(store)) = (body_id, store) {
+        if let Some(warm) = store.hot_identity_get(id) {
+            return Some(warm);
+        }
+    }
     match dict.and_then(|d| d.decode(stored.as_ref(), MAX_DECODE as usize)) {
-        Some(v) => Some(Bytes::from(v)),
+        Some(v) => {
+            if let (Some(id), Some(store)) = (body_id, store) {
+                store.hot_identity_put(id, Bytes::from(v.clone()));
+            }
+            Some(Bytes::from(v))
+        }
         None => {
             tracing::error!(
                 dict_gen = entry.dict_gen,
@@ -332,14 +362,15 @@ pub(super) fn weak_etag(bytes: &[u8]) -> String {
 /// every modern client that accepts zstd also accepts br, so a brotli refresh entry
 /// serves the widest set of hit clients without a per-serve fallback. `None` ⇒ the
 /// client accepts none of zstd/br/gzip ⇒ store no variant (serve identity).
-fn store_encoding(accept_encoding: &str) -> Option<Encoding> {
+fn store_encoding(accept_encoding: AcceptEncoding) -> Option<Encoding> {
+    // (#275) An absent/blank header takes the brotli default (the pre-#275
+    // check was on the RAW string, so a whitespace-only AE — a shape no real
+    // client sends — now also lands here instead of storing nothing; the
+    // variant is still only ever SERVED to a client whose AE accepts it).
     if accept_encoding.is_empty() {
         return Some(Encoding::Brotli);
     }
-    DEFAULT_PRIORITY
-        .iter()
-        .copied()
-        .find(|e| negotiate_with(accept_encoding, &[*e]).is_some())
+    accept_encoding.negotiate(DEFAULT_PRIORITY)
 }
 
 /// The encodings a variant fill should compute: the first hitter's preferred
@@ -355,7 +386,7 @@ fn add_encoding_once(encs: &mut Vec<Encoding>, enc: Encoding) {
 
 fn fill_encodings(
     cf_zstd_egress: bool,
-    accept_encoding: &str,
+    accept_encoding: AcceptEncoding,
     capsule_shell: bool,
 ) -> Vec<Encoding> {
     let mut encs = Vec::with_capacity(if capsule_shell { 3 } else { 2 });
@@ -393,7 +424,7 @@ pub(super) fn eligible_for_variants(
     state: &ServerState,
     headers: &[(http::HeaderName, HeaderValue)],
     body_len: usize,
-    accept_encoding: &str,
+    accept_encoding: AcceptEncoding,
     capsule_shell: bool,
 ) -> bool {
     if (body_len as u64) < DEFAULT_MIN_SIZE {
@@ -425,7 +456,7 @@ pub(super) fn precompress_variants(
     state: &ServerState,
     headers: &[(http::HeaderName, HeaderValue)],
     body: &Bytes,
-    accept_encoding: &str,
+    accept_encoding: AcceptEncoding,
     capsule_shell: bool,
 ) -> Vec<(String, Bytes)> {
     if !eligible_for_variants(state, headers, body.len(), accept_encoding, capsule_shell) {
@@ -520,12 +551,26 @@ mod tests {
     #[test]
     fn pick_variant_honours_server_priority_and_client_accept() {
         let e = entry_with_variants(b"identity-body", &[("br", b"BR"), ("gzip", b"GZ")]);
-        assert_eq!(pick_variant(&e, "br, gzip").unwrap().0, "br"); // brotli preferred
-        assert_eq!(pick_variant(&e, "gzip").unwrap().0, "gzip"); // only gzip accepted
-        assert!(pick_variant(&e, "").is_none()); // identity request
-        assert!(pick_variant(&e, "identity").is_none());
+        assert_eq!(
+            pick_variant(&e, AcceptEncoding::parse("br, gzip"))
+                .unwrap()
+                .0,
+            "br"
+        ); // brotli preferred
+        assert_eq!(
+            pick_variant(&e, AcceptEncoding::parse("gzip")).unwrap().0,
+            "gzip"
+        ); // only gzip accepted
+        assert!(pick_variant(&e, AcceptEncoding::parse("")).is_none()); // identity request
+        assert!(pick_variant(&e, AcceptEncoding::parse("identity")).is_none());
         // No variants stored ⇒ always identity.
-        assert!(pick_variant(&entry_with_variants(b"x", &[]), "br, gzip").is_none());
+        assert!(
+            pick_variant(
+                &entry_with_variants(b"x", &[]),
+                AcceptEncoding::parse("br, gzip")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -534,28 +579,31 @@ mod tests {
         // when zstd egress to CF is forced — later CF hits would recompress every
         // serve for the whole TTL.
         assert_eq!(
-            fill_encodings(true, "gzip", false),
+            fill_encodings(true, AcceptEncoding::parse("gzip"), false),
             vec![Encoding::Gzip, Encoding::Zstd]
         );
         // Already-zstd hitter: no duplicate.
         assert_eq!(
-            fill_encodings(true, "zstd, br, gzip", false),
+            fill_encodings(true, AcceptEncoding::parse("zstd, br, gzip"), false),
             vec![Encoding::Zstd]
         );
         // Empty AE (internal refresh) defaults to brotli, plus zstd under CF egress.
         assert_eq!(
-            fill_encodings(true, "", false),
+            fill_encodings(true, AcceptEncoding::parse(""), false),
             vec![Encoding::Brotli, Encoding::Zstd]
         );
         // identity-only client alone yields nothing — but CF egress still fills zstd.
         assert_eq!(
-            fill_encodings(true, "identity", false),
+            fill_encodings(true, AcceptEncoding::parse("identity"), false),
             vec![Encoding::Zstd]
         );
         // Without CF zstd egress: first hitter's coding only, as before.
-        assert_eq!(fill_encodings(false, "gzip", false), vec![Encoding::Gzip]);
         assert_eq!(
-            fill_encodings(false, "identity", false),
+            fill_encodings(false, AcceptEncoding::parse("gzip"), false),
+            vec![Encoding::Gzip]
+        );
+        assert_eq!(
+            fill_encodings(false, AcceptEncoding::parse("identity"), false),
             Vec::<Encoding>::new()
         );
     }
@@ -563,15 +611,15 @@ mod tests {
     #[test]
     fn fill_encodings_adds_gzip_for_capsule_shells() {
         assert_eq!(
-            fill_encodings(true, "zstd, br, gzip", true),
+            fill_encodings(true, AcceptEncoding::parse("zstd, br, gzip"), true),
             vec![Encoding::Zstd, Encoding::Gzip]
         );
         assert_eq!(
-            fill_encodings(false, "br, gzip", true),
+            fill_encodings(false, AcceptEncoding::parse("br, gzip"), true),
             vec![Encoding::Brotli, Encoding::Gzip]
         );
         assert_eq!(
-            fill_encodings(false, "identity", true),
+            fill_encodings(false, AcceptEncoding::parse("identity"), true),
             vec![Encoding::Gzip]
         );
     }
@@ -580,21 +628,48 @@ mod tests {
     fn store_encoding_picks_one_by_server_priority() {
         // zstd wins when accepted (top server priority, regardless of client order) —
         // cheapest to compress, so it cuts the store-path CPU the most.
-        assert_eq!(store_encoding("zstd, br, gzip"), Some(Encoding::Zstd));
-        assert_eq!(store_encoding("gzip, br, zstd"), Some(Encoding::Zstd));
-        assert_eq!(store_encoding("zstd"), Some(Encoding::Zstd));
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("zstd, br, gzip")),
+            Some(Encoding::Zstd)
+        );
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("gzip, br, zstd")),
+            Some(Encoding::Zstd)
+        );
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("zstd")),
+            Some(Encoding::Zstd)
+        );
         // No zstd: brotli preferred over gzip (server priority, not client order).
-        assert_eq!(store_encoding("br, gzip"), Some(Encoding::Brotli));
-        assert_eq!(store_encoding("gzip, br"), Some(Encoding::Brotli));
-        assert_eq!(store_encoding("gzip, deflate, br"), Some(Encoding::Brotli));
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("br, gzip")),
+            Some(Encoding::Brotli)
+        );
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("gzip, br")),
+            Some(Encoding::Brotli)
+        );
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("gzip, deflate, br")),
+            Some(Encoding::Brotli)
+        );
         // gzip-only client -> gzip (the one variant that will actually be served).
-        assert_eq!(store_encoding("gzip"), Some(Encoding::Gzip));
-        assert_eq!(store_encoding("gzip, deflate"), Some(Encoding::Gzip));
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("gzip")),
+            Some(Encoding::Gzip)
+        );
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("gzip, deflate")),
+            Some(Encoding::Gzip)
+        );
         // Empty AE (SWR refresh dropped the header) -> brotli (widest modern coverage).
-        assert_eq!(store_encoding(""), Some(Encoding::Brotli));
+        assert_eq!(
+            store_encoding(AcceptEncoding::parse("")),
+            Some(Encoding::Brotli)
+        );
         // Accepts none of zstd/br/gzip -> no variant (serve identity).
-        assert_eq!(store_encoding("identity"), None);
-        assert_eq!(store_encoding("deflate"), None);
+        assert_eq!(store_encoding(AcceptEncoding::parse("identity")), None);
+        assert_eq!(store_encoding(AcceptEncoding::parse("deflate")), None);
     }
 
     #[test]
@@ -602,10 +677,15 @@ mod tests {
         // Only gzip stored: a br-only client must NOT be handed br — it falls back.
         let e = entry_with_variants(b"identity-body", &[("gzip", b"GZ")]);
         assert!(
-            pick_variant(&e, "br").is_none(),
+            pick_variant(&e, AcceptEncoding::parse("br")).is_none(),
             "must not serve a non-existent br variant"
         );
-        assert_eq!(pick_variant(&e, "br, gzip").unwrap().0, "gzip");
+        assert_eq!(
+            pick_variant(&e, AcceptEncoding::parse("br, gzip"))
+                .unwrap()
+                .0,
+            "gzip"
+        );
     }
 
     #[test]
@@ -613,13 +693,32 @@ mod tests {
         let e = entry_with_variants(b"identity-body", &[("br", b"BR-bytes")]);
         let now = Instant::now();
         // Brotli client: serve the br variant, labeled, with Vary.
-        let r =
-            build_hit_response(&e, now, "br", false, None, || e.body.in_mem(), || None).unwrap();
+        let r = build_hit_response(
+            &e,
+            now,
+            AcceptEncoding::parse("br"),
+            false,
+            None,
+            None,
+            || e.body.in_mem(),
+            || None,
+        )
+        .unwrap();
         assert_eq!(r.headers().get(CONTENT_ENCODING).unwrap(), "br");
         assert!(r.headers().get(VARY).is_some());
         assert_eq!(r.headers().get(CONTENT_LENGTH).unwrap(), "8"); // "BR-bytes"
         // Identity client: no encoding, identity body length.
-        let r2 = build_hit_response(&e, now, "", false, None, || e.body.in_mem(), || None).unwrap();
+        let r2 = build_hit_response(
+            &e,
+            now,
+            AcceptEncoding::parse(""),
+            false,
+            None,
+            None,
+            || e.body.in_mem(),
+            || None,
+        )
+        .unwrap();
         assert!(r2.headers().get(CONTENT_ENCODING).is_none());
         assert_eq!(r2.headers().get(CONTENT_LENGTH).unwrap(), "13"); // "identity-body"
     }
@@ -642,8 +741,17 @@ mod tests {
         let now = Instant::now();
 
         // (a) zstd client: the stored variant is served directly (no reconstruction).
-        let r =
-            build_hit_response(&e, now, "zstd", false, None, || None, || None).expect("zstd hit");
+        let r = build_hit_response(
+            &e,
+            now,
+            AcceptEncoding::parse("zstd"),
+            false,
+            None,
+            None,
+            || None,
+            || None,
+        )
+        .expect("zstd hit");
         assert_eq!(r.headers().get(CONTENT_ENCODING).unwrap(), "zstd");
         match r.body() {
             Body::Full(b) => assert_eq!(
@@ -656,8 +764,17 @@ mod tests {
 
         // (b) gzip client, only a zstd variant stored: reconstruct the identity from the
         // zstd variant — byte-for-byte, no Content-Encoding.
-        let r2 = build_hit_response(&e, now, "gzip", false, None, || None, || None)
-            .expect("identity hit");
+        let r2 = build_hit_response(
+            &e,
+            now,
+            AcceptEncoding::parse("gzip"),
+            false,
+            None,
+            None,
+            || None,
+            || None,
+        )
+        .expect("identity hit");
         assert!(r2.headers().get(CONTENT_ENCODING).is_none());
         assert_eq!(
             r2.headers().get(CONTENT_LENGTH).unwrap(),
@@ -675,7 +792,17 @@ mod tests {
         let now = Instant::now();
         // HEAD selects the same (br) representation a GET would — Content-Length / encoding
         // match — but the body is empty.
-        let r = build_hit_response(&e, now, "br", true, None, || e.body.in_mem(), || None).unwrap();
+        let r = build_hit_response(
+            &e,
+            now,
+            AcceptEncoding::parse("br"),
+            true,
+            None,
+            None,
+            || e.body.in_mem(),
+            || None,
+        )
+        .unwrap();
         assert_eq!(r.headers().get(CONTENT_ENCODING).unwrap(), "br");
         assert_eq!(r.headers().get(CONTENT_LENGTH).unwrap(), "8");
         assert!(
@@ -683,7 +810,17 @@ mod tests {
             "HEAD hit must have an empty body"
         );
         // Identity HEAD: identity length, empty body.
-        let r2 = build_hit_response(&e, now, "", true, None, || e.body.in_mem(), || None).unwrap();
+        let r2 = build_hit_response(
+            &e,
+            now,
+            AcceptEncoding::parse(""),
+            true,
+            None,
+            None,
+            || e.body.in_mem(),
+            || None,
+        )
+        .unwrap();
         assert_eq!(r2.headers().get(CONTENT_LENGTH).unwrap(), "13");
         assert!(matches!(r2.body(), Body::Empty));
     }
@@ -694,8 +831,9 @@ mod tests {
         let r = build_hit_response(
             &e,
             Instant::now(),
-            "",
+            AcceptEncoding::parse(""),
             false,
+            None,
             None,
             || -> Option<Bytes> { panic!("identity bytes should not be materialized") },
             || {
@@ -732,8 +870,9 @@ mod tests {
         let r = build_hit_response(
             &e,
             Instant::now(),
-            "br",
+            AcceptEncoding::parse("br"),
             false,
+            None,
             None,
             || e.body.in_mem(),
             || None,
@@ -766,8 +905,9 @@ mod tests {
         let got = build_hit_response(
             &e,
             Instant::now(),
-            "",
+            AcceptEncoding::parse(""),
             false,
+            None,
             None,
             || e.body.in_mem(),
             || None,
@@ -788,8 +928,9 @@ mod tests {
             build_hit_response(
                 &e,
                 Instant::now(),
-                "",
+                AcceptEncoding::parse(""),
                 false,
+                None,
                 None,
                 || e.body.in_mem(),
                 || None,
@@ -807,8 +948,9 @@ mod tests {
             build_hit_response(
                 &e,
                 Instant::now(),
-                "",
+                AcceptEncoding::parse(""),
                 false,
+                None,
                 None,
                 || e.body.in_mem(),
                 || None,
@@ -830,8 +972,9 @@ mod tests {
         let r = build_hit_response(
             &e,
             Instant::now(),
-            "",
+            AcceptEncoding::parse(""),
             false,
+            None,
             None,
             || e.body.in_mem(),
             || None,

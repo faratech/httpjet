@@ -264,24 +264,45 @@ fn build_begin_request_into<K, V, HN, HV>(
     // always preceded by `Name: `), so PHP's `off == 0 => absent` test for the
     // index slots stays correct without any sentinel; unknown headers are driven
     // by m_cntUnknownHeaders, not an offset-zero sentinel.
-    let mut hdr_block = BytesMut::new();
+    // (#327) Single-buffer encode: the tables are RESERVED in `out` first (their
+    // sizes are computable up front after one no-copy counting pass), the raw
+    // header block is appended DIRECTLY to `out`, and the tables are backfilled
+    // in place - eliminating the intermediate hdr_block BytesMut + wholesale
+    // memcpy this function used despite its single-allocation contract.
 
     // Per-slot (len, off) for the 25 well-known headers (off 0 == absent).
     let mut known: [(u16, i32); KNOWN_HEADER_COUNT] = [(0, 0); KNOWN_HEADER_COUNT];
-    // (nameOff, nameLen, valueOff, valueLen) for each unknown header.
-    let mut unknown: Vec<[i32; 4]> = Vec::new();
+    // Pass 1: count unknown headers so the offset-table reservation is exact.
+    let unknown_cnt = headers
+        .iter()
+        .filter(|(name, _)| known_header_index(name.as_ref()).is_none())
+        .count();
+    let unknown_table_len = unknown_cnt * 16; // (nameOff, nameLen, valueOff, valueLen)
 
+    // --- reserve: lsapi_http_header_index + lsapi_header_offset[unknown] ------
+    let index_start = out.len();
+    out.put_bytes(0, HEADER_INDEX_LEN + unknown_table_len);
+
+    // --- raw HTTP header block, encoded straight into `out` --------------------
+    // Offsets in the tables are RELATIVE TO THE START OF THE BLOCK (exactly as in
+    // OLS), so track them from zero while writing at the absolute tail.
+    let block_abs_start = out.len();
+    let mut block_rel: i32 = 0;
+    let mut unknown_written = 0usize;
+    let mut unknown_wpos = index_start + HEADER_INDEX_LEN;
     for (name, value) in headers {
         let nb = name.as_ref().as_bytes();
         let vb = value.as_ref().as_bytes();
-        let name_off = hdr_block.len() as i32;
-        hdr_block.extend_from_slice(nb);
-        hdr_block.extend_from_slice(b": ");
-        let value_off = hdr_block.len() as i32;
-        hdr_block.extend_from_slice(vb);
+        let name_off = block_rel;
+        out.extend_from_slice(nb);
+        out.extend_from_slice(b": ");
+        block_rel += (nb.len() + 2) as i32;
+        let value_off = block_rel;
+        out.extend_from_slice(vb);
         // The byte right after the value must be present & writable: lsphp may
         // overwrite it with NUL (LSAPI_GetHeader_r). Our `\r\n` provides it.
-        hdr_block.extend_from_slice(b"\r\n");
+        out.extend_from_slice(b"\r\n");
+        block_rel += (vb.len() + 2) as i32;
 
         match known_header_index(name.as_ref()) {
             // Last occurrence wins, matching how a single indexed slot behaves.
@@ -296,31 +317,37 @@ fn build_begin_request_into<K, V, HN, HV>(
                 );
                 known[i] = (vb.len() as u16, value_off);
             }
-            None => unknown.push([name_off, nb.len() as i32, value_off, vb.len() as i32]),
+            None => {
+                // Write the unknown entry straight into its reserved slot.
+                for f in [name_off, nb.len() as i32, value_off, vb.len() as i32] {
+                    out[unknown_wpos..unknown_wpos + 4].copy_from_slice(&f.to_le_bytes());
+                    unknown_wpos += 4;
+                }
+                unknown_written += 1;
+            }
         }
     }
-    let http_header_len = hdr_block.len() as i32;
+    let http_header_len = block_rel;
+    debug_assert_eq!(unknown_written, unknown_cnt);
+    debug_assert_eq!(
+        unknown_wpos,
+        index_start + HEADER_INDEX_LEN + unknown_table_len
+    );
 
-    // --- lsapi_http_header_index: u16 len[25], 2 pad, i32 off[25] = 152 bytes --
-    let index_start = out.len();
-    for (len, _off) in &known {
-        out.put_u16_le(*len);
-    }
-    out.put_bytes(0, 2); // alignment padding before the i32 array
-    for (_len, off) in &known {
-        out.put_i32_le(*off);
-    }
-    debug_assert_eq!(out.len() - index_start, HEADER_INDEX_LEN);
-
-    // --- lsapi_header_offset[cntUnknown] -------------------------------------
-    for u in &unknown {
-        for field in u {
-            out.put_i32_le(*field);
+    // --- backfill lsapi_http_header_index: u16 len[25], 2 pad, i32 off[25] ----
+    {
+        let mut w = index_start;
+        for (len, _off) in &known {
+            out[w..w + 2].copy_from_slice(&len.to_le_bytes());
+            w += 2;
         }
+        w += 2; // alignment padding before the i32 array
+        for (_len, off) in &known {
+            out[w..w + 4].copy_from_slice(&off.to_le_bytes());
+            w += 4;
+        }
+        debug_assert_eq!(w - index_start, HEADER_INDEX_LEN);
     }
-
-    // --- raw HTTP header block -----------------------------------------------
-    out.extend_from_slice(&hdr_block);
 
     // NOTE: the request body is intentionally NOT appended here; it follows the
     // packet on the wire as raw bytes (see the doc comment above).
@@ -339,7 +366,7 @@ fn build_begin_request_into<K, V, HN, HV>(
     fields[3] = script_name_off;
     fields[4] = query_string_off;
     fields[5] = request_method_off;
-    fields[6] = unknown.len() as i32;
+    fields[6] = unknown_cnt as i32;
     fields[7] = env.len() as i32;
     fields[8] = special_env.len() as i32;
     for (i, f) in fields.iter().enumerate() {

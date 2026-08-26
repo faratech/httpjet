@@ -308,9 +308,9 @@ fn make_ctx(server: &Arc<ServerConfig>, vhost: &Arc<VHostConfig>) -> ReqCtx {
         local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
         peer_port: 40000,
         tls: None,
+        redirect_guard: None,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
-        upstream_id: None,
     }
 }
 
