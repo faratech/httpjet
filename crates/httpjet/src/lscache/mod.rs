@@ -423,48 +423,6 @@ fn egress_ae<'a>(state: &ServerState, ctx: &'a ReqCtx) -> &'a str {
     }
 }
 
-/// (peer-fetch) On a genuine local MISS, try to fill the entry from the `--cache-peer`
-/// instead of rendering: re-derive the (public) key, ask the peer for its HJPC bytes,
-/// adopt them into the local store, then re-run the lookup so the entry is served
-/// through the normal hit path. Returns `None` (→ render locally) when fill is off, the
-/// request isn't publicly cacheable, no peer has it, or the peer is down. Inert unless
-/// `--cache-peer-fill` is set; a slow/down peer is bounded by the fetch timeout +
-/// circuit breaker, so it never delays the render.
-pub async fn try_peer_fill(
-    state: &Arc<ServerState>,
-    ctx: &ReqCtx,
-    cc: &CacheCtx<'_>,
-) -> Option<Response> {
-    let pf = state.peer_purge.as_ref()?;
-    if !pf.fill_enabled() {
-        return None;
-    }
-    let store = state.page_cache.as_ref()?;
-    // Re-derive the key exactly as cache_lookup did. Only PUBLIC entries cross nodes
-    // (a private per-session entry would never match the peer's request).
-    let route = private_route(state, ctx, store, cc, false);
-    if !matches!(route, PrivateRoute::Public) {
-        return None;
-    }
-    let key = build_cache_key(ctx, cc, store, &route);
-    let key_hash = hash_key(&key);
-    // Capture the purge epoch BEFORE the fetch: a purge landing while the peer round-trip is in
-    // flight must veto the adoption, or the fill resurrects just-purged content (the two-node
-    // cross-fill resurrection loop — see PageStore::adopt_entry).
-    let fetch_epoch = store.purge_epoch();
-    let blob = crate::peer_purge::serialize_fetch_key(&key, cc.identity);
-    let bytes = pf.fetch(key_hash, &blob, state).await?;
-    if !store.adopt_entry(key_hash, &bytes, fetch_epoch) {
-        return None;
-    }
-    // The entry is now local → serve it through the standard hit path (build_hit_response,
-    // egress, etc.). force_miss=false, no INM (serve the body, not a 304).
-    match cache_lookup(state, ctx, cc, None, false, None) {
-        CacheOutcome::Hit(h) => Some(h),
-        _ => None,
-    }
-}
-
 pub fn cache_lookup(
     state: &Arc<ServerState>,
     ctx: &ReqCtx,
@@ -2499,13 +2457,6 @@ pub async fn cache_store(
                 let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
                 store.purge_tags(&refs);
             }
-        }
-        // (OPS3) Propagate to the peer node(s) so the active-active pair stays
-        // coherent — without this a purge only invalidates the node Cloudflare
-        // routed the write to. Best-effort + off the response path; a received
-        // purge arrives via the listener (not here), so this never loops.
-        if let Some(pp) = state.peer_purge.as_ref() {
-            pp.forward(p, state);
         }
     }
 

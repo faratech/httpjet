@@ -286,7 +286,6 @@ fn build_begin_request_into<K, V, HN, HV>(
     // --- raw HTTP header block, encoded straight into `out` --------------------
     // Offsets in the tables are RELATIVE TO THE START OF THE BLOCK (exactly as in
     // OLS), so track them from zero while writing at the absolute tail.
-    let block_abs_start = out.len();
     let mut block_rel: i32 = 0;
     let mut unknown_written = 0usize;
     let mut unknown_wpos = index_start + HEADER_INDEX_LEN;

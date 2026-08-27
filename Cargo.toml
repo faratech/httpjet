@@ -57,7 +57,9 @@ bytes = "1"
 # The proxy needs Hyper's HTTP/1 client. Request serving itself lives in the io_uring
 # transport, and h2-over-TLS is the native hj-h2 stack, so NO http2 feature is needed.
 # `upgrade`/`service`/`body::Incoming` come with these features.
-hyper = { version = "1", features = ["http1", "server", "client"] }
+# "server" is NOT a workspace feature: production only uses the h1 client +
+# hyper::body::Incoming; hj-proxy's tests re-add it via dev-dependencies.
+hyper = { version = "1", features = ["http1", "client"] }
 # Only the tokio rt adapters (TokioIo/TokioTimer) are used; not the `auto` h1/h2
 # negotiator (removed with hyper's h2) nor any server-graceful/client helpers.
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -106,9 +108,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 parking_lot = "0.12"
 
-# global allocator — cuts glibc arena lock/futex contention under the multi-thread
-# tokio runtime (Pingora ships jemalloc for the same reason; httpjet's bottleneck
-# analysis named futex ~75% of syscall time).
+# global allocator — cuts glibc arena lock/futex contention across the per-core
+# monoio workers + the tokio side-runtime (Pingora ships jemalloc for the same
+# reason; httpjet's bottleneck analysis named futex ~75% of syscall time).
 mimalloc = "0.1"
 # Direct handle on mimalloc's C API (mi_collect / mi_stats_print_out) for the
 # periodic OS-trim task + the loopback /__mimalloc-stats diagnostics. Already in

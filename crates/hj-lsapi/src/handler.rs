@@ -1083,7 +1083,7 @@ impl Lsapi {
         // Split so the response pump owns a read half + a ReturnGuard like the
         // streaming path. The write half is already done; deposit it immediately
         // so a clean read can re-pool the socket.
-        let (read_half, mut write_half, guard) = conn.into_split();
+        let (read_half, write_half, guard) = conn.into_split();
         guard.deposit_write(write_half);
         // No concurrent body pump here, so the cancel notify has no listener; pass
         // a fresh one to keep one read_response signature.

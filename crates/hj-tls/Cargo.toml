@@ -12,7 +12,6 @@ hj-config = { workspace = true }
 hj-core = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-rustls-pki-types = { workspace = true }
 arc-swap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -1,13 +1,15 @@
 //! (#349) Finished-response memo for the on-core static fast path.
 //!
-//! Experimental, env-gated (`HJ_FAST_MEMO=1`, default OFF). Under saturating
-//! multiplexed small-file load the fast path is instruction-bound re-deriving
-//! an identical response per request (chain probe + SetEnvIf + rewrite + ACL +
-//! static handler + transforms ≈ 25-30% of serving CPU); this memo replays the
-//! finished response for a repeat key instead. Per-thread (no locks), 1 s TTL —
-//! stricter than nginx's `open_file_cache_valid` 60 s default — so any
-//! filesystem/`.htaccess`/purge change is visible within a second, and every
-//! DISTINCT key passes the full pipeline once before it is ever memoized.
+//! DEFAULT-ON; disable with `--no-fast-memo` (or env `HJ_FAST_MEMO=0`). Under
+//! saturating multiplexed small-file load the fast path is instruction-bound
+//! re-deriving an identical response per request (chain probe + SetEnvIf +
+//! rewrite + ACL + static handler + transforms ≈ 25-30% of serving CPU); this
+//! memo replays the finished response for a repeat key instead (measured
+//! 2-3x on h2 small-file throughput with a dedicated load generator).
+//! Per-thread (no locks), 1 s TTL — stricter than nginx's
+//! `open_file_cache_valid` 60 s default — so any filesystem/`.htaccess`/purge
+//! change is visible within a second, and every DISTINCT key passes the full
+//! pipeline once before it is ever memoized.
 //!
 //! Correctness model: a response may be replayed only when it is provably a
 //! pure function of the memo key (listener, scheme, vhost, raw Host, raw
@@ -39,10 +41,18 @@ const MAX_ENTRIES: usize = 2048;
 /// Bodies above this never memoize: large files stream/bridge anyway and one
 /// giant `Bytes` per thread per key would pin RAM for no throughput win.
 const MAX_BODY: usize = 1024 * 1024;
+/// Per-thread cap on the SUM of memoized body bytes. Without it the worst case
+/// is MAX_ENTRIES x MAX_BODY = 2 GiB per worker; with it, memo RSS is bounded
+/// at workers x 64 MiB. Exceeding it clears the map (same policy as the entry
+/// cap — the hot set re-primes within a second).
+const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+/// Kill switch, default ON. `main` clears it for `--no-fast-memo` or env
+/// `HJ_FAST_MEMO=0` BEFORE any listener accepts, so a relaxed load is fine.
+pub(crate) static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 pub(super) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HJ_FAST_MEMO").is_some_and(|v| v != "0"))
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(super) struct MemoKey<'a> {
@@ -102,8 +112,15 @@ struct MemoEntry {
     stored: Instant,
 }
 
+#[derive(Default)]
+struct Memo {
+    map: HashMap<u64, MemoEntry>,
+    /// Sum of `body.len()` across `map` (the [`MAX_BYTES`] budget).
+    bytes: usize,
+}
+
 thread_local! {
-    static MEMO: RefCell<HashMap<u64, MemoEntry>> = RefCell::new(HashMap::new());
+    static MEMO: RefCell<Memo> = RefCell::new(Memo::default());
 }
 
 fn key_hash(k: &MemoKey) -> u64 {
@@ -136,7 +153,7 @@ pub(super) fn probe(k: &MemoKey, now: Instant) -> Option<Response> {
     let h = key_hash(k);
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
-        let expired = match m.get(&h) {
+        let expired = match m.map.get(&h) {
             None => return None,
             Some(e) => {
                 if !matches(e, k) {
@@ -146,10 +163,12 @@ pub(super) fn probe(k: &MemoKey, now: Instant) -> Option<Response> {
             }
         };
         if expired {
-            m.remove(&h);
+            if let Some(e) = m.map.remove(&h) {
+                m.bytes -= e.body.len();
+            }
             return None;
         }
-        let e = m.get(&h).unwrap();
+        let e = m.map.get(&h).unwrap();
         let mut resp = http::Response::new(Body::Full(e.body.clone()));
         *resp.status_mut() = e.status;
         *resp.headers_mut() = e.headers.clone();
@@ -181,10 +200,14 @@ pub(super) fn store(k: &MemoKey, resp: &Response, now: Instant) {
     };
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
-        if m.len() >= MAX_ENTRIES {
-            m.clear();
+        if m.map.len() >= MAX_ENTRIES || m.bytes + entry.body.len() > MAX_BYTES {
+            m.map.clear();
+            m.bytes = 0;
         }
-        m.insert(h, entry);
+        m.bytes += entry.body.len();
+        if let Some(old) = m.map.insert(h, entry) {
+            m.bytes -= old.body.len();
+        }
     });
 }
 
@@ -243,6 +266,33 @@ mod tests {
         let mut k2 = key("/b", b"");
         k2.https = false;
         assert!(probe(&k2, t0).is_none(), "scheme must key");
+    }
+
+    #[test]
+    fn byte_budget_clears_rather_than_grows() {
+        let t0 = Instant::now();
+        let big: &'static [u8] = Box::leak(vec![7u8; MAX_BODY].into_boxed_slice());
+        let big_resp = || http::Response::new(Body::Full(Bytes::from_static(big)));
+        let n = MAX_BYTES / MAX_BODY;
+        let paths: Vec<String> = (0..=n).map(|i| format!("/budget/{i}")).collect();
+        for p in &paths[..n] {
+            store(&key(p, b""), &big_resp(), t0);
+        }
+        assert!(
+            probe(&key(&paths[0], b""), t0).is_some(),
+            "budget full, all kept"
+        );
+        // One more store exceeds MAX_BYTES: the map clears instead of growing.
+        store(&key(&paths[n], b""), &big_resp(), t0);
+        assert!(
+            probe(&key(&paths[0], b""), t0).is_none(),
+            "cleared on overflow"
+        );
+        assert!(probe(&key(&paths[n], b""), t0).is_some(), "new entry kept");
+        MEMO.with(|m| {
+            let m = m.borrow();
+            assert_eq!(m.bytes, MAX_BODY, "accounting reset with the clear");
+        });
     }
 
     #[test]

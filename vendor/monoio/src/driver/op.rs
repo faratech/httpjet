@@ -13,8 +13,6 @@ mod accept;
 // httpjet patch (#334): the multishot-accept op type is named by the listener.
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 pub(crate) use accept::AcceptMulti;
-#[cfg(all(target_os = "linux", feature = "iouring"))]
-pub(crate) use recv::RecvMulti;
 mod connect;
 mod fsync;
 mod open;

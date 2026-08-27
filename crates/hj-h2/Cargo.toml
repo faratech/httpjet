@@ -12,8 +12,10 @@ repository.workspace = true
 # straight from page-cache Bytes. Plugs into the frozen `Fn(Request)->Future<Response>`
 # service closure exactly like the h3 transport. Keeps hj-core unchanged.
 [features]
-# Additive monoio io_uring serve path (`serve_local`) for the pure-io_uring build.
-# Default-OFF: the prod tokio `serve` is unchanged + untouched when this is off.
+# The monoio io_uring serve path (`serve_local`) — what production serves through
+# (httpjet enables it unconditionally). Default-OFF only so the crate builds
+# standalone; the tokio `serve` survives solely as the RFC 7540 conformance
+# harness's entry point.
 monoio = ["dep:monoio", "dep:libc"]
 
 [dependencies]

@@ -29,5 +29,7 @@ rustls = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
+# Test-only upstream stubs (hyper::server::conn::http1) — prod never serves via hyper.
+hyper = { workspace = true, features = ["server"] }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }

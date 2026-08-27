@@ -2110,10 +2110,11 @@ impl PageStore {
         }
     }
 
-    /// (peer-fetch) Serialize a FRESH/STALE PUBLIC entry to its on-disk HJPC bytes
-    /// for cross-node fill, or `None` if absent / not file-backed / private. Uses the
-    /// UNCOUNTED lookup (a peer probe is not a local hit/miss) and the identity
-    /// collision guard, so a key/identity mismatch yields `None`, never a wrong page.
+    /// Serialize a FRESH/STALE PUBLIC entry to its on-disk HJPC bytes, or `None`
+    /// if absent / not file-backed / private. Test-only since the cross-node
+    /// peer-fill removal — kept (with [`Self::adopt_entry`]) as the tests'
+    /// entry-injection vehicle for the live tombstone/warm-scan machinery.
+    #[cfg(test)]
     pub fn serialize_entry(&self, key: &PageCacheKey, identity: &str) -> Option<Vec<u8>> {
         let now = Instant::now();
         let entry = match self.get_entry_uncounted(key, identity, now) {
@@ -2129,15 +2130,15 @@ impl PageStore {
         }
     }
 
-    /// (peer-fetch) Adopt an HJPC blob fetched from a peer: persist it (filename keyed
-    /// by the cross-node-deterministic `key_hash`), rebuild the entry, and index it via
-    /// the SAME path the boot warm-scan uses (freshness/dict/purge/newer-local checks,
-    /// then `load_scanned`). Returns true if installed. No admission gate — the peer
-    /// already served it, so it is proven hot.
-    /// `fetch_epoch` is the purge epoch captured BEFORE the peer fetch began; a relevant purge
-    /// landing after that point vetoes the adoption (same contract as
-    /// [`Self::store_if_not_purged_since`]). Entries whose `stored_unix_ms` is at or before the
-    /// last purge-all are rejected outright — peer-fill must never resurrect purged content.
+    /// Adopt a serialized HJPC blob: persist it (filename keyed by `key_hash`),
+    /// rebuild the entry, and index it via the SAME path the boot warm-scan uses
+    /// (freshness/dict/purge/newer-local checks, then `load_scanned`). Returns
+    /// true if installed. `fetch_epoch` is the purge epoch captured before the
+    /// blob was obtained; a relevant purge landing after that point vetoes the
+    /// adoption (same contract as [`Self::store_if_not_purged_since`]).
+    /// Test-only since the cross-node peer-fill removal — the tests' injection
+    /// vehicle into the live warm-scan/tombstone paths.
+    #[cfg(test)]
     pub fn adopt_entry(&self, key_hash: u64, bytes: &[u8], fetch_epoch: u64) -> bool {
         let Some(disk) = self.disk.clone() else {
             return false;
@@ -4873,79 +4874,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn purge_all_stamp_vetoes_tagless_peer_adoption_before_warm_scan() {
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let a = PageStore::new(disk_cfg(dir_a.path(), 64 * 1024 * 1024));
-        let key = PageCacheKey::public(1, true, "forum.example", "/tagless", "");
-        let mut old = entry(b"pre-purge", &[], Duration::from_secs(60));
-        old.stored_at = Instant::now() - Duration::from_secs(1);
-        assert!(a.store(key.clone(), old));
-        let bytes = a.serialize_entry(&key, "id").unwrap();
-
-        let purge_stamp = wall_now_ms();
-        let disk = DiskStore::open(dir_b.path()).unwrap();
-        disk.write_purge_stamp(purge_stamp).unwrap();
-        drop(disk);
-
-        let b = PageStore::new(disk_cfg(dir_b.path(), 64 * 1024 * 1024));
-        assert!(!b.is_warm(), "the background warm scan has not run");
-        assert_eq!(b.purge_all_wall_ms.load(Ordering::Acquire), purge_stamp);
-        assert!(b.peer_tag_purge_floor_ms.load(Ordering::Acquire) >= purge_stamp);
-        assert!(!b.adopt_entry(CacheKeyId::new(&key).0, &bytes, b.purge_epoch()));
-        assert_eq!(count_pc_files(dir_b.path()), 0);
-    }
-
-    #[test]
-    fn adopt_rejects_when_purge_lands_during_peer_fetch() {
-        // The entry itself postdates the purge stamp (stamp veto passes), but the adopting
-        // request captured its epoch before the purge landed — the epoch veto must reject,
-        // mirroring store_if_not_purged_since's contract.
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let b = PageStore::new(disk_cfg(dir_b.path(), 64 * 1024 * 1024));
-        let fetch_epoch = b.purge_epoch(); // peer fetch "starts" here
-        b.purge_all(); // purge lands while the fetch is in flight
-        std::thread::sleep(Duration::from_millis(5));
-
-        let a = PageStore::new(disk_cfg(dir_a.path(), 64 * 1024 * 1024));
-        let key = PageCacheKey::public(1, true, "forum.example", "/t/2", "");
-        assert!(a.store(
-            key.clone(),
-            entry(b"post-stamp", &["T2"], Duration::from_secs(60))
-        ));
-        let bytes = a
-            .serialize_entry(&key, "id")
-            .expect("file-backed public entry");
-        assert!(
-            !b.adopt_entry(CacheKeyId::new(&key).0, &bytes, fetch_epoch),
-            "a purge landing after the fetch epoch must veto the adoption"
-        );
-    }
-
-    #[test]
-    fn adopt_succeeds_with_current_epoch() {
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let a = PageStore::new(disk_cfg(dir_a.path(), 64 * 1024 * 1024));
-        let key = PageCacheKey::public(1, true, "forum.example", "/t/3", "");
-        assert!(a.store(
-            key.clone(),
-            entry(b"clean", &["T3"], Duration::from_secs(60))
-        ));
-        let bytes = a
-            .serialize_entry(&key, "id")
-            .expect("file-backed public entry");
-
-        let b = PageStore::new(disk_cfg(dir_b.path(), 64 * 1024 * 1024));
-        assert!(b.adopt_entry(CacheKeyId::new(&key).0, &bytes, b.purge_epoch()));
-        assert!(matches!(
-            b.get_entry_uncounted(&key, "id", Instant::now()),
-            EntryState::Fresh(_)
-        ));
-    }
-
     /// Count published (`.pc`, not `.pc.tmp`) body files under a jetcache root.
     fn count_pc_files(dir: &std::path::Path) -> usize {
         let mut n = 0;
@@ -4964,43 +4892,6 @@ mod tests {
             }
         }
         n
-    }
-
-    #[test]
-    fn adopt_rejects_entry_tag_purged_before_fetch() {
-        // #134: node A serialized an entry tagged T5. Node B tag-purged T5 BEFORE the peer
-        // fetch, so B's fetch_epoch is >= that purge's epoch and the EPOCH veto cannot see it
-        // — only the per-tag wall stamp catches this (the dominant XenForo purge case: a member
-        // reply purges tag=T<id>, then the next guest miss peer-fills the pre-reply page).
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let a = PageStore::new(disk_cfg(dir_a.path(), 64 * 1024 * 1024));
-        let key = PageCacheKey::public(1, true, "forum.example", "/t/5", "");
-        assert!(a.store(
-            key.clone(),
-            entry(b"pre-tag-purge", &["T5"], Duration::from_secs(60))
-        ));
-        let bytes = a
-            .serialize_entry(&key, "id")
-            .expect("file-backed public entry");
-
-        let b = PageStore::new(disk_cfg(dir_b.path(), 64 * 1024 * 1024));
-        std::thread::sleep(Duration::from_millis(5)); // wall_now_ms granularity
-        b.purge_tags(&["T5"]); // tag purge COMPLETES before the fetch
-        let fetch_epoch = b.purge_epoch(); // captured AFTER the purge (>= its epoch)
-        assert!(
-            !b.adopt_entry(CacheKeyId::new(&key).0, &bytes, fetch_epoch),
-            "adoption of an entry tag-purged before the fetch must be vetoed by the wall stamp (#134)"
-        );
-        assert!(matches!(
-            b.get_entry_uncounted(&key, "id", Instant::now()),
-            EntryState::Miss
-        ));
-        assert_eq!(
-            count_pc_files(dir_b.path()),
-            0,
-            "the vetoed adopt must not strand a tmpfs file (#137)"
-        );
     }
 
     #[test]
@@ -5307,42 +5198,6 @@ mod tests {
         assert_eq!(
             second.peer_tag_purge_wall.get(&tag_hash).map(|v| *v),
             Some(future_wall)
-        );
-    }
-
-    #[test]
-    fn adopt_epoch_veto_leaves_no_published_file() {
-        // #137: the entry postdates the purge wall stamp, but a purge landed after the peer fetch
-        // began. The commit-time epoch veto must reject before final publication, leaving neither
-        // an indexed entry nor a boot-scannable file.
-        let dir_a = tempfile::tempdir().unwrap();
-        let dir_b = tempfile::tempdir().unwrap();
-        let b = PageStore::new(disk_cfg(dir_b.path(), 64 * 1024 * 1024));
-        // Finish the (empty) boot scan so `scan_purge` becomes None — otherwise
-        // purge_all's `buf.purged_all=true` would make load_scanned reject on the
-        // scan-buffer branch and this test wouldn't exercise the runtime-EPOCH veto.
-        b.load_from_disk(|_| {});
-        let fetch_epoch = b.purge_epoch(); // peer fetch "starts" here
-        b.purge_all(); // purge lands while the fetch is in flight
-        std::thread::sleep(Duration::from_millis(5));
-
-        let a = PageStore::new(disk_cfg(dir_a.path(), 64 * 1024 * 1024));
-        let key = PageCacheKey::public(1, true, "forum.example", "/t/6", "");
-        assert!(a.store(
-            key.clone(),
-            entry(b"post-stamp", &["T6"], Duration::from_secs(60))
-        ));
-        let bytes = a
-            .serialize_entry(&key, "id")
-            .expect("file-backed public entry");
-        assert!(
-            !b.adopt_entry(CacheKeyId::new(&key).0, &bytes, fetch_epoch),
-            "the epoch veto must reject the adoption"
-        );
-        assert_eq!(
-            count_pc_files(dir_b.path()),
-            0,
-            "the epoch-vetoed adopt must not leave an orphaned tmpfs file (#137)"
         );
     }
 

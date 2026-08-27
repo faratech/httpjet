@@ -324,15 +324,10 @@ fn render(state: &ServerState) -> String {
         state.metrics.active_conns.load(Ordering::Relaxed),
         state.metrics.active_requests.load(Ordering::Relaxed),
         PeerPurgeCounters {
-            forwarded: state.metrics.purges_forwarded.load(Ordering::Relaxed),
-            forward_failures: state.metrics.purge_forward_failures.load(Ordering::Relaxed),
             received: state.metrics.purges_received.load(Ordering::Relaxed),
-            fetch_attempts: state.metrics.peer_fetch_attempts.load(Ordering::Relaxed),
-            fetch_hits: state.metrics.peer_fetch_hits.load(Ordering::Relaxed),
-            fetch_misses: state.metrics.peer_fetch_misses.load(Ordering::Relaxed),
-            fetch_failures: state.metrics.peer_fetch_failures.load(Ordering::Relaxed),
-            fetch_skipped: state.metrics.peer_fetch_skipped.load(Ordering::Relaxed),
         },
+        state.metrics.fast_memo_hits.load(Ordering::Relaxed),
+        state.metrics.fast_memo_stores.load(Ordering::Relaxed),
         state.page_cache.as_ref().map(|pc| pc.stats()),
     );
     // Per-request telemetry (counters + latency histograms) self-renders.
@@ -937,17 +932,10 @@ fn mimalloc_stats_text() -> String {
     buf
 }
 
-/// (OPS3) Cross-node purge counters, snapshotted for the metrics render.
+/// (OPS3) Loopback purge-endpoint counters, snapshotted for the metrics render.
 #[derive(Clone, Copy, Default)]
 struct PeerPurgeCounters {
-    forwarded: u64,
-    forward_failures: u64,
     received: u64,
-    fetch_attempts: u64,
-    fetch_hits: u64,
-    fetch_misses: u64,
-    fetch_failures: u64,
-    fetch_skipped: u64,
 }
 
 /// Pure renderer (split out for unit testing): format the metrics from raw values.
@@ -956,6 +944,8 @@ fn render_metrics(
     active: u64,
     active_requests: u64,
     peer_purge: PeerPurgeCounters,
+    fast_memo_hits: u64,
+    fast_memo_stores: u64,
     cache: Option<CacheStats>,
 ) -> String {
     let mut out = String::with_capacity(768);
@@ -983,52 +973,22 @@ fn render_metrics(
         active_requests.to_string(),
     );
     metric(
-        "httpjet_pagecache_purges_forwarded_total",
-        "counter",
-        "Page-cache purges forwarded to peer node(s) (cross-node coherence).",
-        peer_purge.forwarded.to_string(),
-    );
-    metric(
-        "httpjet_pagecache_purge_forward_failures_total",
-        "counter",
-        "Peer purge forwards that failed or timed out (peer briefly stale).",
-        peer_purge.forward_failures.to_string(),
-    );
-    metric(
         "httpjet_pagecache_purges_received_total",
         "counter",
-        "Page-cache purges received from a peer node and applied locally.",
+        "Loopback page-cache purges received on /__hj_cache_purge and applied.",
         peer_purge.received.to_string(),
     );
     metric(
-        "httpjet_pagecache_peer_fetch_attempts_total",
+        "httpjet_fast_memo_hits_total",
         "counter",
-        "Local misses where a cross-node peer fill was attempted (--cache-peer-fill).",
-        peer_purge.fetch_attempts.to_string(),
+        "Finished-response memo hits served on the on-core fast path (#349).",
+        fast_memo_hits.to_string(),
     );
     metric(
-        "httpjet_pagecache_peer_fetch_hits_total",
+        "httpjet_fast_memo_stores_total",
         "counter",
-        "Peer fills that returned an entry, avoiding a local render.",
-        peer_purge.fetch_hits.to_string(),
-    );
-    metric(
-        "httpjet_pagecache_peer_fetch_misses_total",
-        "counter",
-        "Peer-fill attempts where no peer had the entry (rendered locally).",
-        peer_purge.fetch_misses.to_string(),
-    );
-    metric(
-        "httpjet_pagecache_peer_fetch_failures_total",
-        "counter",
-        "Peer fills that failed or timed out (peer down/slow → rendered locally).",
-        peer_purge.fetch_failures.to_string(),
-    );
-    metric(
-        "httpjet_pagecache_peer_fetch_skipped_total",
-        "counter",
-        "Fills skipped with no round-trip (key negative-cached from a recent peer 404).",
-        peer_purge.fetch_skipped.to_string(),
+        "Finished-response memo stores (first full-pipeline serve per key/TTL).",
+        fast_memo_stores.to_string(),
     );
     if let Some(s) = cache {
         let lookups = s.hits + s.misses;
@@ -1294,7 +1254,7 @@ mod tests {
 
     #[test]
     fn render_includes_core_counters() {
-        let body = render_metrics(42, 3, 1, PeerPurgeCounters::default(), None);
+        let body = render_metrics(42, 3, 1, PeerPurgeCounters::default(), 0, 0, None);
         assert!(body.contains("httpjet_requests_total 42\n"));
         assert!(body.contains("httpjet_active_connections 3\n"));
         assert!(body.contains("httpjet_active_requests 1\n"));
@@ -1318,7 +1278,7 @@ mod tests {
             poisoned_locks: 2,
             ..CacheStats::default()
         };
-        let body = render_metrics(100, 2, 0, PeerPurgeCounters::default(), Some(stats));
+        let body = render_metrics(100, 2, 0, PeerPurgeCounters::default(), 0, 0, Some(stats));
         assert!(body.contains("httpjet_pagecache_hits_total 30\n"));
         assert!(body.contains("httpjet_pagecache_misses_total 10\n"));
         // 30 / (30+10) = 0.75.
@@ -1373,6 +1333,8 @@ mod tests {
             0,
             0,
             PeerPurgeCounters::default(),
+            0,
+            0,
             Some(CacheStats::default()),
         );
         assert!(body.contains("httpjet_pagecache_hit_ratio 0.0000\n"));

@@ -34,7 +34,7 @@ static GLOBAL: allocount::Counting = allocount::Counting;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -153,10 +153,9 @@ struct ServeArgs {
     /// `legacy` (default) = flagless rings — the A/B measured `coop`
     /// (COOP_TASKRUN + SUBMIT_ALL) as noise and `defer` (+SINGLE_ISSUER +
     /// DEFER_TASKRUN) as a consistent ~-2% on this virtualized guest; both
-    /// stay available for other hardware. Ring size stays default —
+    /// stay available for other hardware. Ring size always stays default —
     /// ring memory is memlock-charged and bigger rings under the prod unit's
-    /// LimitMEMLOCK bankrupt late runtimes (2026-08-27 crash-loop); the
-    /// HJ_URING_ENTRIES env override exists for alt-instance experiments.
+    /// LimitMEMLOCK bankrupt late runtimes (2026-08-27 crash-loop).
     /// Unsupported flags fall back to plain rings per-thread with a warning.
     #[arg(long, default_value = "legacy", value_parser = ["legacy", "coop", "defer"])]
     uring_ring: String,
@@ -164,10 +163,11 @@ struct ServeArgs {
     /// (the pre-multishot behavior) instead of one armed SQE per listener.
     #[arg(long)]
     no_multishot_accept: bool,
-    /// (#335) Opt IN to multishot receive (provided-buffer-ring reads on
-    /// H1-TLS connections). Measured flat on this host — experiment hook.
+    /// (#349) Disable the finished-response memo on the on-core static fast
+    /// path (default ON; per-thread, 1 s TTL, byte-identity-gated — see
+    /// `pipeline::fast_memo`). Env `HJ_FAST_MEMO=0` is equivalent.
     #[arg(long)]
-    recv_multi: bool,
+    no_fast_memo: bool,
     /// Do not spawn lsphp; PHP requests fall back to static serving.
     #[arg(long)]
     no_php: bool,
@@ -261,16 +261,6 @@ struct ServeArgs {
     /// = no token (loopback is the only guard).
     #[arg(long, default_value = "")]
     profile_token: String,
-    /// (OPS3) Peer node `host:port` to forward page-cache purges to, so the
-    /// active-active pair stays coherent (repeatable). Point it at the peer's
-    /// EXISTING HTTP port (e.g. `192.0.2.3:80`); purges are received on that
-    /// listener via a reserved path gated by loopback/configured peer source IP
-    /// — no extra port is opened.
-    /// The peer's IP is the trusted inbound source. Requires --page-cache; without
-    /// a peer, peer-purge is inert. Inbound purges are authenticated by the
-    /// private/LAN source-IP gate (no shared secret).
-    #[arg(long)]
-    cache_peer: Vec<String>,
     /// (rewrite) TTL in milliseconds for the rewrite-outcome cache (memoized
     /// rewrite decisions for `path_cacheable` chains, keyed by vhost/scheme/
     /// method/host/path/query + any keyable header vars). 0 disables the cache
@@ -423,23 +413,6 @@ struct PageCacheArgs {
     /// guards (GET-only, Set-Cookie/private-cookie, vary, status, self-redirect) always apply.
     #[arg(long = "page-cache-standard-vhosts", default_value = "")]
     standard_vhosts: String,
-    /// (peer-fetch) Enable cross-node cache FILL: on a local page-cache MISS, ask the
-    /// `--cache-peer` for the entry (over the existing purge interconnect) and adopt
-    /// it instead of rendering. OFF by default — deploying the binary is a no-op until
-    /// turned on per node. Requires `--page-cache` + `--cache-peer`; Redis pre-bootstrap
-    /// stays as the fallback.
-    #[arg(long = "cache-peer-fill", default_value_t = false)]
-    cache_peer_fill: bool,
-    /// (peer-fetch) Per-fetch timeout in MILLISECONDS — it is on the request latency
-    /// path, so keep it small (the WireGuard RTT is sub-ms); a slow/down peer falls
-    /// through to a local render via the circuit breaker.
-    #[arg(long = "cache-peer-fill-timeout-ms", default_value_t = 50)]
-    cache_peer_fill_timeout_ms: u64,
-    /// (peer-fetch) Negative-cache TTL in SECONDS: after the peer 404s a key, skip
-    /// re-asking it (no round-trip) for this long. Kills the wasted RTT on long-tail /
-    /// uncacheable keys that neither node caches. 0 keeps the built-in default (10s).
-    #[arg(long = "cache-peer-fill-negcache-secs", default_value_t = 10)]
-    cache_peer_fill_negcache_secs: u64,
     /// Stale-while-revalidate window (seconds) applied when the app declares none. 0 = off
     /// (serve only fresh unless the app sets stale-while-revalidate / max-stale).
     #[arg(long = "page-cache-stale-default-secs", default_value_t = 0)]
@@ -726,16 +699,8 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     if args.workers == Some(0) {
         eprintln!("--workers 0 is invalid; running with 1 worker");
     }
-    // (#349 experiment) HJ_TOKIO_WORKERS: independent tokio side-runtime
-    // sizing — the transport runs `workers` monoio threads AND this runtime
-    // ran `workers` more tokio threads (8+8 on an 8-CPU box).
-    let tokio_workers = std::env::var("HJ_TOKIO_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n >= 1)
-        .unwrap_or(workers);
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(tokio_workers)
+        .worker_threads(workers)
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
         .on_thread_park(memtrim::collect_if_requested_on_thread)
         .on_thread_stop(memtrim::force_collect)
@@ -762,9 +727,9 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         tracing::info!("--no-multishot-accept: single-shot accept SQE per connection");
     }
 
-    if args.recv_multi {
-        uring::directio::RECV_MULTI.store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!("--recv-multi: provided-buffer-ring multishot receive enabled");
+    if args.no_fast_memo || std::env::var("HJ_FAST_MEMO").is_ok_and(|v| v == "0") {
+        pipeline::fast_memo::ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("fast_memo disabled (--no-fast-memo / HJ_FAST_MEMO=0)");
     }
 
     let ring_mode = match args.uring_ring.as_str() {
@@ -1096,40 +1061,9 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // and only when at least one peer is given. Inbound purges are authenticated
         // purely by the private/LAN source-IP gate (no shared secret).
         let peer_purge = page_cache.is_some().then(|| {
-            let pp = peer_purge::PurgeForwarder::from_config(&args.cache_peer)
-                .with_fill(
-                    args.page_cache.cache_peer_fill,
-                    args.page_cache.cache_peer_fill_timeout_ms,
-                    args.page_cache.cache_peer_fill_negcache_secs,
-                );
-            if pp.peer_addrs().is_empty() {
-                tracing::info!("page-cache purge endpoint enabled (loopback-only; no --cache-peer)");
-            } else {
-                tracing::info!(peers = ?pp.peer_addrs(), "cross-node page-cache purge coherence ENABLED");
-            }
-            pp
+            tracing::info!("page-cache purge endpoint enabled (loopback-only)");
+            peer_purge::PurgeForwarder::new()
         });
-
-        // (security) Install the mTLS-exempt peer allow-list BEFORE any listener
-        // accepts. The origin-pull client-cert check exempts loopback (on-box
-        // `/etc/hosts` fetches) + these explicit `--cache-peer` IPs (the active-active
-        // sibling node) ONLY — narrowed from the old whole-RFC1918 exemption that let
-        // any private-LAN host bypass Cloudflare AOP (audit 2026-06-19). Resolved
-        // independently of `--page-cache` so the mTLS boundary is correct even with the
-        // cache off.
-        {
-            let exempt: Vec<std::net::IpAddr> = args
-                .cache_peer
-                .iter()
-                .filter_map(|p| p.to_socket_addrs().ok())
-                .flatten()
-                .map(|a| a.ip())
-                .collect();
-            if !exempt.is_empty() {
-                tracing::info!(peers = ?exempt, "mTLS-exempt peer allow-list installed (loopback + --cache-peer)");
-            }
-            hj_core::set_exempt_peers(exempt);
-        }
 
         // Honor the `CF_SEND_ZSTD` env var too (clap's `env` feature isn't enabled), so
         // either `--cf-send-zstd` or `CF_SEND_ZSTD=1` turns it on.

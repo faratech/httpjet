@@ -152,21 +152,6 @@ pub struct VhostMetrics {
     duration: AtomicHistogram,
 }
 
-/// One cross-node peer-fill fetch outcome (`--cache-peer-fill`).
-#[derive(Clone, Copy)]
-pub enum PeerFetchEvent {
-    /// A round-trip to the peer was started (not negative-cached / breaker-skipped).
-    Attempt,
-    /// The peer returned the entry; the local miss becomes an adopt.
-    Hit,
-    /// The peer answered but had no entry (or every peer was breaker-skipped).
-    Miss,
-    /// Transport error / timeout talking to a peer.
-    Failure,
-    /// Skipped with no round-trip (negative cache).
-    Skipped,
-}
-
 /// One shard of the per-request counters + latency histograms. [`Telemetry`]
 /// holds `SHARDS` of these (one per core); a request records into the calling
 /// thread's shard and reads sum across all shards.
@@ -205,13 +190,6 @@ pub struct TelemetryShard {
     pub disp_store_private: AtomicU64,
     /// Backend 5xx renders answered with a retained stale entry (stale-if-error).
     pub cache_sie_serves: AtomicU64,
-    // --- cross-node peer-fill (--cache-peer-fill): mirrors the :9090 gauges into
-    //     the TSV so fill effectiveness is window-diffable like everything else. ---
-    pub peer_fetch_attempts: AtomicU64,
-    pub peer_fetch_hits: AtomicU64,
-    pub peer_fetch_misses: AtomicU64,
-    pub peer_fetch_failures: AtomicU64,
-    pub peer_fetch_skipped: AtomicU64,
     pub served_static: AtomicU64,
     pub served_php: AtomicU64,
     pub served_proxy: AtomicU64,
@@ -256,7 +234,7 @@ pub struct TelemetryShard {
 
 /// Stable column order for the disk snapshot + the counter render. Keep in sync
 /// with [`Telemetry::counter_values`].
-pub const COUNTER_NAMES: [&str; 43] = [
+pub const COUNTER_NAMES: [&str; 38] = [
     "cache_hits",
     "cache_misses",
     "cache_bypass",
@@ -298,13 +276,6 @@ pub const COUNTER_NAMES: [&str; 43] = [
     "status_502",
     "status_503",
     "status_504",
-    // Appended: cross-node peer-fill outcomes (--cache-peer-fill). Kept after the
-    // originals so the TSV column order stays stable for readers.
-    "peer_fetch_attempts",
-    "peer_fetch_hits",
-    "peer_fetch_misses",
-    "peer_fetch_failures",
-    "peer_fetch_skipped",
 ];
 
 impl TelemetryShard {
@@ -462,11 +433,6 @@ impl TelemetryShard {
             self.status_code[7].load(Relaxed),
             self.status_code[8].load(Relaxed),
             self.status_code[9].load(Relaxed),
-            self.peer_fetch_attempts.load(Relaxed),
-            self.peer_fetch_hits.load(Relaxed),
-            self.peer_fetch_misses.load(Relaxed),
-            self.peer_fetch_failures.load(Relaxed),
-            self.peer_fetch_skipped.load(Relaxed),
         ]
     }
 }
@@ -620,20 +586,6 @@ impl Telemetry {
         } else {
             s.cache_rejected.fetch_add(1, Relaxed);
         }
-    }
-
-    /// Record one cross-node peer-fill outcome (see [`PeerFetchEvent`]); called by
-    /// `PurgeForwarder::fetch` beside the equivalent `:9090` metrics bumps.
-    pub fn record_peer_fetch(&self, event: PeerFetchEvent) {
-        let s = self.shard();
-        let counter = match event {
-            PeerFetchEvent::Attempt => &s.peer_fetch_attempts,
-            PeerFetchEvent::Hit => &s.peer_fetch_hits,
-            PeerFetchEvent::Miss => &s.peer_fetch_misses,
-            PeerFetchEvent::Failure => &s.peer_fetch_failures,
-            PeerFetchEvent::Skipped => &s.peer_fetch_skipped,
-        };
-        counter.fetch_add(1, Relaxed);
     }
 
     /// 1/`rate` sampler for the fine-grained phase timers (see

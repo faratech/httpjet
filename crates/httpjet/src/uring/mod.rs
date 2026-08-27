@@ -419,25 +419,6 @@ pub(crate) const RING_DEFER: u8 = 2;
 pub(crate) static RING_MODE: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(RING_LEGACY);
 
-/// (#330) Experiment-only ring-size override (`HJ_URING_ENTRIES`). Ring memory
-/// is charged against RLIMIT_MEMLOCK for an unprivileged user — prod runs as
-/// nobody under the unit's 8 MiB LimitMEMLOCK, where ~20 4096-entry rings
-/// (~400 KiB each) BANKRUPT the budget and a late runtime fails to build at
-/// all. That was the 2026-08-27 deploy crash-loop: the bridge runtime died at
-/// startup, cache hits kept serving (on-core fast path) while every bridged
-/// request 502'd, and readiness then took the process down. So the DEFAULT
-/// stays monoio's 1024 entries (identical footprint to the proven binary);
-/// bigger rings are an explicit alt-instance experiment.
-fn uring_entries_override() -> Option<u32> {
-    static ENTRIES: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-    *ENTRIES.get_or_init(|| {
-        std::env::var("HJ_URING_ENTRIES")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|n| *n >= 32)
-    })
-}
-
 /// (#330) Build a per-core monoio io_uring runtime with the configured ring
 /// setup. `coop` (default) = COOP_TASKRUN (completion task work runs on the
 /// thread's own kernel transitions instead of via IPI — monoio re-enters the
@@ -449,26 +430,31 @@ fn uring_entries_override() -> Option<u32> {
 /// stays opt-in until soaked). A kernel or rlimit that rejects the flagged
 /// build falls back to a plain default ring (warned once) so ring tuning can
 /// never cost availability.
+///
+/// RING SIZE NEVER MOVES (#345): ring memory is charged against
+/// RLIMIT_MEMLOCK for an unprivileged user — prod runs as nobody under the
+/// unit's 8 MiB LimitMEMLOCK, where ~20 4096-entry rings (~400 KiB each)
+/// BANKRUPT the budget and a late runtime fails to build at all. That was the
+/// 2026-08-27 deploy crash-loop: the bridge runtime died at startup, cache
+/// hits kept serving (on-core fast path) while every bridged request 502'd,
+/// and readiness then took the process down. The build below therefore always
+/// uses monoio's default 1024 entries.
 pub(crate) fn build_core_runtime()
 -> std::io::Result<monoio::Runtime<monoio::time::TimeDriver<monoio::IoUringDriver>>> {
     let mode = RING_MODE.load(std::sync::atomic::Ordering::Relaxed);
-    let entries = uring_entries_override();
     if mode != RING_LEGACY {
         let mut urb = io_uring::IoUring::builder();
         urb.setup_coop_taskrun().setup_submit_all();
         if mode == RING_DEFER {
             urb.setup_single_issuer().setup_defer_taskrun();
         }
-        let mut builder = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new().uring_builder(urb);
-        if let Some(n) = entries {
-            builder = builder.with_entries(n);
-        }
+        let builder = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new().uring_builder(urb);
         match builder.enable_timer().build() {
             Ok(rt) => return Ok(rt),
             Err(error) => {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| {
-                    tracing::warn!(%error, mode, ?entries, "uring: flagged ring build rejected; using plain default rings");
+                    tracing::warn!(%error, mode, "uring: flagged ring build rejected; using plain default rings");
                 });
             }
         }
@@ -886,10 +872,7 @@ async fn handle_tls_bridged(
     // syscall (not an io_uring write) — matching tokio's write path on loopback bulk egress.
     // rustls/aws-lc-rs still does the AEAD; this only changes the socket write.
     let stream = monoio_rustls::ServerTlsStream::new(
-        directio::DirectWriteSocket::new_for(
-            io,
-            proto != Proto::Http2 || directio::h2_ring_writes(),
-        ),
+        directio::DirectWriteSocket::new_for(io, proto != Proto::Http2),
         session,
     );
     match proto {
@@ -1924,8 +1907,7 @@ fn serialize_h1_stream_head(
 
 /// Build a `SO_REUSEPORT` TCP listener (std) for a monoio runtime to adopt via
 /// [`TcpListener::from_std`]. One independent socket is created PER worker so the
-/// kernel load-balances accepts across the per-core runtimes (mirrors the
-/// epoll-path `server::make_reuseport_listener`).
+/// kernel load-balances accepts across the per-core runtimes.
 fn reuseport_std_listener(addr: SocketAddr) -> io::Result<std::net::TcpListener> {
     let domain = if addr.is_ipv6() {
         Domain::IPV6

@@ -24,7 +24,6 @@ use super::{
 };
 use crate::utils::slab::Slab;
 
-pub(crate) mod bufring;
 mod lifecycle;
 #[cfg(feature = "sync")]
 mod waker;
@@ -60,12 +59,6 @@ pub struct IoUringDriver {
 pub(crate) struct UringInner {
     /// In-flight operations
     ops: Ops,
-
-    /// httpjet patch (#335): lazily-registered provided-buffer ring backing
-    /// multishot receive. Boxed so its registered address never moves; field
-    /// order keeps it alive until after `Drop for UringInner` closed the ring
-    /// (registration dies with the ring fd, then the memory frees).
-    buf_ring: Option<Box<bufring::BufRing>>,
 
     #[cfg(feature = "poll-io")]
     poll: super::poll::Poll,
@@ -117,7 +110,6 @@ impl IoUringDriver {
             #[cfg(feature = "poll-io")]
             poller_installed: false,
             ops: Ops::new(),
-            buf_ring: None,
             ext_arg: uring.params().is_feature_ext_arg(),
             uring,
         }));
@@ -152,7 +144,6 @@ impl IoUringDriver {
             #[cfg(feature = "poll-io")]
             poll: super::poll::Poll::with_capacity(entries as usize)?,
             ops: Ops::new(),
-            buf_ring: None,
             ext_arg: uring.params().is_feature_ext_arg(),
             uring,
             shared_waker: std::sync::Arc::new(waker::EventWaker::new(waker)),
@@ -514,50 +505,6 @@ impl UringInner {
     }
 
     /// httpjet patch (#334): poll the next completion of a multishot op.
-    /// httpjet patch (#335): id of the provided-buffer group, registering the
-    /// ring on first use.
-    pub(crate) fn ensure_buf_ring(this: &Rc<UnsafeCell<UringInner>>) -> io::Result<u16> {
-        let inner = unsafe { &mut *this.get() };
-        if inner.buf_ring.is_none() {
-            let mut br = Box::new(bufring::BufRing::new(
-                bufring::DEFAULT_ENTRIES,
-                bufring::DEFAULT_BUF_SIZE,
-                bufring::DEFAULT_BUF_GROUP,
-            ));
-            // SAFETY: the ring memory is boxed inside UringInner and outlives
-            // the io_uring registration (see field-order note on `buf_ring`).
-            unsafe { br.register(&inner.uring.submitter())? };
-            inner.buf_ring = Some(br);
-        }
-        Ok(inner.buf_ring.as_ref().unwrap().bgid())
-    }
-
-    /// httpjet patch (#335): copy out of kernel-filled buffer `bid` starting
-    /// at `off` (of `total` received bytes) into `dst`; returns bytes copied.
-    pub(crate) fn buf_ring_copy(
-        this: &Rc<UnsafeCell<UringInner>>,
-        bid: u16,
-        off: usize,
-        total: usize,
-        dst: &mut [u8],
-    ) -> usize {
-        let inner = unsafe { &mut *this.get() };
-        let br = inner.buf_ring.as_ref().expect("buf ring not registered");
-        let n = (total - off).min(dst.len());
-        // SAFETY: bid+total come from a CQE for this group; bounds asserted
-        // inside slice().
-        dst[..n].copy_from_slice(unsafe { &br.slice(bid, total)[off..off + n] });
-        n
-    }
-
-    /// httpjet patch (#335): hand buffer `bid` back to the kernel.
-    pub(crate) fn buf_ring_recycle(this: &Rc<UnsafeCell<UringInner>>, bid: u16) {
-        let inner = unsafe { &mut *this.get() };
-        if let Some(br) = inner.buf_ring.as_mut() {
-            br.recycle(bid);
-        }
-    }
-
     pub(crate) fn poll_multi_op(
         this: &Rc<UnsafeCell<UringInner>>,
         index: usize,

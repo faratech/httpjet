@@ -20,4 +20,3 @@ thiserror = { workspace = true }
 # key is the untrusted Host header (an attacker cannot insert colliding entries).
 rustc-hash = { workspace = true }
 httpdate = { workspace = true }
-tracing = { workspace = true }

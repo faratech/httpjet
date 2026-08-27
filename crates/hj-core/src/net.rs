@@ -1,58 +1,28 @@
 //! Network-peer trust helpers shared across transports (TCP TLS and QUIC/HTTP3).
 
-use std::collections::HashSet;
 use std::net::IpAddr;
-use std::sync::OnceLock;
 
-/// The explicit allow-list of peer IPs (beyond loopback) that are exempt from the
-/// origin-pull mTLS requirement. Installed once at startup from the resolved
-/// `--cache-peer` addresses (the active-active sibling node). `None` until
-/// installed (and in unit tests) ⇒ ONLY loopback/unspecified is exempt.
-static EXEMPT_PEERS: OnceLock<HashSet<IpAddr>> = OnceLock::new();
-
-/// Install the mTLS-exempt peer allow-list (the resolved `--cache-peer` IPs). Call
-/// ONCE, before any listener accepts. Addresses are canonicalized so an
-/// IPv4-mapped IPv6 form matches its IPv4. Idempotent-ish: a second call is a no-op
-/// (the first install wins) — `--cache-peer` is a fixed CLI arg for the process.
-pub fn set_exempt_peers(peers: impl IntoIterator<Item = IpAddr>) {
-    let set: HashSet<IpAddr> = peers.into_iter().map(|ip| ip.to_canonical()).collect();
-    let _ = EXEMPT_PEERS.set(set);
-}
-
-/// Is `ip` a loopback or explicitly-allow-listed peer that is exempt from the
-/// mandatory Cloudflare origin-pull client-cert requirement (`clientVerify=2`)?
+/// Is `ip` exempt from the mandatory Cloudflare origin-pull client-cert
+/// requirement (`clientVerify=2`)? Loopback/unspecified ONLY.
 ///
 /// The origin-pull mTLS exists to keep *external* clients from reaching the origin
-/// directly (only Cloudflare carries the client cert). Two classes of caller
-/// legitimately reach the origin without it: (1) on-box services, because
-/// `/etc/hosts` maps the public vhosts to `127.0.0.1` so a fetch of
-/// `https://forum.example/...` hits the listener over loopback; and (2) an
-/// explicitly configured peer (purge fan-out / health). Everyone else —
-/// **including arbitrary RFC1918/LAN hosts** — must present a valid cert.
+/// directly (only Cloudflare carries the client cert). On-box services legitimately
+/// reach the origin without it, because `/etc/hosts` maps the public vhosts to
+/// `127.0.0.1` so a fetch of `https://forum.example/...` hits the listener over
+/// loopback. Everyone else — **including arbitrary RFC1918/LAN hosts** — must
+/// present a valid cert.
 ///
 /// History: this used to exempt the WHOLE RFC1918/ULA/link-local space (range
 /// based), which let any private-LAN host bypass Cloudflare AOP (security audit
-/// 2026-06-19, MEDIUM). It is now narrowed to loopback/unspecified + the explicit
-/// `--cache-peer` allow-list installed via [`set_exempt_peers`].
-/// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is unwrapped and judged as its IPv4 form.
+/// 2026-06-19, MEDIUM); it was narrowed to loopback/unspecified plus an explicit
+/// `--cache-peer` allow-list, and the allow-list was removed with the peer node's
+/// 2026-07-13 decommission. IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is unwrapped and
+/// judged as its IPv4 form.
 pub fn is_trusted_internal_peer(ip: IpAddr) -> bool {
-    match EXEMPT_PEERS.get() {
-        Some(set) => peer_is_exempt(ip, set),
-        None => peer_is_exempt(ip, &HashSet::new()),
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
     }
-}
-
-/// Pure core of [`is_trusted_internal_peer`] (testable without the process global):
-/// loopback/unspecified are ALWAYS exempt; otherwise the canonicalized IP must be
-/// in `extra`.
-fn peer_is_exempt(ip: IpAddr, extra: &HashSet<IpAddr>) -> bool {
-    let ip = ip.to_canonical();
-    match ip {
-        IpAddr::V4(v4) if v4.is_loopback() || v4.is_unspecified() => return true,
-        IpAddr::V6(v6) if v6.is_loopback() || v6.is_unspecified() => return true,
-        _ => {}
-    }
-    extra.contains(&ip)
 }
 
 /// Extract the host from a `Host` / `:authority` value, dropping any `:port` and
@@ -80,54 +50,38 @@ pub fn host_without_port(authority: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_without_port, is_trusted_internal_peer, peer_is_exempt};
-    use std::collections::HashSet;
+    use super::{host_without_port, is_trusted_internal_peer};
     use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
         s.parse().expect("parse ip")
     }
 
-    fn allow(addrs: &[&str]) -> HashSet<IpAddr> {
-        addrs.iter().map(|s| ip(s).to_canonical()).collect()
-    }
-
     #[test]
     fn loopback_is_always_exempt() {
-        // Loopback and the unspecified address are exempt even with NO peer
-        // allow-list configured.
-        let empty = HashSet::new();
-        assert!(peer_is_exempt(ip("127.0.0.1"), &empty));
-        assert!(peer_is_exempt(ip("127.0.0.53"), &empty));
-        assert!(peer_is_exempt(ip("::1"), &empty));
-        assert!(peer_is_exempt(ip("0.0.0.0"), &empty));
+        assert!(is_trusted_internal_peer(ip("127.0.0.1")));
+        assert!(is_trusted_internal_peer(ip("127.0.0.53")));
+        assert!(is_trusted_internal_peer(ip("::1")));
+        assert!(is_trusted_internal_peer(ip("0.0.0.0")));
         // IPv4-mapped IPv6 of loopback is unwrapped.
-        assert!(peer_is_exempt(ip("::ffff:127.0.0.1"), &empty));
+        assert!(is_trusted_internal_peer(ip("::ffff:127.0.0.1")));
     }
 
     #[test]
-    fn only_configured_peers_are_exempt_not_the_whole_lan() {
-        // A documentation-range peer explicitly allow-listed via --cache-peer.
-        let allowed = allow(&["192.0.2.3"]);
-        assert!(peer_is_exempt(ip("192.0.2.3"), &allowed));
-        // IPv4-mapped IPv6 of the configured peer still matches.
-        assert!(peer_is_exempt(ip("::ffff:192.0.2.3"), &allowed));
-        // But an arbitrary RFC1918 / LAN host that is NOT a configured peer is no
-        // longer trusted — this is the audit-2026-06-19 narrowing (a cert-less
-        // private-LAN host must not bypass Cloudflare AOP).
-        assert!(!peer_is_exempt(ip("10.0.0.1"), &allowed));
-        assert!(!peer_is_exempt(ip("172.16.5.4"), &allowed));
-        assert!(!peer_is_exempt(ip("192.168.1.10"), &allowed));
-        assert!(!peer_is_exempt(ip("169.254.1.1"), &allowed));
-        assert!(!peer_is_exempt(ip("fd00::1"), &allowed));
-        assert!(!peer_is_exempt(ip("fe80::1"), &allowed));
+    fn lan_hosts_are_not_exempt() {
+        // An arbitrary RFC1918 / LAN host is not trusted — the audit-2026-06-19
+        // narrowing (a cert-less private-LAN host must not bypass Cloudflare AOP).
+        assert!(!is_trusted_internal_peer(ip("10.0.0.1")));
+        assert!(!is_trusted_internal_peer(ip("172.16.5.4")));
+        assert!(!is_trusted_internal_peer(ip("192.168.1.10")));
+        assert!(!is_trusted_internal_peer(ip("169.254.1.1")));
+        assert!(!is_trusted_internal_peer(ip("fd00::1")));
+        assert!(!is_trusted_internal_peer(ip("fe80::1")));
     }
 
     #[test]
     fn public_peers_are_not_trusted() {
-        // Cloudflare edge / arbitrary public IPs must still present a client cert,
-        // even if they were somehow allow-listed-adjacent. With no global installed,
-        // is_trusted_internal_peer falls back to loopback-only.
+        // Cloudflare edge / arbitrary public IPs must still present a client cert.
         assert!(!is_trusted_internal_peer(ip("173.245.48.1"))); // a Cloudflare range
         assert!(!is_trusted_internal_peer(ip("8.8.8.8")));
         assert!(!is_trusted_internal_peer(ip("1.1.1.1")));

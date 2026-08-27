@@ -2053,7 +2053,7 @@ mod tests {
         // un-buffers, so the H1/H2/H3/LSAPI layers share one honest ledger.
         let budget = std::sync::Arc::new(hj_core::budget::BodyBufferBudget::new(16));
         use super::recv::process_frame;
-        use crate::frame::{flags, kind};
+        use crate::frame::kind;
         let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
         streams.insert(
             1,

@@ -560,7 +560,7 @@ async fn rewritten_static_target_with_unparsable_query_fails_closed() {
 async fn reserved_paths_are_intercepted_before_the_fast_path() {
     let doc_root = temp_root("reserved");
     std::fs::write(doc_root.join("__hj_cache_ready"), b"vhost imposter\n").unwrap();
-    let forwarder = crate::peer_purge::PurgeForwarder::new(Vec::new());
+    let forwarder = crate::peer_purge::PurgeForwarder::new();
     let state = build_state_full(
         doc_root.clone(),
         Vec::new(),

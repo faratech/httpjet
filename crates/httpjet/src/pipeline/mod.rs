@@ -33,7 +33,7 @@ use crate::state::ServerState;
 
 #[cfg(test)]
 mod e2e;
-mod fast_memo;
+pub(crate) mod fast_memo;
 mod htaccess_apply;
 mod proxy_glue;
 mod response_util;
@@ -268,6 +268,10 @@ pub(crate) async fn fast_serve(
             ),
         };
         if let Some(resp) = fast_memo::probe(&mk, req_start) {
+            state
+                .metrics
+                .fast_memo_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mtls_ok = if state.mtls_required_vhosts.contains(&ctx.vhost_name) {
                 ctx.tls
                     .as_ref()
@@ -282,9 +286,7 @@ pub(crate) async fn fast_serve(
                 state.server.use_ip_in_proxy_header,
                 mtls_ok,
             );
-            return Some(record_fast_serve(
-                state, &ctx, proto, req, peer_ip, is_tls, req_start, resp,
-            ));
+            return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
     }
     if let Some(ae) = req
@@ -409,9 +411,7 @@ pub(crate) async fn fast_serve(
                 t.transform(&ctx, &mut resp).await;
             }
             state.telemetry.record_cache_hit(peer_ip.is_loopback());
-            return Some(record_fast_serve(
-                state, &ctx, proto, req, peer_ip, is_tls, req_start, resp,
-            ));
+            return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
     }
 
@@ -539,24 +539,25 @@ pub(crate) async fn fast_serve(
             &resp,
             req_start,
         );
+        state
+            .metrics
+            .fast_memo_stores
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    Some(record_fast_serve(
-        state, &ctx, proto, req, peer_ip, is_tls, req_start, resp,
-    ))
+    Some(record_fast_serve(state, &ctx, proto, req, req_start, resp))
 }
 
 /// Mirror `handle()`'s served-request observability funnel on the on-core fast path so a
 /// guest cache HIT / static serve is counted (`requests_total` + telemetry) and
 /// access-logged like every other response — they were previously invisible to ops. The
-/// real client IP is resolved exactly as `handle()` does (XFF / CF-Connecting-IP for a
-/// trusted+mTLS peer) so the fast path does not log the Cloudflare edge IP for every guest.
+/// callers resolve the real client IP into `ctx.client_ip` (XFF / CF-Connecting-IP for a
+/// trusted+mTLS peer) before calling, so the fast path does not log the Cloudflare edge
+/// IP for every guest.
 fn record_fast_serve(
     state: &Arc<ServerState>,
     ctx: &ReqCtx,
     proto: Proto,
     req: &Request,
-    peer_ip: IpAddr,
-    is_tls: bool,
     req_start: std::time::Instant,
     mut resp: Response,
 ) -> Response {
@@ -614,15 +615,6 @@ fn record_fast_serve(
             return resp;
         }
     }
-    let mtls_required = state.mtls_required_vhosts.contains(&ctx.vhost_name);
-    let mtls_ok = if mtls_required {
-        ctx.tls
-            .as_ref()
-            .map(|t| t.client_cert.is_some())
-            .unwrap_or(false)
-    } else {
-        is_tls
-    };
     // (#283) fast_serve already resolved the real client IP into ctx; re-resolving
     // here repeated the trusted-peer scan (incl. per-XFF-entry CIDR checks) for the
     // log record only.
@@ -1904,13 +1896,6 @@ async fn dispatch(
                         // Genuine miss: this request renders (and maybe stores).
                         state.telemetry.record_cache_miss(ctx.peer_ip.is_loopback());
                         _sf_leader = Some(guard);
-                        // (peer-fetch) Before rendering, try to fill from the peer
-                        // (no-op unless --cache-peer-fill). On a peer hit we serve the
-                        // adopted entry and return; followers wake to the now-cached
-                        // entry when this single-flight guard drops.
-                        if let Some(resp) = lscache::try_peer_fill(state, ctx, &cc).await {
-                            return resp;
-                        }
                     }
                     lscache::Enter::Follower(notify) => {
                         // Another request is rendering this key. It may have already stored;

@@ -11,8 +11,6 @@ pub use listener_config::ListenerOpts;
 #[deprecated(since = "0.2.0", note = "use ListenerOpts")]
 pub use listener_config::ListenerOpts as ListenerConfig;
 pub use tcp::{TcpConnectOpts, TcpListener, TcpStream};
-#[cfg(all(target_os = "linux", feature = "iouring"))]
-pub use tcp::RecvMultiStream;
 #[cfg(unix)]
 pub use unix::{Pipe, UnixDatagram, UnixListener, UnixStream};
 #[cfg(windows)]

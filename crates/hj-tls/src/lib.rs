@@ -1,7 +1,8 @@
 //! hj-tls: the unified [`rustls`] server-config builder for httpjet.
 //!
 //! This crate produces a **single** [`rustls::ServerConfig`] that is shared by
-//! both the TCP path (via `tokio-rustls`) and the QUIC/HTTP3 path (via `quinn`).
+//! both the TCP path (via `monoio-rustls`) and the QUIC/HTTP3 path (via
+//! `quinn-proto`).
 //! Sharing one config guarantees there is exactly one SNI certificate resolver
 //! and exactly one client-certificate verifier across every transport — so an
 //! HTTP/3 request and an HTTP/2 request to the same listener are authenticated
@@ -33,8 +34,9 @@
 //!   material and must never be used to verify clients.
 //!
 //! * **ALPN.** `h2` then `http/1.1`. (HTTP/3's ALPN token `h3` is negotiated by
-//!   quinn separately from its own config; this config governs the TCP path's
-//!   ALPN and is reused by quinn for the shared certificate/verifier state.)
+//!   the quinn-proto endpoint from its own config; this config governs the TCP
+//!   path's ALPN and is rebuilt with `h3` for the shared certificate/verifier
+//!   state on the QUIC side.)
 //!
 //! * **0-RTT.** `max_early_data_size` is pinned to `0`.
 //!
@@ -678,7 +680,7 @@ fn load_root_store(ca: &Path) -> Result<RootCertStore> {
 }
 
 /// Build the unified [`rustls::ServerConfig`] for `listener`, shared by the TCP
-/// (tokio-rustls) and QUIC (quinn) transports.
+/// (monoio-rustls) and QUIC (quinn-proto) transports.
 ///
 /// Behaviour:
 /// * SNI resolution per [`build_sni_resolver`], with the listener's own
@@ -1017,9 +1019,9 @@ pub fn tls_params_from_conn(conn: &rustls::ServerConnection) -> Option<TlsParams
 /// string, the cipher name (may be empty), and the optional verified client leaf
 /// certificate (DER). Shared by the TCP path ([`tls_params_from_conn`], which
 /// reads them from a [`rustls::ServerConnection`]) and the QUIC/HTTP3 path, which
-/// extracts them from a `quinn::Connection` (`handshake_data()` + `peer_identity()`)
-/// — quinn does not expose the inner `ServerConnection`, so the QUIC side supplies
-/// the parts directly. A `leaf`, when present, has already been validated against
+/// extracts them from the quinn-proto connection's handshake data + peer identity
+/// — the sans-IO endpoint does not expose the inner `ServerConnection`, so the
+/// QUIC side supplies the parts directly. A `leaf`, when present, has already been validated against
 /// the configured CA by the active client-cert verifier.
 pub fn tls_params_from_parts(
     protocol: &'static str,

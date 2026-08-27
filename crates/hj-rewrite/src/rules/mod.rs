@@ -265,7 +265,7 @@ pub(crate) fn extract_literal_prefix(pattern_src: &str, negate: bool, nocase: bo
 /// Anything else (anchored prefixes, alternations, character classes) returns
 /// `None` and takes the normal regex path. The empty pattern is intentionally
 /// excluded (it is a zero-length match at pos 0, not a whole-string match).
-fn recognize_total_match(src: &str, negate: bool, nocase: bool) -> Option<TotalMatch> {
+fn recognize_total_match(src: &str, negate: bool, _nocase: bool) -> Option<TotalMatch> {
     // (#314d) [NC] is admitted for the WHOLE-MATCH forms: `.*` matches every byte
     // sequence (including empty) regardless of case, so synthesizing the slots is
     // semantically identical to running `(?i)^.*$`. Negation still bails (a total

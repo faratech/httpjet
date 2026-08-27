@@ -327,16 +327,9 @@ impl DiskStore {
     }
 
     /// Adopt a PEER-FETCHED entry: persist its already-encoded HJPC bytes verbatim
-    /// under a filename derived from `key_hash` (the cross-node-deterministic hash).
-    /// The container shape is validated so a corrupt/garbage transfer can never be
-    /// published; the caller then `read_meta()`s the published file and indexes it
-    /// via the same path the boot scan uses. Mirrors `write_entry`'s tmp+hard-link
-    /// publish (no silent overwrite) but takes pre-encoded bytes.
-    pub fn write_raw(&self, key_hash: u64, bytes: &[u8]) -> io::Result<(PathBuf, u32)> {
-        let prepared = self.prepare_raw(key_hash, bytes)?;
-        self.publish_entry(prepared)
-    }
-
+    /// under a filename derived from `key_hash`. Test-only since the cross-node
+    /// peer-fill removal (the injection path for `PageStore::adopt_entry`).
+    #[cfg(test)]
     pub(crate) fn prepare_raw(&self, key_hash: u64, bytes: &[u8]) -> io::Result<PreparedEntry> {
         let corrupt = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
         if (bytes.len() as u64) < HEADER_LEN {
@@ -392,6 +385,7 @@ impl DiskStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn read_prepared_entry(
         &self,
         prepared: &PreparedEntry,

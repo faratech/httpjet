@@ -34,49 +34,6 @@ use {
 use {crate::syscall_u32, std::os::unix::prelude::AsRawFd};
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
-
-/// httpjet patch (#335): MULTISHOT receive drawing from a provided-buffer
-/// group — one armed SQE, one CQE per arrived segment, zero per-read
-/// submissions. The CQE flags carry the chosen buffer id.
-#[cfg(all(target_os = "linux", feature = "iouring"))]
-pub(crate) struct RecvMulti {
-    pub(crate) fd: SharedFd,
-    pub(crate) buf_group: u16,
-}
-
-#[cfg(all(target_os = "linux", feature = "iouring"))]
-impl super::MultiOp<RecvMulti> {
-    pub(crate) fn recv_multi(fd: &SharedFd, buf_group: u16) -> std::io::Result<Self> {
-        super::MultiOp::submit_with(
-            RecvMulti {
-                fd: fd.clone(),
-                buf_group,
-            },
-            false,
-        )
-    }
-}
-
-#[cfg(all(target_os = "linux", feature = "iouring"))]
-impl OpAble for RecvMulti {
-    fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        io_uring::opcode::RecvMulti::new(io_uring::types::Fd(self.fd.raw_fd()), self.buf_group)
-            .build()
-    }
-
-    #[cfg(any(feature = "legacy", feature = "poll-io"))]
-    fn legacy_interest(&self) -> Option<(crate::driver::ready::Direction, usize)> {
-        None
-    }
-
-    #[cfg(any(feature = "legacy", feature = "poll-io"))]
-    fn legacy_call(&mut self) -> std::io::Result<u32> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "multishot recv requires the io_uring driver",
-        ))
-    }
-}
 #[cfg(any(feature = "legacy", feature = "poll-io"))]
 use crate::driver::ready::Direction;
 use crate::{

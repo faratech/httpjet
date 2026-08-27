@@ -161,6 +161,9 @@ impl RewriteOutcomeCache {
     }
 
     /// Fresh cached outcome for `key`, or `None` if absent/expired/disabled.
+    /// Production probes via `parts_hash` + `probe` (#313); the owned-key pair
+    /// (`get`/`insert`) survives for the in-file tests.
+    #[cfg(test)]
     fn get(&self, key: &OutcomeKey) -> Option<RwResult> {
         self.probe(Self::key_hash(key), &|k| k == key)
     }
@@ -182,6 +185,7 @@ impl RewriteOutcomeCache {
     /// FxHash over every key component (domain-separated by length-prefixed
     /// writes via Hasher::write's internal scheme? No — write() is raw bytes, so
     /// separators are written explicitly).
+    #[cfg(test)]
     fn key_hash(key: &OutcomeKey) -> u64 {
         Self::parts_hash(
             &key.vhost,
@@ -215,6 +219,7 @@ impl RewriteOutcomeCache {
 
     /// Store `outcome` for `key` (refreshing an existing entry; otherwise only
     /// when below the cap, so memory is bounded without an eviction sweep).
+    #[cfg(test)]
     fn insert(self: &Arc<Self>, key: OutcomeKey, outcome: RwResult) {
         let hash = Self::key_hash(&key);
         self.insert_hashed(hash, key, outcome);

@@ -234,12 +234,6 @@ pub struct ServerState {
 #[derive(Default)]
 pub struct PaddedAtomic(pub AtomicU64);
 
-impl PaddedAtomic {
-    pub fn new(v: u64) -> Self {
-        PaddedAtomic(AtomicU64::new(v))
-    }
-}
-
 impl std::ops::Deref for PaddedAtomic {
     type Target = AtomicU64;
     fn deref(&self) -> &AtomicU64 {
@@ -260,23 +254,12 @@ pub struct Metrics {
     /// guard ±1) — producing the response head, NOT spanning the streamed body — so it is
     /// a handler-concurrency gauge, not the drain signal.
     pub active_requests: Arc<AtomicU64>,
-    /// (OPS3) Purges successfully forwarded to a peer node.
-    pub purges_forwarded: Arc<AtomicU64>,
-    /// (OPS3) Peer-purge forwards that failed or timed out (peer briefly stale).
-    pub purge_forward_failures: Arc<AtomicU64>,
-    /// (OPS3) Purges received from a peer node and applied locally.
+    /// (OPS3) Local loopback purges received on /__hj_cache_purge and applied.
     pub purges_received: Arc<AtomicU64>,
-    /// (peer-fetch) Local misses where a peer fill was attempted (fill enabled).
-    pub peer_fetch_attempts: Arc<AtomicU64>,
-    /// (peer-fetch) Peer fills that returned an entry (avoided a local render).
-    pub peer_fetch_hits: Arc<AtomicU64>,
-    /// (peer-fetch) Peer-fill attempts where no peer had the entry (render locally).
-    pub peer_fetch_misses: Arc<AtomicU64>,
-    /// (peer-fetch) Peer fills that failed/timed out (peer down/slow → render).
-    pub peer_fetch_failures: Arc<AtomicU64>,
-    /// (peer-fetch) Fills skipped with NO round-trip because the key was negative-cached
-    /// (the peer recently 404'd it) — the latency saved on long-tail cold-both misses.
-    pub peer_fetch_skipped: Arc<AtomicU64>,
+    /// (#349) Finished-response memo hits served on the on-core fast path.
+    pub fast_memo_hits: Arc<AtomicU64>,
+    /// (#349) Finished-response memo stores (first full-pipeline serve per key/TTL).
+    pub fast_memo_stores: Arc<AtomicU64>,
     /// Last accepted `/cache-entries` debug render, in unix milliseconds.
     pub cache_entries_last_ms: Arc<AtomicU64>,
     /// Accepted `/cache-entries` renders.

@@ -1,6 +1,7 @@
 //! hj-h2: httpjet's native HTTP/2 server transport.
 //!
-//! Serves every ALPN-confirmed h2-over-TLS connection (hyper still handles HTTP/1.1).
+//! Serves every ALPN-confirmed h2-over-TLS connection (HTTP/1.1 is the io_uring
+//! transport's own httparse codec).
 //! One tokio task per connection multiplexes all of its streams concurrently — no
 //! per-stream spawn — via `FuturesUnordered`, with a connection-scoped [`hpack`]
 //! codec for headers. Response bodies (in-memory, streaming PHP/proxy/SSE, and

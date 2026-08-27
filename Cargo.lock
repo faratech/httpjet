@@ -801,7 +801,6 @@ dependencies = [
  "proptest",
  "rustc-hash",
  "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -844,7 +843,6 @@ dependencies = [
  "httpdate",
  "rustc-hash",
  "thiserror 2.0.20",
- "tracing",
 ]
 
 [[package]]
@@ -980,7 +978,6 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
- "rustls-pki-types",
  "tracing",
  "x509-parser",
 ]

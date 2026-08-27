@@ -217,58 +217,6 @@ impl Inner {
         }
     }
 
-    // httpjet patch (#335): provided-buffer-ring accessors (io_uring only).
-    pub(crate) fn ensure_buf_ring(&self) -> io::Result<u16> {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::ensure_buf_ring(this),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "buffer rings require the io_uring driver",
-            )),
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
-    }
-
-    pub(crate) fn buf_ring_copy(&self, bid: u16, off: usize, total: usize, dst: &mut [u8]) -> usize {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::buf_ring_copy(this, bid, off, total, dst),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(_) => unreachable!("buffer rings require the io_uring driver"),
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
-    }
-
-    pub(crate) fn buf_ring_recycle(&self, bid: u16) {
-        match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::buf_ring_recycle(this, bid),
-            #[cfg(feature = "legacy")]
-            Inner::Legacy(_) => {}
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
-        }
-    }
-
     fn drop_multi_op(&self, index: usize) {
         match self {
             #[cfg(all(target_os = "linux", feature = "iouring"))]
