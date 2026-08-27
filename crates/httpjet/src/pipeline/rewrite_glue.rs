@@ -513,6 +513,16 @@ pub(super) fn run_rewrite(
             }
         }
     }
+    if uses(CacheKeyVar::Accept) {
+        // Same absent-vs-empty discipline as Origin.
+        match keyed_header(req, "accept") {
+            None => key_vars.push_str("\na-"),
+            Some(v) => {
+                key_vars.push_str("\na=");
+                key_vars.push_str(&v);
+            }
+        }
+    }
     // (#313) Borrow every key part for the size guard and the hash-first probe;
     // the owned OutcomeKey is built only on the miss path that inserts.
     let host = rewrite_host(ctx, req);

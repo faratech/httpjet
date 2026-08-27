@@ -21,9 +21,38 @@ use monoio::net::TcpStream;
 pub(crate) struct DirectWriteSocket {
     inner: TcpStream,
     fd: RawFd,
+    /// (#335) Armed multishot receive drawing from the driver's provided
+    /// buffer ring — reads become zero-submission at steady state. H1-TLS
+    /// connections only (same population as `ring_small`); None = classic
+    /// per-read submissions (`--no-recv-multi`, arming failure, or h2).
+    recv: Option<monoio::net::RecvMultiStream>,
+    /// (#335) H1-over-TLS only: small ciphertext writes ride the io_uring ring
+    /// so many keep-alive sockets' responses batch into shared enters
+    /// (+7% h1/empty/c50, 5/5 pairs). H2 stays direct-always — its tiny
+    /// control-frame writes are latency-sensitive and measured -3..-5% when
+    /// ringed. Large writes always take the direct syscall (the loopback bulk
+    /// case this module exists for).
+    ring_small: bool,
 }
 
 impl DirectWriteSocket {
+    pub(crate) fn new_for(inner: TcpStream, ring_small: bool) -> Self {
+        let mut s = Self::new(inner);
+        s.ring_small = ring_small;
+        if ring_small && RECV_MULTI.load(std::sync::atomic::Ordering::Relaxed) {
+            match s.inner.recv_multi() {
+                Ok(stream) => s.recv = Some(stream),
+                Err(error) => {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::warn!(%error, "uring: multishot recv unavailable; using per-read submissions");
+                    });
+                }
+            }
+        }
+        s
+    }
+
     pub(crate) fn new(inner: TcpStream) -> Self {
         let fd = inner.as_raw_fd();
         // O_NONBLOCK so a full socket buffer returns EAGAIN (→ io_uring fallback) instead of
@@ -35,17 +64,61 @@ impl DirectWriteSocket {
                 let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
             }
         }
-        Self { inner, fd }
+        Self {
+            inner,
+            fd,
+            ring_small: false,
+            recv: None,
+        }
     }
 }
 
+/// (#335) OFF by default: the 5-pair A/B measured multishot receive FLAT
+/// (reads were already ring ops batched into shared enters — unlike the
+/// write side, there was no syscall to save, so the saved SQE push roughly
+/// equals the added copy-on-consume). `--recv-multi` opts in for
+/// experiments/other hardware; the fork machinery stays as the foundation
+/// for SEND_ZC-class work.
+pub(crate) static RECV_MULTI: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 impl AsyncReadRent for DirectWriteSocket {
     fn read<T: IoBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
-        self.inner.read(buf)
+        async move {
+            match self.recv.as_mut() {
+                Some(stream) => stream.read(buf).await,
+                None => self.inner.read(buf).await,
+            }
+        }
     }
     fn readv<T: IoVecBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         self.inner.readv(buf)
     }
+}
+
+/// (#335) Writes up to this many bytes go through the io_uring ring instead
+/// of the direct write(2): under a high rate of SMALL responses the ring
+/// batches many sockets' writes into the enters the reads already pay
+/// (measured +9-22% on h1/empty/c50, all interleaved pairs), while LARGE
+/// egress keeps the direct syscall this module was built for (ring
+/// submit->reap is pure overhead when the copy dominates and the write
+/// never blocks). Env-tunable for experiments: HJ_DIRECT_WRITE_MIN.
+/// (#349 experiment) HJ_H2_RING=1: also ring small H2 ciphertext writes
+/// (testing the response-batching-coherence model — batched writes reach the
+/// shared load generator together, cutting its per-wake overhead).
+pub(crate) fn h2_ring_writes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HJ_H2_RING").is_ok_and(|v| v == "1"))
+}
+
+fn ring_write_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("HJ_DIRECT_WRITE_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16 * 1024)
+    })
 }
 
 impl AsyncWriteRent for DirectWriteSocket {
@@ -54,6 +127,9 @@ impl AsyncWriteRent for DirectWriteSocket {
             let len = buf.bytes_init();
             if len == 0 {
                 return (Ok(0), buf);
+            }
+            if self.ring_small && len <= ring_write_max() {
+                return self.inner.write(buf).await;
             }
             // SAFETY: `buf` owns `len` initialized bytes at `read_ptr()` for this call.
             let n = unsafe { libc::write(self.fd, buf.read_ptr() as *const libc::c_void, len) };

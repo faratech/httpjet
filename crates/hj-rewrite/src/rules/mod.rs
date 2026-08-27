@@ -138,6 +138,12 @@ pub enum CacheKeyVar {
     /// this engine (it falls through to the env lookup), so only the `HTTP:`
     /// form maps here.
     Origin,
+    /// `%{HTTP:Accept}` — the content-negotiation header. Tiny real-world
+    /// cardinality (a handful of per-UA-family constants), commonly read by
+    /// SSE/webp gates (`RewriteCond %{HTTP:Accept} text/event-stream`). As with
+    /// Origin, only the `HTTP:` form maps here (`%{HTTP_ACCEPT}` is not a
+    /// header read in this engine).
+    Accept,
 }
 
 /// A pattern recognized at parse time as a guaranteed WHOLE-STRING match of any

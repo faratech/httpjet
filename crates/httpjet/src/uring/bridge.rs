@@ -134,6 +134,14 @@ pub(crate) const MAX_IN_FLIGHT_REQUESTS: usize = 2048;
 /// unbounded numbers of waiters.
 const BRIDGE_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
+fn bridge_admission_wait() -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(200)
+    } else {
+        BRIDGE_ADMISSION_WAIT
+    }
+}
+
 pub(crate) fn capacity_for_connection_limit(max_connections: u32) -> usize {
     match max_connections {
         0 => MAX_IN_FLIGHT_REQUESTS,
@@ -281,6 +289,7 @@ impl Drop for CancelOnDrop {
 pub(crate) struct Bridge {
     tx: mpsc::Sender<BridgeReq>,
     admission: Arc<AdmissionGate>,
+    timer: tokio::runtime::Handle,
 }
 
 impl Bridge {
@@ -296,9 +305,21 @@ impl Bridge {
             Some(p) => p,
             None => {
                 let wait = async { self.admission.acquire().await };
+                // (#344) The sleep must be CREATED under the side-runtime's
+                // handle: dispatch() polls on monoio transport threads, where a
+                // bare tokio::time::sleep panics ("no reactor running") — with
+                // panic=abort that took every TLS worker down the first time a
+                // flood actually exhausted admission (found by the #329
+                // harness; prod had never fired this path). The entered handle
+                // binds the timer to the tokio side-runtime, whose wheel wakes
+                // us across the runtime boundary; the future stays Send.
+                let shed_timer = {
+                    let _guard = self.timer.enter();
+                    tokio::time::sleep(bridge_admission_wait())
+                };
                 tokio::select! {
                     p = wait => p,
-                    _ = tokio::time::sleep(BRIDGE_ADMISSION_WAIT) => {
+                    _ = shed_timer => {
                         tracing::debug!("bridge admission wait exceeded; shedding request");
                         return Some(service_unavailable_resp());
                     }
@@ -547,10 +568,28 @@ async fn forward_file(
         },
     });
     let mut remaining = len;
-    let mut buf = vec![0u8; FILE_CHUNK];
+    // (#349 D1) Parity with hj-h2's file streamer: adaptive chunks (4-16x
+    // fewer blocking-pool hops + channel sends per MiB than the old fixed
+    // 64 KiB), the read lands directly in the Bytes we ship (no
+    // copy_from_slice), and the kernel gets a sequential-readahead hint.
+    let chunk_size: usize = if len > 4 * 1024 * 1024 {
+        1024 * 1024
+    } else {
+        FILE_CHUNK.max(256 * 1024)
+    };
+    {
+        use std::os::unix::io::AsRawFd;
+        let _ = rustix::fs::fadvise(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(file.as_raw_fd()) },
+            start,
+            Some(std::num::NonZeroU64::new(len).unwrap_or(std::num::NonZeroU64::MIN)),
+            rustix::fs::Advice::Sequential,
+        );
+    }
     while remaining > 0 {
-        let want = remaining.min(FILE_CHUNK as u64) as usize;
-        match file.read(&mut buf[..want]).await {
+        let want = remaining.min(chunk_size as u64) as usize;
+        let mut buf = bytes::BytesMut::with_capacity(want);
+        match file.read_buf(&mut buf).await {
             Ok(0) => {
                 // Short file (truncated since stat): we already committed Content-Length, so
                 // signal an abort rather than finish a short body under the wrong CL.
@@ -558,11 +597,7 @@ async fn forward_file(
                 return;
             }
             Ok(n) => {
-                if tx
-                    .send(Ok(Bytes::copy_from_slice(&buf[..n])))
-                    .await
-                    .is_err()
-                {
+                if tx.send(Ok(buf.freeze())).await.is_err() {
                     return; // client gone
                 }
                 remaining -= n as u64;
@@ -677,18 +712,17 @@ where
     F: Fn(Request, BridgeCtx) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response> + Send + 'static,
 {
-    let (bridge, rx) = bridge_channel(BridgeAdmission::fixed(max_in_flight));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(threads.max(1))
+        .thread_stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
+        .enable_all()
+        .build()?;
+    let (bridge, rx) = bridge_channel(BridgeAdmission::fixed(max_in_flight), rt.handle().clone());
     let handler = Arc::new(handler);
     std::thread::Builder::new()
         .name("hj-uring-bridge".into())
         .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(threads.max(1))
-                .thread_stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
-                .enable_all()
-                .build()
-                .expect("bridge tokio runtime");
             rt.block_on(run_receiver(rx, handler));
         })?;
     Ok(bridge)
@@ -714,17 +748,21 @@ where
     F: Fn(Request, BridgeCtx) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response> + Send + 'static,
 {
-    let (bridge, rx) = bridge_channel(admission);
+    let (bridge, rx) = bridge_channel(admission, tokio::runtime::Handle::current());
     tokio::spawn(run_receiver(rx, Arc::new(handler)));
     bridge
 }
 
-fn bridge_channel(admission: BridgeAdmission) -> (Bridge, mpsc::Receiver<BridgeReq>) {
+fn bridge_channel(
+    admission: BridgeAdmission,
+    timer: tokio::runtime::Handle,
+) -> (Bridge, mpsc::Receiver<BridgeReq>) {
     let (tx, rx) = mpsc::channel(MAX_IN_FLIGHT_REQUESTS);
     (
         Bridge {
             tx,
             admission: admission.gate,
+            timer,
         },
         rx,
     )
@@ -1135,10 +1173,7 @@ mod tests {
             hj_core::text_response(http::StatusCode::OK, format!("bridged {path}"))
         })
         .unwrap();
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap();
+        let mut rt = crate::uring::build_core_runtime().unwrap();
         rt.block_on(async move {
             let req = http::Request::get("/hello")
                 .body(hj_core::empty_incoming())
@@ -1158,6 +1193,39 @@ mod tests {
                 BridgeBody::Full(b) => assert_eq!(&b[..], b"bridged /hello"),
                 BridgeBody::Stream { .. } => panic!("small response must stay Full"),
             }
+        });
+    }
+
+    /// (#344) Admission exhaustion reached from a MONOIO thread must shed 503
+    /// after the bounded wait. The tokio-timer sleep this path used to poll
+    /// there panicked ("no reactor running") and, with panic=abort, took the
+    /// whole transport worker down under a connection flood.
+    #[test]
+    fn admission_shed_on_monoio_thread_does_not_panic() {
+        let bridge =
+            spawn_bridge_with_capacity(1, 1, |_req: Request, _ctx: BridgeCtx| async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                hj_core::text_response(http::StatusCode::OK, "slow".to_string())
+            })
+            .unwrap();
+        let mut rt = crate::uring::build_core_runtime().unwrap();
+        rt.block_on(async move {
+            let holder = {
+                let bridge = bridge.clone();
+                monoio::spawn(async move { bridge.dispatch(test_request(1), test_ctx()).await })
+            };
+            monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let start = std::time::Instant::now();
+            let resp = bridge
+                .dispatch(test_request(2), test_ctx())
+                .await
+                .expect("shed response");
+            assert_eq!(resp.status, http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                start.elapsed() >= std::time::Duration::from_millis(150),
+                "shed fired before the bounded admission wait"
+            );
+            drop(holder);
         });
     }
 

@@ -22,6 +22,21 @@ pub(crate) enum Lifecycle {
 
     /// The operation has completed.
     Completed(io::Result<u32>, u32),
+
+    /// httpjet patch (#334): a MULTISHOT operation (one armed SQE, a stream of
+    /// CQEs flagged `IORING_CQE_F_MORE`, then one terminal CQE without it).
+    /// The slab slot stays alive across completions; results queue here until
+    /// the consumer pops them. `done` = terminal CQE seen; `detached` =
+    /// consumer dropped (drain-and-discard, closing owned fds); `owns_fds` =
+    /// each Ok result is a kernel-created fd the process owns (multishot
+    /// accept) and must be closed rather than leaked when discarded.
+    MultiShot {
+        results: std::collections::VecDeque<(io::Result<u32>, u32)>,
+        waker: Option<Waker>,
+        done: bool,
+        detached: bool,
+        owns_fds: bool,
+    },
 }
 
 impl<'a> Ref<'a, Lifecycle> {
@@ -44,6 +59,98 @@ impl<'a> Ref<'a, Lifecycle> {
                 self.remove();
             }
             Lifecycle::Completed(..) => unsafe { std::hint::unreachable_unchecked() },
+            Lifecycle::MultiShot {
+                results,
+                waker,
+                done,
+                detached,
+                owns_fds,
+            } => {
+                let more = io_uring::cqueue::more(flags);
+                if *detached {
+                    // Consumer is gone: discard, closing any fd we now own.
+                    if *owns_fds {
+                        if let Ok(fd) = &result {
+                            unsafe { libc::close(*fd as libc::c_int) };
+                        }
+                    }
+                    if !more {
+                        self.remove();
+                    }
+                    return;
+                }
+                results.push_back((result, flags));
+                if !more {
+                    *done = true;
+                }
+                if let Some(w) = waker.take() {
+                    w.wake();
+                }
+            }
+        }
+    }
+
+    /// httpjet patch (#334): pop the next queued multishot completion.
+    /// `Ready(Some)` = one completion; `Ready(None)` = the stream terminated
+    /// (terminal CQE seen and queue drained — the consumer may re-arm);
+    /// `Pending` = armed and waiting.
+    pub(crate) fn poll_multi(mut self, cx: &mut Context<'_>) -> Poll<Option<CompletionMeta>> {
+        let ref_mut = &mut *self;
+        match ref_mut {
+            Lifecycle::MultiShot {
+                results,
+                waker,
+                done,
+                ..
+            } => {
+                if let Some((result, flags)) = results.pop_front() {
+                    return Poll::Ready(Some(CompletionMeta { result, flags }));
+                }
+                if *done {
+                    self.remove();
+                    return Poll::Ready(None);
+                }
+                match waker {
+                    Some(w) if w.will_wake(cx.waker()) => {}
+                    _ => *waker = Some(cx.waker().clone()),
+                }
+                Poll::Pending
+            }
+            _ => unsafe { std::hint::unreachable_unchecked() },
+        }
+    }
+
+    /// httpjet patch (#334): the multishot consumer is going away. Discards
+    /// queued results (closing owned fds), and reports whether the slot is
+    /// already terminal (true ⇒ removed here; false ⇒ caller must cancel the
+    /// armed SQE and the terminal CQE will remove the slot).
+    pub(crate) fn detach_multi(mut self) -> bool {
+        let ref_mut = &mut *self;
+        match ref_mut {
+            Lifecycle::MultiShot {
+                results,
+                waker,
+                done,
+                detached,
+                owns_fds,
+            } => {
+                waker.take();
+                if *owns_fds {
+                    for (result, _) in results.iter() {
+                        if let Ok(fd) = result {
+                            unsafe { libc::close(*fd as libc::c_int) };
+                        }
+                    }
+                }
+                results.clear();
+                *detached = true;
+                if *done {
+                    self.remove();
+                    return true;
+                }
+                false
+            }
+            _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 
@@ -87,6 +194,8 @@ impl<'a> Ref<'a, Lifecycle> {
                 self.remove();
             }
             Lifecycle::Ignored(..) => unsafe { std::hint::unreachable_unchecked() },
+            // MultiOp uses detach_multi, never drop_op.
+            Lifecycle::MultiShot { .. } => unsafe { std::hint::unreachable_unchecked() },
         }
         true
     }

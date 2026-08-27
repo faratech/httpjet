@@ -177,12 +177,69 @@ async fn accept_drain_loop<F, Fut>(
     // drain-then-teardown ordering as the tokio path (no lsphp pulled out from under an
     // in-flight request).
     let inflight = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    // (#349) One access-chunk flush ticker per WORKER THREAD (several accept
+    // loops share a thread): ships this thread's partially-filled access-log
+    // chunks at latency bound even when traffic stops mid-chunk.
+    thread_local! {
+        static CHUNK_TICKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !CHUNK_TICKER.with(|t| t.replace(true)) {
+        let ticker_shutdown = shutdown.clone();
+        monoio::spawn(async move {
+            loop {
+                monoio::select! {
+                    _ = ticker_shutdown.cancelled() => break,
+                    _ = monoio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        crate::pipeline::flush_access_chunks();
+                    }
+                }
+            }
+            crate::pipeline::flush_access_chunks();
+        });
+    }
+    // (#334) One armed multishot SQE yields every inbound connection (no accept
+    // submission per conn; peer addr via getpeername since multishot CQEs carry
+    // no sockaddr). A terminal CQE re-arms once; if arming fails the loop falls
+    // back to single-shot accept permanently. `--no-multishot-accept` disables.
+    let mut multi = if MULTISHOT_ACCEPT.load(std::sync::atomic::Ordering::Relaxed) {
+        listener.accept_multi().ok()
+    } else {
+        None
+    };
     loop {
         crate::memtrim::collect_if_requested_on_thread();
+        let next = async {
+            loop {
+                match multi.as_mut() {
+                    Some(stream) => match stream.next().await {
+                        Some(Ok(conn)) => match conn.peer_addr() {
+                            Ok(peer) => return Ok((conn, peer)),
+                            Err(e) => {
+                                tracing::debug!(core = core_idx, secure, error = %e, "uring multishot accept: getpeername failed; dropping conn");
+                                continue;
+                            }
+                        },
+                        Some(Err(e)) => return Err(e),
+                        None => {
+                            multi = listener.accept_multi().ok();
+                            if multi.is_none() {
+                                tracing::warn!(
+                                    core = core_idx,
+                                    secure,
+                                    "uring multishot accept: re-arm failed; falling back to single-shot"
+                                );
+                            }
+                            continue;
+                        }
+                    },
+                    None => return listener.accept().await,
+                }
+            }
+        };
         monoio::select! {
             biased;
             _ = shutdown.cancelled() => break,
-            accepted = listener.accept() => {
+            accepted = next => {
                 match accepted {
                     Ok((stream, peer)) => {
                         let state = core.holder.load();
@@ -348,6 +405,78 @@ pub(crate) fn spawn_uring_http(
 /// (#296) Kill switch for per-core thread pinning (`--no-core-pinning`).
 pub(crate) static CORE_PINNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
+
+/// (#334) Kill switch for multishot accept (`--no-multishot-accept`): the
+/// accept loops then submit one single-shot accept SQE per connection.
+pub(crate) static MULTISHOT_ACCEPT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// (#330) Ring-setup mode for every monoio runtime this transport builds
+/// (`--uring-ring legacy|coop|defer`).
+pub(crate) const RING_LEGACY: u8 = 0;
+pub(crate) const RING_COOP: u8 = 1;
+pub(crate) const RING_DEFER: u8 = 2;
+pub(crate) static RING_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(RING_LEGACY);
+
+/// (#330) Experiment-only ring-size override (`HJ_URING_ENTRIES`). Ring memory
+/// is charged against RLIMIT_MEMLOCK for an unprivileged user — prod runs as
+/// nobody under the unit's 8 MiB LimitMEMLOCK, where ~20 4096-entry rings
+/// (~400 KiB each) BANKRUPT the budget and a late runtime fails to build at
+/// all. That was the 2026-08-27 deploy crash-loop: the bridge runtime died at
+/// startup, cache hits kept serving (on-core fast path) while every bridged
+/// request 502'd, and readiness then took the process down. So the DEFAULT
+/// stays monoio's 1024 entries (identical footprint to the proven binary);
+/// bigger rings are an explicit alt-instance experiment.
+fn uring_entries_override() -> Option<u32> {
+    static ENTRIES: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *ENTRIES.get_or_init(|| {
+        std::env::var("HJ_URING_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n >= 32)
+    })
+}
+
+/// (#330) Build a per-core monoio io_uring runtime with the configured ring
+/// setup. `coop` (default) = COOP_TASKRUN (completion task work runs on the
+/// thread's own kernel transitions instead of via IPI — monoio re-enters the
+/// kernel every park, so the work is never starved) + SUBMIT_ALL (an early
+/// failed SQE no longer stops the batch), at monoio's default ring size.
+/// `defer` additionally sets SINGLE_ISSUER + DEFER_TASKRUN (experiment-only:
+/// completions then run ONLY inside this thread's enter; monoio's cross-thread
+/// waker is eventfd-based so no foreign thread touches the ring, but this
+/// stays opt-in until soaked). A kernel or rlimit that rejects the flagged
+/// build falls back to a plain default ring (warned once) so ring tuning can
+/// never cost availability.
+pub(crate) fn build_core_runtime()
+-> std::io::Result<monoio::Runtime<monoio::time::TimeDriver<monoio::IoUringDriver>>> {
+    let mode = RING_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    let entries = uring_entries_override();
+    if mode != RING_LEGACY {
+        let mut urb = io_uring::IoUring::builder();
+        urb.setup_coop_taskrun().setup_submit_all();
+        if mode == RING_DEFER {
+            urb.setup_single_issuer().setup_defer_taskrun();
+        }
+        let mut builder = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new().uring_builder(urb);
+        if let Some(n) = entries {
+            builder = builder.with_entries(n);
+        }
+        match builder.enable_timer().build() {
+            Ok(rt) => return Ok(rt),
+            Err(error) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(%error, mode, ?entries, "uring: flagged ring build rejected; using plain default rings");
+                });
+            }
+        }
+    }
+    monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .enable_timer()
+        .build()
+}
 
 /// (#296) Pin the CALLING per-core transport thread to `core` — only when the
 /// worker count equals the machine's CPU count, so each runtime owns exactly
@@ -575,10 +704,7 @@ fn per_core_https(
     _active_conns: Arc<std::sync::atomic::AtomicU64>,
     ready: WorkerReadyTx,
 ) {
-    let mut rt = match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-    {
+    let mut rt = match build_core_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = ready.send(Err(format!("build monoio runtime: {error}")));
@@ -759,7 +885,13 @@ async fn handle_tls_bridged(
     // Wrap the socket so monoio-rustls writes the encrypted bytes via a direct write(2)
     // syscall (not an io_uring write) — matching tokio's write path on loopback bulk egress.
     // rustls/aws-lc-rs still does the AEAD; this only changes the socket write.
-    let stream = monoio_rustls::ServerTlsStream::new(directio::DirectWriteSocket::new(io), session);
+    let stream = monoio_rustls::ServerTlsStream::new(
+        directio::DirectWriteSocket::new_for(
+            io,
+            proto != Proto::Http2 || directio::h2_ring_writes(),
+        ),
+        session,
+    );
     match proto {
         Proto::Http2 => serve_h2_bridged(stream, prefix, ctx, core, shutdown, None).await,
         _ => handle_h1_bridged(stream, prefix, ctx, core, shutdown).await,
@@ -775,10 +907,7 @@ fn per_core_bridged(
     _active_conns: Arc<std::sync::atomic::AtomicU64>,
     ready: WorkerReadyTx,
 ) {
-    let mut rt = match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-    {
+    let mut rt = match build_core_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = ready.send(Err(format!("build monoio runtime: {error}")));
@@ -1840,10 +1969,7 @@ pub(crate) fn serve_smoke(addr: SocketAddr, workers: usize) -> io::Result<()> {
 /// pin their per-core threads via `maybe_pin_core_thread` (#296); the smoke
 /// stub stays unpinned.)
 fn per_core(core: usize, std_listener: std::net::TcpListener) {
-    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-        .expect("build monoio io_uring runtime");
+    let mut rt = build_core_runtime().expect("build monoio io_uring runtime");
     rt.block_on(async move {
         let listener = match TcpListener::from_std(std_listener) {
             Ok(l) => l,
@@ -1985,10 +2111,7 @@ pub(crate) fn serve_h2_smoke(addr: SocketAddr, workers: usize) -> io::Result<()>
 }
 
 fn per_core_h2(core: usize, std_listener: std::net::TcpListener) {
-    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-        .expect("build monoio io_uring runtime");
+    let mut rt = build_core_runtime().expect("build monoio io_uring runtime");
     rt.block_on(async move {
         let listener = match TcpListener::from_std(std_listener) {
             Ok(l) => l,
@@ -2064,6 +2187,44 @@ where
 mod chunked_tests {
     use super::codec::*;
     use super::*;
+
+    /// (#334) The monoio-fork multishot accept: one armed SQE yields every
+    /// inbound connection; peer addrs come from getpeername (multishot CQEs
+    /// carry no sockaddr); dropping the stream cancels the armed SQE without
+    /// disturbing the listener or panicking the runtime teardown.
+    #[test]
+    fn multishot_accept_stream_accepts_many() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let mut rt = build_core_runtime().unwrap();
+        rt.block_on(async move {
+            let listener = TcpListener::from_std(std_listener).unwrap();
+            let mut accepts = listener.accept_multi().unwrap();
+            let clients = std::thread::spawn(move || {
+                (0..5)
+                    .map(|_| std::net::TcpStream::connect(addr).unwrap())
+                    .collect::<Vec<_>>()
+            });
+            for _ in 0..5 {
+                let conn = accepts
+                    .next()
+                    .await
+                    .expect("multishot terminated early")
+                    .expect("accept failed");
+                let peer = conn.peer_addr().expect("getpeername");
+                assert!(peer.ip().is_loopback());
+            }
+            drop(accepts);
+            // The listener still works single-shot after the stream detaches.
+            let extra = std::thread::spawn(move || std::net::TcpStream::connect(addr).unwrap());
+            let (conn, peer) = listener.accept().await.expect("single-shot after detach");
+            assert!(peer.ip().is_loopback());
+            drop(conn);
+            let _ = extra.join().unwrap();
+            let _ = clients.join().unwrap();
+        });
+    }
 
     #[test]
     fn listener_readiness_requires_every_worker_acknowledgement() {
@@ -2657,10 +2818,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             stream.read_to_end(&mut wire).unwrap();
             wire
         });
-        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap();
+        let mut runtime = build_core_runtime().unwrap();
         runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).unwrap();
             let (mut stream, _) = listener.accept().await.unwrap();
@@ -2762,10 +2920,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             websocket_client(stream, prefix);
         });
 
-        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap();
+        let mut runtime = build_core_runtime().unwrap();
         runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).unwrap();
             let (mut stream, peer) = listener.accept().await.unwrap();
@@ -2828,10 +2983,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             websocket_client(rustls::StreamOwned::new(connection, socket), prefix);
         });
 
-        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap();
+        let mut runtime = build_core_runtime().unwrap();
         runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).unwrap();
             let (stream, peer) = listener.accept().await.unwrap();
@@ -2875,10 +3027,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             assert_eq!(&body, b"rejected");
         });
 
-        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .enable_timer()
-            .build()
-            .unwrap();
+        let mut runtime = build_core_runtime().unwrap();
         runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).unwrap();
             let (stream, peer) = listener.accept().await.unwrap();

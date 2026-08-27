@@ -1074,6 +1074,7 @@ dependencies = [
  "httpdate",
  "hyper",
  "hyper-util",
+ "io-uring",
  "ktls-sys",
  "libc",
  "libmimalloc-sys",

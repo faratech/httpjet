@@ -10,6 +10,11 @@ use crate::driver;
 pub(crate) mod close;
 
 mod accept;
+// httpjet patch (#334): the multishot-accept op type is named by the listener.
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+pub(crate) use accept::AcceptMulti;
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+pub(crate) use recv::RecvMulti;
 mod connect;
 mod fsync;
 mod open;
@@ -182,6 +187,56 @@ where
 impl<T> Drop for Op<T> {
     fn drop(&mut self) {
         self.driver.drop_op(self.index, &mut self.data);
+    }
+}
+
+/// httpjet patch (#334): an armed MULTISHOT operation — one SQE producing a
+/// stream of completions until its terminal CQE. `data` (e.g. the listener's
+/// `SharedFd`) is pinned for the op's lifetime. io_uring-driver only.
+pub(crate) struct MultiOp<T: 'static> {
+    driver: super::Inner,
+    index: usize,
+    data: Option<T>,
+}
+
+impl<T> MultiOp<T> {
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    pub(crate) fn new(driver: super::Inner, index: usize, data: T) -> Self {
+        Self {
+            driver,
+            index,
+            data: Some(data),
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    pub(crate) fn data_mut(&mut self) -> &mut T {
+        unsafe { self.data.as_mut().unwrap_unchecked() }
+    }
+
+    /// Arm a multishot operation on the current driver. `owns_fds` marks ops
+    /// whose Ok results are kernel-created fds this process owns (multishot
+    /// accept) so discarded results are closed, never leaked.
+    pub(crate) fn submit_with(data: T, owns_fds: bool) -> io::Result<MultiOp<T>>
+    where
+        T: OpAble,
+    {
+        driver::CURRENT.with(|this| this.submit_multi_with(data, owns_fds))
+    }
+
+    /// `Ready(Some)` = next completion; `Ready(None)` = terminal CQE seen and
+    /// queue drained (re-arm with a fresh `submit_with` to continue).
+    pub(crate) fn poll_next_completion(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<CompletionMeta>> {
+        self.driver.poll_multi_op(self.index, cx)
+    }
+}
+
+impl<T> Drop for MultiOp<T> {
+    fn drop(&mut self) {
+        self.driver.drop_multi_op(self.index);
     }
 }
 

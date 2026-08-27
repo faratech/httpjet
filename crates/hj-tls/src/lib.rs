@@ -238,7 +238,27 @@ pub fn install_crypto_provider() -> Result<()> {
     }
     // `install_default` returns Err(existing) if another thread won the race;
     // that is fine — a provider is installed either way.
-    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    // (#349) Hardware-aware TLS 1.3 suite policy: serve AES_128_GCM_SHA256
+    // (+ CHACHA20 for non-AES-NI clients) and EXCLUDE AES_256_GCM_SHA384.
+    // rustls negotiates by CLIENT preference, and OpenSSL-family clients list
+    // 256-GCM-SHA384 first — whose SHA-384 transcript/HKDF runs the software
+    // SHA-512 core (a cold-handshake profile showed 15% of CPU in transcript
+    // hashing alone) while this CPU has hardware SHA-NI for SHA-256, and
+    // AES-256 costs ~20% more per record byte for no practical margin.
+    // AES_128_GCM_SHA256 is the TLS 1.3 MANDATORY-to-implement suite (every
+    // client has it; Cloudflare and Chrome prefer it themselves), so no
+    // interoperability is lost. TLS 1.2 suites are untouched.
+    // rustls negotiates by CLIENT order, so the SET is the only control:
+    // TLS 1.3 keeps ONLY AES_128_GCM_SHA256 (otherwise OpenSSL-family
+    // clients pick 256-GCM-SHA384 or CHACHA20 first — both slower here).
+    // Origin TLS 1.3 traffic is Cloudflare's AES-NI edges; a non-AES-NI
+    // client still interoperates (128-GCM in software), and TLS 1.2 keeps
+    // its full suite set including CHACHA20.
+    provider.cipher_suites.retain(|s| {
+        !matches!(s, rustls::SupportedCipherSuite::Tls13(_))
+            || s.suite() == rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+    });
     let _ = provider.install_default();
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         return Err(anyhow!(

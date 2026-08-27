@@ -80,6 +80,20 @@ impl Writer {
         Ok(())
     }
 
+    /// (#349) Append a pre-rendered block of newline-terminated lines verbatim.
+    async fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes).await?;
+        self.size += bytes.len() as u64;
+        if self.cfg.rolling_size > 0 && self.size >= self.cfg.rolling_size {
+            if let Err(e) = self.roll().await {
+                let _ = self.reopen().await;
+                self.size = 0;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// Re-open the live path (used after the file was renamed away, e.g. by
     /// `logrotate`, or on an explicit [`Msg::Reopen`]).
     async fn reopen(&mut self) -> io::Result<()> {
@@ -167,7 +181,12 @@ fn gzip_file(src: &Path) -> io::Result<()> {
     let dst = with_gz(src);
     let mut input = StdFile::open(src)?;
     let out = StdFile::create(&dst)?;
-    let mut encoder = GzEncoder::new(out, Compression::default());
+    // Level 1: archive gzip ran at the default level on the blocking pool and
+    // profiled at ~5% of TOTAL serving CPU at high request rates (a 10M log
+    // rolls every few seconds under load). Fast level is ~3-4x cheaper for a
+    // modestly larger archive — access logs are line-redundant enough that
+    // level 1 still compresses ~8-10x.
+    let mut encoder = GzEncoder::new(out, Compression::fast());
     copy(&mut input, &mut encoder)?;
     encoder.finish()?;
     std::fs::remove_file(src)?;
@@ -246,10 +265,16 @@ pub async fn run(cfg: RollConfig, mut rx: mpsc::UnboundedReceiver<Msg>, state: c
             // variants ((pre-rendered) `Line` and `Record`, rendered here on the
             // writer task so the request path never pays for it) uncount the queue
             // depth (#8) and then share the single write path below.
+            let mut raw_chunk: Option<Vec<u8>> = None;
             let to_write: Option<String> = match msg.take() {
                 Some(Msg::Line(line)) => {
                     depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     Some(line)
+                }
+                Some(Msg::Chunk(bytes, lines)) => {
+                    depth.fetch_sub(u64::from(lines), std::sync::atomic::Ordering::Relaxed);
+                    raw_chunk = Some(bytes);
+                    None
                 }
                 Some(Msg::Record(record, format, extra)) => {
                     depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -282,6 +307,25 @@ pub async fn run(cfg: RollConfig, mut rx: mpsc::UnboundedReceiver<Msg>, state: c
                 }
                 None => None,
             };
+            if let Some(bytes) = raw_chunk {
+                if let Some(w) = writer.as_mut() {
+                    if let Err(e) = w.write_raw(&bytes).await {
+                        let now = std::time::Instant::now();
+                        if last_write_err.is_none_or(|t| {
+                            now.duration_since(t) >= std::time::Duration::from_secs(5)
+                        }) {
+                            tracing::error!(target: "hj_log", error = %e, "log chunk write failed (rate-limited to 1/5s)");
+                            last_write_err = Some(now);
+                        }
+                        let reopen_cfg = w.cfg.clone();
+                        if let Ok(fresh) = Writer::open(reopen_cfg).await {
+                            *w = fresh;
+                        }
+                    } else {
+                        wrote_line = true;
+                    }
+                }
+            }
             if let Some(line) = to_write {
                 if let Some(w) = writer.as_mut() {
                     match w.write_line(&line).await {

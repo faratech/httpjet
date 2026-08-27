@@ -207,10 +207,7 @@ fn per_core_h3(core: usize, std_sock: std::net::UdpSocket, rustls_cfg: Arc<rustl
             return;
         }
     };
-    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-        .expect("build monoio io_uring runtime");
+    let mut rt = super::build_core_runtime().expect("build monoio io_uring runtime");
     rt.block_on(async move {
         let udp = match UdpSocket::from_std(std_sock) {
             Ok(u) => u,
@@ -2237,7 +2234,7 @@ async fn drive_one_conn(
 async fn recv_drain(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    recv_bufs: &mut [Vec<u8>; GRO_BATCH],
+    recv_bufs: &mut [BytesMut; GRO_BATCH],
     recv_metas: &mut [quinn_udp::RecvMeta; GRO_BATCH],
     scratch: &mut Vec<u8>,
     tx_scratch: &mut Vec<u8>,
@@ -2253,17 +2250,59 @@ async fn recv_drain(
         std::collections::HashSet::new();
     loop {
         let nmsg = {
+            // (#333) The kernel receives straight into each slot's spare
+            // capacity; segments are then split_to() off as O(1) refcounted
+            // views instead of an alloc+memcpy per GRO segment. reserve()
+            // reuses the block when no split segment still holds it and
+            // allocates a fresh one otherwise — a long-held stream chunk can
+            // pin at most its own 64 KiB slot block.
+            for b in recv_bufs.iter_mut() {
+                b.clear();
+                b.reserve(MAX_DATAGRAM);
+            }
             let [b0, b1, b2, b3, b4, b5, b6, b7] = recv_bufs.each_mut();
-            let mut iov = [
-                std::io::IoSliceMut::new(b0.as_mut_slice()),
-                std::io::IoSliceMut::new(b1.as_mut_slice()),
-                std::io::IoSliceMut::new(b2.as_mut_slice()),
-                std::io::IoSliceMut::new(b3.as_mut_slice()),
-                std::io::IoSliceMut::new(b4.as_mut_slice()),
-                std::io::IoSliceMut::new(b5.as_mut_slice()),
-                std::io::IoSliceMut::new(b6.as_mut_slice()),
-                std::io::IoSliceMut::new(b7.as_mut_slice()),
-            ];
+            // SAFETY: every slot has ≥ MAX_DATAGRAM spare capacity (reserved
+            // above, len 0). The raw slices only ever receive kernel writes
+            // inside udp_state.recv below, while no other borrow of the slots
+            // exists; the initialized prefix is claimed via advance_mut with
+            // the kernel-reported length.
+            let mut iov = unsafe {
+                use bytes::BufMut;
+                [
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b0.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b1.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b2.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b3.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b4.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b5.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b6.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
+                        b7.chunk_mut().as_mut_ptr(),
+                        MAX_DATAGRAM,
+                    )),
+                ]
+            };
             let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
             match udp_state.recv(UdpSockRef::from(&bfd), &mut iov, recv_metas) {
                 Ok(n) => n,
@@ -2286,11 +2325,15 @@ async fn recv_drain(
             let pecn = meta
                 .ecn
                 .and_then(|e| quinn_proto::EcnCodepoint::from_bits(e as u8));
-            let mut off = 0usize;
-            while off < meta.len {
-                let end = (off + stride).min(meta.len);
-                let seg = BytesMut::from(&recv_bufs[i][off..end]);
-                off = end;
+            // SAFETY: the kernel initialized exactly meta.len bytes of slot
+            // i's spare capacity in the recv above (len was 0).
+            unsafe {
+                use bytes::BufMut;
+                recv_bufs[i].advance_mut(meta.len);
+            }
+            let mut slot = recv_bufs[i].split();
+            while !slot.is_empty() {
+                let seg = slot.split_to(stride.min(slot.len()));
                 scratch.clear();
                 if let Some(ev) = endpoint.handle(now, meta.addr, meta.dst_ip, pecn, seg, scratch) {
                     match ev {
@@ -2379,7 +2422,7 @@ async fn pump(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
     max_gso: usize,
-    recv_bufs: &mut [Vec<u8>; GRO_BATCH],
+    recv_bufs: &mut [BytesMut; GRO_BATCH],
     recv_metas: &mut [quinn_udp::RecvMeta; GRO_BATCH],
     scratch: &mut Vec<u8>,
     tx_scratch: &mut Vec<u8>,
@@ -2514,7 +2557,8 @@ async fn endpoint_loop_concurrent(
     // returns up to GRO_BATCH messages, each GRO-coalescing up to ~64 segments). Batching ACK
     // processing into ONE flush per wake stops the send-bunching (one flush per ACK) that
     // overwhelmed the path and caused ~48% loss on large transfers.
-    let mut recv_bufs: [Vec<u8>; GRO_BATCH] = std::array::from_fn(|_| vec![0u8; MAX_DATAGRAM]);
+    let mut recv_bufs: [BytesMut; GRO_BATCH] =
+        std::array::from_fn(|_| BytesMut::with_capacity(MAX_DATAGRAM));
     let mut recv_metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
     let mut draining = false;
     let mut drain_deadline: Option<Instant> = None;
@@ -3346,10 +3390,7 @@ fn per_core_h3_pipeline(
             return;
         }
     };
-    let mut rt = match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-    {
+    let mut rt = match super::build_core_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = ready.send(Err(format!("build monoio runtime: {error}")));

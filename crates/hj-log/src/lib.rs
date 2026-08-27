@@ -252,6 +252,48 @@ impl AccessRecord {
     }
 }
 
+/// (#349) Render one access line straight from BORROWED request data into a
+/// reusable buffer, byte-identical to [`AccessRecord::render`] plus the
+/// trailing newline. This is the serving-thread half of chunked logging: no
+/// per-line Strings, no per-line channel send.
+#[allow(clippy::too_many_arguments)]
+pub fn render_access_line_into(
+    out: &mut Vec<u8>,
+    format: LogFormat,
+    client_ip: std::net::IpAddr,
+    ts: SystemTime,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    protocol: &str,
+    status: u16,
+    bytes: u64,
+    referer: Option<&str>,
+    user_agent: Option<&str>,
+    request_id: Option<&dyn std::fmt::Display>,
+) {
+    use std::io::Write;
+    let _ = write!(out, "{} - - [{}] \"", client_ip, fmt::clf_time(ts));
+    let _ = write!(out, "{} ", escape(method));
+    let _ = write!(out, "{}", escape(path));
+    if let Some(q) = query {
+        let _ = write!(out, "?{}", escape(q));
+    }
+    let _ = write!(out, " {}\" {} {}", escape(protocol), status, bytes);
+    if format == LogFormat::Combined {
+        let _ = write!(
+            out,
+            " \"{}\" \"{}\"",
+            quoted_field(referer),
+            quoted_field(user_agent),
+        );
+    }
+    if let Some(id) = request_id {
+        let _ = write!(out, " reqid={}", id);
+    }
+    out.push(b'\n');
+}
+
 /// Unquoted optional field: render `-` when absent/empty (the `%l`/`%u` fields).
 fn field_or_dash(v: Option<&str>) -> Cow<'_, str> {
     match v {
@@ -311,6 +353,10 @@ enum Msg {
     /// the record (#248 logHeaders): same channel message, so it can never mis-align
     /// with its record under load.
     Record(Box<AccessRecord>, LogFormat, Option<String>),
+    /// (#349) A block of PRE-RENDERED, newline-terminated access lines from a
+    /// serving thread's chunk buffer (one message per ~hundreds of lines).
+    /// The count keeps the shared depth/shed accounting line-accurate.
+    Chunk(Vec<u8>, u32),
     /// Close and re-open the underlying file (logrotate / SIGUSR1).
     Reopen,
     /// Flush and shut down; the writer replies on the oneshot.
@@ -387,6 +433,29 @@ impl AccessLogger {
     /// Queue a pre-rendered line (escape/format already applied by the caller).
     pub fn log_line(&self, line: impl Into<String>) {
         send_or_warn(&self.tx, &self.state, Msg::Line(line.into()), "access-log");
+    }
+
+    /// (#349) Queue a block of pre-rendered newline-terminated lines (built
+    /// with [`render_access_line_into`]) as ONE message. Sheds the whole
+    /// chunk, line-accurately, when the writer queue is at its bound.
+    pub fn log_chunk(&self, chunk: Vec<u8>, lines: u32) {
+        if lines == 0 || chunk.is_empty() {
+            return;
+        }
+        let lines64 = u64::from(lines);
+        if self.state.depth.load(Ordering::Relaxed) + lines64 > MAX_QUEUED_LINES {
+            self.state.dropped.fetch_add(lines64, Ordering::Relaxed);
+            return;
+        }
+        self.state.depth.fetch_add(lines64, Ordering::Relaxed);
+        if self.tx.send(Msg::Chunk(chunk, lines)).is_err() {
+            self.state.depth.fetch_sub(lines64, Ordering::Relaxed);
+            self.state.dropped.fetch_add(lines64, Ordering::Relaxed);
+            if !self.state.gone.swap(true, Ordering::Relaxed) {
+                self.state.depth.store(0, Ordering::Relaxed);
+                eprintln!("hj-log: access-log writer task gone; subsequent lines are dropped");
+            }
+        }
     }
 
     /// Request that the writer re-open the log file. Use from a SIGUSR1 handler
@@ -633,5 +702,66 @@ mod tests {
             rx.try_recv().is_err(),
             "shed line must not enter the writer queue"
         );
+    }
+
+    /// (#349) The borrowed chunk renderer must produce BYTE-IDENTICAL lines to
+    /// AccessRecord::render (plus the trailing newline) for both formats.
+    #[test]
+    fn borrowed_render_matches_record_render() {
+        let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_766_000_000);
+        for format in [LogFormat::Common, LogFormat::Combined] {
+            for (query, referer, ua, reqid) in [
+                (None, None, None, None),
+                (
+                    Some("a=1&b=%22x"),
+                    Some("https://ref.example/\"q"),
+                    Some("UA/1.0 (X11; \u{7f})"),
+                    Some("00ffab12cd34ef56"),
+                ),
+            ] {
+                let uri = match query {
+                    Some(q) => format!("/p/th%20x?{q}"),
+                    None => "/p/th%20x".to_string(),
+                };
+                let record = AccessRecord {
+                    client_ip: "203.0.113.9".parse().unwrap(),
+                    ts,
+                    method: std::borrow::Cow::Borrowed("GET"),
+                    uri,
+                    protocol: "HTTP/2",
+                    status: 200,
+                    bytes: 1234,
+                    referer: referer.map(str::to_string),
+                    user_agent: ua.map(str::to_string),
+                    host: None,
+                    remote_user: None,
+                    request_id: reqid.map(str::to_string),
+                };
+                let mut expected = record.render(format).into_bytes();
+                expected.push(b'\n');
+                let mut got = Vec::new();
+                let id_disp = reqid.map(|r| r.to_string());
+                render_access_line_into(
+                    &mut got,
+                    format,
+                    record.client_ip,
+                    ts,
+                    "GET",
+                    "/p/th%20x",
+                    query,
+                    "HTTP/2",
+                    200,
+                    1234,
+                    referer,
+                    ua,
+                    id_disp.as_ref().map(|s| s as &dyn std::fmt::Display),
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&got),
+                    String::from_utf8_lossy(&expected),
+                    "format {format:?} query {query:?}"
+                );
+            }
+        }
     }
 }

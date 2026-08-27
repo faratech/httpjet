@@ -53,6 +53,42 @@ impl Op<Accept> {
     }
 }
 
+/// httpjet patch (#334): MULTISHOT accept — one armed SQE, one CQE per inbound
+/// connection. The kernel cannot fill a per-connection sockaddr in multishot
+/// mode (a single addr buffer would race), so the peer address comes from
+/// `getpeername(2)` on the accepted fd if the caller wants it.
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+pub(crate) struct AcceptMulti {
+    pub(crate) fd: SharedFd,
+}
+
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+impl super::MultiOp<AcceptMulti> {
+    pub(crate) fn accept_multi(fd: &SharedFd) -> io::Result<Self> {
+        super::MultiOp::submit_with(AcceptMulti { fd: fd.clone() }, true)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+impl OpAble for AcceptMulti {
+    fn uring_op(&mut self) -> io_uring::squeue::Entry {
+        opcode::AcceptMulti::new(types::Fd(self.fd.raw_fd())).build()
+    }
+
+    #[cfg(any(feature = "legacy", feature = "poll-io"))]
+    fn legacy_interest(&self) -> Option<(Direction, usize)> {
+        None
+    }
+
+    #[cfg(all(any(feature = "legacy", feature = "poll-io"), unix))]
+    fn legacy_call(&mut self) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "multishot accept requires the io_uring driver",
+        ))
+    }
+}
+
 impl OpAble for Accept {
     #[cfg(all(target_os = "linux", feature = "iouring"))]
     fn uring_op(&mut self) -> io_uring::squeue::Entry {

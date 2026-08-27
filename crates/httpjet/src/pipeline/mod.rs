@@ -33,6 +33,7 @@ use crate::state::ServerState;
 
 #[cfg(test)]
 mod e2e;
+mod fast_memo;
 mod htaccess_apply;
 mod proxy_glue;
 mod response_util;
@@ -225,6 +226,67 @@ pub(crate) async fn fast_serve(
         request_id: hj_core::reqid::next(),
         redirect_guard: None,
     };
+    // (#349) Finished-response memo (experimental, HJ_FAST_MEMO=1 only). The
+    // request gates here are HALF the correctness contract; the other half is
+    // the chain/inline eligibility enforced at the store site below — see the
+    // `fast_memo` module doc. A hit replays a response the FULL fast path
+    // built for this exact key within the last second, resolves the real
+    // client IP for the access log, and goes through the same observability
+    // funnel as every other serve.
+    let memo_eligible_req = fast_memo::enabled()
+        && method == http::Method::GET
+        && !req.headers().contains_key(http::header::COOKIE)
+        && !req.headers().contains_key(http::header::RANGE)
+        && !req.headers().contains_key(http::header::IF_NONE_MATCH)
+        && !req.headers().contains_key(http::header::IF_MODIFIED_SINCE)
+        && !req.headers().contains_key(http::header::AUTHORIZATION);
+    // The inline ruleset's keyable dynamic vars (UA/Origin/Accept) fold into
+    // the memo key at BOTH probe and store — same `state.inline_rules` source,
+    // so the two sides can never disagree. A `path_cacheable: false` inline
+    // set means stores are impossible; skip the probe entirely.
+    let memo_inline = state.inline_rules.get(&ctx.vhost_name);
+    let memo_inline_ok =
+        memo_inline.is_none_or(|rs| rs.path_cacheable && rs.assumed_empty_env.is_empty());
+    if memo_eligible_req && memo_inline_ok {
+        let mk = fast_memo::MemoKey {
+            listener,
+            https: effective_https,
+            vhost: &ctx.vhost_name,
+            host: route_key.as_deref().unwrap_or("").as_bytes(),
+            path: req.uri().path(),
+            query: req.uri().query().unwrap_or(""),
+            ae: req
+                .headers()
+                .get(http::header::ACCEPT_ENCODING)
+                .map(|v| v.as_bytes())
+                .unwrap_or(b""),
+            vars: fast_memo::keyvar_fold(
+                memo_inline
+                    .map(|rs| rs.cache_key_vars.as_slice())
+                    .unwrap_or(&[]),
+                req,
+            ),
+        };
+        if let Some(resp) = fast_memo::probe(&mk, req_start) {
+            let mtls_ok = if state.mtls_required_vhosts.contains(&ctx.vhost_name) {
+                ctx.tls
+                    .as_ref()
+                    .map(|t| t.client_cert.is_some())
+                    .unwrap_or(false)
+            } else {
+                is_tls
+            };
+            ctx.client_ip = state.acl.resolve_client_ip(
+                peer_ip,
+                req.headers(),
+                state.server.use_ip_in_proxy_header,
+                mtls_ok,
+            );
+            return Some(record_fast_serve(
+                state, &ctx, proto, req, peer_ip, is_tls, req_start, resp,
+            ));
+        }
+    }
     if let Some(ae) = req
         .headers()
         .get(http::header::ACCEPT_ENCODING)
@@ -261,6 +323,23 @@ pub(crate) async fn fast_serve(
     };
     let chain: Vec<std::sync::Arc<Htaccess>> =
         chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
+    // (#349) Memo store eligibility — the response must be a pure function of
+    // the memo key. Chain gates: no SetEnvIf (header-driven env), no access
+    // rules (may be client-IP-driven, and IP is not keyed), and rewrite rules
+    // the outcome-cache classifier already proves read only keyed inputs. The
+    // vhost inline ruleset must pass the same bar. `Header`/`extraHeaders`
+    // conditionality is URI/env-modelled in this engine, so under these gates
+    // it is key-deterministic too. A directory change that adds any such
+    // directive is visible within the memo's 1 s TTL.
+    let memo_store_ok = memo_eligible_req
+        && memo_inline_ok
+        && chain_with_dirs.iter().all(|(_, ht)| {
+            ht.set_env_if.is_empty()
+                && ht.access_rules.is_empty()
+                && ht.rules.path_cacheable
+                && ht.rules.cache_key_vars.is_empty()
+                && ht.rules.assumed_empty_env.is_empty()
+        });
     // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
     // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
     // path judges the SAME identity the tokio `handle()` path does — not the raw socket
@@ -358,11 +437,29 @@ pub(crate) async fn fast_serve(
     if access_denied(&chain, &orig_rel, method.as_str()) {
         return None;
     }
-    if matching_proxy_context(&ctx, &orig_path).is_some()
-        || matching_static_context(&ctx, &orig_path).is_some()
-    {
+    if matching_proxy_context(&ctx, &orig_path).is_some() {
         return None;
     }
+    // (#349) A matching static <context> no longer forces the bridge: mirror
+    // dispatch's handling (DocRootOverride when the location differs from the
+    // docroot, extraHeaders after the handler, default charset) so
+    // context-bearing vhosts — e.g. the mcp hybrid docroot, whose `/` static
+    // context used to push EVERY static request through the tokio pipeline —
+    // serve on-core. The post-handler `resolved_static_target_denied` net
+    // still fail-closes an override root against accessDenyDir, exactly as on
+    // the bridged path.
+    let (static_extra_headers, static_location, static_charset): (
+        Option<Vec<(String, String)>>,
+        Option<std::path::PathBuf>,
+        Option<String>,
+    ) = match matching_static_context(&ctx, &orig_path) {
+        Some(c) => (
+            Some(c.extra_headers.clone()),
+            c.location.clone(),
+            effective_static_charset(c),
+        ),
+        None => (None, None, None),
+    };
     // A path that resolves to a script handler must NEVER be served by the static
     // handler (source disclosure) — bridge it. `&chain` lets an `.htaccess`
     // `SetHandler`/`AddHandler`/`AddType` force a non-PHP-suffixed file to script
@@ -381,12 +478,25 @@ pub(crate) async fn fast_serve(
         sreq.extensions_mut()
             .insert(hj_static::IndexFilesOverride(idx.to_vec()));
     }
-    let resp = run_handler(&state.static_handler, &mut ctx, sreq).await;
+    if let Some(loc) = static_location {
+        if loc != ctx.vhost.doc_root {
+            sreq.extensions_mut()
+                .insert(hj_static::DocRootOverride(loc));
+        }
+    }
+    if let Some(charset) = static_charset {
+        sreq.extensions_mut()
+            .insert(hj_static::DefaultCharsetOverride(charset));
+    }
+    let mut resp = run_handler(&state.static_handler, &mut ctx, sreq).await;
     if resolved_static_target_denied(&state.acl, &resp) {
         return None;
     }
     if !matches!(resp.status().as_u16(), 200 | 206 | 304) {
         return None; // 404/403/416 → bridge so the ErrorDocument renders on tokio
+    }
+    if let Some(extra) = &static_extra_headers {
+        apply_static_context_headers(extra, &mut resp);
     }
     // Promote the file body to in-memory ON-CORE (sync read; large/ranged → bridge),
     // BEFORE the transforms — the monoio writers have no on-core file streamer yet, and
@@ -401,6 +511,34 @@ pub(crate) async fn fast_serve(
     // so CacheStaticTransform is a no-op (no block_in_place) and Compress negotiates per AE.
     for t in &state.transforms {
         t.transform(&ctx, &mut resp).await;
+    }
+    if memo_store_ok
+        && resp.status() == StatusCode::OK
+        && !resp.headers().contains_key(http::header::SET_COOKIE)
+    {
+        fast_memo::store(
+            &fast_memo::MemoKey {
+                listener,
+                https: effective_https,
+                vhost: &ctx.vhost_name,
+                host: route_key.as_deref().unwrap_or("").as_bytes(),
+                path: req.uri().path(),
+                query: req.uri().query().unwrap_or(""),
+                ae: req
+                    .headers()
+                    .get(http::header::ACCEPT_ENCODING)
+                    .map(|v| v.as_bytes())
+                    .unwrap_or(b""),
+                vars: fast_memo::keyvar_fold(
+                    memo_inline
+                        .map(|rs| rs.cache_key_vars.as_slice())
+                        .unwrap_or(&[]),
+                    req,
+                ),
+            },
+            &resp,
+            req_start,
+        );
     }
     Some(record_fast_serve(
         state, &ctx, proto, req, peer_ip, is_tls, req_start, resp,
@@ -442,6 +580,40 @@ fn record_fast_serve(
         .get(&ctx.vhost_name)
         .map(|v| v.log_headers)
         .unwrap_or(0);
+    // (#349) Common fast-path case (no logHeaders continuation, known body
+    // length): render the line on-core from borrowed request data into this
+    // thread's chunk — no per-line Strings, no per-line channel send. The
+    // chunk path measured ~11% throughput hidden in per-request logging.
+    if vhost_log_headers == 0 {
+        if let Some(body_bytes) = resp.body().content_length() {
+            let referer = req
+                .headers()
+                .get(http::header::REFERER)
+                .and_then(|v| v.to_str().ok());
+            let user_agent = req
+                .headers()
+                .get(http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok());
+            chunk_access_line(log, |buf, format| {
+                hj_log::render_access_line_into(
+                    buf,
+                    format,
+                    ctx.client_ip,
+                    ctx.request_time,
+                    req.method().as_str(),
+                    req.uri().path(),
+                    req.uri().query(),
+                    proto.as_str(),
+                    status,
+                    body_bytes,
+                    referer,
+                    user_agent,
+                    Some(&ctx.request_id as &dyn std::fmt::Display),
+                );
+            });
+            return resp;
+        }
+    }
     let mtls_required = state.mtls_required_vhosts.contains(&ctx.vhost_name);
     let mtls_ok = if mtls_required {
         ctx.tls
@@ -963,6 +1135,68 @@ pub async fn handle(
 /// trade-off is that a streamed response is logged at completion rather than at
 /// header time — which is how Apache/LiteSpeed already behave. Returns the response
 /// (body rewrapped in the streaming case).
+const ACCESS_CHUNK_FLUSH_BYTES: usize = 16 * 1024;
+const ACCESS_CHUNK_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(250);
+
+struct PendingChunk {
+    logger: Arc<hj_log::AccessLogger>,
+    buf: Vec<u8>,
+    lines: u32,
+    first: std::time::Instant,
+}
+
+thread_local! {
+    /// (#349) Per-serving-thread access-line chunks, keyed by logger identity.
+    /// Fast-path serves render their line on-core (borrowed data, no Strings)
+    /// and ship one channel message per chunk instead of one per line. Flushed
+    /// by size/age here and by the per-worker ticker in `uring`.
+    static ACCESS_CHUNKS: std::cell::RefCell<rustc_hash::FxHashMap<usize, PendingChunk>> =
+        std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+}
+
+fn chunk_access_line(
+    log: &Arc<hj_log::AccessLogger>,
+    render: impl FnOnce(&mut Vec<u8>, hj_log::LogFormat),
+) {
+    let key = Arc::as_ptr(log) as usize;
+    ACCESS_CHUNKS.with(|chunks| {
+        let mut chunks = chunks.borrow_mut();
+        let entry = chunks.entry(key).or_insert_with(|| PendingChunk {
+            logger: log.clone(),
+            buf: Vec::with_capacity(ACCESS_CHUNK_FLUSH_BYTES + 512),
+            lines: 0,
+            first: std::time::Instant::now(),
+        });
+        if entry.lines == 0 {
+            entry.first = std::time::Instant::now();
+        }
+        render(&mut entry.buf, log.format());
+        entry.lines += 1;
+        if entry.buf.len() >= ACCESS_CHUNK_FLUSH_BYTES
+            || entry.first.elapsed() >= ACCESS_CHUNK_MAX_AGE
+        {
+            let buf = std::mem::take(&mut entry.buf);
+            let lines = std::mem::replace(&mut entry.lines, 0);
+            entry.logger.log_chunk(buf, lines);
+        }
+    });
+}
+
+/// (#349) Flush this thread's pending access-line chunks (per-worker ticker +
+/// worker drain call this; size/age flushes happen inline on append).
+pub(crate) fn flush_access_chunks() {
+    ACCESS_CHUNKS.with(|chunks| {
+        let mut chunks = chunks.borrow_mut();
+        for entry in chunks.values_mut() {
+            if entry.lines > 0 {
+                let buf = std::mem::take(&mut entry.buf);
+                let lines = std::mem::replace(&mut entry.lines, 0);
+                entry.logger.log_chunk(buf, lines);
+            }
+        }
+    });
+}
+
 fn log_access(
     log: &Arc<hj_log::AccessLogger>,
     resp: Response,

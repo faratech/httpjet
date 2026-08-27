@@ -149,6 +149,25 @@ struct ServeArgs {
     /// worsens tail latency.
     #[arg(long)]
     no_core_pinning: bool,
+    /// (#330) io_uring ring setup for the per-core transport runtimes.
+    /// `legacy` (default) = flagless rings — the A/B measured `coop`
+    /// (COOP_TASKRUN + SUBMIT_ALL) as noise and `defer` (+SINGLE_ISSUER +
+    /// DEFER_TASKRUN) as a consistent ~-2% on this virtualized guest; both
+    /// stay available for other hardware. Ring size stays default —
+    /// ring memory is memlock-charged and bigger rings under the prod unit's
+    /// LimitMEMLOCK bankrupt late runtimes (2026-08-27 crash-loop); the
+    /// HJ_URING_ENTRIES env override exists for alt-instance experiments.
+    /// Unsupported flags fall back to plain rings per-thread with a warning.
+    #[arg(long, default_value = "legacy", value_parser = ["legacy", "coop", "defer"])]
+    uring_ring: String,
+    /// (#334) Disable multishot accept: submit one accept SQE per connection
+    /// (the pre-multishot behavior) instead of one armed SQE per listener.
+    #[arg(long)]
+    no_multishot_accept: bool,
+    /// (#335) Opt IN to multishot receive (provided-buffer-ring reads on
+    /// H1-TLS connections). Measured flat on this host — experiment hook.
+    #[arg(long)]
+    recv_multi: bool,
     /// Do not spawn lsphp; PHP requests fall back to static serving.
     #[arg(long)]
     no_php: bool,
@@ -707,8 +726,16 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     if args.workers == Some(0) {
         eprintln!("--workers 0 is invalid; running with 1 worker");
     }
+    // (#349 experiment) HJ_TOKIO_WORKERS: independent tokio side-runtime
+    // sizing — the transport runs `workers` monoio threads AND this runtime
+    // ran `workers` more tokio threads (8+8 on an 8-CPU box).
+    let tokio_workers = std::env::var("HJ_TOKIO_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(workers);
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(workers)
+        .worker_threads(tokio_workers)
         .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
         .on_thread_park(memtrim::collect_if_requested_on_thread)
         .on_thread_stop(memtrim::force_collect)
@@ -728,6 +755,26 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     if args.no_core_pinning {
         uring::CORE_PINNING.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("--no-core-pinning: per-core transport threads left unpinned");
+    }
+
+    if args.no_multishot_accept {
+        uring::MULTISHOT_ACCEPT.store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("--no-multishot-accept: single-shot accept SQE per connection");
+    }
+
+    if args.recv_multi {
+        uring::directio::RECV_MULTI.store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("--recv-multi: provided-buffer-ring multishot receive enabled");
+    }
+
+    let ring_mode = match args.uring_ring.as_str() {
+        "legacy" => uring::RING_LEGACY,
+        "defer" => uring::RING_DEFER,
+        _ => uring::RING_COOP,
+    };
+    uring::RING_MODE.store(ring_mode, std::sync::atomic::Ordering::Relaxed);
+    if ring_mode != uring::RING_LEGACY {
+        tracing::info!(mode = %args.uring_ring, "--uring-ring: non-default ring setup selected");
     }
 
     // Local-test override: relax the mandatory client-cert check so TLS can be

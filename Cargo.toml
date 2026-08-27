@@ -43,6 +43,9 @@ hj-h2 = { path = "crates/hj-h2" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "signal", "sync", "time", "macros", "process"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 monoio = { version = "=0.2.4" }
+# Same crate/version monoio drives its rings with — used only to hand
+# `uring_builder` a flags-configured io_uring::Builder (#330).
+io-uring = "0.6"
 socket2 = "0.6"
 rustix = { version = "1", features = ["fs", "net", "process"] }
 

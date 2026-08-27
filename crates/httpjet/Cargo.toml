@@ -43,6 +43,7 @@ pprof = { version = "=0.15.0", features = ["prost-codec", "frame-pointer"], opti
 # Without it, a monoio task awaiting a cross-thread future deadlocks (the local-only waker
 # never unparks the io_uring loop).
 monoio = { workspace = true, features = ["sync"] }
+io-uring = { workspace = true }
 # TLS termination on the monoio io_uring path (rustls over monoio's owned-buffer I/O).
 # Pinned to exact 0.4.0, which requires rustls ~0.23.4 + monoio 0.2 — both already in the
 # lock; default-features=false keeps it on our process-wide aws-lc-rs.

@@ -242,12 +242,23 @@ struct Buffer {
     buf: Box<[u8]>,
 }
 
+/// httpjet patch (#349): allocate the ciphertext buffer without the zero fill.
+/// Every byte below `write` is explicitly written (`copy_from` / `IoBufMut`
+/// completion / `grow_to`'s prefix copy) before any read exposes it
+/// (`read_ptr`/`bytes_init` are bounded by `write`), so the 64 KiB-per-accept
+/// (512 KiB on burst growth) memset was pure cost on the handshake path.
+fn uninit_box(size: usize) -> Box<[u8]> {
+    // SAFETY: u8 has no invalid bit patterns and the Buffer invariant above
+    // guarantees no uninitialized byte is ever read.
+    unsafe { Box::new_uninit_slice(size).assume_init() }
+}
+
 impl Buffer {
     fn new(size: usize) -> Self {
         Self {
             read: 0,
             write: 0,
-            buf: vec![0; size].into_boxed_slice(),
+            buf: uninit_box(size),
         }
     }
 
@@ -290,7 +301,7 @@ impl Buffer {
             self.read = 0;
         }
         let len = self.write;
-        let mut next = vec![0; new_cap].into_boxed_slice();
+        let mut next = uninit_box(new_cap);
         next[..len].copy_from_slice(&self.buf[..len]);
         self.buf = next;
     }

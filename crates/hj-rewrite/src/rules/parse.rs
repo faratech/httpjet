@@ -170,6 +170,9 @@ fn keyable_var(var: &str) -> Option<CacheKeyVar> {
         if hdr.eq_ignore_ascii_case("Origin") {
             return Some(CacheKeyVar::Origin);
         }
+        if hdr.eq_ignore_ascii_case("Accept") {
+            return Some(CacheKeyVar::Accept);
+        }
     }
     None
 }

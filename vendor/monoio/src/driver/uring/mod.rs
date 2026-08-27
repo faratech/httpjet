@@ -24,6 +24,7 @@ use super::{
 };
 use crate::utils::slab::Slab;
 
+pub(crate) mod bufring;
 mod lifecycle;
 #[cfg(feature = "sync")]
 mod waker;
@@ -59,6 +60,12 @@ pub struct IoUringDriver {
 pub(crate) struct UringInner {
     /// In-flight operations
     ops: Ops,
+
+    /// httpjet patch (#335): lazily-registered provided-buffer ring backing
+    /// multishot receive. Boxed so its registered address never moves; field
+    /// order keeps it alive until after `Drop for UringInner` closed the ring
+    /// (registration dies with the ring fd, then the memory frees).
+    buf_ring: Option<Box<bufring::BufRing>>,
 
     #[cfg(feature = "poll-io")]
     poll: super::poll::Poll,
@@ -110,6 +117,7 @@ impl IoUringDriver {
             #[cfg(feature = "poll-io")]
             poller_installed: false,
             ops: Ops::new(),
+            buf_ring: None,
             ext_arg: uring.params().is_feature_ext_arg(),
             uring,
         }));
@@ -144,6 +152,7 @@ impl IoUringDriver {
             #[cfg(feature = "poll-io")]
             poll: super::poll::Poll::with_capacity(entries as usize)?,
             ops: Ops::new(),
+            buf_ring: None,
             ext_arg: uring.params().is_feature_ext_arg(),
             uring,
             shared_waker: std::sync::Arc::new(waker::EventWaker::new(waker)),
@@ -468,6 +477,116 @@ impl UringInner {
         // for IO, we will submit on `park`.
         // let _ = inner.submit();
         Ok(op)
+    }
+
+    /// httpjet patch (#334): arm a MULTISHOT operation — one SQE that yields a
+    /// stream of CQEs. The slab slot is created in the `MultiShot` lifecycle
+    /// so every completion (flagged `IORING_CQE_F_MORE` until the terminal
+    /// one) queues into it instead of consuming the slot.
+    pub(crate) fn submit_multi_with_data<T>(
+        this: &Rc<UnsafeCell<UringInner>>,
+        data: T,
+        owns_fds: bool,
+    ) -> io::Result<crate::driver::op::MultiOp<T>>
+    where
+        T: OpAble,
+    {
+        let inner = unsafe { &mut *this.get() };
+        if inner.uring.submission().is_full() {
+            inner.submit()?;
+        }
+        let index = inner.ops.slab.insert(Lifecycle::MultiShot {
+            results: std::collections::VecDeque::new(),
+            waker: None,
+            done: false,
+            detached: false,
+            owns_fds,
+        });
+        let mut op = crate::driver::op::MultiOp::new(Inner::Uring(this.clone()), index, data);
+        let sqe = OpAble::uring_op(op.data_mut()).user_data(index as _);
+        {
+            let mut sq = inner.uring.submission();
+            if unsafe { sq.push(&sqe).is_err() } {
+                unimplemented!("when is this hit?");
+            }
+        }
+        Ok(op)
+    }
+
+    /// httpjet patch (#334): poll the next completion of a multishot op.
+    /// httpjet patch (#335): id of the provided-buffer group, registering the
+    /// ring on first use.
+    pub(crate) fn ensure_buf_ring(this: &Rc<UnsafeCell<UringInner>>) -> io::Result<u16> {
+        let inner = unsafe { &mut *this.get() };
+        if inner.buf_ring.is_none() {
+            let mut br = Box::new(bufring::BufRing::new(
+                bufring::DEFAULT_ENTRIES,
+                bufring::DEFAULT_BUF_SIZE,
+                bufring::DEFAULT_BUF_GROUP,
+            ));
+            // SAFETY: the ring memory is boxed inside UringInner and outlives
+            // the io_uring registration (see field-order note on `buf_ring`).
+            unsafe { br.register(&inner.uring.submitter())? };
+            inner.buf_ring = Some(br);
+        }
+        Ok(inner.buf_ring.as_ref().unwrap().bgid())
+    }
+
+    /// httpjet patch (#335): copy out of kernel-filled buffer `bid` starting
+    /// at `off` (of `total` received bytes) into `dst`; returns bytes copied.
+    pub(crate) fn buf_ring_copy(
+        this: &Rc<UnsafeCell<UringInner>>,
+        bid: u16,
+        off: usize,
+        total: usize,
+        dst: &mut [u8],
+    ) -> usize {
+        let inner = unsafe { &mut *this.get() };
+        let br = inner.buf_ring.as_ref().expect("buf ring not registered");
+        let n = (total - off).min(dst.len());
+        // SAFETY: bid+total come from a CQE for this group; bounds asserted
+        // inside slice().
+        dst[..n].copy_from_slice(unsafe { &br.slice(bid, total)[off..off + n] });
+        n
+    }
+
+    /// httpjet patch (#335): hand buffer `bid` back to the kernel.
+    pub(crate) fn buf_ring_recycle(this: &Rc<UnsafeCell<UringInner>>, bid: u16) {
+        let inner = unsafe { &mut *this.get() };
+        if let Some(br) = inner.buf_ring.as_mut() {
+            br.recycle(bid);
+        }
+    }
+
+    pub(crate) fn poll_multi_op(
+        this: &Rc<UnsafeCell<UringInner>>,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<CompletionMeta>> {
+        let inner = unsafe { &mut *this.get() };
+        let lifecycle = unsafe { inner.ops.slab.get(index).unwrap_unchecked() };
+        lifecycle.poll_multi(cx)
+    }
+
+    /// httpjet patch (#334): consumer of a multishot op is going away —
+    /// discard queued results (closing owned fds) and cancel the armed SQE if
+    /// it has not terminated yet (its terminal CQE then frees the slot).
+    pub(crate) fn drop_multi_op(this: &Rc<UnsafeCell<UringInner>>, index: usize) {
+        let inner = unsafe { &mut *this.get() };
+        if let Some(lifecycle) = inner.ops.slab.get(index) {
+            let terminal = lifecycle.detach_multi();
+            if !terminal {
+                unsafe {
+                    let cancel = opcode::AsyncCancel::new(index as u64)
+                        .build()
+                        .user_data(u64::MAX);
+                    if inner.uring.submission().push(&cancel).is_err() {
+                        let _ = inner.submit();
+                        let _ = inner.uring.submission().push(&cancel);
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn poll_op(

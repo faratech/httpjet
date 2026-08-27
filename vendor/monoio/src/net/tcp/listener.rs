@@ -106,6 +106,18 @@ impl TcpListener {
         Self::bind_with_config(addr, &DEFAULT_CFG)
     }
 
+    /// httpjet patch (#334): arm a MULTISHOT accept — one submission yields a
+    /// stream of accepted connections until the kernel terminates it (listener
+    /// close/cancel or transient resource exhaustion). io_uring driver only.
+    /// The listener must outlive the stream. Multishot accept carries no peer
+    /// sockaddr; use `TcpStream::peer_addr` if the address is needed.
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    pub fn accept_multi(&self) -> io::Result<AcceptMultiStream> {
+        Ok(AcceptMultiStream {
+            op: crate::driver::op::MultiOp::accept_multi(&self.fd)?,
+        })
+    }
+
     /// Accept
     pub async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let op = Op::accept(&self.fd)?;
@@ -318,4 +330,24 @@ impl Drop for TcpListener {
 #[derive(Debug, Default, Clone)]
 struct ListenerMeta {
     local_addr: Option<SocketAddr>,
+}
+
+/// httpjet patch (#334): an armed multishot-accept stream over a
+/// [`TcpListener`]. `next().await` yields accepted connections with no accept
+/// SQE per connection; `None` means the multishot terminated (re-arm via
+/// [`TcpListener::accept_multi`], or fall back to single-shot `accept`).
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+pub struct AcceptMultiStream {
+    op: crate::driver::op::MultiOp<crate::driver::op::AcceptMulti>,
+}
+
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+impl AcceptMultiStream {
+    pub async fn next(&mut self) -> Option<io::Result<TcpStream>> {
+        let meta = std::future::poll_fn(|cx| self.op.poll_next_completion(cx)).await?;
+        Some(match meta.result {
+            Ok(fd) => SharedFd::new::<false>(fd as _).map(TcpStream::from_shared_fd),
+            Err(e) => Err(e),
+        })
+    }
 }

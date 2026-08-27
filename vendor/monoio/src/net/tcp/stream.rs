@@ -656,3 +656,113 @@ impl Drop for StreamMeta {
         let _ = socket.into_raw_socket();
     }
 }
+
+
+/// httpjet patch (#335): a MULTISHOT receive stream over this connection,
+/// drawing from the driver's provided-buffer ring — zero receive submissions
+/// at steady state. `read` is `AsyncReadRent`-shaped: bytes are copied out of
+/// the kernel-filled group buffer into the caller's buffer and the group
+/// buffer is recycled the moment it is drained (a partially-consumed buffer
+/// is retained across calls). On stream termination (cancel or transient
+/// `ENOBUFS` when the group runs dry) the op re-arms transparently; EOF and
+/// real socket errors surface as usual.
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+pub struct RecvMultiStream {
+    op: crate::driver::op::MultiOp<crate::driver::op::RecvMulti>,
+    fd: SharedFd,
+    bgid: u16,
+    /// (buffer id, total received, consumed offset) of a partially-read buffer.
+    pending: Option<(u16, usize, usize)>,
+}
+
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+impl TcpStream {
+    /// Arm multishot receive on this connection. io_uring driver only.
+    pub fn recv_multi(&self) -> std::io::Result<RecvMultiStream> {
+        let bgid = crate::driver::CURRENT.with(|d| d.ensure_buf_ring())?;
+        Ok(RecvMultiStream {
+            op: crate::driver::op::MultiOp::recv_multi(&self.fd, bgid)?,
+            fd: self.fd.clone(),
+            bgid,
+            pending: None,
+        })
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+impl RecvMultiStream {
+    pub async fn read<B: crate::buf::IoBufMut>(&mut self, mut buf: B) -> crate::BufResult<usize, B> {
+        use crate::buf::IoBufMut;
+        loop {
+            if let Some((bid, total, off)) = self.pending.take() {
+                let cap = buf.bytes_total();
+                if cap == 0 {
+                    self.pending = Some((bid, total, off));
+                    return (Ok(0), buf);
+                }
+                // SAFETY: write_ptr()..cap is this buffer's writable region;
+                // set_init records exactly the bytes copied below.
+                let dst = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), cap) };
+                let n = crate::driver::CURRENT.with(|d| d.buf_ring_copy(bid, off, total, dst));
+                if off + n < total {
+                    self.pending = Some((bid, total, off + n));
+                } else {
+                    crate::driver::CURRENT.with(|d| d.buf_ring_recycle(bid));
+                }
+                unsafe { buf.set_init(n) };
+                return (Ok(n), buf);
+            }
+            match std::future::poll_fn(|cx| self.op.poll_next_completion(cx)).await {
+                None => {
+                    // Terminal CQE drained (cancelled or group momentarily dry): re-arm.
+                    match crate::driver::op::MultiOp::recv_multi(&self.fd, self.bgid) {
+                        Ok(op) => {
+                            self.op = op;
+                            continue;
+                        }
+                        Err(e) => return (Err(e), buf),
+                    }
+                }
+                Some(meta) => match meta.result {
+                    Ok(0) => return (Ok(0), buf),
+                    Ok(len) => match io_uring::cqueue::buffer_select(meta.flags) {
+                        Some(bid) => {
+                            self.pending = Some((bid, len as usize, 0));
+                        }
+                        None => {
+                            return (
+                                Err(std::io::Error::other("multishot recv CQE without buffer id")),
+                                buf,
+                            );
+                        }
+                    },
+                    Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                        // Group exhausted at arrival: the multishot terminated;
+                        // buffers recycle as consumers drain, so re-arm.
+                        match crate::driver::op::MultiOp::recv_multi(&self.fd, self.bgid) {
+                            Ok(op) => {
+                                self.op = op;
+                                continue;
+                            }
+                            Err(e2) => return (Err(e2), buf),
+                        }
+                    }
+                    Err(e) => return (Err(e), buf),
+                },
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "iouring"))]
+impl Drop for RecvMultiStream {
+    fn drop(&mut self) {
+        // A partially-consumed group buffer must go back to the kernel or the
+        // slot leaks for the driver's lifetime.
+        if let Some((bid, _, _)) = self.pending.take() {
+            if crate::driver::CURRENT.is_set() {
+                crate::driver::CURRENT.with(|d| d.buf_ring_recycle(bid));
+            }
+        }
+    }
+}

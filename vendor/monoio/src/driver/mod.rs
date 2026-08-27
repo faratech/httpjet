@@ -173,6 +173,118 @@ impl Inner {
         }
     }
 
+    // httpjet patch (#334): MULTISHOT ops are io_uring-only (the legacy/epoll
+    // driver has no equivalent — callers must fall back to single-shot there).
+    fn submit_multi_with<T: OpAble>(&self, data: T, owns_fds: bool) -> io::Result<op::MultiOp<T>> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "iouring"))]
+            Inner::Uring(this) => UringInner::submit_multi_with_data(this, data, owns_fds),
+            #[cfg(feature = "legacy")]
+            Inner::Legacy(_) => {
+                let _ = (data, owns_fds);
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "multishot ops require the io_uring driver",
+                ))
+            }
+            #[cfg(all(
+                not(feature = "legacy"),
+                not(all(target_os = "linux", feature = "iouring"))
+            ))]
+            _ => {
+                util::feature_panic();
+            }
+        }
+    }
+
+    fn poll_multi_op(
+        &self,
+        index: usize,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<op::CompletionMeta>> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "iouring"))]
+            Inner::Uring(this) => UringInner::poll_multi_op(this, index, cx),
+            #[cfg(feature = "legacy")]
+            Inner::Legacy(_) => unreachable!("multishot ops require the io_uring driver"),
+            #[cfg(all(
+                not(feature = "legacy"),
+                not(all(target_os = "linux", feature = "iouring"))
+            ))]
+            _ => {
+                util::feature_panic();
+            }
+        }
+    }
+
+    // httpjet patch (#335): provided-buffer-ring accessors (io_uring only).
+    pub(crate) fn ensure_buf_ring(&self) -> io::Result<u16> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "iouring"))]
+            Inner::Uring(this) => UringInner::ensure_buf_ring(this),
+            #[cfg(feature = "legacy")]
+            Inner::Legacy(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "buffer rings require the io_uring driver",
+            )),
+            #[cfg(all(
+                not(feature = "legacy"),
+                not(all(target_os = "linux", feature = "iouring"))
+            ))]
+            _ => {
+                util::feature_panic();
+            }
+        }
+    }
+
+    pub(crate) fn buf_ring_copy(&self, bid: u16, off: usize, total: usize, dst: &mut [u8]) -> usize {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "iouring"))]
+            Inner::Uring(this) => UringInner::buf_ring_copy(this, bid, off, total, dst),
+            #[cfg(feature = "legacy")]
+            Inner::Legacy(_) => unreachable!("buffer rings require the io_uring driver"),
+            #[cfg(all(
+                not(feature = "legacy"),
+                not(all(target_os = "linux", feature = "iouring"))
+            ))]
+            _ => {
+                util::feature_panic();
+            }
+        }
+    }
+
+    pub(crate) fn buf_ring_recycle(&self, bid: u16) {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "iouring"))]
+            Inner::Uring(this) => UringInner::buf_ring_recycle(this, bid),
+            #[cfg(feature = "legacy")]
+            Inner::Legacy(_) => {}
+            #[cfg(all(
+                not(feature = "legacy"),
+                not(all(target_os = "linux", feature = "iouring"))
+            ))]
+            _ => {
+                util::feature_panic();
+            }
+        }
+    }
+
+    fn drop_multi_op(&self, index: usize) {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "iouring"))]
+            Inner::Uring(this) => UringInner::drop_multi_op(this, index),
+            #[cfg(feature = "legacy")]
+            Inner::Legacy(_) => {}
+            #[cfg(all(
+                not(feature = "legacy"),
+                not(all(target_os = "linux", feature = "iouring"))
+            ))]
+            _ => {
+                util::feature_panic();
+            }
+        }
+    }
+
     #[allow(unused)]
     pub(super) unsafe fn cancel_op(&self, op_canceller: &op::OpCanceller) {
         match self {
