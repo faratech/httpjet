@@ -250,6 +250,39 @@ impl Upstream {
         }
         // No reusable idle connection: dial fresh, feeding the breaker so a run of
         // connect failures opens it (and a success closes it).
+        self.dial_tracked().await
+    }
+
+    /// Check out a connection for the one-shot retry in [`crate::Proxy::forward`]: ALWAYS a
+    /// fresh dial, never a pooled entry.
+    ///
+    /// The retry exists because a pooled connection lost the idle-close race in
+    /// [`Self::checkout`]'s `is_ready()` gate, and a backend that closed one idle connection
+    /// has usually closed the whole batch (a worker recycle — uvicorn defaults to a 5 s
+    /// keep-alive against our `pcKeepAliveTimeout` of 600 s). Taking another pooled entry
+    /// would lose the same race with no third attempt left. Bounded like [`Self::acquire`]'s
+    /// queue wait, because prod sets `initTimeout=600` on ext processors and a retry must not
+    /// park for ten minutes.
+    pub(crate) async fn checkout_fresh(&self) -> Result<SendRequest<OutBody>, ProxyError> {
+        if self.breaker_open() {
+            return Err(ProxyError::CircuitOpen);
+        }
+        let budget = self.connect_timeout.min(Self::MAX_QUEUE_WAIT);
+        match tokio::time::timeout(budget, self.dial_tracked()).await {
+            Ok(r) => r,
+            Err(_) => {
+                // This budget is shorter than `dial`'s own `connect_timeout`, so it is the arm
+                // that fires against a black-holed upstream. Cancelling `dial_tracked` skips
+                // its bookkeeping, so record the failure here or the breaker never trips.
+                self.note_dial_failure();
+                Err(ProxyError::ConnectTimeout)
+            }
+        }
+    }
+
+    /// Dial, feeding the breaker so a run of connect failures opens it (and a success
+    /// closes it).
+    async fn dial_tracked(&self) -> Result<SendRequest<OutBody>, ProxyError> {
         match self.dial().await {
             Ok(sender) => {
                 self.note_dial_success();

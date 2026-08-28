@@ -51,6 +51,13 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
                 if keep_upgrade && tok.eq_ignore_ascii_case("upgrade") {
                     continue;
                 }
+                // RFC 9110 7.6.1 forbids listing `Host` in `Connection`, so honoring the token
+                // only lets a client delete the Host we just ensured: `ensure_host` runs BEFORE
+                // this strip, hyper's low-level h1 client never synthesizes one, and the backend
+                // answers 400. Never a legitimate hop-by-hop nomination.
+                if tok.eq_ignore_ascii_case("host") {
+                    continue;
+                }
                 if let Ok(name) = HeaderName::from_bytes(tok.as_bytes()) {
                     conn_named.push(name);
                 }

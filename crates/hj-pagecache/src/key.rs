@@ -234,6 +234,58 @@ pub fn vary_value_from_request(cookie_header: Option<&str>, vary_cookie_name: &s
     String::new()
 }
 
+/// Unified 64-bit cache key that discriminates between page and static entries.
+///
+/// Bit 63 is a type discriminant:
+///   0 → page entry (bits 0-62 = hash of PageCacheKey)
+///   1 → static file (bits 0-62 = hash of vhost_id ++ path)
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub struct UnifiedKeyId(pub u64);
+
+impl UnifiedKeyId {
+    /// Build a page-cache key from an existing PageCacheKey hash.
+    pub fn for_page(raw: u64) -> Self {
+        Self(raw & !(1u64 << 63))
+    }
+
+    /// Build a static-file key from vhost_id and path.
+    pub fn for_static(vhost_id: u32, path: &str) -> Self {
+        let h = hash_static_key(vhost_id, path);
+        Self(h | (1u64 << 63))
+    }
+
+    /// Check if this is a static file entry (bit 63 set).
+    pub fn is_static(self) -> bool {
+        self.0 >> 63 == 1
+    }
+
+    /// Get the 0-62 bits (without the type discriminant).
+    pub fn inner(self) -> u64 {
+        self.0 & !(1u64 << 63)
+    }
+}
+
+// For backwards compatibility, CacheKeyId is an alias to UnifiedKeyId
+pub type CacheKeyId = UnifiedKeyId;
+
+/// Hash a static file key from vhost_id and path.
+/// Uses the same FNV-like algorithm as page keys to ensure uniform distribution.
+pub fn hash_static_key(vhost_id: u32, path: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        h ^= 0xFF;
+        h = h.wrapping_mul(0x0000_0100_0000_01B3);
+    };
+    eat(&vhost_id.to_le_bytes());
+    eat(path.as_bytes());
+    // Ensure bit 63 is clear (will be set by for_static)
+    h & !(1u64 << 63)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,56 +505,4 @@ mod tests {
         let http = public_with_vary(0, false, "forum.example", "/threads/1234", "", "");
         assert_ne!(https, http, "HTTP and HTTPS must not share a cache entry");
     }
-}
-
-/// Unified 64-bit cache key that discriminates between page and static entries.
-///
-/// Bit 63 is a type discriminant:
-///   0 → page entry (bits 0-62 = hash of PageCacheKey)
-///   1 → static file (bits 0-62 = hash of vhost_id ++ path)
-#[derive(Copy, Clone, Eq, PartialEq, Hash)]
-pub struct UnifiedKeyId(pub u64);
-
-impl UnifiedKeyId {
-    /// Build a page-cache key from an existing PageCacheKey hash.
-    pub fn for_page(raw: u64) -> Self {
-        Self(raw & !(1u64 << 63))
-    }
-
-    /// Build a static-file key from vhost_id and path.
-    pub fn for_static(vhost_id: u32, path: &str) -> Self {
-        let h = hash_static_key(vhost_id, path);
-        Self(h | (1u64 << 63))
-    }
-
-    /// Check if this is a static file entry (bit 63 set).
-    pub fn is_static(self) -> bool {
-        self.0 >> 63 == 1
-    }
-
-    /// Get the 0-62 bits (without the type discriminant).
-    pub fn inner(self) -> u64 {
-        self.0 & !(1u64 << 63)
-    }
-}
-
-// For backwards compatibility, CacheKeyId is an alias to UnifiedKeyId
-pub type CacheKeyId = UnifiedKeyId;
-
-/// Hash a static file key from vhost_id and path.
-/// Uses the same FNV-like algorithm as page keys to ensure uniform distribution.
-pub fn hash_static_key(vhost_id: u32, path: &str) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut eat = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0000_0100_0000_01B3);
-        }
-        h ^= 0xFF;
-        h = h.wrapping_mul(0x0000_0100_0000_01B3);
-    };
-    eat(&vhost_id.to_le_bytes());
-    eat(path.as_bytes());
-    // Ensure bit 63 is clear (will be set by for_static)
-    h & !(1u64 << 63)
 }

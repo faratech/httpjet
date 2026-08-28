@@ -254,6 +254,16 @@ async fn accept_drain_loop<F, Fut>(
                         // mid-size bodies behind the peer's ~40 ms delayed ACK. The option is
                         // TCP-level and persists across the kTLS TCP_ULP upgrade on this fd.
                         let _ = stream.set_nodelay(true);
+                        // Keepalive persists across an h1->WebSocket upgrade (same fd), so a
+                        // relay whose client peer silently vanishes is reaped instead of parking
+                        // its read forever. The tokio accept path armed this until server.rs was
+                        // removed; the systemd listener sets KeepAlive=no, so nothing is
+                        // inherited. Probe count stays at the OS default.
+                        let _ = stream.set_tcp_keepalive(
+                            Some(hj_proxy::PROXY_KEEPALIVE_IDLE),
+                            Some(hj_proxy::PROXY_KEEPALIVE_INTERVAL),
+                            None,
+                        );
                         let fut = on_accept(stream, peer);
                         let cnt = inflight.clone();
                         cnt.set(cnt.get() + 1);
@@ -1373,7 +1383,7 @@ async fn handle_h1_bridged<S>(
             if written.is_err() {
                 return;
             }
-            relay_h1_upgrade(stream, std::mem::take(&mut acc), upgrade).await;
+            relay_h1_upgrade(stream, std::mem::take(&mut acc), upgrade, &shutdown).await;
             return;
         }
         let is_head = method == http::Method::HEAD;
@@ -1710,8 +1720,12 @@ fn serialize_h1_upgrade_response(status: http::StatusCode, headers: &http::Heade
     out
 }
 
-async fn relay_h1_upgrade<S>(stream: S, prefix: Vec<u8>, upgrade: bridge::UringUpgradeIo)
-where
+async fn relay_h1_upgrade<S>(
+    stream: S,
+    prefix: Vec<u8>,
+    upgrade: bridge::UringUpgradeIo,
+    shutdown: &CancellationToken,
+) where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
 {
     use monoio::io::Splitable;
@@ -1750,9 +1764,14 @@ where
         }
         let _ = writer.shutdown().await;
     };
+    // An established relay has no request boundary to stop at, so without the shutdown arm it
+    // holds the whole drain grace on every restart — and a client that vanished with no
+    // FIN/RST would hold it even after keepalive reaps the socket, because the read has
+    // already returned.
     monoio::select! {
         _ = to_upstream => {}
         _ = from_upstream => {}
+        _ = shutdown.cancelled() => {}
     }
 }
 

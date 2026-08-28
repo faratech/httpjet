@@ -6,6 +6,7 @@
 //! receive/send halves; their fields are `pub(super)` so all three can read/write them.
 
 use bytes::Bytes;
+use rustc_hash::FxHashSet;
 
 /// Peer (client) SETTINGS we act on, with protocol defaults (RFC 7540 §6.5.2).
 #[derive(Debug, Clone, Copy)]
@@ -40,6 +41,15 @@ pub(super) struct Recv {
     /// Stream error to emit once a decode-and-discard header block reaches END_HEADERS.
     /// Even rejected blocks must be decoded because HPACK state is connection-wide.
     pub(super) discard_rst_code: u32,
+    /// (#357) Client stream ids torn down by a RST_STREAM — ours (every `rst!` site) or
+    /// the peer's. A later frame on one of these is the §5.1 close race and stays a
+    /// per-stream STREAM_CLOSED; a reused id NOT recorded here was closed cleanly or
+    /// never opened, which is the §5.1.1 connection error. Unlike `cancelled` (which is
+    /// consumed as aborted handlers drain), entries are never removed — a reset id is
+    /// illegal forever, we just answer it at stream scope. Bounded like `cancelled`
+    /// (cap = max_concurrent * 2); at the cap new ids are skipped — fail closed: an
+    /// unrecorded reset degrades a later race to GOAWAY rather than growing unbounded.
+    pub(super) reset_ids: FxHashSet<u32>,
     /// Our advertised SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2).
     pub(super) max_concurrent: usize,
     /// Connection-level RECEIVE flow-control window (§6.9): credit we have granted the peer for

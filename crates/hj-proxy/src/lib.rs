@@ -73,15 +73,19 @@ const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(60);
 /// instead of pinning it. (#14)
 const BODY_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// TCP keepalive idle + probe interval for connected proxy sockets (dialed
-/// upstream, WebSocket legs, accepted clients). Without keepalive a *dual* silent
-/// half-open — both peers vanish with no FIN/RST (dead NAT/conntrack entry) —
-/// is never surfaced to the app, so the drain task's `sender.ready()` (and the WS
-/// relay's `copy_bidirectional`) never resolve and pin a maxConns permit / relay
-/// task / two fds for the (dead) connection's lifetime. The `#70` drain design
-/// already *assumes* "a dead one is reaped by TCP keepalive" — this makes that true.
-const PROXY_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
-const PROXY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// TCP keepalive idle + probe interval for every socket that can outlive one request: the
+/// dialed upstream, the WebSocket upstream leg, and the ACCEPTED CLIENT socket (armed by the
+/// io_uring accept loop, which imports these). Without keepalive a peer that vanishes with no
+/// FIN/RST (dead NAT/conntrack entry, hard-powered-off box) is never surfaced to the app, so
+/// the drain task's `sender.ready()` — and the WebSocket relay's client-side read — never
+/// resolve, pinning a maxConns permit / relay task / two fds for the dead connection's
+/// lifetime. The `#70` drain design already *assumes* "a dead one is reaped by TCP keepalive".
+///
+/// Probe COUNT is left at the OS default (`tcp_keepalive_probes`, 9), so an idle dead peer is
+/// detected in ~195 s. Note the timer does not run while data is in flight — a push-only feed
+/// with a vanished reader is bounded by `tcp_retries2` (~15 min) instead.
+pub const PROXY_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+pub const PROXY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Enable TCP keepalive (idle 60s, then probe every 15s) on a connected stream.
 /// Best-effort — a failure to set the socket option is non-fatal (`set_nodelay`
@@ -178,8 +182,16 @@ impl Proxy {
     ///   [`Body::Stream`] — **no buffering, no compression, no read-idle
     ///   timeout** — so SSE / chunked / long-lived streams flow through frame by
     ///   frame;
-    /// - on connect failure when the upstream's `retry_timeout == 0`, returns a
-    ///   `502` immediately (the caller passes `retry` accordingly).
+    /// - retries a BODYLESS IDEMPOTENT request once, on a freshly dialed connection, when the
+    ///   first attempt's pooled connection died before response headers. Both attempts share
+    ///   one head deadline (`response_timeout`), so a retry neither shrinks nor doubles the
+    ///   budget an un-retried request would have had.
+    ///
+    /// The upstream's `retry_timeout` is deliberately NOT consulted here. In LiteSpeed it is a
+    /// worker bad-mark *cooldown* (0 means "never mark the worker bad", and the per-request
+    /// retry is bounded by an attempt count instead) — the analogue of this pool's breaker
+    /// half-open delay, not a per-request deadline. Reading it as one made every prod
+    /// extProcessor, all of which set 0, land on an arbitrary 5 s floor.
     pub async fn forward(
         &self,
         ctx: &ReqCtx,
@@ -281,63 +293,49 @@ impl Proxy {
                 }
             }
         } else {
-            match tokio::time::timeout(upstream.response_timeout(), sender.send_request(out_req))
-                .await
-            {
+            // ONE head deadline for the whole request, shared by both attempts. Bounding the
+            // retry separately narrowed a 60 s budget to 5 s and failed a slow-but-healthy
+            // backend that would otherwise have answered; sharing the deadline also keeps the
+            // total from reaching 2x response_timeout. The trade is deliberate: a first
+            // attempt that fails late leaves the retry less than the old fixed floor.
+            let head_deadline = tokio::time::Instant::now() + upstream.response_timeout();
+            match tokio::time::timeout_at(head_deadline, sender.send_request(out_req)).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    if let Some((m, u, _h)) = retry_head {
-                        // Bound the WHOLE retry (fresh dial + headers) by the
-                        // upstream's LiteSpeed `retryTimeout`, floor 5 s.
-                        let bound = target
-                            .retry_timeout
-                            .unwrap_or_default()
-                            .max(std::time::Duration::from_secs(5));
-                        tracing::debug!(
-                            error = %e,
-                            "hj-proxy: pooled connection died before send — retrying once on a fresh connection"
-                        );
-                        // The dead connection is discarded, NEVER re-pooled.
-                        drop(sender);
-                        let attempt = async {
-                            let mut sender2 = match upstream.checkout().await {
-                                Ok(s) => s,
-                                Err(err) => return Err((None, err.to_string())),
-                            };
-                            let inbound2 = match http::Request::builder()
-                                .method(m)
-                                .uri(u)
-                                .version(http::Version::HTTP_11)
-                                .body(hj_core::empty_incoming())
-                            {
-                                Ok(r) => r,
-                                Err(err) => return Err((Some(sender2), err.to_string())),
-                            };
-                            let out_req2 = match build_forward_request(
-                                ctx,
-                                inbound2,
-                                target,
-                                &upstream.authority,
-                            ) {
-                                Ok(r) => r,
-                                Err(err) => return Err((Some(sender2), err.to_string())),
-                            };
-                            match sender2.send_request(out_req2).await {
-                                Ok(resp) => Ok((sender2, resp)),
-                                Err(err) => Err((Some(sender2), err.to_string())),
-                            }
-                        };
-                        match tokio::time::timeout(bound, attempt).await {
-                            // Retry succeeded: hand the LIVE connection to the
-                            // normal drain/pool path below by replacing `sender`.
-                            Ok(Ok((sender2, resp))) => {
-                                sender = sender2;
-                                resp
-                            }
-                            _ => return Err(ProxyError::Request(e.to_string()).into()),
-                        }
-                    } else {
+                    let Some((m, u, h)) = retry_head else {
                         return Err(ProxyError::Request(e.to_string()).into());
+                    };
+                    tracing::debug!(
+                        error = %e,
+                        "hj-proxy: pooled connection died before send — retrying once on a fresh connection"
+                    );
+                    // The dead connection is discarded, NEVER re-pooled.
+                    drop(sender);
+                    // `checkout` prefers a pooled entry, and a backend that closed one idle
+                    // connection has usually closed the batch — so it would hand back a sibling
+                    // of the connection that just died and lose the same race, with no third
+                    // attempt left.
+                    let mut sender2 = match upstream.checkout_fresh().await {
+                        Ok(s) => s,
+                        Err(err) => return Err(err.into()),
+                    };
+                    let inbound2 = match rebuild_retry_request(m, u, h) {
+                        Ok(r) => r,
+                        Err(err) => return Err(HandlerError::Other(err.to_string())),
+                    };
+                    let out_req2 =
+                        build_forward_request(ctx, inbound2, target, &upstream.authority)?;
+                    match tokio::time::timeout_at(head_deadline, sender2.send_request(out_req2))
+                        .await
+                    {
+                        // Retry succeeded: hand the LIVE connection to the
+                        // normal drain/pool path below by replacing `sender`.
+                        Ok(Ok(resp)) => {
+                            sender = sender2;
+                            resp
+                        }
+                        Ok(Err(err)) => return Err(ProxyError::Request(err.to_string()).into()),
+                        Err(_) => return Err(ProxyError::ResponseTimeout.into()),
                     }
                 }
                 Err(_) => return Err(ProxyError::ResponseTimeout.into()),
@@ -624,6 +622,32 @@ fn ensure_host(headers: &mut http::HeaderMap, _target: &ProxyTarget, fallback_au
     if let Ok(v) = HeaderValue::from_str(fallback_authority) {
         headers.insert(HOST, v);
     }
+}
+
+/// Rebuild the inbound request for the one bodyless retry from the pre-rewrite head
+/// snapshotted before the first attempt.
+///
+/// The client's headers must ride along: on an empty map [`ensure_host`] finds no `Host`
+/// and substitutes the upstream authority (and `X-Forwarded-Host` then inherits that wrong
+/// value), while `Cookie` / `Authorization` / `Accept` / `Range` / conditional headers never
+/// reach the backend — so the "retry" would be a materially different request than the one
+/// the dead connection took. `Content-Length` is dropped because the replay carries an empty
+/// body and [`body_is_present`] also classifies an unparseable value as bodyless. Hop-by-hop
+/// headers and the `X-Forwarded-For` hop are handled by [`build_forward_request`], which runs
+/// over this head exactly once, as it did on the first attempt.
+fn rebuild_retry_request(
+    method: http::Method,
+    uri: Uri,
+    headers: http::HeaderMap,
+) -> Result<Request, http::Error> {
+    let mut req = HttpRequest::builder()
+        .method(method)
+        .uri(uri)
+        .version(Version::HTTP_11)
+        .body(hj_core::empty_incoming())?;
+    *req.headers_mut() = headers;
+    req.headers_mut().remove(http::header::CONTENT_LENGTH);
+    Ok(req)
 }
 
 /// Build the full outbound request (URI + rewritten headers + passthrough body)
@@ -1138,6 +1162,107 @@ mod tests {
                 .map(|c| !c.contains("upgrade"))
                 .unwrap_or(true),
             "Connection must not still advertise upgrade, got {conn:?}",
+        );
+    }
+
+    #[test]
+    fn retry_rebuild_replays_the_client_head() {
+        // The one retry must be the SAME request the dead connection took. Without the
+        // snapshotted head, ensure_host substitutes the upstream authority for the client
+        // Host and X-Forwarded-Host silently inherits it.
+        let c = ctx("9.9.9.9", false);
+        let mut h = http::HeaderMap::new();
+        h.insert(HOST, HeaderValue::from_static("client.example"));
+        h.insert(
+            http::header::COOKIE,
+            HeaderValue::from_static("xf_session=abc"),
+        );
+        h.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        h.insert(
+            http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer t0ken"),
+        );
+        h.insert("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        let uri: Uri = "/tools.json?a=1".parse().unwrap();
+        let req = rebuild_retry_request(http::Method::GET, uri, h).unwrap();
+        let target = ProxyTarget::parse_url("http://127.0.0.1:8002").unwrap();
+        let out = build_forward_request(&c, req, &target, &target.authority).unwrap();
+
+        assert_eq!(out.headers().get(HOST).unwrap(), "client.example");
+        assert_eq!(
+            out.headers().get("x-forwarded-host").unwrap(),
+            "client.example"
+        );
+        assert_eq!(
+            out.headers().get(http::header::COOKIE).unwrap(),
+            "xf_session=abc"
+        );
+        assert_eq!(
+            out.headers().get(http::header::ACCEPT).unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            out.headers().get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer t0ken"
+        );
+        // The snapshot is pre-rewrite, so the rewrite appends our hop exactly once.
+        assert_eq!(
+            out.headers().get("x-forwarded-for").unwrap(),
+            "198.51.100.7, 9.9.9.9"
+        );
+        assert_eq!(out.uri().path_and_query().unwrap(), "/tools.json?a=1");
+    }
+
+    #[test]
+    fn retry_rebuild_drops_framing_and_hop_by_hop() {
+        let c = ctx("9.9.9.9", false);
+        let mut h = http::HeaderMap::new();
+        h.insert(HOST, HeaderValue::from_static("client.example"));
+        h.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+        h.insert(
+            http::header::TRANSFER_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        h.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("keep-alive, x-hop"),
+        );
+        h.insert("x-hop", HeaderValue::from_static("secret"));
+        let uri: Uri = "/x".parse().unwrap();
+        let req = rebuild_retry_request(http::Method::GET, uri, h).unwrap();
+        assert!(req.headers().get(http::header::CONTENT_LENGTH).is_none());
+
+        let target = ProxyTarget::parse_url("http://127.0.0.1:8002").unwrap();
+        let out = build_forward_request(&c, req, &target, &target.authority).unwrap();
+        assert!(out.headers().get(http::header::TRANSFER_ENCODING).is_none());
+        assert!(out.headers().get(http::header::CONNECTION).is_none());
+        assert!(out.headers().get("x-hop").is_none());
+        assert_eq!(out.headers().get(HOST).unwrap(), "client.example");
+    }
+
+    #[test]
+    fn connection_host_token_does_not_delete_the_host() {
+        // RFC 9110 7.6.1 forbids naming Host in Connection; honoring it would let a client
+        // strip the Host and make the backend answer 400.
+        let c = ctx("9.9.9.9", false);
+        let body: hj_core::IncomingBody = Empty::<Bytes>::new()
+            .map_err(|e| Box::new(e) as BoxError)
+            .boxed();
+        let req = http::Request::builder()
+            .uri("/")
+            .header(HOST, "ai.windowsforum.com")
+            .header(http::header::CONNECTION, "keep-alive, host")
+            .body(body)
+            .unwrap();
+        let target = ProxyTarget::parse_url("http://127.0.0.1:8001").unwrap();
+        let out = build_forward_request(&c, req, &target, &target.authority).unwrap();
+        assert_eq!(out.headers().get(HOST).unwrap(), "ai.windowsforum.com");
+        assert_eq!(
+            out.headers().get("x-forwarded-host").unwrap(),
+            "ai.windowsforum.com"
         );
     }
 

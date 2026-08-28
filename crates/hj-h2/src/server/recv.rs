@@ -143,6 +143,12 @@ where
     macro_rules! rst {
         ($sid:expr_2021, $code:expr_2021) => {{
             out.frames(|b| frame::write_rst_stream(b, $sid, $code));
+            // (#357) Record the reset id (never consumed; skip at the cap — fail
+            // closed into a connection error on a later reuse) so a subsequent
+            // HEADERS on it is the tolerated §5.1 close race, not §5.1.1 reuse.
+            if recv.reset_ids.len() < recv.max_concurrent.saturating_mul(2) {
+                recv.reset_ids.insert($sid);
+            }
             // (#242) After WE emit RST_STREAM for a stream, RFC 9113 §5.1 forbids
             // sending ANY further frames on it. Tear down the outbound side (a
             // half-written response body would otherwise keep streaming past the
@@ -242,6 +248,13 @@ where
         if hdr.kind != kind::CONTINUATION || sid != open {
             goaway!(error_code::PROTOCOL_ERROR);
         }
+    } else if hdr.kind == kind::CONTINUATION {
+        // The converse half: a CONTINUATION is legal only after a HEADERS/CONTINUATION that did
+        // NOT set END_HEADERS. A discard-in-progress block always carries `open_header_block`,
+        // so it takes the arm above and is unaffected. Without this, a bare CONTINUATION on a
+        // body-pending stream is absorbed as a phantom trailer section, letting every stream
+        // hold a 64 KiB header block at once — outside both the body cap and the body budget.
+        goaway!(error_code::PROTOCOL_ERROR);
     }
 
     // §6: stream association. Some frames MUST carry a stream id; others MUST be on 0.
@@ -368,6 +381,16 @@ where
                 goaway!(error_code::PROTOCOL_ERROR);
             }
             if opens_new_stream && sid <= recv.last_client_stream {
+                if !recv.reset_ids.contains(&sid) {
+                    // §5.1.1: client stream ids are never reused — HEADERS on a lower id
+                    // that no RST_STREAM (ours or the peer's) ever closed was either
+                    // ended cleanly or skipped entirely, a connection error. Only reset
+                    // ids get the tolerant per-stream STREAM_CLOSED below (§5.1's
+                    // limited-period race). GOAWAY without decoding the block: the
+                    // connection is being torn down, so HPACK sync only matters for
+                    // frames we still intend to honor — same as every goaway! site (#357).
+                    goaway!(error_code::PROTOCOL_ERROR);
+                }
                 let block = match headers_block(hdr.flags, payload) {
                     Some(b) => b,
                     None => goaway!(error_code::PROTOCOL_ERROR),
@@ -629,6 +652,16 @@ where
             }
             if let Some(s) = streams.remove(&sid) {
                 recv.buffer_sub(s.body.len());
+            }
+            // (#357) Record the peer's reset UNCONDITIONALLY — even on an id already
+            // cleanly closed or fully drained. §5.1 makes ANY later frame on an id that
+            // saw a RST_STREAM a stream error (STREAM_CLOSED), so the HEADERS-reuse
+            // guard must find it here; reuse-after-self-RST buys a peer nothing (the
+            // churn never resets `no_progress_frames`, so a flood still GOAWAYs).
+            // Unlike the `cancelled` insert below, this must NOT be gated on a live
+            // handler — `cancelled` is consumed on drain, this set is not.
+            if recv.reset_ids.len() < recv.max_concurrent.saturating_mul(2) {
+                recv.reset_ids.insert(sid);
             }
             // If the handler future is still running in `inflight`, cancel it and mark the stream
             // so the aborted completion is discarded. ONLY record sids with a live future:

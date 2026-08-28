@@ -2727,7 +2727,11 @@ async fn data_on_closed_stream_rsts_that_stream_not_the_connection() {
 }
 
 #[tokio::test]
-async fn headers_on_closed_stream_rsts_that_stream_not_the_connection() {
+async fn headers_reusing_a_cleanly_closed_stream_id_is_a_connection_error() {
+    // RFC 9113 §5.1.1: client stream ids are never reused. Reopening an id that closed
+    // cleanly (END_STREAM, no RST_STREAM in either direction) is a connection error —
+    // GOAWAY(PROTOCOL_ERROR) carrying last_client_stream — NOT the per-stream
+    // STREAM_CLOSED reserved for ids racing a RST_STREAM (#357; h2spec 5.1.1).
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let srv =
         tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
@@ -2766,11 +2770,84 @@ async fn headers_on_closed_stream_rsts_that_stream_not_the_connection() {
     client.write_all(&late).await.unwrap();
     client.flush().await.unwrap();
 
+    let (last_stream, code) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (hdr, payload) = read_frame(&mut client).await;
+            if hdr.kind == frame::kind::GOAWAY {
+                return (
+                    u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fff_ffff,
+                    u32::from_be_bytes(payload[4..8].try_into().unwrap()),
+                );
+            }
+        }
+    })
+    .await
+    .expect("reusing a cleanly closed stream id must GOAWAY");
+    assert_eq!(
+        code,
+        frame::error_code::PROTOCOL_ERROR,
+        "clean-close reuse -> connection PROTOCOL_ERROR (§5.1.1)"
+    );
+    assert_eq!(
+        last_stream, 1,
+        "error-path GOAWAY must carry last_client_stream (§6.8)"
+    );
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn headers_reusing_a_reset_stream_id_rsts_that_stream_not_the_connection() {
+    // RFC 9113 §5.1: any frame on a stream that saw a RST_STREAM (either direction) is a
+    // STREAM error (STREAM_CLOSED), never a connection error — a GOAWAY here would tear
+    // down every multiplexed stream over one raced late frame (#357).
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut f = Vec::new();
+    frame::write_settings(&mut f, &[]);
+    client.write_all(&f).await.unwrap();
+    client.flush().await.unwrap();
+
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let end = frame::flags::END_HEADERS | frame::flags::END_STREAM;
+
+    let mut h1 = Vec::new();
+    frame::write_frame(
+        &mut h1,
+        frame::kind::HEADERS,
+        end,
+        1,
+        &encode_get(&mut enc, "/done"),
+    );
+    client.write_all(&h1).await.unwrap();
+    client.flush().await.unwrap();
+    let (status, _) = read_response(&mut client, &mut dec, 1).await;
+    assert_eq!(status.as_deref(), Some("200"));
+
+    // The client resets the stream, then reuses its id — tolerated per-stream.
+    let mut buf = Vec::new();
+    frame::write_rst_stream(&mut buf, 1, frame::error_code::CANCEL);
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        end,
+        1,
+        &encode_get(&mut enc, "/late"),
+    );
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let (hdr, payload) = read_frame(&mut client).await;
             match hdr.kind {
-                frame::kind::GOAWAY => panic!("HEADERS on a closed stream GOAWAYed the connection"),
+                frame::kind::GOAWAY => {
+                    panic!("HEADERS on a reset stream GOAWAYed the connection")
+                }
                 frame::kind::HEADERS => {
                     dec.decode(&payload, |_, _| {}).unwrap();
                 }
@@ -2784,8 +2861,9 @@ async fn headers_on_closed_stream_rsts_that_stream_not_the_connection() {
         }
     })
     .await
-    .expect("timed out waiting for closed-stream HEADERS reset");
+    .expect("timed out waiting for the reset-stream HEADERS reset");
 
+    // The connection must still be usable: stream 3 serves normally.
     let mut h3 = Vec::new();
     frame::write_frame(
         &mut h3,
@@ -2797,8 +2875,66 @@ async fn headers_on_closed_stream_rsts_that_stream_not_the_connection() {
     client.write_all(&h3).await.unwrap();
     client.flush().await.unwrap();
     let (status3, _) = read_response(&mut client, &mut dec, 3).await;
-    assert_eq!(status3.as_deref(), Some("200"));
+    assert_eq!(
+        status3.as_deref(),
+        Some("200"),
+        "connection must survive the reset-stream reuse"
+    );
 
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn headers_on_a_never_opened_lower_stream_id_is_a_connection_error() {
+    // RFC 9113 §5.1.1: a new client stream id must be numerically greater than every id
+    // the client has opened. HEADERS on never-opened 3 after opening 5 is a connection
+    // error (h2spec 5.1.1/2) — no RST_STREAM was ever exchanged on 3, so the §5.1
+    // closed-stream tolerance does not apply (#357).
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut frames = Vec::new();
+    frame::write_settings(&mut frames, &[]);
+    let mut enc = Encoder::new();
+    let end = frame::flags::END_HEADERS | frame::flags::END_STREAM;
+    frame::write_frame(
+        &mut frames,
+        frame::kind::HEADERS,
+        end,
+        5,
+        &encode_get(&mut enc, "/first"),
+    );
+    frame::write_frame(
+        &mut frames,
+        frame::kind::HEADERS,
+        end,
+        3,
+        &encode_get(&mut enc, "/lower"),
+    );
+    client.write_all(&frames).await.unwrap();
+    client.flush().await.unwrap();
+
+    let (last_stream, code) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (hdr, payload) = read_frame(&mut client).await;
+            if hdr.kind == frame::kind::GOAWAY {
+                return (
+                    u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fff_ffff,
+                    u32::from_be_bytes(payload[4..8].try_into().unwrap()),
+                );
+            }
+        }
+    })
+    .await
+    .expect("HEADERS on a never-opened lower stream id must GOAWAY");
+    assert_eq!(code, frame::error_code::PROTOCOL_ERROR);
+    assert_eq!(
+        last_stream, 5,
+        "error-path GOAWAY must carry last_client_stream (§6.8)"
+    );
     drop(client);
     let _ = srv.await;
 }
@@ -2991,4 +3127,51 @@ async fn rapid_reset_flood_is_rejected_with_enhance_your_calm() {
     // nice-to-have). `never_service` is pending forever, so the connection task never
     // returns here — abort it rather than awaiting (this is a test-only shape).
     srv.abort();
+}
+
+#[tokio::test]
+async fn bare_continuation_without_open_header_block_is_a_connection_error() {
+    // RFC 9113 §6.10: a CONTINUATION MUST follow a HEADERS/CONTINUATION that did not set
+    // END_HEADERS. A GET without END_STREAM leaves the stream open with its header block
+    // already closed, so a following CONTINUATION has no block to continue. Absorbing it as a
+    // phantom trailer section lets every stream pin a 64 KiB block at once.
+    let (mut client, server) = tokio::io::duplex(16 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut frames = Vec::new();
+    frame::write_settings(&mut frames, &[]);
+    let mut enc = Encoder::new();
+    let block = encode_get(&mut enc, "/");
+    // END_HEADERS but NOT END_STREAM: the stream stays open awaiting a body.
+    frame::write_frame(
+        &mut frames,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &block,
+    );
+    // A regular field, deliberately not a pseudo-header: a pseudo-header decodes as malformed
+    // and already yields a stream RST today, which would make this pass for the wrong reason.
+    let mut orphan = Vec::new();
+    enc.encode_header(&mut orphan, "x-bare", "continuation");
+    frame::write_frame(
+        &mut frames,
+        frame::kind::CONTINUATION,
+        frame::flags::END_HEADERS,
+        1,
+        &orphan,
+    );
+    client.write_all(&frames).await.unwrap();
+
+    let code = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        read_until_goaway(&mut client),
+    )
+    .await
+    .expect("server accepted a bare CONTINUATION instead of failing the connection");
+    assert_eq!(code, frame::error_code::PROTOCOL_ERROR);
+
+    drop(client);
+    let _ = srv.await;
 }

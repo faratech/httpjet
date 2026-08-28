@@ -155,30 +155,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    #[tokio::test]
-    async fn uring_upgrade_relay_moves_bytes_both_directions() {
-        let (client, mut upstream_peer) = tokio::io::duplex(1024);
-        let mut io = start_uring_upgrade_relay(client);
-
-        io.to_upstream
-            .send(bytes::Bytes::from_static(b"client-frame"))
-            .await
-            .unwrap();
-        let mut received = [0u8; 12];
-        upstream_peer.read_exact(&mut received).await.unwrap();
-        assert_eq!(&received, b"client-frame");
-
-        upstream_peer.write_all(b"upstream-frame").await.unwrap();
-        let received = io.from_upstream.recv().await.unwrap().unwrap();
-        assert_eq!(&received[..], b"upstream-frame");
-    }
-}
-
 /// The longest-matching enabled proxy context for `path`, returning its handler.
 pub(super) fn matching_proxy_context(ctx: &ReqCtx, path: &str) -> Option<String> {
     use hj_core::config::ContextKind;
@@ -213,4 +189,28 @@ pub(super) fn resolve_proxy_target(
         .ext_by_name
         .get(handler)
         .map(ProxyTarget::from_ext_processor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn uring_upgrade_relay_moves_bytes_both_directions() {
+        let (client, mut upstream_peer) = tokio::io::duplex(1024);
+        let mut io = start_uring_upgrade_relay(client);
+
+        io.to_upstream
+            .send(bytes::Bytes::from_static(b"client-frame"))
+            .await
+            .unwrap();
+        let mut received = [0u8; 12];
+        upstream_peer.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"client-frame");
+
+        upstream_peer.write_all(b"upstream-frame").await.unwrap();
+        let received = io.from_upstream.recv().await.unwrap().unwrap();
+        assert_eq!(&received[..], b"upstream-frame");
+    }
 }
