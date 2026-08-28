@@ -128,13 +128,15 @@ impl Drop for RequestGuard<'_> {
 ///
 /// Correctness: this reuses `cache_lookup` verbatim against the SAME mtime-cached
 /// `.htaccess` chain `dispatch()` would load, AFTER running the sync prefix
-/// (`seed_server_env`/`apply_set_env` + the per-dir/accessDenyDir gates), so
-/// request-side state cannot diverge from the tokio path: a `CacheDisable`,
-/// `CacheLookup off`, `CacheKeyModify -qs:` strip or `[E=no-cache]` SetEnvIf mark
-/// applies here exactly as it does at store time / slow-path lookup, a directory
-/// denied AFTER an entry was stored bridges to the 403 instead of serving the stale
-/// hit, and the query-normalized key matches the store-side key byte-for-byte. The
-/// chain load costs only cached per-dir stats on the hot hit path. The cache key
+/// (`seed_server_env`/`apply_set_env` + the per-dir/accessDenyDir gates) AND the
+/// rewrite engine with dispatch()'s post-rewrite gates (#358), so request-side
+/// state cannot diverge from the tokio path: a `CacheDisable`, `CacheLookup off`,
+/// `CacheKeyModify -qs:` strip or `[E=no-cache]` SetEnvIf/rewrite mark applies here
+/// exactly as it does at store time / slow-path lookup, a `RewriteCond`-gated
+/// `[F]`/`[G]`/`[R]` or a directory denied AFTER an entry was stored bridges to the
+/// 403/410/3xx instead of serving the stale hit, and the query-normalized key
+/// matches the store-side key byte-for-byte. The chain load costs only cached
+/// per-dir stats on the hot hit path; the rewrite is outcome-cached. The cache key
 /// embeds `is_tls`, so a cross-scheme request just misses. Net: the fast path can
 /// only ever serve a byte-correct hit or fall through.
 const X_REQUEST_ID: http::HeaderName = http::HeaderName::from_static("x-request-id");
@@ -364,11 +366,47 @@ pub(crate) async fn fast_serve(
     seed_server_env(&mut ctx);
     apply_set_env(&mut ctx, &chain, req, &orig_path, &orig_query);
     let orig_rel = resolved_rel_path(&orig_path);
-    if access_denied(&chain, &orig_rel, method.as_str())
+    if access_denied(&chain, &orig_rel, method.as_str(), &ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
     {
         return None;
     }
+
+    // ---- REWRITE (shared by both branches): dispatch() runs the engine BEFORE its
+    // cache lookup (step 3 → step 4c), as LSWS/OLS hook the cache at URI_MAP after
+    // `processContextRewrite`. Serving a hit first let a `RewriteCond
+    // %{REMOTE_ADDR}|%{HTTP_USER_AGENT}|…` + `[F]`/`[G]`/`[E=no-cache]` — inputs
+    // outside the cache key — be skipped for a warm cookieless URL (#358). Redirect/
+    // status/forbidden/gone outcomes bridge so dispatch() renders them; `[P]` merges
+    // its env and keeps the original path exactly as dispatch() defers it; a
+    // rewritten target carries dispatch()'s post-rewrite gates below.
+    let rw = run_rewrite(state, &ctx, req, &chain_with_dirs, &orig_path, &orig_query);
+    let (cache_path, cache_rel, rewrite_unchanged): (Cow<'_, str>, Cow<'_, str>, bool) = match rw {
+        RwResult::Unchanged { env } => {
+            merge_rewrite_env(&mut ctx, env);
+            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), true)
+        }
+        RwResult::Proxy { env, .. } => {
+            merge_rewrite_env(&mut ctx, env);
+            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), false)
+        }
+        RwResult::Rewritten { path, env, .. } => {
+            merge_rewrite_env(&mut ctx, env);
+            // A rewrite INTO a non-ancestor directory makes dispatch() reload the
+            // destination chain (#8); the on-core path bridges instead of guessing.
+            if !url_parent_dir(&orig_path).starts_with(url_parent_dir(&path)) {
+                return None;
+            }
+            let rel = resolved_rel_path(&path);
+            (Cow::Owned(path), Cow::Owned(rel), false)
+        }
+        RwResult::Redirect { .. }
+        | RwResult::Status { .. }
+        | RwResult::Forbidden
+        | RwResult::Gone => {
+            return None;
+        }
+    };
 
     // ---- Branch 1: GUEST cookieless page-cache HIT (B1) ----
     // Any Cookie may carry membership (`xf_user`) or a vary dimension; bridge cookied
@@ -376,6 +414,16 @@ pub(crate) async fn fast_serve(
     // without this). The lookup sees the SAME loaded chain `dispatch()` uses, so
     // request-side cache policy cannot diverge from the store/slow-path decisions.
     if state.page_cache.is_some() && !req.headers().contains_key(http::header::COOKIE) {
+        if fast_post_rewrite_bridges(
+            state,
+            &ctx,
+            &chain,
+            &cache_path,
+            &cache_rel,
+            method.as_str(),
+        ) {
+            return None;
+        }
         let identity = cache_identity_for(ctx.is_tls, &ctx.vhost_name, &orig_path);
         let render_epoch = state
             .page_cache
@@ -428,13 +476,10 @@ pub(crate) async fn fast_serve(
     }
     // Only an unchanged (no-op) rewrite stays on-core; any rewrite/redirect/status/
     // forbidden/gone/proxy outcome bridges.
-    match run_rewrite(state, &ctx, req, &chain_with_dirs, &orig_path, &orig_query) {
-        RwResult::Unchanged { env } => {
-            merge_rewrite_env(&mut ctx, env);
-        }
-        _ => return None,
+    if !rewrite_unchanged {
+        return None;
     }
-    if access_denied(&chain, &orig_rel, method.as_str()) {
+    if access_denied(&chain, &orig_rel, method.as_str(), &ctx) {
         return None;
     }
     if matching_proxy_context(&ctx, &orig_path).is_some() {
@@ -545,6 +590,73 @@ pub(crate) async fn fast_serve(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Some(record_fast_serve(state, &ctx, proto, req, req_start, resp))
+}
+
+/// The request's Cookie header as ONE string for cache classification.
+/// (security #267) Every Cookie line is joined with ", " — exactly how PHP/lsphp
+/// reassembles multi-line Cookie headers; reading only the first line let a request
+/// present as guest to the cache tier while PHP saw the logged-in cookie on a second
+/// line (tier desync). (#319) The overwhelmingly common single-line case borrows the
+/// header value instead of building a Vec + joined String. (#360) A line carrying a
+/// non-ASCII byte is decoded lossily — the same view lsphp gets — never skipped:
+/// skipping it presented the request as cookieless (public route, default vary)
+/// while PHP still honored its `xf_*` crumbs.
+pub(crate) fn cookie_header_joined(headers: &http::HeaderMap) -> Option<String> {
+    let mut lines = headers
+        .get_all(http::header::COOKIE)
+        .iter()
+        .map(hj_core::header_value_lossy);
+    match (lines.next(), lines.next()) {
+        (Some(first), None) => (!first.is_empty()).then(|| first.into_owned()),
+        (None, _) => None,
+        (Some(first), Some(second)) => {
+            let mut joined = String::with_capacity(first.len() + second.len() + 16);
+            joined.push_str(&first);
+            joined.push_str(", ");
+            joined.push_str(&second);
+            for line in lines {
+                joined.push_str(", ");
+                joined.push_str(&line);
+            }
+            Some(joined)
+        }
+    }
+}
+
+/// dispatch()'s post-rewrite gates (step 4) for the on-core cache-hit branch: the
+/// post-rewrite `.htaccess` access decision (now seeing any `[E=]` env), `accessDenyDir`,
+/// and the resolved-script re-deny (PATH_INFO / DirectoryIndex, `<Files>` scoped to the
+/// file the request MAPS TO). `true` = dispatch() would 403 → the caller bridges so the
+/// tokio path renders it instead of a stale hit.
+fn fast_post_rewrite_bridges(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    chain: &[Arc<Htaccess>],
+    cur_path: &str,
+    cur_rel: &str,
+    method: &str,
+) -> bool {
+    if access_denied(chain, cur_rel, method, ctx)
+        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, cur_rel)
+    {
+        return true;
+    }
+    let index_files = effective_index_files(state, ctx, chain);
+    if let Some((script_abs, _, _)) = split_script_path(state, ctx, cur_path, index_files, chain) {
+        if allowed_script_target(&state.acl, &script_abs).is_none() {
+            return true;
+        }
+        if let Ok(rel) = script_abs.strip_prefix(&ctx.vhost.doc_root) {
+            let script_rel = format!("/{}", rel.to_string_lossy());
+            if script_rel != cur_rel
+                && (access_denied(chain, &script_rel, method, ctx)
+                    || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Mirror `handle()`'s served-request observability funnel on the on-core fast path so a
@@ -1439,7 +1551,7 @@ async fn dispatch(
     // `[P]` rule could proxy a denied path. The post-rewrite checks below still
     // catch a rewrite INTO a denied path; this adds the pre-rewrite guarantee.
     let orig_rel = resolved_rel_path(&orig_path);
-    if access_denied(&chain, &orig_rel, req.method().as_str())
+    if access_denied(&chain, &orig_rel, req.method().as_str(), ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
     {
         return error_doc_or_page(state, ctx, &chain, &orig_path, StatusCode::FORBIDDEN).await;
@@ -1548,7 +1660,7 @@ async fn dispatch(
     // ---- 4. ACCESS enforcement (#1): a denied path is a 403 BEFORE any
     // terminal handler (proxy / LSAPI / static). Fail-safe: any matching
     // `denied` section anywhere in the chain wins. -------------------------
-    if access_denied(&chain, &rel_path, req.method().as_str()) {
+    if access_denied(&chain, &rel_path, req.method().as_str(), ctx) {
         return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN).await;
     }
     // (M4 security) `accessDenyDir` enforcement: the resolved docroot-relative
@@ -1610,7 +1722,7 @@ async fn dispatch(
             // Re-run BOTH deny mechanisms (the `.htaccess` `<Files>`/`Require` chain AND the
             // `accessDenyDir` glob set) against the resolved script, mirroring the request-path check.
             if script_rel != rel_path
-                && (access_denied(&chain, &script_rel, req.method().as_str())
+                && (access_denied(&chain, &script_rel, req.method().as_str(), ctx)
                     || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel))
             {
                 return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN)
@@ -1635,32 +1747,7 @@ async fn dispatch(
     // value; dropped unused when the cache is off (cache_host stays empty as before).
     let cache_host = if cache_on { req_host } else { String::new() };
     let cache_cookie = if cache_on {
-        // (security #267) Join EVERY Cookie line with ", " before classification —
-        // exactly how PHP/lsphp reassembles multi-line Cookie headers. Reading only
-        // the first line let a request present as guest to the cache tier while PHP
-        // saw the logged-in cookie on a second line (tier desync).
-        // (#319) The overwhelmingly common single-line case borrows the header value
-        // instead of building a Vec + joined String.
-        let mut lines = req
-            .headers()
-            .get_all(http::header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok());
-        match (lines.next(), lines.next()) {
-            (Some(first), None) => (!first.is_empty()).then(|| first.to_string()),
-            (None, _) => None,
-            (Some(first), Some(second)) => {
-                let mut joined = String::with_capacity(first.len() + second.len() + 16);
-                joined.push_str(first);
-                joined.push_str(", ");
-                joined.push_str(second);
-                for line in lines {
-                    joined.push_str(", ");
-                    joined.push_str(line);
-                }
-                Some(joined)
-            }
-        }
+        cookie_header_joined(req.headers())
     } else {
         None
     };

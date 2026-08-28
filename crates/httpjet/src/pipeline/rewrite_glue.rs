@@ -588,16 +588,16 @@ pub(super) fn run_rewrite(
 
 /// Header extraction for outcome-cache keying, byte-identical to the engine's
 /// lazy `header_lookup` (`run_rewrite_inner`): case-insensitive name, FIRST
-/// decodable value wins, `None` when absent or undecodable. Keying MUST see
-/// exactly what evaluation sees, or two requests the engine distinguishes could
-/// share a key (e.g. a duplicate header whose first value is non-UTF-8).
+/// value wins (decoded lossily when non-ASCII, #360), `None` when absent. Keying
+/// MUST see exactly what evaluation sees, or two requests the engine
+/// distinguishes could share a key (e.g. a duplicate header whose first value is
+/// non-ASCII).
 fn keyed_header(req: &Request, name: &str) -> Option<String> {
     req.headers()
         .get_all(name)
         .iter()
-        .filter_map(|v| v.to_str().ok())
         .next()
-        .map(|s| s.to_string())
+        .map(|v| hj_core::header_value_lossy(v).into_owned())
 }
 
 /// The `Host` header (port stripped), falling back to the vhost name — the value
@@ -638,18 +638,18 @@ fn run_rewrite_inner(
     // Resolve request headers LAZILY from the live request instead of copying the
     // whole header set into `RewriteInput` up front — the engine only reads the
     // few headers a rule actually references (`%{HTTP:..}` / `%{HTTP_*}`).
-    // Case-insensitive name match (HeaderMap::get_all), skip non-UTF-8 values, and on a duplicate
-    // header name the FIRST decodable value wins — matching `apply_set_env` (SetEnvIf) and
-    // Apache/LiteSpeed. Both stages MUST pick the same occurrence, or a deny/cache rule split
-    // across SetEnvIf + RewriteCond could be evaded by sending two values of the keyed header
-    // (the stages would evaluate against different values). (Was `.next_back()` = last value.)
+    // Case-insensitive name match (HeaderMap::get_all); on a duplicate header name the FIRST
+    // value wins — matching `apply_set_env` (SetEnvIf) and Apache/LiteSpeed. Both stages MUST
+    // pick the same occurrence, or a deny/cache rule split across SetEnvIf + RewriteCond could
+    // be evaded by sending two values of the keyed header (the stages would evaluate against
+    // different values). (Was `.next_back()` = last value.) A non-ASCII value is decoded
+    // lossily (the view lsphp gets), never skipped (#360).
     let header_lookup = |name: &str| -> Option<String> {
         req.headers()
             .get_all(name)
             .iter()
-            .filter_map(|v| v.to_str().ok())
             .next()
-            .map(|s| s.to_string())
+            .map(|v| hj_core::header_value_lossy(v).into_owned())
     };
     // (#3 / A) Populate the expanded %{} variables from ctx. Only the formatted IPs must
     // own; `method`/`host`/`uri`/`query`/`server_name`/`protocol` are borrowed into the

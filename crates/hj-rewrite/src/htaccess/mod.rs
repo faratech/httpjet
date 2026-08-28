@@ -9,6 +9,7 @@
 //! `[E=...]` env sets still flow through the embedded [`RuleSet`].
 
 mod cache;
+mod mod_access;
 mod parse;
 mod php;
 mod scope_index;
@@ -20,6 +21,7 @@ use fancy_regex::Regex;
 use crate::rules::RuleSet;
 
 pub use cache::{CacheDirectives, CacheKeyModifier, cache_directives, chain_cacheable_for_default};
+pub use mod_access::{AccessOrder, AccessSubject, HostAccess, HostEntry};
 pub use php::{ResolvedPhp, php_directives, php_handler_forced};
 pub use scope_index::ScopeIndex;
 
@@ -320,11 +322,25 @@ impl AccessMatcher {
 pub struct AccessRule {
     /// ANDed matchers from the enclosing blocks (empty = directory-wide).
     pub matchers: Vec<AccessMatcher>,
-    /// True = denied (403); false = explicitly granted.
+    /// True = denied (403); false = explicitly granted. For a `host_access` rule
+    /// this is always `true`: it is the fail-closed polarity of the scope
+    /// matchers, and the verdict itself comes from [`HostAccess::permits`].
     pub denied: bool,
+    /// The legacy `Order` + `Allow from` / `Deny from` block of this scope, whose
+    /// verdict depends on the request subject (client IP / env) — see
+    /// [`AccessRule::denies`].
+    pub host_access: Option<HostAccess>,
 }
 
 impl AccessRule {
+    /// The verdict for a request this rule's scope matches.
+    pub fn denies(&self, subject: &AccessSubject<'_>) -> bool {
+        match &self.host_access {
+            Some(ha) => !ha.permits(subject),
+            None => self.denied,
+        }
+    }
+
     pub(crate) fn matches(&self, rel_path: &str, basename: &str) -> bool {
         // Fail CLOSED toward this rule's polarity on a regex match-time error (issue A6): for a
         // deny rule an un-evaluable matcher counts as matched (deny applies); for an allow rule

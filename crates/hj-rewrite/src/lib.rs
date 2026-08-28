@@ -64,9 +64,9 @@ pub use cache::HtaccessCache;
 pub use directives::{AccessDecision, ErrorDoc, HeaderOp, ReqAttrs};
 pub use error::RewriteError;
 pub use htaccess::{
-    AccessMatcher, AccessRule, CacheDirectives, CacheKeyModifier, Htaccess, ResolvedPhp, Scope,
-    ScopeIndex, ScopeKind, cache_directives, chain_cacheable_for_default, php_directives,
-    php_handler_forced,
+    AccessMatcher, AccessOrder, AccessRule, AccessSubject, CacheDirectives, CacheKeyModifier,
+    HostAccess, HostEntry, Htaccess, ResolvedPhp, Scope, ScopeIndex, ScopeKind, cache_directives,
+    chain_cacheable_for_default, php_directives, php_handler_forced,
 };
 pub use input::{FileTests, HeaderLookup, RewriteInput, StatSource};
 pub use rules::{CacheKeyVar, RewriteOutcome, RuleSet, evaluate};

@@ -203,6 +203,22 @@ pub fn stamp_date<B>(mut resp: http::Response<B>) -> http::Response<B> {
     resp
 }
 
+/// The request-header value as text, decoded the way lsphp/CGI sees it: a
+/// visible-ASCII value borrows (zero-alloc, the overwhelmingly common case); a
+/// value carrying obs-text / UTF-8 bytes (which H1, H2 and H3 all admit) is
+/// `from_utf8_lossy`-decoded instead of being treated as ABSENT. Every server-side
+/// consumer of a security-relevant header (Cookie classification for the page
+/// cache, `%{HTTP_*}` rewrite variables, `SetEnvIf`) must use this so that it
+/// classifies the SAME string PHP receives — a `filter_map(to_str().ok())` let a
+/// single non-ASCII cookie crumb hide `xf_user`/`xf_style_id` from the cache tier
+/// while PHP still honored them (#360).
+pub fn header_value_lossy(v: &HeaderValue) -> Cow<'_, str> {
+    match v.to_str() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => String::from_utf8_lossy(v.as_bytes()),
+    }
+}
+
 /// Reassemble HTTP/2 / HTTP/3 `cookie` crumbs into the single standard line.
 ///
 /// RFC 9113 §8.2.3 and RFC 9114 §4.2.1: clients MAY split the Cookie header into

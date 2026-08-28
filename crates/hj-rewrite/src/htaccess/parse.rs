@@ -8,6 +8,7 @@ use crate::error::RewriteError;
 use crate::rules::RuleSet;
 
 use super::cache::{cache_scope_path, parse_cache_key_modify};
+use super::mod_access::parse_host_entries;
 use super::*;
 
 impl Htaccess {
@@ -24,6 +25,11 @@ impl Htaccess {
 
         // Section parsing state: a stack of currently-open access sections.
         let mut section_stack: Vec<PendingSection> = Vec::new();
+        // The legacy mod_access block of each scope (keyed by the innermost open
+        // section's line, `None` = top level): its `Order`/`Allow`/`Deny` lines
+        // accumulate into ONE `AccessRule` so they are judged together (#359).
+        let mut legacy_slots: std::collections::HashMap<Option<usize>, usize> =
+            std::collections::HashMap::new();
 
         for (lineno, raw) in logical_lines(text) {
             let line = raw.trim();
@@ -68,15 +74,31 @@ impl Htaccess {
                 _ => {}
             }
 
-            // Access directives (`Require`, `Allow from all`, `Deny from all`).
-            // Recorded as an [`AccessRule`] scoped by the conjunction of ALL
-            // currently-open blocks — including a top-level rule (empty stack ->
-            // directory-wide, #4) and one nested inside `<If>` whose enclosing
-            // <Files*>/<Directory*> would otherwise lose it (#5). An unrecognized
-            // `Require` predicate (ip/host/valid-user/user/group/...) is fail-
-            // closed to DENY unless it is explicitly `(all) granted` (#2).
+            // Access directives. `Require` is recorded as an [`AccessRule`]
+            // scoped by the conjunction of ALL currently-open blocks — including a
+            // top-level rule (empty stack -> directory-wide, #4) and one nested
+            // inside `<If>` whose enclosing <Files*>/<Directory*> would otherwise
+            // lose it (#5). An unrecognized `Require` predicate (ip/host/valid-
+            // user/user/group/...) is fail-closed to DENY unless it is explicitly
+            // `(all) granted` (#2).
             if let Some(denied) = classify_access_directive(&dlow, rest) {
                 record_access_rule(&mut h, &section_stack, denied);
+                continue;
+            }
+            // Legacy mod_access: `Order`, `Allow from …`, `Deny from …` (every
+            // operand form, not just `all`) accumulate into their scope's single
+            // [`HostAccess`] block, evaluated per request against the client IP
+            // and env (#359). Hostname operands cannot be evaluated here and are
+            // recorded fail-closed.
+            if matches!(dlow.as_str(), "order" | "allow" | "deny") {
+                record_legacy_access(
+                    &mut h,
+                    &section_stack,
+                    &mut legacy_slots,
+                    &dlow,
+                    rest,
+                    lineno,
+                );
                 continue;
             }
 
@@ -256,9 +278,9 @@ impl Htaccess {
 ///   in Apache it RESTRICTS access, so modelling it as "no opinion" would leave
 ///   the resource fully open (the #2 bug). We cannot evaluate the predicate
 ///   here (no identity/IP context at parse time), so we fail **closed** -> deny.
-/// * `Allow from all` -> grant; `Deny from all` -> deny (legacy mod_access).
-/// * `Satisfy`/`Order`/other `Allow`/`Deny` forms are not modelled (return
-///   `None`; they neither grant nor restrict in this engine).
+/// * Legacy `Order`/`Allow from`/`Deny from` are NOT classified here — they
+///   are accumulated per scope by [`record_legacy_access`]. `Satisfy` is not
+///   modelled.
 fn classify_access_directive(dlow: &str, rest: &str) -> Option<bool> {
     match dlow {
         "require" => {
@@ -271,9 +293,69 @@ fn classify_access_directive(dlow: &str, rest: &str) -> Option<bool> {
                 Some(true)
             }
         }
-        "allow" if rest.trim().eq_ignore_ascii_case("from all") => Some(false),
-        "deny" if rest.trim().eq_ignore_ascii_case("from all") => Some(true),
         _ => None,
+    }
+}
+
+/// Fold one `Order` / `Allow from …` / `Deny from …` line into the
+/// [`HostAccess`] block of the innermost open scope, creating that scope's rule
+/// on first sight. The rule's scope matchers carry deny polarity (`denied:
+/// true`) so an un-evaluable enclosing block fails closed, exactly like a
+/// `Require` deny. An `Allow`/`Deny` line without the mandatory `from` keyword
+/// is an Apache config error: a malformed `Deny` denies everything, a
+/// malformed `Allow` grants nothing.
+fn record_legacy_access(
+    h: &mut Htaccess,
+    stack: &[PendingSection],
+    slots: &mut std::collections::HashMap<Option<usize>, usize>,
+    dlow: &str,
+    rest: &str,
+    lineno: usize,
+) {
+    let key = stack.last().map(|s| s.lineno);
+    let idx = match slots.get(&key) {
+        Some(&i) => i,
+        None => {
+            let Some(matchers) = access_matchers(stack, true) else {
+                return;
+            };
+            h.access_rules.push(AccessRule {
+                matchers,
+                denied: true,
+                host_access: Some(HostAccess::default()),
+            });
+            let i = h.access_rules.len() - 1;
+            slots.insert(key, i);
+            i
+        }
+    };
+    let ha = h.access_rules[idx]
+        .host_access
+        .as_mut()
+        .expect("legacy slot always points at a host_access rule");
+    match dlow {
+        "order" => ha.order = AccessOrder::parse(rest),
+        "allow" | "deny" => {
+            let entries = match parse_host_entries(rest) {
+                Some(e) => e,
+                None if dlow == "deny" => vec![HostEntry::Unevaluable(rest.trim().to_string())],
+                None => Vec::new(),
+            };
+            for e in entries.iter().filter(|e| e.is_unevaluable()) {
+                tracing::warn!(
+                    line = lineno,
+                    directive = dlow,
+                    operand = ?e,
+                    ".htaccess host/domain access operand is not evaluable (no reverse DNS); treated fail-closed"
+                );
+            }
+            if dlow == "allow" {
+                ha.allow.extend(entries);
+            } else {
+                ha.deny.extend(entries);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -284,25 +366,31 @@ fn classify_access_directive(dlow: &str, rest: &str) -> Option<bool> {
 /// empty matcher set is a directory-wide rule. For the common single-section
 /// case the legacy flat `access` vec is also populated for back-compat.
 fn record_access_rule(h: &mut Htaccess, stack: &[PendingSection], denied: bool) {
+    if let Some(matchers) = access_matchers(stack, denied) {
+        h.access_rules.push(AccessRule {
+            matchers,
+            denied,
+            host_access: None,
+        });
+    }
+}
+
+/// The ANDed scope matchers of the currently-open blocks, or `None` when the
+/// rule must be dropped (an uncompilable `<Files*>`/`<Directory*>`, or a grant
+/// under an unverifiable `<If>`).
+fn access_matchers(stack: &[PendingSection], denied: bool) -> Option<Vec<AccessMatcher>> {
     let mut matchers: Vec<AccessMatcher> = Vec::new();
     for sec in stack {
         match sec.kind {
+            // A Files*/Directory* block whose pattern did not compile is unusable:
+            // DON'T silently drop it and let the remaining matchers widen the rule's
+            // scope (an empty-matcher rule would deny the WHOLE directory). Skip
+            // recording entirely (`?`), matching the prior drop-on-uncompilable behavior.
             Some(SectionKind::Files) | Some(SectionKind::FilesMatch) => {
-                match sec.regex.clone() {
-                    Some(re) => matchers.push(AccessMatcher::Basename(re)),
-                    // A Files*/Directory* block whose pattern did not compile is
-                    // unusable: DON'T silently drop it and let the remaining
-                    // matchers widen the rule's scope (an empty-matcher rule would
-                    // deny the WHOLE directory). Skip recording entirely, matching
-                    // the prior drop-on-uncompilable behavior.
-                    None => return,
-                }
+                matchers.push(AccessMatcher::Basename(sec.regex.clone()?));
             }
             Some(SectionKind::Directory) | Some(SectionKind::DirectoryMatch) => {
-                match sec.regex.clone() {
-                    Some(re) => matchers.push(AccessMatcher::Path(re)),
-                    None => return,
-                }
+                matchers.push(AccessMatcher::Path(sec.regex.clone()?));
             }
             None => {
                 // `<If>` contributes a URI condition; other None blocks (IfModule
@@ -319,7 +407,7 @@ fn record_access_rule(h: &mut Htaccess, stack: &[PendingSection], denied: bool) 
                             // condition, so drop the whole rule (fail-closed) — mirroring
                             // the uncompilable-Files/Directory drop above.
                             if scope.regex.is_none() && !denied {
-                                return;
+                                return None;
                             }
                             matchers.push(AccessMatcher::IfUri {
                                 regex: scope.regex.clone(),
@@ -332,7 +420,7 @@ fn record_access_rule(h: &mut Htaccess, stack: &[PendingSection], denied: bool) 
         }
     }
 
-    h.access_rules.push(AccessRule { matchers, denied });
+    Some(matchers)
 }
 
 // ===========================================================================
@@ -343,13 +431,16 @@ struct PendingSection {
     kind: Option<SectionKind>,
     kind_name: String,
     regex: Option<Regex>,
+    /// Source line of the opening tag — the identity of this scope for the
+    /// per-scope legacy `Order`/`Allow`/`Deny` accumulation.
+    lineno: usize,
     /// The scope a directive (e.g. `Header`) inside this block inherits. Set for
     /// `<Files*>`/`<Directory*>` and for the common `<If "%{REQUEST_URI} ...">`.
     scope: Option<Scope>,
 }
 
 impl PendingSection {
-    fn open(line: &str, _lineno: usize) -> Option<PendingSection> {
+    fn open(line: &str, lineno: usize) -> Option<PendingSection> {
         // Strip leading '<' and trailing '>'.
         let inner = line.trim_start_matches('<').trim_end_matches('>');
         let (tag, args) = split_first(inner);
@@ -425,6 +516,7 @@ impl PendingSection {
             kind,
             kind_name,
             regex,
+            lineno,
             scope,
         })
     }

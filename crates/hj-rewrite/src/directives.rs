@@ -25,7 +25,7 @@
 
 use std::borrow::Cow;
 
-use crate::htaccess::{EnvGuard, HeaderAction, Htaccess, Scope, ScopeKind};
+use crate::htaccess::{AccessSubject, EnvGuard, HeaderAction, Htaccess, Scope, ScopeKind};
 use crate::input::HeaderLookup;
 
 // ===========================================================================
@@ -64,6 +64,18 @@ impl Htaccess {
     /// method is currently advisory (Apache `<Limit>` is not modelled here), so
     /// any matching `denied` section produces [`AccessDecision::Denied`].
     pub fn access_decision(&self, rel_path: &str, method: &str) -> AccessDecision {
+        self.access_decision_for(rel_path, method, &AccessSubject::default())
+    }
+
+    /// [`Htaccess::access_decision`] evaluated against a concrete request subject
+    /// (resolved client IP + env), which the legacy `Order`/`Allow from`/`Deny
+    /// from` rules need. With an unknown subject those rules fail closed.
+    pub fn access_decision_for(
+        &self,
+        rel_path: &str,
+        method: &str,
+        subject: &AccessSubject<'_>,
+    ) -> AccessDecision {
         let _ = method; // reserved for future <Limit METHOD> support.
         let basename = basename(rel_path);
         let ext = ext_lower(basename);
@@ -78,7 +90,7 @@ impl Htaccess {
         for i in self.access_index.candidates(basename, &ext) {
             let rule = &self.access_rules[i];
             if rule.matches(rel_path, basename) {
-                decision = if rule.denied {
+                decision = if rule.denies(subject) {
                     AccessDecision::Denied
                 } else {
                     AccessDecision::Granted

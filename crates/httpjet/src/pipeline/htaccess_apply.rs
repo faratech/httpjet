@@ -55,15 +55,16 @@ pub(super) fn apply_set_env(
     }
     // Lazy header source: SetEnvIf only reads the specific names its rules reference, so resolve
     // them on demand from `req.headers()` instead of cloning the WHOLE header set into a Vec per
-    // request. Case-insensitive (HeaderMap::get_all); first decodable value wins (matching the old
-    // find-first); `_`/`-` folding is applied by ReqAttrs::lookup_header before this is called.
+    // request. Case-insensitive (HeaderMap::get_all); the first value wins (matching the old
+    // find-first) and a non-ASCII value is decoded lossily, never skipped, so SetEnvIf judges
+    // the same string lsphp receives (#360); `_`/`-` folding is applied by
+    // ReqAttrs::lookup_header before this is called.
     let header_lookup = |name: &str| -> Option<String> {
         req.headers()
             .get_all(name)
             .iter()
-            .filter_map(|v| v.to_str().ok())
             .next()
-            .map(|s| s.to_string())
+            .map(|v| hj_core::header_value_lossy(v).into_owned())
     };
     // `as_str()` already yields a borrow good for the rest of this fn (method borrows `req`,
     // protocol is `&'static`), so feed ReqAttrs the borrows directly — no per-request String.
@@ -109,10 +110,32 @@ pub(super) fn apply_set_env(
 /// (#1) Fail-safe access decision across the whole chain: any `denied` section
 /// (in any `.htaccess`) that matches `rel_path` -> deny. `rel_path` must already
 /// be normalized (see [`resolved_rel_path`](super::rewrite_glue::resolved_rel_path)).
-pub(super) fn access_denied(chain: &[Arc<Htaccess>], rel_path: &str, method: &str) -> bool {
+/// Judged against the RESOLVED client IP and the post-SetEnvIf env in `ctx`, which
+/// the legacy `Order`/`Allow from`/`Deny from` rules read (#359) — so it must run
+/// after `apply_set_env`, as every call site does.
+pub(super) fn access_denied(
+    chain: &[Arc<Htaccess>],
+    rel_path: &str,
+    method: &str,
+    ctx: &ReqCtx,
+) -> bool {
+    let env_set = |name: &str| ctx.get_env(name).is_some();
+    let subject = hj_rewrite::AccessSubject {
+        client_ip: Some(ctx.client_ip),
+        env_set: Some(&env_set),
+    };
+    access_denied_for(chain, rel_path, method, &subject)
+}
+
+pub(super) fn access_denied_for(
+    chain: &[Arc<Htaccess>],
+    rel_path: &str,
+    method: &str,
+    subject: &hj_rewrite::AccessSubject<'_>,
+) -> bool {
     chain
         .iter()
-        .any(|ht| ht.access_decision(rel_path, method) == AccessDecision::Denied)
+        .any(|ht| ht.access_decision_for(rel_path, method, subject) == AccessDecision::Denied)
 }
 
 /// (M4) Resolve the docroot-relative request path to its absolute on-disk path
@@ -286,7 +309,7 @@ mod tests {
             .collect();
         let raw_rel = resolved_rel_path(decoded); // access check already collapsed
         assert!(
-            !access_denied(&raw_chain, &raw_rel, "GET"),
+            !access_denied_for(&raw_chain, &raw_rel, "GET", &Default::default()),
             "pre-fix: raw `..` path skips the protected .htaccess (the bypass)"
         );
 
@@ -306,7 +329,7 @@ mod tests {
         );
         let rel = resolved_rel_path(&canonical);
         assert!(
-            access_denied(&fixed_chain, &rel, "GET"),
+            access_denied_for(&fixed_chain, &rel, "GET", &Default::default()),
             "canonical path loads the deny and 403s (#M1 fixed)"
         );
 

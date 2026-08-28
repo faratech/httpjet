@@ -506,6 +506,220 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
     let _ = std::fs::remove_dir_all(doc_root);
 }
 
+// ─── #358: the on-core cache hit must run the rewrite engine FIRST, like
+// dispatch() (and LSWS's URI_MAP cache hook). A `RewriteCond`-gated `[F]` or
+// `[E=Cache-Control:no-cache]` — inputs outside the cache key — must never be
+// skipped for a warm cookieless URL.
+fn get_with_ua(path: &str, ua: &str) -> Request {
+    http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::HOST, CANON_HOST)
+        .header(header::USER_AGENT, ua)
+        .body(hj_core::empty_incoming())
+        .unwrap()
+}
+
+async fn fast_serve_req(state: &Arc<ServerState>, req: &Request) -> Option<Response> {
+    fast_serve(
+        state,
+        LISTENER,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        SocketAddr::from(([127, 0, 0, 1], 80)),
+        40000,
+        false,
+        Proto::Http1,
+        None,
+        req,
+    )
+    .await
+}
+
+async fn seed_public_entry(
+    state: &Arc<ServerState>,
+    store: &Arc<hj_pagecache::PageStore>,
+    path: &str,
+    body: &'static [u8],
+) {
+    let method = http::Method::GET;
+    let identity = format!("http\n{VHOST}\n{path}");
+    let chain: Vec<std::sync::Arc<hj_rewrite::Htaccess>> = Vec::new();
+    let resolved = state.router.resolve(LISTENER, Some(CANON_HOST)).unwrap();
+    let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let rctx = hj_core::ReqCtx {
+        server: state.server.clone(),
+        vhost_name: resolved.name.clone(),
+        vhost: resolved.config,
+        peer_ip: loopback,
+        client_ip: loopback,
+        is_tls: false,
+        protocol: Proto::Http1,
+        trusted_proxy: false,
+        env: Vec::new(),
+        local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
+        peer_port: 40000,
+        tls: None,
+        redirect_guard: None,
+        request_time: std::time::SystemTime::UNIX_EPOCH,
+        request_id: Default::default(),
+    };
+    let cc = crate::lscache::CacheCtx {
+        method: &method,
+        host: CANON_HOST,
+        cookie: None,
+        identity: &identity,
+        req_path: path,
+        req_query: "",
+        chain: &chain,
+        render_epoch: store.purge_epoch(),
+        has_range: false,
+        host_foreign: false,
+        vary_value: None,
+    };
+    let key =
+        crate::lscache::build_cache_key(&rctx, &cc, store, &crate::lscache::PrivateRoute::Public);
+    state
+        .page_cache_admission
+        .record(crate::lscache::hash_key(&key));
+    let resp = http::Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "text/html")
+        .header(header::CACHE_CONTROL, "public,max-age=600")
+        .body(Body::Full(bytes::Bytes::from_static(body)))
+        .unwrap();
+    crate::lscache::cache_store(state, &rctx, &cc, resp).await;
+}
+
+fn is_cache_hit(resp: Option<&Response>) -> bool {
+    resp.and_then(|r| r.headers().get("x-litespeed-cache"))
+        .map(|v| v.to_str().unwrap())
+        == Some("hit")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_serve_runs_rewrite_before_serving_a_cache_hit() {
+    let doc_root = temp_root("fastserve_rw");
+    std::fs::create_dir_all(doc_root.join("pages")).unwrap();
+    std::fs::write(doc_root.join("pages/index.html"), "<h1>page</h1>\n").unwrap();
+    std::fs::write(
+        doc_root.join(".htaccess"),
+        "RewriteEngine On\n\
+         RewriteCond %{HTTP_USER_AGENT} BadBot\n\
+         RewriteRule .* - [F]\n\
+         RewriteCond %{HTTP_USER_AGENT} NoCache\n\
+         RewriteRule .* - [E=Cache-Control:no-cache]\n",
+    )
+    .unwrap();
+
+    let mut cfg = hj_pagecache::StoreConfig::default();
+    cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+    let state = build_state_full(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        Some(store.clone()),
+        None,
+    );
+    seed_public_entry(&state, &store, "/pages/index.html", b"<h1>page</h1>\n").await;
+
+    // Baseline: an unbanned UA is served on-core from the entry.
+    let ok = fast_serve_req(&state, &get_with_ua("/pages/index.html", "Mozilla/5.0")).await;
+    assert!(is_cache_hit(ok.as_ref()), "baseline must be a Branch-1 hit");
+
+    // The RewriteCond-gated [F] must bridge (dispatch renders the 403), never serve the hit.
+    let banned = get_with_ua("/pages/index.html", "BadBot/1.0");
+    assert!(
+        fast_serve_req(&state, &banned).await.is_none(),
+        "a rewrite [F] must bridge instead of serving the warm entry"
+    );
+    let full = run(&state, banned).await;
+    assert_eq!(
+        full.status(),
+        403,
+        "dispatch() parity: the banned UA is forbidden"
+    );
+
+    // A rewrite-set `[E=Cache-Control:no-cache]` must reach the lookup (bypass), like
+    // dispatch()'s merge_rewrite_env → cache_lookup ordering.
+    let bypass = fast_serve_req(&state, &get_with_ua("/pages/index.html", "NoCache/1.0")).await;
+    assert!(
+        !is_cache_hit(bypass.as_ref()),
+        "a rewrite-set no-cache env must bypass the on-core hit"
+    );
+
+    let _ = std::fs::remove_dir_all(doc_root);
+}
+
+// ─── #360: a Cookie line carrying a non-ASCII byte is decoded the way lsphp
+// decodes it (lossily), never treated as ABSENT — otherwise the cache tier and
+// the rewrite engine classify a request as cookieless while PHP honors its
+// `xf_*` crumbs.
+#[test]
+fn cookie_header_with_non_ascii_byte_is_still_classified() {
+    let mut h = http::HeaderMap::new();
+    h.append(
+        header::COOKIE,
+        http::HeaderValue::from_bytes(b"xf_user=7; x=\xc3\xa9").unwrap(),
+    );
+    let joined = crate::pipeline::cookie_header_joined(&h).expect("cookie must not vanish");
+    assert!(joined.starts_with("xf_user=7; x="), "{joined:?}");
+    // Multi-line: the non-ASCII line is joined, not dropped.
+    h.append(
+        header::COOKIE,
+        http::HeaderValue::from_bytes(b"xf_style_id=9").unwrap(),
+    );
+    let joined = crate::pipeline::cookie_header_joined(&h).unwrap();
+    assert!(
+        joined.contains("xf_user=7") && joined.contains("xf_style_id=9"),
+        "{joined:?}"
+    );
+    // Raw obs-text (invalid UTF-8) is replaced, and the crumb before it survives.
+    let mut h = http::HeaderMap::new();
+    h.append(
+        header::COOKIE,
+        http::HeaderValue::from_bytes(b"xf_session=abc; y=\x80").unwrap(),
+    );
+    assert!(
+        crate::pipeline::cookie_header_joined(&h)
+            .unwrap()
+            .starts_with("xf_session=abc; y=")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_cond_on_cookie_sees_a_non_ascii_cookie_line() {
+    let doc_root = temp_root("cookie_rw");
+    std::fs::write(doc_root.join("index.html"), "<h1>home</h1>\n").unwrap();
+    std::fs::write(
+        doc_root.join(".htaccess"),
+        "RewriteEngine On\nRewriteCond %{HTTP_COOKIE} xf_user=\nRewriteRule .* - [F]\n",
+    )
+    .unwrap();
+    let mut cfg = hj_pagecache::StoreConfig::default();
+    cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+    let state = build_state_full(doc_root.clone(), Vec::new(), Vec::new(), Some(store), None);
+
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/index.html")
+        .header(header::HOST, CANON_HOST)
+        .header(
+            header::COOKIE,
+            http::HeaderValue::from_bytes(b"xf_user=7; x=\xc3\xa9").unwrap(),
+        )
+        .body(hj_core::empty_incoming())
+        .unwrap();
+    let resp = run(&state, req).await;
+    assert_eq!(
+        resp.status(),
+        403,
+        "a non-ASCII crumb must not hide the cookie from %{{HTTP_COOKIE}}"
+    );
+    let _ = std::fs::remove_dir_all(doc_root);
+}
+
 // ─── R5: an unparsable REWRITTEN target must fail closed, not serve the
 // pre-rewrite file. `[NE]` skips substitution escaping so a decoded capture's
 // literal space reaches the static terminal's Uri construction.

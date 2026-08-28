@@ -16,9 +16,9 @@ pub use context::{ClientCert, Proto, RedirectGuard, ReqCtx, TlsParams};
 pub use handler::{Handler, HandlerError, Request, Response, ResponseTransform, text_response};
 pub use http_util::{
     CONNECTION_SPECIFIC_REQUEST_HEADERS, body_forbidden_status, coalesce_cookie_crumbs,
-    http_date_now, if_none_match_matches, is_connection_specific_request_header, percent_decode,
-    percent_decode_cow, response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date,
-    strip_hop_by_hop_response,
+    header_value_lossy, http_date_now, if_none_match_matches,
+    is_connection_specific_request_header, percent_decode, percent_decode_cow,
+    response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date, strip_hop_by_hop_response,
 };
 pub use net::{host_without_port, is_trusted_internal_peer};
 pub use reqid::ReqId;

@@ -355,12 +355,14 @@ mod tests {
         let files = AccessRule {
             matchers: vec![AccessMatcher::Basename(Regex::new(r"\.log$").unwrap())],
             denied: true,
+            host_access: None,
         };
         let dir = AccessRule {
             matchers: vec![AccessMatcher::Path(
                 Regex::new(r"^.*/internal_data$").unwrap(),
             )],
             denied: true,
+            host_access: None,
         };
         let iff = AccessRule {
             matchers: vec![AccessMatcher::IfUri {
@@ -368,6 +370,7 @@ mod tests {
                 negate: false,
             }],
             denied: true,
+            host_access: None,
         };
         let idx = build_access_index(&[files, dir, iff]);
         assert_eq!(idx.suffix.get("log"), Some(&vec![0]));
