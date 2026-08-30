@@ -2667,3 +2667,235 @@ mod ua_classify {
         assert_eq!(format!("{human:?}"), format!("{absent:?}"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// fast_memo replay eligibility (Htaccess::memo, MemoClass)
+// ---------------------------------------------------------------------------
+mod memo_class {
+    use super::*;
+
+    fn memo(src: &str) -> MemoClass {
+        Htaccess::parse(src).unwrap().memo
+    }
+
+    fn reasons(m: &MemoClass) -> Vec<&'static str> {
+        m.blockers.iter().map(|(_, r)| *r).collect()
+    }
+
+    #[test]
+    fn empty_and_header_only_files_are_eligible() {
+        for src in [
+            "",
+            "Header set X-A 1\nHeader unset ETag\nErrorDocument 404 /e.html",
+        ] {
+            let m = memo(src);
+            assert!(m.eligible, "{src:?}");
+            assert!(m.vary_headers.is_empty());
+            assert!(m.blockers.is_empty());
+        }
+    }
+
+    #[test]
+    fn key_covered_set_env_if_attributes_need_no_vary() {
+        let m = memo(
+            "SetEnvIf Request_URI \"^/beta/?$\" WF_BETA=1\n\
+             SetEnvIf Query_String \"(^|&)amp=1(&|$)\" AMP_PAGE\n\
+             SetEnvIf Request_Method ^GET$ IS_GET\n\
+             SetEnvIf Host ^www\\. WWW\n\
+             SetEnvIf Server_Name example SN",
+        );
+        assert!(m.eligible);
+        assert!(m.vary_headers.is_empty(), "{:?}", m.vary_headers);
+    }
+
+    #[test]
+    fn header_attributes_become_vary_dimensions_folded_and_deduped() {
+        let m = memo(
+            "SetEnvIf Origin \"^https://a\\.test$\" ORIGIN_ALLOWED=$0\n\
+             SetEnvIfNoCase Cookie xf_session_admin Cache-Control=no-cache\n\
+             SetEnvIfNoCase Cookie xf_user cache-vary=member\n\
+             SetEnvIf User_Agent Googlebot BOT\n\
+             SetEnvIf user-agent Bingbot BOT2",
+        );
+        assert!(m.eligible);
+        assert_eq!(m.vary_headers, vec!["origin", "cookie", "user-agent"]);
+    }
+
+    #[test]
+    fn address_and_protocol_attributes_block() {
+        for (src, line) in [
+            ("Header set X 1\nSetEnvIf Remote_Addr ^10\\. INTERNAL", 2),
+            ("SetEnvIf Server_Addr ^127 LOCAL", 1),
+            ("\n\nSetEnvIf Request_Protocol HTTP/1\\.0 OLD", 3),
+        ] {
+            let m = memo(src);
+            assert!(!m.eligible, "{src:?}");
+            assert_eq!(m.blockers, vec![(line, "set_env_if_remote")], "{src:?}");
+        }
+    }
+
+    #[test]
+    fn seeding_redirect_status_blocks() {
+        let m = memo("SetEnvIf Request_URI ^/x REDIRECT_STATUS=403");
+        assert!(!m.eligible);
+        assert_eq!(reasons(&m), vec!["set_env_if_seeds_redirect_status"]);
+    }
+
+    #[test]
+    fn require_rules_in_any_scope_are_path_only() {
+        let m = memo(
+            "<FilesMatch \"\\.(env|log)$\">\n  Require all denied\n</FilesMatch>\n\
+             <Files \"robots.txt\">\n  Require all granted\n</Files>\n\
+             <DirectoryMatch \"^/internal_data\">\n  Require all denied\n</DirectoryMatch>\n\
+             <If \"%{REQUEST_URI} =~ m#^/private#\">\n  Require all denied\n</If>\n\
+             <Files \"admin.php\">\n  Require ip 10.0.0.0/8\n</Files>",
+        );
+        // `Require ip` is recorded as a constant deny (fail-closed), so it is
+        // still a pure function of the path.
+        assert!(m.eligible, "{:?}", m.blockers);
+        assert!(m.vary_headers.is_empty());
+    }
+
+    #[test]
+    fn legacy_all_only_access_is_path_only() {
+        let m = memo(
+            "Order deny,allow\nDeny from all\n<Files x>\nOrder allow,deny\nAllow from all\n</Files>",
+        );
+        assert!(m.eligible, "{:?}", m.blockers);
+    }
+
+    #[test]
+    fn legacy_ip_env_or_host_operands_block() {
+        for (src, line) in [
+            ("Order allow,deny\nAllow from 10.0.0.0/8", 2),
+            ("Order allow,deny\nDeny from env=bad_bot", 2),
+            ("Order deny,allow\n\nDeny from example.com", 3),
+            // No `from` keyword: a malformed Deny denies everything (fail-closed), and
+            // that verdict comes from an un-evaluable operand — not a path.
+            ("Deny all", 1),
+        ] {
+            let m = memo(src);
+            assert!(!m.eligible, "{src:?}");
+            assert_eq!(m.blockers, vec![(line, "access_ip_or_env")], "{src:?}");
+        }
+    }
+
+    #[test]
+    fn uncacheable_rewrite_blocks_with_line_zero() {
+        let m = memo(
+            "RewriteEngine On\nRewriteCond %{HTTP_COOKIE} xf_user\nRewriteRule .* - [E=no-cache:1]",
+        );
+        assert!(!m.eligible);
+        assert_eq!(m.blockers, vec![(0, "rewrite_uncacheable")]);
+        let m = memo(
+            "RewriteEngine On\nRewriteCond %{REMOTE_ADDR} ^1\\.2\\.3\\.4$\nRewriteRule ^ - [F]",
+        );
+        assert!(!m.eligible);
+    }
+
+    #[test]
+    fn keyable_rewrite_vars_fold_origin_and_accept_but_leave_ua_to_the_pipeline() {
+        let m = memo(
+            "RewriteEngine On\n\
+             RewriteCond %{HTTP:Origin} ^https://a\\.test$\n\
+             RewriteRule ^ - [E=CORS:1]\n\
+             RewriteCond %{HTTP:Accept} text/event-stream\n\
+             RewriteRule ^ - [E=SSE:1]\n\
+             RewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot)\n\
+             RewriteRule .* - [E=KNOWN_CRAWLER:1]",
+        );
+        assert!(m.eligible, "{:?}", m.blockers);
+        assert_eq!(m.vary_headers, vec!["origin", "accept"]);
+        let h = Htaccess::parse(
+            "RewriteEngine On\nRewriteCond %{HTTP_USER_AGENT} Googlebot\nRewriteRule .* - [E=B:1]",
+        )
+        .unwrap();
+        assert!(h.memo.eligible);
+        assert!(h.rules.cache_key_vars.contains(&CacheKeyVar::UserAgent));
+        assert!(h.rules.ua_classify_eligible());
+    }
+
+    #[test]
+    fn forum_shaped_file_is_eligible_with_origin_and_ua_class() {
+        // The load-bearing shape of the production docroot file: header-driven
+        // SetEnvIf, scoped Requires, a crawler UA cond, CORS Origin conds, the
+        // constant-empty REDIRECT_STATUS read, filesystem tests, and a
+        // FilesMatch canonical block.
+        let src = "\
+php_value auto_prepend_file \"/web/pagecache.php\"
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteRule ^old/(.*)$ /new/$1 [R=301,L]
+<FilesMatch \"\\.(env|log|sh|py)$\">
+  Require all denied
+</FilesMatch>
+<Files \"robots.txt\">
+  Require all granted
+</Files>
+<DirectoryMatch \"^/(?!tags(?:/|$))internal_data\">
+  Require all denied
+</DirectoryMatch>
+<If \"%{REQUEST_URI} =~ m#(^|/)\\.#\">
+  Require all denied
+</If>
+Header always set X-Frame-Options SAMEORIGIN
+Header set Strict-Transport-Security \"max-age=63072000\" env=HTTPS
+Header unset ETag
+SetEnvIf Query_String \"(^|&)amp=1(&|$)\" AMP_PAGE
+Header unset Link env=AMP_PAGE
+SetEnvIf Origin \"^https://(windowsforum\\.com|.*\\.windowsforum\\.com)$\" ORIGIN_ALLOWED=$0
+Header set Access-Control-Allow-Origin \"%{ORIGIN_ALLOWED}e\" env=ORIGIN_ALLOWED
+SetEnvIf Request_URI \"^/(chat|tts)\\.php$\" WF_CHAT_CORS_ENDPOINT=1
+RewriteCond %{REQUEST_URI} ^/(chat|tts)\\.php$ [NC]
+RewriteCond %{HTTP_HOST} ^windowsforum\\.com(?::443)?$ [NC]
+RewriteCond %{HTTP:Origin} ^https://windowsforum\\.com$
+RewriteRule ^ - [E=WF_CHAT_CORS_ORIGIN:https://windowsforum.com]
+RewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot|Baiduspider|Yandex(Bot|Images)|DuckDuckBot)
+RewriteRule .* - [E=KNOWN_CRAWLER:1]
+Header set X-Robots-Tag \"index, follow\" env=KNOWN_CRAWLER
+RewriteCond %{REQUEST_METHOD} OPTIONS
+RewriteRule ^ - [R=200,L]
+RewriteCond %{ENV:REDIRECT_STATUS} ^(403|5)
+RewriteRule .* - [E=no-cache:1]
+SetEnvIfNoCase Cookie xf_session_admin Cache-Control=no-cache
+SetEnvIfNoCase Cookie xf_session_admin cache-vary=admin
+RewriteCond %{REQUEST_URI} ^/(login|logout) [NC,OR]
+RewriteCond %{QUERY_STRING} (^|&)(login|logout) [NC]
+RewriteRule .* - [E=Cache-Control:no-cache,E=\"cache-vary:auth-action\"]
+<FilesMatch \"\\.(ico|jpg|png|js|css)(\\.gz)?$\">
+  RewriteCond %{HTTPS} !=on
+  RewriteRule .* - [E=CANONICAL:http://%{HTTP_HOST}%{REQUEST_URI},NE]
+  RewriteCond %{HTTPS} =on
+  RewriteRule .* - [E=CANONICAL:https://%{HTTP_HOST}%{REQUEST_URI},NE]
+  Header set Link \"<%{CANONICAL}e>; rel=\\\"canonical\\\"\"
+</FilesMatch>
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -l [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^.*$ - [NC,L]
+RewriteCond /tmp/.wf-failover-test -f
+RewriteRule ^ /failover/index.html [L]
+RewriteRule ^.*$ index.php [NC,L]
+ErrorDocument 404 /cf-errors/cf-error-4xx.html
+";
+        let h = Htaccess::parse(src).unwrap();
+        assert!(h.memo.eligible, "{:?}", h.memo.blockers);
+        assert_eq!(h.memo.vary_headers, vec!["origin", "cookie"]);
+        assert!(h.rules.path_cacheable);
+        assert!(h.rules.cache_key_vars.contains(&CacheKeyVar::UserAgent));
+        assert!(h.rules.cache_key_vars.contains(&CacheKeyVar::Origin));
+        assert!(h.rules.ua_classify_eligible());
+        assert_eq!(h.rules.assumed_empty_env, vec!["REDIRECT_STATUS"]);
+    }
+
+    #[test]
+    fn blockers_are_capped_and_first_wins_for_reporting() {
+        let src: String = (0..12)
+            .map(|i| format!("SetEnvIf Remote_Addr ^{i} X{i}\n"))
+            .collect();
+        let m = memo(&src);
+        assert!(!m.eligible);
+        assert_eq!(m.blockers.len(), 8);
+        assert_eq!(m.blockers[0], (1, "set_env_if_remote"));
+    }
+}

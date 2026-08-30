@@ -975,6 +975,7 @@ dependencies = [
  "arc-swap",
  "hj-config",
  "hj-core",
+ "parking_lot",
  "rcgen",
  "rustls",
  "rustls-pemfile",

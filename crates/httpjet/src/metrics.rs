@@ -328,6 +328,7 @@ fn render(state: &ServerState) -> String {
         },
         state.metrics.fast_memo_hits.load(Ordering::Relaxed),
         state.metrics.fast_memo_stores.load(Ordering::Relaxed),
+        state.metrics.fast_memo_ineligible.load(Ordering::Relaxed),
         state.page_cache.as_ref().map(|pc| pc.stats()),
     );
     // Per-request telemetry (counters + latency histograms) self-renders.
@@ -946,6 +947,7 @@ fn render_metrics(
     peer_purge: PeerPurgeCounters,
     fast_memo_hits: u64,
     fast_memo_stores: u64,
+    fast_memo_ineligible: u64,
     cache: Option<CacheStats>,
 ) -> String {
     let mut out = String::with_capacity(768);
@@ -989,6 +991,12 @@ fn render_metrics(
         "counter",
         "Finished-response memo stores (first full-pipeline serve per key/TTL).",
         fast_memo_stores.to_string(),
+    );
+    metric(
+        "httpjet_fast_memo_ineligible_total",
+        "counter",
+        "Memo-eligible static requests whose .htaccess chain refused the store (see `httpjet check`).",
+        fast_memo_ineligible.to_string(),
     );
     if let Some(s) = cache {
         let lookups = s.hits + s.misses;
@@ -1254,7 +1262,7 @@ mod tests {
 
     #[test]
     fn render_includes_core_counters() {
-        let body = render_metrics(42, 3, 1, PeerPurgeCounters::default(), 0, 0, None);
+        let body = render_metrics(42, 3, 1, PeerPurgeCounters::default(), 0, 0, 0, None);
         assert!(body.contains("httpjet_requests_total 42\n"));
         assert!(body.contains("httpjet_active_connections 3\n"));
         assert!(body.contains("httpjet_active_requests 1\n"));
@@ -1278,7 +1286,16 @@ mod tests {
             poisoned_locks: 2,
             ..CacheStats::default()
         };
-        let body = render_metrics(100, 2, 0, PeerPurgeCounters::default(), 0, 0, Some(stats));
+        let body = render_metrics(
+            100,
+            2,
+            0,
+            PeerPurgeCounters::default(),
+            0,
+            0,
+            0,
+            Some(stats),
+        );
         assert!(body.contains("httpjet_pagecache_hits_total 30\n"));
         assert!(body.contains("httpjet_pagecache_misses_total 10\n"));
         // 30 / (30+10) = 0.75.
@@ -1333,6 +1350,7 @@ mod tests {
             0,
             0,
             PeerPurgeCounters::default(),
+            0,
             0,
             0,
             Some(CacheStats::default()),

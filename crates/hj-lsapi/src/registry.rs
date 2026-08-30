@@ -1229,6 +1229,22 @@ mod tests {
         reg.drain_all().await.unwrap();
     }
 
+    /// Generation files refuse a group/other-writable parent
+    /// (`validate_generation_dir`), so stage them in a private directory
+    /// rather than directly in the shared temp dir.
+    fn tmp_generation_path(tag: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "hj-lsapi-registry-generation-{}-{tag}.d",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir.join("lsphp.generation")
+    }
+
     #[tokio::test]
     async fn external_registry_uses_only_its_single_unjailed_socket() {
         let owned = test_registry();
@@ -1238,10 +1254,7 @@ mod tests {
             owned.params.max_process_time,
             owned.params.max_body,
         );
-        let generation_path = std::env::temp_dir().join(format!(
-            "hj-lsapi-registry-generation-{}",
-            std::process::id()
-        ));
+        let generation_path = tmp_generation_path("default");
         let _ = std::fs::remove_file(&generation_path);
         assert!(
             !reg.set_external_generation_file(&generation_path),
@@ -1288,10 +1301,7 @@ mod tests {
             "hj-lsapi-registry-quiet-{}.sock",
             std::process::id()
         ));
-        let generation_path = std::env::temp_dir().join(format!(
-            "hj-lsapi-registry-quiet-generation-{}",
-            std::process::id()
-        ));
+        let generation_path = tmp_generation_path("quiet");
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&generation_path);
 

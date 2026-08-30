@@ -36,6 +36,7 @@ fn acl_with_cf_trusted() -> AccessControl {
         access_control: rules,
         cgi_cpu_limit_secs: None,
     })
+    .unwrap()
 }
 
 /// Mode 2, trusted CF peer, mtls_ok=true (the --no-mtls / network-boundary-trust case):

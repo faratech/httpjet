@@ -23,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,6 +105,38 @@ struct ExternalGenerationSnapshot {
     marker_fingerprint: u64,
 }
 
+/// The generation state is a trust anchor (epoch + promoted-family marker):
+/// in a group/other-writable directory any local user could pre-create or swap
+/// the file and force spurious pool-invalidation churn. Same stance as
+/// `validate_chroot_target` (0o022 = group-write | other-write); the default
+/// sibling-of-socket path would otherwise land beside a /tmp socket.
+fn validate_generation_dir(path: &Path) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let md = std::fs::metadata(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("lsphp generation dir {} stat failed: {e}", dir.display()),
+        )
+    })?;
+    if !md.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("lsphp generation dir {} is not a directory", dir.display()),
+        ));
+    }
+    if md.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "lsphp generation dir {} is group/other-writable (mode {:o}); a local user could forge the generation state — move the file to a root-owned directory (e.g. {DEFAULT_EXTERNAL_GENERATION_PATH})",
+                dir.display(),
+                md.mode() & 0o7777
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Read-only view of the process-independent lsphp generation counter.
 ///
 /// The file is exactly one native-endian [`AtomicU64`] in a shared mapping.
@@ -116,6 +148,7 @@ pub struct ExternalGeneration {
 
 impl ExternalGeneration {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        validate_generation_dir(path.as_ref())?;
         let file = File::open(path)?;
         validate_generation_file(&file)?;
         // SAFETY: the file length and alignment are validated; an mmap starts at
@@ -149,6 +182,7 @@ pub struct ExternalGenerationWriter {
 
 impl ExternalGenerationWriter {
     pub fn open_or_create(path: impl AsRef<Path>) -> io::Result<Self> {
+        validate_generation_dir(path.as_ref())?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1652,14 +1686,49 @@ mod tests {
     }
 
     fn tmp_generation(name: &str) -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "hj-lsapi-generation-test-{}-{}",
+        // The generation file refuses a group/other-writable parent
+        // (validate_generation_dir), so stage it in a private directory rather
+        // than directly in the shared temp dir.
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "hj-lsapi-generation-test-{}-{}.d",
             std::process::id(),
             name
         ));
-        let _ = std::fs::remove_file(&p);
-        p
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir.join("lsphp.generation")
+    }
+
+    #[test]
+    fn generation_file_in_world_writable_dir_is_refused() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "hj-lsapi-generation-world-writable-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = dir.join("lsphp.generation");
+
+        let err = match ExternalGenerationWriter::open_or_create(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a world-writable parent must refuse open_or_create"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let err = match ExternalGeneration::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a world-writable parent must refuse open"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Tightening the directory heals it without code changes.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        ExternalGenerationWriter::open_or_create(&path).expect("private dir is accepted");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

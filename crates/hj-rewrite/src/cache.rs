@@ -24,6 +24,14 @@ const REVALIDATE_TTL: Duration = Duration::from_secs(1);
 /// (mirrors `hj-static`'s `META_CACHE_CAP`).
 const MAX_HTACCESS_ENTRIES: usize = 16_384;
 
+/// Cap on how many ancestor directories a request may make the chain walk
+/// consult. The walk stats one directory per `/` segment and `maxReqURLLen`
+/// (default 8192) admits ~4096 segments, so a single cold deep path — or a
+/// flood of unique ones — buys thousands of syscalls apiece. Real docroots are
+/// a few levels deep. An over-deep path yields the deny-all sentinel (fail
+/// CLOSED: truncating the walk would skip a deeper ancestor's deny and serve).
+const MAX_CHAIN_DEPTH: usize = 64;
+
 /// A cache entry: the parsed `.htaccess`, the mtime it was parsed at, and when
 /// we last validated it (for `REVALIDATE_TTL` coalescing).
 struct Entry {
@@ -56,6 +64,14 @@ impl Default for HtaccessCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The fail-closed stand-in for "this request must not be served": an
+/// unparseable access file (Apache 500s instead) and an over-deep path
+/// ([`MAX_CHAIN_DEPTH`]) both resolve to it, so the pipeline's access check
+/// denies instead of trusting a truncated/absent chain.
+fn deny_all_sentinel() -> Arc<Htaccess> {
+    Arc::new(Htaccess::parse("Require all denied").expect("built-in deny-all sentinel must parse"))
 }
 
 impl HtaccessCache {
@@ -133,6 +149,9 @@ impl HtaccessCache {
         } else {
             seg_count.saturating_sub(1)
         };
+        if dir_count >= MAX_CHAIN_DEPTH {
+            return vec![(docroot.to_path_buf(), deny_all_sentinel())];
+        }
 
         let mut cur = docroot.to_path_buf();
         if let Some(h) = self.get_or_load_named(&cur, access_file_name) {
@@ -195,10 +214,7 @@ impl HtaccessCache {
                     // as long as the typo stands. The sentinel is cached like a
                     // real parse and self-heals when the fixed file's mtime
                     // changes.
-                    Some(Arc::new(
-                        Htaccess::parse("Require all denied")
-                            .expect("built-in deny-all sentinel must parse"),
-                    ))
+                    Some(deny_all_sentinel())
                 }
             },
             _ => None,

@@ -260,6 +260,9 @@ pub struct Metrics {
     pub fast_memo_hits: Arc<AtomicU64>,
     /// (#349) Finished-response memo stores (first full-pipeline serve per key/TTL).
     pub fast_memo_stores: Arc<AtomicU64>,
+    /// (#349) Memo-eligible static requests whose `.htaccess` chain refused the store
+    /// (a `MemoClass` blocker) — "why is this vhost not memoizing" in one number.
+    pub fast_memo_ineligible: Arc<AtomicU64>,
     /// Last accepted `/cache-entries` debug render, in unix milliseconds.
     pub cache_entries_last_ms: Arc<AtomicU64>,
     /// Accepted `/cache-entries` renders.
@@ -356,7 +359,10 @@ struct ConfigDerived {
 /// Build the config-derived half from a parsed config. Used by both
 /// [`ServerState::new`] (boot) and [`ServerState::reload`] (SIGHUP) so the two
 /// can never drift.
-fn build_config_derived(server: &Arc<ServerConfig>, cf_send_zstd: bool) -> ConfigDerived {
+fn build_config_derived(
+    server: &Arc<ServerConfig>,
+    cf_send_zstd: bool,
+) -> Result<ConfigDerived, String> {
     let router = Arc::new(Router::build(server.clone()));
     let serve_config = ServeConfig::from_tuning(&server.tuning);
     let php_suffixes = server
@@ -407,7 +413,7 @@ fn build_config_derived(server: &Arc<ServerConfig>, cf_send_zstd: bool) -> Confi
         }
     }
 
-    let acl = Arc::new(AccessControl::from_security(&server.security));
+    let acl = Arc::new(AccessControl::from_security(&server.security)?);
     let compress = Arc::new(Compress::from_tuning(&server.tuning).with_cf_send_zstd(cf_send_zstd));
     let expires = Arc::new(if server.expires.enabled {
         ExpiresRules::from_pairs(
@@ -421,7 +427,7 @@ fn build_config_derived(server: &Arc<ServerConfig>, cf_send_zstd: bool) -> Confi
         ExpiresRules::from_pairs(std::iter::empty::<(String, String)>())
     });
 
-    ConfigDerived {
+    Ok(ConfigDerived {
         router,
         serve_config,
         static_handler: StaticFiles::new(),
@@ -432,7 +438,7 @@ fn build_config_derived(server: &Arc<ServerConfig>, cf_send_zstd: bool) -> Confi
         compress,
         expires,
         mtls_required_vhosts,
-    }
+    })
 }
 
 fn configured_proxy_targets(server: &ServerConfig) -> Vec<ProxyTarget> {
@@ -543,11 +549,11 @@ impl ServerState {
         php_slow: Option<Arc<crate::phpslow::PhpSlowLog>>,
         request_id_header: bool,
         rewrite_tuning: RewriteTuning,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, String> {
         // (OPS2) One shutdown token the io_uring accept loops select on (stop accepting,
         // then drain in-flight connections before teardown).
         let shutdown = CancellationToken::new();
-        let cd = build_config_derived(&server, cf_send_zstd);
+        let cd = build_config_derived(&server, cf_send_zstd)?;
         let static_cache = page_cache.clone().unwrap_or_else(|| {
             Arc::new(hj_pagecache::PageStore::new(static_store_config(&server)))
         });
@@ -652,7 +658,7 @@ impl ServerState {
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(
             server.vhosts.keys().cloned(),
         ));
-        Arc::new(ServerState {
+        Ok(Arc::new(ServerState {
             server,
             router: cd.router,
             page_cache_inflight: Arc::new(crate::lscache::InflightRegistry::default()),
@@ -706,7 +712,7 @@ impl ServerState {
             php_slow,
             request_id_header,
             shutdown,
-        })
+        }))
     }
 
     /// (OPS6) Build the next config generation for a SIGHUP hot-reload: recompute
@@ -721,10 +727,10 @@ impl ServerState {
     /// the generation they started with. Listener/TLS/lsphp-pool changes are NOT
     /// applied here (the sockets/acceptor/pool live outside `ServerState`) — the
     /// SIGHUP handler rejects a reload that touches those.
-    pub fn reload(old: &ServerState, server: Arc<ServerConfig>) -> Arc<Self> {
+    pub fn reload(old: &ServerState, server: Arc<ServerConfig>) -> Result<Arc<Self>, String> {
         // CF_SEND_ZSTD is a process-lifetime CLI flag; carry it across SIGHUP by
         // reading it back off the old generation's Compress (its single home).
-        let cd = build_config_derived(&server, old.compress.cf_send_zstd());
+        let cd = build_config_derived(&server, old.compress.cf_send_zstd())?;
         // (#10) Drop the accumulated `.htaccess` parse cache on reload. The cache is
         // keyed by attacker-controlled request directory prefixes (every absent
         // intermediate dir of a requested path inserts a miss entry), so for an
@@ -800,7 +806,7 @@ impl ServerState {
                  BOOT — RESTART httpjet to apply"
             );
         }
-        Arc::new(ServerState {
+        Ok(Arc::new(ServerState {
             server,
             router: cd.router,
             serve_config: cd.serve_config,
@@ -849,7 +855,7 @@ impl ServerState {
             php_slow: old.php_slow.clone(),
             request_id_header: old.request_id_header,
             shutdown: old.shutdown.clone(),
-        })
+        }))
     }
 }
 
@@ -940,6 +946,7 @@ mod tests {
             false,
             RewriteTuning::default(),
         )
+        .unwrap()
     }
 
     fn pooled(state: &ServerState, target: &ProxyTarget) -> Arc<hj_proxy::Upstream> {
@@ -963,7 +970,7 @@ mod tests {
 
         let mut generation = state(cfg_a.clone());
         let upstream_a = pooled(&generation, &target_a);
-        let unchanged = ServerState::reload(&generation, cfg_a.clone());
+        let unchanged = ServerState::reload(&generation, cfg_a.clone()).unwrap();
         assert_eq!(unchanged.proxy.pool().len(), 1);
         assert!(Arc::ptr_eq(&upstream_a, &pooled(&unchanged, &target_a)));
         generation = unchanged;
@@ -974,7 +981,7 @@ mod tests {
             (cfg_b.clone(), &target_b),
             (cfg_a.clone(), &target_a),
         ] {
-            let next = ServerState::reload(&generation, server);
+            let next = ServerState::reload(&generation, server).unwrap();
             assert_eq!(next.proxy.pool().len(), 0);
             pooled(&next, target);
             assert_eq!(next.proxy.pool().len(), 1);
@@ -997,7 +1004,7 @@ mod tests {
         let old = state(server.clone());
         let upstream_a = pooled(&old, &target_a);
         let upstream_b = pooled(&old, &target_b);
-        let next = ServerState::reload(&old, server);
+        let next = ServerState::reload(&old, server).unwrap();
 
         assert_eq!(next.proxy.pool().len(), 2);
         assert!(Arc::ptr_eq(&upstream_a, &pooled(&next, &target_a)));

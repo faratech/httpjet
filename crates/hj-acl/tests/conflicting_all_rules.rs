@@ -19,6 +19,7 @@ fn acl_from_rules(rules: Vec<AccessRule>) -> AccessControl {
         access_control: rules,
         cgi_cpu_limit_secs: None,
     })
+    .unwrap()
 }
 
 /// Two ALL rules: first says allow, second says deny. First-listed wins (OLS

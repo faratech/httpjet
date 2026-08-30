@@ -526,7 +526,7 @@ struct DepthLimitedClientVerifier {
     /// verdict. Rejections are never cached (and only CA-signed chains can
     /// enter, so an attacker cannot grow or thrash the memo). Config reloads
     /// rebuild the verifier, so the memo can never outlive a CA change.
-    chain_memo: std::sync::Mutex<Vec<ChainMemo>>,
+    chain_memo: parking_lot::Mutex<Vec<ChainMemo>>,
 }
 
 struct ChainMemo {
@@ -570,7 +570,7 @@ impl DepthLimitedClientVerifier {
         Arc::new(DepthLimitedClientVerifier {
             inner,
             max_intermediates,
-            chain_memo: std::sync::Mutex::new(Vec::new()),
+            chain_memo: parking_lot::Mutex::new(Vec::new()),
         })
     }
 }
@@ -609,7 +609,7 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
         let key = chain_memo_key(end_entity, intermediates);
         let mono_now = std::time::Instant::now();
         {
-            let mut memo = self.chain_memo.lock().expect("chain memo poisoned");
+            let mut memo = self.chain_memo.lock();
             memo.retain(|m| m.valid_until > mono_now);
             if memo.iter().any(|m| m.key == key) {
                 return Ok(rustls::server::danger::ClientCertVerified::assertion());
@@ -618,7 +618,7 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
         let verified = self
             .inner
             .verify_client_cert(end_entity, intermediates, now)?;
-        let mut memo = self.chain_memo.lock().expect("chain memo poisoned");
+        let mut memo = self.chain_memo.lock();
         if memo.len() >= CHAIN_MEMO_CAP {
             memo.remove(0);
         }
@@ -1555,7 +1555,7 @@ mod tests {
         let v = DepthLimitedClientVerifier {
             inner: Arc::new(AlwaysOkVerifier),
             max_intermediates: 1,
-            chain_memo: std::sync::Mutex::new(Vec::new()),
+            chain_memo: parking_lot::Mutex::new(Vec::new()),
         };
         let now = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
             1_700_000_000,

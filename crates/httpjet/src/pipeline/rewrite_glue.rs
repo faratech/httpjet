@@ -350,7 +350,7 @@ impl UaClassifyCache {
     }
 
     /// The memoized bitmap for (`rs`, `ua`), computing + (cap-gated) inserting on miss.
-    fn get_or_compute(&self, rs: &RuleSet, ua: &str) -> u64 {
+    pub(crate) fn get_or_compute(&self, rs: &RuleSet, ua: &str) -> u64 {
         if ua.len() > MAX_MEMO_UA_BYTES {
             return rs.ua_cond_signature(ua);
         }

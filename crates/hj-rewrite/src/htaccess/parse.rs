@@ -5,7 +5,7 @@
 use fancy_regex::Regex;
 
 use crate::error::RewriteError;
-use crate::rules::RuleSet;
+use crate::rules::{CacheKeyVar, RuleSet};
 
 use super::cache::{cache_scope_path, parse_cache_key_modify};
 use super::mod_access::parse_host_entries;
@@ -19,6 +19,8 @@ impl Htaccess {
     /// their blocks is still parsed into `rules`).
     pub fn parse(text: &str) -> Result<Htaccess, RewriteError> {
         let mut h = Htaccess::default();
+        // Memo eligibility starts TRUE and is withdrawn by the first blocking directive.
+        h.memo.eligible = true;
         // The rewrite engine wants the original rewrite directives — extract
         // them (across nested blocks) into one stream, then parse.
         let mut rewrite_stream = String::new();
@@ -137,6 +139,7 @@ impl Htaccess {
                 }
                 "setenvif" | "setenvifnocase" => {
                     if let Some(s) = parse_set_env_if(rest, dlow == "setenvifnocase", lineno) {
+                        classify_set_env_if_for_memo(&mut h.memo, &s, lineno);
                         h.set_env_if.push(s);
                     }
                 }
@@ -241,6 +244,7 @@ impl Htaccess {
         h.header_index = build_header_index(&h.headers);
 
         h.rules = RuleSet::parse(&rewrite_stream)?;
+        classify_rules_for_memo(&mut h.memo, &h.rules);
         Ok(h)
     }
 
@@ -341,6 +345,9 @@ fn record_legacy_access(
                 None if dlow == "deny" => vec![HostEntry::Unevaluable(rest.trim().to_string())],
                 None => Vec::new(),
             };
+            if entries.iter().any(|e| !matches!(e, HostEntry::All)) {
+                h.memo.block(lineno, "access_ip_or_env");
+            }
             for e in entries.iter().filter(|e| e.is_unevaluable()) {
                 tracing::warn!(
                     line = lineno,
@@ -905,6 +912,56 @@ fn parse_header(rest: &str) -> Option<HeaderDirective> {
         always,
         scopes: vec![],
     })
+}
+
+/// Memo classification of one `SetEnvIf`: the attribute must be a key-covered
+/// special (path / query / GET-only method / Host) or a request header — which
+/// then becomes a per-entry vary dimension. Client/server address and protocol
+/// are neither, and a directive that seeds an `%{ENV:}` name the rewrite
+/// classifier assumes constant-empty (`REDIRECT_STATUS`) would invalidate that
+/// assumption for every later reader. Mirrors the attribute set of
+/// `ReqAttrs::resolve`.
+fn classify_set_env_if_for_memo(memo: &mut MemoClass, s: &SetEnvIf, lineno: usize) {
+    if s.var.eq_ignore_ascii_case("REDIRECT_STATUS") {
+        memo.block(lineno, "set_env_if_seeds_redirect_status");
+        return;
+    }
+    let attr = s.attribute.as_str();
+    let eq = |n: &str| attr.eq_ignore_ascii_case(n);
+    if eq("request_uri")
+        || eq("request_method")
+        || eq("query_string")
+        || eq("host")
+        || eq("server_name")
+    {
+        return;
+    }
+    if eq("request_protocol") || eq("remote_addr") || eq("server_addr") {
+        memo.block(lineno, "set_env_if_remote");
+        return;
+    }
+    match fold_header_name(attr) {
+        Some(name) => memo.vary(name),
+        None => memo.block(lineno, "set_env_if_bad_attribute"),
+    }
+}
+
+/// Memo classification of the rewrite ruleset: it must be outcome-cacheable on
+/// the base key plus keyable vars; `Origin`/`Accept` reads become vary
+/// dimensions, `User-Agent` reads are left to the pipeline (bitmap-keyed when
+/// classify-eligible, raw otherwise).
+fn classify_rules_for_memo(memo: &mut MemoClass, rules: &RuleSet) {
+    if !rules.path_cacheable {
+        memo.block(0, "rewrite_uncacheable");
+        return;
+    }
+    for v in &rules.cache_key_vars {
+        match v {
+            CacheKeyVar::Origin => memo.vary("origin".to_string()),
+            CacheKeyVar::Accept => memo.vary("accept".to_string()),
+            CacheKeyVar::UserAgent => {}
+        }
+    }
 }
 
 fn parse_set_env_if(rest: &str, nocase: bool, line: usize) -> Option<SetEnvIf> {

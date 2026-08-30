@@ -92,6 +92,19 @@ impl BodyBufferLease {
         self.held += n;
         true
     }
+
+    /// Give back `n` bytes reserved on this lease (a transient raw copy that
+    /// was drained, so the ledger tracks only the copy that lives on). Clamped
+    /// to what is held so a bookkeeping bug cannot underflow the server-wide
+    /// counter.
+    pub fn release(&mut self, n: u64) {
+        let n = n.min(self.held);
+        if n == 0 {
+            return;
+        }
+        self.budget.release(n);
+        self.held -= n;
+    }
 }
 
 impl Drop for BodyBufferLease {
@@ -112,6 +125,21 @@ mod tests {
         assert!(!l.reserve(60), "exhaustion must refuse without mutating");
         assert!(l.reserve(40));
         assert_eq!(b.in_flight(), 100);
+        drop(l);
+        assert_eq!(b.in_flight(), 0);
+    }
+
+    #[test]
+    fn release_returns_reserved_bytes() {
+        let b = Arc::new(BodyBufferBudget::new(100));
+        let mut l = BodyBufferLease::new(b.clone());
+        assert!(l.reserve(80));
+        l.release(30);
+        assert_eq!(b.in_flight(), 50);
+        assert!(l.reserve(50));
+        assert_eq!(b.in_flight(), 100);
+        l.release(1_000);
+        assert_eq!(b.in_flight(), 0, "release clamps to what is held");
         drop(l);
         assert_eq!(b.in_flight(), 0);
     }

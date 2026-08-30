@@ -26,7 +26,7 @@ use crate::state::ServerState;
 use bridge::{Bridge, BridgeCtx};
 use codec::{
     BodyFraming, ChunkStep, ChunkedDecoder, MAX_REQUEST_HEADERS, RequestHeadProgress,
-    classify_framing, request_head_progress, te_is_chunked,
+    chunked_accounted_bytes, classify_framing, request_head_progress, te_is_chunked,
 };
 use hj_core::Proto;
 use std::sync::Arc;
@@ -346,7 +346,8 @@ pub(crate) fn serve_uring(
             None,
             false,
             crate::state::RewriteTuning::default(),
-        );
+        )
+        .expect("bridge ServerState construction is config-validated upstream");
         let holder = Arc::new(arc_swap::ArcSwap::from(state));
         let admission = pipeline_admission(holder.clone());
         spawn_uring_http(holder, listener_name, http_addr, workers, None, admission)?;
@@ -1269,23 +1270,26 @@ async fn handle_h1_bridged<S>(
                     write_continue(&mut stream).await;
                 }
                 // Reserve incrementally AS BYTES DECODE (never trust the client's framing
-                // to pre-declare anything): the decoded length is the heap we commit.
-                let mut decoded_prev = 0usize;
+                // to pre-declare anything). The DECODED payload lives in `dec.body` while
+                // the RAW chunk stream stays buffered in `acc` until the final drain, so
+                // both are real heap: charging only the decoded copy let every uploading
+                // connection under-count the server-wide ledger by ~1x its body.
+                let mut accounted: u64 = 0;
                 let end = loop {
                     let step = dec.advance(&acc);
-                    let grown = dec.body.len() - decoded_prev;
-                    if grown > 0 {
+                    let buffered = chunked_accounted_bytes(dec.body.len(), acc.len(), head_len);
+                    if buffered > accounted {
                         let ok = body_lease
                             .get_or_insert_with(|| {
                                 hj_core::budget::BodyBufferLease::new(state.body_budget.clone())
                             })
-                            .reserve(grown as u64);
+                            .reserve(buffered - accounted);
                         if !ok {
                             tracing::debug!(%ctx.peer, "uring h1: body buffer budget exhausted");
                             write_status_close(&mut stream, 503, "Service Unavailable").await;
                             return;
                         }
-                        decoded_prev = dec.body.len();
+                        accounted = buffered;
                     }
                     match step {
                         ChunkStep::Done(end) => break end,
@@ -1305,6 +1309,15 @@ async fn handle_h1_bridged<S>(
                 };
                 let bb = bytes::Bytes::from(std::mem::take(&mut dec.body));
                 acc.drain(..end);
+                // Right-size the lease: the raw chunk framing drained above was charged
+                // alongside the decoded body, but only the decoded copy (`bb`) lives on
+                // (any pipelined bytes beyond `end` are re-charged by their own request).
+                let excess = accounted.saturating_sub(bb.len() as u64);
+                if excess > 0 {
+                    if let Some(lease) = body_lease.as_mut() {
+                        lease.release(excess);
+                    }
+                }
                 // Transfer-Encoding was stripped; hand the backend an explicit length so
                 // CONTENT_LENGTH/$_SERVER and LSAPI framing are correct.
                 // classify_framing already rejected TE+CL, so no CL exists to shadow.
@@ -2315,6 +2328,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 false,
                 crate::state::RewriteTuning::default(),
             )
+            .unwrap()
         });
         let bridge = bridge::spawn_bridge(1, |mut req: hj_core::Request, _ctx| async move {
             if req.uri().path() == "/reject" {

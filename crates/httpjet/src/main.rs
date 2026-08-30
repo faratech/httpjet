@@ -1123,7 +1123,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 "rewrite-outcome cache tuning"
             );
         }
-        let state = ServerState::new(server, php_registry.clone(), alt_svc, page_cache, page_cache_dicts, args.page_cache.admit_threshold, xf_capsule, peer_purge, cf_send_zstd, php_slow, args.request_id_header, rewrite_tuning);
+        let state = ServerState::new(server, php_registry.clone(), alt_svc, page_cache, page_cache_dicts, args.page_cache.admit_threshold, xf_capsule, peer_purge, cf_send_zstd, php_slow, args.request_id_header, rewrite_tuning).map_err(anyhow::Error::msg)?;
         // (persist) Rebuild the page-cache index from the tmpfs file tier in the
         // background — the server serves from request #1, with not-yet-scanned keys
         // simply missing during the ~seconds-long walk. Each kept key pre-warms the
@@ -1392,9 +1392,16 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                         "SIGHUP: client-CA trust stores are BOOT-frozen; if an origin-pull CA changed, RESTART httpjet"
                                     );
                                 }
-                                holder.store(ServerState::reload(&cur, new_server));
-                                bridge_admission.limit_changed();
-                                tracing::info!("SIGHUP: config hot-reloaded (config + SNI server certs; client-CA stores boot-frozen; cache + lsphp + connections preserved)");
+                                match ServerState::reload(&cur, new_server) {
+                                    Ok(next) => {
+                                        holder.store(next);
+                                        bridge_admission.limit_changed();
+                                        tracing::info!("SIGHUP: config hot-reloaded (config + SNI server certs; client-CA stores boot-frozen; cache + lsphp + connections preserved)");
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "SIGHUP: reload rejected, keeping the current generation");
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
@@ -2112,9 +2119,52 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
             .map(|c| c.doc_root.display().to_string())
             .unwrap_or_else(|| "<not loaded>".into());
         println!("    - {:<28} -> {}", name, docroot);
+        if let Some(c) = decl.config.as_ref()
+            && c.overrides_enabled(c.rewrite.auto_load_htaccess)
+            && let Ok(text) =
+                std::fs::read_to_string(c.doc_root.join(c.access_file_name_or_default()))
+        {
+            println!("      fast_memo: {}", describe_memo_eligibility(&text));
+        }
     }
 
     lint_topology(&cfg, strict)
+}
+
+/// One-line `fast_memo` verdict for a docroot `.htaccess` (the on-core static
+/// memo stores only under a chain every file of which is `MemoClass`-eligible):
+/// what it varies on, or the first blocking directive and its line.
+fn describe_memo_eligibility(text: &str) -> String {
+    let h = match hj_rewrite::Htaccess::parse(text) {
+        Ok(h) => h,
+        Err(e) => return format!("ineligible — .htaccess parse error: {e}"),
+    };
+    if !h.memo.eligible {
+        return match h.memo.blockers.first() {
+            Some((0, reason)) => format!("ineligible — {reason} (rewrite ruleset)"),
+            Some((line, reason)) => format!("ineligible — {reason} at line {line}"),
+            None => "ineligible".to_string(),
+        };
+    }
+    let mut vary = h.memo.vary_headers.clone();
+    if h.rules
+        .cache_key_vars
+        .contains(&hj_rewrite::CacheKeyVar::UserAgent)
+    {
+        vary.push(
+            if h.rules.ua_classify_eligible() {
+                "ua-class"
+            } else {
+                "user-agent"
+            }
+            .to_string(),
+        );
+    }
+    if vary.is_empty() {
+        "eligible".to_string()
+    } else {
+        format!("eligible [vary: {}]", vary.join(", "))
+    }
 }
 
 /// Vhosts that are mapped on a listener (exact or wildcard) but whose per-vhost config file did NOT

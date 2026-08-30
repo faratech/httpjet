@@ -292,6 +292,7 @@ fn make_state(tuning: RewriteTuning) -> Arc<ServerState> {
         false,
         tuning,
     )
+    .unwrap()
 }
 
 fn make_ctx(server: &Arc<ServerConfig>, vhost: &Arc<VHostConfig>) -> ReqCtx {

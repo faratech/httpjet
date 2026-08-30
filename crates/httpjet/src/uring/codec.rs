@@ -155,6 +155,14 @@ pub fn parse_chunk_size(line: &[u8]) -> Option<usize> {
     usize::from_str_radix(std::str::from_utf8(trimmed).ok()?, 16).ok()
 }
 
+/// Heap a chunked upload has committed: the decoded payload plus the raw chunk
+/// stream still buffered in the keep-alive accumulator (both live until the
+/// final drain). The server-wide body budget must see their sum — charging only
+/// the decoded copy under-counts each uploading connection by ~1x its body.
+pub fn chunked_accounted_bytes(decoded: usize, acc_len: usize, head_len: usize) -> u64 {
+    (decoded + acc_len.saturating_sub(head_len)) as u64
+}
+
 pub enum ChunkStep {
     /// Body fully decoded; the value is the absolute end offset in the buffer (one
     /// past the terminating CRLF) — drain up to here to leave any pipelined bytes.
@@ -256,6 +264,19 @@ impl ChunkedDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_accounting_covers_raw_and_decoded_heap() {
+        let head = 32usize;
+        // Before any body arrives the accumulator is just the head: nothing charged.
+        assert_eq!(chunked_accounted_bytes(0, head, head), 0);
+        // Mid-upload: raw framing in the accumulator + decoded payload, both live.
+        assert_eq!(chunked_accounted_bytes(5_000, head + 12_345, head), 17_345);
+        // Raw extent fully drained after `Done`: only the decoded copy remains.
+        assert_eq!(chunked_accounted_bytes(17_345, head, head), 17_345);
+        // A head_len past the accumulator (defensive) clamps, never wraps.
+        assert_eq!(chunked_accounted_bytes(4, 2, 8), 4);
+    }
 
     #[test]
     fn classify_framing_rejects_smuggling_shapes() {

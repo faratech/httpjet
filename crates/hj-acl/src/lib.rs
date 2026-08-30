@@ -23,7 +23,7 @@
 //! use hj_core::config::Security;
 //!
 //! let security = Security::default();
-//! let acl = AccessControl::from_security(&security);
+//! let acl = AccessControl::from_security(&security).unwrap();
 //! ```
 //!
 //! Per request, in the accept/pipeline path:
@@ -121,8 +121,11 @@ impl AccessControl {
     ///
     /// Rule specs are parsed leniently: an unparseable CIDR is skipped with a
     /// warning rather than failing construction, mirroring LiteSpeed's
-    /// tolerance of malformed config lines.
-    pub fn from_security(security: &Security) -> Self {
+    /// tolerance of malformed config lines. A malformed `accessDenyDir` glob
+    /// is the one fail-closed exception (#365): a skipped deny silently
+    /// exposes exactly the tree the operator asked to protect, so it is a
+    /// hard error — same philosophy as `--page-cache-shared-paths`.
+    pub fn from_security(security: &Security) -> Result<Self, String> {
         let mut rules: Vec<Rule> = Vec::with_capacity(security.access_control.len());
         let mut trusted_nets: Vec<IpNet> = Vec::new();
         let mut all_trusted = false;
@@ -164,14 +167,14 @@ impl AccessControl {
         // the *first-listed* of two equal-specificity rules stays first.
         rules.sort_by_key(|b| std::cmp::Reverse(b.prefix_len()));
 
-        let deny_globs = build_deny_globs(&security.access_deny_dir);
+        let deny_globs = build_deny_globs(&security.access_deny_dir)?;
 
-        AccessControl {
+        Ok(AccessControl {
             rules,
             trusted_nets,
             all_trusted,
             deny_globs,
-        }
+        })
     }
 
     /// Evaluate the allow/deny verdict for a connecting peer.
@@ -424,7 +427,7 @@ impl AccessControl {
 /// any depth — LiteSpeed/Apache never serve these, so httpjet matches that even
 /// when `<accessDenyDir>` is empty (the live config). The default only matches a
 /// basename beginning with `.ht`, so ordinary files are never denied by it.
-fn build_deny_globs(dirs: &[String]) -> GlobSet {
+fn build_deny_globs(dirs: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
 
     // Built-in default: the `.ht*` family, anywhere in the tree. `**/.ht*`
@@ -482,27 +485,26 @@ fn build_deny_globs(dirs: &[String]) -> GlobSet {
 
         // Special case: root.
         if stem.is_empty() {
-            add_glob(&mut builder, "/"); // the root path itself
+            add_glob(&mut builder, "/")?; // the root path itself
             if recursive {
-                add_glob(&mut builder, "/**"); // only `/ *` denies the whole tree
+                add_glob(&mut builder, "/**")?; // only `/ *` denies the whole tree
             }
             continue;
         }
 
         // The directory path itself; plus everything under it only when recursive.
-        add_glob(&mut builder, stem);
+        add_glob(&mut builder, stem)?;
         if recursive {
-            add_glob(&mut builder, &format!("{stem}/**"));
+            add_glob(&mut builder, &format!("{stem}/**"))?;
         }
     }
 
-    builder.build().unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "hj-acl: failed to compile deny-dir globset; denying nothing");
-        GlobSet::empty()
-    })
+    builder
+        .build()
+        .map_err(|e| format!("hj-acl: deny-dir globset failed to compile: {e}"))
 }
 
-fn add_glob(builder: &mut GlobSetBuilder, pat: &str) {
+fn add_glob(builder: &mut GlobSetBuilder, pat: &str) -> Result<(), String> {
     // `literal_separator(true)`: a single `*` does NOT cross `/`, so it matches
     // within one path component only; recursion must be expressed explicitly
     // with `**`. This is what the deny-glob expansion above documents and relies
@@ -511,24 +513,25 @@ fn add_glob(builder: &mut GlobSetBuilder, pat: &str) {
     match GlobBuilder::new(pat).literal_separator(true).build() {
         Ok(g) => {
             builder.add(g);
+            Ok(())
         }
-        Err(e) => tracing::warn!(pattern = %pat, error = %e, "hj-acl: skipping bad deny-dir glob"),
+        Err(e) => Err(format!(
+            "hj-acl: bad accessDenyDir pattern {pat:?}: {e} — fix or remove it; a skipped deny silently exposes the tree"
+        )),
     }
 }
 
 /// Like [`add_glob`] but case-insensitive — used for the built-in `.ht*` default
 /// so an uppercase/mixed-case access-file name (`.HTACCESS`) is also denied.
+/// The patterns are compile-time constants known to compile; a failure is an
+/// internal invariant break, not a config condition.
 fn add_glob_ci(builder: &mut GlobSetBuilder, pat: &str) {
-    match GlobBuilder::new(pat)
+    let g = GlobBuilder::new(pat)
         .literal_separator(true)
         .case_insensitive(true)
         .build()
-    {
-        Ok(g) => {
-            builder.add(g);
-        }
-        Err(e) => tracing::warn!(pattern = %pat, error = %e, "hj-acl: skipping bad deny-dir glob"),
-    }
+        .expect("built-in deny-dir glob must compile");
+    builder.add(g);
 }
 
 /// Parse a CIDR or bare IP into an [`IpNet`]. A bare address becomes a host
@@ -634,7 +637,7 @@ mod tests {
 
     #[test]
     fn cf_range_trust() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         // 173.245.48.0/20 covers 173.245.48.5.
         assert!(acl.is_trusted(ip("173.245.48.5")));
         // A few more from distinct ranges.
@@ -647,7 +650,7 @@ mod tests {
 
     #[test]
     fn allow_all_base_permits_everyone() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
         assert_eq!(acl.check_peer(ip("173.245.48.5")), AclDecision::Allow);
     }
@@ -672,7 +675,7 @@ mod tests {
             ],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("10.0.0.7")), AclDecision::Deny);
         assert_eq!(acl.check_peer(ip("10.0.1.7")), AclDecision::Allow);
         assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
@@ -703,7 +706,7 @@ mod tests {
             ],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("192.168.5.5")), AclDecision::Allow);
         assert_eq!(acl.check_peer(ip("203.0.113.9")), AclDecision::Allow);
         assert_eq!(acl.check_peer(ip("203.0.113.10")), AclDecision::Deny);
@@ -740,7 +743,7 @@ mod tests {
             ],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("10.1.9.9")), AclDecision::Allow); // /16
         assert_eq!(acl.check_peer(ip("10.1.2.7")), AclDecision::Deny); // /24
         assert_eq!(acl.check_peer(ip("10.1.2.50")), AclDecision::Allow); // /32
@@ -749,7 +752,7 @@ mod tests {
 
     #[test]
     fn empty_acl_defaults_open() {
-        let acl = AccessControl::from_security(&Security::default());
+        let acl = AccessControl::from_security(&Security::default()).unwrap();
         assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
         assert!(!acl.is_trusted(ip("8.8.8.8")));
     }
@@ -762,7 +765,7 @@ mod tests {
 
     #[test]
     fn xff_mode_0_ignores_header() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         let h = xff("9.9.9.9");
         // Mode 0: always return peer, even from a trusted proxy.
@@ -774,7 +777,7 @@ mod tests {
 
     #[test]
     fn xff_mode_1_always_trusts_header() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let untrusted_peer = ip("8.8.8.8");
         let h = xff("9.9.9.9");
         // Mode 1: honor header regardless of peer trust.
@@ -786,7 +789,7 @@ mod tests {
 
     #[test]
     fn xff_mode_2_trusted_peer_honored() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         let h = xff("9.9.9.9");
         // Mode 2 + trusted peer + mTLS ok: honor the header.
@@ -798,7 +801,7 @@ mod tests {
 
     #[test]
     fn xff_mode_2_untrusted_peer_rejected() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let untrusted_peer = ip("8.8.8.8");
         let h = xff("9.9.9.9");
         // Mode 2 + untrusted peer: ignore the (spoofed) header, return peer.
@@ -810,7 +813,7 @@ mod tests {
 
     #[test]
     fn xff_mode_2_tls_without_mtls_rejected() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         let h = xff("9.9.9.9");
         // Mode 2 + trusted peer but mTLS failed: do NOT honor header.
@@ -822,7 +825,7 @@ mod tests {
 
     #[test]
     fn xff_leftmost_untrusted_entry() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         // Real client, then two trusted CF hops appended on the right.
         let h = xff("203.0.113.7, 173.245.48.9, 162.158.1.1");
@@ -834,7 +837,7 @@ mod tests {
 
     #[test]
     fn xff_skips_trusted_prefix_to_find_client() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         // Left-most is a trusted hop; the next is the real (untrusted) client.
         let h = xff("162.158.1.1, 203.0.113.7");
@@ -846,7 +849,7 @@ mod tests {
 
     #[test]
     fn cf_connecting_ip_takes_priority() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         let mut h = HeaderMap::new();
         h.insert("cf-connecting-ip", "198.51.100.42".parse().unwrap());
@@ -859,7 +862,7 @@ mod tests {
 
     #[test]
     fn xff_garbage_falls_back_to_peer() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         let h = xff("not-an-ip, also-bad");
         assert_eq!(
@@ -870,7 +873,7 @@ mod tests {
 
     #[test]
     fn xff_no_header_returns_peer() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         let h = HeaderMap::new();
         assert_eq!(
@@ -881,7 +884,7 @@ mod tests {
 
     #[test]
     fn xff_all_entries_trusted_uses_leftmost() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         // Both hops are CF-trusted; no untrusted client present -> leftmost.
         let h = xff("162.158.1.1, 173.245.48.9");
@@ -893,7 +896,7 @@ mod tests {
 
     #[test]
     fn xff_mode_4_takes_last_entry_from_any_peer() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         // Untrusted peer, no mTLS: mode 4 still trusts XFF and takes the right-most entry.
         let untrusted_peer = ip("8.8.8.8");
         let h = xff("203.0.113.7, 198.51.100.9, 192.0.2.5");
@@ -906,7 +909,7 @@ mod tests {
 
     #[test]
     fn xff_mode_4_ignores_cf_connecting_ip() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         let mut h = HeaderMap::new();
         h.insert("cf-connecting-ip", "198.51.100.42".parse().unwrap());
@@ -920,7 +923,7 @@ mod tests {
 
     #[test]
     fn xff_mode_4_no_header_returns_peer() {
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         let peer = ip("8.8.8.8");
         assert_eq!(
             acl.resolve_client_ip(peer, &HeaderMap::new(), 4, true),
@@ -935,12 +938,34 @@ mod tests {
         // deny docroot files (that would 403 ALL traffic, which was the bug once
         // `deny_dir_match` got wired into the pipeline). A recursive deny needs an
         // explicit `/*`.
-        let acl = AccessControl::from_security(&cf_security());
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
         assert!(acl.deny_dir_match(Path::new("/"))); // the root path itself
         assert!(!acl.deny_dir_match(Path::new("/web/public_html/index.html")));
         assert!(!acl.deny_dir_match(Path::new("/web/public_html/robots.txt")));
         // `.ht*` default still applies regardless.
         assert!(acl.deny_dir_match(Path::new("/web/public_html/.htaccess")));
+    }
+
+    #[test]
+    fn malformed_custom_deny_glob_is_a_hard_error_not_fail_open() {
+        // (audit 2026-08-30 #365) A custom glob that fails to compile used to be
+        // skipped with a warning — silently disabling exactly the deny the
+        // operator meant to install. Construction must fail instead.
+        let mut sec = cf_security();
+        sec.access_deny_dir.push("/srv/secret[s/**".into());
+        let Err(err) = AccessControl::from_security(&sec) else {
+            panic!("an uncompilable custom deny glob must fail construction");
+        };
+        assert!(
+            err.contains("/srv/secret[s"),
+            "error names the pattern: {err}"
+        );
+
+        // The same config with the typo fixed constructs and denies normally.
+        sec.access_deny_dir.pop();
+        sec.access_deny_dir.push("/srv/secrets/**".into());
+        let acl = AccessControl::from_security(&sec).unwrap();
+        assert!(acl.deny_dir_match(Path::new("/srv/secrets/token.json")));
     }
 
     #[test]
@@ -952,7 +977,7 @@ mod tests {
             access_control: vec![],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
 
         assert!(acl.deny_dir_match(Path::new("/etc/passwd")));
         assert!(acl.deny_dir_match(Path::new("/etc/ssl/private/key.pem"))); // recursive
@@ -970,7 +995,7 @@ mod tests {
     fn deny_dir_ht_family_default() {
         // (M4) The `.ht*` family is denied by default for EVERY vhost — even when
         // `<accessDenyDir>` is empty (the live config) — matching LiteSpeed/Apache.
-        let acl = AccessControl::from_security(&Security::default());
+        let acl = AccessControl::from_security(&Security::default()).unwrap();
         // `.htaccess` / `.htpasswd` denied at any depth, including the bare root.
         assert!(acl.deny_dir_match(Path::new("/web/public_html/.htaccess")));
         assert!(acl.deny_dir_match(Path::new("/web/public_html/.htpasswd")));
@@ -990,7 +1015,7 @@ mod tests {
         // (security #262) Credential/config classes dropped into a docroot are denied
         // like the .ht* family: .env anywhere, key/pem material, token/client_secret
         // JSON, and the .oci / .git directory trees — at any depth, case-insensitively.
-        let acl = AccessControl::from_security(&Security::default());
+        let acl = AccessControl::from_security(&Security::default()).unwrap();
         for p in [
             "/web/stats/.env",
             "/web/ai/sub/.ENV",
@@ -1029,7 +1054,7 @@ mod tests {
             access_control: vec![],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         assert!(acl.deny_dir_match(Path::new("/web/public_html/.htaccess")));
         assert!(!acl.deny_dir_match(Path::new("/web/public_html/index.php")));
         assert!(!acl.deny_dir_match(Path::new("/web/public_html/assets/app.js")));
@@ -1046,7 +1071,7 @@ mod tests {
             access_control: vec![],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         // The configured dir, its contents (one level), and recursively.
         assert!(acl.deny_dir_match(Path::new("/web/app/secret")));
         assert!(acl.deny_dir_match(Path::new("/web/app/secret/key.pem")));
@@ -1089,7 +1114,7 @@ mod tests {
             ],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         assert!(acl.is_trusted(ip("2400:cb00::1")));
         assert!(!acl.is_trusted(ip("2001:db8::1")));
         assert_eq!(acl.check_peer(ip("2001:db8::1")), AclDecision::Deny);
@@ -1115,7 +1140,7 @@ mod tests {
             ],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("203.0.113.9")), AclDecision::Deny);
         assert_eq!(acl.check_peer(ip("203.0.113.10")), AclDecision::Allow);
     }
@@ -1139,7 +1164,7 @@ mod tests {
             ],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         // Bad rule ignored; ALL allow stands; bad rule didn't register as trusted.
         assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
         assert!(!acl.is_trusted(ip("8.8.8.8")));
@@ -1183,7 +1208,7 @@ mod tests {
             ],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         // Mapped form of a denied v4 address must be denied (was fail-open).
         assert_eq!(acl.check_peer(ip("::ffff:1.2.3.5")), AclDecision::Deny);
         assert_eq!(acl.check_peer(ip("1.2.3.5")), AclDecision::Deny);
@@ -1209,7 +1234,7 @@ mod tests {
             }],
             cgi_cpu_limit_secs: None,
         };
-        let acl = AccessControl::from_security(&sec);
+        let acl = AccessControl::from_security(&sec).unwrap();
         assert!(acl.is_trusted(ip("8.8.8.8")));
         assert!(acl.is_trusted(ip("2001:db8::1")));
         // And a forwarded header IS now honored from any peer under mode 2 (mTLS ok).
@@ -1231,7 +1256,7 @@ mod tests {
             }],
             cgi_cpu_limit_secs: None,
         };
-        let acl2 = AccessControl::from_security(&sec_untrusted);
+        let acl2 = AccessControl::from_security(&sec_untrusted).unwrap();
         assert!(!acl2.is_trusted(ip("8.8.8.8")));
     }
 }

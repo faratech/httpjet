@@ -186,12 +186,17 @@ pub(crate) async fn fast_serve(
     if target_len > state.serve_config.max_req_url_len {
         return None;
     }
-    let route_key: Option<String> = req
+    let (route_key, host_src): (Option<String>, fast_memo::HostSource) = match req
         .headers()
         .get(http::header::HOST)
         .and_then(|h| h.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| req.uri().authority().map(|a| a.host().to_string()));
+    {
+        Some(h) => (Some(h.to_owned()), fast_memo::HostSource::Header),
+        None => match req.uri().authority().map(|a| a.host().to_string()) {
+            Some(a) => (Some(a), fast_memo::HostSource::Authority),
+            None => (None, fast_memo::HostSource::None),
+        },
+    };
     let resolved = state.router.resolve(listener, route_key.as_deref())?;
     if !state.acl.check_peer(peer_ip).is_allowed() {
         return None; // let the bridge render the 403 with the full pipeline
@@ -228,32 +233,38 @@ pub(crate) async fn fast_serve(
         request_id: hj_core::reqid::next(),
         redirect_guard: None,
     };
-    // (#349) Finished-response memo (experimental, HJ_FAST_MEMO=1 only). The
-    // request gates here are HALF the correctness contract; the other half is
-    // the chain/inline eligibility enforced at the store site below — see the
-    // `fast_memo` module doc. A hit replays a response the FULL fast path
-    // built for this exact key within the last second, resolves the real
-    // client IP for the access log, and goes through the same observability
-    // funnel as every other serve.
+    // (#349) Finished-response memo (default-on; `--no-fast-memo` / HJ_FAST_MEMO=0
+    // kill switch). The request gates here are HALF the correctness contract;
+    // the other half is the chain/inline eligibility enforced at the store site
+    // below — see the `fast_memo` module doc. A hit replays a response the FULL
+    // fast path built for this exact key + vary-set within the last second,
+    // resolves the real client IP for the access log, and goes through the same
+    // observability funnel as every other serve. Every conditional header the
+    // static handler answers with 304/412/206 is excluded, not just the two
+    // common ones — a replayed 200 would silently override that verdict.
     let memo_eligible_req = fast_memo::enabled()
         && method == http::Method::GET
         && !req.headers().contains_key(http::header::COOKIE)
         && !req.headers().contains_key(http::header::RANGE)
         && !req.headers().contains_key(http::header::IF_NONE_MATCH)
         && !req.headers().contains_key(http::header::IF_MODIFIED_SINCE)
+        && !req.headers().contains_key(http::header::IF_MATCH)
+        && !req.headers().contains_key(http::header::IF_RANGE)
+        && !req
+            .headers()
+            .contains_key(http::header::IF_UNMODIFIED_SINCE)
         && !req.headers().contains_key(http::header::AUTHORIZATION);
-    // The inline ruleset's keyable dynamic vars (UA/Origin/Accept) fold into
-    // the memo key at BOTH probe and store — same `state.inline_rules` source,
-    // so the two sides can never disagree. A `path_cacheable: false` inline
-    // set means stores are impossible; skip the probe entirely.
+    // A `path_cacheable: false` inline set means stores are impossible; skip
+    // the probe entirely. Its keyable vars become vary items at the store site.
     let memo_inline = state.inline_rules.get(&ctx.vhost_name);
-    let memo_inline_ok =
-        memo_inline.is_none_or(|rs| rs.path_cacheable && rs.assumed_empty_env.is_empty());
+    let memo_inline_ok = memo_inline.is_none_or(|rs| rs.path_cacheable);
     if memo_eligible_req && memo_inline_ok {
         let mk = fast_memo::MemoKey {
             listener,
             https: effective_https,
+            trusted_proxy,
             vhost: &ctx.vhost_name,
+            host_src,
             host: route_key.as_deref().unwrap_or("").as_bytes(),
             path: req.uri().path(),
             query: req.uri().query().unwrap_or(""),
@@ -262,14 +273,8 @@ pub(crate) async fn fast_serve(
                 .get(http::header::ACCEPT_ENCODING)
                 .map(|v| v.as_bytes())
                 .unwrap_or(b""),
-            vars: fast_memo::keyvar_fold(
-                memo_inline
-                    .map(|rs| rs.cache_key_vars.as_slice())
-                    .unwrap_or(&[]),
-                req,
-            ),
         };
-        if let Some(resp) = fast_memo::probe(&mk, req_start) {
+        if let Some(resp) = fast_memo::probe(&mk, req, &state.ua_classify, req_start) {
             state
                 .metrics
                 .fast_memo_hits
@@ -328,22 +333,19 @@ pub(crate) async fn fast_serve(
     let chain: Vec<std::sync::Arc<Htaccess>> =
         chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
     // (#349) Memo store eligibility — the response must be a pure function of
-    // the memo key. Chain gates: no SetEnvIf (header-driven env), no access
-    // rules (may be client-IP-driven, and IP is not keyed), and rewrite rules
-    // the outcome-cache classifier already proves read only keyed inputs. The
-    // vhost inline ruleset must pass the same bar. `Header`/`extraHeaders`
+    // the memo key plus the entry's vary-set. Each chain file's verdict is
+    // parse-time (`MemoClass`, fail-closed): SetEnvIf on client/server address
+    // or protocol, IP/env access rules, and any rewrite input outside the key +
+    // keyable vars withdraw it; header reads become vary dimensions. The vhost
+    // inline ruleset must be `path_cacheable`. `Header`/`extraHeaders`
     // conditionality is URI/env-modelled in this engine, so under these gates
     // it is key-deterministic too. A directory change that adds any such
     // directive is visible within the memo's 1 s TTL.
-    let memo_store_ok = memo_eligible_req
-        && memo_inline_ok
-        && chain_with_dirs.iter().all(|(_, ht)| {
-            ht.set_env_if.is_empty()
-                && ht.access_rules.is_empty()
-                && ht.rules.path_cacheable
-                && ht.rules.cache_key_vars.is_empty()
-                && ht.rules.assumed_empty_env.is_empty()
-        });
+    let memo_chain_ok = memo_inline_ok
+        && chain_with_dirs
+            .iter()
+            .all(|(_, ht)| ht.memo.eligible && ht.rules.path_cacheable);
+    let memo_store_ok = memo_eligible_req && memo_chain_ok;
     // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
     // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
     // path judges the SAME identity the tokio `handle()` path does — not the raw socket
@@ -557,39 +559,120 @@ pub(crate) async fn fast_serve(
     for t in &state.transforms {
         t.transform(&ctx, &mut resp).await;
     }
-    if memo_store_ok
-        && resp.status() == StatusCode::OK
-        && !resp.headers().contains_key(http::header::SET_COOKIE)
-    {
-        fast_memo::store(
-            &fast_memo::MemoKey {
-                listener,
-                https: effective_https,
-                vhost: &ctx.vhost_name,
-                host: route_key.as_deref().unwrap_or("").as_bytes(),
-                path: req.uri().path(),
-                query: req.uri().query().unwrap_or(""),
-                ae: req
-                    .headers()
-                    .get(http::header::ACCEPT_ENCODING)
-                    .map(|v| v.as_bytes())
-                    .unwrap_or(b""),
-                vars: fast_memo::keyvar_fold(
-                    memo_inline
-                        .map(|rs| rs.cache_key_vars.as_slice())
-                        .unwrap_or(&[]),
-                    req,
-                ),
-            },
-            &resp,
-            req_start,
-        );
-        state
-            .metrics
-            .fast_memo_stores
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if resp.status() == StatusCode::OK && !resp.headers().contains_key(http::header::SET_COOKIE) {
+        if memo_store_ok {
+            if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs) {
+                fast_memo::store(
+                    &fast_memo::MemoKey {
+                        listener,
+                        https: effective_https,
+                        trusted_proxy,
+                        vhost: &ctx.vhost_name,
+                        host_src,
+                        host: route_key.as_deref().unwrap_or("").as_bytes(),
+                        path: req.uri().path(),
+                        query: req.uri().query().unwrap_or(""),
+                        ae: req
+                            .headers()
+                            .get(http::header::ACCEPT_ENCODING)
+                            .map(|v| v.as_bytes())
+                            .unwrap_or(b""),
+                    },
+                    vary,
+                    &resp,
+                    req_start,
+                );
+                state
+                    .metrics
+                    .fast_memo_stores
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if memo_eligible_req {
+            state
+                .metrics
+                .fast_memo_ineligible
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     Some(record_fast_serve(state, &ctx, proto, req, req_start, resp))
+}
+
+/// (#349) The vary-set a memo entry for this request must carry: the raw value
+/// of every request header the chain's `SetEnvIf`/`RewriteCond` read, and a
+/// UA-cond bitmap per User-Agent-reading ruleset (raw `User-Agent` when the
+/// ruleset is not classify-eligible or classification is tuned off — the same
+/// choice `run_rewrite` makes for its outcome key). `None` refuses the store:
+/// an `%{ENV:}` name the rewrite classifier assumed constant-empty is actually
+/// seeded on this request (mirrors `run_rewrite`'s `assumed_env_absent`).
+fn memo_vary_set(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    req: &Request,
+    inline: Option<&Arc<hj_rewrite::RuleSet>>,
+    chain: &[(PathBuf, Arc<Htaccess>)],
+) -> Option<Vec<fast_memo::VaryItem>> {
+    let seeded = |rs: &hj_rewrite::RuleSet| {
+        rs.assumed_empty_env
+            .iter()
+            .any(|name| ctx.get_env(name).is_some())
+    };
+    if inline.is_some_and(|rs| seeded(rs)) || chain.iter().any(|(_, ht)| seeded(&ht.rules)) {
+        return None;
+    }
+    let mut vary: Vec<fast_memo::VaryItem> = Vec::new();
+    let push_header = |vary: &mut Vec<fast_memo::VaryItem>, name: &str| -> bool {
+        let Ok(name) = http::HeaderName::from_bytes(name.as_bytes()) else {
+            return false;
+        };
+        if !vary
+            .iter()
+            .any(|v| matches!(v, fast_memo::VaryItem::Header { name: n, .. } if *n == name))
+        {
+            vary.push(fast_memo::vary_header(req, name));
+        }
+        true
+    };
+    let push_rules = |vary: &mut Vec<fast_memo::VaryItem>,
+                      rs: &hj_rewrite::RuleSet,
+                      pin: fast_memo::UaRules|
+     -> bool {
+        for v in &rs.cache_key_vars {
+            let ok = match v {
+                hj_rewrite::CacheKeyVar::Origin => push_header(vary, "origin"),
+                hj_rewrite::CacheKeyVar::Accept => push_header(vary, "accept"),
+                hj_rewrite::CacheKeyVar::UserAgent => {
+                    if state.rewrite_ua_classify && rs.ua_classify_eligible() {
+                        let bits = state
+                            .ua_classify
+                            .get_or_compute(rs, &fast_memo::ua_for_classify(req));
+                        vary.push(fast_memo::VaryItem::UaClass { rules: pin, bits });
+                        return true;
+                    }
+                    push_header(vary, "user-agent")
+                }
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    };
+    if let Some(rs) = inline
+        && !push_rules(&mut vary, rs, fast_memo::UaRules::Inline(rs.clone()))
+    {
+        return None;
+    }
+    for (_, ht) in chain {
+        for name in &ht.memo.vary_headers {
+            if !push_header(&mut vary, name) {
+                return None;
+            }
+        }
+        if !push_rules(&mut vary, &ht.rules, fast_memo::UaRules::Chain(ht.clone())) {
+            return None;
+        }
+    }
+    Some(vary)
 }
 
 /// The request's Cookie header as ONE string for cache classification.
@@ -3407,7 +3490,7 @@ mod tests {
     fn resolved_static_target_is_checked_against_access_deny_dir() {
         let mut security = hj_core::config::Security::default();
         security.access_deny_dir = vec!["/srv/denied/*".to_string()];
-        let acl = hj_acl::AccessControl::from_security(&security);
+        let acl = hj_acl::AccessControl::from_security(&security).unwrap();
         let mut resp = Response::new(Body::Empty);
         resp.extensions_mut()
             .insert(hj_static::ResolvedTargetPath("/srv/denied/file.txt".into()));
@@ -3444,7 +3527,7 @@ mod tests {
 
         let mut security = hj_core::config::Security::default();
         security.access_deny_dir = vec![format!("{}/*", denied.display())];
-        let acl = hj_acl::AccessControl::from_security(&security);
+        let acl = hj_acl::AccessControl::from_security(&security).unwrap();
         assert!(allowed_script_target(&acl, &script).is_none());
 
         let allowed = public.join("allowed.php");

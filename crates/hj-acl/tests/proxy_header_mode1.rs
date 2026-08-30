@@ -31,6 +31,7 @@ fn acl_with_cf_trusted() -> AccessControl {
         access_control: rules,
         cgi_cpu_limit_secs: None,
     })
+    .unwrap()
 }
 
 /// Mode 1 with CF-Connecting-IP set by an untrusted peer: the header must be

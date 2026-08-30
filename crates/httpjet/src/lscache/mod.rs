@@ -3146,6 +3146,7 @@ mod tests {
                 false,
                 crate::state::RewriteTuning::default(),
             )
+            .unwrap()
         };
         let server2 = Arc::new(hj_core::config::ServerConfig::default());
         let vhost = Arc::new(hj_core::config::VHostConfig {
@@ -3696,7 +3697,8 @@ mod tests {
             None,
             false,
             crate::state::RewriteTuning::default(),
-        );
+        )
+        .unwrap();
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let ctx = ReqCtx {
             server,
@@ -3985,7 +3987,8 @@ mod tests {
             None,
             false,
             crate::state::RewriteTuning::default(),
-        );
+        )
+        .unwrap();
         (state, ctx, store)
     }
 
@@ -4037,7 +4040,8 @@ mod tests {
             None,
             false,
             crate::state::RewriteTuning::default(),
-        );
+        )
+        .unwrap();
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         let ctx = ReqCtx {
             server,

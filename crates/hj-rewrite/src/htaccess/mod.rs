@@ -168,6 +168,62 @@ pub struct SetEnvIf {
     pub(crate) value: String,
 }
 
+/// Parse-time verdict on whether a finished STATIC response built under this
+/// file may be replayed for a later request (the pipeline's `fast_memo`).
+/// `eligible` holds iff every request-state input the file reads is either part
+/// of the memo's base key (scheme, Host, path, query, GET-only method) or a
+/// request header named in `vary_headers`, whose raw value the pipeline then
+/// captures per memo entry (an HTTP `Vary`, in effect). Fail-closed: any
+/// directive kind not proven key-determined marks the file ineligible and
+/// records the offending line in `blockers`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MemoClass {
+    pub eligible: bool,
+    /// Lowercased, `_`→`-` folded request-header names whose raw first value
+    /// must match between the memoized request and a replay (absent ≠ present).
+    /// `User-Agent` reads by the REWRITE ruleset are deliberately not listed:
+    /// the pipeline keys those on [`RuleSet::ua_cond_signature`] when
+    /// [`RuleSet::ua_classify_eligible`] and on the raw header otherwise.
+    pub vary_headers: Vec<String>,
+    /// `(line, reason)` of the first few blocking directives; line 0 = the
+    /// rewrite ruleset (which keeps no line numbers).
+    pub blockers: Vec<(usize, &'static str)>,
+}
+
+impl MemoClass {
+    const MAX_BLOCKERS: usize = 8;
+
+    pub(crate) fn block(&mut self, line: usize, reason: &'static str) {
+        self.eligible = false;
+        if self.blockers.len() < Self::MAX_BLOCKERS {
+            self.blockers.push((line, reason));
+        }
+    }
+
+    pub(crate) fn vary(&mut self, folded_name: String) {
+        if !self.vary_headers.contains(&folded_name) {
+            self.vary_headers.push(folded_name);
+        }
+    }
+}
+
+/// `SetEnvIf`'s header-attribute spelling folded to the canonical header name
+/// (`User_Agent` → `user-agent`), or `None` when it is not a valid token.
+pub(crate) fn fold_header_name(attr: &str) -> Option<String> {
+    let folded: String = attr
+        .chars()
+        .map(|c| {
+            if c == '_' {
+                '-'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    let tchar = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+    (!folded.is_empty() && folded.bytes().all(tchar)).then_some(folded)
+}
+
 /// A `php_value` / `php_admin_value` / `php_flag` / `php_admin_flag` directive
 /// from `.htaccess`. Flags are normalized to their value form at parse time
 /// (`on`→`1`, `off`→`0`), so `value` is always the literal php.ini value.
@@ -408,4 +464,6 @@ pub struct Htaccess {
     pub access_index: ScopeIndex,
     /// Load-time index over `headers`, same contract as `access_index`.
     pub header_index: ScopeIndex,
+    /// Parse-time `fast_memo` replay eligibility (see [`MemoClass`]).
+    pub memo: MemoClass,
 }

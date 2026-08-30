@@ -71,6 +71,31 @@ fn build_state_full(
     page_cache: Option<Arc<hj_pagecache::PageStore>>,
     peer_purge: Option<crate::peer_purge::PurgeForwarder>,
 ) -> Arc<ServerState> {
+    let htaccess = page_cache.is_some();
+    build_state_inner(
+        doc_root,
+        contexts,
+        access_deny_dir,
+        htaccess,
+        page_cache,
+        peer_purge,
+    )
+}
+
+/// A `.htaccess`-loading vhost WITHOUT a page cache: the fast_memo tests need
+/// the per-dir chain but not the Branch-1 lookup in front of the static serve.
+fn build_state_htaccess(doc_root: PathBuf) -> Arc<ServerState> {
+    build_state_inner(doc_root, Vec::new(), Vec::new(), true, None, None)
+}
+
+fn build_state_inner(
+    doc_root: PathBuf,
+    contexts: Vec<Context>,
+    access_deny_dir: Vec<String>,
+    htaccess: bool,
+    page_cache: Option<Arc<hj_pagecache::PageStore>>,
+    peer_purge: Option<crate::peer_purge::PurgeForwarder>,
+) -> Arc<ServerState> {
     // AccessLogger writes under server_root/logs; give it a real writable dir.
     let server_root = temp_root("srv");
     std::fs::create_dir_all(server_root.join("logs")).unwrap();
@@ -93,8 +118,10 @@ fn build_state_full(
             enable_public: true,
             enable_private: false,
         });
-        // The cache-parity tests write per-dir `.htaccess` files (CacheDisable /
-        // Require); the vhost must load them like a prod standards vhost does.
+    }
+    if htaccess {
+        // The cache-parity + memo tests write per-dir `.htaccess` files (CacheDisable /
+        // Require / SetEnvIf); the vhost must load them like a prod standards vhost does.
         vhost_cfg.allow_override = 1;
     }
     let decl = VHostDecl {
@@ -157,6 +184,7 @@ fn build_state_full(
         false, // request_id_header
         crate::state::RewriteTuning::default(),
     )
+    .unwrap()
 }
 
 fn get(host: &str, path: &str, inm: Option<&str>) -> Request {
@@ -807,4 +835,273 @@ async fn reserved_paths_are_intercepted_before_the_fast_path() {
     );
 
     let _ = std::fs::remove_dir_all(doc_root);
+}
+
+// ─── (#349) fast_memo under a `.htaccess`-heavy chain: the vary-set contract ───
+// The production forum docroot file reads Origin (SetEnvIf → ACAO echo), the
+// User-Agent (crawler class → X-Robots-Tag), Cookie (SetEnvIfNoCase) and
+// `%{ENV:REDIRECT_STATUS}`, and carries scoped `Require`s and a `<FilesMatch>`
+// canonical block. Every test below drives `fast_serve` on ONE thread (the
+// memo is per-thread) and judges it by the :9090 counters plus byte identity.
+mod fast_memo_e2e {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    const FORUM_HTACCESS: &str = r##"RewriteEngine On
+<FilesMatch "\.(secret)$">
+  Require all denied
+</FilesMatch>
+<Files "robots.txt">
+  Require all granted
+</Files>
+Header set X-Static-Chain 1
+Header unset ETag
+SetEnvIf Query_String "(^|&)amp=1(&|$)" AMP_PAGE
+SetEnvIf Origin "^https://(a\.test|b\.test)$" ORIGIN_ALLOWED=$0
+Header set Access-Control-Allow-Origin "%{ORIGIN_ALLOWED}e" env=ORIGIN_ALLOWED
+SetEnvIfNoCase Cookie xf_session_admin Cache-Control=no-cache
+RewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot)
+RewriteRule .* - [E=KNOWN_CRAWLER:1]
+Header set X-Robots-Tag "index, follow" env=KNOWN_CRAWLER
+RewriteCond %{ENV:REDIRECT_STATUS} ^(403|5)
+RewriteRule .* - [E=no-cache:1]
+<FilesMatch "\.(css|js)$">
+  RewriteCond %{HTTPS} !=on
+  RewriteRule .* - [E=CANONICAL:http://%{HTTP_HOST}%{REQUEST_URI},NE]
+  Header set Link "<%{CANONICAL}e>; rel=\"canonical\""
+</FilesMatch>
+RewriteCond %{REQUEST_FILENAME} -f
+RewriteRule ^.*$ - [NC,L]
+RewriteRule ^.*$ index.php [NC,L]
+"##;
+
+    fn setup(tag: &str, htaccess: &str) -> (PathBuf, Arc<ServerState>) {
+        let doc_root = temp_root(tag);
+        std::fs::write(doc_root.join("a.css"), "body{margin:0}\n").unwrap();
+        std::fs::write(doc_root.join("robots.txt"), "User-agent: *\n").unwrap();
+        std::fs::write(doc_root.join("x.secret"), "hidden\n").unwrap();
+        std::fs::write(doc_root.join(".htaccess"), htaccess).unwrap();
+        let state = build_state_htaccess(doc_root.clone());
+        (doc_root, state)
+    }
+
+    fn req(path: &str, headers: &[(&str, &str)]) -> Request {
+        let mut b = http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::HOST, CANON_HOST);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(hj_core::empty_incoming()).unwrap()
+    }
+
+    fn stores(state: &ServerState) -> u64 {
+        state.metrics.fast_memo_stores.load(Ordering::Relaxed)
+    }
+    fn hits(state: &ServerState) -> u64 {
+        state.metrics.fast_memo_hits.load(Ordering::Relaxed)
+    }
+    fn ineligible(state: &ServerState) -> u64 {
+        state.metrics.fast_memo_ineligible.load(Ordering::Relaxed)
+    }
+
+    fn hdr<'a>(r: &'a Response, name: &str) -> Option<&'a str> {
+        r.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    async fn serve(state: &Arc<ServerState>, r: Request) -> Response {
+        fast_serve_req(state, &r)
+            .await
+            .expect("static GET must be served on-core, not bridged")
+    }
+
+    #[tokio::test]
+    async fn stores_then_replays_byte_identically_under_the_forum_chain() {
+        let (root, state) = setup("memo_basic", FORUM_HTACCESS);
+        let ua = ("user-agent", "Mozilla/5.0 Chrome/120");
+        let first = serve(&state, req("/a.css", &[ua])).await;
+        assert_eq!((stores(&state), hits(&state)), (1, 0), "first sight stores");
+        assert_eq!(hdr(&first, "x-static-chain"), Some("1"));
+        assert_eq!(
+            hdr(&first, "link"),
+            Some("<http://canon.test/a.css>; rel=\"canonical\""),
+            "the FilesMatch canonical block ran for the store"
+        );
+        assert!(hdr(&first, "x-robots-tag").is_none());
+        assert!(hdr(&first, "access-control-allow-origin").is_none());
+
+        let second = serve(&state, req("/a.css", &[ua])).await;
+        assert_eq!((stores(&state), hits(&state)), (1, 1), "repeat key replays");
+        assert_eq!(second.status(), first.status());
+        assert_eq!(
+            second.headers(),
+            first.headers(),
+            "replayed headers are identical"
+        );
+        let (a, b) = (
+            body_bytes(first.into_body()),
+            body_bytes(second.into_body()),
+        );
+        assert_eq!(a, b);
+        assert_eq!(&a[..], b"body{margin:0}\n");
+        assert_eq!(ineligible(&state), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn varies_on_origin_exactly_like_the_setenvif_echo() {
+        let (root, state) = setup("memo_origin", FORUM_HTACCESS);
+        let none = serve(&state, req("/a.css", &[])).await;
+        assert!(hdr(&none, "access-control-allow-origin").is_none());
+        let a = serve(&state, req("/a.css", &[("origin", "https://a.test")])).await;
+        assert_eq!(
+            hdr(&a, "access-control-allow-origin"),
+            Some("https://a.test")
+        );
+        let evil = serve(&state, req("/a.css", &[("origin", "https://evil.test")])).await;
+        assert!(hdr(&evil, "access-control-allow-origin").is_none());
+        assert_eq!(
+            (stores(&state), hits(&state)),
+            (3, 0),
+            "three distinct vary values"
+        );
+
+        // Replays land on their OWN variant — never a sibling's ACAO.
+        let a2 = serve(&state, req("/a.css", &[("origin", "https://a.test")])).await;
+        assert_eq!(
+            hdr(&a2, "access-control-allow-origin"),
+            Some("https://a.test")
+        );
+        let none2 = serve(&state, req("/a.css", &[])).await;
+        assert!(hdr(&none2, "access-control-allow-origin").is_none());
+        let b = serve(&state, req("/a.css", &[("origin", "https://b.test")])).await;
+        assert_eq!(
+            hdr(&b, "access-control-allow-origin"),
+            Some("https://b.test")
+        );
+        assert_eq!((stores(&state), hits(&state)), (4, 2));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn keys_the_user_agent_by_crawler_class_not_string() {
+        let (root, state) = setup("memo_ua", FORUM_HTACCESS);
+        // Classification is the deploy-time `--rewrite-ua-classify` tuning
+        // (ON in prod); without it the memo varies on the raw UA (still correct).
+        let mut tuned = build_state_htaccess(root.clone());
+        Arc::get_mut(&mut tuned).unwrap().rewrite_ua_classify = true;
+        drop(state);
+        let state = tuned;
+        let bot = serve(&state, req("/a.css", &[("user-agent", "Googlebot/2.1")])).await;
+        assert_eq!(hdr(&bot, "x-robots-tag"), Some("index, follow"));
+        let chrome = serve(&state, req("/a.css", &[("user-agent", "Chrome/120")])).await;
+        assert!(hdr(&chrome, "x-robots-tag").is_none());
+        assert_eq!((stores(&state), hits(&state)), (2, 0));
+
+        let bing = serve(&state, req("/a.css", &[("user-agent", "Bingbot/2.0")])).await;
+        assert_eq!(hdr(&bing, "x-robots-tag"), Some("index, follow"));
+        let firefox = serve(&state, req("/a.css", &[("user-agent", "Firefox/130")])).await;
+        assert!(hdr(&firefox, "x-robots-tag").is_none());
+        assert_eq!(
+            (stores(&state), hits(&state)),
+            (2, 2),
+            "a new UA string in a known class replays that class's entry"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cookied_requests_never_store_or_replay() {
+        let (root, state) = setup("memo_cookie", FORUM_HTACCESS);
+        let c = ("cookie", "xf_session_admin=1");
+        let _ = serve(&state, req("/a.css", &[c])).await;
+        let _ = serve(&state, req("/a.css", &[c])).await;
+        assert_eq!(
+            (stores(&state), hits(&state), ineligible(&state)),
+            (0, 0, 0)
+        );
+        // And a cookieless entry is never handed to a cookied request.
+        let _ = serve(&state, req("/a.css", &[])).await;
+        let _ = serve(&state, req("/a.css", &[c])).await;
+        assert_eq!((stores(&state), hits(&state)), (1, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn address_dependent_chains_never_store_and_are_counted() {
+        for (tag, extra) in [
+            ("memo_remote_addr", "SetEnvIf Remote_Addr ^127\\. LOCAL=1\n"),
+            (
+                "memo_deny_net",
+                "Order allow,deny\nAllow from 10.0.0.0/8\nAllow from 127.0.0.1\n",
+            ),
+            (
+                "memo_cookie_cond",
+                "RewriteCond %{HTTP_COOKIE} xf_user\nRewriteRule .* - [E=X:1]\n",
+            ),
+        ] {
+            let (root, state) = setup(tag, &format!("{FORUM_HTACCESS}{extra}"));
+            let _ = serve(&state, req("/a.css", &[])).await;
+            let _ = serve(&state, req("/a.css", &[])).await;
+            assert_eq!(
+                (stores(&state), hits(&state), ineligible(&state)),
+                (0, 0, 2),
+                "{tag}"
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_request_headers_bypass_the_memo() {
+        let (root, state) = setup("memo_conditional", FORUM_HTACCESS);
+        let _ = serve(&state, req("/a.css", &[])).await;
+        assert_eq!(stores(&state), 1);
+        // 412-class preconditions bridge (the static handler's verdict, not a
+        // replayed 200) …
+        for h in [
+            ("if-match", "\"nope\""),
+            ("if-unmodified-since", "Thu, 01 Jan 1970 00:00:00 GMT"),
+        ] {
+            assert!(
+                fast_serve_req(&state, &req("/a.css", &[h])).await.is_none(),
+                "{h:?} must not be answered from the memo"
+            );
+        }
+        // … and a served-but-conditional request neither hits nor stores.
+        let r = serve(&state, req("/a.css", &[("if-range", "\"nope\"")])).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!((stores(&state), hits(&state)), (1, 0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn scoped_deny_and_canonical_link_follow_the_path() {
+        let (root, state) = setup("memo_scopes", FORUM_HTACCESS);
+        assert!(
+            fast_serve_req(&state, &req("/x.secret", &[]))
+                .await
+                .is_none()
+        );
+        assert!(
+            fast_serve_req(&state, &req("/x.secret", &[]))
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            (stores(&state), hits(&state)),
+            (0, 0),
+            "a denied path never memoizes"
+        );
+        let robots = serve(&state, req("/robots.txt", &[])).await;
+        assert!(
+            hdr(&robots, "link").is_none(),
+            "canonical Link is FilesMatch-scoped"
+        );
+        let robots2 = serve(&state, req("/robots.txt", &[])).await;
+        assert!(hdr(&robots2, "link").is_none());
+        assert_eq!((stores(&state), hits(&state)), (1, 1));
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

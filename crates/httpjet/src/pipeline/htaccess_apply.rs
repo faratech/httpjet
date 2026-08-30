@@ -345,7 +345,7 @@ mod tests {
         use hj_core::config::Security;
 
         let docroot = Path::new("/web/public_html");
-        let acl = AccessControl::from_security(&Security::default());
+        let acl = AccessControl::from_security(&Security::default()).unwrap();
         assert!(access_deny_dir(&acl, docroot, "/.htaccess"));
         assert!(access_deny_dir(&acl, docroot, "/sub/.htpasswd"));
         assert!(!access_deny_dir(&acl, docroot, "/index.php"));
