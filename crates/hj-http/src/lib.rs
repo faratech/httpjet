@@ -11,6 +11,8 @@
 
 use std::time::Duration;
 
+pub use hj_core::budget::BandwidthThrottle;
+
 /// Tunables applied to each served connection.
 ///
 /// These mirror the LiteSpeed connection-tuning knobs the orchestrator reads from
@@ -18,6 +20,8 @@ use std::time::Duration;
 /// server. The io_uring transport reads these off `ServerState::serve_config`.
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
+    /// (Tier 2) Per-connection bandwidth limit (bytes/sec). 0 = unlimited.
+    pub bandwidth_limit: u64,
     /// h1 keep-alive: `Some(d)` keeps the connection open between requests and bounds the
     /// idle wait at `d` (the io_uring H1 loop arms this on the next-request read);
     /// `None` disables keep-alive (one request per connection). HTTP/2 has its own
@@ -51,6 +55,7 @@ impl Default for ServeConfig {
             max_req_header_size: 16380,
             max_req_body_size: 100 * 1024 * 1024,
             max_req_url_len: 8192,
+            bandwidth_limit: 0,
         }
     }
 }
@@ -76,6 +81,7 @@ impl ServeConfig {
             max_req_header_size: t.max_req_header_size,
             max_req_body_size: t.max_req_body_size as usize,
             max_req_url_len: t.max_req_url_len,
+            bandwidth_limit: t.bandwidth_limit,
         }
     }
 }

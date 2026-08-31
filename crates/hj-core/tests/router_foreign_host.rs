@@ -58,6 +58,8 @@ fn build_router() -> Router {
         name: "tls".into(),
         address: "0.0.0.0:443".into(),
         secure: true,
+        proxy_protocol: false,
+        uds_path: None,
         vhost_map: vec![
             VhostMap {
                 vhost: "publisher.example".into(),
@@ -219,6 +221,8 @@ fn mapped_vhost_with_unloaded_config_is_known_but_unloaded() {
         name: "tls".into(),
         address: "0.0.0.0:443".into(),
         secure: true,
+        proxy_protocol: false,
+        uds_path: None,
         vhost_map: vec![
             VhostMap {
                 vhost: "broken.example.com".into(),

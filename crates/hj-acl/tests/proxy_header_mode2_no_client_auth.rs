@@ -35,6 +35,7 @@ fn acl_with_cf_trusted() -> AccessControl {
         access_deny_dir: vec![],
         access_control: rules,
         cgi_cpu_limit_secs: None,
+        ..Default::default()
     })
     .unwrap()
 }

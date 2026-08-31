@@ -238,7 +238,12 @@ async fn prune_old(cfg: &RollConfig) -> io::Result<()> {
 /// If the file cannot be opened initially we still consume the channel (logging
 /// must never wedge the request path); lines are dropped and the failure is
 /// reported via `tracing`.
-pub async fn run(cfg: RollConfig, mut rx: mpsc::UnboundedReceiver<Msg>, state: crate::LoggerState) {
+pub async fn run(
+    cfg: RollConfig,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+    state: crate::LoggerState,
+    syslog: Option<crate::SyslogTap>,
+) {
     let depth = &state.depth;
     let mut writer = match Writer::open(cfg.clone()).await {
         Ok(w) => Some(w),
@@ -307,6 +312,18 @@ pub async fn run(cfg: RollConfig, mut rx: mpsc::UnboundedReceiver<Msg>, state: c
                 }
                 None => None,
             };
+            // (Tier 2) The syslog tap fires BEFORE the file write so a file
+            // failure never suppresses the sink; both paths carry the same lines.
+            if let Some(tap) = syslog.as_ref() {
+                if let Some(lines) = to_write.as_deref() {
+                    for line in lines.split('\n') {
+                        tap.send_line(line);
+                    }
+                }
+                if let Some(bytes) = raw_chunk.as_deref() {
+                    tap.send_chunk(bytes);
+                }
+            }
             if let Some(bytes) = raw_chunk {
                 if let Some(w) = writer.as_mut() {
                     if let Err(e) = w.write_raw(&bytes).await {
@@ -421,7 +438,7 @@ mod tests {
             compress_archive: false,
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let h = tokio::spawn(run(cfg, rx, logger_state()));
+        let h = tokio::spawn(run(cfg, rx, logger_state(), None));
 
         send_line(&tx, "line one").await;
         send_line(&tx, "line two").await;
@@ -447,7 +464,7 @@ mod tests {
             compress_archive: false,
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let h = tokio::spawn(run(cfg, rx, logger_state()));
+        let h = tokio::spawn(run(cfg, rx, logger_state(), None));
 
         let record = AccessRecord {
             client_ip: "203.0.113.7".parse().unwrap(),
@@ -462,6 +479,7 @@ mod tests {
             host: Some("example.com".into()),
             remote_user: None,
             request_id: None,
+            peer_unix: false,
         };
         // The line is rendered by the writer task from the structured record.
         tx.send(Msg::Record(Box::new(record), LogFormat::Combined, None))
@@ -488,7 +506,7 @@ mod tests {
             compress_archive: true,
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let h = tokio::spawn(run(cfg, rx, logger_state()));
+        let h = tokio::spawn(run(cfg, rx, logger_state(), None));
 
         // Each line is ~20 bytes; a few lines blow past 32 and force a roll.
         for i in 0..10 {
@@ -569,7 +587,7 @@ mod tests {
             compress_archive: false,
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        let h = tokio::spawn(run(cfg, rx, logger_state()));
+        let h = tokio::spawn(run(cfg, rx, logger_state(), None));
 
         send_line(&tx, "before").await;
         // Simulate logrotate moving the live file aside.

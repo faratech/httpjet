@@ -71,7 +71,7 @@ impl Router {
         let routes = self.listeners.get(listener)?;
         // Use the shared IPv6-aware helper; plain split(':').next() mangles
         // bracketed literals like [::1]:443 down to '[', missing every vhost match.
-        let key = key_host.map(|h| host_without_port(h));
+        let key = key_host.map(host_without_port);
         let vhost_name = key
             .as_deref()
             .and_then(|k| Self::match_exact_or_parent(routes, k))

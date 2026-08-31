@@ -79,13 +79,14 @@ fn build_state_full(
         htaccess,
         page_cache,
         peer_purge,
+        |_| {},
     )
 }
 
 /// A `.htaccess`-loading vhost WITHOUT a page cache: the fast_memo tests need
 /// the per-dir chain but not the Branch-1 lookup in front of the static serve.
 fn build_state_htaccess(doc_root: PathBuf) -> Arc<ServerState> {
-    build_state_inner(doc_root, Vec::new(), Vec::new(), true, None, None)
+    build_state_inner(doc_root, Vec::new(), Vec::new(), true, None, None, |_| {})
 }
 
 fn build_state_inner(
@@ -95,6 +96,7 @@ fn build_state_inner(
     htaccess: bool,
     page_cache: Option<Arc<hj_pagecache::PageStore>>,
     peer_purge: Option<crate::peer_purge::PurgeForwarder>,
+    config_tweak: impl FnOnce(&mut ServerConfig),
 ) -> Arc<ServerState> {
     // AccessLogger writes under server_root/logs; give it a real writable dir.
     let server_root = temp_root("srv");
@@ -140,6 +142,8 @@ fn build_state_inner(
         name: LISTENER.into(),
         address: "127.0.0.1:0".into(),
         secure: false,
+        proxy_protocol: false,
+        uds_path: None,
         vhost_map: vec![VhostMap {
             vhost: VHOST.into(),
             domains: vec![CANON_HOST.into(), "*".into()],
@@ -149,7 +153,7 @@ fn build_state_inner(
 
     let mut security = hj_core::config::Security::default();
     security.access_deny_dir = access_deny_dir;
-    let server = ServerConfig {
+    let mut server = ServerConfig {
         server_root,
         server_name: "e2e".into(),
         user: "nobody".into(),
@@ -170,6 +174,7 @@ fn build_state_inner(
         mime: mime(),
     };
 
+    config_tweak(&mut server);
     ServerState::new(
         Arc::new(server),
         None, // lsapi
@@ -219,6 +224,7 @@ async fn run(state: &Arc<ServerState>, req: Request) -> Response {
         SocketAddr::from(([127, 0, 0, 1], 80)),
         40000,
         false, // is_tls
+        false, // peer_unix
         false, // mtls_required
         None,  // tls
         Proto::Http1,
@@ -325,6 +331,10 @@ async fn static_context_resolved_location_in_access_deny_dir_is_forbidden() {
     std::fs::write(target_dir.join("secret.txt"), b"must not be served").unwrap();
     let context = Context {
         cache_policy: None,
+        bandwidth_limit: 0,
+        max_body_override: None,
+        timeout_override: None,
+        sub_filter: None,
         kind: ContextKind::Static,
         uri: "/assets".into(),
         location: Some(context_root),
@@ -359,6 +369,10 @@ async fn static_context_default_charset_applies_without_other_overrides() {
         add_default_charset: true,
         charset: Some("ISO-8859-1".into()),
         cache_policy: None,
+        bandwidth_limit: 0,
+        max_body_override: None,
+        timeout_override: None,
+        sub_filter: None,
     };
     let state = build_state_with(doc_root, vec![context], Vec::new());
 
@@ -367,6 +381,50 @@ async fn static_context_default_charset_applies_without_other_overrides() {
     assert_eq!(
         resp.headers()[header::CONTENT_TYPE],
         "text/plain; charset=ISO-8859-1"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_bandwidth_limit_stamps_per_conn_rate_extension() {
+    let doc_root = temp_root("bw-context");
+    std::fs::create_dir_all(doc_root.join("dl")).unwrap();
+    std::fs::write(doc_root.join("dl/big.txt"), vec![b'x'; 4096]).unwrap();
+    std::fs::write(doc_root.join("index.html"), b"<html>ok</html>").unwrap();
+    let throttled = Context {
+        kind: ContextKind::Static,
+        uri: "/dl".into(),
+        location: None,
+        handler: None,
+        enabled: true,
+        extra_headers: Vec::new(),
+        add_default_charset: false,
+        charset: None,
+        cache_policy: None,
+        bandwidth_limit: 250_000,
+        max_body_override: None,
+        timeout_override: None,
+        sub_filter: None,
+    };
+    let state = build_state_with(doc_root, vec![throttled], Vec::new());
+
+    let resp = run(&state, get(CANON_HOST, "/dl/big.txt", None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.extensions()
+            .get::<super::PerConnBandwidth>()
+            .map(|b| b.0),
+        Some(250_000),
+        "the matched context's bandwidthLimit must reach the transport extension"
+    );
+
+    let unthrottled = run(&state, get(CANON_HOST, "/index.html", None)).await;
+    assert_eq!(unthrottled.status(), 200);
+    assert!(
+        unthrottled
+            .extensions()
+            .get::<super::PerConnBandwidth>()
+            .is_none(),
+        "paths outside the throttled context must not carry a rate stamp"
     );
 }
 
@@ -416,6 +474,7 @@ async fn fast_serve_get(state: &Arc<ServerState>, path: &str) -> Option<Response
         SocketAddr::from(([127, 0, 0, 1], 80)),
         40000,
         false,
+        false,
         Proto::Http1,
         None,
         &req,
@@ -460,6 +519,7 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
         env: Vec::new(),
         local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
         peer_port: 40000,
+        peer_unix: false,
         tls: None,
         redirect_guard: None,
         request_time: std::time::SystemTime::UNIX_EPOCH,
@@ -556,6 +616,7 @@ async fn fast_serve_req(state: &Arc<ServerState>, req: &Request) -> Option<Respo
         SocketAddr::from(([127, 0, 0, 1], 80)),
         40000,
         false,
+        false,
         Proto::Http1,
         None,
         req,
@@ -586,6 +647,7 @@ async fn seed_public_entry(
         env: Vec::new(),
         local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
         peer_port: 40000,
+        peer_unix: false,
         tls: None,
         redirect_guard: None,
         request_time: std::time::SystemTime::UNIX_EPOCH,
@@ -916,7 +978,84 @@ RewriteRule ^.*$ index.php [NC,L]
             .expect("static GET must be served on-core, not bridged")
     }
 
+    /// Full-pipeline dispatch for auth tests: auth-protected trees decline the
+    /// on-core path by design, so the 401/200 verdict comes from dispatch().
+    async fn dispatch_get(
+        state: &Arc<ServerState>,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Response {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let r = req(path, headers);
+        let req_host = CANON_HOST.to_string();
+        let resolved = state.router.resolve(LISTENER, Some(CANON_HOST)).unwrap();
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut ctx = hj_core::ReqCtx {
+            server: state.server.clone(),
+            vhost_name: resolved.name.clone(),
+            vhost: resolved.config,
+            peer_ip: loopback,
+            client_ip: loopback,
+            is_tls: false,
+            protocol: Proto::Http1,
+            trusted_proxy: false,
+            env: Vec::new(),
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
+            peer_port: 40000,
+            peer_unix: false,
+            redirect_guard: None,
+            request_time: std::time::SystemTime::UNIX_EPOCH,
+            request_id: Default::default(),
+            tls: None,
+        };
+        crate::pipeline::dispatch(state, false, req_host, &mut ctx, r).await
+    }
+
+    // (Tier 1.3) Basic auth end-to-end through dispatch: challenge, wrong-password
+    // rejection, and the served file on valid credentials.
     #[tokio::test]
+    async fn basic_auth_challenges_then_accepts_valid_credentials() {
+        // htpasswd -s user:password
+        let ht = "AuthType Basic\n\
+                 AuthName \"Restricted\"\n\
+                 AuthUserFile htpasswd\n\
+                 Require valid-user\n";
+        let (root, state) = setup("auth_basic", ht);
+        std::fs::write(
+            root.join("htpasswd"),
+            "user:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n",
+        )
+        .unwrap();
+
+        // No credentials → 401 with the Basic challenge.
+        let resp = dispatch_get(&state, "/x.secret", &[]).await;
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            hdr(&resp, "www-authenticate"),
+            Some("Basic realm=\"Restricted\"")
+        );
+
+        // Wrong password → still 401.
+        let bad = dispatch_get(
+            &state,
+            "/x.secret",
+            &[("authorization", "Basic dXNlcjpwYXNz")],
+        )
+        .await;
+        assert_eq!(bad.status(), 401);
+
+        // Correct credentials (user:password) → the file is served.
+        let ok = dispatch_get(
+            &state,
+            "/x.secret",
+            &[("authorization", "Basic dXNlcjpwYXNzd29yZA==")],
+        )
+        .await;
+        assert_eq!(ok.status(), 200);
+        assert_eq!(&body_bytes(ok.into_body())[..], b"hidden\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     async fn stores_then_replays_byte_identically_under_the_forum_chain() {
         let (root, state) = setup("memo_basic", FORUM_HTACCESS);
         let ua = ("user-agent", "Mozilla/5.0 Chrome/120");
@@ -1104,4 +1243,469 @@ RewriteRule ^.*$ index.php [NC,L]
         assert_eq!((stores(&state), hits(&state)), (1, 1));
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_range_request_serves_framed_multipart_byteranges() {
+    // (Tier 2) The full funnel: a comma-separated Range over a static file leaves
+    // the pipeline as a framed multipart/byteranges 206 with an exact Content-Length
+    // (the transports then carry the buffered body untouched).
+    let doc_root = temp_root("multipart-e2e");
+    let data: Vec<u8> = (0u32..1000).map(|i| (i % 251) as u8).collect();
+    std::fs::write(doc_root.join("blob.bin"), &data).unwrap();
+    let state = build_state(doc_root);
+
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/blob.bin")
+        .header(header::HOST, CANON_HOST)
+        .header(header::RANGE, "bytes=0-9,100-109")
+        .body(hj_core::empty_incoming())
+        .unwrap();
+    let resp = run(&state, req).await;
+    assert_eq!(resp.status(), http::StatusCode::PARTIAL_CONTENT);
+    let ct = resp.headers()[header::CONTENT_TYPE]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let boundary = ct
+        .strip_prefix("multipart/byteranges; boundary=")
+        .expect("multipart content type")
+        .to_owned();
+    let mut expect = Vec::new();
+    for (s, e) in [(0usize, 9usize), (100usize, 109usize)] {
+        expect.extend_from_slice(
+            format!("\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes {s}-{e}/1000\r\n\r\n")
+                .as_bytes(),
+        );
+        expect.extend_from_slice(&data[s..=e]);
+    }
+    expect.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    match resp.into_body() {
+        Body::Full(bytes) => {
+            assert_eq!(
+                bytes.len(),
+                expect.len(),
+                "Content-Length covers the whole framed entity"
+            );
+            assert_eq!(&bytes[..], &expect[..]);
+        }
+        _ => panic!("multipart must be a buffered full body"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn geo_acl_denies_by_resolved_client_ip() {
+    // (Tier 2) A country-labelled CIDR list + `geoDeny` must 403 a request whose
+    // RESOLVED client IP (CF-Connecting-IP from a trusted peer) falls in the
+    // denied range — while the same request without the header (client_ip ==
+    // loopback peer) passes. This is the real-IP trust boundary the geo gate
+    // depends on.
+    let doc_root = temp_root("geo-e2e");
+    std::fs::write(doc_root.join("page.html"), b"<html>ok</html>").unwrap();
+    let db = doc_root.join("geo.db");
+    std::fs::write(
+        &db,
+        "country US 203.0.113.0/24\ncountry DE 198.51.100.0/24\n",
+    )
+    .unwrap();
+    let state = build_state_inner(doc_root, Vec::new(), Vec::new(), false, None, None, |cfg| {
+        cfg.security.geo_db_file = Some(db);
+        cfg.security.geo_deny = vec!["US".into()];
+        // Mode 2 + a trusted loopback rule: CF-Connecting-IP is honored from
+        // the (loopback) peer, exactly like the production CF path.
+        cfg.use_ip_in_proxy_header = 2;
+        cfg.security.access_control = vec![hj_core::config::AccessRule {
+            spec: "127.0.0.0/8".into(),
+            trusted: true,
+            allow: true,
+        }];
+    });
+
+    // Mode-2 real-IP resolution only honors forwarded headers on the TLS path
+    // (run_tls sets is_tls=true, mtls_required=false — the CF-over-TLS shape).
+    let denied = get_with(
+        CANON_HOST,
+        "/page.html",
+        &[("CF-Connecting-IP", "203.0.113.9")],
+    );
+    let resp = run_tls(&state, denied).await;
+    assert_eq!(
+        resp.status(),
+        http::StatusCode::FORBIDDEN,
+        "a denied-country visitor must be rejected"
+    );
+
+    let allowed = get_with(CANON_HOST, "/page.html", &[("CF-Connecting-IP", "8.8.8.8")]);
+    let resp = run_tls(&state, allowed).await;
+    assert_eq!(resp.status(), http::StatusCode::OK, "other countries pass");
+
+    let no_header = get(CANON_HOST, "/page.html", None);
+    let resp = run_tls(&state, no_header).await;
+    assert_eq!(
+        resp.status(),
+        http::StatusCode::OK,
+        "loopback (the peer) is not in any denied range"
+    );
+}
+
+/// [`run`] over a TLS-shaped connection (`is_tls=true`, no client-cert
+/// requirement): forwarded client-IP headers are honored from a trusted peer.
+async fn run_tls(state: &Arc<ServerState>, req: Request) -> Response {
+    handle(
+        state.clone(),
+        LISTENER,
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        SocketAddr::from(([127, 0, 0, 1], 443)),
+        40000,
+        true,  // is_tls
+        false, // peer_unix
+        false, // mtls_required
+        None,  // tls
+        Proto::Http1,
+        None, // sni
+        req,
+    )
+    .await
+}
+
+fn get_with(host: &str, path: &str, headers: &[(&str, &str)]) -> Request {
+    let mut b = http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::HOST, host);
+    for (name, value) in headers {
+        b = b.header(*name, *value);
+    }
+    b.body(hj_core::empty_incoming()).unwrap()
+}
+
+// ─── (Tier 2) sub_filter: literal response-body substitution ───
+
+fn sub_filter_context(uri: &str, rules: &[(&str, &str)], once: bool) -> Context {
+    Context {
+        kind: ContextKind::Static,
+        uri: uri.into(),
+        location: None,
+        handler: None,
+        enabled: true,
+        extra_headers: Vec::new(),
+        add_default_charset: false,
+        charset: None,
+        cache_policy: None,
+        bandwidth_limit: 0,
+        max_body_override: None,
+        timeout_override: None,
+        sub_filter: Some(Box::new(hj_core::config::SubFilterConfig {
+            rules: rules
+                .iter()
+                .map(|(s, r)| (s.to_string(), r.to_string()))
+                .collect(),
+            once,
+            ..hj_core::config::SubFilterConfig::default()
+        })),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_filter_rewrites_matching_type_and_recomputes_headers() {
+    let doc_root = temp_root("subfilter");
+    std::fs::write(
+        doc_root.join("page.html"),
+        b"<html>hello world hello</html>",
+    )
+    .unwrap();
+    std::fs::write(doc_root.join("data.txt"), b"hello world").unwrap();
+    let state = build_state_with(
+        doc_root,
+        vec![sub_filter_context("/", &[("hello", "goodbye")], false)],
+        Vec::new(),
+    );
+
+    let resp = run(&state, get(CANON_HOST, "/page.html", None)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        body_bytes(resp.into_body()),
+        "<html>goodbye world goodbye</html>"
+    );
+    let resp = run(&state, get(CANON_HOST, "/page.html", None)).await;
+    assert!(
+        resp.headers().get(header::ETAG).is_none(),
+        "the entity changed: ETag must drop"
+    );
+    assert!(
+        resp.headers().get(header::LAST_MODIFIED).is_none(),
+        "Last-Modified defaults off (nginx sub_filter_last_modified)"
+    );
+    assert_eq!(resp.headers()[header::CONTENT_LENGTH], "34");
+
+    // Non-matching Content-Type is untouched.
+    let resp = run(&state, get(CANON_HOST, "/data.txt", None)).await;
+    assert_eq!(body_bytes(resp.into_body()), "hello world");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_filter_once_replaces_first_occurrence_only() {
+    let doc_root = temp_root("subfilter-once");
+    std::fs::write(doc_root.join("page.html"), b"<html>aaa and aaa</html>").unwrap();
+    let state = build_state_with(
+        doc_root,
+        vec![sub_filter_context("/", &[("aaa", "bbb")], true)],
+        Vec::new(),
+    );
+    let resp = run(&state, get(CANON_HOST, "/page.html", None)).await;
+    assert_eq!(body_bytes(resp.into_body()), "<html>bbb and aaa</html>");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_filter_paths_never_memoize_and_stay_consistent() {
+    // The memo stores POST-transform bytes and a memo hit re-runs the
+    // transforms — a replacement containing its own search string would
+    // substitute twice on the second serve. sub_filter paths must therefore
+    // never enter the memo, and every serve must produce identical bytes.
+    let doc_root = temp_root("subfilter-memo");
+    std::fs::create_dir_all(doc_root.join("sub")).unwrap();
+    std::fs::write(doc_root.join("sub/index.html"), b"a b a").unwrap();
+    let state = build_state_inner(
+        doc_root,
+        vec![sub_filter_context("/sub", &[("a", "ab")], false)],
+        Vec::new(),
+        true, // htaccess-loading vhost: the memo path is live
+        None,
+        None,
+        |_| {},
+    );
+
+    let stores = || {
+        state
+            .metrics
+            .fast_memo_stores
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let first = fast_serve_get(&state, "/sub/").await;
+    let first = first.expect("first serve");
+    assert_eq!(body_bytes(first.into_body()), "ab b ab");
+    assert_eq!(stores(), 0, "a sub_filter path must never enter the memo");
+    let second = fast_serve_get(&state, "/sub/").await;
+    let second = second.expect("second serve");
+    assert_eq!(
+        body_bytes(second.into_body()),
+        "ab b ab",
+        "byte-identical re-serve"
+    );
+}
+
+#[test]
+fn apply_sub_filter_rules_are_ordered_and_literal() {
+    use super::apply_sub_filter;
+    let plan = |rules: &[(&str, &str)], once: bool| hj_core::config::SubFilterConfig {
+        rules: rules
+            .iter()
+            .map(|(s, r)| (s.to_string(), r.to_string()))
+            .collect(),
+        once,
+        ..hj_core::config::SubFilterConfig::default()
+    };
+    // Rules apply in order; each sees the PREVIOUS rule's output.
+    let out = apply_sub_filter(
+        &plan(&[("aaa", "aba"), ("aba", "XYZ")], false),
+        "aaa".into(),
+    );
+    assert_eq!(&out[..], b"XYZ");
+
+    // once replaces only the first occurrence.
+    let out = apply_sub_filter(&plan(&[("a", "b")], true), "aa".into());
+    assert_eq!(&out[..], b"ba");
+
+    // An empty search string would insert everywhere — skipped by design.
+    let out = apply_sub_filter(&plan(&[("", "x")], false), "ab".into());
+    assert_eq!(&out[..], b"ab");
+
+    // Non-idempotent shapes are exactly why sub_filter paths never memoize:
+    // a replacement containing its own search would grow on every re-apply.
+    let plan = plan(&[("a", "ab")], false);
+    let once = apply_sub_filter(&plan, "a".into());
+    let twice = apply_sub_filter(&plan, once.clone());
+    assert_ne!(&once[..], &twice[..]);
+}
+
+// ─── (Tier 2) SubFilterTransform stream handling: filter-within-cap, raw past it ───
+
+/// A tiny replayable stream body for transform tests.
+struct VecBody {
+    frames: std::collections::VecDeque<bytes::Bytes>,
+}
+
+impl http_body::Body for VecBody {
+    type Data = bytes::Bytes;
+    type Error = hj_core::BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        match self.frames.pop_front() {
+            Some(b) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(b)))),
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+fn stream_response(body: hj_core::StreamBody) -> Response {
+    http::Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "text/html")
+        .body(hj_core::Body::Stream(body))
+        .unwrap()
+}
+
+fn html_plan(max_body: u64) -> super::SubFilterPlan {
+    super::SubFilterPlan(Arc::new(hj_core::config::SubFilterConfig {
+        rules: vec![("SEND".to_string(), "RECEIVED".to_string())],
+        max_body,
+        ..hj_core::config::SubFilterConfig::default()
+    }))
+}
+
+fn ctx_for_transform() -> hj_core::ReqCtx {
+    let server = ServerConfig {
+        server_root: Default::default(),
+        server_name: String::new(),
+        user: String::new(),
+        group: String::new(),
+        index_files: vec![],
+        tuning: Default::default(),
+        quic_enable: false,
+        use_ip_in_proxy_header: 0,
+        expires: Default::default(),
+        cache: Default::default(),
+        security: Default::default(),
+        suexec: Default::default(),
+        ext_processors: vec![],
+        php_config: None,
+        listeners: vec![],
+        vhosts: Default::default(),
+        vhost_order: vec![],
+        mime: Default::default(),
+    };
+    hj_core::ReqCtx {
+        server: Arc::new(server),
+        vhost_name: String::new(),
+        vhost: Arc::new(hj_core::config::VHostConfig::default()),
+        peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        is_tls: false,
+        peer_unix: false,
+        protocol: Proto::Http1,
+        trusted_proxy: false,
+        env: Vec::new(),
+        local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
+        peer_port: 40000,
+        request_time: std::time::SystemTime::UNIX_EPOCH,
+        request_id: Default::default(),
+        redirect_guard: None,
+        tls: None,
+    }
+}
+
+fn frames_of(body: Body) -> Vec<u8> {
+    match body {
+        Body::Full(b) => b.to_vec(),
+        Body::Stream(mut s) => {
+            use http_body_util::BodyExt;
+            let mut out = Vec::new();
+            futures_executor_block(async {
+                while let Some(frame) = s.frame().await {
+                    out.extend_from_slice(
+                        frame.expect("frame").into_data().expect("data").as_ref(),
+                    );
+                }
+            });
+            out
+        }
+        _other => panic!("unexpected body variant"),
+    }
+}
+
+// The pipeline is tokio-native; block inline so the unit test stays sync.
+fn futures_executor_block<F: std::future::Future<Output = ()>>(fut: F) {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fut);
+}
+
+#[tokio::test]
+async fn sub_filter_stream_within_cap_is_buffered_and_filtered() {
+    use http_body_util::BodyExt;
+    let mut resp = stream_response(hj_core::StreamBody::boxed(
+        http_body_util::Full::new(bytes::Bytes::from_static(b"<p>SEND a</p>SEND"))
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed(),
+    ));
+    resp.extensions_mut().insert(html_plan(1024));
+    let ctx = ctx_for_transform();
+    use hj_core::ResponseTransform;
+    crate::pipeline::SubFilterTransform
+        .transform(&ctx, &mut resp)
+        .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(frames_of(resp.into_body()), b"<p>RECEIVED a</p>RECEIVED");
+}
+
+#[tokio::test]
+async fn sub_filter_stream_over_cap_passes_through_raw_untouched() {
+    use http_body_util::BodyExt;
+    // Two frames totaling > the 8-byte cap; the SEARCH token appears in the
+    // buffered prefix — the response must still pass through UNFILTERED.
+    let frames = vec![
+        bytes::Bytes::from_static(b"SEND a"),
+        bytes::Bytes::from_static(b"SEND b"),
+    ];
+    let mut resp = stream_response(hj_core::StreamBody::boxed(
+        VecBody {
+            frames: frames.clone().into(),
+        }
+        .boxed(),
+    ));
+    resp.extensions_mut().insert(html_plan(8));
+    let ctx = ctx_for_transform();
+    use hj_core::ResponseTransform;
+    crate::pipeline::SubFilterTransform
+        .transform(&ctx, &mut resp)
+        .await;
+
+    let body = match resp.into_body() {
+        Body::Stream(s) => s,
+        _ => panic!("over-cap stream must stay a stream"),
+    };
+    let mut got = Vec::new();
+    let mut s = body;
+    while let Some(frame) = s.frame().await {
+        got.extend_from_slice(frame.expect("frame").into_data().expect("data").as_ref());
+    }
+    assert_eq!(
+        got, b"SEND aSEND b",
+        "raw passthrough: prefix + remainder, unfiltered"
+    );
+}
+
+#[test]
+fn sub_filter_no_extension_is_a_no_op() {
+    // The transform must leave responses WITHOUT a plan untouched (every serve
+    // path runs it; only stamped responses may change).
+    let mut resp = http::Response::builder()
+        .status(200)
+        .header(header::CONTENT_TYPE, "text/html")
+        .body(Body::Full(bytes::Bytes::from_static(b"SEND")))
+        .unwrap();
+    let ctx = ctx_for_transform();
+    use hj_core::ResponseTransform;
+    futures_executor_block(async {
+        crate::pipeline::SubFilterTransform
+            .transform(&ctx, &mut resp)
+            .await;
+    });
+    assert_eq!(frames_of(resp.into_body()), b"SEND");
 }

@@ -25,6 +25,7 @@ fn record() -> AccessRecord {
         host: None,
         remote_user: None,
         request_id: None,
+        peer_unix: false,
     }
 }
 

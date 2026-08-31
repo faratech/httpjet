@@ -148,6 +148,8 @@ fn quic_clientverify2_handshake_completes_without_client_cert() {
         address: "*:443".into(),
         secure: true,
         vhost_map: vec![],
+        proxy_protocol: false,
+        uds_path: None,
         tls: Some(ListenerTls {
             key_file: key,
             cert_file: cert,
@@ -156,6 +158,7 @@ fn quic_clientverify2_handshake_completes_without_client_cert() {
             client_verify: 2,
             verify_depth: 1,
             enable_stapling: false,
+            crl_file: None,
         }),
     };
 
@@ -186,6 +189,8 @@ fn tcp_clientverify2_handshake_completes_without_client_cert() {
         address: "*:443".into(),
         secure: true,
         vhost_map: vec![],
+        proxy_protocol: false,
+        uds_path: None,
         tls: Some(ListenerTls {
             key_file: key,
             cert_file: cert,
@@ -194,6 +199,7 @@ fn tcp_clientverify2_handshake_completes_without_client_cert() {
             client_verify: 2,
             verify_depth: 1,
             enable_stapling: false,
+            crl_file: None,
         }),
     };
 

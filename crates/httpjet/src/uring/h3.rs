@@ -3250,6 +3250,7 @@ async fn handle_h3_request(
         local,
         proto: Proto::Http3,
         is_tls: true,
+        peer_unix: false,
         mtls_required: require_client_cert,
         sni,
         tls,

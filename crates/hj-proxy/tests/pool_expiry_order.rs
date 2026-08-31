@@ -62,6 +62,7 @@ fn ctx() -> ReqCtx {
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
+        peer_unix: false,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
         tls: None,
@@ -105,7 +106,7 @@ async fn drain(proxy: &Proxy, target: &ProxyTarget) {
         .body(empty_body())
         .unwrap();
     let resp = proxy
-        .forward(&ctx(), req, target)
+        .forward(&ctx(), req, target, None)
         .await
         .expect("forward ok");
     if let Body::Stream(s) = resp.into_body() {

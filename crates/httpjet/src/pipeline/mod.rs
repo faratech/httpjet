@@ -25,7 +25,7 @@ use hj_core::{Body, Handler, Proto, ReqCtx, Request, Response, ResponseTransform
 use hj_lsapi::{JailConfig, LsapiScript, SpecialEnvType};
 use hj_proxy::{ProxyTarget, is_websocket_upgrade};
 use hj_rewrite::Htaccess;
-use http::header::COOKIE;
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, LAST_MODIFIED};
 use http::{HeaderValue, StatusCode};
 
 use crate::lscache;
@@ -154,6 +154,24 @@ fn apply_request_id_header(state: &ServerState, ctx: &ReqCtx, resp: &mut Respons
     }
 }
 
+/// (#343 Step 1) Cookie-census classes for the on-core fast path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FastCookieClass {
+    None,
+    MemberSession,
+    BenignOnly,
+}
+
+/// True when the Cookie header's NAMES include a membership marker (the configured
+/// private user/session cookies). Names only — cookie values are never read here.
+fn has_member_session_cookie(cookie: &str, session: &str, user: &str) -> bool {
+    cookie.split(';').any(|kv| {
+        let name = kv.split('=').next().unwrap_or("").trim();
+        (!session.is_empty() && name.eq_ignore_ascii_case(session.trim()))
+            || (!user.is_empty() && name.eq_ignore_ascii_case(user.trim()))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_serve(
     state: &Arc<ServerState>,
@@ -162,6 +180,7 @@ pub(crate) async fn fast_serve(
     local_addr: std::net::SocketAddr,
     peer_port: u16,
     is_tls: bool,
+    peer_unix: bool,
     proto: Proto,
     tls: Option<hj_core::TlsParams>,
     req: &Request,
@@ -223,6 +242,7 @@ pub(crate) async fn fast_serve(
         peer_ip,
         client_ip: peer_ip,
         is_tls: effective_https,
+        peer_unix,
         protocol: proto,
         trusted_proxy,
         env: Vec::with_capacity(8),
@@ -293,6 +313,12 @@ pub(crate) async fn fast_serve(
                 state.server.use_ip_in_proxy_header,
                 mtls_ok,
             );
+            if !state.geo.allows(ctx.client_ip) {
+                return None; // the full pipeline renders the identical geo 403
+            }
+            if !state.client_throttle.allow(peer_ip) {
+                return None; // over the per-IP rate: dispatch() renders the 429
+            }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
     }
@@ -332,6 +358,11 @@ pub(crate) async fn fast_serve(
     };
     let chain: Vec<std::sync::Arc<Htaccess>> =
         chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
+    // (Tier 1.3) An auth-protected tree never serves on-core: dispatch() enforces
+    // the 401 challenge / credential verification before anything else.
+    if chain.iter().any(|h| h.auth.is_some()) {
+        return None;
+    }
     // (#349) Memo store eligibility — the response must be a pure function of
     // the memo key plus the entry's vary-set. Each chain file's verdict is
     // parse-time (`MemoClass`, fail-closed): SetEnvIf on client/server address
@@ -345,7 +376,10 @@ pub(crate) async fn fast_serve(
         && chain_with_dirs
             .iter()
             .all(|(_, ht)| ht.memo.eligible && ht.rules.path_cacheable);
-    let memo_store_ok = memo_eligible_req && memo_chain_ok;
+    // (Tier 2) sub_filter paths are memo-ineligible: the memo stores
+    // POST-transform bytes and a memo hit re-runs the transforms, which would
+    // substitute twice whenever a replacement contains its own search string.
+    let memo_store_ok = memo_eligible_req && memo_chain_ok && !sub_filter_matches(&ctx, &orig_path);
     // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
     // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
     // path judges the SAME identity the tokio `handle()` path does — not the raw socket
@@ -365,6 +399,11 @@ pub(crate) async fn fast_serve(
         state.server.use_ip_in_proxy_header,
         mtls_ok,
     );
+    if !state.geo.allows(ctx.client_ip) {
+        // (Tier 2) Decline so the bridge renders the identical geo 403 the full
+        // pipeline would (fast_serve cannot produce an error page itself).
+        return None;
+    }
     seed_server_env(&mut ctx);
     apply_set_env(&mut ctx, &chain, req, &orig_path, &orig_query);
     let orig_rel = resolved_rel_path(&orig_path);
@@ -415,6 +454,35 @@ pub(crate) async fn fast_serve(
     // requests so the full pipeline decides (the cache_private gate catches a leak
     // without this). The lookup sees the SAME loaded chain `dispatch()` uses, so
     // request-side cache policy cannot diverge from the store/slow-path decisions.
+    // (#343 Step 1) Cookie census on every fast-path GET/HEAD: names only, values never
+    // read — the benign-only share among cookied requests decides whether extending the
+    // fast path past literally-cookieless guests is worth building.
+    if let Some(store) = state.page_cache.as_ref() {
+        let cfg = store.config();
+        let class = match req
+            .headers()
+            .get(http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+        {
+            None => FastCookieClass::None,
+            Some(c)
+                if has_member_session_cookie(
+                    c,
+                    &cfg.private_session_cookie,
+                    &cfg.private_user_cookie,
+                ) =>
+            {
+                FastCookieClass::MemberSession
+            }
+            Some(_) => FastCookieClass::BenignOnly,
+        };
+        let counter = match class {
+            FastCookieClass::None => &state.metrics.fast_cookie_none,
+            FastCookieClass::MemberSession => &state.metrics.fast_cookie_member_session,
+            FastCookieClass::BenignOnly => &state.metrics.fast_cookie_benign_only,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if state.page_cache.is_some() && !req.headers().contains_key(http::header::COOKIE) {
         if fast_post_rewrite_bridges(
             state,
@@ -461,6 +529,9 @@ pub(crate) async fn fast_serve(
                 t.transform(&ctx, &mut resp).await;
             }
             state.telemetry.record_cache_hit(peer_ip.is_loopback());
+            if !state.client_throttle.allow(peer_ip) {
+                return None; // over the per-IP rate: dispatch() renders the 429
+            }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
     }
@@ -554,6 +625,8 @@ pub(crate) async fn fast_serve(
         state, &mut ctx, &chain, &orig_rel, &orig_path, &orig_path, &mut resp,
     )
     .await;
+    // (Tier 2) Stamp BEFORE the transform loop so SubFilterTransform sees the plan.
+    stamp_sub_filter(&ctx, &orig_path, &mut resp);
     // Header transforms (expires / Alt-Svc / compress) — they see an in-memory body now,
     // so CacheStaticTransform is a no-op (no block_in_place) and Compress negotiates per AE.
     for t in &state.transforms {
@@ -594,6 +667,15 @@ pub(crate) async fn fast_serve(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    if !state.client_throttle.allow(peer_ip) {
+        return None; // over the per-IP rate: dispatch() renders the 429
+    }
+    stamp_bandwidth(
+        &ctx,
+        &orig_path,
+        state.serve_config.bandwidth_limit,
+        &mut resp,
+    );
     Some(record_fast_serve(state, &ctx, proto, req, req_start, resp))
 }
 
@@ -805,6 +887,7 @@ fn record_fast_serve(
                     referer,
                     user_agent,
                     Some(&ctx.request_id as &dyn std::fmt::Display),
+                    ctx.peer_unix,
                 );
             });
             return resp;
@@ -831,6 +914,7 @@ fn record_fast_serve(
         host: header_str(req, http::header::HOST),
         remote_user: None,
         request_id: Some(ctx.request_id.to_string()),
+        peer_unix: ctx.peer_unix,
     };
     // (#248 + #261) LSWS `logHeaders`: a vhost that opts in gets its request headers
     // as a redacted continuation line carried in the SAME channel message as the
@@ -977,6 +1061,7 @@ pub async fn handle(
     local_addr: std::net::SocketAddr,
     peer_port: u16,
     is_tls: bool,
+    peer_unix: bool,
     mtls_required: bool,
     tls: Option<hj_core::TlsParams>,
     proto: Proto,
@@ -1116,6 +1201,7 @@ pub async fn handle(
                     // No `ctx` yet (bounced before trust resolution): mint a fresh id so
                     // even a :80 mTLS-bounce probe is joinable across the logs.
                     request_id: Some(hj_core::reqid::next().to_string()),
+                    peer_unix: false,
                 };
                 resp = log_access(log, resp, record, None);
             }
@@ -1174,6 +1260,7 @@ pub async fn handle(
         peer_ip,
         client_ip,
         is_tls: effective_https,
+        peer_unix,
         protocol: proto,
         trusted_proxy,
         // Pre-size past the first growth doublings: the PHP path pushes ~8-24 entries
@@ -1200,7 +1287,19 @@ pub async fn handle(
     let host_foreign = !req_host.eq_ignore_ascii_case(&ctx.vhost_name)
         && !state.router.host_is_exact(listener, &req_host);
 
+    // (Tier 2) Captured only when a context declares a bandwidthLimit — the per-request
+    // path allocation stays off the hot path otherwise (the connection-wide tuning rate
+    // needs no stamp; the transport already carries it).
+    let bw_path = (has_bandwidth_context(&ctx.vhost) || sub_filter_matches(&ctx, req.uri().path()))
+        .then(|| req.uri().path().to_owned());
+
     let mut resp = if !state.acl.check_peer(peer_ip).is_allowed() {
+        error_page(StatusCode::FORBIDDEN)
+    } else if !state.client_throttle.allow(peer_ip) {
+        error_page(StatusCode::TOO_MANY_REQUESTS)
+    } else if !state.geo.allows(client_ip) {
+        // (Tier 2) GeoIP/ASN ACL: judged by the resolved client IP, so a
+        // CF-fronted visitor is evaluated by their real address.
         error_page(StatusCode::FORBIDDEN)
     } else {
         // Expose Accept-Encoding to the compression transform (which only sees ctx).
@@ -1214,6 +1313,11 @@ pub async fn handle(
         set_redirect_guard(&mut ctx, req.uri(), &req_host);
         dispatch(&state, host_foreign, req_host, &mut ctx, req).await
     };
+
+    if let Some(p) = &bw_path {
+        stamp_bandwidth(&ctx, p, state.serve_config.bandwidth_limit, &mut resp);
+        stamp_sub_filter(&ctx, p, &mut resp);
+    }
 
     // ---- Response-transform pipeline (the post-handler stage) --------------
     // Runs ServerState::transforms in order: cache-small-static (so gzip can compress it)
@@ -1298,6 +1402,7 @@ pub async fn handle(
             host: host_hdr,
             remote_user: None,
             request_id: Some(ctx.request_id.to_string()),
+            peer_unix: ctx.peer_unix,
         };
         // (#248) Mirror 5xx responses into the vhost's own error file when it
         // declares one.
@@ -1427,6 +1532,217 @@ const SINGLEFLIGHT_WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy)]
 struct RefreshMode;
 
+/// (Tier 2) Response-extension carrying the per-connection egress rate (bytes/sec) the
+/// transport should pace this response with — set when the matched `<context>` declares a
+/// `bandwidthLimit`. Absent ⇒ the transport's connection-wide default applies.
+#[derive(Clone, Copy)]
+pub(crate) struct PerConnBandwidth(pub u64);
+
+/// (Tier 2) Response extension carrying the resolved sub_filter plan — set when
+/// the matched `<context>` declares rules, read by [`SubFilterTransform`]. The
+/// plan is resolved against the ORIGINAL request path (same deliberate
+/// deviation the page cache documents: contexts are matched pre-rewrite).
+#[derive(Clone)]
+pub(crate) struct SubFilterPlan(pub Arc<hj_core::config::SubFilterConfig>);
+
+/// The innermost (longest matching URI prefix) enabled context that declares
+/// active sub_filter rules for `path`.
+fn resolve_sub_filter<'a>(
+    ctx: &'a ReqCtx,
+    path: &str,
+) -> Option<&'a hj_core::config::SubFilterConfig> {
+    ctx.vhost
+        .contexts
+        .iter()
+        .filter(|c| {
+            c.enabled
+                && c.sub_filter.as_ref().is_some_and(|s| s.is_active())
+                && context_uri_matches(path, &c.uri)
+        })
+        .max_by_key(|c| c.uri.len())
+        .and_then(|c| c.sub_filter.as_deref())
+}
+
+/// Stamp the sub_filter plan onto a terminal response (mirror of
+/// [`stamp_bandwidth`]); skipped when no context declares rules.
+fn stamp_sub_filter(ctx: &ReqCtx, path: &str, resp: &mut Response) {
+    if let Some(cfg) = resolve_sub_filter(ctx, path) {
+        resp.extensions_mut()
+            .insert(SubFilterPlan(Arc::new(cfg.clone())));
+    }
+}
+
+/// Does ANY enabled context with active sub_filter rules match this path?
+/// Gates the fast-memo store and the page cache: the memo stores POST-transform
+/// bytes that a memo hit would re-filter (non-idempotent when a replacement
+/// contains its search string), and the page-cache hot path must not serve
+/// entries the transform vec would have to filter inconsistently.
+fn sub_filter_matches(ctx: &ReqCtx, path: &str) -> bool {
+    ctx.vhost.contexts.iter().any(|c| {
+        c.enabled
+            && c.sub_filter.as_ref().is_some_and(|s| s.is_active())
+            && context_uri_matches(path, &c.uri)
+    })
+}
+
+/// (Tier 2) Literal search/replace over an eligible response body. Runs between
+/// expires and compress so the filtered body is compressed by the ordinary
+/// transform, and every serve funnel re-applies it to unfiltered bytes.
+pub(crate) struct SubFilterTransform;
+
+impl SubFilterTransform {
+    /// 200 only; never filter already-encoded bytes; Content-Type must match.
+    fn eligible(plan: &hj_core::config::SubFilterConfig, resp: &Response) -> bool {
+        resp.status() == StatusCode::OK
+            && !resp.headers().contains_key(CONTENT_ENCODING)
+            && resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| plan.matches_type(ct))
+    }
+}
+
+#[async_trait]
+impl hj_core::ResponseTransform for SubFilterTransform {
+    async fn transform(&self, _ctx: &ReqCtx, resp: &mut Response) {
+        let Some(plan) = resp.extensions().get::<SubFilterPlan>().cloned() else {
+            return;
+        };
+        let plan = plan.0;
+        if !Self::eligible(&plan, resp) {
+            return;
+        }
+        let body = std::mem::replace(resp.body_mut(), Body::Empty);
+        match body {
+            Body::Full(bytes) => {
+                let filtered = apply_sub_filter(&plan, bytes);
+                finalize_filtered(resp, &plan, filtered.len());
+                *resp.body_mut() = Body::Full(filtered);
+            }
+            Body::File(f) if f.range.is_none() && f.len <= plan.max_body => {
+                // Small files are already promoted to Full by CacheStaticTransform;
+                // this File is uncached but small enough to buffer.
+                match std::fs::read(&f.path) {
+                    Ok(bytes) => {
+                        let filtered = apply_sub_filter(&plan, bytes.into());
+                        finalize_filtered(resp, &plan, filtered.len());
+                        *resp.body_mut() = Body::Full(filtered);
+                    }
+                    Err(_) => *resp.body_mut() = Body::File(f),
+                }
+            }
+            Body::Stream(mut s) => {
+                // Buffer with a cap: a stream that completes within it is filtered;
+                // one that overflows passes through RAW (prefix + remainder chained)
+                // — never a half-filtered entity.
+                use http_body_util::BodyExt;
+                let mut buf = bytes::BytesMut::new();
+                let mut overflow = false;
+                loop {
+                    match s.frame().await {
+                        Some(Ok(frame)) => {
+                            if let Some(d) = frame.data_ref() {
+                                buf.extend_from_slice(d);
+                                if buf.len() as u64 > plan.max_body {
+                                    overflow = true;
+                                    break;
+                                }
+                            }
+                        }
+                        Some(Err(_)) | None => break,
+                    }
+                }
+                if overflow {
+                    use http_body_util::BodyExt;
+                    *resp.body_mut() = Body::Stream(
+                        PrefixBody {
+                            prefix: Some(buf.freeze()),
+                            inner: s,
+                        }
+                        .boxed(),
+                    );
+                } else {
+                    let filtered = apply_sub_filter(&plan, buf.freeze());
+                    finalize_filtered(resp, &plan, filtered.len());
+                    *resp.body_mut() = Body::Full(filtered);
+                }
+            }
+            other => *resp.body_mut() = other,
+        }
+    }
+}
+
+/// A body that yields one buffered prefix frame before forwarding the inner
+/// stream — the raw-passthrough path when a stream overflows the sub_filter
+/// buffering cap (the entity must pass through whole, never half-filtered).
+struct PrefixBody {
+    prefix: Option<bytes::Bytes>,
+    inner: hj_core::StreamBody,
+}
+
+impl http_body::Body for PrefixBody {
+    type Data = bytes::Bytes;
+    type Error = hj_core::BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if let Some(chunk) = self.prefix.take() {
+            return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
+        }
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.prefix.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        // The prefix is known; the inner stream is not — lower bound only.
+        let mut hint = http_body::SizeHint::default();
+        hint.set_lower(self.prefix.as_ref().map_or(0, |b| b.len() as u64));
+        hint
+    }
+}
+
+/// Apply the rules in order (all occurrences, or the first only under `once`).
+fn apply_sub_filter(plan: &hj_core::config::SubFilterConfig, body: bytes::Bytes) -> bytes::Bytes {
+    if plan.rules.is_empty() {
+        return body;
+    }
+    let mut text = String::from_utf8_lossy(&body).into_owned();
+    for (search, replace) in &plan.rules {
+        if search.is_empty() {
+            continue;
+        }
+        if plan.once {
+            if let Some(pos) = text.find(search.as_str()) {
+                text.replace_range(pos..pos + search.len(), replace);
+            }
+        } else {
+            text = text.replace(search.as_str(), replace);
+        }
+    }
+    text.into_bytes().into()
+}
+
+/// Recompute Content-Length and drop the entity validators: the bytes changed,
+/// so the strong ETag is wrong by construction, and Last-Modified defaults off
+/// (nginx sub_filter_last_modified).
+fn finalize_filtered(resp: &mut Response, plan: &hj_core::config::SubFilterConfig, len: usize) {
+    let h = resp.headers_mut();
+    h.remove(CONTENT_LENGTH);
+    h.remove(ETAG);
+    if !plan.keep_last_modified {
+        h.remove(LAST_MODIFIED);
+    }
+    if let Ok(v) = http::HeaderValue::from_str(&len.to_string()) {
+        h.insert(CONTENT_LENGTH, v);
+    }
+}
+
 enum RefreshCookie {
     Preserve,
     Replace(Option<HeaderValue>),
@@ -1471,6 +1787,64 @@ fn build_revalidation_request(req: &Request, cookie: RefreshCookie) -> Request {
 /// idempotent per key (no refresh-storms, no refresh-spawns-refresh loop) and globally caps
 /// concurrent refreshes; if the slot/permit can't be taken the refresh is simply skipped and
 /// the stale entry is retried on the next hit. Only cacheable GET/HEAD reach a stale hit.
+
+/// (Tier 2) Find the tightest per-context body limit matching `path`, or the
+/// server-wide default. A `<context>` with `<maxReqBodySize>` overrides the
+/// server limit for requests under its URI prefix.
+fn effective_max_body(ctx: &ReqCtx, path: &str, server_default: u64) -> u64 {
+    let mut best = server_default;
+    for c in &ctx.vhost.contexts {
+        if !c.enabled || c.max_body_override.is_none() {
+            continue;
+        }
+        if context_uri_matches(path, &c.uri) {
+            let v = c.max_body_override.unwrap();
+            if v < best {
+                best = v;
+            }
+        }
+    }
+    best
+}
+
+/// (Tier 2) The strictest `bandwidthLimit` among the matching contexts that declare one;
+/// the server-wide `<tuning>` rate when none matches. A declared context rate is an
+/// OVERRIDE (it may raise as well as lower) — an operator scoping a limit to a subtree
+/// is not served by a min-against-server-default rule that can never raise.
+fn effective_bandwidth(ctx: &ReqCtx, path: &str, server_default: u64) -> u64 {
+    let mut best: Option<u64> = None;
+    for c in &ctx.vhost.contexts {
+        if !c.enabled || c.bandwidth_limit == 0 {
+            continue;
+        }
+        if context_uri_matches(path, &c.uri) {
+            best = Some(best.map_or(c.bandwidth_limit, |b| b.min(c.bandwidth_limit)));
+        }
+    }
+    best.unwrap_or(server_default)
+}
+
+/// Any enabled context on this vhost declares a `bandwidthLimit` (the cheap pre-check
+/// that keeps the per-request path capture off the hot path when none does).
+fn has_bandwidth_context(vhost: &hj_core::config::VHostConfig) -> bool {
+    vhost
+        .contexts
+        .iter()
+        .any(|c| c.enabled && c.bandwidth_limit > 0)
+}
+
+/// Stamp the transport-facing egress rate onto a terminal response. Skipped entirely when
+/// no context declares a rate — the connection-wide tuning default then applies.
+fn stamp_bandwidth(ctx: &ReqCtx, path: &str, server_default: u64, resp: &mut Response) {
+    if !has_bandwidth_context(&ctx.vhost) {
+        return;
+    }
+    let rate = effective_bandwidth(ctx, path, server_default);
+    if rate > 0 {
+        resp.extensions_mut().insert(PerConnBandwidth(rate));
+    }
+}
+
 fn spawn_revalidate(
     state: &Arc<ServerState>,
     host_foreign: bool,
@@ -1911,6 +2285,47 @@ async fn dispatch(
         vary_value: (cache_on && state.page_cache.is_some()).then_some(cache_vary.as_str()),
     };
 
+    // (Tier 1.3) Basic auth: the deepest `.htaccess` realm in the chain governs
+    // this tree. Missing/invalid credentials → 401 + WWW-Authenticate BEFORE any
+    // cache lookup or backend runs; valid credentials set REMOTE_USER for the app.
+    if let Some(realm) = chain.iter().rev().find_map(|h| h.auth.as_ref()) {
+        // A relative AuthUserFile resolves against the vhost docroot.
+        let user_file = if realm.user_file.is_absolute() {
+            realm.user_file.clone()
+        } else {
+            ctx.vhost.doc_root.join(&realm.user_file)
+        };
+        let creds = req
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Basic "))
+            .and_then(hj_rewrite::auth::decode_basic_credentials);
+        let authorized = match &creds {
+            Some((user, pass)) => {
+                let uf = user_file;
+                let (u, p) = (user.clone(), pass.clone());
+                let ok = tokio::task::spawn_blocking(move || {
+                    hj_rewrite::auth::verify_credentials(&uf, &u, &p)
+                })
+                .await
+                .unwrap_or(false);
+                ok && realm.user_satisfies(user)
+            }
+            None => false,
+        };
+        if !authorized {
+            let mut resp = error_page(StatusCode::UNAUTHORIZED);
+            if let Ok(v) = http::HeaderValue::from_str(&realm.challenge()) {
+                resp.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
+            }
+            return resp;
+        }
+        if let Some((user, _)) = &creds {
+            ctx.set_env("REMOTE_USER", user.clone());
+        }
+    }
+
     // ---- 4d. Deferred terminal `[P]` proxy, with page-cache participation ------------
     // Mirrors the proxy-<context> arm (lookup -> render -> store) but for a rewrite `[P]`
     // target. Keyed by the original request URI (cc); respects the `[E=no-cache]` env merged
@@ -1919,6 +2334,25 @@ async fn dispatch(
     // `[P]` is non-cacheable, so this is inert for it). No single-flight: the `[P]` path is
     // low-volume; add it if a high-traffic cacheable `[P]` ever appears.
     if let Some(target_url) = proxy_target {
+        // (Tier 2) Per-context body limit: reject before the body is consumed if the
+        // matching context declares a tighter limit than the server-wide default.
+        {
+            let eff_max = effective_max_body(
+                ctx,
+                req.uri().path(),
+                state.serve_config.max_req_body_size as u64,
+            );
+            if let Some(cl) = req
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                if cl > eff_max {
+                    return error_page(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+            }
+        }
         let is_refresh_p = req.extensions().get::<RefreshMode>().is_some();
         if cache_on && !cache_has_range && !is_refresh_p {
             let inm = req
@@ -1938,7 +2372,14 @@ async fn dispatch(
             Ok(target) => {
                 let h = ProxyHandler {
                     proxy: state.proxy.clone(),
+                    telemetry: state.telemetry.clone(),
                     target,
+                    response_timeout_override: ctx
+                        .vhost
+                        .contexts
+                        .iter()
+                        .find(|c| context_uri_matches(cur_path.as_ref(), c.uri.as_str()))
+                        .and_then(|c| c.timeout_override),
                 };
                 state
                     .telemetry
@@ -2141,7 +2582,14 @@ async fn dispatch(
         if let Some(target) = resolve_proxy_target(state, ctx, &handler) {
             let h = ProxyHandler {
                 proxy: state.proxy.clone(),
+                telemetry: state.telemetry.clone(),
                 target,
+                response_timeout_override: ctx
+                    .vhost
+                    .contexts
+                    .iter()
+                    .find(|c| context_uri_matches(cur_path.as_ref(), c.uri.as_str()))
+                    .and_then(|c| c.timeout_override),
             };
             state
                 .telemetry
@@ -3364,6 +3812,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn member_session_cookie_classification() {
+        // Member marker present (either name, any case, any position).
+        assert!(has_member_session_cookie(
+            "xf_style_variation=dark; xf_user=42",
+            "xf_session",
+            "xf_user"
+        ));
+        assert!(has_member_session_cookie(
+            "XF_SESSION=abc; theme=x",
+            "xf_session",
+            "xf_user"
+        ));
+        assert!(has_member_session_cookie(
+            "consent=1; xf_session=abc",
+            "xf_session",
+            "xf_user"
+        ));
+        // Benign-only: vary/analytics-style names without markers.
+        assert!(!has_member_session_cookie(
+            "xf_style_variation=dark; xf_style_id=3; consent=1",
+            "xf_session",
+            "xf_user"
+        ));
+        assert!(!has_member_session_cookie(
+            "cf_bm=abc",
+            "xf_session",
+            "xf_user"
+        ));
+        // A marker PREFIX must not match (name equality, not prefix).
+        assert!(!has_member_session_cookie(
+            "xf_username=evil",
+            "xf_session",
+            "xf_user"
+        ));
+        // Values containing the marker name don't count (names before '=' only).
+        assert!(!has_member_session_cookie(
+            "theme=xf_user",
+            "xf_session",
+            "xf_user"
+        ));
+        // Empty configured names never match.
+        assert!(!has_member_session_cookie("xf_session=abc", "", "xf_user"));
+    }
+
+    #[test]
     fn revalidation_request_is_an_unconditional_get_with_vary_inputs() {
         let req = http::Request::builder()
             .method(http::Method::HEAD)
@@ -3559,6 +4052,10 @@ mod tests {
         use hj_core::config::{Context, ContextKind};
         let mut context = Context {
             cache_policy: None,
+            max_body_override: None,
+            bandwidth_limit: 0,
+            timeout_override: None,
+            sub_filter: None,
             kind: ContextKind::Static,
             uri: "/assets".into(),
             location: None,
@@ -4367,6 +4864,7 @@ mod tests {
             env: Vec::new(),
             local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
             peer_port: 12345,
+            peer_unix: false,
             tls: None,
             redirect_guard: None,
             request_time: std::time::SystemTime::now(),

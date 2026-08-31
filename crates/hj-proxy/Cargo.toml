@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 # Upstream TLS for https:// / wss:// proxy targets — cert verified against the webpki
 # Mozilla root store, SNI = the target authority host.
 tokio-rustls = { workspace = true }
+rustls-pemfile = "2"
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 

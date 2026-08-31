@@ -55,6 +55,8 @@ fn build_router() -> Router {
         name: "default".into(),
         address: "0.0.0.0:443".into(),
         secure: true,
+        proxy_protocol: false,
+        uds_path: None,
         vhost_map: vec![
             VhostMap {
                 vhost: "ipv6loopback".into(),
@@ -115,6 +117,8 @@ fn hostname_with_port_still_routes_correctly() {
         name: "http".into(),
         address: "0.0.0.0:80".into(),
         secure: false,
+        proxy_protocol: false,
+        uds_path: None,
         vhost_map: vec![
             VhostMap {
                 vhost: "forum".into(),

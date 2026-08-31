@@ -1050,6 +1050,7 @@ mod tests {
             env: Vec::new(),
             local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
             peer_port: 12345,
+            peer_unix: false,
             tls: None,
             redirect_guard: None,
             request_time: std::time::SystemTime::now(),

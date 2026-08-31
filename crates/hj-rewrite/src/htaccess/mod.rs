@@ -424,6 +424,12 @@ pub struct Htaccess {
     /// it captures top-level `Deny from all` (#4), `<If>`-nested `Require`
     /// (#5), and fail-closed unrecognized `Require` predicates (#2).
     pub access_rules: Vec<AccessRule>,
+    /// (Tier 1.3) `AuthType Basic` + `AuthName` + `AuthUserFile` (+ `Require
+    /// valid-user`/`user …`) resolved into a Basic-auth realm covering this
+    /// directory tree. Enforcement (401 challenge + credential verification)
+    /// happens in the pipeline; `None` = no auth directives (or an incomplete
+    /// block, which keeps the historical fail-closed deny collapse).
+    pub auth: Option<crate::auth::AuthRealm>,
     /// `SetEnvIf`/`SetEnvIfNoCase`.
     pub set_env_if: Vec<SetEnvIf>,
     /// `CacheLookup [public|private] on|off` — `Some(true/false)` if present in

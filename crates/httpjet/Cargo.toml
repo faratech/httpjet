@@ -86,6 +86,7 @@ hj-lsapi = { workspace = true }
 hj-proxy = { workspace = true }
 hj-rewrite = { workspace = true }
 hj-acl = { workspace = true }
+hj-geo = { workspace = true }
 hj-cache = { workspace = true }
 hj-compress = { workspace = true }
 hj-pagecache = { workspace = true }

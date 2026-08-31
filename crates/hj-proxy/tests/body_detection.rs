@@ -64,6 +64,7 @@ fn ctx() -> ReqCtx {
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
+        peer_unix: false,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
         tls: None,
@@ -128,10 +129,13 @@ async fn non_empty_body_without_content_length_is_forwarded() {
     // The whole forward must finish well under the 60s response-head timeout — if the
     // request were mis-detected as bodyless, the fast upstream still answers, so the
     // discriminating fact here is that the body BYTES reached the upstream.
-    let resp = tokio::time::timeout(Duration::from_secs(10), proxy.forward(&ctx(), req, &target))
-        .await
-        .expect("forward must not hang")
-        .expect("forward ok");
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        proxy.forward(&ctx(), req, &target, None),
+    )
+    .await
+    .expect("forward must not hang")
+    .expect("forward ok");
     let text = collect(resp).await;
     assert_eq!(
         text, "len=11",
@@ -155,9 +159,44 @@ async fn empty_get_has_no_body() {
         .body(body)
         .unwrap();
     let resp = proxy
-        .forward(&ctx(), req, &target)
+        .forward(&ctx(), req, &target, None)
         .await
         .expect("forward ok");
     let text = collect(resp).await;
     assert_eq!(text, "len=0", "an empty GET forwards no body: {text}");
+}
+
+/// (Tier 2) h2:// and h2s:// targets parse with the right scheme, transport,
+/// and http2 flag, and their pool keys never collide with the h1 target on the
+/// same host:port.
+#[test]
+fn h2_targets_parse_and_pool_separately_from_h1() {
+    use hj_proxy::ProxyTarget;
+
+    let h2 = ProxyTarget::parse_url("h2://10.0.0.9:9000/api").unwrap();
+    assert_eq!(h2.scheme, "h2");
+    assert!(h2.http2);
+    assert!(!h2.is_tls());
+    assert_eq!(h2.authority, "10.0.0.9:9000");
+    assert_eq!(h2.path_and_query, "/api");
+
+    let h2s = ProxyTarget::parse_url("h2s://api.internal").unwrap();
+    assert_eq!(h2s.scheme, "h2s");
+    assert!(h2s.http2);
+    assert!(h2s.is_tls(), "h2s is the TLS arm");
+    assert_eq!(
+        h2s.authority, "api.internal:443",
+        "h2s defaults to port 443"
+    );
+
+    let h1 = ProxyTarget::parse_url("http://10.0.0.9:9000/api").unwrap();
+    assert!(!h1.http2);
+    assert_ne!(
+        h2.pool_key(),
+        h1.pool_key(),
+        "h1 and h2 upstreams on the same host:port must not share a pool entry"
+    );
+
+    // The unix: form stays h1 (h2 marker unsupported there).
+    assert!(ProxyTarget::parse_url("unix:/tmp/x.sock|/p").unwrap().http2 == false);
 }

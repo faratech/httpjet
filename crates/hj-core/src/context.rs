@@ -64,6 +64,11 @@ pub struct ReqCtx {
     pub request_id: crate::reqid::ReqId,
     /// TLS parameters, `Some` on TLS/QUIC connections.
     pub tls: Option<TlsParams>,
+    /// (Tier 2) The connection arrived over a unix-domain socket: there is no
+    /// address, so `peer_ip`/`client_ip` are loopback fabrications and the
+    /// filesystem mode/owner is the real access boundary. ACLs, the per-IP
+    /// throttle, and `REMOTE_ADDR` see loopback; the access log renders `unix:`.
+    pub peer_unix: bool,
     /// Request identity consumed by the redirect-decache transform (see the
     /// pipeline's `deny_redirect_cdn_headers`), reached only on 3xx responses.
     /// (#318) A dedicated field — not `env` — so setting it costs one host

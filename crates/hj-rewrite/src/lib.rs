@@ -53,6 +53,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod auth;
 mod cache;
 mod directives;
 mod error;
@@ -60,6 +61,7 @@ mod htaccess;
 mod input;
 mod rules;
 
+pub use auth::AuthRealm;
 pub use cache::HtaccessCache;
 pub use directives::{AccessDecision, ErrorDoc, HeaderOp, ReqAttrs};
 pub use error::RewriteError;

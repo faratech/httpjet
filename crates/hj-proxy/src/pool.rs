@@ -12,7 +12,7 @@
 //! long-lived proxied streams.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,27 @@ fn client_tls_config() -> Arc<rustls::ClientConfig> {
     .clone()
 }
 
+/// (Tier 2) Build a TLS client config with upstream mTLS client authentication.
+/// The cert/key pair authenticates this origin to the upstream backend.
+fn client_tls_config_with_cert(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<Arc<rustls::ClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
+        cert_path,
+    )?))
+    .collect::<Result<Vec<_>, _>>()?;
+    let key =
+        rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key_path)?))?
+            .ok_or("no private key found")?;
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)?;
+    Ok(Arc::new(config))
+}
+
 /// Consecutive connect failures before the circuit breaker opens.
 const CB_THRESHOLD: u32 = 3;
 /// How long the breaker stays open before allowing a half-open trial dial.
@@ -60,9 +81,43 @@ const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 /// forwarded verbatim with no buffering and a real `http_body::Body` impl.
 pub(crate) type OutBody = hj_core::StreamBody;
 
+/// (Tier 2) Protocol-agnostic pooled sender. hyper 1.x types the http1 and
+/// http2 client senders as DISTINCT types, so the pool (and `forward`) erase
+/// the arm behind this enum and delegate the three calls they need.
+pub(crate) enum AnySender {
+    H1(SendRequest<OutBody>),
+    H2(hyper::client::conn::http2::SendRequest<OutBody>),
+}
+
+impl AnySender {
+    pub(crate) fn is_ready(&self) -> bool {
+        match self {
+            AnySender::H1(s) => s.is_ready(),
+            AnySender::H2(s) => s.is_ready(),
+        }
+    }
+
+    pub(crate) async fn ready(&mut self) -> Result<(), hyper::Error> {
+        match self {
+            AnySender::H1(s) => s.ready().await,
+            AnySender::H2(s) => s.ready().await,
+        }
+    }
+
+    pub(crate) async fn send_request(
+        &mut self,
+        req: http::Request<OutBody>,
+    ) -> Result<http::Response<hyper::body::Incoming>, hyper::Error> {
+        match self {
+            AnySender::H1(s) => s.send_request(req).await,
+            AnySender::H2(s) => s.send_request(req).await,
+        }
+    }
+}
+
 /// A pooled, ready-to-use upstream connection.
 pub(crate) struct PooledConn {
-    pub(crate) sender: SendRequest<OutBody>,
+    pub(crate) sender: AnySender,
     /// When this connection was last returned to the pool (for idle expiry).
     idle_since: Instant,
 }
@@ -79,6 +134,8 @@ pub struct Upstream {
     /// handshake before speaking HTTP. Without this an `https` target would speak cleartext
     /// HTTP to a TLS port (silent failure).
     requires_tls: bool,
+    /// (Tier 2) Speak HTTP/2 prior knowledge to this upstream (`h2://`/`h2s://`).
+    requires_h2: bool,
     /// SNI / cert-verification name for the TLS handshake (the authority host, no port). When
     /// `requires_tls` is set but this is `None` (unparseable authority), a dial fails closed
     /// rather than silently falling back to plaintext.
@@ -101,6 +158,13 @@ pub struct Upstream {
     /// When the breaker opened (`None` = closed). While open, checkout fast-fails
     /// without dialing, avoiding a connect-timeout storm against a dead upstream.
     tripped_at: Mutex<Option<Instant>>,
+    /// (Tier 2) Upstream mTLS: client cert/key paths for TLS upstream connections.
+    client_cert_file: Option<std::path::PathBuf>,
+    client_key_file: Option<std::path::PathBuf>,
+    /// (Tier 1.2) Shared with the owning [`UpstreamPool`]: epoch-ms until which the
+    /// POOL skips this peer for new requests (failover). Set when the breaker trips,
+    /// cleared on a successful dial.
+    bad_until: Mutex<Option<Arc<AtomicU64>>>,
 }
 
 impl Upstream {
@@ -113,6 +177,7 @@ impl Upstream {
     ) -> Arc<Upstream> {
         let max_conns = max_conns.max(1);
         let requires_tls = target.is_tls();
+        let requires_h2 = target.http2;
         let tls_server_name = if requires_tls {
             // SNI + cert-verification name = the authority host (port/brackets removed).
             match ServerName::try_from(hj_core::host_without_port(&target.authority)) {
@@ -133,6 +198,7 @@ impl Upstream {
             authority: target.authority.clone(),
             transport: target.transport.clone(),
             requires_tls,
+            requires_h2,
             tls_server_name,
             sem: Arc::new(Semaphore::new(max_conns as usize)),
             max_conns,
@@ -146,6 +212,9 @@ impl Upstream {
             idle: Mutex::new(Vec::new()),
             fail_count: AtomicU32::new(0),
             tripped_at: Mutex::new(None),
+            client_cert_file: target.client_cert_file.clone(),
+            client_key_file: target.client_key_file.clone(),
+            bad_until: Mutex::new(None),
         })
     }
 
@@ -196,18 +265,33 @@ impl Upstream {
         }
     }
 
-    /// Record a successful dial: reset the failure count and close the breaker.
+    /// Record a successful dial: reset the failure count and close the breaker
+    /// (and clear the pool-level failover mark).
     fn note_dial_success(&self) {
         self.fail_count.store(0, Ordering::Relaxed);
         *self.tripped_at.lock() = None;
+        if let Some(b) = self.bad_until.lock().as_ref() {
+            b.store(0, Ordering::Relaxed);
+        }
     }
 
-    /// Record a failed dial: trip the breaker once the threshold is reached.
+    /// Record a failed dial: trip the breaker once the threshold is reached. A
+    /// trip also marks the peer bad at the POOL level for one half-open window,
+    /// so new requests fail over to the next peer instead of fast-failing here.
     fn note_dial_failure(&self) {
         let n = self.fail_count.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= CB_THRESHOLD {
             *self.tripped_at.lock() = Some(Instant::now());
+            if let Some(b) = self.bad_until.lock().as_ref() {
+                let until = now_epoch_ms() + CB_HALF_OPEN_AFTER.as_millis() as u64;
+                b.store(until, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Install the pool-shared failover handle (called once at pool creation).
+    fn set_bad_until_handle(&self, handle: Arc<AtomicU64>) {
+        *self.bad_until.lock() = Some(handle);
     }
 
     /// Number of connections currently idle in the pool (for tests/metrics).
@@ -217,7 +301,7 @@ impl Upstream {
 
     /// Check out a usable connection, reusing a live idle one if available, else
     /// dialing a new connection and driving it on a background task.
-    pub(crate) async fn checkout(&self) -> Result<SendRequest<OutBody>, ProxyError> {
+    pub(crate) async fn checkout(&self) -> Result<AnySender, ProxyError> {
         // Breaker open: fast-fail (502) instead of dialing a known-dead upstream
         // and eating a full connect timeout. Checked before idle reuse, since idle
         // entries to a dead upstream are stale anyway. Half-open trials fall through.
@@ -263,7 +347,7 @@ impl Upstream {
     /// would lose the same race with no third attempt left. Bounded like [`Self::acquire`]'s
     /// queue wait, because prod sets `initTimeout=600` on ext processors and a retry must not
     /// park for ten minutes.
-    pub(crate) async fn checkout_fresh(&self) -> Result<SendRequest<OutBody>, ProxyError> {
+    pub(crate) async fn checkout_fresh(&self) -> Result<AnySender, ProxyError> {
         if self.breaker_open() {
             return Err(ProxyError::CircuitOpen);
         }
@@ -282,7 +366,7 @@ impl Upstream {
 
     /// Dial, feeding the breaker so a run of connect failures opens it (and a success
     /// closes it).
-    async fn dial_tracked(&self) -> Result<SendRequest<OutBody>, ProxyError> {
+    async fn dial_tracked(&self) -> Result<AnySender, ProxyError> {
         match self.dial().await {
             Ok(sender) => {
                 self.note_dial_success();
@@ -298,7 +382,7 @@ impl Upstream {
     /// Establish a fresh connection, spawn its background driver task, and
     /// return the request sender. The driver task differs per transport (its
     /// `Connection` type is IO-specific), so each arm spawns its own.
-    async fn dial(&self) -> Result<SendRequest<OutBody>, ProxyError> {
+    async fn dial(&self) -> Result<AnySender, ProxyError> {
         match &self.transport {
             TargetTransport::Tcp(hostport) => {
                 let connect = TcpStream::connect(hostport.clone());
@@ -317,7 +401,15 @@ impl Upstream {
                             self.authority
                         ))
                     })?;
-                    let connector = TlsConnector::from(client_tls_config());
+                    let tls_cfg = if let (Some(cert), Some(key)) =
+                        (&self.client_cert_file, &self.client_key_file)
+                    {
+                        client_tls_config_with_cert(cert, key)
+                            .unwrap_or_else(|_| client_tls_config())
+                    } else {
+                        client_tls_config()
+                    };
+                    let connector = TlsConnector::from(tls_cfg);
                     let tls = tokio::time::timeout(
                         self.connect_timeout,
                         connector.connect(server_name, stream),
@@ -325,9 +417,20 @@ impl Upstream {
                     .await
                     .map_err(|_| ProxyError::ConnectTimeout)?
                     .map_err(ProxyError::Connect)?;
-                    self.h1_handshake(tls).await
+                    if self.requires_h2 {
+                        // h2s: the upstream MUST have negotiated h2 via ALPN —
+                        // falling back to h1 over the same port would silently
+                        // speak the wrong protocol.
+                        if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+                            return Err(ProxyError::Handshake(format!(
+                                "TLS upstream {} negotiated no h2 ALPN",
+                                self.authority
+                            )));
+                        }
+                    }
+                    self.http_handshake(tls).await
                 } else {
-                    self.h1_handshake(stream).await
+                    self.http_handshake(stream).await
                 }
             }
             #[cfg(unix)]
@@ -337,7 +440,7 @@ impl Upstream {
                     .await
                     .map_err(|_| ProxyError::ConnectTimeout)?
                     .map_err(ProxyError::Connect)?;
-                self.h1_handshake(stream).await
+                self.http_handshake(stream).await
             }
             #[cfg(not(unix))]
             TargetTransport::Uds(_) => Err(ProxyError::Other(
@@ -348,7 +451,7 @@ impl Upstream {
 
     /// Complete the HTTP/1.1 client handshake over an already-connected (optionally
     /// TLS-wrapped) stream and spawn its background connection driver, returning the sender.
-    async fn h1_handshake<IO>(&self, io: IO) -> Result<SendRequest<OutBody>, ProxyError>
+    async fn h1_handshake<IO>(&self, io: IO) -> Result<AnySender, ProxyError>
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -361,12 +464,57 @@ impl Upstream {
                 tracing::debug!(error = %e, "upstream connection closed");
             }
         });
-        Ok(sender)
+        Ok(AnySender::H1(sender))
+    }
+
+    /// Complete the HTTP client handshake appropriate for this upstream —
+    /// HTTP/1.1, or HTTP/2 prior knowledge for `h2`/`h2s` targets — over an
+    /// already-connected (optionally TLS-wrapped) stream. Both return the same
+    /// hyper `SendRequest`, so checkout/release/forward are protocol-agnostic.
+    async fn http_handshake<IO>(&self, io: IO) -> Result<AnySender, ProxyError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        if self.requires_h2 {
+            self.h2_handshake(io).await
+        } else {
+            self.h1_handshake(io).await
+        }
+    }
+
+    /// HTTP/2 prior-knowledge client handshake. The connection driver is spawned
+    /// WITHOUT upgrade relay (h2 has none); one multiplexed connection carries
+    /// every concurrent stream, so an `!is_ready()` sender is not unhealthy —
+    /// `release` simply lets it drop and the next checkout dials a fresh one.
+    async fn h2_handshake<IO>(&self, io: IO) -> Result<AnySender, ProxyError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let io = hyper_util::rt::TokioIo::new(io);
+        let (sender, conn): (hyper::client::conn::http2::SendRequest<OutBody>, _) =
+            hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .handshake(io)
+                .await
+                .map_err(|e| ProxyError::Handshake(e.to_string()))?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!(error = %e, "upstream h2 connection closed");
+            }
+        });
+        // Unlike h1, an h2 sender rejects send_request until the preface +
+        // SETTINGS exchange completes — await it under the dial, not per request
+        // (a send on a not-yet-ready h2 sender fails with hyper's Canceled).
+        let mut sender = sender;
+        sender
+            .ready()
+            .await
+            .map_err(|e| ProxyError::Handshake(e.to_string()))?;
+        Ok(AnySender::H2(sender))
     }
 
     /// Return a connection to the idle pool after a completed request, if it is
     /// still healthy and the pool has room.
-    pub(crate) fn release(&self, sender: SendRequest<OutBody>) {
+    pub(crate) fn release(&self, sender: AnySender) {
         if !sender.is_ready() {
             return;
         }
@@ -387,6 +535,19 @@ impl Upstream {
 #[derive(Default)]
 pub struct UpstreamPool {
     pools: Mutex<HashMap<PoolKey, Arc<Upstream>>>,
+    /// (Tier 1.2) Per-peer failover marks: epoch-ms until which the peer is skipped
+    /// for NEW requests (set when the peer's breaker trips, cleared on a successful
+    /// dial). Keyed by the same PoolKey as `pools`.
+    bad_until: Mutex<HashMap<PoolKey, Arc<AtomicU64>>>,
+    /// (Tier 1.2) Requests served by a failover peer because the primary was marked.
+    failovers: AtomicU64,
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -427,11 +588,18 @@ impl UpstreamPool {
     pub fn new() -> Self {
         UpstreamPool {
             pools: Mutex::new(HashMap::new()),
+            bad_until: Mutex::new(HashMap::new()),
+            failovers: AtomicU64::new(0),
         }
     }
 
     /// Get (or lazily create) the [`Upstream`] for `target`, applying the given
     /// limits the first time it is seen.
+    ///
+    /// (Tier 1.2) When the target carries failover peers, a peer whose breaker
+    /// tripped recently (marked bad for one half-open window by its own dial
+    /// failures) is skipped in favor of the next peer; the primary is retried once
+    /// its mark expires, so recovery is automatic and needs no active probing.
     pub fn get_or_create(
         &self,
         target: &ProxyTarget,
@@ -439,12 +607,56 @@ impl UpstreamPool {
         keep_alive: Duration,
         connect_timeout: Duration,
     ) -> Arc<Upstream> {
-        let key = PoolKey::new(target, max_conns, keep_alive, connect_timeout);
+        let peers = target.peers();
+        let now_ms = now_epoch_ms();
+        for (idx, peer) in peers.iter().enumerate() {
+            let key = PoolKey::new(peer, max_conns, keep_alive, connect_timeout);
+            let bad = {
+                let bad = self.bad_until.lock();
+                bad.get(&key)
+                    .map(|a| a.load(Ordering::Relaxed))
+                    .unwrap_or(0)
+            };
+            if bad > now_ms {
+                continue; // peer in its failover cooldown — try the next
+            }
+            let handle = {
+                let mut bad = self.bad_until.lock();
+                Arc::clone(
+                    bad.entry(key.clone())
+                        .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+                )
+            };
+            let upstream = {
+                let mut pools = self.pools.lock();
+                pools
+                    .entry(key)
+                    .or_insert_with(|| {
+                        let up = Upstream::new(peer, max_conns, keep_alive, connect_timeout);
+                        up.set_bad_until_handle(handle);
+                        up
+                    })
+                    .clone()
+            };
+            if idx > 0 {
+                self.failovers.fetch_add(1, Ordering::Relaxed);
+            }
+            return upstream;
+        }
+        // Every peer marked bad: serve from the primary (its breaker half-open
+        // window decides fast-fail vs trial dial) rather than refusing outright.
+        let primary = &peers[0];
+        let key = PoolKey::new(primary, max_conns, keep_alive, connect_timeout);
         let mut pools = self.pools.lock();
         pools
             .entry(key)
-            .or_insert_with(|| Upstream::new(target, max_conns, keep_alive, connect_timeout))
+            .or_insert_with(|| Upstream::new(primary, max_conns, keep_alive, connect_timeout))
             .clone()
+    }
+
+    /// Requests served by a failover peer (Tier 1.2, for metrics).
+    pub fn failovers_total(&self) -> u64 {
+        self.failovers.load(Ordering::Relaxed)
     }
 
     /// Number of distinct upstream pools (for tests/metrics).
@@ -483,6 +695,8 @@ impl UpstreamPool {
             .collect();
         UpstreamPool {
             pools: Mutex::new(retained),
+            bad_until: Mutex::new(HashMap::new()),
+            failovers: AtomicU64::new(0),
         }
     }
 }
@@ -490,6 +704,59 @@ impl UpstreamPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // (Tier 1.2) A target with failover peers hands out the primary until its
+    // breaker trips, then the next peer; the primary is retried once its
+    // failover mark (one half-open window) expires.
+    #[test]
+    fn failover_peers_skips_marked_primary_then_recovers() {
+        use hj_core::config::{ExtAddress, ExtKind, ExtProcessor};
+
+        let ep = ExtProcessor {
+            name: "lb".into(),
+            kind: ExtKind::Proxy,
+            address: ExtAddress::Tcp("127.0.0.1:29001".parse().unwrap()),
+            extra_addresses: vec![ExtAddress::Tcp("127.0.0.1:29002".parse().unwrap())],
+            max_conns: 10,
+            init_timeout: Duration::from_secs(1),
+            retry_timeout: Duration::from_secs(0),
+            pc_keep_alive_timeout: Duration::from_secs(5),
+            resp_buffer: false,
+            env: vec![],
+            auto_start: 0,
+            path: None,
+            backlog: 0,
+            client_cert_file: None,
+            client_key_file: None,
+            instances: 1,
+            run_on_startup: 0,
+        };
+        let target = ProxyTarget::from_ext_processor(&ep);
+        let pool = UpstreamPool::new();
+
+        let primary =
+            pool.get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1));
+        assert_eq!(primary.authority, "127.0.0.1:29001");
+
+        // Trip the primary's breaker (CB_THRESHOLD consecutive dial failures) —
+        // the pool-level failover mark is installed by the pool itself.
+        for _ in 0..3 {
+            primary.note_dial_failure();
+        }
+
+        let next = pool.get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1));
+        assert_eq!(
+            next.authority, "127.0.0.1:29002",
+            "over-rate primary must be skipped in favor of the failover peer"
+        );
+        assert_eq!(pool.failovers_total(), 1);
+
+        // The primary recovers after the failover mark expires.
+        std::thread::sleep(crate::pool::CB_HALF_OPEN_AFTER + Duration::from_millis(50));
+        let recovered =
+            pool.get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1));
+        assert_eq!(recovered.authority, "127.0.0.1:29001");
+    }
 
     #[test]
     fn pool_dedups_by_key() {
@@ -636,15 +903,15 @@ mod tests {
             let mut idle = u.idle.lock();
             // Front: expired (idle longer than keep_alive). Back: two fresh entries.
             idle.push(PooledConn {
-                sender: s_old,
+                sender: AnySender::H1(s_old),
                 idle_since: Instant::now() - Duration::from_secs(120),
             });
             idle.push(PooledConn {
-                sender: s_fresh1,
+                sender: AnySender::H1(s_fresh1),
                 idle_since: Instant::now(),
             });
             idle.push(PooledConn {
-                sender: s_fresh2,
+                sender: AnySender::H1(s_fresh2),
                 idle_since: Instant::now(),
             });
         }

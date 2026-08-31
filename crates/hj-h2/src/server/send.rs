@@ -64,7 +64,7 @@ async fn pull_next(
 /// validation pass plus a heap copy of every Link value on every response. Every match
 /// site of the four old substring needles starts with `rel=`, so anchoring there and
 /// prefix-testing the (optionally quoted) relation is needle-for-needle equivalent.
-fn is_early_hint_link(v: &http::HeaderValue) -> bool {
+pub fn is_early_hint_link(v: &http::HeaderValue) -> bool {
     fn rel_at(rest: &[u8]) -> bool {
         for rel in [&b"preload"[..], b"preconnect"] {
             // Bare form: the old needle `rel=preload` matched as a substring, i.e. a

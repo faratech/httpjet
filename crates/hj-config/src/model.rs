@@ -80,6 +80,13 @@ pub struct Tuning {
     pub enable_dyn_brotli: bool,
     /// zstd compression level (1-22; default 3).
     pub zstd_level: u32,
+    /// httpjet-native per-client-IP request throttle (Tier 1.1): max requests per
+    /// client IP within `per_ip_rate_window`. 0 (default) = disabled — a shared
+    /// NAT egress aggregates real visitors, so limits are strictly opt-in.
+    pub per_ip_rate: u32,
+    pub per_ip_rate_window: Duration,
+    /// (Tier 2) Per-connection bandwidth limit (bytes/sec). 0 = unlimited.
+    pub bandwidth_limit: u64,
     /// brotli quality (0-11; default 5).
     pub brotli_quality: u32,
 }
@@ -107,6 +114,9 @@ impl Default for Tuning {
             enable_dyn_brotli: true,
             zstd_level: 3,
             brotli_quality: 5,
+            per_ip_rate: 0,
+            per_ip_rate_window: std::time::Duration::from_secs(1),
+            bandwidth_limit: 0,
         }
     }
 }
@@ -193,6 +203,17 @@ pub struct Security {
     /// Server-wide `<security><CGIRLimit>` CPU soft/hard limits, in seconds.
     /// `None` = neither side configured.
     pub cgi_cpu_limit_secs: Option<RlimitPair>,
+    /// (Tier 2) GeoIP/ASN ACL source: a CidrList text file mapping country
+    /// labels and ASNs to prefixes (httpjet-native; absent = geo ACL inert).
+    pub geo_db_file: Option<PathBuf>,
+    /// Country labels (ISO-3166 alpha-2) to ALLOW/require. Empty = no allow list.
+    pub geo_allow: Vec<String>,
+    /// Country labels to DENY (checked first).
+    pub geo_deny: Vec<String>,
+    /// ASNs to ALLOW/require.
+    pub asn_allow: Vec<u32>,
+    /// ASNs to DENY (checked first).
+    pub asn_deny: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +323,12 @@ pub struct ExtProcessor {
     pub name: String,
     pub kind: ExtKind,
     pub address: ExtAddress,
+    /// (Tier 1.2) Additional upstream addresses — failover peers tried in order
+    /// when the primary's circuit breaker is open.
+    pub extra_addresses: Vec<ExtAddress>,
+    /// (Tier 2) Upstream mTLS: client certificate + key for TLS upstream connections.
+    pub client_cert_file: Option<PathBuf>,
+    pub client_key_file: Option<PathBuf>,
     pub max_conns: u32,
     pub init_timeout: Duration,
     pub retry_timeout: Duration,
@@ -378,6 +405,17 @@ pub struct Listener {
     pub secure: bool,
     pub vhost_map: Vec<VhostMap>,
     pub tls: Option<ListenerTls>,
+    /// (Tier 2) Serve HTTP over this unix domain socket instead of TCP — set by an
+    /// `<address>unix:/path/sock</address>` (or `uds:`) listener address. `None`
+    /// for ordinary TCP listeners. TLS-over-UDS is unsupported (hard error).
+    pub uds_path: Option<std::path::PathBuf>,
+    /// (Tier 2) PROXY protocol v2/v1 on THIS listener: every connection to it must
+    /// send a PROXY header before any other data; the header's source address
+    /// overrides the TCP peer for client-IP resolution and ACLs. Listener opt-in IS
+    /// the trust decision — only enable on listeners whose direct peers are the
+    /// trusted LB/proxy. (OLS models this server-level as a peer allow-list; the
+    /// per-listener form is httpjet-native.)
+    pub proxy_protocol: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -400,6 +438,9 @@ pub struct ListenerTls {
     pub client_verify: u8,
     pub verify_depth: u32,
     pub enable_stapling: bool,
+    /// (Tier 1.5) Optional PEM certificate-revocation list (CRL) checked during
+    /// client-cert verification. Empty/absent = no revocation checking.
+    pub crl_file: Option<std::path::PathBuf>,
 }
 
 /// A virtual host as declared in the server config (before its file is loaded).
@@ -535,6 +576,64 @@ pub struct Context {
     /// entries under its URI prefix regardless of the vhost policy; the private
     /// pair gates the private tier the same way. `None` = block absent ⇒ inherit.
     pub cache_policy: Option<ContextCachePolicy>,
+    /// (Tier 2) Per-context request-body limit override. `None` = the server-wide
+    /// `<tuning><maxReqBodySize>` applies. Set via a `<maxReqBodySize>` child of
+    /// the `<context>` block (httpjet-native extension, not an LSWS field).
+    pub max_body_override: Option<u64>,
+    /// (Tier 2) Per-vhost bandwidth limit in bytes/sec. 0 = unlimited.
+    pub bandwidth_limit: u64,
+    /// (Tier 2) Per-context response timeout override. `None` = the server-wide
+    /// timeout applies. Set via a `<responseTimeout>` child of the `<context>`
+    /// block (seconds). Limits how long the server waits for the backend's
+    /// response — useful for long-polling or slow-report contexts.
+    pub timeout_override: Option<u64>,
+    /// (Tier 2) nginx-shaped literal response-body substitution for this context.
+    /// `None` = inherit nothing (no filtering).
+    pub sub_filter: Option<Box<SubFilterConfig>>,
+}
+
+/// (Tier 2) nginx `sub_filter` parity: literal search/replace over an eligible
+/// response body (200, not already encoded, matching Content-Type), buffered
+/// with a cap — a body beyond the cap passes through RAW, never half-filtered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubFilterConfig {
+    /// (search, replace) pairs applied in order.
+    pub rules: Vec<(String, String)>,
+    /// Replace only the FIRST occurrence of each rule (nginx sub_filter_once).
+    pub once: bool,
+    /// Eligible Content-Type base values (default `["text/html"]`).
+    pub types: Vec<String>,
+    /// Keep `Last-Modified` when filtering (ETag is always dropped — the
+    /// entity changed, and httpjet's ETag shape is file-identity-derived).
+    pub keep_last_modified: bool,
+    /// Buffering cap for streamed bodies (bytes). Default 4 MiB.
+    pub max_body: u64,
+}
+
+impl Default for SubFilterConfig {
+    fn default() -> Self {
+        SubFilterConfig {
+            rules: Vec::new(),
+            once: false,
+            types: vec!["text/html".to_string()],
+            keep_last_modified: false,
+            max_body: 4 * 1024 * 1024,
+        }
+    }
+}
+
+impl SubFilterConfig {
+    /// True when any rule is configured.
+    pub fn is_active(&self) -> bool {
+        !self.rules.is_empty()
+    }
+
+    /// Content-Type eligibility: the base type (before `; parameters`) must
+    /// equal one of the configured entries.
+    pub fn matches_type(&self, content_type: &str) -> bool {
+        let base = content_type.split(';').next().unwrap_or("").trim();
+        self.types.iter().any(|t| t.eq_ignore_ascii_case(base))
+    }
 }
 
 /// The LSWS per-context cache flags. All six are modeled for fidelity; httpjet's

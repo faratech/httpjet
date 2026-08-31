@@ -54,8 +54,9 @@
 //!
 //!   - `If-None-Match` / `If-Modified-Since` → `304 Not Modified` (no body).
 //!   - `Range: bytes=` (single range) → `206 Partial Content` with
-//!     `Content-Range` and `FileBody.range` set; multi-range is not split and
-//!     falls back to a full `200`.
+//!     `Content-Range` and `FileBody.range` set.
+//!   - Multi-range sets → a materialized `multipart/byteranges` 206 (≤ 8 ranges,
+//!     ≤ 8 MiB of part bytes; anything beyond falls back to a full `200`).
 //!   - Unsatisfiable range → `416 Range Not Satisfiable` with `Content-Range:
 //!     bytes */<len>`.
 //!   - `If-Range` gates the range: if it does not match the current validator
@@ -74,8 +75,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use http::header::{
-    ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, IF_MATCH, IF_MODIFIED_SINCE,
-    IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE, LAST_MODIFIED, LOCATION, RANGE,
+    ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+    ETAG, IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE, IF_UNMODIFIED_SINCE, LAST_MODIFIED,
+    LOCATION, RANGE, VARY,
 };
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 
@@ -553,6 +555,54 @@ impl Handler for StaticFiles {
             .map(|c| c.0.as_str());
         let content_type = self.content_type_for(ctx, ext, default_charset);
 
+        // (Tier 2) Precompressed sibling serving (nginx gzip_static/brotli_static
+        // parity): when the client accepts br/gzip and a `<file>.br`/`.gz`
+        // sibling exists, serve it with Content-Encoding instead of letting the
+        // compress transform re-encode per request. The sibling lives in the same
+        // directory as the primary, so accessDenyDir verdicts are unaffected; the
+        // ETag/length describe the sibling bytes and `Vary: Accept-Encoding`
+        // marks the variant for caches. Ranged requests skip the swap (they
+        // operate on the primary's bytes).
+        let mut content_encoding: Option<&'static str> = None;
+        if !req.headers().contains_key(RANGE) {
+            let accepts = req
+                .headers()
+                .get(ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let wanted: &[(&str, &str)] = if accepts.contains("br") {
+                &[("br", ".br"), ("gzip", ".gz")]
+            } else if accepts.contains("gzip") {
+                &[("gzip", ".gz")]
+            } else {
+                &[]
+            };
+            for (enc, ext_suffix) in wanted {
+                let mut sib = resolved.path.clone().into_os_string();
+                sib.push(ext_suffix);
+                let sib = PathBuf::from(sib);
+                if let Ok(f) = std::fs::File::open(&sib) {
+                    let Some(md) = f.metadata().ok().filter(|m| m.is_file()) else {
+                        continue;
+                    };
+                    content_encoding = Some(match *enc {
+                        "br" => "br",
+                        _ => "gzip",
+                    });
+                    resolved = ResolvedFile {
+                        path: sib.clone(),
+                        len: md.len(),
+                        mtime: md.modified().unwrap_or(resolved.mtime),
+                        inode: md.ino(),
+                        dev: md.dev(),
+                        resolved_path: sib,
+                        file: Some(f),
+                    };
+                    break;
+                }
+            }
+        }
+
         // ETag from the server's fileETag bitmask (default 28 = Size|MTime|INode).
         // `meta.etag` is `None` when the bitmask is NONE (no ETag header emitted).
         let file_etag = ctx.server.tuning.file_etag;
@@ -638,7 +688,7 @@ impl Handler for StaticFiles {
         };
 
         if let Some(range_val) = range {
-            match parse_range(range_val.as_bytes(), resolved.len) {
+            match parse_ranges(range_val.as_bytes(), resolved.len) {
                 RangeOutcome::Single(start, end) => {
                     let body = if is_head {
                         Body::Empty
@@ -684,7 +734,46 @@ impl Handler for StaticFiles {
                     h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                     return Ok(with_resolved_target(resp, resolved_target));
                 }
-                // Unparseable or multi-range: ignore Range, serve full entity.
+                RangeOutcome::Multi(ranges) => {
+                    let total: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();
+                    let content_type_str =
+                        content_type.to_str().unwrap_or("application/octet-stream");
+                    if total <= MAX_MULTIPART_PART_BYTES
+                        && let Some(parts) = read_multipart_parts(
+                            &ranges,
+                            verified_cached.as_ref(),
+                            resolved.file.as_ref(),
+                            &resolved_target,
+                        )
+                    {
+                        let boundary = multipart_boundary();
+                        let wire = build_multipart_body(
+                            &boundary,
+                            content_type_str,
+                            resolved.len,
+                            &ranges,
+                            &parts,
+                        );
+                        let mut resp = Response::new(Body::Full(wire.clone()));
+                        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+                        let h = resp.headers_mut();
+                        insert_static(
+                            h,
+                            CONTENT_TYPE,
+                            &format!("multipart/byteranges; boundary={boundary}"),
+                        );
+                        h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+                        if let Some(ref e) = meta.etag {
+                            h.insert(ETAG, e.clone());
+                        }
+                        h.insert(LAST_MODIFIED, meta.last_modified.clone());
+                        insert_static(h, CONTENT_LENGTH, &wire.len().to_string());
+                        return Ok(with_resolved_target(resp, resolved_target));
+                    }
+                    // Over the materialization cap (or a failed part read): ignore
+                    // Range and serve the full entity below — always RFC-permitted.
+                }
+                // Unparseable: ignore Range, serve full entity.
                 RangeOutcome::Ignore => {}
             }
         }
@@ -705,6 +794,16 @@ impl Handler for StaticFiles {
         *resp.status_mut() = StatusCode::OK;
         let h = resp.headers_mut();
         h.insert(CONTENT_TYPE, content_type.clone());
+        if let Some(enc) = content_encoding {
+            h.insert(
+                CONTENT_ENCODING,
+                HeaderValue::from_static(match enc {
+                    "br" => "br",
+                    _ => "gzip",
+                }),
+            );
+            h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+        }
         h.insert(CONTENT_LENGTH, meta.content_length.clone());
         h.insert(LAST_MODIFIED, meta.last_modified.clone());
         h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
@@ -1137,24 +1236,195 @@ fn map_open_err(e: io::Error) -> HandlerError {
 }
 
 /// Outcome of parsing a `Range` header.
+#[derive(Debug)]
 enum RangeOutcome {
     /// A single satisfiable byte range `[start, end_inclusive]`.
     Single(u64, u64),
+    /// (Tier 2) ≥2 satisfiable ranges, clamped + coalesced, sorted ascending —
+    /// served as one `multipart/byteranges` entity.
+    Multi(Vec<(u64, u64)>),
     /// Range syntax present but unsatisfiable for this entity → 416.
     Unsatisfiable,
-    /// Unparseable, non-bytes unit, or multi-range → ignore and serve 200.
+    /// Unparseable, non-bytes unit, or unusable multi-range → ignore and serve 200.
     Ignore,
 }
 
-/// Parse a `Range` header value against a known entity length.
-///
-/// Supports the three single-range forms:
-///   - `bytes=START-END`
-///   - `bytes=START-`     (to end of file)
-///   - `bytes=-SUFFIX`    (last SUFFIX bytes)
-///
-/// A header with multiple comma-separated ranges is treated as `Ignore` (we do
-/// not emit multipart/byteranges); callers then send the full entity.
+/// Ranges accepted in one `multipart/byteranges` entity; beyond this the whole
+/// header is ignored (a 200 full entity is always RFC-permitted).
+const MAX_RANGES: usize = 8;
+/// Total part-bytes a materialized multipart entity may carry before falling back
+/// to the full 200 entity — multipart bodies are buffered, and the transports
+/// serve `Body::File` (zero-copy ranges) for everything this cap excludes.
+const MAX_MULTIPART_PART_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Parse a `Range` header value against a known entity length, handling the
+/// single-range forms via [`parse_range`] and comma-separated sets via a
+/// `multipart/byteranges`-capable path:
+///   - syntactically invalid components make the WHOLE header invalid (`Ignore`);
+///   - valid-but-unsatisfiable components are dropped (RFC 9110 §14.2);
+///   - if nothing remains satisfiable → `Unsatisfiable` (416);
+///   - >[`MAX_RANGES`] components → `Ignore`.
+fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
+    let s = match std::str::from_utf8(value) {
+        Ok(s) => s.trim(),
+        Err(_) => return RangeOutcome::Ignore,
+    };
+    let spec = match s.strip_prefix("bytes=") {
+        Some(rest) => rest.trim(),
+        None => return RangeOutcome::Ignore,
+    };
+    if spec.is_empty() {
+        return RangeOutcome::Ignore;
+    }
+    if !spec.contains(',') {
+        return parse_range(value, len);
+    }
+
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for part in spec.split(',').map(str::trim) {
+        let Some((start_s, end_s)) = part.split_once('-') else {
+            return RangeOutcome::Ignore;
+        };
+        let start_s = start_s.trim();
+        let end_s = end_s.trim();
+        if start_s.is_empty() {
+            // Suffix form `-N`: N=0 is invalid → whole header invalid; the last
+            // N bytes of an empty entity are unsatisfiable.
+            let Ok(n) = end_s.parse::<u64>() else {
+                return RangeOutcome::Ignore;
+            };
+            if n == 0 {
+                return RangeOutcome::Ignore;
+            }
+            if len == 0 {
+                continue;
+            }
+            ranges.push((len.saturating_sub(n), len - 1));
+            continue;
+        }
+        let Ok(start) = start_s.parse::<u64>() else {
+            return RangeOutcome::Ignore;
+        };
+        if start >= len {
+            continue; // valid but unsatisfiable: dropped
+        }
+        let end: u64 = if end_s.is_empty() {
+            len - 1
+        } else {
+            let Ok(n) = end_s.parse::<u64>() else {
+                return RangeOutcome::Ignore;
+            };
+            if n < start {
+                // last-byte-pos < first-byte-pos is INVALID (not unsatisfiable).
+                return RangeOutcome::Ignore;
+            }
+            n.min(len - 1)
+        };
+        ranges.push((start, end));
+    }
+
+    if ranges.is_empty() {
+        return RangeOutcome::Unsatisfiable;
+    }
+    if ranges.len() > MAX_RANGES {
+        return RangeOutcome::Ignore;
+    }
+    ranges.sort_unstable();
+    let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        // Overlapping/adjacent ranges merge: duplicate bytes in a multipart entity
+        // are legal but waste part framing, and one canonical form is easier to pin.
+        match coalesced.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => {
+                last.1 = last.1.max(end);
+            }
+            _ => coalesced.push((start, end)),
+        }
+    }
+    match coalesced.len() {
+        1 => RangeOutcome::Single(coalesced[0].0, coalesced[0].1),
+        _ => RangeOutcome::Multi(coalesced),
+    }
+}
+
+/// Build a `multipart/byteranges` entity: leading CRLF on every part (the form
+/// nginx/Apache emit, which every byte-range client parses) and a closing
+/// `--boundary--`. Returns the framed body and the exact wire length.
+fn build_multipart_body(
+    boundary: &str,
+    content_type: &str,
+    len: u64,
+    ranges: &[(u64, u64)],
+    part_bytes: &[bytes::Bytes],
+) -> bytes::Bytes {
+    let mut out = bytes::BytesMut::new();
+    for ((start, end), data) in ranges.iter().zip(part_bytes) {
+        out.extend_from_slice(b"\r\n--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"\r\nContent-Type: ");
+        out.extend_from_slice(content_type.as_bytes());
+        out.extend_from_slice(
+            format!("\r\nContent-Range: bytes {}-{}/{}\r\n\r\n", start, end, len).as_bytes(),
+        );
+        out.extend_from_slice(data);
+    }
+    out.extend_from_slice(b"\r\n--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+    out.freeze()
+}
+
+/// A per-response multipart boundary: entropy comes from the clock plus this
+/// response's stack address; uniqueness only has to hold long enough for one
+/// client to parse one response, so a collision is harmless, not a bug.
+fn multipart_boundary() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let addr = &nanos as *const _ as usize;
+    format!("{nanos:016x}{addr:08x}")
+}
+
+/// Read the requested slices out of the entity: from the symlink-verified cached
+/// bytes when present, else `read_at` off the pinned fd (a fresh open of the
+/// resolved path as the fallback — `read_at` never disturbs a shared cursor).
+/// `None` = a read failed or the entity shrank → the caller serves the full 200.
+fn read_multipart_parts(
+    ranges: &[(u64, u64)],
+    cached: Option<&bytes::Bytes>,
+    pinned: Option<&std::fs::File>,
+    path: &std::path::Path,
+) -> Option<Vec<bytes::Bytes>> {
+    use std::os::unix::fs::FileExt;
+    let mut parts = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        let n = (*end - *start + 1) as usize;
+        let mut buf = vec![0u8; n];
+        if let Some(c) = cached {
+            let s = *start as usize;
+            if s + n > c.len() {
+                return None; // entity shrank since the stat — fail safe to a 200
+            }
+            buf.copy_from_slice(&c[s..s + n]);
+        } else {
+            let owned;
+            let file = match pinned {
+                Some(f) => f,
+                None => {
+                    owned = std::fs::File::open(path).ok()?;
+                    &owned
+                }
+            };
+            file.read_exact_at(&mut buf, *start).ok()?;
+        }
+        parts.push(bytes::Bytes::from(buf));
+    }
+    Some(parts)
+}
+
+/// Parse a `Range` header value against a known entity length (single-range
+/// forms only; multi-range sets go through [`parse_ranges`]).
 fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
     let s = match std::str::from_utf8(value) {
         Ok(s) => s.trim(),

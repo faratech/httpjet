@@ -26,14 +26,18 @@ pub(crate) enum TargetTransport {
 /// A resolved reverse-proxy destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyTarget {
-    /// Scheme as written (`http` / `https` / `ws` / `wss`). `https`/`wss`
-    /// indicate the *upstream* leg is TLS (rare for LSWS backends, but parsed).
+    /// Scheme as written (`http` / `https` / `ws` / `wss` / `h2` / `h2s`).
+    /// `https`/`wss`/`h2s` indicate the *upstream* leg is TLS (rare for LSWS
+    /// backends, but parsed).
     pub scheme: String,
     /// The authority used both for the TCP connection and the upstream `Host`
     /// fallback, e.g. `127.0.0.1:8002`.
     pub authority: String,
     /// How to physically reach the upstream.
     pub(crate) transport: TargetTransport,
+    /// (Tier 1.2) Failover peers, tried in order when the primary's circuit
+    /// breaker is open. Empty = single peer (the historical behavior).
+    pub(crate) failover: Vec<TargetTransport>,
     /// Path (+query) to send upstream. Empty means "use the request's own
     /// path-and-query unchanged".
     pub path_and_query: String,
@@ -49,12 +53,39 @@ pub struct ProxyTarget {
     /// idempotent request whose pooled connection died between checkout and send
     /// (audit: parsed for years, consumed nowhere). `None`/zero → a 5 s cap.
     pub retry_timeout: Option<Duration>,
+    /// (Tier 2) Per-context response timeout override (seconds). When set, replaces
+    /// the upstream's default response_timeout for requests routed through this target.
+    pub response_timeout_override: Option<Duration>,
+    /// (Tier 2) Upstream mTLS: client certificate + key for TLS upstream connections.
+    pub client_cert_file: Option<std::path::PathBuf>,
+    pub client_key_file: Option<std::path::PathBuf>,
+    /// (Tier 2) Speak HTTP/2 prior-knowledge to this upstream (`h2://`/`h2s://`).
+    pub http2: bool,
 }
 
 impl ProxyTarget {
+    /// (Tier 1.2) Ordered peer list for pool selection: `self` (primary) first,
+    /// then the failover transports as peer targets. Len 1 = single peer.
+    pub(crate) fn peers(&self) -> Vec<ProxyTarget> {
+        let mut out = Vec::with_capacity(1 + self.failover.len());
+        out.push(self.clone());
+        for t in &self.failover {
+            let mut p = self.clone();
+            p.transport = t.clone();
+            p.authority = match t {
+                TargetTransport::Tcp(hp) => hp.clone(),
+                TargetTransport::Uds(_) => "localhost".to_string(),
+            };
+            out.push(p);
+        }
+        out
+    }
+
     /// True if the upstream leg should itself be TLS.
     pub fn is_tls(&self) -> bool {
-        self.scheme.eq_ignore_ascii_case("https") || self.scheme.eq_ignore_ascii_case("wss")
+        self.scheme.eq_ignore_ascii_case("https")
+            || self.scheme.eq_ignore_ascii_case("wss")
+            || self.scheme.eq_ignore_ascii_case("h2s")
     }
 
     /// True if this is a WebSocket scheme (`ws`/`wss`).
@@ -77,9 +108,10 @@ impl ProxyTarget {
     /// Parse an ad-hoc proxy URL from a rewrite `[P]` rule.
     ///
     /// Accepts `http://host:port/path`, `https://...`, `ws://...`, `wss://...`,
-    /// and a Unix-socket form `unix:/path/to.sock|/upstream/path` (LiteSpeed
-    /// `uds://` style). A missing port defaults to 80 for http/ws and 443 for
-    /// https/wss. The path (if any) becomes [`Self::path_and_query`].
+    /// `h2://...` (HTTP/2 prior knowledge) and `h2s://...` (h2 over TLS), plus a
+    /// Unix-socket form `unix:/path/to.sock|/upstream/path` (LiteSpeed `uds://`
+    /// style). A missing port defaults to 80 for http/ws/h2 and 443 for
+    /// https/wss/h2s. The path (if any) becomes [`Self::path_and_query`].
     pub fn parse_url(url: &str) -> Result<ProxyTarget, TargetParseError> {
         let url = url.trim();
         if url.is_empty() {
@@ -104,12 +136,17 @@ impl ProxyTarget {
                 scheme: "http".into(),
                 authority: "localhost".into(),
                 transport: TargetTransport::Uds(sock),
+                failover: Vec::new(),
+                client_cert_file: None,
+                client_key_file: None,
+                http2: false,
                 path_and_query: path,
                 name: None,
                 max_conns: None,
                 keep_alive: None,
                 connect_timeout: None,
                 retry_timeout: None,
+                response_timeout_override: None,
             });
         }
 
@@ -117,9 +154,13 @@ impl ProxyTarget {
             .split_once("://")
             .ok_or_else(|| TargetParseError(format!("missing scheme in {url:?}")))?;
         let scheme = scheme.to_ascii_lowercase();
-        if !matches!(scheme.as_str(), "http" | "https" | "ws" | "wss") {
+        if !matches!(
+            scheme.as_str(),
+            "http" | "https" | "ws" | "wss" | "h2" | "h2s"
+        ) {
             return Err(TargetParseError(format!("unsupported scheme {scheme:?}")));
         }
+        let http2 = matches!(scheme.as_str(), "h2" | "h2s");
 
         // Split authority from path/query. A query-only absolute URI (`http://h?x=1`)
         // is equivalent to path `/` plus that query.
@@ -139,6 +180,10 @@ impl ProxyTarget {
 
         Ok(ProxyTarget {
             transport: TargetTransport::Tcp(authority.clone()),
+            failover: Vec::new(),
+            client_cert_file: None,
+            client_key_file: None,
+            http2,
             scheme,
             authority,
             path_and_query: path,
@@ -147,6 +192,7 @@ impl ProxyTarget {
             keep_alive: None,
             connect_timeout: None,
             retry_timeout: None,
+            response_timeout_override: None,
         })
     }
 
@@ -163,16 +209,32 @@ impl ProxyTarget {
                 TargetTransport::Uds(p.to_string_lossy().into_owned()),
             ),
         };
+        let failover = ep
+            .extra_addresses
+            .iter()
+            .map(|a| match a {
+                ExtAddress::Tcp(sa) => TargetTransport::Tcp(sa.to_string()),
+                ExtAddress::HostPort(hp) => {
+                    TargetTransport::Tcp(hp.trim_start_matches("UDS://").to_string())
+                }
+                ExtAddress::Uds(p) => TargetTransport::Uds(p.to_string_lossy().into_owned()),
+            })
+            .collect();
         ProxyTarget {
             scheme: "http".into(),
+            http2: false,
             authority,
             transport,
+            failover,
             path_and_query: String::new(),
             name: Some(ep.name.clone()),
             max_conns: Some(ep.max_conns),
             keep_alive: Some(ep.pc_keep_alive_timeout),
             connect_timeout: Some(ep.init_timeout),
             retry_timeout: Some(ep.retry_timeout),
+            response_timeout_override: None,
+            client_cert_file: ep.client_cert_file.clone(),
+            client_key_file: ep.client_key_file.clone(),
         }
     }
 
@@ -192,14 +254,19 @@ impl ProxyTarget {
         let authority = authority_raw_with_port(addr, "ws");
         ProxyTarget {
             scheme: "ws".into(),
+            http2: false,
             authority: authority.clone(),
             transport: TargetTransport::Tcp(authority),
+            failover: Vec::new(),
+            client_cert_file: None,
+            client_key_file: None,
             path_and_query: String::new(),
             name: None,
             max_conns: None,
             keep_alive: None,
             connect_timeout: None,
             retry_timeout: None,
+            response_timeout_override: None,
         }
     }
 }
@@ -233,7 +300,7 @@ fn authority_raw_with_port(authority: &str, scheme: &str) -> String {
 
 fn default_port(scheme: &str) -> u16 {
     match scheme {
-        "https" | "wss" => 443,
+        "https" | "wss" | "h2s" => 443,
         _ => 80,
     }
 }
@@ -339,6 +406,9 @@ mod tests {
             name: "mcp-api".into(),
             kind: ExtKind::Proxy,
             address: ExtAddress::Tcp("127.0.0.1:8002".parse::<SocketAddr>().unwrap()),
+            extra_addresses: vec![ExtAddress::Tcp(
+                "127.0.0.1:8003".parse::<SocketAddr>().unwrap(),
+            )],
             max_conns: 100,
             init_timeout: Duration::from_secs(60),
             retry_timeout: Duration::from_secs(0),
@@ -348,6 +418,8 @@ mod tests {
             auto_start: 0,
             path: None,
             backlog: 0,
+            client_cert_file: None,
+            client_key_file: None,
             instances: 1,
             run_on_startup: 0,
         };
@@ -355,6 +427,12 @@ mod tests {
         assert_eq!(t.authority, "127.0.0.1:8002");
         assert_eq!(t.name.as_deref(), Some("mcp-api"));
         assert_eq!(t.pool_key(), "ext:mcp-api:tcp:http://127.0.0.1:8002");
+        // (Tier 1.2) The extra address becomes an ordered failover peer.
+        assert_eq!(t.failover.len(), 1);
+        assert_eq!(t.failover[0], TargetTransport::Tcp("127.0.0.1:8003".into()));
+        let peers = t.peers();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[1].authority, "127.0.0.1:8003");
         assert_eq!(t.max_conns, Some(100));
         assert_eq!(t.keep_alive, Some(Duration::from_secs(60)));
         assert_eq!(t.connect_timeout, Some(Duration::from_secs(60)));

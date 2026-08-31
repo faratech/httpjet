@@ -604,6 +604,7 @@ mod tests {
             env: vec![],
             local_addr: "192.0.2.1:8080".parse().unwrap(),
             peer_port: 54321,
+            peer_unix: false,
             // Fixed instant so REQUEST_TIME assertions are deterministic.
             request_time: std::time::UNIX_EPOCH
                 + std::time::Duration::new(1_700_000_000, 123_456_000),

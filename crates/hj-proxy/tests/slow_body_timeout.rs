@@ -62,6 +62,7 @@ fn ctx() -> ReqCtx {
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
+        peer_unix: false,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
         tls: None,
@@ -154,8 +155,11 @@ async fn stalled_upload_releases_permit_before_followup() {
 
     // The forward must resolve (with a gateway timeout) within the inactivity window
     // (30s) — well under a no-timeout hang. Allow margin for CI slowness.
-    let first =
-        tokio::time::timeout(Duration::from_secs(45), proxy.forward(&ctx(), req, &target)).await;
+    let first = tokio::time::timeout(
+        Duration::from_secs(45),
+        proxy.forward(&ctx(), req, &target, None),
+    )
+    .await;
     assert!(
         first.is_ok(),
         "stalled body must not hang the proxy task forever"
@@ -171,7 +175,7 @@ async fn stalled_upload_releases_permit_before_followup() {
         .header(hyper::header::HOST, "h")
         .body(empty_body())
         .unwrap();
-    let second = proxy.forward(&ctx(), req2, &target).await;
+    let second = proxy.forward(&ctx(), req2, &target, None).await;
     match second {
         Ok(resp) => assert_ne!(
             resp.status(),

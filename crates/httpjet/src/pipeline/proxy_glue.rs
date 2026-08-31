@@ -20,6 +20,8 @@ use super::error_page;
 /// upstream-authority correlation log the generic `run_handler` 5xx line lacks —
 /// so `handle` never surfaces `Err`.
 pub(super) struct ProxyHandler {
+    pub telemetry: Arc<crate::telemetry::Telemetry>,
+    pub response_timeout_override: Option<u64>,
     pub proxy: Arc<Proxy>,
     pub target: ProxyTarget,
 }
@@ -30,8 +32,21 @@ impl Handler for ProxyHandler {
         // Capture before `forward` consumes `req`, for the 5xx-with-cause log.
         let method = req.method().clone();
         let path = req.uri().path().to_string();
-        match self.proxy.forward(ctx, req, &self.target).await {
-            Ok(resp) => Ok(resp),
+        // (Tier 1.5) Upstream forward latency: checkout through response head — the
+        // reverse-proxy's one observable so backend degradation is visible in metrics.
+        let upstream_t0 = std::time::Instant::now();
+        match self
+            .proxy
+            .forward(ctx, req, &self.target, self.response_timeout_override)
+            .await
+        {
+            Ok(resp) => {
+                self.telemetry
+                    .shard()
+                    .phase_upstream
+                    .record(upstream_t0.elapsed());
+                Ok(resp)
+            }
             Err(e) => {
                 let status = e.status();
                 // (item 4) Proxy faults are 502/503/504 — always server errors; correlate.

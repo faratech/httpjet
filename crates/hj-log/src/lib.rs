@@ -56,6 +56,7 @@
 //!     host: Some("example.com".into()),
 //!     remote_user: None,
 //!     request_id: None,
+//!     peer_unix: false,
 //! });
 //!
 //! let errlog = ErrorLogger::spawn(
@@ -72,6 +73,7 @@
 //! ```
 
 mod fmt;
+mod syslog;
 mod tracing_layer;
 mod writer;
 
@@ -85,6 +87,7 @@ use std::time::SystemTime;
 use tokio::sync::{mpsc, oneshot};
 
 pub use fmt::clf_time;
+pub use syslog::{SyslogConfig, SyslogFacility, SyslogSeverity, SyslogTap, SyslogTarget};
 pub use tracing_layer::ErrorLogLayer;
 pub use writer::RollConfig;
 
@@ -174,6 +177,29 @@ pub enum LogFormat {
     /// Common + `"%{Referer}i" "%{User-Agent}i"` — the Combined Log Format
     /// (LiteSpeed `logHeaders=7`).
     Combined,
+    /// (Tier 2) One JSON object per line — structured logging for log shippers.
+    /// Field order is fixed; absent optionals render as `null`.
+    Json,
+}
+
+/// JSON string escape: quotes, backslashes and control characters. `<`/`>` and
+/// U+2028/9 are left as-is (the logs are UTF-8 text consumed line-wise).
+fn json_escape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 2);
+    for ch in v.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// One access-log event. Construct on the request path and hand to
@@ -213,6 +239,10 @@ pub struct AccessRecord {
     /// built without a `ReqCtx`) renders no token, keeping the legacy CLF/combined
     /// layout byte-identical.
     pub request_id: Option<String>,
+    /// (Tier 2) The connection arrived over a unix domain socket: there is no
+    /// client address, so the `%h` field renders as the literal `unix:` (nginx's
+    /// exact behavior) instead of the fabricated loopback address.
+    pub peer_unix: bool,
 }
 
 impl AccessRecord {
@@ -221,9 +251,44 @@ impl AccessRecord {
     /// crafted `User-Agent` cannot break the line structure.
     pub fn render(&self, format: LogFormat) -> String {
         use std::fmt::Write;
+        if format == LogFormat::Json {
+            let null = |v: Option<&str>| {
+                v.map(|s| format!("\"{}\"", json_escape(s)))
+                    .unwrap_or_else(|| "null".into())
+            };
+            let reqid = self
+                .request_id
+                .as_deref()
+                .map(|id| format!("\"{}\"", json_escape(id)))
+                .unwrap_or_else(|| "null".into());
+            let client = if self.peer_unix {
+                "unix:".to_string()
+            } else {
+                self.client_ip.to_string()
+            };
+            return format!(
+                "{{\"ts\":\"{}\",\"client_ip\":\"{}\",\"remote_user\":{},\"method\":\"{}\",\"uri\":\"{}\",\"protocol\":\"{}\",\"status\":{},\"bytes\":{},\"referer\":{},\"user_agent\":{},\"reqid\":{}}}",
+                fmt::clf_time(self.ts),
+                json_escape(&client),
+                null(self.remote_user.as_deref()),
+                json_escape(&self.method),
+                json_escape(&self.uri),
+                json_escape(self.protocol),
+                self.status,
+                self.bytes,
+                null(self.referer.as_deref()),
+                null(self.user_agent.as_deref()),
+                reqid,
+            );
+        }
+        let client_field = if self.peer_unix {
+            Cow::Borrowed("unix:")
+        } else {
+            Cow::Owned(self.client_ip.to_string())
+        };
         let mut line = format!(
             "{} - {} [{}] \"{} {} {}\" {} {}",
-            self.client_ip,
+            client_field,
             field_or_dash(self.remote_user.as_deref()),
             fmt::clf_time(self.ts),
             escape(&self.method),
@@ -271,9 +336,50 @@ pub fn render_access_line_into(
     referer: Option<&str>,
     user_agent: Option<&str>,
     request_id: Option<&dyn std::fmt::Display>,
+    peer_unix: bool,
 ) {
     use std::io::Write;
-    let _ = write!(out, "{} - - [{}] \"", client_ip, fmt::clf_time(ts));
+    if format == LogFormat::Json {
+        let je = |v: &str| json_escape(v);
+        let jopt = |v: Option<&str>| {
+            v.map(|s| format!("\"{}\"", je(s)))
+                .unwrap_or_else(|| "null".to_string())
+        };
+        let mut line = String::with_capacity(192);
+        line.push_str("{\"ts\":\"");
+        line.push_str(&je(&fmt::clf_time(ts)));
+        line.push_str("\",\"client_ip\":\"");
+        line.push_str(&je(&client_ip.to_string()));
+        line.push_str("\",\"method\":\"");
+        line.push_str(&je(method));
+        line.push_str("\",\"uri\":\"");
+        line.push_str(&je(path));
+        if let Some(q) = query {
+            line.push('?');
+            line.push_str(&je(q));
+        }
+        line.push_str("\",\"protocol\":\"");
+        line.push_str(&je(protocol));
+        line.push_str("\",\"status\":");
+        line.push_str(&status.to_string());
+        line.push_str(",\"bytes\":");
+        line.push_str(&bytes.to_string());
+        line.push_str(",\"referer\":");
+        line.push_str(&jopt(referer));
+        line.push_str(",\"user_agent\":");
+        line.push_str(&jopt(user_agent));
+        line.push_str(",\"reqid\":");
+        line.push_str(&jopt(request_id.map(|d| d.to_string()).as_deref()));
+        line.push('}');
+        line.push('\n');
+        out.extend_from_slice(line.as_bytes());
+        return;
+    }
+    if peer_unix {
+        let _ = write!(out, "unix: - - [{}] \"", fmt::clf_time(ts));
+    } else {
+        let _ = write!(out, "{} - - [{}] \"", client_ip, fmt::clf_time(ts));
+    }
     let _ = write!(out, "{} ", escape(method));
     let _ = write!(out, "{}", escape(path));
     if let Some(q) = query {
@@ -402,7 +508,33 @@ impl AccessLogger {
         let (tx, rx) = mpsc::unbounded_channel();
         let state: LoggerState = Arc::new(LoggerStateInner::new());
         supervise_writer(
-            tokio::spawn(writer::run(cfg, rx, state.clone())),
+            tokio::spawn(writer::run(cfg, rx, state.clone(), None)),
+            "access-log",
+        );
+        AccessLogger { tx, format, state }
+    }
+
+    /// [`AccessLogger::spawn`] plus a (Tier 2) syslog tap: every rendered line is
+    /// ALSO framed as a syslog datagram and sent best-effort from the writer
+    /// task. The request path is untouched either way.
+    pub fn spawn_with_syslog(
+        path: impl AsRef<Path>,
+        format: LogFormat,
+        rolling_size: u64,
+        keep_days: u64,
+        compress_archive: bool,
+        syslog: Option<SyslogTap>,
+    ) -> Self {
+        let cfg = RollConfig {
+            path: path.as_ref().to_path_buf(),
+            rolling_size,
+            keep_days,
+            compress_archive,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let state: LoggerState = Arc::new(LoggerStateInner::new());
+        supervise_writer(
+            tokio::spawn(writer::run(cfg, rx, state.clone(), syslog)),
             "access-log",
         );
         AccessLogger { tx, format, state }
@@ -534,7 +666,7 @@ impl ErrorLogger {
         let (tx, rx) = mpsc::unbounded_channel();
         let state: LoggerState = Arc::new(LoggerStateInner::new());
         supervise_writer(
-            tokio::spawn(writer::run(cfg, rx, state.clone())),
+            tokio::spawn(writer::run(cfg, rx, state.clone(), None)),
             "error-log",
         );
         ErrorLogger { tx, state }
@@ -592,6 +724,52 @@ fn sanitize_msg(s: &str) -> String {
 }
 
 #[cfg(test)]
+mod json_render_tests {
+    use super::*;
+
+    #[test]
+    fn json_line_is_valid_shape_and_escapes_quotes() {
+        let mut out = Vec::new();
+        render_access_line_into(
+            &mut out,
+            LogFormat::Json,
+            "203.0.113.9".parse().unwrap(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+            "GET",
+            "/a?b=\"x\"",
+            Some("c=d"),
+            "HTTP/2",
+            200,
+            12,
+            None,
+            Some("Mozilla \"quoted\""),
+            Some(&1u64),
+            false,
+        );
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.starts_with("{\"ts\":\""));
+        assert!(line.contains("\"method\":\"GET\""));
+        assert!(line.contains("\"status\":200"));
+        assert!(line.contains("\"bytes\":12"));
+        assert!(line.contains("\"referer\":null"));
+        let bslash = char::from(92);
+        let expected_uri = [
+            bslash.to_string(),
+            String::from("\""),
+            "x".to_string(),
+            bslash.to_string(),
+            String::from("\""),
+        ]
+        .join("");
+        assert!(
+            line.contains(&expected_uri),
+            "quotes inside the query value are escaped: {line}"
+        );
+        assert!(line.ends_with("}\n"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
@@ -610,6 +788,7 @@ mod tests {
             host: Some("example.com".into()),
             remote_user: None,
             request_id: None,
+            peer_unix: false,
         }
     }
 
@@ -736,6 +915,7 @@ mod tests {
                     host: None,
                     remote_user: None,
                     request_id: reqid.map(str::to_string),
+                    peer_unix: false,
                 };
                 let mut expected = record.render(format).into_bytes();
                 expected.push(b'\n');
@@ -755,6 +935,7 @@ mod tests {
                     referer,
                     ua,
                     id_disp.as_ref().map(|s| s as &dyn std::fmt::Display),
+                    false,
                 );
                 assert_eq!(
                     String::from_utf8_lossy(&got),

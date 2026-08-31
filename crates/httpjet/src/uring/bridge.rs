@@ -32,6 +32,8 @@ pub(crate) struct BridgeCtx {
     pub local: std::net::SocketAddr,
     pub proto: Proto,
     pub is_tls: bool,
+    /// (Tier 2) UDS connection: peer/local are loopback fabrications.
+    pub peer_unix: bool,
     /// clientVerify=2 in effect for this listener (app-layer mTLS enforced at accept;
     /// passed through so the pipeline applies the same real-IP / trust semantics as
     /// the tokio path).
@@ -44,6 +46,22 @@ pub(crate) struct BridgeCtx {
 }
 
 impl BridgeCtx {
+    /// A unix-domain-socket context: peer/local are fabricated loopback, the
+    /// filesystem mode is the real access boundary.
+    #[cfg(test)]
+    pub(crate) fn unix(local: std::net::SocketAddr, proto: Proto) -> Self {
+        BridgeCtx {
+            peer: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+            local,
+            proto,
+            is_tls: false,
+            peer_unix: true,
+            mtls_required: false,
+            sni: None,
+            tls: None,
+        }
+    }
+
     /// A plaintext (non-TLS) context for the given peer/local/proto.
     pub(crate) fn plain(
         peer: std::net::SocketAddr,
@@ -55,6 +73,7 @@ impl BridgeCtx {
             local,
             proto,
             is_tls: false,
+            peer_unix: false,
             mtls_required: false,
             sni: None,
             tls: None,
@@ -83,6 +102,10 @@ pub(crate) struct BridgeResp {
     pub status: http::StatusCode,
     pub headers: http::HeaderMap,
     pub body: BridgeBody,
+    /// (Tier 2) Per-connection egress rate (bytes/sec) the H1 writer should pace this
+    /// response with; None ⇒ the connection-wide ServeConfig default. Popped from the
+    /// pipeline's `PerConnBandwidth` response extension.
+    pub bw_rate: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -462,6 +485,7 @@ pub(crate) fn bad_gateway() -> BridgeResp {
         status: http::StatusCode::BAD_GATEWAY,
         headers: http::HeaderMap::new(),
         body: BridgeBody::Full(Bytes::from_static(b"upstream body truncated\n")),
+        bw_rate: None,
     }
 }
 
@@ -472,16 +496,18 @@ pub(crate) fn service_unavailable_resp() -> BridgeResp {
         status: http::StatusCode::SERVICE_UNAVAILABLE,
         headers: http::HeaderMap::new(),
         body: BridgeBody::Full(Bytes::from_static(b"server busy\n")),
+        bw_rate: None,
     }
 }
 
-fn full_resp(parts: http::response::Parts, body: Bytes) -> BridgeResp {
+fn full_resp(parts: http::response::Parts, body: Bytes, bw_rate: Option<u64>) -> BridgeResp {
     // The Full arms own `parts` outright — move the header map instead of cloning it per
     // bridged response.
     BridgeResp {
         status: parts.status,
         headers: parts.headers,
         body: BridgeBody::Full(body),
+        bw_rate,
     }
 }
 
@@ -510,22 +536,30 @@ fn is_event_stream(h: &http::HeaderMap) -> bool {
 /// bodies stay `Full` (byte-identical to the pre-streaming path, zero extra copy); large
 /// files and large/SSE streams are forwarded incrementally.
 async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>) {
-    let (parts, body) = r.into_parts();
+    let (mut parts, body) = r.into_parts();
+    let bw_rate = parts
+        .extensions
+        .remove::<crate::pipeline::PerConnBandwidth>()
+        .map(|b| b.0);
     match body {
         Body::Empty => {
-            let _ = resp.send(full_resp(parts, Bytes::new()));
+            let _ = resp.send(full_resp(parts, Bytes::new(), bw_rate));
         }
         Body::Full(b) => {
-            let _ = resp.send(full_resp(parts, b));
+            let _ = resp.send(full_resp(parts, b, bw_rate));
         }
         Body::File(f) if f.cached.is_some() => {
             // `cached` holds the WHOLE file; apply the range (single-sourced, bounds-clamped) so a
             // 206 served here matches the native-H2 path — previously this emitted the whole file
             // under a partial Content-Range.
-            let _ = resp.send(full_resp(parts, f.cached_ranged().unwrap_or_default()));
+            let _ = resp.send(full_resp(
+                parts,
+                f.cached_ranged().unwrap_or_default(),
+                bw_rate,
+            ));
         }
-        Body::File(f) => forward_file(parts, f, resp).await,
-        Body::Stream(s) => forward_stream(parts, s, resp).await,
+        Body::File(f) => forward_file(parts, f, resp, bw_rate).await,
+        Body::Stream(s) => forward_stream(parts, s, resp, bw_rate).await,
     }
 }
 
@@ -536,6 +570,7 @@ async fn forward_file(
     parts: http::response::Parts,
     mut f: hj_core::FileBody,
     resp: oneshot::Sender<BridgeResp>,
+    bw_rate: Option<u64>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let (start, len) = match f.range {
@@ -566,6 +601,7 @@ async fn forward_file(
             rx: rrx,
             len: Some(len),
         },
+        bw_rate,
     });
     let mut remaining = len;
     // (#349 D1) Parity with hj-h2's file streamer: adaptive chunks (4-16x
@@ -618,6 +654,7 @@ async fn forward_stream(
     parts: http::response::Parts,
     mut s: hj_core::StreamBody,
     resp: oneshot::Sender<BridgeResp>,
+    bw_rate: Option<u64>,
 ) {
     use http_body_util::BodyExt;
     if is_event_stream(&parts.headers) {
@@ -627,6 +664,7 @@ async fn forward_stream(
             status: parts.status,
             headers,
             body: BridgeBody::Stream { rx: rrx, len: None },
+            bw_rate,
         });
         pump_body(s, tx).await;
         return;
@@ -644,6 +682,7 @@ async fn forward_stream(
                             status: parts.status,
                             headers,
                             body: BridgeBody::Stream { rx: rrx, len: None },
+                            bw_rate,
                         });
                         if tx.send(Ok(Bytes::from(acc))).await.is_err() {
                             return;
@@ -662,6 +701,7 @@ async fn forward_stream(
                     status: parts.status,
                     headers: parts.headers,
                     body: BridgeBody::Full(Bytes::from(acc)),
+                    bw_rate,
                 });
                 return;
             }
@@ -1183,6 +1223,7 @@ mod tests {
                 local: "127.0.0.1:80".parse().unwrap(),
                 proto: Proto::Http1,
                 is_tls: false,
+                peer_unix: false,
                 mtls_required: false,
                 sni: None,
                 tls: None,
@@ -1448,6 +1489,24 @@ mod tests {
             out.extend_from_slice(&item?);
         }
         Ok(out)
+    }
+
+    #[tokio::test]
+    async fn per_conn_bandwidth_extension_is_carried_into_bridge_resp() {
+        let full = |bytes: bytes::Bytes| {
+            http::Response::builder()
+                .status(200)
+                .body(Body::Full(bytes))
+                .unwrap()
+        };
+        let mut r = full(Bytes::from_static(b"hello"));
+        r.extensions_mut()
+            .insert(crate::pipeline::PerConnBandwidth(1234));
+        let out = run_forward(r).await;
+        assert_eq!(out.bw_rate, Some(1234));
+
+        let plain = full(Bytes::from_static(b"plain"));
+        assert_eq!(run_forward(plain).await.bw_rate, None);
     }
 
     #[tokio::test]

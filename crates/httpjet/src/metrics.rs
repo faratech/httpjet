@@ -329,8 +329,31 @@ fn render(state: &ServerState) -> String {
         state.metrics.fast_memo_hits.load(Ordering::Relaxed),
         state.metrics.fast_memo_stores.load(Ordering::Relaxed),
         state.metrics.fast_memo_ineligible.load(Ordering::Relaxed),
+        state.metrics.fast_cookie_none.load(Ordering::Relaxed),
+        state
+            .metrics
+            .fast_cookie_member_session
+            .load(Ordering::Relaxed),
+        state
+            .metrics
+            .fast_cookie_benign_only
+            .load(Ordering::Relaxed),
+        state.metrics.tls_handshakes_full.load(Ordering::Relaxed),
+        state.metrics.tls_handshakes_resumed.load(Ordering::Relaxed),
         state.page_cache.as_ref().map(|pc| pc.stats()),
     );
+    body.push_str(&format!(
+        "# HELP httpjet_proxy_failover_total Requests served by a failover upstream peer because the primary was marked bad (Tier 1.2).\n# TYPE httpjet_proxy_failover_total counter\nhttpjet_proxy_failover_total {}\n",
+        state.proxy.pool().failovers_total()
+    ));
+    body.push_str(&format!(
+        "# HELP httpjet_throttle_rejected_total Per-client-IP requests refused by the request throttle (disabled = always 0).\n# TYPE httpjet_throttle_rejected_total counter\nhttpjet_throttle_rejected_total {}\n",
+        state.client_throttle.rejected_total()
+    ));
+    body.push_str(&format!(
+        "# HELP httpjet_throttle_allowed_total Per-client-IP requests admitted by the request throttle.\n# TYPE httpjet_throttle_allowed_total counter\nhttpjet_throttle_allowed_total {}\n",
+        state.client_throttle.allowed_total()
+    ));
     // Per-request telemetry (counters + latency histograms) self-renders.
     state.telemetry.render_into(&mut body);
     append_lsapi_pool_metrics(
@@ -948,6 +971,11 @@ fn render_metrics(
     fast_memo_hits: u64,
     fast_memo_stores: u64,
     fast_memo_ineligible: u64,
+    fast_cookie_none: u64,
+    fast_cookie_member_session: u64,
+    fast_cookie_benign_only: u64,
+    tls_handshakes_full: u64,
+    tls_handshakes_resumed: u64,
     cache: Option<CacheStats>,
 ) -> String {
     let mut out = String::with_capacity(768);
@@ -997,6 +1025,36 @@ fn render_metrics(
         "counter",
         "Memo-eligible static requests whose .htaccess chain refused the store (see `httpjet check`).",
         fast_memo_ineligible.to_string(),
+    );
+    metric(
+        "httpjet_fast_cookie_none_total",
+        "counter",
+        "Fast-path GET/HEAD requests with no Cookie header (#343 Step 1).",
+        fast_cookie_none.to_string(),
+    );
+    metric(
+        "httpjet_fast_cookie_member_session_total",
+        "counter",
+        "Cookied fast-path GET/HEAD requests carrying a member/session cookie marker.",
+        fast_cookie_member_session.to_string(),
+    );
+    metric(
+        "httpjet_fast_cookie_benign_only_total",
+        "counter",
+        "Cookied fast-path GET/HEAD requests with NO member/session marker (the benign-cookie fast-path candidate pool, #343 Step 1).",
+        fast_cookie_benign_only.to_string(),
+    );
+    metric(
+        "httpjet_tls_handshakes_full_total",
+        "counter",
+        "TLS connections that completed a full handshake (rustls HandshakeKind::Full | FullWithHelloRetryRequest).",
+        tls_handshakes_full.to_string(),
+    );
+    metric(
+        "httpjet_tls_handshakes_resumed_total",
+        "counter",
+        "TLS connections that completed a resumed handshake (session ticket/PSK).",
+        tls_handshakes_resumed.to_string(),
     );
     if let Some(s) = cache {
         let lookups = s.hits + s.misses;
@@ -1262,12 +1320,32 @@ mod tests {
 
     #[test]
     fn render_includes_core_counters() {
-        let body = render_metrics(42, 3, 1, PeerPurgeCounters::default(), 0, 0, 0, None);
+        let body = render_metrics(
+            42,
+            3,
+            1,
+            PeerPurgeCounters::default(),
+            0,
+            0,
+            0,
+            7,
+            2,
+            1,
+            90,
+            10,
+            None,
+        );
         assert!(body.contains("httpjet_requests_total 42\n"));
         assert!(body.contains("httpjet_active_connections 3\n"));
         assert!(body.contains("httpjet_active_requests 1\n"));
         // Peer-purge counters are always present (0 when idle).
         assert!(body.contains("httpjet_pagecache_purges_received_total 0\n"));
+        // (#343 Step 1) cookie census + TLS handshake split always render.
+        assert!(body.contains("httpjet_fast_cookie_none_total 7\n"));
+        assert!(body.contains("httpjet_fast_cookie_member_session_total 2\n"));
+        assert!(body.contains("httpjet_fast_cookie_benign_only_total 1\n"));
+        assert!(body.contains("httpjet_tls_handshakes_full_total 90\n"));
+        assert!(body.contains("httpjet_tls_handshakes_resumed_total 10\n"));
         // No page cache => no pagecache hit/miss metrics.
         assert!(!body.contains("httpjet_pagecache_hits_total"));
         // Well-formed Prometheus: every metric line is preceded by HELP+TYPE.
@@ -1291,6 +1369,11 @@ mod tests {
             2,
             0,
             PeerPurgeCounters::default(),
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,
@@ -1350,6 +1433,11 @@ mod tests {
             0,
             0,
             PeerPurgeCounters::default(),
+            0,
+            0,
+            0,
+            0,
+            0,
             0,
             0,
             0,

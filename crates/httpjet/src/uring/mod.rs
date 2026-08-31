@@ -14,6 +14,7 @@ pub(crate) mod directio;
 pub(crate) mod h3;
 #[cfg(feature = "ktls")]
 pub(crate) mod ktls;
+pub(crate) mod proxy_protocol;
 
 use std::io;
 use std::net::SocketAddr;
@@ -62,6 +63,14 @@ impl Drop for ConnectionPermit {
     }
 }
 
+/// Per-listener accept-time options, resolved ONCE at spawn from THAT listener's
+/// config entry. Never derived from a global scan over all listeners — one
+/// listener's opt-in must not change another listener's accept protocol.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ListenerBinding {
+    pub proxy_protocol: bool,
+}
+
 /// What each monoio connection handler needs to serve a request: the on-core
 /// cache-hit fast path (`pipeline::fast_serve`, no runtime hop) plus the bridge to
 /// the tokio side-runtime for everything the fast path declines (miss / dynamic).
@@ -88,6 +97,7 @@ impl CoreHandler {
             ctx.local,
             ctx.peer.port(),
             ctx.is_tls,
+            ctx.peer_unix,
             ctx.proto,
             ctx.tls.clone(),
             req,
@@ -350,7 +360,15 @@ pub(crate) fn serve_uring(
         .expect("bridge ServerState construction is config-validated upstream");
         let holder = Arc::new(arc_swap::ArcSwap::from(state));
         let admission = pipeline_admission(holder.clone());
-        spawn_uring_http(holder, listener_name, http_addr, workers, None, admission)?;
+        spawn_uring_http(
+            holder,
+            listener_name,
+            http_addr,
+            workers,
+            None,
+            admission,
+            ListenerBinding::default(),
+        )?;
         // Keep this runtime alive to drive the bridge; the monoio cores run independently.
         std::future::pending::<()>().await;
         Ok::<(), anyhow::Error>(())
@@ -371,6 +389,7 @@ pub(crate) fn spawn_uring_http(
     workers: usize,
     inherited: Option<Vec<std::net::TcpListener>>,
     admission: bridge::BridgeAdmission,
+    binding: ListenerBinding,
 ) -> anyhow::Result<()> {
     let shutdown = holder.load().shutdown.clone();
     let active_conns = holder.load().metrics.active_conns.clone();
@@ -405,6 +424,7 @@ pub(crate) fn spawn_uring_http(
                     shutdown,
                     active_conns,
                     ready,
+                    binding,
                 )
             })?;
     }
@@ -556,6 +576,7 @@ fn build_pipeline_bridge(
                 ctx.local,
                 ctx.peer.port(),
                 ctx.is_tls,
+                ctx.peer_unix,
                 ctx.mtls_required,
                 ctx.tls,
                 ctx.proto,
@@ -646,6 +667,7 @@ pub(crate) fn spawn_uring_https(
     ktls_template: Option<Arc<hj_tls::KtlsConfigTemplate>>,
     inherited: Option<Vec<std::net::TcpListener>>,
     admission: bridge::BridgeAdmission,
+    binding: ListenerBinding,
 ) -> anyhow::Result<()> {
     let shutdown = holder.load().shutdown.clone();
     let active_conns = holder.load().metrics.active_conns.clone();
@@ -681,6 +703,7 @@ pub(crate) fn spawn_uring_https(
                     shutdown,
                     active_conns,
                     ready,
+                    binding,
                 )
             })?;
     }
@@ -700,6 +723,7 @@ fn per_core_https(
     shutdown: CancellationToken,
     _active_conns: Arc<std::sync::atomic::AtomicU64>,
     ready: WorkerReadyTx,
+    binding: ListenerBinding,
 ) {
     let mut rt = match build_core_runtime() {
         Ok(runtime) => runtime,
@@ -720,7 +744,7 @@ fn per_core_https(
         let _ = ready.send(Ok(()));
         tracing::info!(core = core_idx, "uring tls: per-core runtime serving (H1/H2 over TLS → real pipeline)");
         accept_drain_loop(core_idx, listener, shutdown.clone(), true, core.clone(), move |stream, peer| {
-            handle_tls_bridged(stream, peer, local, core.clone(), acceptor.clone(), require_client_cert, ktls_template.clone(), shutdown.clone())
+            handle_tls_bridged(stream, peer, local, core.clone(), acceptor.clone(), require_client_cert, ktls_template.clone(), shutdown.clone(), binding)
         })
         .await;
     });
@@ -733,14 +757,15 @@ fn per_core_https(
 /// post-handshake plaintext into the handler prefix (lossless), then reconstructing
 /// the stream to serve.
 async fn handle_tls_bridged(
-    stream: TcpStream,
-    peer: SocketAddr,
+    mut stream: TcpStream,
+    mut peer: SocketAddr,
     local: SocketAddr,
     core: CoreHandler,
     acceptor: monoio_rustls::TlsAcceptor,
     require_client_cert: bool,
     ktls_template: Option<Arc<hj_tls::KtlsConfigTemplate>>,
     shutdown: CancellationToken,
+    binding: ListenerBinding,
 ) {
     // For the kTLS path we need this connection's OWN config carrying a per-connection
     // KeyLog (the only way to recover the raw traffic secrets for a later KeyUpdate rekey).
@@ -763,6 +788,20 @@ async fn handle_tls_bridged(
     let _ = &ktls_template;
 
     let state = core.holder.load();
+    // (Tier 2) PROXY protocol: read the header from the raw stream and override the
+    // peer address before the TLS handshake. Fail-closed: no header = close.
+    if binding.proxy_protocol {
+        match proxy_protocol::reader::read_and_strip(&mut stream).await {
+            Ok(Some(h)) => {
+                tracing::debug!(real_peer = %h.src, "proxy_protocol: peer overridden");
+                peer = h.src;
+            }
+            _ => {
+                tracing::debug!(%peer, "proxy_protocol: missing/malformed header; closing");
+                return;
+            }
+        }
+    }
     let handshake_timeout = state.serve_config.header_read_timeout;
     let tls = match handshake_timeout {
         Some(d) => match monoio::time::timeout(d, acceptor.accept(stream)).await {
@@ -793,9 +832,33 @@ async fn handle_tls_bridged(
         _ => Proto::Http1,
     };
     let has_client_cert = session.peer_certificates().is_some_and(|c| !c.is_empty());
+    // Full-vs-resumed split sizes the resumption win the client-verify
+    // `NoServerSessions` posture forfeits (every CF-cycled origin connection is a
+    // full handshake today). Counted once, at handshake completion.
+    {
+        use std::sync::atomic::Ordering;
+        let m = core.holder.load();
+        match session.handshake_kind() {
+            Some(rustls::HandshakeKind::Resumed) => {
+                m.metrics
+                    .tls_handshakes_resumed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Some(_) => {
+                m.metrics
+                    .tls_handshakes_full
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
+    }
     let tls_params = hj_tls::tls_params_from_conn(&session);
     // Application-layer mTLS (clientVerify=2): refuse a non-internal peer that
     // presented no valid client cert — mirrors server.rs::mtls_refused exactly.
+    // On a RESUMED handshake `peer_certificates` is the chain rustls reinstated
+    // from the session store (the chain verified when that ticket was issued),
+    // so certified CF connections keep passing this gate — and uncertified
+    // resumed sessions reinstate nothing and are refused, same as fresh.
     if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
         tracing::debug!(%peer, "uring tls: mTLS required, no client cert from non-internal peer; refusing");
         return;
@@ -821,6 +884,7 @@ async fn handle_tls_bridged(
         local,
         proto,
         is_tls: true,
+        peer_unix: false,
         mtls_required: require_client_cert,
         sni,
         tls: tls_params,
@@ -900,6 +964,7 @@ fn per_core_bridged(
     shutdown: CancellationToken,
     _active_conns: Arc<std::sync::atomic::AtomicU64>,
     ready: WorkerReadyTx,
+    binding: ListenerBinding,
 ) {
     let mut rt = match build_core_runtime() {
         Ok(runtime) => runtime,
@@ -920,7 +985,7 @@ fn per_core_bridged(
         let _ = ready.send(Ok(()));
         tracing::info!(core = core_idx, "uring serve: per-core runtime serving (H1/h2c → real pipeline)");
         accept_drain_loop(core_idx, listener, shutdown.clone(), false, core.clone(), move |stream, peer| {
-            handle_conn_bridged(stream, peer, local, core.clone(), shutdown.clone())
+            handle_conn_bridged(stream, peer, local, core.clone(), shutdown.clone(), binding)
         })
         .await;
     });
@@ -934,13 +999,33 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// route both through the bridge to the real pipeline. monoio streams aren't
 /// peekable, so the discriminator bytes are read into `acc` and handed onward
 /// (H1 reuses them as the head start; H2 seeds them as the preface prefix).
-async fn handle_conn_bridged(
-    mut stream: TcpStream,
-    peer: SocketAddr,
+/// Serve one PLAINTEXT connection: PROXY-protocol strip (per-listener opt-in),
+/// then the H1/h2c discriminator, then the generic H1/H2 serve paths. Generic
+/// over the stream so the UDS listener reuses it verbatim.
+async fn handle_conn_bridged<S>(
+    mut stream: S,
+    mut peer: SocketAddr,
     local: SocketAddr,
     core: CoreHandler,
     shutdown: CancellationToken,
-) {
+    binding: ListenerBinding,
+) where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
+{
+    // (Tier 2) PROXY protocol on a PLAINTEXT listener: strip the header (fail-closed)
+    // and override the peer BEFORE the H1/h2c discriminator reads the first bytes.
+    if binding.proxy_protocol {
+        match proxy_protocol::reader::read_and_strip(&mut stream).await {
+            Ok(Some(h)) => {
+                tracing::debug!(real_peer = %h.src, "proxy_protocol: peer overridden");
+                peer = h.src;
+            }
+            _ => {
+                tracing::debug!(%peer, "proxy_protocol: missing/malformed header; closing");
+                return;
+            }
+        }
+    }
     let state = core.holder.load();
     let header_read_timeout = state.serve_config.header_read_timeout;
     let request_start = std::time::Instant::now();
@@ -1013,6 +1098,9 @@ async fn serve_h2_bridged<S>(
     h2_cfg.max_request_body = state.serve_config.max_req_body_size;
     // (#236 residual) share the server-wide buffered-body cap with H1/H3/LSAPI.
     h2_cfg.body_budget = Some(state.body_budget.clone());
+    // (Tier 2) Per-connection egress pacing (h2 streams share one pipe, so the
+    // rate is connection-wide here; the per-context override is an H1 refinement).
+    h2_cfg.bandwidth_limit = state.serve_config.bandwidth_limit;
 
     let service = move |req: hj_core::Request| {
         let core = core.clone();
@@ -1065,6 +1153,11 @@ async fn handle_h1_bridged<S>(
     // Requests served on this keep-alive connection (LiteSpeed maxKeepAliveReq enforcement).
     let mut served: u32 = 0;
     let mut read_scratch: Vec<u8> = Vec::new();
+    // (Tier 2) One bucket per CONNECTION — pacing must not reset per response. Rebuilt
+    // inside the loop only when a response carries a different rate (context override or
+    // a post-reload tuning change).
+    let mut throttle =
+        hj_http::BandwidthThrottle::new(core.holder.load().serve_config.bandwidth_limit);
     loop {
         let state = core.holder.load();
         // Request-size caps from the LiteSpeed config (maxReqHeaderSize/maxReqBodySize),
@@ -1329,6 +1422,33 @@ async fn handle_h1_bridged<S>(
         };
 
         // Build the full hj_core::Request.
+        // (Tier 2) Request-body decompression: when Content-Encoding is gzip,
+        // decode the body before handing it to the pipeline so backends see plain
+        // bytes with the correct Content-Length. Only the gzip codec is decoded
+        // (br/zstd request bodies are rare and can be added later).
+        let body_bytes = if headers
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"))
+            && !body_bytes.is_empty()
+        {
+            match hj_compress::decode_bytes(hj_compress::Encoding::Gzip, &body_bytes) {
+                Some(decoded) => {
+                    let decoded = bytes::Bytes::from(decoded);
+                    if let Ok(v) = http::HeaderValue::from_str(&decoded.len().to_string()) {
+                        headers.insert(http::header::CONTENT_LENGTH, v);
+                    }
+                    headers.remove(http::header::CONTENT_ENCODING);
+                    decoded
+                }
+                None => {
+                    tracing::debug!(%ctx.peer, "uring h1: gzip request-body decode failed; forwarding as-is");
+                    body_bytes
+                }
+            }
+        } else {
+            body_bytes
+        };
         let body: hj_core::IncomingBody = if body_bytes.is_empty() {
             hj_core::empty_incoming()
         } else {
@@ -1357,7 +1477,7 @@ async fn handle_h1_bridged<S>(
         let resp: bridge::BridgeResp = if upgrade_ready.is_none() {
             match core.fast(&ctx, &req).await {
                 Some(r) => {
-                    let (p, b) = r.into_parts();
+                    let (mut p, b) = r.into_parts();
                     // The fast path is buffered; a failed/short file read becomes a clean 502 before
                     // any success headers are committed.
                     let (body_bytes, truncated) = bridge::buffer_body(b).await;
@@ -1368,6 +1488,10 @@ async fn handle_h1_bridged<S>(
                             status: p.status,
                             headers: p.headers,
                             body: bridge::BridgeBody::Full(body_bytes),
+                            bw_rate: p
+                                .extensions
+                                .remove::<crate::pipeline::PerConnBandwidth>()
+                                .map(|b| b.0),
                         }
                     }
                 }
@@ -1399,9 +1523,32 @@ async fn handle_h1_bridged<S>(
             relay_h1_upgrade(stream, std::mem::take(&mut acc), upgrade, &shutdown).await;
             return;
         }
+        // (Tier 2) Explicit CONNECT rejection: no tunneling.
+        if method == http::Method::CONNECT {
+            write_status_close(&mut stream, 405, "Method Not Allowed").await;
+            return;
+        }
         let is_head = method == http::Method::HEAD;
-        // Full → one vectored head/body write; Stream → head then drained chunks.
-        let must_close = write_h1_response(&mut stream, resp, is_head, keep_alive).await;
+        // (Tier 2) 103 Early Hints over HTTP/1.1 — parity with the h2 emitter: the
+        // backend's preload/preconnect Link headers go out as an interim response
+        // before the final head. Upgrades (101) are handled above and skip this.
+        if let Some(interim) = build_103_early_hints(&resp.headers) {
+            let (written, _) = stream.write_all(interim).await;
+            if written.is_err() {
+                return;
+            }
+        }
+        // Full → paced 64 KiB slices when a rate is configured, else one vectored
+        // head/body write; Stream → head then drained (paced) chunks. A context
+        // bandwidthLimit wins over the connection-wide tuning rate.
+        let want_rate = resp
+            .bw_rate
+            .unwrap_or_else(|| core.holder.load().serve_config.bandwidth_limit);
+        if throttle.as_ref().is_none_or(|t| t.rate_bps() != want_rate) {
+            throttle = hj_http::BandwidthThrottle::new(want_rate);
+        }
+        let must_close =
+            write_h1_response(&mut stream, resp, is_head, keep_alive, &mut throttle).await;
         if must_close {
             let _ = stream.shutdown().await;
             return;
@@ -1791,11 +1938,73 @@ async fn relay_h1_upgrade<S>(
 /// Write a `BridgeResp` to the H1 wire. `Full` gathers the head and body in one vectored write;
 /// `Stream` writes the head then drains chunks. Returns true if the connection must close
 /// (write error, no keep-alive, or a mid-stream abort that desynced framing).
+
+/// Serialize an interim `103 Early Hints` response carrying the backend's
+/// preload/preconnect `Link` headers, or `None` when there are none. HTTP/1.1
+/// parity with hj-h2's h2 emitter.
+fn build_103_early_hints(headers: &http::HeaderMap) -> Option<Vec<u8>> {
+    let links: Vec<&http::HeaderValue> = headers
+        .get_all(http::header::LINK)
+        .iter()
+        .filter(|v| hj_h2::server::is_early_hint_link(v))
+        .collect();
+    if links.is_empty() {
+        return None;
+    }
+    let mut interim = String::from("HTTP/1.1 103 Early Hints\r\n");
+    for v in links {
+        interim.push_str("Link: ");
+        interim.push_str(&String::from_utf8_lossy(v.as_bytes()));
+        interim.push_str("\r\n");
+    }
+    interim.push_str("\r\n");
+    Some(interim.into_bytes())
+}
+
+#[cfg(test)]
+mod early_hints_tests {
+    use super::*;
+
+    #[test]
+    fn build_103_includes_only_preload_and_preconnect_links() {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::LINK,
+            http::HeaderValue::from_static("</a.css>; rel=preload"),
+        );
+        h.append(
+            http::header::LINK,
+            http::HeaderValue::from_static("</b.js>; rel=\"preconnect\""),
+        );
+        h.append(
+            http::header::LINK,
+            http::HeaderValue::from_static("<https://x/>; rel=canonical"),
+        );
+        let out = build_103_early_hints(&h).expect("interim response");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("HTTP/1.1 103 Early Hints\r\n"));
+        assert!(text.contains("Link: </a.css>; rel=preload\r\n"));
+        assert!(text.contains("preconnect"));
+        assert!(!text.contains("canonical"), "non-hint relations stay out");
+    }
+
+    #[test]
+    fn build_103_is_none_without_hint_links() {
+        let mut h = http::HeaderMap::new();
+        h.insert(
+            http::header::LINK,
+            http::HeaderValue::from_static("<https://x/>; rel=canonical"),
+        );
+        assert!(build_103_early_hints(&h).is_none());
+    }
+}
+
 async fn write_h1_response<S>(
     stream: &mut S,
     resp: bridge::BridgeResp,
     is_head: bool,
     keep_alive: bool,
+    throttle: &mut Option<hj_http::BandwidthThrottle>,
 ) -> bool
 where
     S: AsyncWriteRent,
@@ -1812,6 +2021,8 @@ where
             let body_forbidden = hj_core::response_body_forbidden(is_head, resp.status);
             let result = if body_forbidden || body.is_empty() {
                 stream.write_all(head).await.0.map(|_| ())
+            } else if let Some(t) = throttle.as_mut() {
+                paced_h1_body(stream, head, body, t).await
             } else {
                 write_h1_vectored(stream, vec![bytes::Bytes::from(head), body]).await
             };
@@ -1826,10 +2037,38 @@ where
                 len,
                 is_head,
                 keep_alive,
+                throttle,
             )
             .await
         }
     }
+}
+
+/// (Tier 2) Throttled full-body write: the head goes out immediately, then the body in
+/// 64 KiB slices, each gated by the token bucket (acquire → sleep the returned µs).
+async fn paced_h1_body<S>(
+    stream: &mut S,
+    head: Vec<u8>,
+    body: bytes::Bytes,
+    throttle: &mut hj_http::BandwidthThrottle,
+) -> io::Result<()>
+where
+    S: AsyncWriteRent,
+{
+    stream.write_all(head).await.0?;
+    const SLICE: usize = 64 * 1024;
+    let mut off = 0usize;
+    while off < body.len() {
+        let end = (off + SLICE).min(body.len());
+        let chunk = body.slice(off..end);
+        let wait = throttle.acquire(chunk.len() as u64);
+        if wait > 0 {
+            monoio::time::sleep(std::time::Duration::from_micros(wait)).await;
+        }
+        stream.write_all(chunk).await.0?;
+        off = end;
+    }
+    Ok(())
 }
 
 /// Write a streamed H1 response: head, then drain the chunk channel. `len: Some(n)` ⇒
@@ -1846,6 +2085,7 @@ async fn write_h1_stream<S>(
     len: Option<u64>,
     is_head: bool,
     keep_alive: bool,
+    throttle: &mut Option<hj_http::BandwidthThrottle>,
 ) -> bool
 where
     S: AsyncWriteRent,
@@ -1865,6 +2105,12 @@ where
             Ok(b) => {
                 if b.is_empty() {
                     continue;
+                }
+                if let Some(t) = throttle.as_mut() {
+                    let wait = t.acquire(b.len() as u64);
+                    if wait > 0 {
+                        monoio::time::sleep(std::time::Duration::from_micros(wait)).await;
+                    }
                 }
                 let result = if chunked {
                     let mut prefix = Vec::with_capacity(20);
@@ -2819,6 +3065,13 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
     }
 
     fn capture_h1_response(response: bridge::BridgeResp) -> Vec<u8> {
+        capture_h1_response_throttled(response, &mut None)
+    }
+
+    fn capture_h1_response_throttled(
+        response: bridge::BridgeResp,
+        throttle: &mut Option<hj_http::BandwidthThrottle>,
+    ) -> Vec<u8> {
         use std::io::Read;
 
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2837,10 +3090,59 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).unwrap();
             let (mut stream, _) = listener.accept().await.unwrap();
-            assert!(write_h1_response(&mut stream, response, false, false).await);
+            assert!(write_h1_response(&mut stream, response, false, false, throttle).await);
             let _ = stream.shutdown().await;
         });
         client.join().unwrap()
+    }
+
+    #[test]
+    fn throttled_full_body_write_is_paced() {
+        // 512 KiB at 300 KiB/s: the initial bucket (1× rate) covers the first burst and
+        // the rest drains at the configured rate (~0.7 s). The floor is deliberately
+        // generous; the point is "measurably paced", not a precise-duration assertion.
+        let body = bytes::Bytes::from(vec![b'x'; 512 * 1024]);
+        let tail = body.slice(body.len() - 16..);
+        let response = bridge::BridgeResp {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::Full(body),
+            bw_rate: Some(300_000),
+        };
+        let started = std::time::Instant::now();
+        // The connection loop reconciles resp.bw_rate into the per-connection bucket
+        // before calling the writer; mirror that here.
+        let mut throttle = hj_http::BandwidthThrottle::new(300_000);
+        let wire = capture_h1_response_throttled(response, &mut throttle);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(400),
+            "a 512 KiB body at 300 KiB/s must take ≳0.4 s, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "pacing ran away: {elapsed:?}"
+        );
+        assert!(wire.ends_with(&tail[..]), "whole body must be written");
+    }
+
+    #[test]
+    fn unthrottled_full_body_write_is_not_delayed() {
+        let body = bytes::Bytes::from(vec![b'y'; 512 * 1024]);
+        let tail = body.slice(body.len() - 16..);
+        let response = bridge::BridgeResp {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::Full(body),
+            bw_rate: None,
+        };
+        let started = std::time::Instant::now();
+        let wire = capture_h1_response(response);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "no rate configured ⇒ no pacing"
+        );
+        assert!(wire.ends_with(&tail[..]));
     }
 
     #[test]
@@ -2849,6 +3151,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             status: http::StatusCode::NO_CONTENT,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Full(bytes::Bytes::from_static(b"full-sentinel")),
+            bw_rate: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -2858,6 +3161,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             status: http::StatusCode::NO_CONTENT,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Stream { rx, len: Some(15) },
+            bw_rate: None,
         });
 
         for wire in [&full, &streamed] {
@@ -2881,6 +3185,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Stream { rx, len: None },
+            bw_rate: None,
         });
         let split = wire
             .windows(4)
@@ -3011,6 +3316,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 false,
                 None,
                 CancellationToken::new(),
+                ListenerBinding::default(),
             )
             .await;
         });
@@ -3194,5 +3500,331 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             _ => panic!("expected Done"),
         }
         assert!(done(&parse(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")));
+    }
+}
+
+/// (Tier 2) Serve HTTP over a unix domain socket: the SAME per-connection
+/// pipeline as the TCP plain path on a `monoio::net::UnixStream`, with a
+/// fabricated loopback peer (the socket file's mode/owner is the real access
+/// boundary). AF_UNIX has no SO_REUSEPORT, so the listener runs on ONE core —
+/// sized for the few on-box peers a UDS listener serves.
+pub(crate) fn spawn_uring_uds(
+    holder: Arc<arc_swap::ArcSwap<ServerState>>,
+    listener_name: Arc<str>,
+    path: std::path::PathBuf,
+    inherited: Option<std::os::unix::net::UnixListener>,
+    admission: bridge::BridgeAdmission,
+) -> anyhow::Result<()> {
+    let shutdown = holder.load().shutdown.clone();
+    let bridge = build_pipeline_bridge(holder.clone(), listener_name.clone(), admission);
+    let core = CoreHandler {
+        bridge,
+        holder,
+        listener_name,
+    };
+    let inherited = inherited.map(|l| {
+        let _ = l.set_nonblocking(true);
+        l
+    });
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("hj-uring-uds".into())
+        .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
+        .spawn(move || {
+            maybe_pin_core_thread(0, 1);
+            per_core_uds(core, path, inherited, shutdown, ready_tx)
+        })?;
+    wait_for_worker_readiness("UDS", 1, ready_rx)?;
+    Ok(())
+}
+
+fn per_core_uds(
+    core: CoreHandler,
+    path: std::path::PathBuf,
+    inherited: Option<std::os::unix::net::UnixListener>,
+    shutdown: CancellationToken,
+    ready: WorkerReadyTx,
+) {
+    let mut rt = match build_core_runtime() {
+        Ok(rt) => rt,
+        Err(error) => {
+            let _ = ready.send(Err(format!("build monoio runtime: {error}")));
+            return;
+        }
+    };
+    rt.block_on(async move {
+        let listener = match inherited {
+            Some(l) => match monoio::net::UnixListener::from_std(l) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = ready.send(Err(format!("adopt unix listener: {e}")));
+                    return;
+                }
+            },
+            None => {
+                // Stale socket file (crashed previous run): connect proves it is
+                // dead before the unlink.
+                if path.exists()
+                    && std::os::unix::net::UnixStream::connect(&path).is_err()
+                    && std::fs::remove_file(&path).is_err()
+                {
+                    let _ = ready.send(Err(format!(
+                        "stale unix socket {} could not be removed",
+                        path.display()
+                    )));
+                    return;
+                }
+                // SO_REUSEPORT (monoio's bind default) is unsupported on
+                // AF_UNIX — opt out explicitly.
+                let mut opts = monoio::net::ListenerOpts::default();
+                opts.reuse_port = false;
+                match monoio::net::UnixListener::bind_with_config(&path, &opts) {
+                    Ok(l) => {
+                        // Group-writable so local services in the run group can
+                        // dial; ownership is the unit's job (User=/Group=).
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+                        l
+                    }
+                    Err(e) => {
+                        let _ = ready.send(Err(format!("bind unix listener: {e}")));
+                        return;
+                    }
+                }
+            }
+        };
+        let _ = ready.send(Ok(()));
+        tracing::info!(path = %path.display(), "uring UDS listener serving (H1/h2c → real pipeline, one core)");
+        accept_drain_loop_unix(listener, shutdown, core).await;
+    });
+}
+
+/// Single-shot accept loop for the UDS listener (no multishot accept for
+/// AF_UNIX), mirroring [`accept_drain_loop`]'s drain semantics.
+async fn accept_drain_loop_unix(
+    listener: monoio::net::UnixListener,
+    shutdown: CancellationToken,
+    core: CoreHandler,
+) {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let inflight = Rc::new(Cell::new(0usize));
+    thread_local! {
+        static UDS_CHUNK_TICKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !UDS_CHUNK_TICKER.with(|t| t.replace(true)) {
+        let ticker_shutdown = shutdown.clone();
+        monoio::spawn(async move {
+            loop {
+                monoio::select! {
+                    _ = ticker_shutdown.cancelled() => break,
+                    _ = monoio::time::sleep(std::time::Duration::from_millis(250)) => {
+                        crate::pipeline::flush_access_chunks();
+                    }
+                }
+            }
+            crate::pipeline::flush_access_chunks();
+        });
+    }
+    // A UDS peer has no address: both ends of the bridge see fabricated loopback.
+    let peer = SocketAddr::from(([127, 0, 0, 1], 0));
+    let local = peer;
+    loop {
+        crate::memtrim::collect_if_requested_on_thread();
+        monoio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let state = core.holder.load();
+                        let cap = state.server.tuning.max_connections;
+                        let active_conns = state.metrics.active_conns.clone();
+                        let Some(permit) = ConnectionPermit::try_acquire(active_conns, cap) else {
+                            tracing::debug!("uring UDS: connection cap reached; rejecting");
+                            continue;
+                        };
+                        let fut = handle_conn_bridged(
+                            stream,
+                            peer,
+                            local,
+                            core.clone(),
+                            shutdown.clone(),
+                            ListenerBinding::default(),
+                        );
+                        let cnt = inflight.clone();
+                        cnt.set(cnt.get() + 1);
+                        monoio::spawn(async move {
+                            let _permit = permit;
+                            fut.await;
+                            cnt.set(cnt.get().saturating_sub(1));
+                            crate::memtrim::collect_after_connection_close();
+                        });
+                    }
+                    Err(e) => tracing::debug!(error = %e, "uring UDS accept failed"),
+                }
+            }
+        }
+    }
+    let start = std::time::Instant::now();
+    while inflight.get() > 0 && start.elapsed() < URING_DRAIN_GRACE {
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if inflight.get() > 0 {
+        tracing::warn!(
+            remaining = inflight.get(),
+            "uring UDS: drain grace elapsed; abandoning in-flight connections"
+        );
+    }
+}
+
+#[cfg(test)]
+mod uds_tests {
+    use super::*;
+
+    /// Full stack over a REAL unix socket: spawn_uring_uds against a temp
+    /// docroot, then dial it with a std client over H1 and h2c prior
+    /// knowledge. The access log must render the fabricated peer as `unix:`.
+    #[test]
+    fn uds_listener_serves_h1_and_h2c_with_unix_peer() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = std::env::temp_dir().join(format!(
+            "hj-uds-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc_root = dir.join("html");
+        std::fs::create_dir_all(&doc_root).unwrap();
+        std::fs::write(doc_root.join("index.html"), b"<html>uds ok</html>").unwrap();
+        let sock_path = dir.join("http.sock");
+
+        // Minimal real ServerState (mirror of the e2e/smoke constructions).
+        let mut by_suffix = std::collections::BTreeMap::new();
+        by_suffix.insert("html".to_string(), "text/html".to_string());
+        let server = hj_core::config::ServerConfig {
+            server_root: dir.clone(),
+            server_name: "uds-test".into(),
+            user: "nobody".into(),
+            group: "nobody".into(),
+            index_files: vec!["index.html".into()],
+            tuning: Default::default(),
+            quic_enable: false,
+            use_ip_in_proxy_header: 0,
+            expires: Default::default(),
+            cache: Default::default(),
+            security: Default::default(),
+            suexec: Default::default(),
+            ext_processors: vec![],
+            php_config: None,
+            listeners: vec![hj_core::config::Listener {
+                name: "uds-test".into(),
+                address: "127.0.0.1:0".into(),
+                secure: false,
+                vhost_map: vec![hj_core::config::VhostMap {
+                    vhost: "testvh".into(),
+                    domains: vec!["*".into()],
+                }],
+                uds_path: None,
+                proxy_protocol: false,
+                tls: None,
+            }],
+            vhosts: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "testvh".to_string(),
+                    hj_core::config::VHostDecl {
+                        name: "testvh".into(),
+                        vh_root: doc_root.clone(),
+                        config_file: std::path::PathBuf::new(),
+                        allow_symbol_link: Some(true),
+                        restrained: false,
+                        enable_script: true,
+                        config: Some(Arc::new(hj_core::config::VHostConfig {
+                            doc_root: doc_root.clone(),
+                            index_files: vec!["index.html".into()],
+                            ..Default::default()
+                        })),
+                    },
+                );
+                m
+            },
+            vhost_order: vec!["testvh".into()],
+            mime: hj_core::config::MimeMap { by_suffix },
+        };
+        // The logger + bridge spawn on the CURRENT tokio runtime; keep the
+        // runtime alive for the whole test (client I/O below is sync).
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = crate::state::ServerState::new(
+                Arc::new(server),
+                None,
+                None,
+                None,
+                Arc::new(hj_compress::PageDictRegistry::empty()),
+                1,
+                crate::state::XfCapsuleConfig::disabled(),
+                None,
+                false,
+                None,
+                false,
+                crate::state::RewriteTuning::default(),
+            )
+            .expect("test state builds");
+            let holder = Arc::new(arc_swap::ArcSwap::from(state));
+            let admission = pipeline_admission(holder.clone());
+            spawn_uring_uds(
+                holder.clone(),
+                Arc::from("uds-test"),
+                sock_path.clone(),
+                None,
+                admission,
+            )
+            .expect("UDS listener spawns");
+        });
+
+        // Wait for the socket file, then serve an H1 request.
+        for _ in 0..100 {
+            if sock_path.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut client = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+        client
+            .write_all(b"GET /index.html HTTP/1.1\r\nHost: uds.test\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut buf = String::new();
+        let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        let _ = client.read_to_string(&mut buf);
+        assert!(buf.starts_with("HTTP/1.1 200 OK"), "got {buf:.80}");
+        assert!(buf.contains("uds ok"), "body served over UDS: {buf:.120}");
+
+        // h2c prior knowledge must reach the same pipeline (a SETTINGS-only
+        // preface gets an h2 SETTINGS reply, not an H1 error).
+        let mut client = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .unwrap();
+        let mut buf = [0u8; 9];
+        let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+        // The h2 server replies with a SETTINGS frame: len/type/flags = 0/4/0.
+        match client.read_exact(&mut buf) {
+            Ok(_) => {}
+            Err(e) => panic!("h2c prior knowledge over UDS got no SETTINGS reply: {e}"),
+        }
+        let _ = AtomicU64::new(0).load(Ordering::Relaxed);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -12,12 +12,112 @@ use hj_core::Router;
 use hj_core::config::{ExtKind, ExtProcessor, ServerConfig};
 use hj_http::ServeConfig;
 use hj_log::{AccessLogger, LogFormat};
+
+/// (Tier 2) Access-log format: `HTTPJET_ACCESS_LOG_FORMAT=json` selects one
+/// JSON object per line for log shippers; anything else is the Combined Log
+/// Format. Process-lifetime, read once per logger construction.
+pub(crate) fn access_log_format() -> LogFormat {
+    if std::env::var("HTTPJET_ACCESS_LOG_FORMAT").as_deref() == Ok("json") {
+        LogFormat::Json
+    } else {
+        LogFormat::Combined
+    }
+}
+
 use hj_lsapi::LsapiRegistry;
 use hj_proxy::{Proxy, ProxyTarget};
 use hj_rewrite::{HtaccessCache, RuleSet};
 use hj_static::StaticFiles;
 
 use crate::statcache::{DEFAULT_STAT_TTL, StatCache};
+
+/// (Tier 2) Resolve the GeoIP/ASN label lists against the CidrList source.
+/// Labels configured without a readable db, a malformed db, or a label the db
+/// does not know are HARD build errors: an inert or silently-partial geo ACL
+/// would admit denied regions instead of failing loudly.
+fn build_geo_rules(server: &ServerConfig) -> Result<hj_acl::GeoRules, String> {
+    let sec = &server.security;
+    let configured = !sec.geo_allow.is_empty()
+        || !sec.geo_deny.is_empty()
+        || !sec.asn_allow.is_empty()
+        || !sec.asn_deny.is_empty();
+    if !configured {
+        return Ok(hj_acl::GeoRules::default());
+    }
+    let Some(path) = &sec.geo_db_file else {
+        return Err(
+            "geoAllow/geoDeny/asnAllow/asnDeny configured but <geoipDBFile> is absent              — the rules would be inert"
+                .to_string(),
+        );
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading geo db {}: {e}", path.display()))?;
+    let source = hj_geo::CidrList::parse(&text)
+        .map_err(|e| format!("parsing geo db {}: {e}", path.display()))?;
+    hj_acl::GeoRules::resolve(
+        &source,
+        &sec.geo_allow,
+        &sec.geo_deny,
+        &sec.asn_allow,
+        &sec.asn_deny,
+    )
+}
+
+/// (Tier 2) Optional syslog sink for the UNIFIED access log, configured through
+/// the process environment like the other process-lifetime log knobs:
+///   - `HTTPJET_SYSLOG_TARGET` — `udp://host:port`, bare `host:port`, or a unix
+///     dgram path (`/run/systemd/journal/syslog`). Absent = sink disabled.
+///   - `HTTPJET_SYSLOG_FACILITY` (default `daemon`), `HTTPJET_SYSLOG_SEVERITY`
+///     (default `info`), `HTTPJET_SYSLOG_RFC=3164` (default 5424),
+///     `HTTPJET_SYSLOG_HOSTNAME` (default the server name).
+/// An unreachable target disables the sink with a warning; file logging is
+/// unaffected either way. Returns `None` when disabled.
+fn build_syslog_tap(server: &ServerConfig) -> Option<hj_log::SyslogTap> {
+    let raw = std::env::var("HTTPJET_SYSLOG_TARGET").ok()?;
+    let target = match hj_log::SyslogTarget::parse(&raw) {
+        Some(t) => t,
+        None => {
+            tracing::warn!(
+                value = %raw,
+                "HTTPJET_SYSLOG_TARGET is unparseable; syslog access-log sink disabled"
+            );
+            return None;
+        }
+    };
+    let facility = std::env::var("HTTPJET_SYSLOG_FACILITY")
+        .ok()
+        .and_then(|v| hj_log::SyslogFacility::parse(&v))
+        .unwrap_or(hj_log::SyslogFacility::Daemon);
+    let severity = std::env::var("HTTPJET_SYSLOG_SEVERITY")
+        .ok()
+        .and_then(|v| hj_log::SyslogSeverity::parse(&v))
+        .unwrap_or(hj_log::SyslogSeverity::Info);
+    let rfc5424 = std::env::var("HTTPJET_SYSLOG_RFC").as_deref() != Ok("3164");
+    let hostname =
+        std::env::var("HTTPJET_SYSLOG_HOSTNAME").unwrap_or_else(|_| server.server_name.clone());
+    let app_name =
+        std::env::var("HTTPJET_SYSLOG_APP_NAME").unwrap_or_else(|_| "httpjet".to_string());
+    match hj_log::SyslogTap::new(hj_log::SyslogConfig {
+        target,
+        facility,
+        severity,
+        app_name,
+        hostname,
+        rfc5424,
+    }) {
+        Ok(tap) => {
+            tracing::info!("syslog access-log sink enabled");
+            Some(tap)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "syslog sink unreachable at startup; disabled (file logging unaffected)"
+            );
+            None
+        }
+    }
+}
 
 /// (#248) A vhost's own access logger plus its `logHeaders` bitmask.
 #[derive(Clone)]
@@ -108,6 +208,11 @@ pub struct ServerState {
     pub php_suffixes: HashSet<String>,
     /// IP allow/deny + trusted-proxy XFF resolution.
     pub acl: Arc<AccessControl>,
+    /// Per-client-IP request throttle (Tier 1.1; disabled unless <perIpRate> > 0).
+    pub client_throttle: hj_acl::ClientThrottle,
+    /// (Tier 2) Resolved GeoIP/ASN rules (empty/inert unless <geoipDBFile> plus
+    /// label lists are configured). Judged against the RESOLVED client IP.
+    pub geo: Arc<hj_acl::GeoRules>,
     /// gzip response compression (type-gated).
     pub compress: Arc<Compress>,
     /// The post-handler response-transform pipeline, applied in order by
@@ -263,6 +368,21 @@ pub struct Metrics {
     /// (#349) Memo-eligible static requests whose `.htaccess` chain refused the store
     /// (a `MemoClass` blocker) — "why is this vhost not memoizing" in one number.
     pub fast_memo_ineligible: Arc<AtomicU64>,
+    /// (#343 Step 1) Fast-path GET/HEAD requests carrying NO Cookie header.
+    pub fast_cookie_none: Arc<AtomicU64>,
+    /// (#343 Step 1) Cookied GET/HEAD requests whose cookie names include the
+    /// configured member/session markers — presumed logged-in, not a fast-path
+    /// extension candidate.
+    pub fast_cookie_member_session: Arc<AtomicU64>,
+    /// (#343 Step 1) Cookied GET/HEAD requests with NO member/session marker — the
+    /// benign-cookie population an on-core fast-path extension could serve.
+    pub fast_cookie_benign_only: Arc<AtomicU64>,
+    /// TLS connections that completed a FULL handshake (rustls `HandshakeKind::Full`
+    /// or `FullWithHelloRetryRequest`). Compared against `_resumed` to size the
+    /// resumption win the client-verify `NoServerSessions` posture forfeits.
+    pub tls_handshakes_full: Arc<AtomicU64>,
+    /// TLS connections that completed a RESUMED handshake (session ticket/PSK).
+    pub tls_handshakes_resumed: Arc<AtomicU64>,
     /// Last accepted `/cache-entries` debug render, in unix milliseconds.
     pub cache_entries_last_ms: Arc<AtomicU64>,
     /// Accepted `/cache-entries` renders.
@@ -351,6 +471,7 @@ struct ConfigDerived {
     ext_by_name: HashMap<String, ExtProcessor>,
     php_suffixes: HashSet<String>,
     acl: Arc<AccessControl>,
+    client_throttle: hj_acl::ClientThrottle,
     compress: Arc<Compress>,
     expires: Arc<ExpiresRules>,
     mtls_required_vhosts: HashSet<String>,
@@ -414,6 +535,7 @@ fn build_config_derived(
     }
 
     let acl = Arc::new(AccessControl::from_security(&server.security)?);
+    let client_throttle = hj_acl::ClientThrottle::from_tuning(&server.tuning);
     let compress = Arc::new(Compress::from_tuning(&server.tuning).with_cf_send_zstd(cf_send_zstd));
     let expires = Arc::new(if server.expires.enabled {
         ExpiresRules::from_pairs(
@@ -435,6 +557,7 @@ fn build_config_derived(
         ext_by_name,
         php_suffixes,
         acl,
+        client_throttle,
         compress,
         expires,
         mtls_required_vhosts,
@@ -468,6 +591,7 @@ fn build_transforms(
 ) -> Vec<Arc<dyn hj_core::ResponseTransform>> {
     use crate::pipeline::{
         AltSvcTransform, CacheStaticTransform, DenyRedirectCdnTransform, ExpiresTransform,
+        SubFilterTransform,
     };
     vec![
         Arc::new(CacheStaticTransform {
@@ -477,6 +601,9 @@ fn build_transforms(
             expires: expires.clone(),
             vhost_expires: vhost_expires.clone(),
         }),
+        // (Tier 2) sub_filter runs BEFORE compress so the filtered body is then
+        // compressed by the ordinary transform (nginx's filter order).
+        Arc::new(SubFilterTransform),
         compress.clone(),
         Arc::new(DenyRedirectCdnTransform),
         Arc::new(AltSvcTransform {
@@ -577,12 +704,13 @@ impl ServerState {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(30);
-            Some(Arc::new(AccessLogger::spawn(
+            Some(Arc::new(AccessLogger::spawn_with_syslog(
                 path,
-                LogFormat::Combined,
+                crate::state::access_log_format(),
                 rolling_bytes,
                 keep_days,
                 true,
+                build_syslog_tap(&server),
             )))
         };
 
@@ -606,7 +734,7 @@ impl ServerState {
                 VhostAccessLogger {
                     logger: Arc::new(AccessLogger::spawn(
                         &spec.path,
-                        LogFormat::Combined,
+                        crate::state::access_log_format(),
                         spec.rolling_bytes,
                         spec.keep_days,
                         false,
@@ -621,7 +749,7 @@ impl ServerState {
                     name.clone(),
                     Arc::new(AccessLogger::spawn(
                         &err.path,
-                        LogFormat::Combined,
+                        crate::state::access_log_format(),
                         err.rolling_bytes,
                         err.keep_days,
                         false,
@@ -658,6 +786,7 @@ impl ServerState {
         let telemetry = Arc::new(crate::telemetry::Telemetry::new(
             server.vhosts.keys().cloned(),
         ));
+        let geo = Arc::new(build_geo_rules(&server)?);
         Ok(Arc::new(ServerState {
             server,
             router: cd.router,
@@ -690,6 +819,8 @@ impl ServerState {
             ext_by_name: cd.ext_by_name,
             php_suffixes: cd.php_suffixes,
             acl: cd.acl,
+            client_throttle: cd.client_throttle,
+            geo,
             compress: cd.compress,
             transforms,
             access_log,
@@ -806,6 +937,7 @@ impl ServerState {
                  BOOT — RESTART httpjet to apply"
             );
         }
+        let geo = Arc::new(build_geo_rules(&server)?);
         Ok(Arc::new(ServerState {
             server,
             router: cd.router,
@@ -818,6 +950,8 @@ impl ServerState {
             ext_by_name: cd.ext_by_name,
             php_suffixes: cd.php_suffixes,
             acl: cd.acl,
+            client_throttle: cd.client_throttle,
+            geo,
             compress: cd.compress,
             transforms,
             mtls_required_vhosts: cd.mtls_required_vhosts,
@@ -884,6 +1018,7 @@ mod tests {
             name: name.into(),
             kind: ExtKind::Proxy,
             address: ExtAddress::HostPort(format!("127.0.0.1:{port}")),
+            extra_addresses: Vec::new(),
             max_conns: 10,
             init_timeout: Duration::from_secs(5),
             retry_timeout: Duration::ZERO,
@@ -893,6 +1028,8 @@ mod tests {
             auto_start: 0,
             path: None,
             backlog: 0,
+            client_cert_file: None,
+            client_key_file: None,
             instances: 1,
             run_on_startup: 0,
         }

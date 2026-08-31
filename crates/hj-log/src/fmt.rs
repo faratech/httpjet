@@ -122,6 +122,34 @@ pub fn roll_stamp(ts: SystemTime) -> String {
     )
 }
 
+/// RFC 5424 TIMESTAMP with millisecond precision and the required `Z` designator,
+/// e.g. `2000-10-10T13:55:36.042Z`.
+pub fn syslog_time(ts: SystemTime) -> String {
+    let c = to_civil(ts);
+    let millis = ts
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_millis())
+        .unwrap_or(0);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        c.year, c.month, c.day, c.hour, c.min, c.sec, millis,
+    )
+}
+
+/// RFC 3164 BSD timestamp, e.g. `Oct 10 13:55:36` (day space-padded, no year —
+/// legacy receivers assume the current year).
+pub fn bsd_time(ts: SystemTime) -> String {
+    let c = to_civil(ts);
+    format!(
+        "{} {:2} {:02}:{:02}:{:02}",
+        MONTHS[(c.month - 1) as usize],
+        c.day,
+        c.hour,
+        c.min,
+        c.sec,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +185,19 @@ mod tests {
     fn leap_year_day() {
         // 2024-02-29T00:00:00Z == 1709164800
         assert_eq!(clf_time(at(1_709_164_800)), "29/Feb/2024:00:00:00 +0000");
+    }
+
+    #[test]
+    fn syslog_time_rfc5424() {
+        let t = UNIX_EPOCH + Duration::new(971_186_136, 42_000_000);
+        assert_eq!(syslog_time(t), "2000-10-10T13:55:36.042Z");
+        assert_eq!(syslog_time(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn bsd_time_rfc3164() {
+        assert_eq!(bsd_time(at(971_186_136)), "Oct 10 13:55:36");
+        // Day is space-padded to two columns.
+        assert_eq!(bsd_time(UNIX_EPOCH), "Jan  1 00:00:00");
     }
 }

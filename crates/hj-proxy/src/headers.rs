@@ -243,6 +243,7 @@ mod tests {
             env: vec![],
             local_addr: "127.0.0.1:8080".parse().unwrap(),
             peer_port: 0,
+            peer_unix: false,
             request_time: std::time::SystemTime::now(),
             request_id: Default::default(),
             tls: None,

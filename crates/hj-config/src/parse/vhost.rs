@@ -168,8 +168,9 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         .map(|cl| {
             cl.context
                 .into_iter()
-                .filter_map(|c| {
-                    let uri = nonempty(c.uri)?;
+                .filter_map(|mut c| {
+                    let sub_filter = convert_sub_filter(&c);
+                    let uri = nonempty(c.uri.take())?;
                     Some(Context {
                         kind: context_kind(&c.kind),
                         uri,
@@ -187,6 +188,10 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
                             .unwrap_or_default(),
                         add_default_charset: charset_on(&c.add_default_charset),
                         charset: nonempty(c.charset),
+                        max_body_override: None,
+                        bandwidth_limit: 0,
+                        timeout_override: None,
+                        sub_filter,
                         cache_policy: c.cache_policy.map(|p| {
                             // A present-but-absent FLAG defaults ON (LSWS
                             // getLongValue(..,default) semantics), except
@@ -413,4 +418,47 @@ pub(super) fn convert_isolation(
         from_docroot_owner: uid_mode == 2,
         namespaces,
     })
+}
+
+/// (Tier 2) Build the context's sub_filter plan: repeatable
+/// `<subFilter>SEARCH => REPLACEMENT</subFilter>` children plus the
+/// `subFilterOnce`/`subFilterTypes`/`subFilterMaxBody` modifiers. Absent when
+/// no rule is configured.
+fn convert_sub_filter(c: &super::raw::RawContext) -> Option<Box<crate::SubFilterConfig>> {
+    use crate::units::parse_bytes;
+    if c.sub_filter.is_empty() {
+        return None;
+    }
+    let mut cfg = crate::SubFilterConfig::default();
+    for (idx, rule) in c.sub_filter.iter().enumerate() {
+        let Some((search, replace)) = rule.split_once("=>") else {
+            // A rule without the `=>` separator would silently never match;
+            // that's a config bug, not a no-op.
+            tracing::warn!(
+                rule = %rule,
+                "subFilter rule {idx}: missing `=>` separator — context sub_filter DISABLED"
+            );
+            return None;
+        };
+        cfg.rules
+            .push((search.trim().to_string(), replace.trim().to_string()));
+    }
+    if let Some(v) = c.sub_filter_once.as_deref() {
+        cfg.once = v.trim() == "1" || v.eq_ignore_ascii_case("true");
+    }
+    if let Some(v) = c.sub_filter_types.as_deref() {
+        let types: Vec<String> = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !types.is_empty() {
+            cfg.types = types;
+        }
+    }
+    if let Some(n) = c.sub_filter_max_body.as_deref().and_then(parse_bytes) {
+        cfg.max_body = n;
+    }
+    Some(Box::new(cfg))
 }

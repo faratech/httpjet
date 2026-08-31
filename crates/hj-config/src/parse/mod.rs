@@ -154,6 +154,11 @@ fn convert_tuning(r: RawTuning) -> Tuning {
         // OLS-style bounded parse: out-of-range/absent falls back to the default.
         zstd_level: bounded_u8(&r.zstd_level, 1, 22, 3) as u32,
         brotli_quality: bounded_u8(&r.brotli_quality, 0, 11, 5) as u32,
+        per_ip_rate: r.per_ip_rate.unwrap_or(0),
+        per_ip_rate_window: std::time::Duration::from_secs(
+            u64::from(r.per_ip_rate_window.unwrap_or(1)).max(1),
+        ),
+        bandwidth_limit: u64::from(r.bandwidth_limit.unwrap_or(0)),
     }
 }
 
@@ -245,11 +250,39 @@ fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx) -> Security {
         };
         (!pair.is_empty()).then_some(pair)
     });
+    let split_labels = |v: &Option<String>| -> Vec<String> {
+        v.as_deref()
+            .map(|s| {
+                s.split([',', ' ', '\t'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let parse_asns = |v: &Option<String>| -> Vec<u32> {
+        split_labels(v)
+            .into_iter()
+            .filter_map(|s| s.trim_start_matches("AS").parse::<u32>().ok())
+            .collect()
+    };
     Security {
         follow_symlink,
         access_deny_dir,
         access_control,
         cgi_cpu_limit_secs,
+        geo_db_file: r
+            .geo_db_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .map(|p| PathBuf::from(ctx.expand(&p.to_string_lossy()))),
+        geo_allow: split_labels(&r.geo_allow),
+        geo_deny: split_labels(&r.geo_deny),
+        asn_allow: parse_asns(&r.asn_allow),
+        asn_deny: parse_asns(&r.asn_deny),
     }
 }
 
@@ -305,11 +338,18 @@ fn convert_ext(e: RawExtProcessor, ctx: &SubstCtx) -> Option<ExtProcessor> {
         Some("lsapi") => ExtKind::Lsapi,
         _ => ExtKind::Proxy,
     };
-    let address = ext_address(e.address.as_deref().unwrap_or(""));
+    // (Tier 1.2) Every <address> element is a peer; the first is primary and the
+    // rest are failover peers tried in order when the primary's breaker is open.
+    let mut addr_iter = e.address.iter().map(|s| ext_address(s.as_str()));
+    let address = addr_iter.next().unwrap_or(ext_address(""));
+    let extra_addresses: Vec<_> = addr_iter.collect();
     Some(ExtProcessor {
         name,
         kind,
         address,
+        extra_addresses,
+        client_cert_file: nonempty(e.client_cert_file).map(|p| PathBuf::from(ctx.expand(&p))),
+        client_key_file: nonempty(e.client_key_file).map(|p| PathBuf::from(ctx.expand(&p))),
         max_conns: u32_of(&e.max_conns, 100),
         init_timeout: secs_of(&e.init_timeout, 60),
         retry_timeout: secs_of(&e.retry_timeout, 0),
@@ -435,11 +475,30 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
                     // default 1, clamps above. See configctx.cpp:844.
                     verify_depth: bounded_u32_clamp_max(&l.verify_depth, 1, 1),
                     enable_stapling: truthy(&l.enable_stapling),
+                    crl_file: l
+                        .crl_file
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from),
                 })
             } else {
                 None
             };
-            Some(Listener { name, address, secure, vhost_map, tls })
+            // (Tier 2) `unix:`/`uds:` address prefix ⇒ serve HTTP over a UDS path.
+            let uds_path = address
+                .strip_prefix("unix:")
+                .or_else(|| address.strip_prefix("uds:"))
+                .map(|p| PathBuf::from(ctx.expand(p)));
+            Some(Listener {
+                name,
+                address,
+                secure,
+                vhost_map,
+                tls,
+                uds_path,
+                proxy_protocol: truthy(&l.proxy_protocol),
+            })
         })
         .collect()
 }
@@ -475,6 +534,40 @@ pub(crate) fn parse_mime(text: &str) -> MimeMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- (Tier 2) per-listener proxyProtocol -----
+
+    #[test]
+    fn proxy_protocol_is_per_listener_and_available_on_plain_listeners() {
+        use super::raw::{RawListener, RawListenerList};
+        let list = RawListenerList {
+            listener: vec![
+                RawListener {
+                    name: Some("plain-pp".into()),
+                    address: Some("127.0.0.1:8080".into()),
+                    proxy_protocol: Some("1".into()),
+                    ..Default::default()
+                },
+                RawListener {
+                    name: Some("plain".into()),
+                    address: Some("127.0.0.1:8081".into()),
+                    ..Default::default()
+                },
+            ],
+        };
+        let listeners = convert_listeners(Some(list), &Default::default());
+        assert_eq!(listeners.len(), 2);
+        let pp = listeners.iter().find(|l| l.name == "plain-pp").unwrap();
+        assert!(
+            pp.proxy_protocol && pp.tls.is_none(),
+            "a plain (non-TLS) listener can carry the flag"
+        );
+        let plain = listeners.iter().find(|l| l.name == "plain").unwrap();
+        assert!(
+            !plain.proxy_protocol,
+            "the flag must not leak across listeners"
+        );
+    }
 
     // ----- useIpInProxyHeader: OLS getLongValue(...,0,4,2) -----
 
@@ -847,6 +940,55 @@ mod tests {
         assert!(!rules[0].trusted);
     }
 
+    // ----- (Tier 2) unix: listener addresses -----
+
+    #[test]
+    fn unix_address_yields_uds_path() {
+        let list = crate::parse::raw::RawListenerList {
+            listener: vec![
+                crate::parse::raw::RawListener {
+                    name: Some("uds".into()),
+                    address: Some("unix:/run/httpjet/http.sock".into()),
+                    ..Default::default()
+                },
+                crate::parse::raw::RawListener {
+                    name: Some("tcp".into()),
+                    address: Some("127.0.0.1:8080".into()),
+                    ..Default::default()
+                },
+            ],
+        };
+        let listeners = convert_listeners(Some(list), &Default::default());
+        assert_eq!(
+            listeners[0].uds_path,
+            Some(PathBuf::from("/run/httpjet/http.sock")),
+            "the unix: prefix is stripped into uds_path"
+        );
+        assert!(
+            listeners[0].address.starts_with("unix:"),
+            "address stays verbatim for listener_sig"
+        );
+        assert_eq!(listeners[1].uds_path, None, "TCP addresses are untouched");
+    }
+
+    // ----- (Tier 2) geo ACL label lists -----
+
+    #[test]
+    fn geo_acl_lists_parse() {
+        let raw = RawSecurity {
+            geo_db_file: Some("/x/geo.db".into()),
+            geo_allow: Some("US, DE".into()),
+            asn_deny: Some("AS64512 13335".into()),
+            ..Default::default()
+        };
+        let sec = convert_security(Some(raw), &SubstCtx::default());
+        assert_eq!(sec.geo_db_file, Some(PathBuf::from("/x/geo.db")));
+        assert_eq!(sec.geo_allow, vec!["US", "DE"]);
+        assert_eq!(sec.asn_deny, vec![64512, 13335]);
+        let none = convert_security(None, &SubstCtx::default());
+        assert!(none.geo_db_file.is_none() && none.geo_allow.is_empty());
+    }
+
     // ----- vhostMap domain lowercasing (OLS mapDomainList strnlower) -----
 
     #[test]
@@ -859,6 +1001,7 @@ mod tests {
                 deny: Some("5.6.7.0/24T".into()),
             }),
             cgi_rlimit: None,
+            ..Default::default()
         };
         let sec = convert_security(Some(raw), &SubstCtx::default());
         let allow_rule = sec.access_control.iter().find(|r| r.allow).unwrap();

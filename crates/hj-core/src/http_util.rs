@@ -168,7 +168,7 @@ fn hex_val(b: u8) -> Option<u8> {
 pub fn http_date_now() -> HeaderValue {
     thread_local! {
         static DATE_MEMO: RefCell<(u64, HeaderValue)> =
-            RefCell::new((0, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT")));
+            const { RefCell::new((0, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"))) };
     }
     let now = SystemTime::now();
     let secs = now

@@ -3,6 +3,7 @@
 //! per-directive parsers, and the small line/tokenize helpers.
 
 use fancy_regex::Regex;
+use std::path::PathBuf;
 
 use crate::error::RewriteError;
 use crate::rules::{CacheKeyVar, RuleSet};
@@ -27,6 +28,16 @@ impl Htaccess {
 
         // Section parsing state: a stack of currently-open access sections.
         let mut section_stack: Vec<PendingSection> = Vec::new();
+        // (Tier 1.3) Basic-auth block pre-scan: order-independent (AuthType may
+        // follow the Require lines it governs). A complete block intercepts
+        // `Require valid-user`/`user …` into a realm; an incomplete one keeps the
+        // fail-closed deny collapse.
+        let lower = text.to_ascii_lowercase();
+        let basic_auth_block = lower.contains("authtype basic") && lower.contains("authuserfile");
+        let mut auth_realm: Option<String> = None;
+        let mut auth_user_file: Option<PathBuf> = None;
+        let mut auth_valid_user = false;
+        let mut auth_users: Vec<String> = Vec::new();
         // The legacy mod_access block of each scope (keyed by the innermost open
         // section's line, `None` = top level): its `Order`/`Allow`/`Deny` lines
         // accumulate into ONE `AccessRule` so they are judged together (#359).
@@ -73,7 +84,29 @@ impl Htaccess {
                     rewrite_stream.push('\n');
                     continue;
                 }
+                "authtype" | "authname" | "authuserfile" => {
+                    if dlow == "authname" {
+                        auth_realm = Some(rest.trim().trim_matches('"').to_string());
+                    } else if dlow == "authuserfile" {
+                        auth_user_file = Some(PathBuf::from(rest.trim().trim_matches('"')));
+                    }
+                    continue;
+                }
                 _ => {}
+            }
+
+            // (Tier 1.3) In a complete Basic-auth block, auth-capable Require
+            // predicates feed the realm instead of the deny collapse.
+            if basic_auth_block && dlow == "require" {
+                let rlow = rest.trim().to_ascii_lowercase();
+                if rlow == "valid-user" {
+                    auth_valid_user = true;
+                    continue;
+                }
+                if let Some(list) = rlow.strip_prefix("user ") {
+                    auth_users.extend(list.split_whitespace().map(String::from));
+                    continue;
+                }
             }
 
             // Access directives. `Require` is recorded as an [`AccessRule`]
@@ -240,6 +273,20 @@ impl Htaccess {
         // TTL and can never be stale vs the rules they index).
         h.has_resp_op = !h.headers.is_empty();
         h.has_handler_override = !h.set_handlers.is_empty() || !h.add_php_exts.is_empty();
+        // (Tier 1.3) Resolve the Basic-auth realm. Auth directives alone (no
+        // Require) are inert in Apache — mirror that; an INCOMPLETE block (no
+        // AuthUserFile / non-Basic AuthType) keeps the fail-closed deny collapse.
+        if basic_auth_block
+            && let Some(uf) = auth_user_file
+            && (auth_valid_user || !auth_users.is_empty())
+        {
+            h.auth = Some(crate::auth::AuthRealm {
+                realm: auth_realm.unwrap_or_else(|| "Restricted".into()),
+                user_file: uf,
+                require_valid_user: auth_valid_user,
+                require_users: auth_users,
+            });
+        }
         h.access_index = build_access_index(&h.access_rules);
         h.header_index = build_header_index(&h.headers);
 

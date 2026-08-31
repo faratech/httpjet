@@ -58,8 +58,10 @@ bytes = "1"
 # transport, and h2-over-TLS is the native hj-h2 stack, so NO http2 feature is needed.
 # `upgrade`/`service`/`body::Incoming` come with these features.
 # "server" is NOT a workspace feature: production only uses the h1 client +
-# hyper::body::Incoming; hj-proxy's tests re-add it via dev-dependencies.
-hyper = { version = "1", features = ["http1", "client"] }
+# hyper::body::Incoming; hj-proxy's tests re-add it via dev-dependencies. The
+# http2 feature powers hj-proxy's h2:// / h2s:// upstream client (hyper's client
+# SendRequest type is shared by both protocol arms).
+hyper = { version = "1", features = ["http1", "http2", "client"] }
 # Only the tokio rt adapters (TokioIo/TokioTimer) are used; not the `auto` h1/h2
 # negotiator (removed with hyper's h2) nor any server-graceful/client helpers.
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -79,6 +81,7 @@ fancy-regex = "0.19"
 regex = "1"
 regex-automata = "0.4"
 ipnet = "2"
+hj-geo = { path = "crates/hj-geo" }
 globset = "0.4"
 dashmap = { version = "=7.0.0-rc2", features = ["inline-more"] }
 hashbrown = "0.17.1"

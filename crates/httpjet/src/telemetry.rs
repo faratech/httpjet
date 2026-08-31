@@ -219,6 +219,8 @@ pub struct TelemetryShard {
     pub phase_cache_lookup: AtomicHistogram,
     /// Response transforms — compression (gzip/br/zstd) + header rules.
     pub phase_compress: AtomicHistogram,
+    /// (Tier 1.5) Reverse-proxy upstream forward duration (checkout + response head).
+    pub phase_upstream: AtomicHistogram,
     /// Monotonic per-request tick used only to drive 1/N phase sampling (a single
     /// relaxed counter; the decision is `tick & (rate-1) == 0`).
     pub sample_tick: AtomicU64,
@@ -336,7 +338,7 @@ impl TelemetryShard {
 
     /// All histograms in stable order: `(prom_name, help, tsv_prefix, &hist)`.
     /// Single source of truth for render / snapshot / header so they can't drift.
-    fn histograms(&self) -> [(&'static str, &'static str, &'static str, &AtomicHistogram); 7] {
+    fn histograms(&self) -> [(&'static str, &'static str, &'static str, &AtomicHistogram); 8] {
         [
             (
                 "httpjet_request_duration_seconds",
@@ -379,6 +381,12 @@ impl TelemetryShard {
                 "Response transforms / compression (sampled).",
                 "phase_compress",
                 &self.phase_compress,
+            ),
+            (
+                "httpjet_phase_upstream_seconds",
+                "Reverse-proxy upstream forward: checkout through response head (sampled).",
+                "phase_upstream",
+                &self.phase_upstream,
             ),
         ]
     }
@@ -1022,8 +1030,8 @@ mod tests {
         let cols = Telemetry::tsv_header().split('\t').count();
         let cells = t.snapshot_row().split('\t').count();
         assert_eq!(cols, cells);
-        // Counters + 7 histograms * (16 buckets + inf + sum + count = 19).
-        assert_eq!(cols, COUNTER_NAMES.len() + 7 * (NB + 3));
+        // Counters + 8 histograms * (16 buckets + inf + sum + count = 19).
+        assert_eq!(cols, COUNTER_NAMES.len() + 8 * (NB + 3));
     }
 
     #[test]

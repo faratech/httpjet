@@ -84,6 +84,7 @@ fn clean_rejects_bad_escape() {
 fn single(o: RangeOutcome) -> (u64, u64) {
     match o {
         RangeOutcome::Single(s, e) => (s, e),
+        RangeOutcome::Multi(r) => panic!("expected single, got multi {r:?}"),
         RangeOutcome::Unsatisfiable => panic!("expected single, got unsatisfiable"),
         RangeOutcome::Ignore => panic!("expected single, got ignore"),
     }
@@ -147,6 +148,107 @@ fn range_ignored_forms() {
         RangeOutcome::Ignore
     ));
     assert!(matches!(parse_range(b"", 100), RangeOutcome::Ignore));
+}
+
+// ----------------------------------------------------------------------------
+// (Tier 2) Multi-range parsing → multipart/byteranges
+// ----------------------------------------------------------------------------
+
+fn multi(o: RangeOutcome) -> Vec<(u64, u64)> {
+    match o {
+        RangeOutcome::Multi(r) => r,
+        other => panic!("expected multi, got unsatisfiable/ignore ({other:?})"),
+    }
+}
+
+#[test]
+fn multi_range_parses_clamps_and_orders() {
+    assert_eq!(
+        multi(parse_ranges(b"bytes=20-29,0-9", 1000)),
+        vec![(0, 9), (20, 29)]
+    );
+    // Open-ended and suffix forms join the set; end beyond EOF clamps.
+    assert_eq!(
+        multi(parse_ranges(b"bytes=10-19,-5,900-989", 1000)),
+        vec![(10, 19), (900, 989), (995, 999)]
+    );
+}
+
+#[test]
+fn multi_range_unsatisfiable_components_are_dropped() {
+    // start beyond EOF is skipped, not fatal; the sole survivor downgrades to
+    // the plain single-range 206.
+    assert_eq!(single(parse_ranges(b"bytes=2000-2100,0-9", 1000)), (0, 9));
+    // ... and when nothing is satisfiable the request is a 416, not a 200.
+    assert!(matches!(
+        parse_ranges(b"bytes=2000-2100,3000-", 1000),
+        RangeOutcome::Unsatisfiable
+    ));
+}
+
+#[test]
+fn multi_range_invalid_component_poisons_the_whole_header() {
+    // last-byte-pos < first-byte-pos is INVALID (RFC 9110 §14.1.1), and one
+    // invalid range-spec invalidates the entire header → 200 full entity.
+    assert!(matches!(
+        parse_ranges(b"bytes=0-9,20-10", 1000),
+        RangeOutcome::Ignore
+    ));
+    // A non-numeric component is equally invalid.
+    assert!(matches!(
+        parse_ranges(b"bytes=0-9,abc", 1000),
+        RangeOutcome::Ignore
+    ));
+    // Zero suffix-length is an invalid suffix-byte-range-spec.
+    assert!(matches!(
+        parse_ranges(b"bytes=0-9,-0", 1000),
+        RangeOutcome::Ignore
+    ));
+}
+
+#[test]
+fn multi_range_coalesces_overlapping_and_adjacent() {
+    // Overlap merges to one range → downgrade to the plain single-range 206.
+    assert_eq!(single(parse_ranges(b"bytes=0-9,5-14", 1000)), (0, 14));
+    // Adjacent (9, 10) merges; a real gap keeps two parts.
+    assert_eq!(single(parse_ranges(b"bytes=0-9,10-19", 1000)), (0, 19));
+    assert_eq!(
+        multi(parse_ranges(b"bytes=0-9,20-29", 1000)),
+        vec![(0, 9), (20, 29)]
+    );
+}
+
+#[test]
+fn multi_range_count_cap_falls_back_to_ignore() {
+    let spec = |n: usize| {
+        format!(
+            "bytes={}",
+            (0..n)
+                .map(|i| format!("{}-{}", i * 10, i * 10 + 5))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    assert!(matches!(
+        parse_ranges(spec(9).as_bytes(), 1000),
+        RangeOutcome::Ignore
+    ));
+    // Exactly the cap is fine.
+    assert_eq!(multi(parse_ranges(spec(8).as_bytes(), 1000)).len(), 8);
+}
+
+#[test]
+fn multipart_body_framing_is_byte_exact() {
+    let data = bytes::Bytes::from_static(b"0123456789");
+    let ranges = [(0u64, 3u64), (6u64, 9u64)];
+    let parts = vec![data.slice(0..4), data.slice(6..10)];
+    let body = build_multipart_body("BOUND", "text/plain", 10, &ranges, &parts);
+    assert_eq!(
+        &body[..],
+        b"\r\n--BOUND\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-3/10\r\n\r\n0123\
+          \r\n--BOUND\r\nContent-Type: text/plain\r\nContent-Range: bytes 6-9/10\r\n\r\n6789\
+          \r\n--BOUND--\r\n"
+    );
 }
 
 // ----------------------------------------------------------------------------
@@ -315,6 +417,7 @@ fn make_ctx(server: Arc<ServerConfig>, vhost: Arc<VHostConfig>) -> ReqCtx {
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
+        peer_unix: false,
         request_time: SystemTime::now(),
         request_id: Default::default(),
         tls: None,
@@ -1599,4 +1702,189 @@ fn directory_slash_redirect_neutralizes_backslash() {
         !loc.contains('\\'),
         "the Location must contain no literal backslash"
     );
+}
+
+// (Tier 2) Precompressed sibling serving: a `.gz`/`.br` sibling is served with
+// Content-Encoding when the client accepts it, and the plain file otherwise.
+#[tokio::test]
+async fn precompressed_sibling_served_with_content_encoding() {
+    use std::io::Write as _;
+
+    let root = temp_root("precomp");
+    fs::write(root.join("style.css"), b"body{color:red}").unwrap();
+    let mut gz = fs::File::create(root.join("style.css.gz")).unwrap();
+    gz.write_all(b"\x1f\x8bGZ-BYTES").unwrap();
+    drop(gz);
+    fs::write(root.join("style.css.br"), b"BR-BYTES").unwrap();
+
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+
+    // No Accept-Encoding: plain identity bytes.
+    let resp = serve(&mut ctx, req(Method::GET, "/style.css"))
+        .await
+        .unwrap();
+    assert!(resp.headers().get(CONTENT_ENCODING).is_none());
+    let Body::File(f) = resp.into_body() else {
+        panic!("plain static body");
+    };
+    assert!(f.path.ends_with("style.css"), "identity primary served");
+
+    // Accepts gzip+br: br wins (preferred, served first in the ladder).
+    let mut req2 = req(Method::GET, "/style.css");
+    req2.headers_mut().insert(
+        ACCEPT_ENCODING,
+        http::HeaderValue::from_static("gzip, deflate, br"),
+    );
+    let resp2 = serve(&mut ctx, req2).await.unwrap();
+    assert_eq!(
+        resp2.headers().get(CONTENT_ENCODING).unwrap(),
+        "br",
+        "br is preferred when the sibling exists"
+    );
+    assert_eq!(
+        resp2.headers().get(VARY).map(|v| v.as_bytes()),
+        Some(&b"Accept-Encoding"[..])
+    );
+
+    // Accepts gzip only: the .gz sibling is served, marked, with a Vary.
+    let mut req_gz = req(Method::GET, "/style.css");
+    req_gz
+        .headers_mut()
+        .insert(ACCEPT_ENCODING, http::HeaderValue::from_static("gzip"));
+    let resp_gz = serve(&mut ctx, req_gz).await.unwrap();
+    assert_eq!(
+        resp_gz.headers().get(CONTENT_ENCODING).unwrap(),
+        "gzip",
+        "the .gz sibling is served for gzip-capable clients"
+    );
+
+    // Accepts br (preferred): the .br sibling wins.
+    let mut req3 = req(Method::GET, "/style.css");
+    req3.headers_mut()
+        .insert(ACCEPT_ENCODING, http::HeaderValue::from_static("br"));
+    let resp3 = serve(&mut ctx, req3).await.unwrap();
+    assert_eq!(resp3.headers().get(CONTENT_ENCODING).unwrap(), "br");
+    let Body::File(f3) = resp3.into_body() else {
+        panic!("br static body");
+    };
+    assert_eq!(
+        f3.len, 8,
+        "the .br sibling's bytes are served (Content-Length matches)"
+    );
+    assert!(f3.file.is_some(), "the sibling fd is pinned for streaming");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+// ----------------------------------------------------------------------------
+// (Tier 2) multipart/byteranges handler behavior
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn range_multi_serves_framed_multipart_byteranges() {
+    let root = temp_root("multipart");
+    let data: Vec<u8> = (0u32..1000).map(|i| (i % 251) as u8).collect();
+    fs::write(root.join("blob.txt"), &data).unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri("/blob.txt")
+        .header(RANGE, "bytes=100-109,0-9")
+        .body(empty_body())
+        .unwrap();
+    let resp = serve(&mut ctx, request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    let ct = resp.headers()[CONTENT_TYPE].to_str().unwrap().to_owned();
+    let boundary = ct
+        .strip_prefix("multipart/byteranges; boundary=")
+        .expect("multipart content type with boundary")
+        .to_owned();
+    assert_eq!(resp.headers()[ACCEPT_RANGES], "bytes");
+    assert!(resp.headers().contains_key(ETAG));
+    assert!(resp.headers().contains_key(LAST_MODIFIED));
+    assert!(resp.headers().get(CONTENT_RANGE).is_none());
+
+    let clen = resp.headers()[CONTENT_LENGTH].to_str().unwrap().to_owned();
+    let body = match resp.into_body() {
+        Body::Full(b) => b,
+        _ => panic!("multipart must be a buffered full body"),
+    };
+    assert_eq!(
+        body.len().to_string(),
+        clen,
+        "Content-Length must be the exact framed length"
+    );
+    let mut expect = Vec::new();
+    for (s, e) in [(0usize, 9usize), (100usize, 109usize)] {
+        expect.extend_from_slice(
+            format!("\r\n--{boundary}\r\nContent-Type: text/plain\r\nContent-Range: bytes {s}-{e}/1000\r\n\r\n")
+                .as_bytes(),
+        );
+        expect.extend_from_slice(&data[s..=e]);
+    }
+    expect.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    assert_eq!(&body[..], &expect[..], "framed entity must be byte-exact");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn range_multi_over_materialization_cap_serves_full_200() {
+    let root = temp_root("multipartcap");
+    let big = vec![b'A'; 9 * 1024 * 1024];
+    fs::write(root.join("big.bin"), &big).unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    // Two ranges whose PART bytes exceed the 8 MiB materialization cap.
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri("/big.bin")
+        .header(RANGE, "bytes=0-8388607,9000000-9000001")
+        .body(empty_body())
+        .unwrap();
+    let resp = serve(&mut ctx, request).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "cap fallback is a full entity"
+    );
+    assert_eq!(
+        resp.headers()[CONTENT_LENGTH],
+        (9 * 1024 * 1024).to_string()
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn range_multi_all_unsatisfiable_is_416() {
+    let root = temp_root("multipart416");
+    fs::write(root.join("small.txt"), b"0123456789").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri("/small.txt")
+        .header(RANGE, "bytes=2000-2100,3000-")
+        .body(empty_body())
+        .unwrap();
+    let resp = serve(&mut ctx, request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(resp.headers()[CONTENT_RANGE], "bytes */10");
+
+    fs::remove_dir_all(&root).ok();
 }

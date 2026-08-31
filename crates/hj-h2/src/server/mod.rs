@@ -27,7 +27,7 @@ mod recv;
 mod send;
 mod state;
 
-pub use send::set_io_handle;
+pub use send::{is_early_hint_link, set_io_handle};
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -123,6 +123,12 @@ pub struct Config {
     /// TCP/TLS then stalls is cut here; keep it short regardless of `conn_idle_timeout`.
     /// `None` falls back to `conn_idle_timeout` (the pre-split behavior).
     pub preface_timeout: Option<std::time::Duration>,
+    /// (Tier 2) Per-connection egress cap in bytes/sec. 0 (default) = unlimited. When set,
+    /// EVERY DATA/header flush on this connection is paced through one token bucket —
+    /// connection-level semantics: all streams share the pipe, so a paced stream
+    /// head-of-line-blocks the connection by design. The H1 path refines per context;
+    /// h2 multiplexing makes a per-response rate ill-defined.
+    pub bandwidth_limit: u64,
 }
 
 impl Default for Config {
@@ -137,6 +143,7 @@ impl Default for Config {
             body_budget: None,
             conn_idle_timeout: Some(std::time::Duration::from_secs(60)),
             preface_timeout: None,
+            bandwidth_limit: 0,
         }
     }
 }
@@ -783,6 +790,17 @@ impl OutQueue {
     fn is_empty(&self) -> bool {
         self.segs.is_empty()
     }
+    /// (Tier 2) Total queued wire bytes — the token bucket's acquire size.
+    #[inline]
+    fn total_bytes(&self) -> usize {
+        self.segs
+            .iter()
+            .map(|s| match s {
+                Seg::Inline(_, l) => *l,
+                Seg::Body(b) => b.len(),
+            })
+            .sum()
+    }
     /// Append small frame bytes via `f` (control frames / a HEADERS block / a DATA frame
     /// header), recording the written span as one inline segment.
     #[inline]
@@ -858,6 +876,26 @@ async fn flush<W: AsyncWrite + Unpin>(w: &mut W, q: &mut OutQueue) -> std::io::R
 /// Flush an [`OutQueue`] over a monoio stream. The normal path retains the inline frame
 /// allocation and every body [`Bytes`] inside an owned iovec buffer until io_uring returns
 /// completion, so cancellation cannot leave kernel-visible pointers dangling.
+/// (Tier 2) Paced wrapper around [`monoio_flush`]: one token bucket per
+/// connection, acquiring for the queued byte count before the write goes out.
+#[cfg(feature = "monoio")]
+async fn paced_flush<IO: monoio::io::AsyncWriteRent>(
+    wh: &mut IO,
+    q: &mut OutQueue,
+    ktls_fd: Option<i32>,
+    pacer: &mut Option<hj_core::budget::BandwidthThrottle>,
+) -> std::io::Result<()> {
+    if let Some(p) = pacer.as_mut()
+        && !q.is_empty()
+    {
+        let wait = p.acquire(q.total_bytes() as u64);
+        if wait > 0 {
+            monoio::time::sleep(std::time::Duration::from_micros(wait)).await;
+        }
+    }
+    monoio_flush(wh, q, ktls_fd).await
+}
+
 #[cfg(feature = "monoio")]
 async fn monoio_flush<IO: monoio::io::AsyncWriteRent>(
     stream: &mut IO,
@@ -1057,6 +1095,9 @@ where
     use monoio::io::{AsyncReadRent, AsyncWriteRent, Splitable};
 
     let _conn_guard = ConnGuard::new();
+    // (Tier 2) One bucket per h2 CONNECTION: every flush is paced when a rate is
+    // configured. Connection-level semantics — multiplexed streams share the pipe.
+    let mut pacer = hj_core::budget::BandwidthThrottle::new(config.bandwidth_limit);
 
     // Split into owned read/write halves so the step-5 read future can persist
     // ACROSS select! iterations (a handler completing must NOT cancel an in-flight
@@ -1127,7 +1168,7 @@ where
             frame::write_window_update(b, 0, delta);
         }
     });
-    monoio_flush(&mut wh, &mut out, ktls_fd).await?;
+    paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer).await?;
 
     let mut dec = Decoder::new(
         config.header_table_size as usize,
@@ -1351,7 +1392,7 @@ where
         );
 
         // 3) Flush queued output.
-        monoio_flush(&mut wh, &mut out, ktls_fd).await?;
+        paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer).await?;
 
         // 4) Termination — shared `should_close` with the tokio `serve` loop. Once
         // `reading` stops we must still drain `inflight` (running handlers) and `pulls`
@@ -1435,7 +1476,7 @@ where
         }
     }
 
-    monoio_flush(&mut wh, &mut out, ktls_fd).await?;
+    paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer).await?;
     let _ = AsyncWriteRent::shutdown(&mut wh).await;
     Ok(())
 }
@@ -2134,5 +2175,25 @@ mod tests {
         // Un-buffering releases exactly what was reserved.
         recv.buffer_sub(8);
         assert_eq!(budget.in_flight(), 0, "buffer_sub must release the budget");
+    }
+}
+
+#[cfg(test)]
+mod pacer_tests {
+    use super::*;
+
+    #[test]
+    fn out_queue_total_bytes_covers_inline_and_body_segments() {
+        let mut q = OutQueue::default();
+        q.frames(|f| f.extend_from_slice(b"1234"));
+        q.body(bytes::Bytes::from_static(b"abcdef"));
+        assert_eq!(q.total_bytes(), 10, "inline + body segment lengths");
+        assert!(!q.is_empty());
+        assert_eq!(OutQueue::default().total_bytes(), 0);
+    }
+
+    #[test]
+    fn h2_config_pacing_defaults_off() {
+        assert_eq!(Config::default().bandwidth_limit, 0);
     }
 }

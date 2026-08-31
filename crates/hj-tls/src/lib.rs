@@ -108,7 +108,7 @@ pub(crate) const ALPN_PROTOCOLS: &[&[u8]] = &[b"h2", b"http/1.1"];
 /// (rustls also hands us an already-lowercased servername).
 #[derive(Debug, Default)]
 pub(crate) struct SniCertMap {
-    by_name: HashMap<String, Arc<CertifiedKey>>,
+    by_name: HashMap<String, Vec<Arc<CertifiedKey>>>,
 }
 
 impl SniCertMap {
@@ -123,15 +123,39 @@ impl SniCertMap {
     /// certificate name-match check: the configured mapping is authoritative,
     /// exactly as OLS treats its vhost domain map.
     pub(crate) fn add(&mut self, name: &str, ck: Arc<CertifiedKey>) {
-        self.by_name.insert(name.to_ascii_lowercase(), ck);
+        self.by_name
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(ck);
     }
 
     /// Resolve by exact (lowercased) servername. Returns `None` when SNI is
     /// absent or maps to no configured domain — the wrapping resolver then
     /// supplies the listener default certificate.
-    pub(crate) fn resolve_name(&self, server_name: Option<&str>) -> Option<Arc<CertifiedKey>> {
+    pub(crate) fn resolve_name(
+        &self,
+        server_name: Option<&str>,
+        prefers_ecdsa: bool,
+    ) -> Option<Arc<CertifiedKey>> {
         let name = server_name?;
-        self.by_name.get(&name.to_ascii_lowercase()).cloned()
+        let certs = self.by_name.get(&name.to_ascii_lowercase())?;
+        if certs.len() == 1 {
+            return Some(certs[0].clone());
+        }
+        // Multiple chains: prefer ECDSA when the client offers ECDSA signature
+        // algorithms, otherwise the first RSA chain. Falls back to certs[0].
+        if prefers_ecdsa {
+            certs
+                .iter()
+                .find(|ck| ck.key.algorithm() == rustls::SignatureAlgorithm::ECDSA)
+                .or_else(|| certs.first())
+        } else {
+            certs
+                .iter()
+                .find(|ck| ck.key.algorithm() != rustls::SignatureAlgorithm::ECDSA)
+                .or_else(|| certs.first())
+        }
+        .cloned()
     }
 }
 
@@ -154,8 +178,17 @@ impl ResolvesServerCert for SniWithDefault {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // Match the configured domain exactly (no SAN validation); otherwise
         // fall back to the listener default cert.
+        // (Tier 2) Prefer ECDSA chains when the client offers ECDSA signature
+        // algorithms — smaller handshakes, faster key exchange.
+        let prefers_ecdsa = client_hello.signature_schemes().iter().any(|s| {
+            matches!(
+                s,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256
+                    | rustls::SignatureScheme::ECDSA_NISTP384_SHA384
+            )
+        });
         self.sni
-            .resolve_name(client_hello.server_name())
+            .resolve_name(client_hello.server_name(), prefers_ecdsa)
             .or_else(|| Some(self.default.clone()))
     }
 }
@@ -492,17 +525,37 @@ pub(crate) fn build_sni_resolver(server: &ServerConfig, listener: &Listener) -> 
 /// when presented, but a connection with no client cert is still allowed.
 fn build_optional_client_verifier(
     ca: &Path,
+    crl_file: Option<&Path>,
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
     let roots = load_root_store(ca)?;
-    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider()?)
-        .allow_unauthenticated()
-        .build()
-        .with_context(|| {
-            format!(
-                "building optional client certificate verifier from {}",
-                ca.display()
-            )
-        })
+    let mut builder = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider()?)
+        .allow_unauthenticated();
+    // (Tier 1.5) Optional revocation checking: a PEM CRL (or bundle) checked during
+    // client-cert verification. Boot-loaded like the CA (rotating a CRL = restart or
+    // a future reload path).
+    if let Some(crl_path) = crl_file {
+        let mut pem = std::io::BufReader::new(
+            std::fs::File::open(crl_path)
+                .with_context(|| format!("reading CRL {}", crl_path.display()))?,
+        );
+        let crls: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
+            rustls_pemfile::crls(&mut pem)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .with_context(|| format!("parsing CRL {}", crl_path.display()))?;
+        anyhow::ensure!(
+            !crls.is_empty(),
+            "CRL file {} contains no revocation lists",
+            crl_path.display()
+        );
+        builder = builder.with_crls(crls);
+    }
+    let verifier = builder.build().with_context(|| {
+        format!(
+            "building optional client certificate verifier from {}",
+            ca.display()
+        )
+    })?;
+    Ok(verifier)
 }
 
 /// Wraps a [`ClientCertVerifier`] to additionally enforce the listener's `verifyDepth`
@@ -778,22 +831,25 @@ fn build_server_config_inner(
     // process: a restart (deploy) starts cold and cannot resume the post-restart burst —
     // this lifts steady-state churn, not the cold-start reconnect.
     //
-    // (audit) NOT for a client-cert-verifying listener: rustls persists the presented
-    // client-cert chain INSIDE the stored session value and reinstalls it as
-    // peer_certificates on a RESUMED handshake — an actor holding any earlier ticket
-    // would pass the app-layer mTLS gate (`has_client_cert`) without presenting a
-    // certificate at all. rustls resumes ONLY through this store (no bare session-ID
-    // path), so a no-op store disables resumption outright on that listener and forces
-    // the full handshake, which presents (or omits) the cert fresh every time.
-    // (#300) The former "keep the rustls default" branch did NOT do that: ServerConfig's
-    // default session_storage IS a stateful ServerSessionMemoryCache(256), so TLS 1.3
-    // tickets were stored and resumed with the old chain reinstated. Explicit no-op,
-    // mirroring the kTLS builder below.
-    config.session_storage = if tls.client_verify != 0 {
-        Arc::new(NoServerSessions)
-    } else {
-        ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE)
-    };
+    // (security, 2026-08-30) ENABLED on client-cert-verifying listeners too. The 2026-06
+    // posture disabled it because rustls reinstates the stored client-cert chain as
+    // `peer_certificates` on a resumed handshake, which the app-layer mTLS gate
+    // (`has_client_cert`) would read as "presented". The reinstated chain is, however,
+    // exactly the chain the verifier ACCEPTED when that ticket's session was created —
+    // the chain⇄ticket binding is by construction — and the resumption capability is
+    // bounded three ways:
+    //   * the session secret is server-side state and `take()` removes it, so TLS 1.3
+    //     tickets are single-use: a replayed identity falls back to a FULL handshake and
+    //     a fresh certificate presentation (no downgrade for the legitimate peer);
+    //   * the ticket identity travels only inside encrypted records between CF and the
+    //     origin — stealing it already implies breaking the record layer;
+    //   * 0-RTT stays off (`max_early_data_size = 0`), so no replayed early data.
+    // The application gates keep working unchanged: a session created WITHOUT a client
+    // cert reinstates NO chain on resume and is refused exactly like a fresh uncertified
+    // connection, while a resumed CERTIFIED session carries the previously verified chain,
+    // which also keeps `mtls_ok` (client-IP honoring) working across resumes.
+    // `httpjet_tls_handshakes_{full,resumed}_total` observe the split in production.
+    config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
 
     Ok((Arc::new(config), CertReloadHandle(cert_swap)))
 }
@@ -823,7 +879,7 @@ fn build_listener_verifier(
                     listener.name
                 )
             })?;
-            build_optional_client_verifier(ca).with_context(|| {
+            build_optional_client_verifier(ca, tls.crl_file.as_deref()).with_context(|| {
                 format!(
                     "listener {}: building app-enforced client verifier",
                     listener.name
@@ -838,7 +894,7 @@ fn build_listener_verifier(
                     tls.client_verify
                 )
             })?;
-            build_optional_client_verifier(ca).with_context(|| {
+            build_optional_client_verifier(ca, tls.crl_file.as_deref()).with_context(|| {
                 format!(
                     "listener {}: building optional client verifier",
                     listener.name
@@ -914,17 +970,13 @@ pub fn build_ktls_template(
         cfg, listener,
     )?));
     let resolver = Arc::new(ReloadableResolver(cert_swap.clone()));
-    // (security #267) Same rule as the TCP builder: NO session storage on a
-    // client-cert-verifying listener — a resumed handshake reinstates the stored
-    // client-cert chain and defeats the app-layer mTLS gate. kTLS's ticket/sequence
-    // accounting (see `server_config_with_key_log`) is unaffected by leaving the
-    // default (no) storage; there are simply no tickets to emit.
+    // (security, 2026-08-30) Mirror the TCP builder: the stateful session cache is
+    // enabled on client-cert-verifying listeners as well — see the rationale at
+    // `build_server_config_inner` (chain⇄ticket binding, single-use tickets, 0-RTT off).
+    // kTLS's ticket/sequence accounting (see `server_config_with_key_log`) already
+    // handles post-handshake NewSessionTicket records via its KeyUpdate path.
     let session_storage: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
-        if tls.client_verify != 0 {
-            Arc::new(NoServerSessions)
-        } else {
-            ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE)
-        };
+        ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
     let template = KtlsConfigTemplate {
         provider,
         verifier,
@@ -933,27 +985,6 @@ pub fn build_ktls_template(
         session_storage,
     };
     Ok((template, CertReloadHandle(cert_swap)))
-}
-
-/// A `StoresServerSessions` implementation that stores nothing — used instead of
-/// the shared memory cache on client-cert-verifying listeners so resumption is
-/// impossible (see [`build_ktls_template`]).
-#[derive(Debug)]
-struct NoServerSessions;
-
-impl rustls::server::StoresServerSessions for NoServerSessions {
-    fn put(&self, _id: Vec<u8>, _value: Vec<u8>) -> bool {
-        false
-    }
-    fn get(&self, _id: &[u8]) -> Option<Vec<u8>> {
-        None
-    }
-    fn take(&self, _id: &[u8]) -> Option<Vec<u8>> {
-        None
-    }
-    fn can_cache(&self) -> bool {
-        false
-    }
 }
 
 /// QUIC/HTTP3 entry point. Like [`build_server_config`] (the TCP entry), uses
@@ -1075,12 +1106,12 @@ mod tests {
     use hj_config::model::{Listener, ListenerTls, VHostConfig, VHostDecl, VhSsl, VhostMap};
 
     /// A generated leaf cert + key (PEM) for a set of SAN names.
-    struct TestCert {
-        cert_pem: String,
-        key_pem: String,
+    pub(crate) struct TestCert {
+        pub(crate) cert_pem: String,
+        pub(crate) key_pem: String,
     }
 
-    fn gen_cert(names: &[&str]) -> TestCert {
+    pub(crate) fn gen_cert(names: &[&str]) -> TestCert {
         let certified = rcgen::generate_simple_self_signed(
             names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         )
@@ -1091,14 +1122,14 @@ mod tests {
         }
     }
 
-    fn write_tmp(dir: &Path, name: &str, contents: &str) -> PathBuf {
+    pub(crate) fn write_tmp(dir: &Path, name: &str, contents: &str) -> PathBuf {
         let p = dir.join(name);
         let mut f = File::create(&p).expect("create temp file");
         f.write_all(contents.as_bytes()).expect("write temp file");
         p
     }
 
-    fn tmpdir() -> PathBuf {
+    pub(crate) fn tmpdir() -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "hj-tls-test-{}-{}",
             std::process::id(),
@@ -1111,7 +1142,7 @@ mod tests {
         base
     }
 
-    fn ensure_provider() {
+    pub(crate) fn ensure_provider() {
         install_crypto_provider().expect("install crypto provider");
     }
 
@@ -1131,7 +1162,7 @@ mod tests {
         }
     }
 
-    fn base_server() -> ServerConfig {
+    pub(crate) fn base_server() -> ServerConfig {
         ServerConfig {
             server_root: PathBuf::from("/tmp"),
             server_name: "test".into(),
@@ -1245,19 +1276,37 @@ mod tests {
                 vhost: "vh1".into(),
                 domains: vec!["a.example.com".into(), "alias.example.com".into()],
             }],
+            proxy_protocol: false,
+            uds_path: None,
             tls: None,
         };
 
         let resolver = build_sni_resolver(&server, &listener).expect("resolver");
         // Both configured domains are registered (cert SAN happens to cover
         // them here, but the map does not depend on that).
-        assert!(resolver.resolve_name(Some("a.example.com")).is_some());
-        assert!(resolver.resolve_name(Some("alias.example.com")).is_some());
+        assert!(
+            resolver
+                .resolve_name(Some("a.example.com"), false)
+                .is_some()
+        );
+        assert!(
+            resolver
+                .resolve_name(Some("alias.example.com"), false)
+                .is_some()
+        );
         // Case-insensitive lookup (OLS lowercases the servername).
-        assert!(resolver.resolve_name(Some("A.Example.Com")).is_some());
+        assert!(
+            resolver
+                .resolve_name(Some("A.Example.Com"), false)
+                .is_some()
+        );
         // Unmapped name yields None so the wrapper falls back to the default.
-        assert!(resolver.resolve_name(Some("nope.example.com")).is_none());
-        assert!(resolver.resolve_name(None).is_none());
+        assert!(
+            resolver
+                .resolve_name(Some("nope.example.com"), false)
+                .is_none()
+        );
+        assert!(resolver.resolve_name(None, false).is_none());
     }
 
     #[test]
@@ -1283,6 +1332,8 @@ mod tests {
             name: "TLS".into(),
             address: "*:8443".into(),
             secure: true,
+            proxy_protocol: false,
+            uds_path: None,
             vhost_map: vec![
                 VhostMap {
                     vhost: "vh1".into(),
@@ -1301,9 +1352,17 @@ mod tests {
         let resolver = build_sni_resolver(&server, &listener).expect("resolver");
         // `*` (catch-all) and the unknown `ghost` vhost are skipped; only the
         // single real domain is registered.
-        assert!(resolver.resolve_name(Some("real.example.com")).is_some());
-        assert!(resolver.resolve_name(Some("*")).is_none());
-        assert!(resolver.resolve_name(Some("ghost.example.com")).is_none());
+        assert!(
+            resolver
+                .resolve_name(Some("real.example.com"), false)
+                .is_some()
+        );
+        assert!(resolver.resolve_name(Some("*"), false).is_none());
+        assert!(
+            resolver
+                .resolve_name(Some("ghost.example.com"), false)
+                .is_none()
+        );
     }
 
     /// THE OLS-CORRECTNESS TEST: a domain mapped to a vhost whose certificate
@@ -1339,6 +1398,8 @@ mod tests {
             name: "TLS".into(),
             address: "*:8443".into(),
             secure: true,
+            proxy_protocol: false,
+            uds_path: None,
             vhost_map: vec![VhostMap {
                 vhost: "publisher.example".into(),
                 // Both names map to the same vhost+cert.
@@ -1350,10 +1411,10 @@ mod tests {
         let resolver = build_sni_resolver(&server, &listener).expect("resolver");
 
         let on_name = resolver
-            .resolve_name(Some("publisher.example"))
+            .resolve_name(Some("publisher.example"), false)
             .expect("publisher.example resolves");
         let off_name = resolver
-            .resolve_name(Some("news.forum.example"))
+            .resolve_name(Some("news.forum.example"), false)
             .expect("news.forum.example resolves to the publisher.example cert");
 
         // It is the SAME configured cert for both names (the vhost's cert),
@@ -1409,6 +1470,8 @@ mod tests {
             name: "TLS".into(),
             address: "*:8443".into(),
             secure: true,
+            proxy_protocol: false,
+            uds_path: None,
             vhost_map: vec![VhostMap {
                 vhost: "publisher.example".into(),
                 domains: vec!["news.forum.example".into()],
@@ -1421,6 +1484,7 @@ mod tests {
                 client_verify: 0,
                 verify_depth: 1,
                 enable_stapling: false,
+                crl_file: None,
             }),
         };
 
@@ -1444,7 +1508,7 @@ mod tests {
         // Mapped (but SAN-uncovered) name -> the vhost cert, not the default.
         let mapped = wrapper
             .sni
-            .resolve_name(Some("news.forum.example"))
+            .resolve_name(Some("news.forum.example"), false)
             .expect("mapped name resolves");
         assert!(
             !Arc::ptr_eq(&mapped, &default_ck),
@@ -1455,10 +1519,10 @@ mod tests {
         assert!(
             wrapper
                 .sni
-                .resolve_name(Some("unmapped.example.com"))
+                .resolve_name(Some("unmapped.example.com"), false)
                 .is_none()
         );
-        assert!(wrapper.sni.resolve_name(None).is_none());
+        assert!(wrapper.sni.resolve_name(None, false).is_none());
         // And the full config still builds.
         let cfg = build_server_config(&server, &listener).expect("server config");
         assert_eq!(cfg.max_early_data_size, 0);
@@ -1484,6 +1548,8 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             vhost_map: vec![],
+            proxy_protocol: false,
+            uds_path: None,
             tls: Some(ListenerTls {
                 key_file: d_key.clone(),
                 cert_file: d_cert.clone(),
@@ -1492,6 +1558,7 @@ mod tests {
                 client_verify,
                 verify_depth: 1,
                 enable_stapling: false,
+                crl_file: None,
             }),
         };
         let server = base_server();
@@ -1595,6 +1662,8 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             vhost_map: vec![],
+            proxy_protocol: false,
+            uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key_path,
                 cert_file: cert_path.clone(),
@@ -1603,6 +1672,7 @@ mod tests {
                 client_verify: 0,
                 verify_depth: 1,
                 enable_stapling: false,
+                crl_file: None,
             }),
         };
 
@@ -1650,6 +1720,8 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             vhost_map: vec![],
+            proxy_protocol: false,
+            uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key,
                 cert_file: cert,
@@ -1658,6 +1730,7 @@ mod tests {
                 client_verify: 0,
                 verify_depth: 1,
                 enable_stapling: false,
+                crl_file: None,
             }),
         };
 
@@ -1685,6 +1758,8 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             vhost_map: vec![],
+            proxy_protocol: false,
+            uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key,
                 cert_file: cert,
@@ -1693,6 +1768,7 @@ mod tests {
                 client_verify: 0,
                 verify_depth: 1,
                 enable_stapling: false,
+                crl_file: None,
             }),
         };
 
@@ -1716,6 +1792,8 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             vhost_map: vec![],
+            proxy_protocol: false,
+            uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key,
                 cert_file: cert,
@@ -1724,6 +1802,7 @@ mod tests {
                 client_verify: 2,   // require -> must fail closed (error)
                 verify_depth: 1,
                 enable_stapling: false,
+                crl_file: None,
             }),
         };
 
@@ -1742,7 +1821,7 @@ mod tests {
         let ca = gen_cert(&["ca.example.com"]);
         let ca_file = write_tmp(&dir, "ca.pem", &ca.cert_pem);
 
-        let verifier = build_optional_client_verifier(&ca_file).expect("optional verifier");
+        let verifier = build_optional_client_verifier(&ca_file, None).expect("optional verifier");
         assert!(
             !verifier.client_auth_mandatory(),
             "optional verifier must allow connections with no client cert"
@@ -1774,6 +1853,8 @@ mod tests {
             name: "TLS".into(),
             address: "*:443".into(),
             secure: true,
+            proxy_protocol: false,
+            uds_path: None,
             vhost_map: vec![],
             tls: Some(ListenerTls {
                 key_file: key,
@@ -1783,6 +1864,7 @@ mod tests {
                 client_verify: 2,
                 verify_depth: 1,
                 enable_stapling: true,
+                crl_file: None,
             }),
         };
         let server_cfg = build(&server, &listener).expect("server config");
@@ -1877,6 +1959,8 @@ mod tests {
             name: "TLS".into(),
             address: "*:443".into(),
             secure: true,
+            proxy_protocol: false,
+            uds_path: None,
             vhost_map: vec![],
             tls: Some(ListenerTls {
                 key_file: key.clone(),
@@ -1886,6 +1970,7 @@ mod tests {
                 client_verify: 2,
                 verify_depth: 1,
                 enable_stapling: false,
+                crl_file: None,
             }),
         };
 
@@ -1946,6 +2031,8 @@ mod tests {
             name: "TLS".into(),
             address: "*:8443".into(),
             secure: true,
+            proxy_protocol: false,
+            uds_path: None,
             vhost_map: vec![VhostMap {
                 vhost: "vh1".into(),
                 domains: vec!["sni.example.com".into()],
@@ -1958,6 +2045,7 @@ mod tests {
                 client_verify: 2,
                 verify_depth: 1,
                 enable_stapling: true,
+                crl_file: None,
             }),
         };
 
@@ -2017,22 +2105,7 @@ mod tests {
 #[cfg(test)]
 mod resumption_tests {
     use super::*;
-    use rustls::server::StoresServerSessions as _;
-
-    // (#300) The no-op store must genuinely store nothing: a resumed handshake can only
-    // reinstate a client-cert chain if the store returned one. Pins the type the
-    // client_verify branch now installs.
-    #[test]
-    fn no_server_sessions_stores_nothing() {
-        let s = NoServerSessions;
-        assert!(
-            !s.put(b"k".to_vec(), b"v".to_vec()),
-            "put must refuse to store"
-        );
-        assert!(s.get(b"k").is_none(), "store must never return a session");
-        assert!(s.take(b"k").is_none(), "take must never return a session");
-        assert!(!s.can_cache());
-    }
+    use crate::tests::{base_server, ensure_provider, gen_cert, tmpdir, write_tmp};
 
     /// (#301) The depth-limited verifier memoizes POSITIVE chain verdicts by
     /// exact DER bytes: the second handshake with the same chain skips webpki
@@ -2144,6 +2217,188 @@ mod resumption_tests {
             counting.calls.load(Ordering::Relaxed) - before,
             2,
             "a rejected chain is re-verified every time (negatives never memoized)"
+        );
+    }
+
+    // ---- (security, 2026-08-30) resumption on the client-verify listener ----
+    // The stateful session cache is installed on clientVerify=2 listeners; these
+    // tests pin the exact property the app-layer mTLS gate depends on: a RESUMED
+    // certified handshake reinstates the previously VERIFIED chain, while a resumed
+    // uncertified session reinstates nothing (and is refused like a fresh
+    // uncertified connection).
+
+    use rustls::{ClientConfig, ClientConnection, ServerConnection};
+    use std::sync::atomic::Ordering as _;
+
+    struct ResumptionFixture {
+        server_cfg: Arc<RustlsServerConfig>,
+        client_cfg: Arc<ClientConfig>,
+        name: rustls::pki_types::ServerName<'static>,
+    }
+
+    fn resumption_fixture(with_client_cert: bool) -> ResumptionFixture {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        use rustls::pki_types::ServerName;
+
+        ensure_provider();
+        let dir = tmpdir();
+        let leaf = gen_cert(&["forum.example"]);
+        let cert = write_tmp(&dir, "cert.pem", &leaf.cert_pem);
+        let key = write_tmp(&dir, "key.pem", &leaf.key_pem);
+
+        // A real CA + a client leaf it signed (clientAuth EKU): the server's
+        // clientCertVerifier validates the presented chain against this CA.
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("ca cert");
+        let ca_file = write_tmp(&dir, "ca.pem", &ca.pem());
+
+        let server = base_server();
+        let listener = Listener {
+            name: "TLS".into(),
+            address: "*:443".into(),
+            secure: true,
+            proxy_protocol: false,
+            uds_path: None,
+            vhost_map: vec![],
+            tls: Some(ListenerTls {
+                key_file: key,
+                cert_file: cert,
+                cert_chain: false,
+                ca_cert_file: Some(ca_file),
+                client_verify: 2,
+                verify_depth: 1,
+                enable_stapling: false,
+                crl_file: None,
+            }),
+        };
+        let server_cfg = build_server_config(&server, &listener).expect("server config");
+
+        // The client trusts the server's self-signed leaf and — when the fixture is
+        // built with a cert — presents the CA-signed client chain.
+        let mut roots = RootCertStore::empty();
+        let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
+            .next()
+            .unwrap()
+            .unwrap();
+        roots.add(leaf_der).unwrap();
+        let builder = ClientConfig::builder().with_root_certificates(roots);
+        let client_cfg = if with_client_cert {
+            let client_key = KeyPair::generate().expect("client key");
+            let mut client_params =
+                CertificateParams::new(vec!["client.test".to_string()]).expect("client params");
+            client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let client_cert = client_params
+                .signed_by(&client_key, &ca)
+                .expect("client cert");
+            builder
+                .with_client_auth_cert(
+                    vec![client_cert.der().clone()],
+                    PrivateKeyDer::Pkcs8(client_key.serialize_der().into()),
+                )
+                .expect("client auth")
+        } else {
+            builder.with_no_client_auth()
+        };
+
+        ResumptionFixture {
+            server_cfg,
+            client_cfg: Arc::new(client_cfg),
+            name: ServerName::try_from("forum.example").unwrap(),
+        }
+    }
+
+    /// Move bytes between the two endpoints, including the post-handshake
+    /// NewSessionTicket flight (the client stores tickets only while processing
+    /// server records). Bounded rounds; a settled pair no-ops.
+    fn settle(client: &mut ClientConnection, server: &mut ServerConnection) {
+        for _ in 0..24 {
+            let mut buf = Vec::new();
+            while client.wants_write() {
+                client.write_tls(&mut buf).unwrap();
+            }
+            if !buf.is_empty() {
+                let mut sl = &buf[..];
+                while !sl.is_empty() {
+                    server.read_tls(&mut sl).unwrap();
+                }
+                server.process_new_packets().unwrap();
+            }
+            let mut buf = Vec::new();
+            while server.wants_write() {
+                server.write_tls(&mut buf).unwrap();
+            }
+            if !buf.is_empty() {
+                let mut sl = &buf[..];
+                while !sl.is_empty() {
+                    client.read_tls(&mut sl).unwrap();
+                }
+                client.process_new_packets().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn clientverify2_resumes_with_the_reinstated_client_chain() {
+        let fx = resumption_fixture(true);
+        let name = fx.name.clone();
+
+        // Connection 1: FULL handshake; cert presented, verified, session stored.
+        let mut client = ClientConnection::new(fx.client_cfg.clone(), name.clone()).unwrap();
+        let mut srv = ServerConnection::new(fx.server_cfg.clone()).unwrap();
+        settle(&mut client, &mut srv);
+        assert!(matches!(
+            srv.handshake_kind(),
+            Some(rustls::HandshakeKind::Full)
+        ));
+        assert!(
+            srv.peer_certificates().is_some_and(|c| !c.is_empty()),
+            "full handshake verified the presented chain"
+        );
+
+        // Connection 2: the client offers its ticket → RESUMED. The server
+        // reinstates the previously VERIFIED chain — exactly what the app-layer
+        // mTLS gate reads, so resumed certified connections keep passing it (and
+        // keep `mtls_ok` client-IP honoring working).
+        let mut client2 = ClientConnection::new(fx.client_cfg.clone(), name).unwrap();
+        let mut srv2 = ServerConnection::new(fx.server_cfg.clone()).unwrap();
+        settle(&mut client2, &mut srv2);
+        assert_eq!(
+            srv2.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed),
+            "second connection must resume from the issued ticket"
+        );
+        assert!(
+            srv2.peer_certificates().is_some_and(|c| !c.is_empty()),
+            "resumed certified session reinstates the verified chain"
+        );
+    }
+
+    #[test]
+    fn clientverify2_resume_of_uncertified_session_reinstates_no_chain() {
+        let fx = resumption_fixture(false);
+        let name = fx.name.clone();
+
+        let mut client = ClientConnection::new(fx.client_cfg.clone(), name.clone()).unwrap();
+        let mut srv = ServerConnection::new(fx.server_cfg.clone()).unwrap();
+        settle(&mut client, &mut srv);
+        assert!(matches!(
+            srv.handshake_kind(),
+            Some(rustls::HandshakeKind::Full)
+        ));
+        assert!(srv.peer_certificates().is_none());
+
+        // The uncertified session is ALSO resumable (rustls stores it) — but it
+        // reinstates NO chain, so the app-layer gate refuses this connection exactly
+        // like a fresh uncertified one. Fail-closed in both handshake kinds.
+        let mut client2 = ClientConnection::new(fx.client_cfg.clone(), name).unwrap();
+        let mut srv2 = ServerConnection::new(fx.server_cfg.clone()).unwrap();
+        settle(&mut client2, &mut srv2);
+        assert_eq!(srv2.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
+        assert!(
+            srv2.peer_certificates().is_none(),
+            "resumed uncertified session must NOT fabricate a client chain"
         );
     }
 }

@@ -57,6 +57,7 @@ fn ctx() -> ReqCtx {
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
+        peer_unix: false,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
         tls: None,
@@ -123,7 +124,7 @@ async fn forward_to_local_echo() {
         .unwrap();
 
     let resp = proxy
-        .forward(&ctx(), req, &target)
+        .forward(&ctx(), req, &target, None)
         .await
         .expect("forward ok");
     assert_eq!(resp.status(), http::StatusCode::OK);
@@ -155,7 +156,7 @@ async fn keep_alive_reuses_connection() {
             .header(hyper::header::HOST, "h")
             .body(empty_body())
             .unwrap();
-        let resp = proxy.forward(&ctx(), req, &target).await.unwrap();
+        let resp = proxy.forward(&ctx(), req, &target, None).await.unwrap();
         let _ = match resp.into_body() {
             hj_core::Body::Stream(s) => s.collect().await.unwrap().to_bytes(),
             _ => panic!("expected stream"),
@@ -183,7 +184,7 @@ async fn connect_failure_is_gateway_error() {
         .body(empty_body())
         .unwrap();
     let err = proxy
-        .forward(&ctx(), req, &target)
+        .forward(&ctx(), req, &target, None)
         .await
         .err()
         .expect("should fail");
@@ -204,7 +205,7 @@ async fn live_fastapi_backend() {
         .header(hyper::header::HOST, "forum.example")
         .body(empty_body())
         .unwrap();
-    match proxy.forward(&ctx(), req, &target).await {
+    match proxy.forward(&ctx(), req, &target, None).await {
         Ok(resp) => eprintln!("fastapi status: {}", resp.status()),
         Err(e) => eprintln!("fastapi unreachable: {e}"),
     }
@@ -220,7 +221,7 @@ async fn live_mcp_backend() {
         .header(hyper::header::HOST, "mcp.forum.example")
         .body(empty_body())
         .unwrap();
-    match proxy.forward(&ctx(), req, &target).await {
+    match proxy.forward(&ctx(), req, &target, None).await {
         Ok(resp) => eprintln!("mcp /health status: {}", resp.status()),
         Err(e) => eprintln!("mcp unreachable: {e}"),
     }

@@ -64,6 +64,7 @@ fn ctx() -> ReqCtx {
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
+        peer_unix: false,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
         tls: None,
@@ -162,7 +163,7 @@ async fn disconnect_mid_stream_never_over_counts_connections() {
             .header(hyper::header::HOST, "h")
             .body(empty_body())
             .unwrap();
-        if let Ok(resp) = proxy.forward(&ctx(), req, &target).await {
+        if let Ok(resp) = proxy.forward(&ctx(), req, &target, None).await {
             if let Body::Stream(mut s) = resp.into_body() {
                 // Pull a single frame, then drop the stream (mid-stream disconnect).
                 let _ = s.frame().await;

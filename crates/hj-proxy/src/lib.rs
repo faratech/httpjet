@@ -197,6 +197,7 @@ impl Proxy {
         ctx: &ReqCtx,
         req: Request,
         target: &ProxyTarget,
+        timeout_override: Option<u64>,
     ) -> Result<Response, HandlerError> {
         let upstream = self.pool.get_or_create(
             target,
@@ -275,7 +276,9 @@ impl Proxy {
             // only at EOF); but a backend that drains the body then never sends headers can no
             // longer pin this task — and with it the maxConns permit and the pooled connection
             // — forever (the body-inactivity timer cannot fire once the body has ended).
-            let head_timeout = upstream.response_timeout();
+            let head_timeout = timeout_override
+                .map(std::time::Duration::from_secs)
+                .unwrap_or_else(|| upstream.response_timeout());
             tokio::select! {
                 biased;
                 r = sender.send_request(out_req2) => match r {
@@ -670,9 +673,33 @@ fn build_forward_request(
     // HTTP/3 (QUIC) client that is `HTTP/3.0`, which hyper's h1 request encoder hits
     // with `panic!("unexpected request version")` — aborting the task and dropping the
     // connection (HTTP/2.0 is silently coerced, but still wrong to forward). The
-    // upstream wire protocol is independent of the client's, so normalize it here.
-    parts.version = Version::HTTP_11;
+    // upstream wire protocol is independent of the client's, so normalize it here —
+    // to HTTP/2 for h2/h2s targets (hyper's h1 encoder PANICS on a wrong version),
+    // HTTP/1.1 for everything else.
+    parts.version = if target.http2 {
+        Version::HTTP_2
+    } else {
+        Version::HTTP_11
+    };
     parts.uri = upstream_uri(&parts.uri, target)?;
+    if target.http2 {
+        // hyper's h2 client derives :scheme/:authority from the URI; a
+        // path-only URI (correct origin-form for h1) is an invalid
+        // pseudo-header set, so re-absolutize against the target authority.
+        let scheme = if target.scheme.eq_ignore_ascii_case("h2s") {
+            "https"
+        } else {
+            "http"
+        };
+        let pq = parts
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        parts.uri = format!("{scheme}://{}{pq}", target.authority)
+            .parse()
+            .map_err(|e| HandlerError::Other(format!("bad h2 upstream uri: {e}")))?;
+    }
     ensure_host(&mut parts.headers, target, fallback_authority);
     headers::rewrite_request_headers(&mut parts.headers, ctx, keep_upgrade);
     // The inbound body (IncomingBody = BoxBody<Bytes, BoxError>) is forwarded
@@ -914,6 +941,7 @@ mod tests {
             env: vec![],
             local_addr: "127.0.0.1:8080".parse().unwrap(),
             peer_port: 0,
+            peer_unix: false,
             request_time: std::time::SystemTime::now(),
             request_id: Default::default(),
             tls: None,

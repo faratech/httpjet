@@ -35,6 +35,9 @@
 //! 4. After path resolution in the static handler:
 //!    `acl.deny_dir_match(&resolved_path)` — return 403 if true.
 
+pub mod throttle;
+pub use throttle::ClientThrottle;
+
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -628,6 +631,7 @@ mod tests {
             ],
             access_control: rules,
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         }
     }
 
@@ -674,6 +678,7 @@ mod tests {
                 },
             ],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("10.0.0.7")), AclDecision::Deny);
@@ -705,6 +710,7 @@ mod tests {
                 },
             ],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("192.168.5.5")), AclDecision::Allow);
@@ -742,6 +748,7 @@ mod tests {
                 },
             ],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("10.1.9.9")), AclDecision::Allow); // /16
@@ -976,6 +983,7 @@ mod tests {
             access_deny_dir: vec!["/etc/*".into(), "/usr/local/lsws/conf/*".into()],
             access_control: vec![],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
 
@@ -1053,6 +1061,7 @@ mod tests {
             access_deny_dir: vec![],
             access_control: vec![],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         assert!(acl.deny_dir_match(Path::new("/web/public_html/.htaccess")));
@@ -1070,6 +1079,7 @@ mod tests {
             access_deny_dir: vec!["/web/app/secret/*".into()],
             access_control: vec![],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         // The configured dir, its contents (one level), and recursively.
@@ -1113,6 +1123,7 @@ mod tests {
                 },
             ],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         assert!(acl.is_trusted(ip("2400:cb00::1")));
@@ -1139,6 +1150,7 @@ mod tests {
                 },
             ],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         assert_eq!(acl.check_peer(ip("203.0.113.9")), AclDecision::Deny);
@@ -1163,6 +1175,7 @@ mod tests {
                 },
             ],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         // Bad rule ignored; ALL allow stands; bad rule didn't register as trusted.
@@ -1207,6 +1220,7 @@ mod tests {
                 },
             ],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         // Mapped form of a denied v4 address must be denied (was fail-open).
@@ -1233,6 +1247,7 @@ mod tests {
                 allow: true,
             }],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl = AccessControl::from_security(&sec).unwrap();
         assert!(acl.is_trusted(ip("8.8.8.8")));
@@ -1255,8 +1270,155 @@ mod tests {
                 allow: true,
             }],
             cgi_cpu_limit_secs: None,
+            ..Default::default()
         };
         let acl2 = AccessControl::from_security(&sec_untrusted).unwrap();
         assert!(!acl2.is_trusted(ip("8.8.8.8")));
+    }
+}
+
+/// (Tier 2) Resolved GeoIP/ASN rules: label lists (country ISO codes, ASN
+/// numbers) resolved against a [`hj_geo::GeoSource`] into CIDR sets ONCE at
+/// state build, so the per-request check is deny-first binary-search set
+/// membership — never a database lookup, never a network fetch.
+///
+/// Precedence, deliberately simple and documented: a deny-list hit denies;
+/// else, when any allow list is configured, the address must be in it (so an
+/// allow list alone is a fail-closed whitelist); else the request passes
+/// through to the ordinary `AccessControl` CIDR rules, which remain the
+/// final word.
+#[derive(Debug, Default, Clone)]
+pub struct GeoRules {
+    denies: Option<hj_geo::IntervalSet>,
+    allows: Option<hj_geo::IntervalSet>,
+}
+
+impl GeoRules {
+    /// Resolve label lists against `source`. An unknown label is an ERROR —
+    /// a typo in a country code must fail the state build, not silently
+    /// exempt a region.
+    pub fn resolve(
+        source: &dyn hj_geo::GeoSource,
+        geo_allow: &[String],
+        geo_deny: &[String],
+        asn_allow: &[u32],
+        asn_deny: &[u32],
+    ) -> Result<Self, String> {
+        let mut deny_prefixes: Vec<ipnet::IpNet> = Vec::new();
+        let mut allow_prefixes: Vec<ipnet::IpNet> = Vec::new();
+        for label in geo_deny {
+            let prefixes = source
+                .country_prefixes(label)
+                .ok_or_else(|| format!("geoDeny label {label:?} is not known to the geo source"))?;
+            deny_prefixes.extend(prefixes);
+        }
+        for label in geo_allow {
+            let prefixes = source.country_prefixes(label).ok_or_else(|| {
+                format!("geoAllow label {label:?} is not known to the geo source")
+            })?;
+            allow_prefixes.extend(prefixes);
+        }
+        for asn in asn_deny {
+            let prefixes = source
+                .asn_prefixes(*asn)
+                .ok_or_else(|| format!("asnDeny {asn} is not known to the geo source"))?;
+            deny_prefixes.extend(prefixes);
+        }
+        for asn in asn_allow {
+            let prefixes = source
+                .asn_prefixes(*asn)
+                .ok_or_else(|| format!("asnAllow {asn} is not known to the geo source"))?;
+            allow_prefixes.extend(prefixes);
+        }
+        Ok(GeoRules {
+            denies: (!deny_prefixes.is_empty())
+                .then(|| hj_geo::IntervalSet::from_prefixes(&deny_prefixes)),
+            allows: (!allow_prefixes.is_empty())
+                .then(|| hj_geo::IntervalSet::from_prefixes(&allow_prefixes)),
+        })
+    }
+
+    /// `true` when no rule list is configured (the check can be skipped).
+    pub fn is_empty(&self) -> bool {
+        self.denies.is_none() && self.allows.is_none()
+    }
+
+    /// Evaluate one (already resolved) client address.
+    pub fn allows(&self, ip: IpAddr) -> bool {
+        if let Some(denies) = &self.denies
+            && denies.contains(ip)
+        {
+            return false;
+        }
+        match &self.allows {
+            Some(allows) => allows.contains(ip),
+            None => true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod geo_rules_tests {
+    use super::*;
+
+    const SOURCE: &str =
+        "country US 203.0.113.0/24\ncountry DE 198.51.100.0/24\nasn 64512 10.0.0.0/8\n";
+
+    fn source() -> hj_geo::CidrList {
+        hj_geo::CidrList::parse(SOURCE).unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn deny_list_blocks_labelled_networks_only() {
+        let rules = GeoRules::resolve(&source(), &[], &["US".to_string()], &[], &[]).unwrap();
+        assert!(!rules.allows(ip("203.0.113.9")));
+        assert!(rules.allows(ip("198.51.100.9")));
+        assert!(rules.allows(ip("8.8.8.8")));
+    }
+
+    #[test]
+    fn allow_list_alone_is_fail_closed_whitelist() {
+        let rules = GeoRules::resolve(&source(), &["US".to_string()], &[], &[], &[]).unwrap();
+        assert!(rules.allows(ip("203.0.113.9")));
+        assert!(!rules.allows(ip("198.51.100.9")), "unlabelled = denied");
+    }
+
+    #[test]
+    fn deny_wins_over_allow() {
+        let rules = GeoRules::resolve(
+            &source(),
+            &["US".to_string(), "DE".to_string()],
+            &["DE".to_string()],
+            &[],
+            &[],
+        )
+        .unwrap();
+        assert!(rules.allows(ip("203.0.113.9")));
+        assert!(!rules.allows(ip("198.51.100.9")), "deny-first precedence");
+    }
+
+    #[test]
+    fn asn_lists_resolve_too() {
+        let rules = GeoRules::resolve(&source(), &[], &[], &[], &[64512]).unwrap();
+        assert!(!rules.allows(ip("10.1.2.3")));
+        assert!(rules.allows(ip("203.0.113.9")));
+    }
+
+    #[test]
+    fn unknown_label_fails_the_build() {
+        assert!(GeoRules::resolve(&source(), &["ZZ".to_string()], &[], &[], &[]).is_err());
+        assert!(GeoRules::resolve(&source(), &[], &["GB".to_string()], &[], &[]).is_err());
+        assert!(GeoRules::resolve(&source(), &[], &[], &[], &[99999]).is_err());
+    }
+
+    #[test]
+    fn empty_rules_allow_everything_and_report_skippable() {
+        let rules = GeoRules::resolve(&source(), &[], &[], &[], &[]).unwrap();
+        assert!(rules.is_empty());
+        assert!(rules.allows(ip("8.8.8.8")));
     }
 }

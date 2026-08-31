@@ -283,6 +283,15 @@ fn vhost_allows_public(ctx: &ReqCtx, store: &hj_pagecache::PageStore, path: &str
 /// checks the private pair; false the public pair.
 fn context_denies_cache(ctx: &ReqCtx, path: &str, private: bool) -> bool {
     ctx.vhost.contexts.iter().any(|c| {
+        // (Tier 2) A sub_filter context bypasses the cache entirely: the cache
+        // hot path must never serve entries whose filtering depends on the
+        // transform vec running on a path it may not see.
+        if c.enabled
+            && c.sub_filter.as_ref().is_some_and(|s| s.is_active())
+            && crate::pipeline::context_uri_matches(path, &c.uri)
+        {
+            return true;
+        }
         let Some(p) = c.cache_policy else {
             return false;
         };
@@ -3169,6 +3178,7 @@ mod tests {
             env: Vec::new(),
             local_addr: "127.0.0.1:443".parse().unwrap(),
             peer_port: 12345,
+            peer_unix: false,
             request_time: std::time::SystemTime::UNIX_EPOCH,
             request_id: Default::default(),
             tls: None,
@@ -3712,6 +3722,7 @@ mod tests {
             env: Vec::new(),
             local_addr: "127.0.0.1:443".parse().unwrap(),
             peer_port: 12345,
+            peer_unix: false,
             request_time: std::time::SystemTime::UNIX_EPOCH,
             request_id: Default::default(),
             tls: None,
@@ -4055,6 +4066,7 @@ mod tests {
             env: Vec::new(),
             local_addr: "127.0.0.1:443".parse().unwrap(),
             peer_port: 12345,
+            peer_unix: false,
             request_time: std::time::SystemTime::UNIX_EPOCH,
             request_id: Default::default(),
             tls: None,

@@ -251,6 +251,7 @@ mod tests {
             env: Vec::new(),
             local_addr: "127.0.0.1:80".parse().unwrap(),
             peer_port: 40000,
+            peer_unix: false,
             tls: None,
             redirect_guard: None,
             request_time: std::time::SystemTime::UNIX_EPOCH,

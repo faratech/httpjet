@@ -168,6 +168,19 @@ struct ServeArgs {
     /// `pipeline::fast_memo`). Env `HJ_FAST_MEMO=0` is equivalent.
     #[arg(long)]
     no_fast_memo: bool,
+    /// (Tier 1.1) Per-client-IP request throttle: max requests per client IP per
+    /// second. 0 (default) = disabled — overrides the `<perIpRate>` tuning field
+    /// when set. Protects the origin from single-source floods; a shared NAT
+    /// egress aggregates many visitors, so size accordingly.
+    #[arg(long)]
+    per_ip_rate: Option<u32>,
+    /// (Tier 2) Additionally serve plain HTTP on this unix domain socket (H1 +
+    /// h2c prior knowledge, one accept core). Peers have no address: ACLs and
+    /// logs see fabricated loopback and the access log renders `unix:` — the
+    /// socket file's mode/owner is the real access boundary. A socket-activated
+    /// fd at the same path (socket unit) is adopted for zero-downtime restarts.
+    #[arg(long)]
+    http_uds: Option<PathBuf>,
     /// Do not spawn lsphp; PHP requests fall back to static serving.
     #[arg(long)]
     no_php: bool,
@@ -750,16 +763,30 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             "--no-mtls: client-cert verification DISABLED (local testing / explicit rollback only)"
         );
     }
+    if let Some(rate) = args.per_ip_rate {
+        cfg.tuning.per_ip_rate = rate;
+        if rate > 0 {
+            tracing::info!(
+                rate,
+                window_secs = cfg.tuning.per_ip_rate_window.as_secs(),
+                "per-IP request throttle ENABLED (--per-ip-rate)"
+            );
+        }
+    }
     let server = Arc::new(cfg);
 
-    let http_listener_name: Arc<str> = server
+    let http_listener = server
         .listeners
         .iter()
         .find(|l| !l.secure)
-        .or_else(|| server.listeners.first())
+        .or_else(|| server.listeners.first());
+    let http_listener_name: Arc<str> = http_listener
         .map(|l| l.name.clone())
         .unwrap_or_else(|| "Default".to_string())
         .into();
+    let http_binding = uring::ListenerBinding {
+        proxy_protocol: http_listener.is_some_and(|l| l.proxy_protocol),
+    };
 
     // The secure listener (if any) drives the TLS config + routing under :443.
     let secure_listener = server.listeners.iter().find(|l| l.secure).cloned();
@@ -1182,10 +1209,10 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         let https_listen_port = https_addr.map(|a| a.port()).unwrap_or(443);
         // `inh_quic` is `mut` so the io_uring H3 path can `.take()` the inherited UDP
         // fds for the quinn-proto driver.
-        let (inh_http, inh_https, mut inh_quic) =
-            match server::listeners_from_env(args.http_addr.port(), https_listen_port)? {
-                Some(i) => (Some(i.http), Some(i.https), Some(i.quic)),
-                None => (None, None, None),
+        let (inh_http, inh_https, mut inh_quic, inh_unix) =
+            match server::listeners_from_env(args.http_addr.port(), https_listen_port, args.http_uds.as_deref())? {
+                Some(i) => (Some(i.http), Some(i.https), Some(i.quic), Some(i.unix)),
+                None => (None, None, None, None),
             };
 
         // The HTTP/TLS/H3 listeners are the pure-io_uring thread-per-core (monoio) transport,
@@ -1213,9 +1240,24 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             workers,
             inh_http_std,
             bridge_admission.clone(),
+            http_binding,
         )?;
         tracing::info!(%args.http_addr, listener = %http_listener_name, workers, "plain HTTP up (io_uring thread-per-core transport)");
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // (Tier 2) Optional unix-domain-socket HTTP listener: same plain path,
+        // one core, fabricated loopback peers. TLS-over-UDS is unsupported.
+        if let Some(uds) = args.http_uds.clone() {
+            let inherited = inh_unix.unwrap_or_default().into_iter().next();
+            uring::spawn_uring_uds(
+                holder.clone(),
+                http_listener_name.clone(),
+                uds.clone(),
+                inherited,
+                bridge_admission.clone(),
+            )?;
+            tracing::info!(path = %uds.display(), "unix socket HTTP up");
+        }
 
         if let (Some(addr), Some(tls_config), Some(l)) =
             (https_addr, tls_config, secure_listener.as_ref())
@@ -1235,6 +1277,9 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 ktls_template.clone(),
                 inh_https_std,
                 bridge_admission.clone(),
+                uring::ListenerBinding {
+                    proxy_protocol: l.proxy_protocol,
+                },
             )?;
             tracing::info!(%addr, listener = %name, client_verify = mtls, workers, ktls = use_ktls, "TLS up (io_uring thread-per-core transport; H1/H2 over rustls-on-monoio; mTLS required for external peers when client_verify=2, loopback/private-LAN exempt)");
         }
@@ -2045,6 +2090,27 @@ fn php_pool_sig(c: &hj_core::config::ServerConfig) -> String {
     }
 }
 
+/// (Tier 2) Would a PROXY-protocol-enabled listener with this bind address be
+/// reachable by untrusted direct peers? Wildcard and public unicast binds warn;
+/// loopback/private/link-local binds are the normal on-box LB topology and don't.
+/// Unparseable hosts (hostnames) don't warn — nothing classifiable is claimed.
+fn pp_bind_is_public(address: &str) -> bool {
+    let host = address.rsplit_once(':').map_or(address, |(h, _)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() || host == "*" || host == "0.0.0.0" || host == "::" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !match ip {
+            std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unique_local() || v6.is_unicast_link_local()
+            }
+        },
+        Err(_) => false,
+    }
+}
+
 fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
     let cfg = hj_config::load(root)?;
     println!("httpjet config check — root: {}", cfg.server_root.display());
@@ -2057,6 +2123,40 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
         cfg.tuning.keep_alive_timeout,
         cfg.tuning.max_req_body_size / (1024 * 1024)
     );
+    println!(
+        "  per-IP throttle: {}",
+        if cfg.tuning.per_ip_rate == 0 {
+            "disabled".to_string()
+        } else {
+            format!(
+                "{} req / {}s per client IP",
+                cfg.tuning.per_ip_rate,
+                cfg.tuning.per_ip_rate_window.as_secs()
+            )
+        }
+    );
+
+    // (Tier 2) Geo ACL rules that cannot fire are the worst kind of silent no-op.
+    {
+        let s = &cfg.security;
+        let configured = !s.geo_allow.is_empty()
+            || !s.geo_deny.is_empty()
+            || !s.asn_allow.is_empty()
+            || !s.asn_deny.is_empty();
+        if configured && s.geo_db_file.is_none() {
+            println!(
+                "  lint WARN : geoAllow/geoDeny/asnAllow/asnDeny configured without <geoipDBFile> — the geo ACL is INERT"
+            );
+        }
+    }
+
+    // (Tier 2) The syslog access-log sink is env-configured; surface it so `check`
+    // shows where access lines are being shipped.
+    if let Ok(t) = std::env::var("HTTPJET_SYSLOG_TARGET")
+        && !t.is_empty()
+    {
+        println!("  syslog sink : {t}");
+    }
 
     println!("  listeners ({}):", cfg.listeners.len());
     for l in &cfg.listeners {
@@ -2083,12 +2183,32 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
             None => String::new(),
         };
         println!(
-            "    - {} @ {} ({} maps){}",
+            "    - {} @ {} ({} maps){}{}",
             l.name,
             l.address,
             l.vhost_map.len(),
-            tls
+            tls,
+            if l.proxy_protocol {
+                " proxyProtocol"
+            } else {
+                ""
+            }
         );
+        // (Tier 2) TLS-over-UDS is unsupported (no SNI/ALPN on AF_UNIX).
+        if l.uds_path.is_some() && (l.secure || l.tls.is_some()) {
+            println!(
+                "  lint WARN : listener '{}' combines a unix: address with TLS — TLS-over-UDS is unsupported and the TLS half will not serve",
+                l.name
+            );
+        }
+        // (Tier 2) The PROXY header overrides the client address, so a pp-enabled
+        // listener is safe only when its direct peers are the trusted LB.
+        if l.proxy_protocol && pp_bind_is_public(&l.address) {
+            println!(
+                "  lint WARN : proxyProtocol on listener '{}' binds a wildcard/public address ({}); any direct peer can forge its client address — enable only behind a trusted LB",
+                l.name, l.address
+            );
+        }
     }
 
     println!("  ext processors ({}):", cfg.ext_processors.len());
@@ -2128,7 +2248,110 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
         }
     }
 
+    let unsupported = lint_unsupported_features(&cfg, root);
+    for w in &unsupported {
+        println!("  lint WARN : {w}");
+    }
+
     lint_topology(&cfg, strict)
+}
+
+/// (audit 2026-08-30) Surface config that httpjet parses but does not implement, or
+/// accepts without effect: the worst failure mode of a drop-in replacement is a
+/// directive that reports success and does nothing. Warnings only (never strict
+/// failures) — the config is the operator's, the feature gap is ours to own.
+fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // LiteSpeed server-level elements with no httpjet implementation. Scanned in the
+    // raw XML because the deserializer (deliberately) ignores unknown elements.
+    let mut texts: Vec<(String, String)> = Vec::new();
+    let server_xml = root.join("conf/httpd_config.xml");
+    if let Ok(t) = std::fs::read_to_string(&server_xml) {
+        texts.push((server_xml.display().to_string(), t));
+    }
+    for decl in cfg.vhosts.values() {
+        if let Ok(t) = std::fs::read_to_string(&decl.config_file) {
+            texts.push((decl.config_file.display().to_string(), t));
+        }
+    }
+    const UNIMPLEMENTED: &[&str] = &[
+        "lsrecaptcha",
+        "censorshipControl",
+        "requiredPermissionMask",
+        "restrictedPermissionMask",
+        "cgiRlimit",
+    ];
+    for (file, text) in &texts {
+        for tag in UNIMPLEMENTED {
+            if text.contains(&format!("<{tag}>")) || text.contains(&format!("<{tag} ")) {
+                warnings.push(format!(
+                    "element <{tag}> in {file} is not implemented by httpjet — it is ignored (e.g. reCAPTCHA/censorship protection is NOT active)"
+                ));
+            }
+        }
+    }
+
+    for e in &cfg.ext_processors {
+        if e.instances > 1 {
+            warnings.push(format!(
+                "extProcessor {} requests instances={} but httpjet always uses a single fixed upstream — no load balancing or failover (requests never reach instances 2..N)",
+                e.name, e.instances
+            ));
+        }
+        if e.resp_buffer {
+            warnings.push(format!(
+                "extProcessor {} sets respBuffer but httpjet always streams proxy responses — the directive has no effect",
+                e.name
+            ));
+        }
+    }
+
+    for (name, decl) in &cfg.vhosts {
+        let Some(config) = decl.config.as_ref() else {
+            continue;
+        };
+        for ctx in &config.contexts {
+            if ctx.kind == hj_config::ContextKind::Cgi {
+                warnings.push(format!(
+                    "vhost {name}: CGI context {} is not implemented — requests there are not executed as CGI",
+                    ctx.uri
+                ));
+            }
+        }
+
+        // Auth directives collapse to deny-all (HTTP auth is not implemented): a
+        // shipped .htaccess using them silently locks every visitor out.
+        let htaccess = config.doc_root.join(config.access_file_name_or_default());
+        if config.overrides_enabled(config.rewrite.auto_load_htaccess)
+            && let Ok(text) = std::fs::read_to_string(&htaccess)
+        {
+            // Basic auth IS implemented (AuthType Basic + AuthUserFile + Require
+            // valid-user/user). Warn only for the shapes still unsupported.
+            let low = text.to_ascii_lowercase();
+            let basic_block = low.contains("authtype basic") && low.contains("authuserfile");
+            if !basic_block {
+                let auth_line = text.lines().enumerate().find(|(_, l)| {
+                    let t = l.trim();
+                    t.starts_with("AuthType ")
+                        || t.starts_with("AuthUserFile ")
+                        || t.starts_with("AuthName ")
+                        || t.starts_with("Require valid-user")
+                        || t.starts_with("Require user ")
+                        || t.starts_with("Require group ")
+                });
+                if let Some((lineno, _line)) = auth_line {
+                    warnings.push(format!(
+                        "vhost {name}: {}:{} auth directives other than a complete AuthType Basic + AuthUserFile block collapse to deny-all — every visitor to this tree is 403'd",
+                        htaccess.display(),
+                        lineno + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    warnings
 }
 
 /// One-line `fast_memo` verdict for a docroot `.htaccess` (the on-core static
@@ -2318,6 +2541,33 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
         ));
     }
 
+    // (audit 2026-08-30) Same class, one step later in the chain: a LOADED vhost whose
+    // docroot is missing (typo'd path, un-rsynced tree, deleted directory) passes every
+    // other check and then 404s everything. `check` runs on the box that serves, so an
+    // existence probe is meaningful here. Hard error under --strict for exactly the
+    // mapped-and-loaded vhosts the deploy gate cares about.
+    for (name, decl) in &cfg.vhosts {
+        let Some(config) = decl.config.as_ref() else {
+            continue;
+        };
+        let dr = &config.doc_root;
+        match std::fs::metadata(dr) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                errors.push(format!(
+                    "vhost '{name}' docroot {} does not exist — every request to it would 404",
+                    dr.display()
+                ));
+            }
+            Ok(m) if !m.is_dir() => {
+                errors.push(format!(
+                    "vhost '{name}' docroot {} is not a directory",
+                    dr.display()
+                ));
+            }
+            _ => {}
+        }
+    }
+
     table.sort();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for line in &table {
@@ -2352,6 +2602,133 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pp_bind_classifier_warns_only_on_public_reachable_binds() {
+        // Wildcard / any-address binds are reachable by untrusted direct peers.
+        for a in ["*:80", "0.0.0.0:443", "[::]:80", "[::]:443"] {
+            assert!(pp_bind_is_public(a), "{a} must warn");
+        }
+        // Public unicast warns; loopback/private/link-local are the on-box LB topology.
+        assert!(pp_bind_is_public("203.0.113.7:80"));
+        for a in [
+            "127.0.0.1:8080",
+            "10.0.0.3:443",
+            "192.168.1.10:80",
+            "169.254.1.2:80",
+            "[::1]:443",
+            "[fd00::3]:443",
+        ] {
+            assert!(!pp_bind_is_public(a), "{a} must not warn");
+        }
+        // A hostname bind claims nothing classifiable — no warning.
+        assert!(!pp_bind_is_public("origin.example.com:443"));
+    }
+
+    #[test]
+    fn unsupported_feature_and_missing_docroot_lints() {
+        let dir = std::env::temp_dir().join(format!(
+            "hj-lint-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+
+        // Server XML carrying an unimplemented LiteSpeed element.
+        std::fs::write(
+            dir.join("conf/httpd_config.xml"),
+            b"<server><lsrecaptcha><siteKey>k</siteKey></lsrecaptcha></server>",
+        )
+        .unwrap();
+
+        // One vhost: docroot deliberately missing; a CGI context; a config file with
+        // instances>1 + respBuffer on its ext processor... (ext processors live on the
+        // server config below).
+        let vhost_xml = dir.join("conf/vhost.xml");
+        std::fs::write(&vhost_xml, b"<vhost></vhost>").unwrap();
+
+        let mut cfg = hj_config::ServerConfig {
+            server_root: dir.clone(),
+            ..Default::default()
+        };
+        let mut vhost = hj_config::VHostConfig::default();
+        vhost.doc_root = dir.join("missing-docroot");
+        vhost.contexts = vec![hj_config::Context {
+            kind: hj_config::ContextKind::Cgi,
+            uri: "/cgi-bin/".into(),
+            location: None,
+            handler: None,
+            enabled: true,
+            extra_headers: Vec::new(),
+            add_default_charset: false,
+            charset: None,
+            cache_policy: None,
+            bandwidth_limit: 0,
+            max_body_override: None,
+            timeout_override: None,
+            sub_filter: None,
+        }];
+        cfg.vhosts.insert(
+            "t.example".into(),
+            hj_config::VHostDecl {
+                name: "t.example".into(),
+                vh_root: dir.clone(),
+                config_file: vhost_xml,
+                allow_symbol_link: None,
+                restrained: false,
+                enable_script: true,
+                config: Some(Arc::new(vhost)),
+            },
+        );
+
+        let warnings = lint_unsupported_features(&cfg, &dir);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("<lsrecaptcha>") && w.contains("not implemented")),
+            "lsrecaptcha must be surfaced: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("CGI context /cgi-bin/ is not implemented")),
+            "cgi context must be surfaced: {warnings:?}"
+        );
+        drop(cfg);
+
+        // lint_topology (strict): the missing docroot is a hard error.
+        let mut cfg2 = hj_config::ServerConfig {
+            server_root: dir.clone(),
+            ..Default::default()
+        };
+        let mut vhost2 = hj_config::VHostConfig::default();
+        vhost2.doc_root = dir.join("missing-docroot");
+        cfg2.vhosts.insert(
+            "t.example".into(),
+            hj_config::VHostDecl {
+                name: "t.example".into(),
+                vh_root: dir.clone(),
+                config_file: dir.join("conf/vhost.xml"),
+                allow_symbol_link: None,
+                restrained: false,
+                enable_script: true,
+                config: Some(Arc::new(vhost2)),
+            },
+        );
+        assert!(
+            lint_topology(&cfg2, true).is_err(),
+            "a missing docroot must fail the strict deploy gate"
+        );
+        assert!(
+            lint_topology(&cfg2, false).is_ok(),
+            "non-strict check keeps it a printed warning"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn lsphp_default_state_paths_derive_from_the_pool_socket() {

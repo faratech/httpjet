@@ -1,5 +1,5 @@
 [package]
-name = "hj-acl"
+name = "hj-geo"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -8,10 +8,4 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-hj-core = { workspace = true }
-hj-geo = { workspace = true }
-http = { workspace = true }
 ipnet = { workspace = true }
-parking_lot = { workspace = true }
-globset = { workspace = true }
-tracing = { workspace = true }

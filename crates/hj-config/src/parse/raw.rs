@@ -64,6 +64,12 @@ pub(super) struct RawTuning {
     pub(super) max_req_header_size: Option<String>,
     #[serde(rename = "maxReqBodySize", default)]
     pub(super) max_req_body_size: Option<String>,
+    #[serde(rename = "perIpRate", default)]
+    pub(super) per_ip_rate: Option<u32>,
+    #[serde(rename = "perIpRateWindowSecs", default)]
+    pub(super) per_ip_rate_window: Option<u32>,
+    #[serde(rename = "bandwidthLimit", default)]
+    pub(super) bandwidth_limit: Option<u32>,
     #[serde(rename = "maxCachedFileSize", default)]
     pub(super) max_cached_file_size: Option<String>,
     #[serde(rename = "totalInMemCacheSize", default)]
@@ -162,6 +168,18 @@ pub(super) struct RawSecurity {
     pub(super) access_control: Option<RawAccessControl>,
     #[serde(rename = "CGIRLimit", default)]
     pub(super) cgi_rlimit: Option<RawCgiRLimit>,
+    // (Tier 2) httpjet-native GeoIP/ASN ACL: label lists resolved against a
+    // CidrList file at state build (see hj-geo / hj_acl::GeoRules).
+    #[serde(rename = "geoipDBFile", default)]
+    pub(super) geo_db_file: Option<String>,
+    #[serde(rename = "geoAllow", default)]
+    pub(super) geo_allow: Option<String>,
+    #[serde(rename = "geoDeny", default)]
+    pub(super) geo_deny: Option<String>,
+    #[serde(rename = "asnAllow", default)]
+    pub(super) asn_allow: Option<String>,
+    #[serde(rename = "asnDeny", default)]
+    pub(super) asn_deny: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -236,7 +254,7 @@ pub(super) struct RawExtProcessor {
     #[serde(default)]
     pub(super) name: Option<String>,
     #[serde(default)]
-    pub(super) address: Option<String>,
+    pub(super) address: Vec<String>,
     #[serde(rename = "maxConns", default)]
     pub(super) max_conns: Option<String>,
     #[serde(rename = "pcKeepAliveTimeout", default)]
@@ -247,6 +265,10 @@ pub(super) struct RawExtProcessor {
     pub(super) retry_timeout: Option<String>,
     #[serde(rename = "respBuffer", default)]
     pub(super) resp_buffer: Option<String>,
+    #[serde(rename = "clientCertFile", default)]
+    pub(super) client_cert_file: Option<String>,
+    #[serde(rename = "clientKeyFile", default)]
+    pub(super) client_key_file: Option<String>,
     #[serde(default)]
     pub(super) env: Vec<String>,
     #[serde(rename = "autoStart", default)]
@@ -352,6 +374,10 @@ pub(super) struct RawListener {
     pub(super) cert_chain: Option<String>,
     #[serde(rename = "CACertFile", default)]
     pub(super) ca_cert_file: Option<String>,
+    #[serde(rename = "proxyProtocol", default)]
+    pub(super) proxy_protocol: Option<String>,
+    #[serde(rename = "crlFile", default)]
+    pub(super) crl_file: Option<String>,
     #[serde(rename = "enableStapling", default)]
     pub(super) enable_stapling: Option<String>,
     #[serde(rename = "clientVerify", default)]
@@ -525,6 +551,16 @@ pub(super) struct RawContext {
     /// (#249) LSWS six-flag context `<cachePolicy>` (+ microCache5xx).
     #[serde(rename = "cachePolicy", default)]
     pub(super) cache_policy: Option<RawContextCachePolicy>,
+    // (Tier 2) httpjet-native sub_filter block: repeatable
+    // `<subFilter>SEARCH => REPLACEMENT</subFilter>` plus modifiers.
+    #[serde(rename = "subFilter", default)]
+    pub(super) sub_filter: Vec<String>,
+    #[serde(rename = "subFilterOnce", default)]
+    pub(super) sub_filter_once: Option<String>,
+    #[serde(rename = "subFilterTypes", default)]
+    pub(super) sub_filter_types: Option<String>,
+    #[serde(rename = "subFilterMaxBody", default)]
+    pub(super) sub_filter_max_body: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

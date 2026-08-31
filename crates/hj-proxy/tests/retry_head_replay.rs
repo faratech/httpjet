@@ -55,6 +55,7 @@ fn ctx() -> ReqCtx {
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
+        peer_unix: false,
         request_time: std::time::SystemTime::now(),
         request_id: Default::default(),
         tls: None,
@@ -134,7 +135,10 @@ async fn retry_replays_the_client_head_not_an_empty_one() {
         .header(hyper::header::HOST, "mcp.windowsforum.com")
         .body(empty_body())
         .unwrap();
-    let resp = proxy.forward(&ctx(), req, &target).await.expect("first ok");
+    let resp = proxy
+        .forward(&ctx(), req, &target, None)
+        .await
+        .expect("first ok");
     if let Body::Stream(s) = resp.into_body() {
         let _ = s.collect().await;
     }
@@ -153,7 +157,7 @@ async fn retry_replays_the_client_head_not_an_empty_one() {
         .body(empty_body())
         .unwrap();
     let resp = proxy
-        .forward(&ctx(), req, &target)
+        .forward(&ctx(), req, &target, None)
         .await
         .expect("retried request must succeed");
     assert_eq!(resp.status(), http::StatusCode::OK);
