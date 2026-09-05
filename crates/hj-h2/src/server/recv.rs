@@ -738,6 +738,8 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
     // malformed per RFC 9113 §8.3.1 — build_request REPLACES Host with :authority,
     // so forwarding both verbatim would inject a second HTTP_HOST value downstream.
     let mut host_value: Option<http::HeaderValue> = None;
+    let mut scheme_is_http = false;
+    let mut path_is_asterisk = false;
     let mut seen = [false; 4]; // :method, :scheme, :path, :authority
     let ok = dec
         .decode(block, |name, value| {
@@ -782,34 +784,51 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
                     // foreign-host CDN-cache-protection bypass). Reject anything with a scheme
                     // or authority. (CONNECT — which omits :path/:scheme — is already rejected
                     // by the required-pseudo-header set check.)
-                    ":path" => match http::Uri::try_from(value) {
-                        Ok(u) if u.scheme().is_none() && u.authority().is_none() => {
-                            st.path = Some(u)
-                        }
-                        _ => {
+                    ":path" => {
+                        // Check the raw value before `http::Uri` parsing: that parser accepts a
+                        // fragment and silently drops `#...`, but fragments are not request-target
+                        // data and are outside the HTTP/2 :path grammar.
+                        if value.contains('#') || (value != "*" && !value.starts_with('/')) {
                             malformed = true;
                             return;
                         }
-                    },
-                    // An un-representable authority is dropped (no Host header), mirroring the
-                    // old `HeaderValue::from_str(a).ok()` skip — it does not reject the request.
-                    ":authority" => {
-                        if let Ok(v) = http::HeaderValue::from_str(value) {
-                            st.authority = Some(v);
+                        match http::Uri::try_from(value) {
+                            Ok(u) if u.scheme().is_none() && u.authority().is_none() => {
+                                path_is_asterisk = value == "*";
+                                st.path = Some(u)
+                            }
+                            _ => {
+                                malformed = true;
+                                return;
+                            }
                         }
                     }
-                    _ => {} // :scheme validated; the actual scheme is implied by the listener
+                    ":authority" => {
+                        match (
+                            hj_core::valid_uri_authority(value),
+                            http::HeaderValue::from_str(value),
+                        ) {
+                            (true, Ok(v)) => st.authority = Some(v),
+                            _ => {
+                                malformed = true;
+                                return;
+                            }
+                        }
+                    }
+                    ":scheme" => {
+                        if !hj_core::valid_uri_scheme(value) {
+                            malformed = true;
+                            return;
+                        }
+                        // Routing continues to use the listener scheme, as before. This flag is
+                        // only for RFC 9113's http/https-specific userinfo restriction.
+                        scheme_is_http = value.eq_ignore_ascii_case("http")
+                            || value.eq_ignore_ascii_case("https");
+                    }
+                    _ => unreachable!("known pseudo-header matched above"),
                 }
             } else {
                 seen_regular = true;
-                if is_trailers {
-                    // RFC 9113 §8.1: a trailer section is decoded only to keep the connection
-                    // HPACK dynamic table in sync — its fields are DISCARDED, never appended to
-                    // the request header map handed to the backend. A trailer field must not
-                    // masquerade as a request header (a smuggling/confusion surface once forwarded
-                    // over HTTP/1.x); this matches the h3 path, which drops request trailers.
-                    return;
-                }
                 if name.bytes().any(|b| b.is_ascii_uppercase()) {
                     malformed = true; // §8.1.2: field names must be lowercase
                     return;
@@ -818,31 +837,9 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
                     malformed = true; // §8.1.2.2: connection-specific header (shared h2/h3 list)
                     return;
                 }
-                match name {
-                    "te" if !value.eq_ignore_ascii_case("trailers") => {
-                        malformed = true; // §8.1.2.2: TE may only be "trailers"
-                        return;
-                    }
-                    "content-length" => {
-                        // (security #264) Digit-only, mirroring hj-core/H1's #232 strict
-                        // resolver: Rust's unsigned parse() accepts a leading '+', which
-                        // H1/H3 reject for the same bytes — a per-protocol divergence.
-                        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                            malformed = true;
-                            return;
-                        }
-                        match value.parse::<u64>() {
-                            // A second, conflicting content-length is malformed (§8.1.2.6).
-                            Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
-                                st.content_length = Some(cl)
-                            }
-                            _ => {
-                                malformed = true;
-                                return;
-                            }
-                        }
-                    }
-                    _ => {}
+                if name == "te" && !value.eq_ignore_ascii_case("trailers") {
+                    malformed = true; // §8.1.2.2: TE may only be "trailers"
+                    return;
                 }
                 // §8.2.1 (RFC 9113): a field name/value that fails validation makes the message
                 // malformed — it is NOT silently dropped — because an unvalidated field can enable
@@ -858,6 +855,32 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
                     http::HeaderValue::from_str(value),
                 ) {
                     (Ok(n), Ok(v)) if !edge_ws => {
+                        if is_trailers {
+                            // Trailer fields obey the same field syntax and connection-header
+                            // rules, but valid trailers are discarded after HPACK decoding. This
+                            // keeps the dynamic table synchronized without forwarding trailers as
+                            // ordinary request headers.
+                            return;
+                        }
+                        if name == "content-length" {
+                            // (security #264) Digit-only, mirroring hj-core/H1's #232 strict
+                            // resolver: Rust's unsigned parse() accepts a leading '+', which
+                            // H1/H3 reject for the same bytes — a per-protocol divergence.
+                            if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                                malformed = true;
+                                return;
+                            }
+                            match value.parse::<u64>() {
+                                // A second, conflicting content-length is malformed (§8.1.2.6).
+                                Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
+                                    st.content_length = Some(cl)
+                                }
+                                _ => {
+                                    malformed = true;
+                                    return;
+                                }
+                            }
+                        }
                         if n == http::header::HOST {
                             if host_value.is_some() {
                                 malformed = true; // duplicate Host line
@@ -883,6 +906,32 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
         if !seen[0] || !seen[1] || !seen[2] {
             return Decoded::Malformed;
         }
+        // RFC 9112 §3.2.4: asterisk-form is only a server-wide OPTIONS request.
+        if path_is_asterisk && st.method.as_ref() != Some(&http::Method::OPTIONS) {
+            return Decoded::Malformed;
+        }
+        // RFC 3986 permits userinfo and an empty reg-name for a generic
+        // :authority, while RFC 9113 forbids both for HTTP(S).
+        if let Some(authority) = st.authority.as_ref() {
+            let Ok(text) = authority.to_str() else {
+                return Decoded::Malformed;
+            };
+            if !hj_core::valid_uri_authority(text)
+                || (scheme_is_http && !hj_core::valid_http_authority(text))
+            {
+                return Decoded::Malformed;
+            }
+        }
+        // The regular Host field always uses HTTP host[:port] syntax, including
+        // when it supplies the effective authority for a non-HTTP URI scheme.
+        if let Some(host) = host_value.as_ref() {
+            let Ok(text) = host.to_str() else {
+                return Decoded::Malformed;
+            };
+            if !hj_core::valid_http_authority(text) {
+                return Decoded::Malformed;
+            }
+        }
         // (security #264) :authority + Host must agree when both are present
         // (RFC 9113 §8.3.1); build_request replaces Host with :authority, so a
         // disagreeing pair would smuggle two different hosts downstream.
@@ -894,6 +943,165 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
         st.headers_done = true;
     }
     Decoded::Ok
+}
+
+#[cfg(test)]
+mod pseudo_header_tests {
+    use super::*;
+    use crate::hpack::Encoder;
+
+    fn decode(headers: &[(&str, &str)]) -> Decoded {
+        let mut encoder = Encoder::new();
+        let mut block = Vec::new();
+        for (name, value) in headers {
+            encoder.encode_header(&mut block, name, value);
+        }
+        let mut decoder = Decoder::new(4096, 8192);
+        let mut state = StreamState::default();
+        decode_block_from(&mut decoder, &mut state, &block)
+    }
+
+    #[test]
+    fn rejects_invalid_scheme_authority_and_fragment_path_syntax() {
+        for scheme in ["", "1http", "http space", "http:"] {
+            assert!(matches!(
+                decode(&[(":method", "GET"), (":scheme", scheme), (":path", "/")]),
+                Decoded::Malformed
+            ));
+        }
+        for authority in [
+            "bad host",
+            "host/path",
+            "[::1",
+            "example.com:abc",
+            "user@@example.com",
+        ] {
+            assert!(matches!(
+                decode(&[
+                    (":method", "GET"),
+                    (":scheme", "https"),
+                    (":path", "/"),
+                    (":authority", authority),
+                ]),
+                Decoded::Malformed
+            ));
+        }
+        assert!(matches!(
+            decode(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/safe#ignored"),
+            ]),
+            Decoded::Malformed
+        ));
+        for authority in [":443", "user@example.com"] {
+            assert!(matches!(
+                decode(&[
+                    (":method", "GET"),
+                    (":scheme", "https"),
+                    (":path", "/"),
+                    (":authority", authority),
+                ]),
+                Decoded::Malformed
+            ));
+        }
+        for host in ["bad host", "user@example.com", "example.com:abc", ":443"] {
+            assert!(matches!(
+                decode(&[
+                    (":method", "GET"),
+                    (":scheme", "https"),
+                    (":path", "/"),
+                    ("host", host),
+                ]),
+                Decoded::Malformed
+            ));
+        }
+        assert!(matches!(
+            decode(&[
+                (":method", "GET"),
+                (":scheme", "web+custom"),
+                (":path", "/"),
+                ("host", "user@example.com"),
+            ]),
+            Decoded::Malformed
+        ));
+    }
+
+    #[test]
+    fn asterisk_path_is_valid_only_for_options() {
+        assert!(matches!(
+            decode(&[(":method", "GET"), (":scheme", "https"), (":path", "*")]),
+            Decoded::Malformed
+        ));
+        assert!(matches!(
+            decode(&[(":method", "OPTIONS"), (":scheme", "https"), (":path", "*"),]),
+            Decoded::Ok
+        ));
+    }
+
+    #[test]
+    fn accepts_non_http_scheme_arbitrary_pseudo_order_and_ipv6_authority() {
+        assert!(matches!(
+            decode(&[
+                (":path", "/resource?x=1"),
+                (":authority", "[2001:db8::1]:8443"),
+                (":method", "GET"),
+                (":scheme", "web+custom"),
+            ]),
+            Decoded::Ok
+        ));
+        assert!(matches!(
+            decode(&[
+                (":method", "GET"),
+                (":scheme", "web+custom"),
+                (":authority", "[v1.a-b]:443"),
+                (":path", "/"),
+            ]),
+            Decoded::Ok
+        ));
+    }
+
+    #[test]
+    fn rejects_userinfo_only_for_http_and_https_authorities() {
+        assert!(matches!(
+            decode(&[
+                (":authority", "user@example.com:443"),
+                (":path", "/"),
+                (":scheme", "https"),
+                (":method", "GET"),
+            ]),
+            Decoded::Malformed
+        ));
+        assert!(matches!(
+            decode(&[
+                (":authority", "user@example.com"),
+                (":path", "/"),
+                (":scheme", "web+custom"),
+                (":method", "GET"),
+            ]),
+            Decoded::Ok
+        ));
+        // RFC 3986's generic `reg-name` permits zero characters, so a custom
+        // scheme can carry an explicitly empty authority. HTTP(S) cannot.
+        assert!(matches!(
+            decode(&[
+                (":authority", ""),
+                (":path", "/"),
+                (":scheme", "web+custom"),
+                (":method", "GET"),
+            ]),
+            Decoded::Ok
+        ));
+        assert!(matches!(
+            decode(&[
+                (":authority", ""),
+                (":path", "/"),
+                (":scheme", "https"),
+                (":method", "GET"),
+            ]),
+            Decoded::Malformed
+        ));
+    }
 }
 
 /// Translate the captured pseudo-headers, decoded HeaderMap, and buffered body into a

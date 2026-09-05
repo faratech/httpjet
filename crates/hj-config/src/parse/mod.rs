@@ -66,7 +66,7 @@ pub(crate) fn load_server_file(server_root: &Path, path: &Path) -> Result<Server
     let tuning = convert_tuning(raw.tuning.unwrap_or_default());
     let expires = convert_expires(raw.expires);
     let cache = convert_server_cache(raw.cache);
-    let security = convert_security(raw.security, &ctx);
+    let security = convert_security(raw.security, &ctx, path)?;
     let suexec = convert_suexec(raw.suexec);
     let ext_processors = convert_ext_list(raw.ext_processor_list, &ctx);
     let php_config = raw
@@ -220,10 +220,10 @@ fn convert_server_cache(r: Option<RawServerCache>) -> CacheConfig {
     }
 }
 
-fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx) -> Security {
+fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx, path: &Path) -> Result<Security> {
     let r = match r {
         Some(r) => r,
-        None => return Security::default(),
+        None => return Ok(Security::default()),
     };
     let access_deny_dir = r
         .access_deny_dir
@@ -253,7 +253,7 @@ fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx) -> Security {
     let split_labels = |v: &Option<String>| -> Vec<String> {
         v.as_deref()
             .map(|s| {
-                s.split([',', ' ', '\t'])
+                s.split(|c: char| c == ',' || c.is_whitespace())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(str::to_string)
@@ -261,13 +261,34 @@ fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx) -> Security {
             })
             .unwrap_or_default()
     };
-    let parse_asns = |v: &Option<String>| -> Vec<u32> {
+    let parse_asns = |directive: &'static str, v: &Option<String>| -> Result<Vec<u32>> {
         split_labels(v)
             .into_iter()
-            .filter_map(|s| s.trim_start_matches("AS").parse::<u32>().ok())
+            .map(|token| {
+                let digits = token
+                    .get(..2)
+                    .filter(|prefix| prefix.eq_ignore_ascii_case("AS"))
+                    .map_or(token.as_str(), |_| &token[2..]);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ConfigError::InvalidValue {
+                        path: path.to_path_buf(),
+                        directive,
+                        value: token,
+                        reason: "expected an ASN number with at most one optional AS prefix".into(),
+                    });
+                }
+                digits
+                    .parse::<u32>()
+                    .map_err(|_| ConfigError::InvalidValue {
+                        path: path.to_path_buf(),
+                        directive,
+                        value: token,
+                        reason: "ASN is out of range".into(),
+                    })
+            })
             .collect()
     };
-    Security {
+    Ok(Security {
         follow_symlink,
         access_deny_dir,
         access_control,
@@ -281,9 +302,9 @@ fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx) -> Security {
             .map(|p| PathBuf::from(ctx.expand(&p.to_string_lossy()))),
         geo_allow: split_labels(&r.geo_allow),
         geo_deny: split_labels(&r.geo_deny),
-        asn_allow: parse_asns(&r.asn_allow),
-        asn_deny: parse_asns(&r.asn_deny),
-    }
+        asn_allow: parse_asns("asnAllow", &r.asn_allow)?,
+        asn_deny: parse_asns("asnDeny", &r.asn_deny)?,
+    })
 }
 
 /// Convert the server `<suexec>` block into a [`SuExecPolicy`]. Absent block →
@@ -738,6 +759,67 @@ mod tests {
     }
 
     #[test]
+    fn context_native_resource_controls_preserve_absent_and_explicit_zero() {
+        let text = r#"<virtualHostConfig>
+            <contextList>
+                <context>
+                    <type>proxy</type><uri>/configured</uri><handler>app</handler>
+                    <maxReqBodySize>1K</maxReqBodySize>
+                    <bandwidthLimit>2048</bandwidthLimit>
+                    <responseTimeout>7</responseTimeout>
+                </context>
+                <context>
+                    <type>proxy</type><uri>/absent</uri><handler>app</handler>
+                </context>
+                <context>
+                    <type>proxy</type><uri>/zero</uri><handler>app</handler>
+                    <maxReqBodySize>0</maxReqBodySize>
+                    <bandwidthLimit>0</bandwidthLimit>
+                    <responseTimeout>0</responseTimeout>
+                </context>
+            </contextList>
+        </virtualHostConfig>"#;
+        let vc = parse_vhost_config(text, &crate::parse::SubstCtx::default()).unwrap();
+        let configured = &vc.contexts[0];
+        assert_eq!(configured.max_body_override, Some(1024));
+        assert_eq!(configured.bandwidth_limit, 2048);
+        assert_eq!(configured.timeout_override, Some(7));
+        let absent = &vc.contexts[1];
+        assert_eq!(absent.max_body_override, None);
+        assert_eq!(absent.bandwidth_limit, 0);
+        assert_eq!(absent.timeout_override, None);
+        let zero = &vc.contexts[2];
+        assert_eq!(zero.max_body_override, Some(0));
+        assert_eq!(zero.bandwidth_limit, 0);
+        assert_eq!(zero.timeout_override, Some(0));
+    }
+
+    #[test]
+    fn context_native_resource_controls_reject_malformed_values() {
+        for (directive, value) in [
+            ("maxReqBodySize", "12XB"),
+            ("bandwidthLimit", "-1"),
+            ("responseTimeout", "1.5"),
+        ] {
+            let text = format!(
+                "<virtualHostConfig><contextList><context><uri>/api</uri><{directive}>{value}</{directive}></context></contextList></virtualHostConfig>"
+            );
+            let err = parse_vhost_config(&text, &crate::parse::SubstCtx::default())
+                .expect_err("a provided malformed native value must fail config parsing");
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidValue {
+                        directive: found,
+                        ..
+                    } if found == directive
+                ),
+                "unexpected error for {directive}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn cacheable_status_parse() {
         assert_eq!(parse_cacheable_status("200,301"), vec![200, 301]);
         assert_eq!(parse_cacheable_status("301, 200, 200"), vec![200, 301]);
@@ -981,12 +1063,44 @@ mod tests {
             asn_deny: Some("AS64512 13335".into()),
             ..Default::default()
         };
-        let sec = convert_security(Some(raw), &SubstCtx::default());
+        let sec = convert_security(Some(raw), &SubstCtx::default(), Path::new("<test>")).unwrap();
         assert_eq!(sec.geo_db_file, Some(PathBuf::from("/x/geo.db")));
         assert_eq!(sec.geo_allow, vec!["US", "DE"]);
         assert_eq!(sec.asn_deny, vec![64512, 13335]);
-        let none = convert_security(None, &SubstCtx::default());
+        let none = convert_security(None, &SubstCtx::default(), Path::new("<test>")).unwrap();
         assert!(none.geo_db_file.is_none() && none.geo_allow.is_empty());
+    }
+
+    #[test]
+    fn asn_acl_lists_accept_mixed_case_prefixes_and_all_whitespace() {
+        let raw = RawSecurity {
+            asn_allow: Some("as13335,\nAS64512\t42\r\naS7".into()),
+            ..Default::default()
+        };
+        let sec = convert_security(Some(raw), &SubstCtx::default(), Path::new("<test>")).unwrap();
+        assert_eq!(sec.asn_allow, vec![13335, 64512, 42, 7]);
+    }
+
+    #[test]
+    fn asn_acl_lists_reject_every_malformed_or_overflowing_token() {
+        for token in ["AS", "ASAS13335", "AS13x", "-1", "+1", "4294967296"] {
+            let raw = RawSecurity {
+                asn_allow: Some(format!("13335,{token}")),
+                ..Default::default()
+            };
+            let err = convert_security(Some(raw), &SubstCtx::default(), Path::new("<test>"))
+                .expect_err("malformed ASN tokens must not be silently filtered");
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidValue {
+                        directive: "asnAllow",
+                        ..
+                    }
+                ),
+                "unexpected error for {token}: {err}"
+            );
+        }
     }
 
     // ----- vhostMap domain lowercasing (OLS mapDomainList strnlower) -----
@@ -1003,7 +1117,7 @@ mod tests {
             cgi_rlimit: None,
             ..Default::default()
         };
-        let sec = convert_security(Some(raw), &SubstCtx::default());
+        let sec = convert_security(Some(raw), &SubstCtx::default(), Path::new("<test>")).unwrap();
         let allow_rule = sec.access_control.iter().find(|r| r.allow).unwrap();
         assert!(allow_rule.trusted);
         let deny_rule = sec.access_control.iter().find(|r| !r.allow).unwrap();

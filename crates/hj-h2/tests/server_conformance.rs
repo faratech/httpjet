@@ -1170,6 +1170,117 @@ async fn request_trailers_are_not_forwarded() {
 }
 
 #[tokio::test]
+async fn malformed_request_trailers_reset_stream_and_keep_connection_usable() {
+    // Trailer fields obey the ordinary field-name/value rules. The decoder must
+    // consume malformed HPACK blocks, reset only their streams, and retain its
+    // connection-scoped dynamic-table state.
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut setup = Vec::new();
+    frame::write_settings(&mut setup, &[]);
+    client.write_all(&setup).await.unwrap();
+    client.flush().await.unwrap();
+    for _ in 0..3 {
+        let _ = read_frame(&mut client).await;
+    }
+
+    let mut enc = Encoder::new();
+    for (stream_id, split_trailer, trailer_name, trailer_value) in [
+        (1, true, "X-Bad", "value"),
+        (3, false, "connection", "close"),
+        (5, false, "bad name", "value"),
+    ] {
+        let mut request_head = Vec::new();
+        enc.encode_header(&mut request_head, ":method", "POST");
+        enc.encode_header(&mut request_head, ":path", "/upload");
+        enc.encode_header(&mut request_head, ":scheme", "https");
+        enc.encode_header(&mut request_head, ":authority", "example.com");
+        let mut trailer = Vec::new();
+        enc.encode_header(&mut trailer, trailer_name, trailer_value);
+
+        let mut wire = Vec::new();
+        frame::write_frame(
+            &mut wire,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS,
+            stream_id,
+            &request_head,
+        );
+        frame::write_frame(&mut wire, frame::kind::DATA, 0, stream_id, b"payload");
+        if split_trailer {
+            let split = trailer.len().div_ceil(2);
+            frame::write_frame(
+                &mut wire,
+                frame::kind::HEADERS,
+                frame::flags::END_STREAM,
+                stream_id,
+                &trailer[..split],
+            );
+            frame::write_frame(
+                &mut wire,
+                frame::kind::CONTINUATION,
+                frame::flags::END_HEADERS,
+                stream_id,
+                &trailer[split..],
+            );
+        } else {
+            frame::write_frame(
+                &mut wire,
+                frame::kind::HEADERS,
+                frame::flags::END_HEADERS | frame::flags::END_STREAM,
+                stream_id,
+                &trailer,
+            );
+        }
+        client.write_all(&wire).await.unwrap();
+        client.flush().await.unwrap();
+
+        let code = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (hdr, payload) = read_frame(&mut client).await;
+                match hdr.kind {
+                    frame::kind::RST_STREAM if hdr.stream_id == stream_id => {
+                        return u32::from_be_bytes(payload[..4].try_into().unwrap());
+                    }
+                    frame::kind::GOAWAY => panic!("malformed trailer killed the connection"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("malformed trailer must reset its stream");
+        assert_eq!(code, frame::error_code::PROTOCOL_ERROR);
+    }
+
+    // A valid request after the resets proves HPACK state remained synchronized.
+    let mut valid = Vec::new();
+    enc.encode_header(&mut valid, ":method", "GET");
+    enc.encode_header(&mut valid, ":path", "/after-trailers");
+    enc.encode_header(&mut valid, ":scheme", "https");
+    enc.encode_header(&mut valid, ":authority", "example.com");
+    let mut wire = Vec::new();
+    frame::write_frame(
+        &mut wire,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        7,
+        &valid,
+    );
+    client.write_all(&wire).await.unwrap();
+    client.flush().await.unwrap();
+
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let (status, _) = read_response(&mut client, &mut dec, 7).await;
+    assert_eq!(status.as_deref(), Some("200"));
+
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
 async fn respects_send_flow_control() {
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     // 30-byte in-memory body; the client grants only a 10-byte initial per-stream window.
@@ -1465,6 +1576,60 @@ async fn absolute_form_path_pseudo_header_is_reset() {
         rst,
         "an absolute-form :path must be RST_STREAM'd, not accepted or GOAWAY"
     );
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn malformed_host_fallback_is_reset_on_the_wire() {
+    // When :authority is omitted, Host supplies the effective authority. Exercise
+    // the full HPACK/frame receive path so malformed Host values cannot bypass the
+    // stricter HTTP(S) authority checks at the pseudo-header seam.
+    let (mut client, server) = tokio::io::duplex(64 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut f = Vec::new();
+    frame::write_settings(&mut f, &[]);
+    client.write_all(&f).await.unwrap();
+
+    let mut enc = Encoder::new();
+    for (index, host) in ["bad host", "user@example.com", "example.com:abc", ":443"]
+        .into_iter()
+        .enumerate()
+    {
+        let stream_id = 1 + (index as u32 * 2);
+        let mut block = Vec::new();
+        enc.encode_header(&mut block, ":method", "GET");
+        enc.encode_header(&mut block, ":scheme", "https");
+        enc.encode_header(&mut block, ":path", "/");
+        enc.encode_header(&mut block, "host", host);
+        let mut req = Vec::new();
+        frame::write_frame(
+            &mut req,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS | frame::flags::END_STREAM,
+            stream_id,
+            &block,
+        );
+        client.write_all(&req).await.unwrap();
+        client.flush().await.unwrap();
+
+        let rst = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (hdr, _) = read_frame(&mut client).await;
+                match hdr.kind {
+                    frame::kind::RST_STREAM if hdr.stream_id == stream_id => return true,
+                    frame::kind::GOAWAY => return false,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("server must respond");
+        assert!(rst, "malformed Host {host:?} must reset its stream");
+    }
+
     drop(client);
     let _ = srv.await;
 }

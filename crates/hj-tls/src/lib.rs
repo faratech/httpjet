@@ -135,26 +135,41 @@ impl SniCertMap {
     pub(crate) fn resolve_name(
         &self,
         server_name: Option<&str>,
-        prefers_ecdsa: bool,
+        signature_schemes: &[rustls::SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
         let name = server_name?;
         let certs = self.by_name.get(&name.to_ascii_lowercase())?;
-        if certs.len() == 1 {
-            return Some(certs[0].clone());
-        }
-        // Multiple chains: prefer ECDSA when the client offers ECDSA signature
-        // algorithms, otherwise the first RSA chain. Falls back to certs[0].
+        let compatible =
+            |ck: &&Arc<CertifiedKey>| ck.key.choose_scheme(signature_schemes).is_some();
+        // Multiple chains: prefer a compatible ECDSA key when the client offers
+        // one of its exact schemes, otherwise prefer a compatible non-ECDSA key.
+        // Never select a key solely by its broad algorithm: rustls cannot sign
+        // the handshake when, for example, a P-256 key is paired with a client
+        // that offered only ECDSA P-384 plus a compatible RSA scheme.
+        let prefers_ecdsa = signature_schemes.iter().any(|scheme| {
+            matches!(
+                scheme,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256
+                    | rustls::SignatureScheme::ECDSA_NISTP384_SHA384
+            )
+        });
         if prefers_ecdsa {
             certs
                 .iter()
+                .filter(compatible)
                 .find(|ck| ck.key.algorithm() == rustls::SignatureAlgorithm::ECDSA)
-                .or_else(|| certs.first())
         } else {
             certs
                 .iter()
+                .filter(compatible)
                 .find(|ck| ck.key.algorithm() != rustls::SignatureAlgorithm::ECDSA)
-                .or_else(|| certs.first())
         }
+        .or_else(|| certs.iter().find(compatible))
+        // Preserve the configured-name boundary when none of its keys can sign
+        // for this client: return that mapping's original first key so rustls
+        // rejects the handshake, rather than falling through to the listener's
+        // unrelated default certificate.
+        .or_else(|| certs.first())
         .cloned()
     }
 }
@@ -178,17 +193,8 @@ impl ResolvesServerCert for SniWithDefault {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         // Match the configured domain exactly (no SAN validation); otherwise
         // fall back to the listener default cert.
-        // (Tier 2) Prefer ECDSA chains when the client offers ECDSA signature
-        // algorithms — smaller handshakes, faster key exchange.
-        let prefers_ecdsa = client_hello.signature_schemes().iter().any(|s| {
-            matches!(
-                s,
-                rustls::SignatureScheme::ECDSA_NISTP256_SHA256
-                    | rustls::SignatureScheme::ECDSA_NISTP384_SHA384
-            )
-        });
         self.sni
-            .resolve_name(client_hello.server_name(), prefers_ecdsa)
+            .resolve_name(client_hello.server_name(), client_hello.signature_schemes())
             .or_else(|| Some(self.default.clone()))
     }
 }
@@ -1105,6 +1111,53 @@ mod tests {
 
     use hj_config::model::{Listener, ListenerTls, VHostConfig, VHostDecl, VhSsl, VhostMap};
 
+    const P256_SCHEMES: &[rustls::SignatureScheme] =
+        &[rustls::SignatureScheme::ECDSA_NISTP256_SHA256];
+
+    #[derive(Debug)]
+    struct ExactSchemeKey {
+        algorithm: rustls::SignatureAlgorithm,
+        scheme: rustls::SignatureScheme,
+    }
+
+    impl rustls::sign::SigningKey for ExactSchemeKey {
+        fn choose_scheme(
+            &self,
+            offered: &[rustls::SignatureScheme],
+        ) -> Option<Box<dyn rustls::sign::Signer>> {
+            offered
+                .contains(&self.scheme)
+                .then(|| Box::new(ExactSchemeSigner(self.scheme)) as Box<dyn rustls::sign::Signer>)
+        }
+
+        fn algorithm(&self) -> rustls::SignatureAlgorithm {
+            self.algorithm
+        }
+    }
+
+    #[derive(Debug)]
+    struct ExactSchemeSigner(rustls::SignatureScheme);
+
+    impl rustls::sign::Signer for ExactSchemeSigner {
+        fn sign(&self, _message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+            Ok(Vec::new())
+        }
+
+        fn scheme(&self) -> rustls::SignatureScheme {
+            self.0
+        }
+    }
+
+    fn exact_scheme_cert(
+        algorithm: rustls::SignatureAlgorithm,
+        scheme: rustls::SignatureScheme,
+    ) -> Arc<CertifiedKey> {
+        Arc::new(CertifiedKey::new(
+            Vec::new(),
+            Arc::new(ExactSchemeKey { algorithm, scheme }),
+        ))
+    }
+
     /// A generated leaf cert + key (PEM) for a set of SAN names.
     pub(crate) struct TestCert {
         pub(crate) cert_pem: String,
@@ -1190,6 +1243,55 @@ mod tests {
         ensure_provider();
         ensure_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn resolver_skips_ecdsa_key_incompatible_with_exact_client_schemes() {
+        let p256 = exact_scheme_cert(
+            rustls::SignatureAlgorithm::ECDSA,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+        );
+        let rsa = exact_scheme_cert(
+            rustls::SignatureAlgorithm::RSA,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        );
+        let mut resolver = SniCertMap::new();
+        resolver.add("dual.example", p256.clone());
+        resolver.add("dual.example", rsa.clone());
+
+        let offered = [
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        ];
+        let selected = resolver
+            .resolve_name(Some("dual.example"), &offered)
+            .expect("the compatible RSA certificate must be selected");
+        assert!(
+            Arc::ptr_eq(&selected, &rsa),
+            "a broad ECDSA preference must not select an unusable P-256 key"
+        );
+
+        let selected = resolver
+            .resolve_name(Some("dual.example"), P256_SCHEMES)
+            .expect("an exactly compatible ECDSA certificate must remain preferred");
+        assert!(Arc::ptr_eq(&selected, &p256));
+
+        let selected = resolver
+            .resolve_name(
+                Some("dual.example"),
+                &[rustls::SignatureScheme::ECDSA_NISTP384_SHA384],
+            )
+            .expect("a known name must not fall through to the listener default");
+        assert!(
+            Arc::ptr_eq(&selected, &p256),
+            "rustls must reject the known mapping's original key at signing time"
+        );
+        assert!(
+            resolver
+                .resolve_name(Some("unmapped.example"), P256_SCHEMES)
+                .is_none(),
+            "only an unknown name may reach SniWithDefault's listener fallback"
+        );
     }
 
     #[test]
@@ -1286,27 +1388,27 @@ mod tests {
         // them here, but the map does not depend on that).
         assert!(
             resolver
-                .resolve_name(Some("a.example.com"), false)
+                .resolve_name(Some("a.example.com"), P256_SCHEMES)
                 .is_some()
         );
         assert!(
             resolver
-                .resolve_name(Some("alias.example.com"), false)
+                .resolve_name(Some("alias.example.com"), P256_SCHEMES)
                 .is_some()
         );
         // Case-insensitive lookup (OLS lowercases the servername).
         assert!(
             resolver
-                .resolve_name(Some("A.Example.Com"), false)
+                .resolve_name(Some("A.Example.Com"), P256_SCHEMES)
                 .is_some()
         );
         // Unmapped name yields None so the wrapper falls back to the default.
         assert!(
             resolver
-                .resolve_name(Some("nope.example.com"), false)
+                .resolve_name(Some("nope.example.com"), P256_SCHEMES)
                 .is_none()
         );
-        assert!(resolver.resolve_name(None, false).is_none());
+        assert!(resolver.resolve_name(None, P256_SCHEMES).is_none());
     }
 
     #[test]
@@ -1354,13 +1456,13 @@ mod tests {
         // single real domain is registered.
         assert!(
             resolver
-                .resolve_name(Some("real.example.com"), false)
+                .resolve_name(Some("real.example.com"), P256_SCHEMES)
                 .is_some()
         );
-        assert!(resolver.resolve_name(Some("*"), false).is_none());
+        assert!(resolver.resolve_name(Some("*"), P256_SCHEMES).is_none());
         assert!(
             resolver
-                .resolve_name(Some("ghost.example.com"), false)
+                .resolve_name(Some("ghost.example.com"), P256_SCHEMES)
                 .is_none()
         );
     }
@@ -1411,10 +1513,10 @@ mod tests {
         let resolver = build_sni_resolver(&server, &listener).expect("resolver");
 
         let on_name = resolver
-            .resolve_name(Some("publisher.example"), false)
+            .resolve_name(Some("publisher.example"), P256_SCHEMES)
             .expect("publisher.example resolves");
         let off_name = resolver
-            .resolve_name(Some("news.forum.example"), false)
+            .resolve_name(Some("news.forum.example"), P256_SCHEMES)
             .expect("news.forum.example resolves to the publisher.example cert");
 
         // It is the SAME configured cert for both names (the vhost's cert),
@@ -1508,7 +1610,7 @@ mod tests {
         // Mapped (but SAN-uncovered) name -> the vhost cert, not the default.
         let mapped = wrapper
             .sni
-            .resolve_name(Some("news.forum.example"), false)
+            .resolve_name(Some("news.forum.example"), P256_SCHEMES)
             .expect("mapped name resolves");
         assert!(
             !Arc::ptr_eq(&mapped, &default_ck),
@@ -1519,10 +1621,10 @@ mod tests {
         assert!(
             wrapper
                 .sni
-                .resolve_name(Some("unmapped.example.com"), false)
+                .resolve_name(Some("unmapped.example.com"), P256_SCHEMES)
                 .is_none()
         );
-        assert!(wrapper.sni.resolve_name(None, false).is_none());
+        assert!(wrapper.sni.resolve_name(None, P256_SCHEMES).is_none());
         // And the full config still builds.
         let cfg = build_server_config(&server, &listener).expect("server config");
         assert_eq!(cfg.max_early_data_size, 0);

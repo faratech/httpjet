@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::error::{ConfigError, Result};
 use crate::model::*;
 use crate::subst::SubstCtx;
-use crate::units::split_list;
+use crate::units::{parse_bytes, parse_secs, split_list};
 
 use super::raw::{RawLogFileSpec, RawVHostConfig, RawVHostList};
 use super::scalar::u32_of;
@@ -138,6 +138,7 @@ pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
                     decl.config = Some(Arc::new(vc));
                 }
             }
+            Err(e @ ConfigError::InvalidValue { .. }) => return Err(e),
             Err(e) => {
                 tracing::warn!(vhost = %name, error = %e, "skipping vhost: parse error");
             }
@@ -148,8 +149,9 @@ pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
 
 /// Parse a per-vhost XML file body into [`VHostConfig`].
 pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConfig> {
+    let config_path = PathBuf::from(format!("<vhost {}>", ctx.vh_name));
     let raw: RawVHostConfig = quick_xml::de::from_str(text).map_err(|e| ConfigError::Xml {
-        path: PathBuf::from(format!("<vhost {}>", ctx.vh_name)),
+        path: config_path.clone(),
         msg: e.to_string(),
     })?;
 
@@ -163,61 +165,103 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         })
         .unwrap_or_default();
 
-    let contexts = raw
-        .context_list
-        .map(|cl| {
-            cl.context
-                .into_iter()
-                .filter_map(|mut c| {
-                    let sub_filter = convert_sub_filter(&c);
-                    let uri = nonempty(c.uri.take())?;
-                    Some(Context {
-                        kind: context_kind(&c.kind),
-                        uri,
-                        location: nonempty(c.location).map(|p| PathBuf::from(ctx.expand(&p))),
-                        handler: nonempty(c.handler),
-                        enabled: c
-                            .enabled
-                            .as_ref()
-                            .map(|_| truthy(&c.enabled))
-                            .unwrap_or(true),
-                        extra_headers: c
-                            .extra_headers
-                            .as_deref()
-                            .map(parse_extra_headers)
-                            .unwrap_or_default(),
-                        add_default_charset: charset_on(&c.add_default_charset),
-                        charset: nonempty(c.charset),
-                        max_body_override: None,
-                        bandwidth_limit: 0,
-                        timeout_override: None,
-                        sub_filter,
-                        cache_policy: c.cache_policy.map(|p| {
-                            // A present-but-absent FLAG defaults ON (LSWS
-                            // getLongValue(..,default) semantics), except
-                            // enablePostCache which OLS defaults off.
-                            let f = |v: &Option<String>, d: bool| {
-                                v.as_deref()
-                                    .map(|s| {
-                                        let t = s.trim();
-                                        t == "1" || t == "2" || t.eq_ignore_ascii_case("true")
-                                    })
-                                    .unwrap_or(d)
-                            };
-                            ContextCachePolicy {
-                                check_public_cache: f(&p.check_public_cache, true),
-                                check_private_cache: f(&p.check_private_cache, true),
-                                respect_cacheable: f(&p.respect_cacheable, true),
-                                enable_cache: f(&p.enable_cache, true),
-                                enable_private_cache: f(&p.enable_private_cache, true),
-                                enable_post_cache: f(&p.enable_post_cache, false),
+    let contexts =
+        raw.context_list
+            .map(|cl| {
+                cl.context
+                    .into_iter()
+                    .map(|mut c| -> Result<Option<Context>> {
+                        let sub_filter = convert_sub_filter(&c);
+                        let Some(uri) = nonempty(c.uri.take()) else {
+                            return Ok(None);
+                        };
+                        let parse_value = |directive: &'static str,
+                                           raw: &Option<String>,
+                                           parse: fn(&str) -> Option<u64>,
+                                           expected: &'static str|
+                         -> Result<Option<u64>> {
+                            match raw {
+                                None => Ok(None),
+                                Some(value) => parse(value).map(Some).ok_or_else(|| {
+                                    ConfigError::InvalidValue {
+                                        path: config_path.clone(),
+                                        directive,
+                                        value: value.clone(),
+                                        reason: format!("{expected} in context {uri:?}"),
+                                    }
+                                }),
                             }
-                        }),
+                        };
+                        let max_body_override = parse_value(
+                            "maxReqBodySize",
+                            &c.max_req_body_size,
+                            parse_bytes,
+                            "expected a non-negative byte size with an optional K/M/G suffix",
+                        )?;
+                        let bandwidth_limit = parse_value(
+                            "bandwidthLimit",
+                            &c.bandwidth_limit,
+                            parse_bytes,
+                            "expected a non-negative byte rate with an optional K/M/G suffix",
+                        )?
+                        .unwrap_or(0);
+                        let timeout_override = parse_value(
+                            "responseTimeout",
+                            &c.response_timeout,
+                            parse_secs,
+                            "expected a non-negative integer number of seconds",
+                        )?;
+                        Ok(Some(Context {
+                            kind: context_kind(&c.kind),
+                            uri,
+                            location: nonempty(c.location).map(|p| PathBuf::from(ctx.expand(&p))),
+                            handler: nonempty(c.handler),
+                            enabled: c
+                                .enabled
+                                .as_ref()
+                                .map(|_| truthy(&c.enabled))
+                                .unwrap_or(true),
+                            extra_headers: c
+                                .extra_headers
+                                .as_deref()
+                                .map(parse_extra_headers)
+                                .unwrap_or_default(),
+                            add_default_charset: charset_on(&c.add_default_charset),
+                            charset: nonempty(c.charset),
+                            max_body_override,
+                            bandwidth_limit,
+                            timeout_override,
+                            sub_filter,
+                            cache_policy: c.cache_policy.map(|p| {
+                                // A present-but-absent FLAG defaults ON (LSWS
+                                // getLongValue(..,default) semantics), except
+                                // enablePostCache which OLS defaults off.
+                                let f = |v: &Option<String>, d: bool| {
+                                    v.as_deref()
+                                        .map(|s| {
+                                            let t = s.trim();
+                                            t == "1" || t == "2" || t.eq_ignore_ascii_case("true")
+                                        })
+                                        .unwrap_or(d)
+                                };
+                                ContextCachePolicy {
+                                    check_public_cache: f(&p.check_public_cache, true),
+                                    check_private_cache: f(&p.check_private_cache, true),
+                                    respect_cacheable: f(&p.respect_cacheable, true),
+                                    enable_cache: f(&p.enable_cache, true),
+                                    enable_private_cache: f(&p.enable_private_cache, true),
+                                    enable_post_cache: f(&p.enable_post_cache, false),
+                                }
+                            }),
+                        }))
                     })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .flatten()
+            .collect();
 
     let websockets = raw
         .websocket_list

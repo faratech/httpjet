@@ -2,8 +2,8 @@
 //! L4 load balancer (HAProxy/Spectrum/tunnel) fronts the origin and carries the real
 //! client address. Per-LISTENER opt-in (`<listener><proxyProtocol>`): when enabled,
 //! the first bytes of EVERY connection to that listener must be a PROXY header —
-//! anything else is closed (fail-closed). The header's source address then overrides
-//! the TCP peer for client-IP resolution, ACLs, and logs.
+//! anything else is closed (fail-closed). A PROXY command's source address overrides
+//! the TCP peer for client-IP resolution, ACLs, and logs; LOCAL/UNKNOWN retain it.
 //!
 //! Security: the listener opt-in IS the trust decision (nginx/HAProxy semantics) —
 //! there is no per-peer list at accept time, so enabling it on a listener reachable
@@ -22,13 +22,12 @@ const V2_SIGNATURE: [u8; 12] = [
 const V2_HEADER_LEN: usize = 16;
 const V1_MAX_LINE: usize = 107;
 
-/// Parsed header outcome: the real source address plus how many wire bytes the
-/// header consumed (so the caller can prepend any over-read remainder). The
-/// accept path's reader consumes exactly the header, so `consumed` is asserted
-/// by tests rather than read in production code.
+/// Parsed header outcome. `src` is absent for identity-preserving LOCAL (v2) or
+/// UNKNOWN (v1) commands; callers then retain the socket peer. `consumed` is the
+/// exact header length and is asserted by tests.
 #[allow(dead_code)]
 pub struct ProxyHeader {
-    pub src: SocketAddr,
+    pub src: Option<SocketAddr>,
     pub consumed: usize,
 }
 
@@ -39,7 +38,6 @@ pub fn parse_v2(buf: &[u8]) -> Option<ProxyHeader> {
         return None;
     }
     let ver_cmd = buf[12];
-    // Only the LOCAL/PROXY commands of version 2.
     if ver_cmd >> 4 != 2 {
         return None;
     }
@@ -47,7 +45,26 @@ pub fn parse_v2(buf: &[u8]) -> Option<ProxyHeader> {
     if buf.len() < V2_HEADER_LEN + len {
         return None;
     }
+    // LOCAL means the connection was made intentionally by the proxy without
+    // relaying an upstream address. The family/protocol and payload are ignored.
+    if ver_cmd & 0x0f == 0x00 {
+        return Some(ProxyHeader {
+            src: None,
+            consumed: V2_HEADER_LEN + len,
+        });
+    }
+    // Values other than LOCAL (0) and PROXY (1) are invalid commands.
+    if ver_cmd & 0x0f != 0x01 {
+        return None;
+    }
+
     let family = buf[13] >> 4; // high nibble: AF_INET=1, AF_INET6=2
+    let transport = buf[13] & 0x0f;
+    // TCP listeners accept only STREAM tuples. DGRAM/UNSPEC must not be
+    // interpreted as a stream peer address.
+    if transport != 0x01 {
+        return None;
+    }
     let addr = &buf[V2_HEADER_LEN..V2_HEADER_LEN + len];
     let src = match family {
         0x1 => {
@@ -75,7 +92,7 @@ pub fn parse_v2(buf: &[u8]) -> Option<ProxyHeader> {
         _ => return None,
     };
     Some(ProxyHeader {
-        src,
+        src: Some(src),
         consumed: V2_HEADER_LEN + len,
     })
 }
@@ -83,31 +100,62 @@ pub fn parse_v2(buf: &[u8]) -> Option<ProxyHeader> {
 /// Parse a v1 text header line (`PROXY TCP4 src dst sport dport\r\n` / `UNKNOWN`).
 pub fn parse_v1(line: &[u8]) -> Option<ProxyHeader> {
     let line = strip_crlf(line)?;
-    if !line.starts_with(b"PROXY ") {
+    let text = std::str::from_utf8(line).ok()?;
+    let fields = text.strip_prefix("PROXY ")?;
+    if fields == "UNKNOWN" || fields.starts_with("UNKNOWN ") {
+        return Some(ProxyHeader {
+            src: None,
+            consumed: text.len() + 2,
+        });
+    }
+
+    // Known families have exactly six fields separated by one SP. Validate both
+    // endpoints and ports even though only the source tuple is retained; otherwise a
+    // malformed destination or appended field can be smuggled through as a valid preface.
+    let mut parts = text.split(' ');
+    if parts.next()? != "PROXY" {
         return None;
     }
-    let text = std::str::from_utf8(line).ok()?;
-    let mut parts = text.split_whitespace();
-    let _proto = parts.next()?;
-    let ip: std::net::IpAddr = match parts.next()?.to_ascii_uppercase().as_str() {
-        "TCP4" => parts.next()?.parse::<Ipv4Addr>().ok()?.into(),
-        "TCP6" => parts.next()?.parse::<Ipv6Addr>().ok()?.into(),
+    let family = parts.next()?;
+    let src = parts.next()?;
+    let dst = parts.next()?;
+    let sport = parse_v1_port(parts.next()?)?;
+    let _dport = parse_v1_port(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let ip: std::net::IpAddr = match family {
+        "TCP4" => {
+            let src = src.parse::<Ipv4Addr>().ok()?;
+            dst.parse::<Ipv4Addr>().ok()?;
+            src.into()
+        }
+        "TCP6" => {
+            let src = src.parse::<Ipv6Addr>().ok()?;
+            dst.parse::<Ipv6Addr>().ok()?;
+            src.into()
+        }
         _ => return None,
     };
-    let _dst = parts.next()?;
-    let sport: u16 = parts.next()?.parse().ok()?;
-    let _dport = parts.next()?;
     let consumed = text.len() + 2; // + CRLF
     Some(ProxyHeader {
-        src: SocketAddr::new(ip, sport),
+        src: Some(SocketAddr::new(ip, sport)),
         consumed,
     })
 }
 
+fn parse_v1_port(value: &str) -> Option<u16> {
+    if value.is_empty()
+        || !value.bytes().all(|b| b.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn strip_crlf(line: &[u8]) -> Option<&[u8]> {
-    let line = line.strip_suffix(b"\n")?;
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    Some(line)
+    line.strip_suffix(b"\r\n")
 }
 
 #[cfg(test)]
@@ -132,7 +180,7 @@ mod tests {
         buf.extend_from_slice(&[0x00, 0x50]); // dport 80
         buf.extend_from_slice(b"TAIL"); // over-read must not count
         let h = parse_v2(&buf).expect("parses");
-        assert_eq!(h.src, SocketAddr::from(([203, 0, 113, 9], 8080)));
+        assert_eq!(h.src, Some(SocketAddr::from(([203, 0, 113, 9], 8080))));
         assert_eq!(h.consumed, 28);
     }
 
@@ -143,8 +191,8 @@ mod tests {
         buf.extend_from_slice(&[0x1f, 0x90]);
         buf.extend_from_slice(&[0x00, 0x50]);
         let h = parse_v2(&buf).expect("parses");
-        assert!(h.src.is_ipv6());
-        assert_eq!(h.src.port(), 8080);
+        assert!(h.src.unwrap().is_ipv6());
+        assert_eq!(h.src.unwrap().port(), 8080);
         assert_eq!(h.consumed, 52);
     }
 
@@ -159,12 +207,70 @@ mod tests {
     }
 
     #[test]
+    fn v2_local_preserves_peer_and_invalid_command_or_transport_is_rejected() {
+        let mut local = v2_header(4, 0x12);
+        local[12] = 0x20; // version 2, LOCAL; family/protocol and payload ignored
+        local.extend_from_slice(b"junk");
+        let h = parse_v2(&local).expect("LOCAL command is valid");
+        assert_eq!(h.src, None);
+        assert_eq!(h.consumed, local.len());
+
+        let mut invalid_command = v2_header(12, 0x11);
+        invalid_command[12] = 0x22;
+        invalid_command.extend_from_slice(&[0; 12]);
+        assert!(parse_v2(&invalid_command).is_none());
+
+        let mut dgram = v2_header(12, 0x12);
+        dgram.extend_from_slice(&[0; 12]);
+        assert!(parse_v2(&dgram).is_none());
+    }
+
+    #[test]
     fn v1_text_parses_source_and_consumed_length() {
         let line = b"PROXY TCP4 203.0.113.9 10.0.0.1 8080 80\r\n";
         let h = parse_v1(line).expect("parses");
-        assert_eq!(h.src, SocketAddr::from(([203, 0, 113, 9], 8080)));
+        assert_eq!(h.src, Some(SocketAddr::from(([203, 0, 113, 9], 8080))));
         assert_eq!(h.consumed, line.len());
         assert!(parse_v1(b"GET / HTTP/1.1\r\n").is_none());
+    }
+
+    #[test]
+    fn v1_known_family_requires_exact_fields_and_crlf() {
+        for malformed in [
+            b"PROXY tcp4 203.0.113.9 10.0.0.1 8080 80\r\n".as_slice(),
+            b"PROXY TCP4 203.0.113.9 not-an-ip 8080 80\r\n".as_slice(),
+            b"PROXY TCP4 203.0.113.9 ::1 8080 80\r\n".as_slice(),
+            b"PROXY TCP6 ::1 127.0.0.1 8080 80\r\n".as_slice(),
+            b"PROXY TCP4 203.0.113.9 10.0.0.1 +8080 80\r\n".as_slice(),
+            b"PROXY TCP4 203.0.113.9 10.0.0.1 08080 80\r\n".as_slice(),
+            b"PROXY TCP4 203.0.113.9 10.0.0.1 8080 invalid\r\n".as_slice(),
+            b"PROXY TCP4 203.0.113.9 10.0.0.1 8080 80 extra\r\n".as_slice(),
+            b"PROXY  TCP4 203.0.113.9 10.0.0.1 8080 80\r\n".as_slice(),
+            b"PROXY TCP4 203.0.113.9 10.0.0.1 8080 80\n".as_slice(),
+        ] {
+            assert!(
+                parse_v1(malformed).is_none(),
+                "accepted malformed v1 preface: {malformed:?}"
+            );
+        }
+        let tcp6 = b"PROXY TCP6 2001:db8::1 2001:db8::2 443 8443\r\n";
+        assert_eq!(
+            parse_v1(tcp6).and_then(|header| header.src),
+            Some("[2001:db8::1]:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn v1_unknown_preserves_peer() {
+        let line = b"PROXY UNKNOWN\r\n";
+        let h = parse_v1(line).expect("UNKNOWN is a valid v1 command");
+        assert_eq!(h.src, None);
+        assert_eq!(h.consumed, line.len());
+        let extended = b"PROXY UNKNOWN arbitrary trailing bytes are ignored\r\n";
+        let extended = parse_v1(extended).expect("UNKNOWN permits an ignored trailing payload");
+        assert_eq!(extended.src, None);
+        assert!(parse_v1(b"PROXY UNKNOWN-without-delimiter\r\n").is_none());
+        assert!(parse_v1(b"PROXY UNKNOWN\n").is_none());
     }
 }
 
@@ -196,24 +302,47 @@ pub(crate) mod reader {
         Ok(buf)
     }
 
-    /// Read and strip the PROXY header. Returns `Some((src, consumed))` if a valid
-    /// header was found and stripped, `None` if the stream doesn't start with a
-    /// PROXY header (the caller must close the connection on a pp-enabled listener).
+    /// Read and strip the PROXY header. `timeout` is one deadline for the whole
+    /// header, including its variable-length portion; `None` preserves the
+    /// configured `connTimeout=0` meaning of no deadline. Returns
+    /// `Some((src, consumed))` if a valid header was found and stripped, `None`
+    /// if the stream doesn't start with a PROXY header (the caller must close the
+    /// connection on a pp-enabled listener).
     pub(crate) async fn read_and_strip<S: AsyncReadRent>(
         stream: &mut S,
+        timeout: Option<std::time::Duration>,
     ) -> std::io::Result<Option<ProxyHeader>> {
-        // Read the fixed v2 header (16 bytes) to check the signature.
-        let header = read_exact(stream, V2_HEADER_LEN).await?;
-        if header[..12] == V2_SIGNATURE {
+        let read = read_and_strip_unbounded(stream);
+        match timeout {
+            Some(duration) => monoio::time::timeout(duration, read).await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "PROXY protocol header timed out",
+                )
+            })?,
+            None => read.await,
+        }
+    }
+
+    async fn read_and_strip_unbounded<S: AsyncReadRent>(
+        stream: &mut S,
+    ) -> std::io::Result<Option<ProxyHeader>> {
+        // Twelve bytes distinguish the binary v2 signature from the text v1
+        // prefix without over-reading the minimal 15-byte `PROXY UNKNOWN\r\n`.
+        let prefix = read_exact(stream, V2_SIGNATURE.len()).await?;
+        if prefix == V2_SIGNATURE {
+            let fixed_tail = read_exact(stream, V2_HEADER_LEN - V2_SIGNATURE.len()).await?;
+            let mut header = prefix;
+            header.extend_from_slice(&fixed_tail);
             // v2 binary: read the variable-length address block.
             let len = u16::from_be_bytes([header[14], header[15]]) as usize;
             let addr = read_exact(stream, len).await?;
             let mut full = header;
             full.extend_from_slice(&addr);
             Ok(parse_v2(&full))
-        } else if header[0] == b'P' {
+        } else if prefix.starts_with(b"PROXY ") {
             // Possibly v1 text: read until \n (max V1_MAX_LINE bytes total).
-            let mut line = header.clone();
+            let mut line = prefix;
             while line.len() < V1_MAX_LINE {
                 let (res, t) = stream.read(vec![0u8; 1]).await;
                 if res? == 0 {
@@ -257,7 +386,7 @@ mod accept_tests {
             rt.block_on(async move {
                 let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
                 let (mut stream, peer) = listener.accept().await.unwrap();
-                let stripped = read_and_strip(&mut stream).await.unwrap();
+                let stripped = read_and_strip(&mut stream, None).await.unwrap();
                 let mut rest = Vec::with_capacity(follow_len);
                 while rest.len() < follow_len {
                     let (res, buf) =
@@ -288,8 +417,12 @@ mod accept_tests {
 
         let (peer, stripped, rest) = serve_one(&payload, request.len());
         let h = stripped.expect("v2 header stripped on a pp-enabled connection");
-        assert_eq!(h.src, SocketAddr::from(([203, 0, 113, 9], 8080)));
-        assert_ne!(peer, h.src, "the overridden address replaces the TCP peer");
+        assert_eq!(h.src, Some(SocketAddr::from(([203, 0, 113, 9], 8080))));
+        assert_ne!(
+            Some(peer),
+            h.src,
+            "the overridden address replaces the TCP peer"
+        );
         assert_eq!(
             h.consumed,
             payload.len() - request.len(),
@@ -310,10 +443,32 @@ mod accept_tests {
 
         let (peer, stripped, rest) = serve_one(&payload, request.len());
         let h = stripped.expect("v1 header stripped on a pp-enabled connection");
-        assert_eq!(h.src, SocketAddr::from(([198, 51, 100, 22], 5678)));
-        assert_ne!(peer, h.src);
+        assert_eq!(h.src, Some(SocketAddr::from(([198, 51, 100, 22], 5678))));
+        assert_ne!(Some(peer), h.src);
         assert_eq!(h.consumed, line.len());
         assert_eq!(rest, request);
+    }
+
+    #[test]
+    fn identity_preserving_commands_do_not_consume_following_protocol_bytes() {
+        let request = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut unknown = b"PROXY UNKNOWN\r\n".to_vec();
+        unknown.extend_from_slice(request);
+        let (peer, stripped, rest) = serve_one(&unknown, request.len());
+        let h = stripped.expect("UNKNOWN header stripped");
+        assert_eq!(h.src, None);
+        assert!(peer.ip().is_loopback());
+        assert_eq!(rest, request);
+
+        let tls_prefix = [0x16, 0x03, 0x03, 0x00, 0x01];
+        let mut local = v2_header(0, 0x00);
+        local[12] = 0x20;
+        local.extend_from_slice(&tls_prefix);
+        let (peer, stripped, rest) = serve_one(&local, tls_prefix.len());
+        let h = stripped.expect("LOCAL header stripped");
+        assert_eq!(h.src, None);
+        assert!(peer.ip().is_loopback());
+        assert_eq!(rest, tls_prefix);
     }
 
     #[test]
@@ -324,5 +479,40 @@ mod accept_tests {
             stripped.is_none(),
             "a non-PROXY connection must be reported absent so the accept path closes it"
         );
+    }
+
+    #[test]
+    fn partial_proxy_header_obeys_one_total_timeout() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut rt = build_core_runtime().unwrap();
+            rt.block_on(async move {
+                let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let started = Instant::now();
+                let err = match read_and_strip(&mut stream, Some(Duration::from_millis(100))).await
+                {
+                    Err(err) => err,
+                    Ok(_) => panic!("a stalled partial header must time out"),
+                };
+                let _ = tx.send((err.kind(), started.elapsed()));
+            });
+        });
+
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client.write_all(b"P").unwrap();
+        let (kind, elapsed) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(kind, std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= Duration::from_millis(75) && elapsed < Duration::from_secs(1),
+            "one 100 ms header deadline should fire promptly, got {elapsed:?}"
+        );
+        drop(client);
     }
 }

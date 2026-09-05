@@ -8,7 +8,24 @@
 //! the client path, bounded by a global concurrency cap so a wave of stale hits
 //! can't spawn unbounded PHP renders.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+struct InflightState {
+    completed: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl InflightState {
+    fn new() -> Self {
+        Self {
+            completed: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+}
 
 /// Single-flight registry: collapses concurrent cache MISSES of the same key into a single
 /// backend render. The first misser becomes the leader (renders + stores); concurrent
@@ -18,7 +35,7 @@ use std::sync::Arc;
 /// blocks on itself (a render does not sub-request its own URL).
 #[derive(Default)]
 pub struct InflightRegistry {
-    map: dashmap::DashMap<u64, Arc<tokio::sync::Notify>>,
+    map: dashmap::DashMap<u64, Arc<InflightState>>,
 }
 
 /// What [`InflightRegistry::enter`] decided for a given key.
@@ -27,7 +44,31 @@ pub enum Enter {
     /// followers and removes the registry entry.
     Leader(InflightLeader),
     /// Another request is already rendering this key — await it, then re-check the cache.
-    Follower(Arc<tokio::sync::Notify>),
+    Follower(InflightFollower),
+}
+
+/// A follower's sticky view of the current leader's completion.
+#[derive(Clone)]
+pub struct InflightFollower {
+    state: Arc<InflightState>,
+}
+
+impl InflightFollower {
+    /// Wait until the leader finishes. The atomic completion bit closes both
+    /// Notify races: completion before this future exists, and completion
+    /// between the initial check and waiter registration.
+    pub async fn wait(&self) {
+        if self.state.completed.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.state.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.state.completed.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
 }
 
 /// RAII leader token. On drop (at any dispatch return, after `cache_store` on the cacheable
@@ -35,7 +76,7 @@ pub enum Enter {
 pub struct InflightLeader {
     registry: Arc<InflightRegistry>,
     key_hash: u64,
-    notify: Arc<tokio::sync::Notify>,
+    state: Arc<InflightState>,
 }
 
 impl InflightRegistry {
@@ -43,14 +84,16 @@ impl InflightRegistry {
     pub fn enter(self: &Arc<Self>, key_hash: u64) -> Enter {
         use dashmap::mapref::entry::Entry;
         match self.map.entry(key_hash) {
-            Entry::Occupied(e) => Enter::Follower(e.get().clone()),
+            Entry::Occupied(e) => Enter::Follower(InflightFollower {
+                state: e.get().clone(),
+            }),
             Entry::Vacant(e) => {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                e.insert(notify.clone());
+                let state = Arc::new(InflightState::new());
+                e.insert(state.clone());
                 Enter::Leader(InflightLeader {
                     registry: self.clone(),
                     key_hash,
-                    notify,
+                    state,
                 })
             }
         }
@@ -63,18 +106,10 @@ impl Drop for InflightLeader {
         // now-stored entry or (if nothing was cacheable) starts a fresh leader, never
         // waiting on us again.
         self.registry.map.remove(&self.key_hash);
-        // Wake ALL followers, covering both races. The common case is N concurrent missers
-        // parked on this shared Notify at a hot key's TTL expiry:
-        // - notify_waiters() releases EVERY currently-parked follower at once. notify_one()
-        //   alone would wake only ONE and leave the other N-1 to block the full
-        //   SINGLEFLIGHT_WAIT (10s) and then each render the backend — the inverse of the
-        //   stampede protection (the promised "wake the next in turn" chain was never built).
-        // - notify_one() additionally stores ONE permit so a follower that finishes its
-        //   synchronous pre-wait cache_lookup AFTER this drop but before its first notified()
-        //   poll still wakes (notify_waiters stores no permit). Woken followers re-check the
-        //   cache (hit) or one becomes the next leader.
-        self.notify.notify_waiters();
-        self.notify.notify_one();
+        // Completion is sticky for followers that have not started waiting yet;
+        // notify_waiters releases every follower already registered on this state.
+        self.state.completed.store(true, Ordering::Release);
+        self.state.notify.notify_waiters();
     }
 }
 
@@ -208,7 +243,7 @@ mod tests {
             _ => panic!("first enter must be leader"),
         };
         // Concurrent enter, same key → follower with the leader's notify.
-        let notify = match reg.enter(7) {
+        let follower = match reg.enter(7) {
             Enter::Follower(n) => n,
             _ => panic!("second same-key enter must be follower"),
         };
@@ -216,10 +251,10 @@ mod tests {
         assert!(matches!(reg.enter(8), Enter::Leader(_)));
 
         // A waiter on the follower's notify is woken when the leader drops.
-        let woken = notify.clone();
-        let waiter = tokio::spawn(async move { woken.notified().await });
+        let woken = follower.clone();
+        let waiter = tokio::spawn(async move { woken.wait().await });
         tokio::task::yield_now().await; // let the waiter register
-        drop(leader); // removes the slot + notify_one()
+        drop(leader); // removes the slot and marks this generation complete
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("follower must be woken when the leader drops")
@@ -229,15 +264,7 @@ mod tests {
         assert!(matches!(reg.enter(7), Enter::Leader(_)));
     }
 
-    // (#4) Lost-wakeup regression. Reproduces the EXACT production ordering: a follower
-    // obtains the leader's notify (a synchronous pre-wait cache_lookup runs here in prod
-    // with NO yield), the leader then completes + drops, and ONLY AFTER that does the
-    // follower first poll `notified()`. notify_waiters() only wakes futures already parked,
-    // so it would lose this edge and the follower would block the full SINGLEFLIGHT_WAIT
-    // (10s). notify_one() stores a permit, so the first poll after the drop consumes it and
-    // returns immediately — well under SINGLEFLIGHT_WAIT. (The existing
-    // inflight_leader_follower_and_reentry test parks BEFORE the drop with a yield_now; this
-    // one deliberately reverses that order, which is the bug.)
+    // Lost-wakeup regression: the leader completes before the follower starts waiting.
     #[tokio::test]
     async fn inflight_follower_wakeup_survives_drop_before_wait() {
         let reg = Arc::new(InflightRegistry::default());
@@ -245,22 +272,48 @@ mod tests {
             Enter::Leader(g) => g,
             _ => panic!("first enter must be leader"),
         };
-        // Follower grabs the notify (mirrors the pre-wait lookup), no parking yet.
-        let notify = match reg.enter(42) {
+        // Follower enters (mirrors the pre-wait lookup), no waiting yet.
+        let follower = match reg.enter(42) {
             Enter::Follower(n) => n,
             _ => panic!("second same-key enter must be follower"),
         };
-        // Leader finishes + drops BEFORE the follower ever polls notified() — the race.
+        // Leader finishes before the follower calls wait.
         drop(leader);
-        // The stored permit makes this resolve at once; a lost edge would hang to timeout.
-        tokio::time::timeout(Duration::from_millis(500), notify.notified())
+        // Sticky completion makes this resolve at once; a lost edge would hang to timeout.
+        tokio::time::timeout(Duration::from_millis(500), follower.wait())
             .await
-            .expect("notify_one must store a permit so a post-drop notified() does not stall");
+            .expect("a post-drop follower wait must observe completion");
     }
 
-    // (#4, corrected) N followers parked on the shared Notify BEFORE the leader drops must
-    // ALL be released. notify_one() alone woke only ONE and left the other N-1 to block the
-    // full SINGLEFLIGHT_WAIT (10s) then stampede the backend — the inverse of the protection.
+    #[tokio::test]
+    async fn inflight_all_late_followers_observe_completion() {
+        let reg = Arc::new(InflightRegistry::default());
+        let leader = match reg.enter(43) {
+            Enter::Leader(g) => g,
+            _ => panic!("first enter must be leader"),
+        };
+        let first = match reg.enter(43) {
+            Enter::Follower(n) => n,
+            _ => panic!("same-key enter must be follower"),
+        };
+        let second = match reg.enter(43) {
+            Enter::Follower(n) => n,
+            _ => panic!("same-key enter must be follower"),
+        };
+
+        // Neither follower has created or polled a wait future when the leader
+        // completes. Completion must remain observable to every follower, not
+        // only the first one that consumes Notify's single stored permit.
+        drop(leader);
+        tokio::time::timeout(Duration::from_millis(100), first.wait())
+            .await
+            .expect("first late follower must observe completion");
+        tokio::time::timeout(Duration::from_millis(100), second.wait())
+            .await
+            .expect("second late follower must also observe completion");
+    }
+
+    // N followers parked before the leader drops must all be released.
     #[tokio::test]
     async fn inflight_wakes_all_parked_followers_not_just_one() {
         let reg = Arc::new(InflightRegistry::default());
@@ -275,9 +328,9 @@ mod tests {
                 Enter::Follower(nf) => nf,
                 _ => panic!("same-key enter must be follower"),
             };
-            handles.push(tokio::spawn(async move { notify.notified().await }));
+            handles.push(tokio::spawn(async move { notify.wait().await }));
         }
-        // Let every follower poll notified() and park (register as a waiter) before the drop.
+        // Let every follower register before the drop.
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(leader);
         // With notify_waiters() every parked follower wakes; with notify_one() only one would
@@ -290,19 +343,10 @@ mod tests {
         }
     }
 
-    // (#5) The production heavy-vhost concurrency collapse. The pipeline follower does
-    // SLOW pre-wait work (a cache_lookup that loads the whole `.htaccess` chain) before
-    // it parks. If it registers on the notify only AFTER that work (`notified()` last),
-    // a fast leader that renders an UNCACHEABLE response (stores nothing) and drops DURING
-    // the work wakes nobody via notify_waiters() (no one parked yet) and leaves a single
-    // notify_one() permit — so out of N racing followers exactly one proceeds and the rest
-    // block the full SINGLEFLIGHT_WAIT (10s), serializing every concurrent miss. The fix
-    // is for the follower to `enable()` the Notified future BEFORE the slow work, becoming
-    // a registered waiter so notify_waiters() releases it regardless of work duration. This
-    // test reproduces that exact ordering (register → slow work → leader drops mid-work →
-    // park) and asserts ALL followers wake promptly.
+    // Followers that do slow pre-wait work must still observe a leader that completes
+    // during that work.
     #[tokio::test]
-    async fn followers_enabling_before_slow_prework_all_wake_when_leader_drops_midwork() {
+    async fn followers_waiting_after_slow_prework_observe_midwork_completion() {
         let reg = Arc::new(InflightRegistry::default());
         let leader = match reg.enter(123) {
             Enter::Leader(g) => g,
@@ -316,27 +360,20 @@ mod tests {
                 _ => panic!("same-key enter must be follower"),
             };
             handles.push(tokio::spawn(async move {
-                // The correct pipeline pattern: register as a waiter FIRST...
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                // ...THEN do the slow synchronous pre-wait work (the .htaccess-loading
+                // Do the slow synchronous pre-wait work (the .htaccess-loading
                 // cache_lookup), during which the leader will drop...
                 tokio::time::sleep(Duration::from_millis(20)).await;
-                // ...and only now actually park. enable() means the mid-work
-                // notify_waiters() already marked us notified, so this returns at once.
-                notified.await;
+                // ...and only now wait. Sticky completion makes this return at once.
+                notify.wait().await;
             }));
         }
-        // Drop the leader while every follower is still inside its pre-wait work window
-        // (all have enable()d, none has reached the final await). A buggy register-last
-        // follower would lose this wakeup; an enable()-first follower must not.
+        // Drop the leader while every follower is still inside its pre-wait work window.
         tokio::time::sleep(Duration::from_millis(5)).await;
         drop(leader);
         for h in handles {
             tokio::time::timeout(Duration::from_millis(500), h)
                 .await
-                .expect("a follower that enabled before its slow prework must wake on the leader drop, not block to SINGLEFLIGHT_WAIT")
+                .expect("a follower must observe completion after its slow prework")
                 .expect("follower task panicked");
         }
     }

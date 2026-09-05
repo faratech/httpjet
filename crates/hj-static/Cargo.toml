@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 hj-core = { workspace = true }
+hj-compress = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 httpdate = { workspace = true }

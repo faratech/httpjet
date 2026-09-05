@@ -1709,3 +1709,355 @@ fn sub_filter_no_extension_is_a_no_op() {
     });
     assert_eq!(frames_of(resp.into_body()), b"SEND");
 }
+
+/// A deterministic body that can replay data, trailers, and errors in order.
+struct ScriptedBody {
+    frames: std::collections::VecDeque<Result<http_body::Frame<bytes::Bytes>, hj_core::BoxError>>,
+}
+
+impl http_body::Body for ScriptedBody {
+    type Data = bytes::Bytes;
+    type Error = hj_core::BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(self.frames.pop_front())
+    }
+}
+
+#[tokio::test]
+async fn sub_filter_stream_error_preserves_raw_prefix_and_error() {
+    use hj_core::ResponseTransform;
+    use http_body_util::BodyExt;
+
+    let scripted = ScriptedBody {
+        frames: vec![
+            Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                b"prefix ",
+            ))),
+            Ok(http_body::Frame::data(bytes::Bytes::from_static(b"SEND"))),
+            Err(Box::new(std::io::Error::other("scripted stream failure")) as hj_core::BoxError),
+        ]
+        .into(),
+    };
+    let mut resp = stream_response(scripted.boxed());
+    resp.extensions_mut().insert(html_plan(1024));
+    crate::pipeline::SubFilterTransform
+        .transform(&ctx_for_transform(), &mut resp)
+        .await;
+
+    let Body::Stream(mut body) = resp.into_body() else {
+        panic!("a failed source stream must remain a stream");
+    };
+    let prefix = body
+        .frame()
+        .await
+        .expect("prefix frame")
+        .expect("prefix remains successful")
+        .into_data()
+        .expect("prefix data");
+    assert_eq!(prefix, "prefix SEND", "partial data stays unfiltered");
+    let err = body
+        .frame()
+        .await
+        .expect("error frame")
+        .expect_err("the original stream failure must reach the transport");
+    assert_eq!(err.to_string(), "scripted stream failure");
+}
+
+#[tokio::test]
+async fn sub_filter_stream_preserves_trailers_after_filtering() {
+    use hj_core::ResponseTransform;
+    use http_body_util::BodyExt;
+
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert(
+        http::HeaderName::from_static("x-body-checksum"),
+        http::HeaderValue::from_static("present"),
+    );
+    let scripted = ScriptedBody {
+        frames: vec![
+            Ok(http_body::Frame::data(bytes::Bytes::from_static(b"SEND"))),
+            Ok(http_body::Frame::trailers(trailers)),
+        ]
+        .into(),
+    };
+    let mut resp = stream_response(scripted.boxed());
+    resp.extensions_mut().insert(html_plan(1024));
+    crate::pipeline::SubFilterTransform
+        .transform(&ctx_for_transform(), &mut resp)
+        .await;
+
+    assert!(
+        resp.headers().get(header::CONTENT_LENGTH).is_none(),
+        "HTTP/1 trailers require streamed framing"
+    );
+    let Body::Stream(mut body) = resp.into_body() else {
+        panic!("trailers require the filtered response to remain a stream");
+    };
+    let data = body
+        .frame()
+        .await
+        .expect("data frame")
+        .expect("successful data")
+        .into_data()
+        .expect("filtered data");
+    assert_eq!(data, "RECEIVED");
+    let trailers = body
+        .frame()
+        .await
+        .expect("trailer frame")
+        .expect("successful trailers")
+        .into_trailers()
+        .expect("trailers preserved");
+    assert_eq!(trailers["x-body-checksum"], "present");
+}
+
+#[tokio::test]
+async fn sub_filter_file_uses_selected_pinned_or_cached_bytes() {
+    use hj_core::ResponseTransform;
+
+    fn file_response(file: hj_core::FileBody) -> Response {
+        http::Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/html")
+            .body(Body::File(file))
+            .unwrap()
+    }
+
+    let root = temp_root("subfilter-file-version");
+    let selected = root.join("page.html");
+    let archived = root.join("selected-version.html");
+    std::fs::write(&selected, b"PINNED SEND").unwrap();
+    let pinned = std::fs::File::open(&selected).unwrap();
+    std::fs::rename(&selected, &archived).unwrap();
+    std::fs::write(&selected, b"REPLACEMENT SEND").unwrap();
+
+    let mut pinned_resp = file_response(hj_core::FileBody {
+        path: selected.clone(),
+        file: Some(pinned),
+        len: 11,
+        range: None,
+        cached: None,
+    });
+    pinned_resp.extensions_mut().insert(html_plan(1024));
+    crate::pipeline::SubFilterTransform
+        .transform(&ctx_for_transform(), &mut pinned_resp)
+        .await;
+    assert_eq!(frames_of(pinned_resp.into_body()), b"PINNED RECEIVED");
+
+    std::fs::write(&selected, b"DISK SEND").unwrap();
+    let mut cached_resp = file_response(hj_core::FileBody {
+        path: selected,
+        file: None,
+        len: 11,
+        range: None,
+        cached: Some(bytes::Bytes::from_static(b"CACHED SEND")),
+    });
+    cached_resp.extensions_mut().insert(html_plan(1024));
+    crate::pipeline::SubFilterTransform
+        .transform(&ctx_for_transform(), &mut cached_resp)
+        .await;
+    assert_eq!(frames_of(cached_resp.into_body()), b"CACHED RECEIVED");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn apply_sub_filter_preserves_non_utf8_bytes() {
+    use super::apply_sub_filter;
+
+    let plan = hj_core::config::SubFilterConfig {
+        rules: vec![("SEND".to_string(), "RECEIVED".to_string())],
+        ..hj_core::config::SubFilterConfig::default()
+    };
+    let out = apply_sub_filter(
+        &plan,
+        bytes::Bytes::from_static(b"\xff prefix SEND suffix \xfe"),
+    );
+    assert_eq!(&out[..], b"\xff prefix RECEIVED suffix \xfe");
+
+    let untouched = bytes::Bytes::from_static(b"\xff no match \xfe");
+    assert_eq!(apply_sub_filter(&plan, untouched.clone()), untouched);
+}
+
+fn body_limit_context(uri: &str, max_body: u64) -> Context {
+    Context {
+        kind: ContextKind::Static,
+        uri: uri.into(),
+        location: None,
+        handler: None,
+        enabled: true,
+        extra_headers: Vec::new(),
+        add_default_charset: false,
+        charset: None,
+        cache_policy: None,
+        max_body_override: Some(max_body),
+        bandwidth_limit: 0,
+        timeout_override: None,
+        sub_filter: None,
+    }
+}
+
+fn get_with_body(path: &str, body: &'static [u8]) -> Request {
+    use http_body_util::BodyExt;
+    let body = http_body_util::Full::new(bytes::Bytes::from_static(body))
+        .map_err(|never: std::convert::Infallible| -> hj_core::BoxError { match never {} })
+        .boxed();
+    http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::HOST, CANON_HOST)
+        .body(body)
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_body_limit_enforces_original_and_rewritten_paths_without_content_length() {
+    let doc_root = temp_root("context-body-limit");
+    std::fs::write(doc_root.join("upload.txt"), b"upload target\n").unwrap();
+    std::fs::write(
+        doc_root.join(".htaccess"),
+        "RewriteEngine On\nRewriteRule ^front$ /upload.txt [L]\n",
+    )
+    .unwrap();
+    let state = build_state_inner(
+        doc_root.clone(),
+        vec![body_limit_context("/upload.txt", 4)],
+        Vec::new(),
+        true,
+        None,
+        None,
+        |_| {},
+    );
+
+    let direct = get_with_body("/upload.txt", b"12345");
+    assert!(!direct.headers().contains_key(header::CONTENT_LENGTH));
+    assert_eq!(run(&state, direct).await.status(), 413);
+
+    let rewritten = get_with_body("/front", b"12345");
+    assert!(!rewritten.headers().contains_key(header::CONTENT_LENGTH));
+    assert_eq!(
+        run(&state, rewritten).await.status(),
+        413,
+        "the final rewritten context must enforce its body cap"
+    );
+
+    let allowed = run(&state, get_with_body("/front", b"1234")).await;
+    assert_eq!(allowed.status(), 200);
+    assert_eq!(body_bytes(allowed.into_body()), "upload target\n");
+    std::fs::remove_dir_all(doc_root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_serve_bridges_nonempty_and_unknown_request_bodies_before_memo_or_static() {
+    use http_body_util::BodyExt;
+
+    let doc_root = temp_root("fast-body-bridge");
+    std::fs::write(doc_root.join("hello.txt"), b"hello\n").unwrap();
+    let state = build_state(doc_root.clone());
+
+    let nonempty = get_with_body("/hello.txt", b"x");
+    assert!(fast_serve_req(&state, &nonempty).await.is_none());
+
+    let unknown = http::Request::builder()
+        .method("GET")
+        .uri("/hello.txt")
+        .header(header::HOST, CANON_HOST)
+        .body(
+            ScriptedBody {
+                frames: vec![Ok(http_body::Frame::data(bytes::Bytes::from_static(b"x")))].into(),
+            }
+            .boxed(),
+        )
+        .unwrap();
+    assert!(fast_serve_req(&state, &unknown).await.is_none());
+
+    assert!(
+        fast_serve_get(&state, "/hello.txt").await.is_some(),
+        "an actually empty request remains eligible"
+    );
+    std::fs::remove_dir_all(doc_root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_cache_promotion_reads_the_selected_descriptor_for_full_range_and_fast_paths() {
+    fn file_response(
+        path: PathBuf,
+        file: std::fs::File,
+        len: u64,
+        range: Option<(u64, u64)>,
+    ) -> Response {
+        http::Response::builder()
+            .status(if range.is_some() { 206 } else { 200 })
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::ETAG, "\"selected-version\"")
+            .header(header::LAST_MODIFIED, "Thu, 01 Jan 1970 00:00:00 GMT")
+            .body(Body::File(hj_core::FileBody {
+                path,
+                file: Some(file),
+                len,
+                range,
+                cached: None,
+            }))
+            .unwrap()
+    }
+
+    let root = temp_root("static-selected-fd");
+    let state = build_state(root.clone());
+
+    let ordinary_path = root.join("ordinary.txt");
+    let selected = b"OLD-FULL";
+    std::fs::write(&ordinary_path, selected).unwrap();
+    let ordinary_fd = std::fs::File::open(&ordinary_path).unwrap();
+    let range_fd = ordinary_fd.try_clone().unwrap();
+    let replacement = root.join("ordinary-replacement.txt");
+    std::fs::write(&replacement, b"NEW-FULL").unwrap();
+    std::fs::rename(replacement, &ordinary_path).unwrap();
+
+    let mut full = file_response(
+        ordinary_path.clone(),
+        ordinary_fd,
+        selected.len() as u64,
+        None,
+    );
+    super::maybe_cache_static(&state.static_cache, 7, &mut full);
+    assert_eq!(
+        body_bytes(full.into_body()),
+        bytes::Bytes::from_static(selected),
+        "ordinary promotion must not mix replacement bytes with selected-file validators"
+    );
+
+    let mut ranged = file_response(ordinary_path, range_fd, selected.len() as u64, Some((1, 3)));
+    super::maybe_cache_static(&state.static_cache, 7, &mut ranged);
+    let Body::File(ranged) = ranged.into_body() else {
+        panic!("a ranged response stays a file body");
+    };
+    assert!(
+        ranged.file.is_some(),
+        "the selected descriptor remains pinned"
+    );
+    assert_eq!(
+        ranged.cached_ranged().unwrap(),
+        bytes::Bytes::from_static(b"LD-"),
+        "range promotion must attach the selected file's whole cached body"
+    );
+
+    let fast_path = root.join("fast.txt");
+    std::fs::write(&fast_path, b"OLD-FAST").unwrap();
+    let fast_fd = std::fs::File::open(&fast_path).unwrap();
+    let fast_replacement = root.join("fast-replacement.txt");
+    std::fs::write(&fast_replacement, b"NEW-FAST").unwrap();
+    std::fs::rename(fast_replacement, &fast_path).unwrap();
+    let fast = file_response(fast_path, fast_fd, 8, None);
+    let fast = super::buffer_static_file(&state, 8, fast).expect("small file buffers in fast path");
+    assert_eq!(
+        body_bytes(fast.into_body()),
+        bytes::Bytes::from_static(b"OLD-FAST"),
+        "fast promotion must read the same selected descriptor as the ordinary funnel"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}

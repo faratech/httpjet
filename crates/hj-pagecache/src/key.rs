@@ -134,21 +134,22 @@ fn should_strip(name: &str, modifiers: &[QsStrip]) -> bool {
 /// Only cookies that are *present* in the request contribute, sorted by name
 /// and joined `name=value`. So a guest with none of them yields `""` (one
 /// shared cache entry — the common case), while a dark-mode visitor yields
-/// `xf_style_variation=dark` (its own entry). Identical on the lookup and store
+/// `xf_style_variation=v:dark` (its own entry). Identical on the lookup and store
 /// paths, so the keys agree. Each value is bounded to 64 bytes for key sanity.
-/// Bound a vary-cookie value's contribution to the cache key. A short value is used
-/// verbatim; a long one is replaced by a deterministic hash of the FULL value rather
-/// than a 64-byte prefix — truncation would alias two long cookies sharing that prefix
-/// onto a single variant (wrong-variant serve). `DefaultHasher::new()` is fixed-seed, so
-/// the digest is stable across calls/processes (lookup and store keys still agree).
+/// Bound a vary-cookie value's contribution to the cache key. Literal and hashed
+/// encodings have distinct prefixes, so a short cookie that looks like an emitted
+/// hash token cannot alias the long cookie that produced that token. Values over 62
+/// bytes are replaced by a deterministic hash of the FULL value rather than a prefix.
+/// `DefaultHasher::new()` is fixed-seed, so the digest is stable across calls/processes
+/// (lookup and store keys still agree).
 fn bounded_vary_value(v: &str) -> String {
-    if v.len() <= 64 {
-        return v.to_string();
+    if v.len() <= 62 {
+        return format!("v:{v}");
     }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     v.hash(&mut h);
-    format!("#h{:016x}", h.finish())
+    format!("h:{:016x}", h.finish())
 }
 
 pub fn compute_vary_value<S: AsRef<str>>(
@@ -371,7 +372,7 @@ mod tests {
     #[test]
     fn vary_cookie_extracted() {
         let c = Some("xf_csrf=abc; xf_user=42,deadbeef; foo=bar");
-        assert_eq!(vary_value_from_request(c, "xf_user"), "42,deadbeef");
+        assert_eq!(vary_value_from_request(c, "xf_user"), "v:42,deadbeef");
         assert_eq!(vary_value_from_request(c, "missing"), "");
         assert_eq!(vary_value_from_request(None, "xf_user"), "");
     }
@@ -401,7 +402,7 @@ mod tests {
             &style_cookies(),
         );
         assert_eq!(guest, "");
-        assert_eq!(dark, "xf_style_variation=dark");
+        assert_eq!(dark, "xf_style_variation=v:dark");
         assert_ne!(
             guest, dark,
             "dark-mode visitor must key to a distinct entry"
@@ -425,10 +426,38 @@ mod tests {
             a, b,
             "long values sharing a 64-byte prefix must key distinctly"
         );
-        // A short value is still used verbatim (stable, readable key).
+        // A short value remains readable inside the literal domain.
         assert_eq!(
             compute_vary_value(Some("xf_style_variation=dark"), &style_cookies()),
-            "xf_style_variation=dark"
+            "xf_style_variation=v:dark"
+        );
+    }
+
+    #[test]
+    fn vary_hash_encoding_cannot_alias_a_literal_cookie_value() {
+        let long = "x".repeat(65);
+        let encoded_long = bounded_vary_value(&long);
+        assert!(
+            encoded_long.len() <= 64,
+            "hash marker is itself a short value"
+        );
+        assert_ne!(
+            bounded_vary_value(&encoded_long),
+            encoded_long,
+            "literal and hashed value domains must be distinct"
+        );
+
+        let long_header = format!("xf_style_variation={long}");
+        let literal_header = format!("xf_style_variation={encoded_long}");
+        assert_ne!(
+            compute_vary_value(Some(&long_header), &style_cookies()),
+            compute_vary_value(Some(&literal_header), &style_cookies()),
+            "multi-cookie vary keys must distinguish a literal hash-looking value"
+        );
+        assert_ne!(
+            vary_value_from_request(Some(&long_header), "xf_style_variation"),
+            vary_value_from_request(Some(&literal_header), "xf_style_variation"),
+            "single-cookie helper must distinguish a literal hash-looking value"
         );
     }
 
@@ -442,7 +471,7 @@ mod tests {
             Some("xf_csrf=abc; XF_Style_Variation=dark"),
             &style_cookies(),
         );
-        assert_eq!(canon, "xf_style_variation=dark");
+        assert_eq!(canon, "xf_style_variation=v:dark");
         assert_eq!(upper, "");
         assert_ne!(canon, upper);
     }
@@ -454,7 +483,7 @@ mod tests {
                 Some("xf_style_id=4; xf_style_id=7; XF_STYLE_ID=9"),
                 &style_cookies(),
             ),
-            "xf_style_id=4"
+            "xf_style_id=v:4"
         );
     }
 
@@ -486,7 +515,7 @@ mod tests {
             &style_cookies(),
         );
         assert_eq!(a, b);
-        assert_eq!(a, "xf_language_id=2;xf_style_id=5");
+        assert_eq!(a, "xf_language_id=v:2;xf_style_id=v:5");
     }
 
     #[test]

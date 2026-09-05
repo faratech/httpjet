@@ -27,12 +27,15 @@ use hj_proxy::{ProxyTarget, is_websocket_upgrade};
 use hj_rewrite::Htaccess;
 use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, ETAG, LAST_MODIFIED};
 use http::{HeaderValue, StatusCode};
+use http_body::Body as _;
 
 use crate::lscache;
 use crate::state::ServerState;
 
 #[cfg(test)]
 mod e2e;
+#[cfg(test)]
+mod expires_tests;
 pub(crate) mod fast_memo;
 mod htaccess_apply;
 mod proxy_glue;
@@ -198,6 +201,13 @@ pub(crate) async fn fast_serve(
     }
     let method = req.method().clone();
     if method != http::Method::GET && method != http::Method::HEAD {
+        return None;
+    }
+    // Request bodies are outside the on-core memo/cache/static contract. The
+    // final routed path may rewrite into a capped context, and body bytes are
+    // not part of any fast-path cache key, so always bridge nonempty or inexact
+    // bodies before probing a finished response.
+    if exact_request_body_size(req) != Some(0) {
         return None;
     }
     // (SEC1) request-target length cap — bridge the 414 to the full pipeline.
@@ -991,9 +1001,9 @@ fn buffer_static_file(
     vhost_id: u32,
     mut resp: Response,
 ) -> Option<Response> {
-    let (path, len, cached) = match resp.body() {
+    let (len, cached) = match resp.body() {
         Body::Full(_) | Body::Empty => return Some(resp),
-        Body::File(f) if f.range.is_none() => (f.path.clone(), f.len, f.cached.clone()),
+        Body::File(f) if f.range.is_none() => (f.len, f.cached.clone()),
         _ => return None,
     };
     if len > state.static_cache.config().max_static_obj_bytes {
@@ -1014,11 +1024,14 @@ fn buffer_static_file(
         .to_string();
     let etag = header_value_string(resp.headers(), http::header::ETAG);
     let last_modified = header_value_string(resp.headers(), http::header::LAST_MODIFIED);
+    let selected = match resp.body() {
+        Body::File(f) => f,
+        _ => return Some(resp),
+    };
     match static_cached_bytes(
         &state.static_cache,
         vhost_id,
-        &path,
-        len,
+        selected,
         ct,
         etag,
         last_modified,
@@ -1621,11 +1634,11 @@ impl hj_core::ResponseTransform for SubFilterTransform {
                 *resp.body_mut() = Body::Full(filtered);
             }
             Body::File(f) if f.range.is_none() && f.len <= plan.max_body => {
-                // Small files are already promoted to Full by CacheStaticTransform;
-                // this File is uncached but small enough to buffer.
-                match std::fs::read(&f.path) {
+                // Buffer the exact representation selected upstream. FileBody may
+                // carry cache bytes or a descriptor pinned before path replacement.
+                match selected_file_bytes(&f) {
                     Ok(bytes) => {
-                        let filtered = apply_sub_filter(&plan, bytes.into());
+                        let filtered = apply_sub_filter(&plan, bytes);
                         finalize_filtered(resp, &plan, filtered.len());
                         *resp.body_mut() = Body::Full(filtered);
                     }
@@ -1638,26 +1651,65 @@ impl hj_core::ResponseTransform for SubFilterTransform {
                 // — never a half-filtered entity.
                 use http_body_util::BodyExt;
                 let mut buf = bytes::BytesMut::new();
-                let mut overflow = false;
+                let mut overflow_chunk = None;
+                let mut failure = None;
+                let mut trailers = Vec::new();
                 loop {
                     match s.frame().await {
                         Some(Ok(frame)) => {
-                            if let Some(d) = frame.data_ref() {
-                                buf.extend_from_slice(d);
-                                if buf.len() as u64 > plan.max_body {
-                                    overflow = true;
+                            if frame.is_data() {
+                                let data = frame.into_data().expect("data frame");
+                                if (buf.len() as u64).saturating_add(data.len() as u64)
+                                    > plan.max_body
+                                {
+                                    // Keep the chunk intact for raw replay. Do not
+                                    // copy bytes that already prove the cap exceeded.
+                                    overflow_chunk = Some(data);
                                     break;
                                 }
+                                buf.extend_from_slice(&data);
+                            } else {
+                                let trailer = frame.into_trailers().expect("trailers frame");
+                                trailers.push(trailer);
                             }
                         }
-                        Some(Err(_)) | None => break,
+                        Some(Err(err)) => {
+                            // The prefix has already left the source body. Replay it
+                            // unchanged, followed by the exact error, so a truncated
+                            // upstream can never become a successful filtered entity.
+                            failure = Some(err);
+                            break;
+                        }
+                        None => break,
                     }
                 }
-                if overflow {
+                if overflow_chunk.is_some() || failure.is_some() {
+                    // Coalesce all accepted DATA into one frame: chunk count must
+                    // not become an allocation multiplier under the byte cap.
+                    let buffered = buf.freeze();
+                    let prefix_len = (buffered.len() as u64).saturating_add(
+                        overflow_chunk.as_ref().map_or(0, |data| data.len() as u64),
+                    );
+                    let mut prefix = std::collections::VecDeque::new();
+                    if !buffered.is_empty() {
+                        prefix.push_back(Ok(http_body::Frame::data(buffered)));
+                    }
+                    if let Some(data) = overflow_chunk {
+                        prefix.push_back(Ok(http_body::Frame::data(data)));
+                    }
+                    prefix.extend(
+                        trailers
+                            .into_iter()
+                            .map(|t| Ok(http_body::Frame::trailers(t))),
+                    );
+                    if let Some(err) = failure {
+                        prefix.push_back(Err(err));
+                    }
                     use http_body_util::BodyExt;
                     *resp.body_mut() = Body::Stream(
                         PrefixBody {
-                            prefix: Some(buf.freeze()),
+                            prefix,
+                            prefix_len,
                             inner: s,
                         }
                         .boxed(),
@@ -1665,7 +1717,33 @@ impl hj_core::ResponseTransform for SubFilterTransform {
                 } else {
                     let filtered = apply_sub_filter(&plan, buf.freeze());
                     finalize_filtered(resp, &plan, filtered.len());
-                    *resp.body_mut() = Body::Full(filtered);
+                    if trailers.is_empty() {
+                        *resp.body_mut() = Body::Full(filtered);
+                    } else {
+                        // HTTP/1 trailers require chunked framing. Preserve the
+                        // original trailers after the filtered data and leave the
+                        // response length unknown to the transport.
+                        resp.headers_mut().remove(CONTENT_LENGTH);
+                        let prefix_len = filtered.len() as u64;
+                        let mut prefix = std::collections::VecDeque::new();
+                        if !filtered.is_empty() {
+                            prefix.push_back(Ok(http_body::Frame::data(filtered)));
+                        }
+                        prefix.extend(
+                            trailers
+                                .into_iter()
+                                .map(|t| Ok(http_body::Frame::trailers(t))),
+                        );
+                        use http_body_util::BodyExt;
+                        *resp.body_mut() = Body::Stream(
+                            PrefixBody {
+                                prefix,
+                                prefix_len,
+                                inner: s,
+                            }
+                            .boxed(),
+                        );
+                    }
                 }
             }
             other => *resp.body_mut() = other,
@@ -1673,11 +1751,38 @@ impl hj_core::ResponseTransform for SubFilterTransform {
     }
 }
 
-/// A body that yields one buffered prefix frame before forwarding the inner
-/// stream — the raw-passthrough path when a stream overflows the sub_filter
-/// buffering cap (the entity must pass through whole, never half-filtered).
+/// Read the exact representation selected by the static/cache layer. Cached
+/// bytes take precedence, followed by the pinned descriptor; the pathname is
+/// only a fallback for legacy FileBody producers that supply neither.
+fn selected_file_bytes(file: &hj_core::FileBody) -> std::io::Result<bytes::Bytes> {
+    if let Some(bytes) = &file.cached {
+        return Ok(bytes.clone());
+    }
+    let opened;
+    let selected = if let Some(pinned) = &file.file {
+        pinned
+    } else {
+        opened = std::fs::File::open(&file.path)?;
+        &opened
+    };
+    use std::os::unix::fs::FileExt;
+    let len = usize::try_from(file.len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file body length too large",
+        )
+    })?;
+    let mut bytes = vec![0; len];
+    selected.read_exact_at(&mut bytes, 0)?;
+    Ok(bytes.into())
+}
+
+/// A body that replays frames consumed during inspection before forwarding the
+/// inner stream. Used for raw passthrough after overflow/error and to retain
+/// trailers on successfully filtered streams.
 struct PrefixBody {
-    prefix: Option<bytes::Bytes>,
+    prefix: std::collections::VecDeque<Result<http_body::Frame<bytes::Bytes>, hj_core::BoxError>>,
+    prefix_len: u64,
     inner: hj_core::StreamBody,
 }
 
@@ -1689,43 +1794,76 @@ impl http_body::Body for PrefixBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        if let Some(chunk) = self.prefix.take() {
-            return std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))));
+        if let Some(frame) = self.prefix.pop_front() {
+            if let Ok(frame) = &frame
+                && let Some(data) = frame.data_ref()
+            {
+                self.prefix_len = self.prefix_len.saturating_sub(data.len() as u64);
+            }
+            return std::task::Poll::Ready(Some(frame));
         }
         std::pin::Pin::new(&mut self.inner).poll_frame(cx)
     }
 
     fn is_end_stream(&self) -> bool {
-        self.prefix.is_none() && self.inner.is_end_stream()
+        self.prefix.is_empty() && self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         // The prefix is known; the inner stream is not — lower bound only.
         let mut hint = http_body::SizeHint::default();
-        hint.set_lower(self.prefix.as_ref().map_or(0, |b| b.len() as u64));
+        hint.set_lower(self.prefix_len);
         hint
     }
 }
 
 /// Apply the rules in order (all occurrences, or the first only under `once`).
 fn apply_sub_filter(plan: &hj_core::config::SubFilterConfig, body: bytes::Bytes) -> bytes::Bytes {
-    if plan.rules.is_empty() {
-        return body;
-    }
-    let mut text = String::from_utf8_lossy(&body).into_owned();
+    let mut bytes = body;
     for (search, replace) in &plan.rules {
         if search.is_empty() {
             continue;
         }
-        if plan.once {
-            if let Some(pos) = text.find(search.as_str()) {
-                text.replace_range(pos..pos + search.len(), replace);
-            }
-        } else {
-            text = text.replace(search.as_str(), replace);
+        bytes = replace_bytes(bytes, search.as_bytes(), replace.as_bytes(), plan.once);
+    }
+    bytes
+}
+
+/// Literal, non-overlapping byte replacement. Rules are configured as UTF-8
+/// strings, but eligible response bodies may use another charset, so bytes
+/// outside the matched tokens must pass through unchanged.
+fn replace_bytes(
+    body: bytes::Bytes,
+    search: &[u8],
+    replacement: &[u8],
+    once: bool,
+) -> bytes::Bytes {
+    if search.is_empty() {
+        return body;
+    }
+    let Some(first) = body
+        .windows(search.len())
+        .position(|window| window == search)
+    else {
+        return body;
+    };
+    let mut out = Vec::with_capacity(body.len());
+    out.extend_from_slice(&body[..first]);
+    out.extend_from_slice(replacement);
+    let mut cursor = first + search.len();
+    if !once {
+        while let Some(relative) = body[cursor..]
+            .windows(search.len())
+            .position(|window| window == search)
+        {
+            let pos = cursor + relative;
+            out.extend_from_slice(&body[cursor..pos]);
+            out.extend_from_slice(replacement);
+            cursor = pos + search.len();
         }
     }
-    text.into_bytes().into()
+    out.extend_from_slice(&body[cursor..]);
+    out.into()
 }
 
 /// Recompute Content-Length and drop the entity validators: the bytes changed,
@@ -1788,23 +1926,113 @@ fn build_revalidation_request(req: &Request, cookie: RefreshCookie) -> Request {
 /// concurrent refreshes; if the slot/permit can't be taken the refresh is simply skipped and
 /// the stale entry is retried on the next hit. Only cacheable GET/HEAD reach a stale hit.
 
-/// (Tier 2) Find the tightest per-context body limit matching `path`, or the
-/// server-wide default. A `<context>` with `<maxReqBodySize>` overrides the
-/// server limit for requests under its URI prefix.
-fn effective_max_body(ctx: &ReqCtx, path: &str, server_default: u64) -> u64 {
-    let mut best = server_default;
-    for c in &ctx.vhost.contexts {
-        if !c.enabled || c.max_body_override.is_none() {
-            continue;
+/// Exact request-body size when the incoming body implementation knows it.
+/// All active H1/H2/H3 transports buffer request bodies before entering the
+/// pipeline, so this accounts for actual bytes even when Content-Length is
+/// absent (for example HTTP/2 DATA or H1 chunked encoding).
+fn exact_request_body_size(req: &Request) -> Option<u64> {
+    let hint = req.body().size_hint();
+    (hint.upper() == Some(hint.lower())).then_some(hint.lower())
+}
+
+struct BufferedRequestBody {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    remaining_data: u64,
+}
+
+impl http_body::Body for BufferedRequestBody {
+    type Data = bytes::Bytes;
+    type Error = hj_core::BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let frame = self.frames.pop_front();
+        if let Some(data) = frame.as_ref().and_then(http_body::Frame::data_ref) {
+            self.remaining_data = self.remaining_data.saturating_sub(data.len() as u64);
         }
-        if context_uri_matches(path, &c.uri) {
-            let v = c.max_body_override.unwrap();
-            if v < best {
-                best = v;
+        std::task::Poll::Ready(frame.map(Ok))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining_data)
+    }
+}
+
+/// Find the tightest declared context body limit matching `path`. The
+/// server-wide cap remains a ceiling: a context may only tighten it. `None`
+/// means no matching enabled context declares an override.
+fn matching_max_body_limit(ctx: &ReqCtx, path: &str, server_default: u64) -> Option<u64> {
+    ctx.vhost
+        .contexts
+        .iter()
+        .filter(|c| c.enabled && c.max_body_override.is_some() && context_uri_matches(path, &c.uri))
+        .filter_map(|c| c.max_body_override)
+        .fold(None, |best, value| {
+            Some(best.map_or(server_default.min(value), |b: u64| b.min(value)))
+        })
+}
+
+/// Enforce a matching context cap against actual bytes. Active transports enter
+/// with an exact buffered body; if a future/internal caller supplies a stream,
+/// collect only up to the cap and replace the request body so valid bytes and
+/// trailers remain available to the terminal handler.
+async fn enforce_context_body_limit(
+    ctx: &ReqCtx,
+    path: &str,
+    server_default: u64,
+    req: &mut Request,
+) -> Result<(), StatusCode> {
+    let Some(limit) = matching_max_body_limit(ctx, path, server_default) else {
+        return Ok(());
+    };
+    if let Some(size) = exact_request_body_size(req) {
+        return if size <= limit {
+            Ok(())
+        } else {
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        };
+    }
+
+    use http_body_util::BodyExt;
+    let mut body = std::mem::replace(req.body_mut(), hj_core::empty_incoming());
+    let mut frames = std::collections::VecDeque::new();
+    let mut size = 0u64;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| StatusCode::BAD_REQUEST)?;
+        if let Some(data) = frame.data_ref() {
+            size = size
+                .checked_add(data.len() as u64)
+                .ok_or(StatusCode::PAYLOAD_TOO_LARGE)?;
+            if size > limit {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
             }
         }
+        frames.push_back(frame);
     }
-    best
+    *req.body_mut() = BufferedRequestBody {
+        frames,
+        remaining_data: size,
+    }
+    .boxed();
+    Ok(())
+}
+
+/// Most-specific enabled context that both matches `path` and declares a
+/// response timeout. A more-specific context with no override inherits the
+/// nearest declaring ancestor rather than masking it.
+fn effective_response_timeout(ctx: &ReqCtx, path: &str) -> Option<u64> {
+    ctx.vhost
+        .contexts
+        .iter()
+        .filter(|c| c.enabled && c.timeout_override.is_some() && context_uri_matches(path, &c.uri))
+        .max_by_key(|c| c.uri.len())
+        .and_then(|c| c.timeout_override)
 }
 
 /// (Tier 2) The strictest `bandwidthLimit` among the matching contexts that declare one;
@@ -1960,6 +2188,21 @@ async fn dispatch(
     // continue to call `resolved_rel_path` (slash irrelevant there).
     let orig_path = normalized_request_path(&decoded_path);
     let orig_query = req.uri().query().unwrap_or("").to_string();
+    // Enforce the context body cap before rewrite can return a terminal result
+    // and before any page-cache lookup or handler. The transport-buffered body's
+    // exact size is authoritative and therefore also covers requests with no
+    // Content-Length. Fail closed if a future transport supplies an inexact
+    // streaming body under a capped path.
+    if let Err(status) = enforce_context_body_limit(
+        ctx,
+        &orig_path,
+        state.serve_config.max_req_body_size as u64,
+        &mut req,
+    )
+    .await
+    {
+        return error_page(status);
+    }
     // Borrow the original path/query; only the `Rewritten` arm below promotes them to Owned, so
     // the common unchanged case (e.g. a static `.bin` whose rewrite is a no-op) clones neither.
     let mut cur_path: Cow<str> = Cow::Borrowed(&orig_path);
@@ -2113,6 +2356,22 @@ async fn dispatch(
     } else {
         orig_rel
     };
+
+    // A rewrite may route an originally unbounded URI into a context with a
+    // tighter cap. Recheck the final normalized path before any access result,
+    // page-cache lookup, or terminal handler. If the original-path check had to
+    // collect a stream, the replacement body now has an exact size and this is
+    // a cheap comparison.
+    if let Err(status) = enforce_context_body_limit(
+        ctx,
+        cur_path.as_ref(),
+        state.serve_config.max_req_body_size as u64,
+        &mut req,
+    )
+    .await
+    {
+        return error_page(status);
+    }
 
     // ---- 4. ACCESS enforcement (#1): a denied path is a 403 BEFORE any
     // terminal handler (proxy / LSAPI / static). Fail-safe: any matching
@@ -2334,25 +2593,6 @@ async fn dispatch(
     // `[P]` is non-cacheable, so this is inert for it). No single-flight: the `[P]` path is
     // low-volume; add it if a high-traffic cacheable `[P]` ever appears.
     if let Some(target_url) = proxy_target {
-        // (Tier 2) Per-context body limit: reject before the body is consumed if the
-        // matching context declares a tighter limit than the server-wide default.
-        {
-            let eff_max = effective_max_body(
-                ctx,
-                req.uri().path(),
-                state.serve_config.max_req_body_size as u64,
-            );
-            if let Some(cl) = req
-                .headers()
-                .get(http::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                if cl > eff_max {
-                    return error_page(StatusCode::PAYLOAD_TOO_LARGE);
-                }
-            }
-        }
         let is_refresh_p = req.extensions().get::<RefreshMode>().is_some();
         if cache_on && !cache_has_range && !is_refresh_p {
             let inm = req
@@ -2374,12 +2614,7 @@ async fn dispatch(
                     proxy: state.proxy.clone(),
                     telemetry: state.telemetry.clone(),
                     target,
-                    response_timeout_override: ctx
-                        .vhost
-                        .contexts
-                        .iter()
-                        .find(|c| context_uri_matches(cur_path.as_ref(), c.uri.as_str()))
-                        .and_then(|c| c.timeout_override),
+                    response_timeout_override: effective_response_timeout(ctx, cur_path.as_ref()),
                 };
                 state
                     .telemetry
@@ -2508,28 +2743,11 @@ async fn dispatch(
                         state.telemetry.record_cache_miss(ctx.peer_ip.is_loopback());
                         _sf_leader = Some(guard);
                     }
-                    lscache::Enter::Follower(notify) => {
+                    lscache::Enter::Follower(follower) => {
                         // Another request is rendering this key. It may have already stored;
                         // otherwise wait (bounded) for it to wake us, then serve from cache.
                         // (force_miss=false here: a follower WANTS the leader's fresh entry.)
                         //
-                        // CRITICAL: REGISTER on the leader's Notify (`enable()`) BEFORE the
-                        // pre-wait cache_lookup. A tokio `Notified` future is not a registered
-                        // waiter until first polled or enabled. If we ran the lookup first —
-                        // which on the heavy vhost loads the whole `.htaccess` chain and builds
-                        // the key, far longer than a fast leader's render — and the leader
-                        // dropped during it, the leader's `notify_waiters()` would wake nobody
-                        // (we are not parked yet) and its `notify_one()` stores only ONE permit.
-                        // With N concurrent followers racing in this window, exactly one consumes
-                        // the permit and the other N-1 lose the wakeup and block the full
-                        // SINGLEFLIGHT_WAIT (10s) — the heavy-vhost concurrency collapse (a
-                        // cacheable-candidate-but-uncacheable response, e.g. robots.txt, where
-                        // the leader stores nothing, serializes every concurrent miss to ~1 at a
-                        // time with 10s tails). Enabling first makes us a registered waiter so
-                        // `notify_waiters()` releases us regardless of lookup duration.
-                        let notified = notify.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
                         if let lscache::CacheOutcome::Hit(hit) =
                             lscache::cache_lookup(state, ctx, &cc, inm, false, None)
                         {
@@ -2537,7 +2755,7 @@ async fn dispatch(
                             state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
                             return hit;
                         }
-                        let _ = tokio::time::timeout(SINGLEFLIGHT_WAIT, notified).await;
+                        let _ = tokio::time::timeout(SINGLEFLIGHT_WAIT, follower.wait()).await;
                         if let lscache::CacheOutcome::Hit(hit) =
                             lscache::cache_lookup(state, ctx, &cc, inm, false, None)
                         {
@@ -2584,12 +2802,7 @@ async fn dispatch(
                 proxy: state.proxy.clone(),
                 telemetry: state.telemetry.clone(),
                 target,
-                response_timeout_override: ctx
-                    .vhost
-                    .contexts
-                    .iter()
-                    .find(|c| context_uri_matches(cur_path.as_ref(), c.uri.as_str()))
-                    .and_then(|c| c.timeout_override),
+                response_timeout_override: effective_response_timeout(ctx, cur_path.as_ref()),
             };
             state
                 .telemetry
@@ -3455,10 +3668,8 @@ pub(super) fn maybe_cache_static(
     if !ranged && resp.status() != StatusCode::OK {
         return;
     }
-    let (path, len) = match resp.body() {
-        Body::File(f) if f.range.is_some() == ranged && f.cached.is_none() => {
-            (f.path.clone(), f.len)
-        }
+    let len = match resp.body() {
+        Body::File(f) if f.range.is_some() == ranged && f.cached.is_none() => f.len,
         _ => return,
     };
     if len > static_cache.config().max_static_obj_bytes {
@@ -3472,11 +3683,14 @@ pub(super) fn maybe_cache_static(
         .to_string();
     let etag = header_value_string(resp.headers(), http::header::ETAG);
     let last_modified = header_value_string(resp.headers(), http::header::LAST_MODIFIED);
+    let selected = match resp.body() {
+        Body::File(f) => f,
+        _ => return,
+    };
     if let Some(bytes) = static_cached_bytes(
         static_cache,
         vhost_id,
-        &path,
-        len,
+        selected,
         ct,
         etag,
         last_modified,
@@ -3502,18 +3716,37 @@ enum StaticReadMode {
 fn static_cached_bytes(
     cache: &hj_pagecache::PageStore,
     vhost_id: u32,
-    path: &std::path::Path,
-    len: u64,
+    selected: &hj_core::FileBody,
     content_type: String,
     etag: String,
     last_modified: String,
     read_mode: StaticReadMode,
 ) -> Option<bytes::Bytes> {
+    let path = &selected.path;
+    let len = selected.len;
     if len > cache.config().max_static_obj_bytes {
         return None;
     }
-    let fresh_id = match hj_pagecache::FileId::stat(path) {
-        Ok(id) => id,
+    // The descriptor chosen by hj-static is the representation whose ETag and
+    // Last-Modified are already on the response. Derive cache identity and body
+    // from that SAME open file. Legacy producers without a descriptor open the
+    // pathname once and use that one handle for both operations.
+    let opened;
+    let file = match selected.file.as_ref() {
+        Some(file) => file,
+        None => {
+            opened = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(_) => {
+                    cache.invalidate_static(vhost_id, path);
+                    return None;
+                }
+            };
+            &opened
+        }
+    };
+    let fresh_id = match file.metadata() {
+        Ok(meta) => hj_pagecache::FileId::from_metadata(&meta),
         Err(_) => {
             cache.invalidate_static(vhost_id, path);
             return None;
@@ -3532,10 +3765,16 @@ fn static_cached_bytes(
             }
         }
     }
-    let read = || std::fs::read(path);
+    let read = || {
+        let size = usize::try_from(len).ok()?;
+        let mut bytes = vec![0; size];
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut bytes, 0).ok()?;
+        Some(bytes)
+    };
     let bytes = match read_mode {
-        StaticReadMode::Direct => read().ok()?,
-        StaticReadMode::TokioBlocking => tokio::task::block_in_place(read).ok()?,
+        StaticReadMode::Direct => read()?,
+        StaticReadMode::TokioBlocking => tokio::task::block_in_place(read)?,
     };
     if bytes.len() as u64 != len {
         return None;
@@ -3593,7 +3832,7 @@ fn unix_now() -> i64 {
 }
 
 /// Apply `expiresByType` Cache-Control/Expires headers to cacheable static
-/// responses (200/206 with a content-type, no existing Cache-Control).
+/// responses (200/206 with a content-type, no existing cache-expiry headers).
 pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp: &mut Response) {
     if expires.is_empty() {
         return;
@@ -3602,7 +3841,9 @@ pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp:
     if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
         return;
     }
-    if resp.headers().contains_key(http::header::CACHE_CONTROL) {
+    if resp.headers().contains_key(http::header::CACHE_CONTROL)
+        || resp.headers().contains_key(http::header::EXPIRES)
+    {
         return;
     }
     let rule = match resp
@@ -3634,7 +3875,7 @@ pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp:
         static EXPIRES_MEMO: std::cell::RefCell<(i64, http::HeaderValue)> =
             std::cell::RefCell::new((i64::MIN, http::HeaderValue::from_static("0")));
     }
-    let key = h.expire_unix.max(0);
+    let key = h.expire_unix;
     let memo = EXPIRES_MEMO.with(|m| {
         let mut m = m.borrow_mut();
         if m.0 != key {
@@ -4072,6 +4313,170 @@ mod tests {
         assert_eq!(
             effective_static_charset(&context).as_deref(),
             Some("ISO-8859-1")
+        );
+    }
+
+    fn resource_context(
+        uri: &str,
+        enabled: bool,
+        max_body_override: Option<u64>,
+        timeout_override: Option<u64>,
+    ) -> hj_core::config::Context {
+        hj_core::config::Context {
+            kind: hj_core::config::ContextKind::Proxy,
+            uri: uri.into(),
+            location: None,
+            handler: Some("app".into()),
+            enabled,
+            extra_headers: vec![],
+            add_default_charset: false,
+            charset: None,
+            cache_policy: None,
+            max_body_override,
+            bandwidth_limit: 0,
+            timeout_override,
+            sub_filter: None,
+        }
+    }
+
+    fn request_with_bytes(bytes: &'static [u8]) -> Request {
+        use http_body_util::BodyExt;
+        let body = http_body_util::Full::new(bytes::Bytes::from_static(bytes))
+            .map_err(|never: std::convert::Infallible| -> hj_core::BoxError { match never {} })
+            .boxed();
+        http::Request::builder().uri("/api").body(body).unwrap()
+    }
+
+    #[derive(Debug)]
+    struct UnknownIncomingBody {
+        frame: Option<Result<http_body::Frame<bytes::Bytes>, hj_core::BoxError>>,
+    }
+
+    impl http_body::Body for UnknownIncomingBody {
+        type Data = bytes::Bytes;
+        type Error = hj_core::BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Ready(self.frame.take())
+        }
+    }
+
+    fn request_with_unknown_body(bytes: &'static [u8]) -> Request {
+        use http_body_util::BodyExt;
+        http::Request::builder()
+            .uri("/api")
+            .body(
+                UnknownIncomingBody {
+                    frame: Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(bytes)))),
+                }
+                .boxed(),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn context_body_limit_uses_actual_body_size_without_content_length() {
+        let mut ctx = bare_ctx_for_headers();
+        let mut vhost = hj_core::config::VHostConfig::default();
+        vhost.contexts = vec![
+            resource_context("/", true, Some(100), None),
+            resource_context("/api", true, Some(4), None),
+            resource_context("/api", false, Some(1), None),
+        ];
+        ctx.vhost = Arc::new(vhost);
+
+        let mut oversized = request_with_bytes(b"12345");
+        assert!(!oversized.headers().contains_key(CONTENT_LENGTH));
+        assert_eq!(exact_request_body_size(&oversized), Some(5));
+        assert_eq!(
+            enforce_context_body_limit(&ctx, "/api", 50, &mut oversized).await,
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+
+        let mut allowed = request_with_bytes(b"1234");
+        assert_eq!(
+            enforce_context_body_limit(&ctx, "/api", 50, &mut allowed).await,
+            Ok(())
+        );
+
+        let empty = request_with_bytes(b"");
+        assert_eq!(exact_request_body_size(&empty), Some(0));
+    }
+
+    #[tokio::test]
+    async fn context_body_limit_keeps_server_ceiling_and_collects_unknown_size() {
+        let mut ctx = bare_ctx_for_headers();
+        let mut vhost = hj_core::config::VHostConfig::default();
+        vhost.contexts = vec![
+            resource_context("/", true, Some(100), None),
+            resource_context("/zero", true, Some(0), None),
+        ];
+        ctx.vhost = Arc::new(vhost);
+
+        assert_eq!(matching_max_body_limit(&ctx, "/api", 50), Some(50));
+        assert_eq!(matching_max_body_limit(&ctx, "/zero", 50), Some(0));
+        assert_eq!(matching_max_body_limit(&ctx, "/other", 50), Some(50));
+
+        let mut unknown = request_with_unknown_body(b"streamed");
+        assert_eq!(exact_request_body_size(&unknown), None);
+        assert_eq!(
+            enforce_context_body_limit(&ctx, "/api", 50, &mut unknown).await,
+            Ok(()),
+            "an unknown-size body is measured rather than treated as oversized"
+        );
+        use http_body_util::BodyExt;
+        let body = std::mem::replace(unknown.body_mut(), hj_core::empty_incoming());
+        assert_eq!(body.collect().await.unwrap().to_bytes(), "streamed");
+
+        let mut oversized = request_with_unknown_body(b"12345");
+        assert_eq!(
+            enforce_context_body_limit(&ctx, "/zero", 50, &mut oversized).await,
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        );
+
+        let mut failed = http::Request::builder()
+            .uri("/api")
+            .body(
+                UnknownIncomingBody {
+                    frame: Some(Err(Box::new(std::io::Error::other("body failed")))),
+                }
+                .boxed(),
+            )
+            .unwrap();
+        assert_eq!(
+            enforce_context_body_limit(&ctx, "/api", 50, &mut failed).await,
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn response_timeout_uses_most_specific_enabled_declaring_context() {
+        let mut ctx = bare_ctx_for_headers();
+        let mut vhost = hj_core::config::VHostConfig::default();
+        vhost.contexts = vec![
+            resource_context("/", true, None, Some(30)),
+            resource_context("/api", true, None, Some(7)),
+            resource_context("/instant", true, None, Some(0)),
+            resource_context("/api/reports", true, None, None),
+            resource_context("/api/reports/private", false, None, Some(1)),
+        ];
+        ctx.vhost = Arc::new(vhost);
+
+        assert_eq!(effective_response_timeout(&ctx, "/other"), Some(30));
+        assert_eq!(effective_response_timeout(&ctx, "/api/x"), Some(7));
+        assert_eq!(effective_response_timeout(&ctx, "/instant/x"), Some(0));
+        assert_eq!(
+            effective_response_timeout(&ctx, "/api/reports/monthly"),
+            Some(7),
+            "a more-specific context with no override inherits the declaring ancestor"
+        );
+        assert_eq!(
+            effective_response_timeout(&ctx, "/api/reports/private/x"),
+            Some(7),
+            "disabled contexts cannot supply an override"
         );
     }
 

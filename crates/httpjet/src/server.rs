@@ -8,7 +8,7 @@
 //! hands them on. Alt-port / manual runs (no socket activation) self-bind inside `uring`.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::FromRawFd;
 
 use socket2::{Socket, Type};
 use tokio::net::TcpListener;

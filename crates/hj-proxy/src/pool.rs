@@ -29,18 +29,42 @@ use crate::target::{ProxyTarget, TargetTransport};
 /// Process-shared rustls client config for upstream TLS, built once on first use: the webpki
 /// (Mozilla) root store, server-auth only, no client certificate. The default crypto provider
 /// (aws-lc-rs) is installed at server startup by `hj-tls`, so `builder()` resolves it.
-fn client_tls_config() -> Arc<rustls::ClientConfig> {
-    static CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
-    CFG.get_or_init(|| {
+fn client_tls_config(http2: bool) -> Arc<rustls::ClientConfig> {
+    static H1_CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    static H2_CFG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    let slot = if http2 { &H2_CFG } else { &H1_CFG };
+    slot.get_or_init(|| {
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        )
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Arc::new(with_upstream_alpn(config, http2))
     })
     .clone()
+}
+
+/// Keep TLS protocol negotiation aligned with the explicitly selected upstream
+/// transport. `https://` is the HTTP/1 arm and therefore offers no ALPN; `h2s://`
+/// offers only `h2` and is checked again after the handshake before any HTTP bytes
+/// are sent.
+fn with_upstream_alpn(mut config: rustls::ClientConfig, http2: bool) -> rustls::ClientConfig {
+    config.alpn_protocols = if http2 {
+        vec![b"h2".to_vec()]
+    } else {
+        Vec::new()
+    };
+    config
+}
+
+fn require_h2_alpn(authority: &str, negotiated: Option<&[u8]>) -> Result<(), ProxyError> {
+    if negotiated == Some(b"h2".as_slice()) {
+        Ok(())
+    } else {
+        Err(ProxyError::Handshake(format!(
+            "TLS upstream {authority} negotiated no h2 ALPN"
+        )))
+    }
 }
 
 /// (Tier 2) Build a TLS client config with upstream mTLS client authentication.
@@ -48,6 +72,7 @@ fn client_tls_config() -> Arc<rustls::ClientConfig> {
 fn client_tls_config_with_cert(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
+    http2: bool,
 ) -> Result<Arc<rustls::ClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -61,7 +86,27 @@ fn client_tls_config_with_cert(
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)?;
-    Ok(Arc::new(config))
+    Ok(Arc::new(with_upstream_alpn(config, http2)))
+}
+
+/// Resolve the explicitly configured upstream TLS identity. Anonymous TLS is
+/// valid only when neither credential path is configured; an incomplete or
+/// unusable identity must remain a hard dial error rather than silently
+/// disabling client authentication.
+fn upstream_tls_config(
+    cert_path: Option<&std::path::Path>,
+    key_path: Option<&std::path::Path>,
+    http2: bool,
+) -> Result<Arc<rustls::ClientConfig>, String> {
+    match (cert_path, key_path) {
+        (None, None) => Ok(client_tls_config(http2)),
+        (Some(cert), Some(key)) => client_tls_config_with_cert(cert, key, http2)
+            .map_err(|e| format!("invalid upstream client TLS certificate/key: {e}")),
+        _ => Err(
+            "upstream client TLS authentication requires both clientCertFile and clientKeyFile"
+                .to_string(),
+        ),
+    }
 }
 
 /// Consecutive connect failures before the circuit breaker opens.
@@ -90,6 +135,10 @@ pub(crate) enum AnySender {
 }
 
 impl AnySender {
+    pub(crate) fn is_h2(&self) -> bool {
+        matches!(self, AnySender::H2(_))
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         match self {
             AnySender::H1(s) => s.is_ready(),
@@ -130,10 +179,6 @@ pub struct Upstream {
     /// fallback and TCP dial.
     pub authority: String,
     transport: TargetTransport,
-    /// The upstream leg is TLS (`https`/`wss` target): dial TCP then complete a TLS
-    /// handshake before speaking HTTP. Without this an `https` target would speak cleartext
-    /// HTTP to a TLS port (silent failure).
-    requires_tls: bool,
     /// (Tier 2) Speak HTTP/2 prior knowledge to this upstream (`h2://`/`h2s://`).
     requires_h2: bool,
     /// SNI / cert-verification name for the TLS handshake (the authority host, no port). When
@@ -158,9 +203,9 @@ pub struct Upstream {
     /// When the breaker opened (`None` = closed). While open, checkout fast-fails
     /// without dialing, avoiding a connect-timeout storm against a dead upstream.
     tripped_at: Mutex<Option<Instant>>,
-    /// (Tier 2) Upstream mTLS: client cert/key paths for TLS upstream connections.
-    client_cert_file: Option<std::path::PathBuf>,
-    client_key_file: Option<std::path::PathBuf>,
+    /// TLS client configuration is built at pool construction. Retaining an
+    /// error makes every dial fail before opening a socket until config reload.
+    tls_config: Option<Result<Arc<rustls::ClientConfig>, Arc<str>>>,
     /// (Tier 1.2) Shared with the owning [`UpstreamPool`]: epoch-ms until which the
     /// POOL skips this peer for new requests (failover). Set when the breaker trips,
     /// cleared on a successful dial.
@@ -178,6 +223,14 @@ impl Upstream {
         let max_conns = max_conns.max(1);
         let requires_tls = target.is_tls();
         let requires_h2 = target.http2;
+        let tls_config = requires_tls.then(|| {
+            upstream_tls_config(
+                target.client_cert_file.as_deref(),
+                target.client_key_file.as_deref(),
+                requires_h2,
+            )
+            .map_err(Arc::<str>::from)
+        });
         let tls_server_name = if requires_tls {
             // SNI + cert-verification name = the authority host (port/brackets removed).
             match ServerName::try_from(hj_core::host_without_port(&target.authority)) {
@@ -197,7 +250,6 @@ impl Upstream {
             name: target.pool_key(),
             authority: target.authority.clone(),
             transport: target.transport.clone(),
-            requires_tls,
             requires_h2,
             tls_server_name,
             sem: Arc::new(Semaphore::new(max_conns as usize)),
@@ -212,8 +264,7 @@ impl Upstream {
             idle: Mutex::new(Vec::new()),
             fail_count: AtomicU32::new(0),
             tripped_at: Mutex::new(None),
-            client_cert_file: target.client_cert_file.clone(),
-            client_key_file: target.client_key_file.clone(),
+            tls_config,
             bad_until: Mutex::new(None),
         })
     }
@@ -385,6 +436,15 @@ impl Upstream {
     async fn dial(&self) -> Result<AnySender, ProxyError> {
         match &self.transport {
             TargetTransport::Tcp(hostport) => {
+                // Resolve configured TLS credentials before opening a socket. A
+                // bad or incomplete identity is deterministic configuration,
+                // not a transient backend failure and never falls back to
+                // anonymous TLS.
+                let tls_cfg = match self.tls_config.as_ref() {
+                    Some(Ok(config)) => Some(config.clone()),
+                    Some(Err(error)) => return Err(ProxyError::Other(error.to_string())),
+                    None => None,
+                };
                 let connect = TcpStream::connect(hostport.clone());
                 let stream = tokio::time::timeout(self.connect_timeout, connect)
                     .await
@@ -392,7 +452,7 @@ impl Upstream {
                     .map_err(ProxyError::Connect)?;
                 let _ = stream.set_nodelay(true);
                 crate::set_tcp_keepalive(&stream);
-                if self.requires_tls {
+                if let Some(tls_cfg) = tls_cfg {
                     // Complete the TLS handshake before HTTP. Fail closed if the server name
                     // never parsed (so an `https` target is never spoken to in cleartext).
                     let server_name = self.tls_server_name.clone().ok_or_else(|| {
@@ -401,14 +461,6 @@ impl Upstream {
                             self.authority
                         ))
                     })?;
-                    let tls_cfg = if let (Some(cert), Some(key)) =
-                        (&self.client_cert_file, &self.client_key_file)
-                    {
-                        client_tls_config_with_cert(cert, key)
-                            .unwrap_or_else(|_| client_tls_config())
-                    } else {
-                        client_tls_config()
-                    };
                     let connector = TlsConnector::from(tls_cfg);
                     let tls = tokio::time::timeout(
                         self.connect_timeout,
@@ -421,12 +473,7 @@ impl Upstream {
                         // h2s: the upstream MUST have negotiated h2 via ALPN —
                         // falling back to h1 over the same port would silently
                         // speak the wrong protocol.
-                        if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-                            return Err(ProxyError::Handshake(format!(
-                                "TLS upstream {} negotiated no h2 ALPN",
-                                self.authority
-                            )));
-                        }
+                        require_h2_alpn(&self.authority, tls.get_ref().1.alpn_protocol())?;
                     }
                     self.http_handshake(tls).await
                 } else {
@@ -556,6 +603,8 @@ struct PoolKey {
     scheme: String,
     authority: String,
     transport: TargetTransport,
+    client_cert_file: Option<std::path::PathBuf>,
+    client_key_file: Option<std::path::PathBuf>,
     max_conns: u32,
     keep_alive: Duration,
     connect_timeout: Duration,
@@ -573,6 +622,8 @@ impl PoolKey {
             scheme: target.scheme.to_ascii_lowercase(),
             authority: target.authority.clone(),
             transport: target.transport.clone(),
+            client_cert_file: target.client_cert_file.clone(),
+            client_key_file: target.client_key_file.clone(),
             max_conns: max_conns.max(1),
             keep_alive,
             connect_timeout: if connect_timeout.is_zero() {
@@ -581,6 +632,10 @@ impl PoolKey {
                 connect_timeout
             },
         }
+    }
+
+    fn has_configured_tls_identity(&self) -> bool {
+        self.client_cert_file.is_some() || self.client_key_file.is_some()
     }
 }
 
@@ -690,7 +745,14 @@ impl UpstreamPool {
         let pools = self.pools.lock();
         let retained = pools
             .iter()
-            .filter(|(key, _)| key.name.is_none() || retained_named.contains(*key))
+            // Credential files can rotate in place without changing their paths. Rebuild any
+            // explicitly authenticated TLS upstream for the new generation so it re-reads the
+            // identity (or retains a new load error) while the old generation's in-flight handles
+            // drain naturally. Anonymous pools still retain their live connections.
+            .filter(|(key, _)| {
+                !key.has_configured_tls_identity()
+                    && (key.name.is_none() || retained_named.contains(*key))
+            })
             .map(|(key, upstream)| (key.clone(), upstream.clone()))
             .collect();
         UpstreamPool {
@@ -704,6 +766,11 @@ impl UpstreamPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Proxy;
+
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
 
     // (Tier 1.2) A target with failover peers hands out the primary until its
     // breaker trips, then the next peer; the primary is retried once its
@@ -936,7 +1003,7 @@ mod tests {
     fn https_target_enables_upstream_tls_with_authority_server_name() {
         let t = ProxyTarget::parse_url("https://backend.internal/api").unwrap();
         let u = Upstream::new(&t, 4, Duration::from_secs(30), Duration::from_secs(5));
-        assert!(u.requires_tls, "https target dials TLS");
+        assert!(u.tls_config.is_some(), "https target dials TLS");
         assert!(
             u.tls_server_name.is_some(),
             "TLS upstream resolves an SNI server name"
@@ -945,8 +1012,320 @@ mod tests {
         // Plain http stays cleartext.
         let t2 = ProxyTarget::parse_url("http://127.0.0.1:8002/").unwrap();
         let u2 = Upstream::new(&t2, 4, Duration::from_secs(30), Duration::from_secs(5));
-        assert!(!u2.requires_tls);
+        assert!(u2.tls_config.is_none());
         assert!(u2.tls_server_name.is_none());
+    }
+
+    #[test]
+    fn tls_client_configs_offer_only_the_selected_protocol() {
+        ensure_crypto_provider();
+        assert!(
+            client_tls_config(false).alpn_protocols.is_empty(),
+            "the explicit https:// HTTP/1 arm must not negotiate h2"
+        );
+        assert_eq!(
+            client_tls_config(true).alpn_protocols,
+            [b"h2".to_vec()],
+            "h2s:// must offer exactly h2"
+        );
+        assert!(require_h2_alpn("backend.test", Some(b"h2")).is_ok());
+        assert!(require_h2_alpn("backend.test", None).is_err());
+        assert!(require_h2_alpn("backend.test", Some(b"http/1.1")).is_err());
+    }
+
+    #[test]
+    fn mtls_h2_config_keeps_client_certificate_and_h2_alpn() {
+        ensure_crypto_provider();
+        let generated = rcgen::generate_simple_self_signed(vec!["client.test".to_string()])
+            .expect("client certificate");
+        let unique = format!(
+            "hj-proxy-mtls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cert_path = std::env::temp_dir().join(format!("{unique}.cert.pem"));
+        let key_path = std::env::temp_dir().join(format!("{unique}.key.pem"));
+        std::fs::write(&cert_path, generated.cert.pem()).expect("write client cert");
+        std::fs::write(&key_path, generated.signing_key.serialize_pem()).expect("write client key");
+
+        let config =
+            client_tls_config_with_cert(&cert_path, &key_path, true).expect("build mTLS h2 config");
+        assert_eq!(config.alpn_protocols, [b"h2".to_vec()]);
+        assert!(
+            config.client_auth_cert_resolver.has_certs(),
+            "adding h2 ALPN must retain the configured client certificate"
+        );
+
+        std::fs::remove_file(cert_path).expect("remove client cert");
+        std::fs::remove_file(key_path).expect("remove client key");
+    }
+
+    #[test]
+    fn configured_mtls_never_falls_back_to_anonymous_tls() {
+        ensure_crypto_provider();
+        let unique = format!(
+            "hj-proxy-mtls-invalid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let missing_cert = std::env::temp_dir().join(format!("{unique}.missing-cert.pem"));
+        let missing_key = std::env::temp_dir().join(format!("{unique}.missing-key.pem"));
+        assert!(
+            upstream_tls_config(Some(&missing_cert), Some(&missing_key), false).is_err(),
+            "missing configured credentials must fail instead of selecting anonymous HTTPS"
+        );
+        assert!(
+            upstream_tls_config(Some(&missing_cert), None, false).is_err(),
+            "a one-sided HTTPS identity must fail closed"
+        );
+        assert!(
+            upstream_tls_config(None, Some(&missing_key), true).is_err(),
+            "a one-sided h2s identity must fail closed"
+        );
+        let mut target = ProxyTarget::parse_url("https://127.0.0.1:9/").unwrap();
+        target.client_cert_file = Some(missing_cert.clone());
+        let upstream = Upstream::new(&target, 1, Duration::from_secs(1), Duration::from_secs(1));
+        assert!(
+            upstream.tls_config.as_ref().is_some_and(Result::is_err),
+            "the pool must retain the credential error for every dial"
+        );
+
+        let bad_cert = std::env::temp_dir().join(format!("{unique}.bad-cert.pem"));
+        let bad_key = std::env::temp_dir().join(format!("{unique}.bad-key.pem"));
+        std::fs::write(&bad_cert, b"not a certificate").unwrap();
+        std::fs::write(&bad_key, b"not a private key").unwrap();
+        assert!(
+            upstream_tls_config(Some(&bad_cert), Some(&bad_key), false).is_err(),
+            "malformed HTTPS credentials must fail closed"
+        );
+        assert!(
+            upstream_tls_config(Some(&bad_cert), Some(&bad_key), true).is_err(),
+            "malformed h2s credentials must fail closed"
+        );
+        std::fs::remove_file(bad_cert).unwrap();
+        std::fs::remove_file(bad_key).unwrap();
+
+        assert!(
+            upstream_tls_config(None, None, false).is_ok(),
+            "HTTPS without configured credentials remains anonymous"
+        );
+        assert!(
+            upstream_tls_config(None, None, true).is_ok(),
+            "h2s without configured credentials remains anonymous"
+        );
+    }
+
+    fn named_mtls_target(cert: std::path::PathBuf, key: std::path::PathBuf) -> ProxyTarget {
+        let mut target = ProxyTarget::parse_url("https://127.0.0.1:9443/").unwrap();
+        target.name = Some("named-mtls".into());
+        target.max_conns = Some(4);
+        target.keep_alive = Some(Duration::from_secs(30));
+        target.connect_timeout = Some(Duration::from_secs(5));
+        target.client_cert_file = Some(cert);
+        target.client_key_file = Some(key);
+        target
+    }
+
+    fn target_upstream(proxy: &Proxy, target: &ProxyTarget) -> Arc<Upstream> {
+        proxy.pool().get_or_create(
+            target,
+            target.max_conns.unwrap(),
+            target.keep_alive.unwrap(),
+            target.connect_timeout.unwrap(),
+        )
+    }
+
+    #[test]
+    fn credential_paths_are_part_of_pool_identity() {
+        ensure_crypto_provider();
+        let first = named_mtls_target(
+            "/tmp/hj-proxy-first-client.pem".into(),
+            "/tmp/hj-proxy-first-key.pem".into(),
+        );
+        let second = named_mtls_target(
+            "/tmp/hj-proxy-second-client.pem".into(),
+            "/tmp/hj-proxy-second-key.pem".into(),
+        );
+        let proxy = Proxy::new();
+        let first_upstream = target_upstream(&proxy, &first);
+        let second_upstream = target_upstream(&proxy, &second);
+        assert!(!Arc::ptr_eq(&first_upstream, &second_upstream));
+        assert_eq!(proxy.pool().len(), 2);
+    }
+
+    #[test]
+    fn configured_identity_is_reloaded_each_generation_at_the_same_paths() {
+        ensure_crypto_provider();
+        let generated = rcgen::generate_simple_self_signed(vec!["client.test".to_string()])
+            .expect("client certificate");
+        let unique = format!(
+            "hj-proxy-mtls-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cert_path = std::env::temp_dir().join(format!("{unique}.cert.pem"));
+        let key_path = std::env::temp_dir().join(format!("{unique}.key.pem"));
+        let write_valid = || {
+            std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+            std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
+        };
+        write_valid();
+
+        let target = named_mtls_target(cert_path.clone(), key_path.clone());
+        let first_proxy = Proxy::new();
+        let valid = target_upstream(&first_proxy, &target);
+        assert!(valid.tls_config.as_ref().is_some_and(Result::is_ok));
+
+        std::fs::write(&cert_path, b"invalid rotated certificate").unwrap();
+        std::fs::write(&key_path, b"invalid rotated key").unwrap();
+        let invalid_proxy = first_proxy.next_generation([target.clone()]);
+        let invalid = target_upstream(&invalid_proxy, &target);
+        assert!(
+            !Arc::ptr_eq(&valid, &invalid),
+            "configured identities must not retain a stale upstream across reload"
+        );
+        assert!(invalid.tls_config.as_ref().is_some_and(Result::is_err));
+
+        write_valid();
+        let recovered_proxy = invalid_proxy.next_generation([target.clone()]);
+        let recovered = target_upstream(&recovered_proxy, &target);
+        assert!(!Arc::ptr_eq(&invalid, &recovered));
+        assert!(recovered.tls_config.as_ref().is_some_and(Result::is_ok));
+
+        std::fs::remove_file(cert_path).unwrap();
+        std::fs::remove_file(key_path).unwrap();
+    }
+
+    #[test]
+    fn anonymous_tls_pool_is_retained_across_generation() {
+        let mut target = ProxyTarget::parse_url("https://127.0.0.1:9443/").unwrap();
+        target.name = Some("anonymous-tls".into());
+        target.max_conns = Some(4);
+        target.keep_alive = Some(Duration::from_secs(30));
+        target.connect_timeout = Some(Duration::from_secs(5));
+        let proxy = Proxy::new();
+        let before = target_upstream(&proxy, &target);
+        let next = proxy.next_generation([target.clone()]);
+        let after = target_upstream(&next, &target);
+        assert!(Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn valid_mtls_identity_builds_for_https_and_h2s() {
+        ensure_crypto_provider();
+        let generated = rcgen::generate_simple_self_signed(vec!["client.test".to_string()])
+            .expect("client certificate");
+        let unique = format!(
+            "hj-proxy-mtls-valid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cert_path = std::env::temp_dir().join(format!("{unique}.cert.pem"));
+        let key_path = std::env::temp_dir().join(format!("{unique}.key.pem"));
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        std::fs::write(&key_path, generated.signing_key.serialize_pem()).unwrap();
+
+        let https = upstream_tls_config(Some(&cert_path), Some(&key_path), false).unwrap();
+        assert!(https.alpn_protocols.is_empty());
+        assert!(https.client_auth_cert_resolver.has_certs());
+        let h2s = upstream_tls_config(Some(&cert_path), Some(&key_path), true).unwrap();
+        assert_eq!(h2s.alpn_protocols, [b"h2".to_vec()]);
+        assert!(h2s.client_auth_cert_resolver.has_certs());
+
+        std::fs::remove_file(cert_path).unwrap();
+        std::fs::remove_file(key_path).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trusted_local_tls_fixture_negotiates_and_speaks_h2() {
+        use http_body_util::{BodyExt, Empty, Full};
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        ensure_crypto_provider();
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("server certificate");
+        let cert_der = generated.cert.der().clone();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            generated.signing_key.serialize_der(),
+        ));
+
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server TLS config");
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind TLS fixture");
+        let addr = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("fixture accept");
+            let tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(tcp)
+                .await
+                .expect("server TLS handshake");
+            let service = hyper::service::service_fn(|_req| async move {
+                Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(
+                    bytes::Bytes::from_static(b"h2s-ok"),
+                )))
+            });
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(tls), service)
+                .await;
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).expect("trust fixture certificate");
+        let client_config = with_upstream_alpn(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+            true,
+        );
+        let tcp = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect TLS fixture");
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+            .connect(ServerName::try_from("localhost").unwrap(), tcp)
+            .await
+            .expect("verified TLS handshake");
+        require_h2_alpn("localhost", tls.get_ref().1.alpn_protocol())
+            .expect("fixture must negotiate h2");
+
+        let target = ProxyTarget::parse_url(&format!("h2://{addr}")).unwrap();
+        let upstream = Upstream::new(&target, 1, Duration::from_secs(5), Duration::from_secs(2));
+        let mut sender = upstream.h2_handshake(tls).await.expect("h2 handshake");
+        let body: OutBody = Empty::<bytes::Bytes>::new().map_err(|e| match e {}).boxed();
+        let request = http::Request::builder()
+            .method(http::Method::GET)
+            .version(http::Version::HTTP_2)
+            .uri("https://localhost/probe")
+            .header(http::header::HOST, "localhost")
+            .body(body)
+            .unwrap();
+        let response = sender.send_request(request).await.expect("h2 request");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "h2s-ok"
+        );
+
+        drop(sender);
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

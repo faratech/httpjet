@@ -205,7 +205,16 @@ async fn prune_old(cfg: &RollConfig) -> io::Result<()> {
         None => return Ok(()),
     };
     let prefix = format!("{}.", live_name);
-    let cutoff = SystemTime::now() - Duration::from_secs(cfg.keep_days * 86_400);
+    // An operator can supply the unified logger's retention as any u64. If the
+    // duration cannot be represented, it means "older than the clock can
+    // express"; keep every archive rather than panic the writer task or invent
+    // a cutoff that could delete files.
+    let Some(retention_secs) = cfg.keep_days.checked_mul(86_400) else {
+        return Ok(());
+    };
+    let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(retention_secs)) else {
+        return Ok(());
+    };
 
     let mut entries = fs::read_dir(&dir).await?;
     while let Some(entry) = entries.next_entry().await? {
@@ -573,6 +582,49 @@ mod tests {
 
         assert!(!old.exists(), "old archive should be pruned");
         assert!(fresh.exists(), "recent archive should be kept");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_retention_keeps_archives_and_writer_survives_rotation() {
+        let dir = temp_dir("retention-overflow");
+        let path = dir.join("access.log");
+        let planted = dir.join("access.log.1970_01_01_000000");
+        std::fs::write(&planted, b"old archive").unwrap();
+        filetime_set(&planted, SystemTime::UNIX_EPOCH);
+
+        let cfg = RollConfig {
+            path: path.clone(),
+            rolling_size: 8,
+            keep_days: u64::MAX,
+            compress_archive: false,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let h = tokio::spawn(run(cfg, rx, logger_state(), None));
+
+        // Eight bytes including the newline force a real roll and prune. The
+        // next line proves the same writer task remains alive afterward.
+        send_line(&tx, "trigger").await;
+        send_line(&tx, "after").await;
+        shutdown(&tx).await;
+        h.await.unwrap();
+
+        assert!(
+            planted.exists(),
+            "unrepresentable retention must keep archives"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "after\n");
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("access.log.") && entry.path() != planted
+                }),
+            "the trigger line must have produced a rolled archive"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

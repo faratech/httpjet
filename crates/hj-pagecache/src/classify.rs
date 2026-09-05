@@ -682,4 +682,109 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn duplicate_standard_freshness_keeps_first_value_across_and_within_fields() {
+        let within = hdrs(&[("cache-control", "public, max-age=0, max-age=300")]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &within, false, &cfg(), true),
+            Disposition::Bypass("cc-max-age-zero")
+        );
+
+        let mut repeated = HeaderMap::new();
+        repeated.append(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=0"),
+        );
+        repeated.append(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("max-age=300"),
+        );
+        assert_eq!(
+            classify_response(&Method::GET, 200, &repeated, false, &cfg(), true),
+            Disposition::Bypass("cc-max-age-zero")
+        );
+    }
+
+    #[test]
+    fn qualified_standard_restrictions_bypass_all_public_opt_ins() {
+        let standard = hdrs(&[("cache-control", "public, max-age=60, private=\"x-user\"")]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &standard, false, &cfg(), true),
+            Disposition::Bypass("cache-control")
+        );
+
+        let mut litespeed = hdrs(&[("x-litespeed-cache-control", "public, max-age=60")]);
+        litespeed.append(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=60"),
+        );
+        litespeed.append(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache=\"set-cookie\""),
+        );
+        assert_eq!(
+            classify_response(&Method::GET, 200, &litespeed, false, &cfg(), false),
+            Disposition::Bypass("cache-control")
+        );
+    }
+
+    #[test]
+    fn s_maxage_suppresses_configured_default_stale_windows() {
+        let mut c = cfg();
+        c.default_stale_secs = 30;
+        c.default_sie_secs = 600;
+        let h = hdrs(&[("cache-control", "public, s-maxage=60")]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &h, false, &c, true),
+            Disposition::StorePublic {
+                ttl_secs: 60,
+                stale_secs: 0,
+                stale_if_error_secs: 0,
+            }
+        );
+
+        let explicit = hdrs(&[("cache-control", "public, s-maxage=60, stale-if-error=45")]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &explicit, false, &c, true),
+            Disposition::StorePublic {
+                ttl_secs: 60,
+                stale_secs: 0,
+                stale_if_error_secs: 45,
+            }
+        );
+    }
+
+    #[test]
+    fn quoted_extension_contents_cannot_opt_in_or_veto_caching() {
+        let hidden_public = hdrs(&[("cache-control", "extension=\"ignore, public, max-age=300\"")]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &hidden_public, false, &cfg(), true),
+            Disposition::Bypass("not-opted-in")
+        );
+
+        let hidden_ls_public = hdrs(&[(
+            "x-litespeed-cache-control",
+            "extension=\"ignore, public, max-age=300\"",
+        )]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &hidden_ls_public, false, &cfg(), false),
+            Disposition::Bypass("not-opted-in")
+        );
+
+        let opaque_no_cache = hdrs(&[
+            ("x-litespeed-cache-control", "public, max-age=60"),
+            ("cache-control", "extension=\"ignore, no-cache\""),
+        ]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &opaque_no_cache, false, &cfg(), false),
+            sp(60)
+        );
+
+        let malformed = hdrs(&[("cache-control", "public, extension=\"unterminated")]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &malformed, false, &cfg(), true),
+            Disposition::Bypass("cache-control")
+        );
+    }
 }

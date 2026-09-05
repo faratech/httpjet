@@ -53,6 +53,7 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::oneshot;
 
 pub use headers::is_websocket_upgrade;
 pub use pool::{Upstream, UpstreamPool};
@@ -207,6 +208,12 @@ impl Proxy {
                 .connect_timeout
                 .unwrap_or(self.default_connect_timeout),
         );
+        // One response-head duration applies to every forward shape. In particular,
+        // a context override must govern bodyless requests and their transparent retry
+        // as well as the post-upload wait for body-bearing requests.
+        let response_head_timeout = timeout_override
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| upstream.response_timeout());
 
         // (#6/#14/#33) Whether the inbound request carries a request body. For a
         // body-bearing forward the upstream's response *head* does not arrive until it
@@ -276,9 +283,6 @@ impl Proxy {
             // only at EOF); but a backend that drains the body then never sends headers can no
             // longer pin this task — and with it the maxConns permit and the pooled connection
             // — forever (the body-inactivity timer cannot fire once the body has ended).
-            let head_timeout = timeout_override
-                .map(std::time::Duration::from_secs)
-                .unwrap_or_else(|| upstream.response_timeout());
             tokio::select! {
                 biased;
                 r = sender.send_request(out_req2) => match r {
@@ -291,7 +295,7 @@ impl Proxy {
                         return Err(ProxyError::Request(e.to_string()).into());
                     }
                 },
-                _ = async move { let _ = eof_rx.await; tokio::time::sleep(head_timeout).await; } => {
+                _ = async move { let _ = eof_rx.await; tokio::time::sleep(response_head_timeout).await; } => {
                     return Err(ProxyError::ResponseTimeout.into());
                 }
             }
@@ -301,7 +305,7 @@ impl Proxy {
             // backend that would otherwise have answered; sharing the deadline also keeps the
             // total from reaching 2x response_timeout. The trade is deliberate: a first
             // attempt that fails late leaves the retry less than the old fixed floor.
-            let head_deadline = tokio::time::Instant::now() + upstream.response_timeout();
+            let head_deadline = tokio::time::Instant::now() + response_head_timeout;
             match tokio::time::timeout_at(head_deadline, sender.send_request(out_req)).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
@@ -345,44 +349,63 @@ impl Proxy {
             }
         };
 
-        // Return the connection to the pool once it is free again. The response
-        // body streams straight through to the client, so the connection only
-        // becomes reusable after that body has fully drained. We don't block the
-        // request on that here (it would defeat streaming); instead a detached
-        // task waits for `sender.ready()` — which resolves when the in-flight
-        // response is done (or the client disconnected, dropping the response
-        // body and stopping the upstream read) — and returns the sender to the
-        // idle pool. A short cap keeps a never-finishing stream (e.g. an SSE feed
-        // held open for hours) from pinning the task forever; in that case the
-        // connection is simply not reused.
+        // An h2 sender becomes ready for another stream as soon as the peer permits it,
+        // even while this response body remains open. `maxConns` is documented as an
+        // in-flight REQUEST limit, so the h2 drain task must also wait for the downstream
+        // body to reach EOF/error or be dropped. For h1, sender.ready() already tracks the
+        // single in-flight response and preserves the existing disconnect/drain behavior.
+        let (response_done_tx, response_done_rx) = if sender.is_h2() {
+            let (tx, rx) = oneshot::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let downstream_response = into_streaming_response(upstream_resp, response_done_tx);
+
+        // Return the sender according to its protocol. An h2 sender can open another
+        // stream as soon as the response head arrives, while an h1 connection becomes
+        // reusable only after its response body drains. We never block this request on
+        // the h1 drain (that would defeat streaming); its detached task waits for
+        // `sender.ready()` and then returns it to the pool. A genuinely busy stream
+        // keeps its request slot for its real lifetime; TCP keepalive eventually reaps
+        // a silently dead peer.
         //
-        // (#28) The maxConns permit is MOVED INTO this drain task (not attached to
-        // the response body). On a mid-stream client disconnect the body drops and
-        // frees nothing on its own; the slot is released only once this task finishes
-        // draining (or its keep_alive_window cap fires). That way the semaphore counts
+        // (#28) The maxConns permit is MOVED INTO this drain task. On a mid-stream
+        // client disconnect, the h1 sender reports its final readiness/error; the h2
+        // response wrapper signals its drop. The slot is released only once this task
+        // sees the protocol-specific completion. That way the semaphore counts
         // running + draining connections, so a fresh request can't acquire a permit,
         // find the idle pool empty, and dial a second connection while the old one is
         // still being drained — which would let the upstream transiently see up to
         // 2× max_conns sockets.
-        let up = upstream.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            // (#70) Hold the maxConns permit until the upstream connection is ACTUALLY free.
-            // `sender.ready()` resolves when the in-flight response is fully consumed by the
-            // client, the client disconnects (the response body drops -> connection error), or
-            // the upstream closes. A previous `keep_alive_window` cap (<=75s) released the
-            // permit while a long-lived stream (SSE / large download) was STILL in flight,
-            // letting a new request dial a 2nd connection (up to 2x max_conns) and defeating
-            // the anti-double-dial guarantee. No time cap now: a genuinely-busy connection
-            // holds its slot for its real lifetime, and a dead one is reaped by TCP keepalive
-            // (which resolves ready() with an error, exiting this task without re-pooling).
-            if sender.ready().await.is_ok() {
-                up.release(sender);
-            }
-            // _permit drops here: the slot frees only after the connection is truly free.
-        });
+        if let Some(response_done) = response_done_rx {
+            // H2 can reuse the multiplexed connection while the prior response stream is
+            // open. Hyper's h2 sender is ready whenever the connection is not closed, so
+            // return it synchronously: deferring this to a spawned task leaves the pool
+            // briefly empty and a back-to-back request can commit to an unnecessary dial.
+            // The semaphore permit remains tied to the response body's real lifetime below.
+            upstream.release(sender);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let _ = response_done.await;
+            });
+        } else {
+            let up = upstream.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                // (#70) Hold the h1 maxConns permit until the upstream connection is
+                // ACTUALLY free. `sender.ready()` resolves when the in-flight response is
+                // fully consumed, its body is dropped, or the upstream closes. There is no
+                // time cap: a genuinely busy connection holds its slot for its real lifetime,
+                // and TCP keepalive reaps a silently dead peer.
+                if sender.ready().await.is_ok() {
+                    up.release(sender);
+                }
+                // _permit drops here: the slot frees only after the connection is truly free.
+            });
+        }
 
-        Ok(into_streaming_response(upstream_resp))
+        Ok(downstream_response)
     }
 
     /// Begin a WebSocket proxy to `target`: open a TCP connection to the
@@ -491,7 +514,7 @@ impl Proxy {
 
         // Non-101: surface the upstream's response (buffered) to the client.
         drop(driver);
-        let mut resp = into_streaming_response(upstream_resp);
+        let mut resp = into_streaming_response(upstream_resp, None);
         headers::sanitize_response_headers(resp.headers_mut(), false);
         Ok(WebSocketUpgrade {
             response: resp,
@@ -682,6 +705,11 @@ fn build_forward_request(
         Version::HTTP_11
     };
     parts.uri = upstream_uri(&parts.uri, target)?;
+    // Strip hop-by-hop fields before the final Host decision. `Connection: host`
+    // remains ignored by strip_hop_by_hop (#351), so a client cannot nominate Host
+    // away and force the upstream fallback.
+    headers::rewrite_request_headers(&mut parts.headers, ctx, keep_upgrade);
+    ensure_host(&mut parts.headers, target, fallback_authority);
     if target.http2 {
         // hyper's h2 client derives :scheme/:authority from the URI; a
         // path-only URI (correct origin-form for h1) is an invalid
@@ -696,12 +724,20 @@ fn build_forward_request(
             .path_and_query()
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
-        parts.uri = format!("{scheme}://{}{pq}", target.authority)
+        // HTTP/2 carries routing identity in :authority, derived by hyper from this
+        // absolute URI. Keep it byte-identical to the final Host header; RFC 9113
+        // requires equality when both fields are present, and preserving the client
+        // Host is this proxy's documented virtual-host behavior. The transport still
+        // dials (and h2s verifies SNI against) target.authority.
+        let authority = parts
+            .headers
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| HandlerError::Other("h2 upstream request has no valid Host".into()))?;
+        parts.uri = format!("{scheme}://{authority}{pq}")
             .parse()
             .map_err(|e| HandlerError::Other(format!("bad h2 upstream uri: {e}")))?;
     }
-    ensure_host(&mut parts.headers, target, fallback_authority);
-    headers::rewrite_request_headers(&mut parts.headers, ctx, keep_upgrade);
     // The inbound body (IncomingBody = BoxBody<Bytes, BoxError>) is forwarded
     // verbatim — it is already the streaming body type, so request bodies
     // (uploads, POSTs, chunked uploads) pass through with no buffering.
@@ -725,13 +761,16 @@ fn empty_stream_body() -> StreamBody {
 
 /// Convert a hyper upstream response into an [`hj_core::Response`] whose body is
 /// a pass-through [`Body::Stream`]. Hop-by-hop headers are stripped.
-fn into_streaming_response(resp: hyper::Response<Incoming>) -> Response {
+fn into_streaming_response(
+    resp: hyper::Response<Incoming>,
+    completion: Option<oneshot::Sender<()>>,
+) -> Response {
     let (mut parts, incoming) = resp.into_parts();
     // Run BEFORE sanitize (which strips TE), while we can still see that the upstream framed by
     // Transfer-Encoding and thus that any Content-Length it also sent is stale.
     drop_stale_content_length_on_te(&mut parts.headers);
     headers::sanitize_response_headers(&mut parts.headers, false);
-    let stream: StreamBody = box_incoming(incoming);
+    let stream: StreamBody = box_incoming(incoming, completion);
     http::Response::from_parts(parts, Body::Stream(stream))
 }
 
@@ -749,8 +788,72 @@ fn drop_stale_content_length_on_te(headers: &mut http::HeaderMap) {
 
 /// Box a hyper `Incoming` body into the workspace `StreamBody`
 /// (`BoxBody<Bytes, BoxError>`), mapping hyper's error into [`BoxError`].
-fn box_incoming(incoming: Incoming) -> BoxBody<Bytes, BoxError> {
-    incoming.map_err(|e| Box::new(e) as BoxError).boxed()
+fn box_incoming(
+    incoming: Incoming,
+    completion: Option<oneshot::Sender<()>>,
+) -> BoxBody<Bytes, BoxError> {
+    if let Some(completion) = completion {
+        ResponseCompletionBody {
+            incoming,
+            completion: Some(completion),
+        }
+        .boxed()
+    } else {
+        incoming.map_err(|e| Box::new(e) as BoxError).boxed()
+    }
+}
+
+/// Signals when an h2 response stops being in flight from the downstream's point of view.
+/// Hyper exposes h2 connection capacity independently from individual response bodies, so
+/// `SendRequest::ready()` alone cannot define the `maxConns` permit lifetime.
+struct ResponseCompletionBody {
+    incoming: Incoming,
+    completion: Option<oneshot::Sender<()>>,
+}
+
+impl ResponseCompletionBody {
+    fn complete(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(());
+        }
+    }
+}
+
+impl Drop for ResponseCompletionBody {
+    fn drop(&mut self) {
+        self.complete();
+    }
+}
+
+impl HttpBody for ResponseCompletionBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        match std::pin::Pin::new(&mut self.incoming).poll_frame(cx) {
+            std::task::Poll::Ready(None) => {
+                self.complete();
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Ready(Some(Err(error))) => {
+                self.complete();
+                std::task::Poll::Ready(Some(Err(Box::new(error))))
+            }
+            std::task::Poll::Ready(Some(Ok(frame))) => std::task::Poll::Ready(Some(Ok(frame))),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.incoming.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.incoming.size_hint()
+    }
 }
 
 /// Whether the inbound request actually carries a body to forward upstream.
@@ -1155,6 +1258,33 @@ mod tests {
         let target = ProxyTarget::parse_url("http://127.0.0.1:8000/y").unwrap();
         let out = build_forward_request(&c, req, &target, &target.authority).unwrap();
         assert_eq!(out.version(), Version::HTTP_11);
+    }
+
+    #[test]
+    fn h2_authority_matches_final_preserved_host() {
+        let c = ctx("9.9.9.9", true);
+        let body: hj_core::IncomingBody = Empty::<Bytes>::new()
+            .map_err(|e| Box::new(e) as BoxError)
+            .boxed();
+        let req = http::Request::builder()
+            .uri("/v1/items?q=2")
+            .version(Version::HTTP_2)
+            .header(HOST, "public.example:8443")
+            .header(http::header::CONNECTION, "keep-alive, host")
+            .body(body)
+            .unwrap();
+        let target = ProxyTarget::parse_url("h2://127.0.0.1:9000").unwrap();
+        let out = build_forward_request(&c, req, &target, &target.authority).unwrap();
+
+        assert_eq!(out.version(), Version::HTTP_2);
+        assert_eq!(out.uri().scheme_str(), Some("http"));
+        assert_eq!(out.uri().authority().unwrap(), "public.example:8443");
+        assert_eq!(out.headers().get(HOST).unwrap(), "public.example:8443");
+        assert_eq!(
+            out.headers().get("x-forwarded-host").unwrap(),
+            "public.example:8443"
+        );
+        assert!(out.headers().get(http::header::CONNECTION).is_none());
     }
 
     #[test]

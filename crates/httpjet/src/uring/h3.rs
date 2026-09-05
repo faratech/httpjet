@@ -3097,17 +3097,104 @@ fn split_h3_request_headers(headers: Vec<(Vec<u8>, Vec<u8>)>) -> Option<H3Reques
 fn valid_h3_trailers(field: &[u8], max_field_section_size: usize) -> bool {
     qpack_decode_limited(field, max_field_section_size).is_some_and(|(headers, _)| {
         headers.into_iter().all(|(name, value)| {
-            name.first() != Some(&b':')
-                && !name.iter().any(|b| b.is_ascii_uppercase())
-                && !hj_core::is_connection_specific_request_header(
-                    std::str::from_utf8(&name).unwrap_or(""),
-                )
-                && !(name.as_slice() == b"te"
-                    && !value.as_slice().eq_ignore_ascii_case(b"trailers"))
-                && !matches!(value.first(), Some(b' ' | b'\t'))
-                && !matches!(value.last(), Some(b' ' | b'\t'))
+            if name.first() == Some(&b':') || name.iter().any(|b| b.is_ascii_uppercase()) {
+                return false;
+            }
+            let (Ok(name), Ok(value)) = (
+                http::HeaderName::from_bytes(&name),
+                http::HeaderValue::from_bytes(&value),
+            ) else {
+                return false;
+            };
+            !hj_core::is_connection_specific_request_header(name.as_str())
+                && !(name == http::header::TE
+                    && !value.as_bytes().eq_ignore_ascii_case(b"trailers"))
+                && !matches!(value.as_bytes().first(), Some(b' ' | b'\t'))
+                && !matches!(value.as_bytes().last(), Some(b' ' | b'\t'))
         })
     })
+}
+
+/// Validate the decoded H3 request head and construct the HTTP request builder.
+/// Keeping raw pseudo-header checks here avoids `http::Uri` silently discarding
+/// fragments, and gives tests a seam that consumes real QPACK-decoded fields.
+fn build_h3_request_head(
+    head: H3RequestHeaders,
+) -> Option<(http::request::Builder, Option<Arc<str>>)> {
+    let H3RequestHeaders {
+        method,
+        path,
+        authority,
+        regular,
+    } = head;
+    let method = http::Method::from_bytes(&method).ok()?;
+    let path_str = std::str::from_utf8(&path).ok()?;
+    if path.contains(&b'#') || !(path.starts_with(b"/") || path.as_slice() == b"*") {
+        return None;
+    }
+    if path.as_slice() == b"*" && method != http::Method::OPTIONS {
+        return None;
+    }
+
+    let authority_value = match authority.as_deref() {
+        Some(raw) => {
+            let text = std::str::from_utf8(raw).ok()?;
+            // H3 is HTTPS-only here. RFC 9113/9114 forbid empty HTTP(S)
+            // authorities and userinfo even though generic URI syntax permits both.
+            if !hj_core::valid_http_authority(text) {
+                return None;
+            }
+            Some(http::HeaderValue::from_bytes(raw).ok()?)
+        }
+        None => None,
+    };
+    let sni = authority
+        .as_deref()
+        .and_then(|a| std::str::from_utf8(a).ok())
+        .map(|s| Arc::from(hj_core::host_without_port(s).as_str()));
+
+    let mut builder = http::Request::builder()
+        .version(http::Version::HTTP_3)
+        .method(method)
+        .uri(path_str);
+    let mut regular_host: Option<http::HeaderValue> = None;
+    for (raw_name, raw_value) in regular {
+        if raw_name.iter().any(|b| b.is_ascii_uppercase()) {
+            return None;
+        }
+        let name = http::HeaderName::from_bytes(&raw_name).ok()?;
+        let value = http::HeaderValue::from_bytes(&raw_value).ok()?;
+        if hj_core::is_connection_specific_request_header(name.as_str()) {
+            return None;
+        }
+        if name == http::header::TE && !value.as_bytes().eq_ignore_ascii_case(b"trailers") {
+            return None;
+        }
+        if matches!(value.as_bytes().first(), Some(b' ' | b'\t'))
+            || matches!(value.as_bytes().last(), Some(b' ' | b'\t'))
+        {
+            return None;
+        }
+        if name == http::header::HOST {
+            let text = value.to_str().ok()?;
+            if !hj_core::valid_http_authority(text) {
+                return None;
+            }
+            if regular_host.replace(value).is_some() {
+                return None;
+            }
+        } else {
+            builder = builder.header(name, value);
+        }
+    }
+
+    match (authority_value, regular_host) {
+        (Some(authority), Some(host)) if authority.as_bytes() != host.as_bytes() => return None,
+        (Some(authority), _) => builder = builder.header(http::header::HOST, authority),
+        (None, Some(host)) => builder = builder.header(http::header::HOST, host),
+        (None, None) => {}
+    }
+    Some((builder, sni))
 }
 
 /// Decode one io_uring-H3 request, dispatch it through the bridge (real pipeline), and
@@ -3147,28 +3234,17 @@ async fn handle_h3_request(
     }) {
         return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
     }
-    let H3RequestHeaders {
-        method,
-        path,
-        authority,
-        regular,
-    } = match split_h3_request_headers(headers) {
+    let head = match split_h3_request_headers(headers) {
         Some(h) => h,
         None => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
-    // RFC 9114 §4.3.1 (mirrors RFC 9113 §8.3.1): :path MUST be origin-form ("/…") or "*"
-    // (OPTIONS) — never absolute-form. An absolute-form :path carrying its own scheme/authority
-    // would let uri().host() disagree with the routed :authority/Host (foreign-host
-    // CDN-cache-protection bypass) and is malformed regardless.
-    if !(path.first() == Some(&b'/') || path.as_slice() == b"*") {
-        return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
-    }
     // (N2) §4.1.2: a Content-Length that disagrees with the DATA length is malformed.
     // Parsed with the SAME strict resolver as H1 (#232 residual): ASCII-OWS trim,
     // digit-only — the old `trim().parse()` accepted "+5" (unsigned FromStr sign) and
     // obs-text-padded values that every conformant stack rejects.
     let declared_cl = {
-        let values = regular
+        let values = head
+            .regular
             .iter()
             .filter(|(n, _)| n.as_slice() == b"content-length")
             .map(|(_, v)| v.as_slice());
@@ -3180,6 +3256,10 @@ async fn handle_h3_request(
     if declared_cl.is_some_and(|cl| cl != parsed.body.len()) {
         return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
     }
+    let (builder, sni) = match build_h3_request_head(head) {
+        Some(head) => head,
+        None => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
+    };
     let body_b = parsed.body;
     let inbody: hj_core::IncomingBody = if body_b.is_empty() {
         hj_core::empty_incoming()
@@ -3189,62 +3269,11 @@ async fn handle_h3_request(
             .map_err(|n| match n {})
             .boxed()
     };
-    let mut builder = http::Request::builder().version(http::Version::HTTP_3);
-    builder = match (std::str::from_utf8(&method), std::str::from_utf8(&path)) {
-        (Ok(m), Ok(p)) => builder.method(m).uri(p),
-        _ => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
-    };
-    // Host comes solely from :authority (matches the native H2 path, which inserts/replaces HOST).
-    // The builder APPENDS, so a client-supplied regular `host` forwarded alongside :authority would
-    // reach the backend as two values joined to HTTP_HOST="real, attacker" — a host-header
-    // injection unique to H3. Drop any regular host; fall back to a single one only if :authority
-    // is absent.
-    let mut host_set = false;
-    if let Some(a) = &authority {
-        builder = builder.header("host", &a[..]);
-        host_set = true;
-    }
-    for (n, v) in &regular {
-        // RFC 9114 §4.1.2 / §8.2.1 (mirrors the native H2 stack, hj-h2/server/recv.rs): reject as
-        // malformed when (a) a field NAME contains ASCII uppercase (http::HeaderName would silently
-        // lowercase it, diverging from H2 which RSTs), (b) `te` carries any value other than
-        // `trailers`, or (c) a value starts/ends with SP/HTAB. An unvalidated field is a smuggling
-        // surface once re-serialized to a backend over HTTP/1.x; H2 and H3 must agree on what they
-        // reject.
-        if n.iter().any(|b| b.is_ascii_uppercase()) {
-            return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
-        }
-        if hj_core::is_connection_specific_request_header(std::str::from_utf8(n).unwrap_or("")) {
-            return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
-        }
-        if n.as_slice() == b"te" && !v.as_slice().eq_ignore_ascii_case(b"trailers") {
-            return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
-        }
-        if matches!(v.first(), Some(b' ' | b'\t')) || matches!(v.last(), Some(b' ' | b'\t')) {
-            return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
-        }
-        if n.as_slice().eq_ignore_ascii_case(b"host") {
-            if !host_set {
-                builder = builder.header("host", &v[..]);
-                host_set = true;
-            }
-            continue; // never forward a second host
-        }
-        builder = builder.header(&n[..], &v[..]);
-    }
     let mut req = match builder.body(inbody) {
         Ok(r) => r,
         Err(_) => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
     hj_core::coalesce_cookie_crumbs(req.headers_mut());
-    // SNI/routing key from :authority — the secure-listener router key. IPv6-aware
-    // (a naive `split(':')` mangles a bracketed `[::1]:443` to `[`); `host_without_port`
-    // also matches how `Router::resolve` normalizes the key, so an IPv6 :authority
-    // routes to the intended vhost instead of falling through to the default.
-    let sni: Option<Arc<str>> = authority
-        .as_deref()
-        .and_then(|a| std::str::from_utf8(a).ok())
-        .map(|s| Arc::from(hj_core::host_without_port(s).as_str()));
     let ctx = BridgeCtx {
         peer,
         local,
@@ -4343,6 +4372,112 @@ mod h3_codec_tests {
             split_h3_request_headers(valid).is_none(),
             "duplicate :scheme must be rejected"
         );
+    }
+
+    fn literal_qpack_fields(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut block = vec![0x00, 0x00]; // RIC=0, Base=0
+        for (name, value) in fields {
+            // Literal Field Line With Literal Name, both strings non-Huffman.
+            qpack_int(&mut block, 0x20, 3, name.len() as u64);
+            block.extend_from_slice(name);
+            qpack_int(&mut block, 0, 7, value.len() as u64);
+            block.extend_from_slice(value);
+        }
+        block
+    }
+
+    fn request_from_raw_qpack(fields: &[(&[u8], &[u8])]) -> Option<http::Request<()>> {
+        let decoded = qpack_decode(&literal_qpack_fields(fields))?;
+        let head = split_h3_request_headers(decoded)?;
+        let (builder, _) = build_h3_request_head(head)?;
+        builder.body(()).ok()
+    }
+
+    #[test]
+    fn raw_qpack_request_head_rejects_malformed_path_authority_and_host() {
+        let request = |method: &'static [u8], path: &'static [u8], authority: &'static [u8]| {
+            [
+                (b":method".as_slice(), method),
+                (b":scheme".as_slice(), b"https".as_slice()),
+                (b":path".as_slice(), path),
+                (b":authority".as_slice(), authority),
+            ]
+        };
+        assert!(
+            request_from_raw_qpack(&request(b"GET", b"/safe#ignored", b"example.com")).is_none()
+        );
+        assert!(request_from_raw_qpack(&request(b"GET", b"*", b"example.com")).is_none());
+        for authority in [
+            b"bad host".as_slice(),
+            b"host/path".as_slice(),
+            b"[::1".as_slice(),
+            b"example.com:abc".as_slice(),
+            b"user@example.com".as_slice(),
+            b":443".as_slice(),
+        ] {
+            assert!(request_from_raw_qpack(&request(b"GET", b"/", authority)).is_none());
+        }
+
+        let duplicate_host = [
+            (b":method".as_slice(), b"GET".as_slice()),
+            (b":scheme".as_slice(), b"https".as_slice()),
+            (b":path".as_slice(), b"/".as_slice()),
+            (b"host".as_slice(), b"example.com".as_slice()),
+            (b"host".as_slice(), b"example.com".as_slice()),
+        ];
+        assert!(request_from_raw_qpack(&duplicate_host).is_none());
+        let conflicting_host = [
+            (b":method".as_slice(), b"GET".as_slice()),
+            (b":scheme".as_slice(), b"https".as_slice()),
+            (b":path".as_slice(), b"/".as_slice()),
+            (b":authority".as_slice(), b"good.example".as_slice()),
+            (b"host".as_slice(), b"evil.example".as_slice()),
+        ];
+        assert!(request_from_raw_qpack(&conflicting_host).is_none());
+
+        for host in [
+            b"bad host".as_slice(),
+            b"user@example.com".as_slice(),
+            b"example.com:abc".as_slice(),
+            b":443".as_slice(),
+        ] {
+            let host_only = [
+                (b":method".as_slice(), b"GET".as_slice()),
+                (b":scheme".as_slice(), b"https".as_slice()),
+                (b":path".as_slice(), b"/".as_slice()),
+                (b"host".as_slice(), host),
+            ];
+            assert!(request_from_raw_qpack(&host_only).is_none(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn raw_qpack_request_head_keeps_valid_asterisk_ipv6_and_matching_host() {
+        let options = [
+            (b":method".as_slice(), b"OPTIONS".as_slice()),
+            (b":scheme".as_slice(), b"https".as_slice()),
+            (b":path".as_slice(), b"*".as_slice()),
+            (b":authority".as_slice(), b"[2001:db8::1]:8443".as_slice()),
+            (b"host".as_slice(), b"[2001:db8::1]:8443".as_slice()),
+        ];
+        let req = request_from_raw_qpack(&options).expect("valid OPTIONS asterisk request");
+        assert_eq!(req.method(), http::Method::OPTIONS);
+        assert_eq!(req.uri(), "*");
+        assert_eq!(req.headers()[http::header::HOST], "[2001:db8::1]:8443");
+    }
+
+    #[test]
+    fn raw_qpack_trailers_validate_generic_field_syntax_before_discard() {
+        let valid = literal_qpack_fields(&[(b"x-trailer", b"ok")]);
+        assert!(valid_h3_trailers(&valid, 4096));
+        for invalid in [
+            literal_qpack_fields(&[(b"bad name", b"value")]),
+            literal_qpack_fields(&[(b"X-Bad", b"value")]),
+            literal_qpack_fields(&[(b"x-bad", b"nul\0value")]),
+            literal_qpack_fields(&[(b"te", b"gzip")]),
+        ] {
+            assert!(!valid_h3_trailers(&invalid, 4096));
+        }
     }
 
     #[test]

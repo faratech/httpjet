@@ -20,7 +20,10 @@ pub use http_util::{
     is_connection_specific_request_header, percent_decode, percent_decode_cow,
     response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date, strip_hop_by_hop_response,
 };
-pub use net::{host_without_port, is_trusted_internal_peer};
+pub use net::{
+    host_without_port, is_trusted_internal_peer, valid_http_authority, valid_uri_authority,
+    valid_uri_scheme,
+};
 pub use reqid::ReqId;
 pub use router::{ResolvedVhost, Router};
 

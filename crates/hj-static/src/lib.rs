@@ -81,6 +81,7 @@ use http::header::{
 };
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 
+use hj_compress::{AcceptEncoding, Encoding};
 use hj_core::{Body, FileBody, Handler, HandlerError, ReqCtx};
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 
@@ -102,11 +103,11 @@ const META_CACHE_CAP: usize = 16_384;
 const CT_CACHE_CAP: usize = 1_024;
 
 /// Path-resolution cache cap + freshness window. A successful directory→file
-/// resolution (the `open_beneath`/`fstat`/`close` sequence — ~8.5% of CPU on a
-/// hot static path under load) is memoized for this short window. A memo hit
-/// performs one pathname metadata check so an atomic replacement cannot combine
-/// stale validators with current bytes, but still avoids reopening the full
-/// resolution chain. The TTL bounds how long an unchanged identity stays memoized.
+/// resolution is memoized for this short window. A memo hit re-opens the final
+/// target through the same beneath-root resolver and accepts it only when its
+/// descriptor identity matches, so an atomic replacement cannot combine stale
+/// validators with current bytes. The TTL bounds how long an unchanged identity
+/// stays memoized.
 const RESOLVE_CACHE_CAP: usize = 16_384;
 const RESOLVE_TTL: Duration = Duration::from_secs(1);
 
@@ -254,9 +255,9 @@ impl StaticFiles {
     }
 
     /// [`resolve_file`] with a short TTL memo on success, so a file requested
-    /// repeatedly within [`RESOLVE_TTL`] skips the `open_beneath`/`fstat`/`close`
-    /// chain after a cheap identity check. A changed identity or expired entry
-    /// re-runs the safe resolver. Only `File` outcomes are cached;
+    /// repeatedly within [`RESOLVE_TTL`] re-opens the memoized final target and
+    /// skips directory/index discovery after a descriptor identity check. A
+    /// changed identity or expired entry re-runs the safe resolver. Only `File` outcomes are cached;
     /// `DirectorySlash` (a redirect) and errors fall through.
     fn resolve_cached(
         &self,
@@ -287,9 +288,11 @@ impl StaticFiles {
                     && e.allow_symlink == allow_symlink
                     && e.root == doc_root
                     && e.rel == rel
-                    && e.file.is_current()
+                    && let Some(file) = e.file.reopen_matching(doc_root, allow_symlink)
                 {
-                    return Ok(Resolved::File(e.file.clone()));
+                    let mut resolved = e.file.clone();
+                    resolved.file = Some(file);
+                    return Ok(Resolved::File(resolved));
                 }
             }
         }
@@ -366,14 +369,21 @@ impl Clone for ResolvedFile {
 }
 
 impl ResolvedFile {
-    fn is_current(&self) -> bool {
-        std::fs::metadata(&self.path).is_ok_and(|meta| {
-            meta.is_file()
-                && meta.len() == self.len
-                && meta.ino() == self.inode
-                && meta.dev() == self.dev
-                && meta.modified().unwrap_or(UNIX_EPOCH) == self.mtime
-        })
+    /// Re-open this memoized final target through the same resolver and return
+    /// the descriptor only when its fstat identity still matches the memo.
+    /// The identity check and selected descriptor are therefore one operation:
+    /// an atomic pathname replacement can never pair the memo's validators with
+    /// bytes from the replacement inode.
+    fn reopen_matching(&self, doc_root: &Path, allow_symlink: bool) -> Option<std::fs::File> {
+        let rel = self.path.strip_prefix(doc_root).ok()?.to_string_lossy();
+        let root_fd = open_dir(doc_root).ok()?;
+        let (fd, meta) = open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
+        (meta.is_file()
+            && meta.len == self.len
+            && meta.inode == self.inode
+            && meta.dev == self.dev
+            && meta.mtime == self.mtime)
+            .then(|| std::fs::File::from(fd))
     }
 
     /// Build the ETag string for a given LiteSpeed `fileETag` bitmask, byte-for-byte
@@ -537,8 +547,6 @@ impl Handler for StaticFiles {
                 ));
             }
         };
-        let resolved_target = resolved.resolved_path.clone();
-
         // Static response headers are formatted once per file version / extension
         // and cached, then cloned per request — byte-identical to building them
         // inline. Content-Type depends on the extension; ETag / Last-Modified /
@@ -558,50 +566,41 @@ impl Handler for StaticFiles {
         // (Tier 2) Precompressed sibling serving (nginx gzip_static/brotli_static
         // parity): when the client accepts br/gzip and a `<file>.br`/`.gz`
         // sibling exists, serve it with Content-Encoding instead of letting the
-        // compress transform re-encode per request. The sibling lives in the same
-        // directory as the primary, so accessDenyDir verdicts are unaffected; the
+        // compress transform re-encode per request. Resolve the sibling through
+        // the same confined/nonblocking opener as the primary, and carry that
+        // exact resolved path + pinned descriptor into the response. The
         // ETag/length describe the sibling bytes and `Vary: Accept-Encoding`
         // marks the variant for caches. Ranged requests skip the swap (they
         // operate on the primary's bytes).
-        let mut content_encoding: Option<&'static str> = None;
+        let mut content_encoding: Option<Encoding> = None;
         if !req.headers().contains_key(RANGE) {
             let accepts = req
                 .headers()
                 .get(ACCEPT_ENCODING)
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
-            let wanted: &[(&str, &str)] = if accepts.contains("br") {
-                &[("br", ".br"), ("gzip", ".gz")]
-            } else if accepts.contains("gzip") {
-                &[("gzip", ".gz")]
-            } else {
-                &[]
-            };
-            for (enc, ext_suffix) in wanted {
-                let mut sib = resolved.path.clone().into_os_string();
-                sib.push(ext_suffix);
-                let sib = PathBuf::from(sib);
-                if let Ok(f) = std::fs::File::open(&sib) {
-                    let Some(md) = f.metadata().ok().filter(|m| m.is_file()) else {
-                        continue;
-                    };
-                    content_encoding = Some(match *enc {
-                        "br" => "br",
-                        _ => "gzip",
-                    });
-                    resolved = ResolvedFile {
-                        path: sib.clone(),
-                        len: md.len(),
-                        mtime: md.modified().unwrap_or(resolved.mtime),
-                        inode: md.ino(),
-                        dev: md.dev(),
-                        resolved_path: sib,
-                        file: Some(f),
-                    };
+            let accepted = AcceptEncoding::parse(accepts);
+            for (enc, ext_suffix) in [(Encoding::Brotli, ".br"), (Encoding::Gzip, ".gz")] {
+                if !accepted.accepts(enc) {
+                    continue;
+                }
+                if let Some(sibling) = resolve_precompressed_sibling(
+                    &doc_root,
+                    &resolved.path,
+                    ext_suffix,
+                    allow_symlink,
+                    want_resolved,
+                ) {
+                    content_encoding = Some(enc);
+                    resolved = sibling;
                     break;
                 }
             }
         }
+        // This must be captured after precompressed selection: every response
+        // extension and FileBody path has to identify the representation whose
+        // metadata and pinned descriptor are being returned.
+        let resolved_target = resolved.resolved_path.clone();
 
         // ETag from the server's fileETag bitmask (default 28 = Size|MTime|INode).
         // `meta.etag` is `None` when the bitmask is NONE (no ETag header emitted).
@@ -653,6 +652,14 @@ impl Handler for StaticFiles {
             let mut resp = Response::new(Body::Empty);
             *resp.status_mut() = StatusCode::NOT_MODIFIED;
             let h = resp.headers_mut();
+            // RFC 9110 requires a 304 to carry the Vary field the selected 200
+            // would have sent. Precompressed sibling selection depends on
+            // Accept-Encoding, and the compression transform intentionally
+            // skips bodyless 304 responses, so stamp it here with the sibling's
+            // validator metadata.
+            if content_encoding.is_some() {
+                h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
+            }
             if let Some(ref e) = meta.etag {
                 h.insert(ETAG, e.clone());
             }
@@ -676,13 +683,13 @@ impl Handler for StaticFiles {
             None
         };
 
-        // (#10) When symlinks are disallowed, serve from bytes read through a fresh symlink-safe
-        // open instead of letting the transport re-open the (followable) path — closing the
-        // resolve→serve TOCTOU. Read once here and reuse for the range and full bodies via
+        // (#10/#387) When symlinks are disallowed, serve from bytes read through the
+        // exact symlink-safe descriptor resolved above instead of re-opening the
+        // pathname — closing the resolve→serve TOCTOU. Read once and reuse via
         // FileBody.cached (which the transports serve range-aware). HEAD has no body. allow_symlink
         // is true for every prod vhost, so this is inert in prod.
         let verified_cached: Option<bytes::Bytes> = if !allow_symlink && !is_head {
-            Some(read_verified_no_symlink(&doc_root, &resolved.path)?)
+            Some(read_verified_file(&resolved)?)
         } else {
             None
         };
@@ -795,13 +802,7 @@ impl Handler for StaticFiles {
         let h = resp.headers_mut();
         h.insert(CONTENT_TYPE, content_type.clone());
         if let Some(enc) = content_encoding {
-            h.insert(
-                CONTENT_ENCODING,
-                HeaderValue::from_static(match enc {
-                    "br" => "br",
-                    _ => "gzip",
-                }),
-            );
+            h.insert(CONTENT_ENCODING, HeaderValue::from_static(enc.token()));
             h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
         }
         h.insert(CONTENT_LENGTH, meta.content_length.clone());
@@ -991,46 +992,63 @@ fn resolved_fd_path(fd: &OwnedFd, lexical: &Path) -> io::Result<PathBuf> {
     std::fs::read_link(proc_path).or_else(|_| std::fs::canonicalize(lexical))
 }
 
-/// Read the full bytes of an already-resolved file through a FRESH symlink-safe open beneath
-/// `doc_root` (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`).
-///
-/// (#10) For a `followSymbolLink off` vhost the resolve step proves no symlink exists, then drops
-/// the verified fd; the transport later re-opens the response BY PATH, which DOES follow symlinks —
-/// so a symlink swapped into a path component between resolve and serve would be followed
-/// out-of-tree (a TOCTOU the NO_SYMLINKS proof was meant to prevent). Reading the bytes here from a
-/// fresh symlink-safe open and handing them to the transport via `FileBody.cached` means the
-/// transport never re-opens the followable path. `allow_symlink` is true for every prod vhost, so
-/// this is never taken in prod (no hot-path cost).
-fn read_verified_no_symlink(
+/// Resolve a precompressed sibling with the same path and file-type guarantees
+/// as the primary request target. A missing or unusable representation is just
+/// a candidate miss, allowing the caller to try the next accepted encoding.
+fn resolve_precompressed_sibling(
     doc_root: &Path,
-    abs_path: &Path,
-) -> Result<bytes::Bytes, HandlerError> {
-    let rel = abs_path
-        .strip_prefix(doc_root)
-        .map_err(|_| HandlerError::Forbidden)?;
-    let root_fd = open_dir(doc_root).map_err(|_| HandlerError::NotFound)?;
-    let rel_str = rel.to_string_lossy();
-    let rel_open = if rel_str.is_empty() {
-        "."
-    } else {
-        rel_str.as_ref()
-    };
-    let (fd, stat) = open_beneath(&root_fd, rel_open, false).map_err(map_open_err)?;
+    primary_path: &Path,
+    suffix: &str,
+    allow_symlink: bool,
+    want_resolved: bool,
+) -> Option<ResolvedFile> {
+    let mut sibling_os = primary_path.as_os_str().to_os_string();
+    sibling_os.push(suffix);
+    let sibling = PathBuf::from(sibling_os);
+    let rel = sibling.strip_prefix(doc_root).ok()?;
+    let rel = rel.to_string_lossy();
+    let root_fd = open_dir(doc_root).ok()?;
+    let (fd, stat) = open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
     if !stat.is_file() {
-        return Err(HandlerError::Forbidden);
+        return None;
     }
+    let resolved_path = if want_resolved {
+        resolved_fd_path(&fd, &sibling).ok()?
+    } else {
+        sibling.clone()
+    };
+    Some(ResolvedFile {
+        path: sibling,
+        len: stat.len,
+        mtime: stat.mtime,
+        inode: stat.inode,
+        dev: stat.dev,
+        resolved_path,
+        file: Some(std::fs::File::from(fd)),
+    })
+}
+
+/// Read the full bytes of the exact descriptor selected by resolution.
+///
+/// (#10/#387) A `followSymbolLink off` response is buffered so transports never
+/// reopen a followable path. Consuming the descriptor already returned by
+/// `open_beneath` also guarantees its metadata and bytes name the same inode.
+fn read_verified_file(resolved: &ResolvedFile) -> Result<bytes::Bytes, HandlerError> {
     // This path buffers the WHOLE file into RAM (the symlink-TOCTOU mitigation hands
     // the bytes to the transport via `FileBody.cached` so it never re-opens the
     // followable path). Cap it so a symlink-off vhost can't be made to fault an
     // arbitrarily large file into memory per request. Generous — a static file this
     // large on such a vhost is pathological; everything real fits.
     const MAX_VERIFIED_INMEM: u64 = 512 * 1024 * 1024;
-    if stat.len > MAX_VERIFIED_INMEM {
+    if resolved.len > MAX_VERIFIED_INMEM {
         return Err(HandlerError::PayloadTooLarge);
     }
-    let mut file = std::fs::File::from(fd);
-    let mut buf = Vec::with_capacity(stat.len as usize);
-    std::io::Read::read_to_end(&mut file, &mut buf).map_err(|_| HandlerError::NotFound)?;
+    let file = resolved.file.as_ref().ok_or(HandlerError::NotFound)?;
+    let len = usize::try_from(resolved.len).map_err(|_| HandlerError::PayloadTooLarge)?;
+    let mut buf = vec![0; len];
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(&mut buf, 0)
+        .map_err(|_| HandlerError::NotFound)?;
     Ok(bytes::Bytes::from(buf))
 }
 

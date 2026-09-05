@@ -169,6 +169,10 @@ pub struct ExpiresHeaders {
     pub max_age: i64,
 }
 
+/// Last second representable by IMF-fixdate's four-digit year.
+/// `httpdate::fmt_http_date` rejects later `SystemTime` values.
+pub const MAX_HTTP_DATE_UNIX: i64 = 253_402_300_799;
+
 impl ExpiresHeaders {
     /// Compute the `Cache-Control` / `Expires` pair exactly as OLS
     /// `HttpResp::addExpiresHeader` does.
@@ -177,16 +181,20 @@ impl ExpiresHeaders {
     /// - `last_modified_unix` is the resource mtime; only used for `M` rules.
     ///   Pass `now_unix` (or anything) for `A` rules — it is ignored.
     pub fn compute(rule: ExpiresRule, now_unix: i64, last_modified_unix: i64) -> ExpiresHeaders {
-        let (age, expire) = match rule.base {
-            ExpiresBase::Access => {
-                let age = rule.age_secs;
-                (age, now_unix + age)
-            }
-            ExpiresBase::Modify => {
-                let expire = last_modified_unix + rule.age_secs;
-                let age = expire - now_unix;
-                (age, expire)
-            }
+        let raw_expire = match rule.base {
+            ExpiresBase::Access => now_unix.saturating_add(rule.age_secs),
+            ExpiresBase::Modify => last_modified_unix.saturating_add(rule.age_secs),
+        };
+        // IMF-fixdate has a four-digit year. Clamp exceptional operator values
+        // to its representable range, then derive max-age from that same instant
+        // so Cache-Control and Expires cannot disagree. Ordinary access rules
+        // retain their configured age, and ordinary/stale modify rules retain
+        // their previous future/negative age respectively.
+        let expire = raw_expire.clamp(0, MAX_HTTP_DATE_UNIX);
+        let age = if rule.base == ExpiresBase::Access && expire == raw_expire {
+            rule.age_secs
+        } else {
+            expire.saturating_sub(now_unix)
         };
         ExpiresHeaders {
             cache_control: format!("public, max-age={age}"),
@@ -372,6 +380,40 @@ mod tests {
         assert_eq!(h.max_age, -990);
         // OLS prints the negative age verbatim via "%d".
         assert_eq!(h.cache_control, "public, max-age=-990");
+    }
+
+    #[test]
+    fn compute_clamps_large_compact_and_verbose_rules_to_http_date_range() {
+        let now = 1_700_000_000;
+        for value in [
+            "A9223372036854775807",
+            "A315360000000",
+            "access plus 315360000000 seconds",
+        ] {
+            let rule = ExpiresRule::parse(value).expect("large rule remains accepted");
+            let h = ExpiresHeaders::compute(rule, now, now);
+            assert_eq!(h.expire_unix, MAX_HTTP_DATE_UNIX, "rule {value}");
+            assert_eq!(
+                h.max_age,
+                MAX_HTTP_DATE_UNIX - now,
+                "Cache-Control must describe the clamped Expires instant for {value}"
+            );
+            assert_eq!(
+                h.cache_control,
+                format!("public, max-age={}", MAX_HTTP_DATE_UNIX - now)
+            );
+        }
+    }
+
+    #[test]
+    fn compute_saturates_modify_arithmetic_before_clamping() {
+        let rule = ExpiresRule {
+            base: ExpiresBase::Modify,
+            age_secs: i64::MAX,
+        };
+        let h = ExpiresHeaders::compute(rule, i64::MIN, i64::MAX);
+        assert_eq!(h.expire_unix, MAX_HTTP_DATE_UNIX);
+        assert_eq!(h.max_age, i64::MAX);
     }
 
     #[test]

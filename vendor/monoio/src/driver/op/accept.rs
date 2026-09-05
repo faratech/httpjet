@@ -72,7 +72,9 @@ impl super::MultiOp<AcceptMulti> {
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 impl OpAble for AcceptMulti {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
-        opcode::AcceptMulti::new(types::Fd(self.fd.raw_fd())).build()
+        opcode::AcceptMulti::new(types::Fd(self.fd.raw_fd()))
+            .flags(libc::SOCK_CLOEXEC)
+            .build()
     }
 
     #[cfg(any(feature = "legacy", feature = "poll-io"))]
@@ -97,6 +99,7 @@ impl OpAble for Accept {
             self.addr.0.as_mut_ptr() as *mut _,
             &mut self.addr.1,
         )
+        .flags(libc::SOCK_CLOEXEC)
         .build()
     }
 

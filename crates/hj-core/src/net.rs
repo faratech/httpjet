@@ -48,9 +48,115 @@ pub fn host_without_port(authority: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// RFC 3986 §3.1 URI scheme syntax. HTTP/2 permits valid non-HTTP schemes, so
+/// transports use this syntax check without narrowing the value to `http` or
+/// `https`.
+pub fn valid_uri_scheme(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn uri_sub_delim(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+    )
+}
+
+fn valid_uri_component(value: &str, allow_colon: bool) -> bool {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~')
+            || uri_sub_delim(b)
+            || (allow_colon && b == b':')
+        {
+            i += 1;
+        } else if b == b'%'
+            && bytes.get(i + 1).is_some_and(u8::is_ascii_hexdigit)
+            && bytes.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+        {
+            i += 3;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_ip_literal(value: &str) -> bool {
+    if value.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    // RFC 3986 §3.2.2 IPvFuture:
+    // `"v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )`.
+    let Some(rest) = value.strip_prefix('v').or_else(|| value.strip_prefix('V')) else {
+        return false;
+    };
+    let Some((version, address)) = rest.split_once('.') else {
+        return false;
+    };
+    !version.is_empty()
+        && version.bytes().all(|b| b.is_ascii_hexdigit())
+        && !address.is_empty()
+        && address.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'-' | b'.' | b'_' | b'~' | b':')
+                || uri_sub_delim(b)
+        })
+}
+
+/// RFC 3986 §3.2 authority syntax. This validates the generic grammar rather
+/// than DNS semantics so it is suitable for every valid HTTP/2 scheme.
+pub fn valid_uri_authority(value: &str) -> bool {
+    let host_port = if let Some((userinfo, host_port)) = value.rsplit_once('@') {
+        if host_port.contains('@') || !valid_uri_component(userinfo, true) {
+            return false;
+        }
+        host_port
+    } else {
+        value
+    };
+
+    if let Some(literal) = host_port.strip_prefix('[') {
+        let Some(close) = literal.find(']') else {
+            return false;
+        };
+        let (address, suffix) = literal.split_at(close);
+        let suffix = &suffix[1..];
+        return valid_ip_literal(address)
+            && (suffix.is_empty()
+                || suffix
+                    .strip_prefix(':')
+                    .is_some_and(|port| port.bytes().all(|b| b.is_ascii_digit())));
+    }
+
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (host_port, None),
+    };
+    !host.contains(':')
+        && valid_uri_component(host, false)
+        && port.is_none_or(|port| port.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Validate an HTTP(S) authority. RFC 3986's generic authority grammar permits
+/// userinfo and an empty registered name, but HTTP request authorities permit
+/// neither. Keep the generic validator separate so HTTP/2 can still carry valid
+/// non-HTTP schemes.
+pub fn valid_http_authority(value: &str) -> bool {
+    !value.contains('@') && valid_uri_authority(value) && !host_without_port(value).is_empty()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{host_without_port, is_trusted_internal_peer};
+    use super::{
+        host_without_port, is_trusted_internal_peer, valid_http_authority, valid_uri_authority,
+        valid_uri_scheme,
+    };
     use std::net::IpAddr;
 
     fn ip(s: &str) -> IpAddr {
@@ -107,5 +213,49 @@ mod tests {
         );
         // Bare unbracketed IPv6 (malformed) is passed through, not truncated.
         assert_eq!(host_without_port("::1"), "::1");
+    }
+
+    #[test]
+    fn uri_scheme_and_authority_validation_supports_generic_h2_syntax() {
+        for scheme in ["http", "web+custom", "a.b-c"] {
+            assert!(valid_uri_scheme(scheme), "{scheme}");
+        }
+        for scheme in ["", "1http", "http space", "http:"] {
+            assert!(!valid_uri_scheme(scheme), "{scheme}");
+        }
+        for authority in [
+            "example.com",
+            "example.com:443",
+            "[2001:db8::1]:8443",
+            "[v1.a-b]:443",
+            "user@example.com",
+        ] {
+            assert!(valid_uri_authority(authority), "{authority}");
+        }
+        for authority in [
+            "bad host",
+            "host/path",
+            "[::1",
+            "example.com:abc",
+            "user@@example.com",
+        ] {
+            assert!(!valid_uri_authority(authority), "{authority}");
+        }
+    }
+
+    #[test]
+    fn http_authority_requires_a_host_and_forbids_userinfo() {
+        for authority in ["example.com", "example.com:443", "[2001:db8::1]:8443"] {
+            assert!(valid_http_authority(authority), "{authority}");
+        }
+        for authority in [
+            "",
+            ":443",
+            "user@example.com",
+            "bad host",
+            "example.com:abc",
+        ] {
+            assert!(!valid_http_authority(authority), "{authority}");
+        }
     }
 }

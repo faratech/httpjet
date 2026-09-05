@@ -793,6 +793,78 @@ async fn resolve_cache_revalidates_atomic_file_replacement() {
 }
 
 #[tokio::test]
+async fn resolve_cache_hit_retains_a_descriptor_for_the_memoized_inode() {
+    use std::io::Read as _;
+
+    let root = temp_root("resolve-cache-fd");
+    fs::write(root.join("a.txt"), b"selected bytes").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        allow_symbol_link: true,
+        ..Default::default()
+    });
+    let server = Arc::new(make_server());
+    let handler = StaticFiles::new();
+
+    let mut first_ctx = make_ctx(server.clone(), vhost.clone());
+    let first = handler
+        .handle(&mut first_ctx, req(Method::GET, "/a.txt"))
+        .await
+        .unwrap();
+    assert!(matches!(first.body(), Body::File(f) if f.file.is_some()));
+
+    let mut second_ctx = make_ctx(server, vhost);
+    let second = handler
+        .handle(&mut second_ctx, req(Method::GET, "/a.txt"))
+        .await
+        .unwrap();
+    let Body::File(mut body) = second.into_body() else {
+        panic!("memo hit must remain a file body");
+    };
+    let mut pinned = body
+        .file
+        .take()
+        .expect("memo hit must pin its selected inode");
+    let mut bytes = Vec::new();
+    pinned.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"selected bytes");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn verified_buffer_reads_the_resolved_descriptor_after_path_replacement() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let root = temp_root("verified-fd-replace");
+    let path = root.join("a.txt");
+    fs::write(&path, b"old selected").unwrap();
+    let file = fs::File::open(&path).unwrap();
+    let meta = file.metadata().unwrap();
+    let resolved = ResolvedFile {
+        path: path.clone(),
+        len: meta.len(),
+        mtime: meta.modified().unwrap(),
+        inode: meta.ino(),
+        dev: meta.dev(),
+        resolved_path: fs::canonicalize(&path).unwrap(),
+        file: Some(file),
+    };
+
+    let replacement = root.join("replacement.txt");
+    fs::write(&replacement, b"new pathname").unwrap();
+    fs::rename(replacement, &path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"new pathname");
+    assert_eq!(
+        read_verified_file(&resolved).unwrap(),
+        bytes::Bytes::from_static(b"old selected"),
+        "buffering must stay on the inode whose metadata supplied the response validators"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
 async fn head_has_no_body() {
     let root = temp_root("head");
     fs::write(root.join("a.txt"), b"abcdef").unwrap();
@@ -1708,7 +1780,7 @@ fn directory_slash_redirect_neutralizes_backslash() {
 // Content-Encoding when the client accepts it, and the plain file otherwise.
 #[tokio::test]
 async fn precompressed_sibling_served_with_content_encoding() {
-    use std::io::Write as _;
+    use std::io::{Read as _, Seek as _, Write as _};
 
     let root = temp_root("precomp");
     fs::write(root.join("style.css"), b"body{color:red}").unwrap();
@@ -1721,7 +1793,11 @@ async fn precompressed_sibling_served_with_content_encoding() {
         doc_root: root.clone(),
         ..Default::default()
     });
-    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    // Keep canonical target reporting enabled with a benign, nonmatching rule.
+    // All fixtures are ordinary regular files inside the temporary docroot.
+    let mut server = make_server();
+    server.security.access_deny_dir = vec!["/nonexistent-denied/*".into()];
+    let mut ctx = make_ctx(Arc::new(server), vhost);
 
     // No Accept-Encoding: plain identity bytes.
     let resp = serve(&mut ctx, req(Method::GET, "/style.css"))
@@ -1749,6 +1825,15 @@ async fn precompressed_sibling_served_with_content_encoding() {
         resp2.headers().get(VARY).map(|v| v.as_bytes()),
         Some(&b"Accept-Encoding"[..])
     );
+    let br_etag = resp2.headers()[ETAG].clone();
+    let mut req_br_304 = req(Method::GET, "/style.css");
+    req_br_304
+        .headers_mut()
+        .insert(ACCEPT_ENCODING, http::HeaderValue::from_static("br"));
+    req_br_304.headers_mut().insert(IF_NONE_MATCH, br_etag);
+    let resp_br_304 = serve(&mut ctx, req_br_304).await.unwrap();
+    assert_eq!(resp_br_304.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(resp_br_304.headers().get(VARY).unwrap(), "Accept-Encoding");
 
     // Accepts gzip only: the .gz sibling is served, marked, with a Vary.
     let mut req_gz = req(Method::GET, "/style.css");
@@ -1761,6 +1846,18 @@ async fn precompressed_sibling_served_with_content_encoding() {
         "gzip",
         "the .gz sibling is served for gzip-capable clients"
     );
+    let gzip_etag = resp_gz.headers()[ETAG].clone();
+    let mut req_gzip_304 = req(Method::GET, "/style.css");
+    req_gzip_304
+        .headers_mut()
+        .insert(ACCEPT_ENCODING, http::HeaderValue::from_static("gzip"));
+    req_gzip_304.headers_mut().insert(IF_NONE_MATCH, gzip_etag);
+    let resp_gzip_304 = serve(&mut ctx, req_gzip_304).await.unwrap();
+    assert_eq!(resp_gzip_304.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        resp_gzip_304.headers().get(VARY).unwrap(),
+        "Accept-Encoding"
+    );
 
     // Accepts br (preferred): the .br sibling wins.
     let mut req3 = req(Method::GET, "/style.css");
@@ -1768,14 +1865,76 @@ async fn precompressed_sibling_served_with_content_encoding() {
         .insert(ACCEPT_ENCODING, http::HeaderValue::from_static("br"));
     let resp3 = serve(&mut ctx, req3).await.unwrap();
     assert_eq!(resp3.headers().get(CONTENT_ENCODING).unwrap(), "br");
+    assert_eq!(resp3.headers()[CONTENT_LENGTH], "8");
+    let selected_target = resp3
+        .extensions()
+        .get::<ResolvedTargetPath>()
+        .expect("selected target extension")
+        .0
+        .clone();
+    assert_eq!(
+        selected_target,
+        fs::canonicalize(root.join("style.css.br")).unwrap()
+    );
     let Body::File(f3) = resp3.into_body() else {
         panic!("br static body");
     };
+    assert_eq!(f3.path, selected_target, "body and target metadata agree");
+    assert_eq!(f3.len, 8, "the selected sibling length is returned");
+    let mut pinned = f3.file.expect("the sibling fd is pinned for streaming");
+    pinned.rewind().unwrap();
+    let mut bytes = Vec::new();
+    pinned.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"BR-BYTES", "the pinned fd is the selected sibling");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn precompressed_negotiation_honors_tokens_qvalues_and_wildcards() {
+    let root = temp_root("precomp-negotiation");
+    fs::write(root.join("style.css"), b"IDENTITY").unwrap();
+    fs::write(root.join("style.css.br"), b"BROTLI").unwrap();
+    fs::write(root.join("style.css.gz"), b"GZIP").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+
+    async fn selected(ctx: &mut ReqCtx, value: &'static str) -> Option<String> {
+        let mut request = req(Method::GET, "/style.css");
+        request
+            .headers_mut()
+            .insert(ACCEPT_ENCODING, http::HeaderValue::from_static(value));
+        serve(ctx, request)
+            .await
+            .unwrap()
+            .headers()
+            .get(CONTENT_ENCODING)
+            .map(|v| v.to_str().unwrap().to_owned())
+    }
+
+    assert_eq!(selected(&mut ctx, "br;q=0").await, None);
     assert_eq!(
-        f3.len, 8,
-        "the .br sibling's bytes are served (Content-Length matches)"
+        selected(&mut ctx, "br;q=0, gzip").await.as_deref(),
+        Some("gzip")
     );
-    assert!(f3.file.is_some(), "the sibling fd is pinned for streaming");
+    assert_eq!(selected(&mut ctx, "BR").await.as_deref(), Some("br"));
+    assert_eq!(selected(&mut ctx, "*").await.as_deref(), Some("br"));
+    assert_eq!(selected(&mut ctx, "xbr").await, None);
+
+    fs::remove_file(root.join("style.css.br")).unwrap();
+    assert_eq!(
+        selected(&mut ctx, "br").await,
+        None,
+        "a missing accepted br sibling must not fall back to unadvertised gzip"
+    );
+    assert_eq!(
+        selected(&mut ctx, "gzip;q=0, *").await,
+        None,
+        "an explicit refusal overrides wildcard acceptance"
+    );
 
     fs::remove_dir_all(&root).ok();
 }

@@ -19,6 +19,19 @@ async fn accept_read_write() -> std::io::Result<()> {
     let connect = UnixStream::connect(&sock_path);
     let ((mut server, _), client) = try_join(accept, connect).await?;
 
+    use std::os::fd::AsRawFd;
+    let flags = unsafe { libc::fcntl(server.as_raw_fd(), libc::F_GETFD) };
+    assert!(
+        flags >= 0,
+        "F_GETFD failed: {}",
+        std::io::Error::last_os_error()
+    );
+    assert_ne!(
+        flags & libc::FD_CLOEXEC,
+        0,
+        "accepted UDS fd must be close-on-exec"
+    );
+
     // testing into_raw_fd and from_raw_fd
     #[cfg(unix)]
     use std::os::fd::{FromRawFd, IntoRawFd};

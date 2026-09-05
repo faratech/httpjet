@@ -163,7 +163,23 @@ impl CidrList {
                             format!("geo line {line_no}: `asn` needs a number and prefixes")
                         })
                         .and_then(|a| {
-                            a.trim_start_matches("AS")
+                            let number = if a
+                                .as_bytes()
+                                .get(..2)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"AS"))
+                            {
+                                &a[2..]
+                            } else {
+                                a
+                            };
+                            if number.is_empty()
+                                || !number.bytes().all(|byte| byte.is_ascii_digit())
+                            {
+                                return Err(format!(
+                                    "geo line {line_no}: bad ASN {a:?}: expected decimal digits"
+                                ));
+                            }
+                            number
                                 .parse::<u32>()
                                 .map_err(|e| format!("geo line {line_no}: bad ASN {a:?}: {e}"))
                         })?;
@@ -256,7 +272,7 @@ mod tests {
     #[test]
     fn cidr_list_parses_countries_and_asns() {
         let list = CidrList::parse(
-            "# comment\n\ncountry US 203.0.113.0/24 198.51.100.0/24\ncountry de 2001:db8::/32\nasn 13335 203.0.114.0/24\nasn AS64512 10.0.0.0/8\n",
+            "# comment\n\ncountry US 203.0.113.0/24 198.51.100.0/24\ncountry de 2001:db8::/32\nasn 13335 203.0.114.0/24\nasn AS64512 10.0.0.0/8\nasn as64513 10.1.0.0/16\nasn As64514 10.2.0.0/16\nasn aS64515 10.3.0.0/16\n",
         )
         .unwrap();
         assert!(list.country_prefixes("us").is_some());
@@ -264,6 +280,9 @@ mod tests {
         assert_eq!(list.country_prefixes("GB"), None);
         assert!(list.asn_prefixes(13335).is_some());
         assert!(list.asn_prefixes(64512).is_some());
+        assert!(list.asn_prefixes(64513).is_some());
+        assert!(list.asn_prefixes(64514).is_some());
+        assert!(list.asn_prefixes(64515).is_some());
         assert_eq!(list.asn_prefixes(1), None);
         assert_eq!(list.countries().count(), 2);
     }
@@ -278,5 +297,25 @@ mod tests {
         // Errors name the line.
         let e = CidrList::parse("country US 1.2.3.0/24\ncountry DE nope").unwrap_err();
         assert!(e.contains("line 2"), "{e}");
+    }
+
+    #[test]
+    fn cidr_list_rejects_malformed_asn_labels() {
+        for label in [
+            "AS",
+            "as",
+            "ASAS13335",
+            "asas13335",
+            "+13335",
+            "-1",
+            "13335x",
+            "4294967296",
+        ] {
+            let spec = format!("asn {label} 203.0.113.0/24");
+            assert!(
+                CidrList::parse(&spec).is_err(),
+                "malformed ASN label {label:?} was accepted"
+            );
+        }
     }
 }

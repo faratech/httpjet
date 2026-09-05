@@ -791,10 +791,19 @@ async fn handle_tls_bridged(
     // (Tier 2) PROXY protocol: read the header from the raw stream and override the
     // peer address before the TLS handshake. Fail-closed: no header = close.
     if binding.proxy_protocol {
-        match proxy_protocol::reader::read_and_strip(&mut stream).await {
+        match proxy_protocol::reader::read_and_strip(
+            &mut stream,
+            state.serve_config.header_read_timeout,
+        )
+        .await
+        {
             Ok(Some(h)) => {
-                tracing::debug!(real_peer = %h.src, "proxy_protocol: peer overridden");
-                peer = h.src;
+                if let Some(src) = h.src {
+                    tracing::debug!(real_peer = %src, "proxy_protocol: peer overridden");
+                    peer = src;
+                } else {
+                    tracing::debug!(%peer, "proxy_protocol: peer preserved by LOCAL/UNKNOWN");
+                }
             }
             _ => {
                 tracing::debug!(%peer, "proxy_protocol: missing/malformed header; closing");
@@ -1012,13 +1021,20 @@ async fn handle_conn_bridged<S>(
 ) where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
 {
+    let state = core.holder.load();
+    let header_read_timeout = state.serve_config.header_read_timeout;
+    let request_start = std::time::Instant::now();
     // (Tier 2) PROXY protocol on a PLAINTEXT listener: strip the header (fail-closed)
     // and override the peer BEFORE the H1/h2c discriminator reads the first bytes.
     if binding.proxy_protocol {
-        match proxy_protocol::reader::read_and_strip(&mut stream).await {
+        match proxy_protocol::reader::read_and_strip(&mut stream, header_read_timeout).await {
             Ok(Some(h)) => {
-                tracing::debug!(real_peer = %h.src, "proxy_protocol: peer overridden");
-                peer = h.src;
+                if let Some(src) = h.src {
+                    tracing::debug!(real_peer = %src, "proxy_protocol: peer overridden");
+                    peer = src;
+                } else {
+                    tracing::debug!(%peer, "proxy_protocol: peer preserved by LOCAL/UNKNOWN");
+                }
             }
             _ => {
                 tracing::debug!(%peer, "proxy_protocol: missing/malformed header; closing");
@@ -1026,9 +1042,6 @@ async fn handle_conn_bridged<S>(
             }
         }
     }
-    let state = core.holder.load();
-    let header_read_timeout = state.serve_config.header_read_timeout;
-    let request_start = std::time::Instant::now();
     let mut acc: Vec<u8> = Vec::with_capacity(8192);
     let mut read_scratch: Vec<u8> = Vec::new();
     let is_h2 = loop {
@@ -2472,6 +2485,14 @@ mod chunked_tests {
                     .await
                     .expect("multishot terminated early")
                     .expect("accept failed");
+                use std::os::fd::AsRawFd;
+                let flags = unsafe { libc::fcntl(conn.as_raw_fd(), libc::F_GETFD) };
+                assert!(flags >= 0, "F_GETFD failed: {}", io::Error::last_os_error());
+                assert_ne!(
+                    flags & libc::FD_CLOEXEC,
+                    0,
+                    "multishot accepted fd must be close-on-exec"
+                );
                 let peer = conn.peer_addr().expect("getpeername");
                 assert!(peer.ip().is_loopback());
             }
@@ -2479,6 +2500,14 @@ mod chunked_tests {
             // The listener still works single-shot after the stream detaches.
             let extra = std::thread::spawn(move || std::net::TcpStream::connect(addr).unwrap());
             let (conn, peer) = listener.accept().await.expect("single-shot after detach");
+            use std::os::fd::AsRawFd;
+            let flags = unsafe { libc::fcntl(conn.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed: {}", io::Error::last_os_error());
+            assert_ne!(
+                flags & libc::FD_CLOEXEC,
+                0,
+                "single-shot accepted fd must be close-on-exec"
+            );
             assert!(peer.ip().is_loopback());
             drop(conn);
             let _ = extra.join().unwrap();

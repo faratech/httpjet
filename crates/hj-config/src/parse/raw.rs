@@ -548,6 +548,15 @@ pub(super) struct RawContext {
     pub(super) add_default_charset: Option<String>,
     #[serde(rename = "addDefaultCharsetCustomized", default)]
     pub(super) charset: Option<String>,
+    // httpjet-native per-context resource controls. Keep the raw strings so
+    // conversion can distinguish an absent directive from an explicit zero
+    // and reject malformed values instead of silently applying a default.
+    #[serde(rename = "maxReqBodySize", default)]
+    pub(super) max_req_body_size: Option<String>,
+    #[serde(rename = "bandwidthLimit", default)]
+    pub(super) bandwidth_limit: Option<String>,
+    #[serde(rename = "responseTimeout", default)]
+    pub(super) response_timeout: Option<String>,
     /// (#249) LSWS six-flag context `<cachePolicy>` (+ microCache5xx).
     #[serde(rename = "cachePolicy", default)]
     pub(super) cache_policy: Option<RawContextCachePolicy>,

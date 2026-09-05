@@ -244,16 +244,7 @@ impl RewriteOutcomeCache {
                 // every other cold insert just skips (best-effort).
                 let now = prune_epoch().elapsed().as_millis() as u64;
                 let window = (self.ttl.as_millis() as u64).saturating_mul(10).max(100);
-                let last = self.last_sync_prune.load(Ordering::Relaxed);
-                // last == 0 means never run: allow immediately regardless of the
-                // (process-uptime based) clock being younger than the window.
-                if last == 0
-                    || now.saturating_sub(last) >= window
-                        && self
-                            .last_sync_prune
-                            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_ok()
-                {
+                if self.claim_sync_prune(now, window) {
                     self.prune_expired();
                 }
                 if self.count.load(Ordering::Relaxed) >= self.cap {
@@ -275,6 +266,20 @@ impl RewriteOutcomeCache {
         {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Claim the rare synchronous prune slot. The due check and CAS stay in the
+    /// same boolean group so the initial `last == 0` sentinel cannot bypass the
+    /// CAS and let every at-cap request run an O(N) sweep. Store at least 1:
+    /// process uptime may still be millisecond zero on the first claim, and
+    /// writing zero would leave the sentinel armed.
+    fn claim_sync_prune(&self, now: u64, window: u64) -> bool {
+        let last = self.last_sync_prune.load(Ordering::Relaxed);
+        (last == 0 || now.saturating_sub(last) >= window)
+            && self
+                .last_sync_prune
+                .compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
     }
 
     /// Run `prune_expired` at most once per TTL (L3). Between sweeps the cap simply keeps
@@ -1150,6 +1155,55 @@ mod tests {
         }
         assert!(c.get(&okey("/a")).is_none());
         assert!(c.get(&okey("/b")).is_none());
+    }
+
+    #[test]
+    fn sync_prune_initial_claim_uses_cas_and_disarms_zero_sentinel() {
+        let c = RewriteOutcomeCache::with_cap(Duration::from_millis(20), 2);
+        assert!(c.claim_sync_prune(0, 100), "first caller claims the slot");
+        assert_eq!(
+            c.last_sync_prune.load(Ordering::Relaxed),
+            1,
+            "millisecond-zero claim must not leave the never-run sentinel armed"
+        );
+        assert!(
+            !c.claim_sync_prune(0, 100),
+            "a second caller inside the window must not run another synchronous sweep"
+        );
+        assert!(
+            c.claim_sync_prune(101, 100),
+            "a later window may claim again"
+        );
+    }
+
+    #[test]
+    fn full_live_cache_runs_only_one_sync_prune_inside_the_window() {
+        let c = Arc::new(RewriteOutcomeCache::with_cap(Duration::from_secs(60), 2));
+        c.insert(okey("/a"), RwResult::Gone);
+        c.insert(okey("/b"), RwResult::Forbidden);
+        assert_eq!(c.count.load(Ordering::Relaxed), 2);
+
+        c.insert(okey("/cold-1"), RwResult::Gone);
+        let first_claim = c.last_sync_prune.load(Ordering::Relaxed);
+        assert_ne!(
+            first_claim, 0,
+            "the real at-cap insert gate must claim and disarm the initial sentinel"
+        );
+        assert_eq!(c.count.load(Ordering::Relaxed), 2, "the cap remains hard");
+        assert!(c.get(&okey("/cold-1")).is_none());
+
+        for path in ["/cold-2", "/cold-3", "/cold-4"] {
+            c.insert(okey(path), RwResult::Gone);
+            assert!(c.get(&okey(path)).is_none());
+        }
+        assert_eq!(
+            c.last_sync_prune.load(Ordering::Relaxed),
+            first_claim,
+            "later cold inserts over a live full cache must not sweep again inside the window"
+        );
+        assert_eq!(c.count.load(Ordering::Relaxed), 2);
+        assert!(matches!(c.get(&okey("/a")), Some(RwResult::Gone)));
+        assert!(matches!(c.get(&okey("/b")), Some(RwResult::Forbidden)));
     }
 
     #[test]

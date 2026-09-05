@@ -161,7 +161,9 @@ mod tests {
 /// until `n` bytes of budget are available. Disabled when rate is 0.
 pub struct BandwidthThrottle {
     rate_bps: u64,
-    available: std::sync::atomic::AtomicI64,
+    // Signed so a write may consume future tokens (debt). i128 covers the
+    // complete u64 rate/request domain plus the 2x burst cap without casts.
+    available: i128,
     last: std::time::Instant,
 }
 
@@ -172,7 +174,7 @@ impl BandwidthThrottle {
         }
         Some(Self {
             rate_bps,
-            available: std::sync::atomic::AtomicI64::new(rate_bps as i64),
+            available: i128::from(rate_bps),
             last: std::time::Instant::now(),
         })
     }
@@ -187,19 +189,28 @@ impl BandwidthThrottle {
     /// Returns the MICROSECONDS the caller should wait before writing (0 = go now).
     pub fn acquire(&mut self, n: u64) -> u64 {
         let now = std::time::Instant::now();
-        let elapsed_us = now.duration_since(self.last).as_micros() as u64;
+        let elapsed_us = now.duration_since(self.last).as_micros();
         self.last = now;
-        let refill = elapsed_us * self.rate_bps / 1_000_000;
-        let mut avail = self.available.load(std::sync::atomic::Ordering::Relaxed) + refill as i64;
-        let cap = self.rate_bps as i64 * 2; // burst cap = 2× rate
-        avail = avail.min(cap);
-        avail -= n as i64;
-        self.available
-            .store(avail, std::sync::atomic::Ordering::Relaxed);
-        if avail < 0 {
+        self.acquire_after(n, elapsed_us)
+    }
+
+    /// Deterministic arithmetic core for [`Self::acquire`]. `elapsed_us` is
+    /// u128 because `Duration::as_micros` is u128; every conversion below is
+    /// saturating so all legal u64 rates and write sizes remain defined.
+    fn acquire_after(&mut self, n: u64, elapsed_us: u128) -> u64 {
+        let refill = elapsed_us.saturating_mul(u128::from(self.rate_bps)) / 1_000_000;
+        let refill = i128::try_from(refill).unwrap_or(i128::MAX);
+        let cap = i128::from(self.rate_bps) * 2; // burst cap = 2× rate
+        self.available = self
+            .available
+            .saturating_add(refill)
+            .min(cap)
+            .saturating_sub(i128::from(n));
+        if self.available < 0 {
             // Over budget: caller should wait this many µs.
-            let wait_us = (-avail) * 1_000_000 / self.rate_bps as i64;
-            wait_us as u64
+            let wait_us =
+                self.available.unsigned_abs().saturating_mul(1_000_000) / u128::from(self.rate_bps);
+            wait_us.min(u128::from(u64::MAX)) as u64
         } else {
             0
         }
@@ -225,5 +236,44 @@ mod bandwidth_tests {
     #[test]
     fn bandwidth_throttle_disabled_at_zero() {
         assert!(BandwidthThrottle::new(0).is_none());
+    }
+
+    #[test]
+    fn bandwidth_throttle_preserves_token_and_debt_math() {
+        let mut t = BandwidthThrottle::new(1_000).expect("nonzero rate");
+        assert_eq!(t.acquire_after(500, 0), 0);
+        assert_eq!(t.available, 500);
+        assert_eq!(t.acquire_after(1_000, 0), 500_000);
+        assert_eq!(t.available, -500);
+        assert_eq!(t.acquire_after(0, 500_000), 0);
+        assert_eq!(t.available, 0);
+    }
+
+    #[test]
+    fn bandwidth_throttle_accepts_maximum_u64_rate() {
+        let mut t = BandwidthThrottle::new(u64::MAX).expect("nonzero rate");
+        assert_eq!(t.rate_bps(), u64::MAX);
+        assert_eq!(t.available, i128::from(u64::MAX));
+        assert_eq!(
+            t.acquire_after(u64::MAX, u128::MAX),
+            0,
+            "huge elapsed refill saturates at the 2x burst cap"
+        );
+        assert_eq!(t.available, i128::from(u64::MAX));
+    }
+
+    #[test]
+    fn bandwidth_throttle_clamps_unrepresentable_wait() {
+        let mut t = BandwidthThrottle::new(1).expect("nonzero rate");
+        assert_eq!(
+            t.acquire_after(u64::MAX, 0),
+            u64::MAX,
+            "a legal request can create more wait microseconds than u64 holds"
+        );
+
+        // Large elapsed arithmetic also stays defined and restores only the
+        // configured 2x burst, rather than wrapping into excess credit.
+        assert_eq!(t.acquire_after(2, u128::MAX), 0);
+        assert_eq!(t.available, 0);
     }
 }

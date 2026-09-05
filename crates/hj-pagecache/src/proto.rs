@@ -42,17 +42,54 @@ fn dir_secs(tok: &str, name: &str) -> Option<u32> {
     Some(v.parse().unwrap_or(0))
 }
 
+/// Split a Cache-Control field at commas outside quoted strings. Backslash
+/// escapes are significant inside a quoted string. An unterminated quote is
+/// rejected so callers can fail closed instead of interpreting its contents as
+/// independent directives.
+fn cache_directives(v: &str) -> Result<Vec<&str>, ()> {
+    let bytes = v.as_bytes();
+    let mut directives = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (i, &byte) in bytes.iter().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else if byte == b'"' {
+            quoted = true;
+        } else if byte == b',' {
+            directives.push(&v[start..i]);
+            start = i + 1;
+        }
+    }
+    if quoted || escaped {
+        return Err(());
+    }
+    directives.push(&v[start..]);
+    Ok(directives)
+}
+
 /// Parse an `X-LiteSpeed-Cache-Control` header value.
 pub fn parse_lscache_control(v: &str) -> LsCacheControl {
     let lower = v.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return LsCacheControl::Absent;
     }
+    let directives = match cache_directives(&lower) {
+        Ok(directives) => directives,
+        Err(()) => return LsCacheControl::NoCache,
+    };
     // Explicit non-cache wins regardless of any accompanying scope token.
-    if lower.split(',').any(|t| t.trim() == "no-cache") {
+    if directives.iter().any(|t| t.trim() == "no-cache") {
         return LsCacheControl::NoCache;
     }
-    if lower.split(',').any(|t| t.trim() == "no-store") {
+    if directives.iter().any(|t| t.trim() == "no-store") {
         return LsCacheControl::NoStore;
     }
 
@@ -61,7 +98,7 @@ pub fn parse_lscache_control(v: &str) -> LsCacheControl {
     let mut stale_if_error_secs: u32 = 0;
     let mut is_private = false;
     let mut is_public = false;
-    for tok in lower.split(',') {
+    for tok in directives {
         let tok = tok.trim();
         if tok == "private" {
             is_private = true;
@@ -115,10 +152,11 @@ pub struct StdCacheControl {
     pub private: bool,
     pub no_store: bool,
     pub no_cache: bool,
-    /// `must-revalidate` / `proxy-revalidate` (RFC 9111 §5.2.2.2/§5.2.2.8): once
-    /// stale, the entry MUST be revalidated, not served stale. We never inject our
-    /// configured DEFAULT stale windows over this (an explicit app-declared SWR/SIE
-    /// still wins — that combination is the app's own choice).
+    /// `must-revalidate`, `proxy-revalidate`, or `s-maxage` (RFC 9111
+    /// §5.2.2.2/§5.2.2.8/§5.2.2.10): once stale, the entry MUST be revalidated,
+    /// not served stale. We never inject our configured DEFAULT stale windows over
+    /// this (an explicit app-declared SWR/SIE still wins — that combination is the
+    /// app's own choice).
     pub must_revalidate: bool,
     /// `max-age` (browser TTL).
     pub max_age: Option<u32>,
@@ -143,7 +181,14 @@ impl StdCacheControl {
 /// Parse a standard `Cache-Control` value by exact directive token.
 pub fn parse_std_cache_control(v: &str) -> StdCacheControl {
     let mut cc = StdCacheControl::default();
-    for tok in v.split(',') {
+    let directives = match cache_directives(v) {
+        Ok(directives) => directives,
+        Err(()) => {
+            cc.no_store = true;
+            return cc;
+        }
+    };
+    for tok in directives {
         let tok = tok.trim();
         let low = tok.to_ascii_lowercase();
         match low.as_str() {
@@ -153,17 +198,21 @@ pub fn parse_std_cache_control(v: &str) -> StdCacheControl {
             "no-cache" => cc.no_cache = true,
             "must-revalidate" | "proxy-revalidate" => cc.must_revalidate = true,
             _ => {
-                if let Some(n) = dir_secs(&low, "s-maxage") {
-                    cc.s_maxage = Some(n);
+                let name = low.split_once('=').map(|(name, _)| name.trim());
+                if name == Some("private") {
+                    cc.private = true;
+                } else if name == Some("no-cache") {
+                    cc.no_cache = true;
+                } else if let Some(n) = dir_secs(&low, "s-maxage") {
+                    cc.s_maxage.get_or_insert(n);
+                    cc.must_revalidate = true;
                 } else if let Some(n) = dir_secs(&low, "max-age") {
-                    cc.max_age = Some(n);
+                    cc.max_age.get_or_insert(n);
                 } else if let Some(n) = dir_secs(&low, "stale-while-revalidate") {
-                    cc.stale_while_revalidate = Some(n);
+                    cc.stale_while_revalidate.get_or_insert(n);
                 } else if let Some(n) = dir_secs(&low, "stale-if-error") {
-                    cc.stale_if_error = Some(n);
+                    cc.stale_if_error.get_or_insert(n);
                 }
-                // `private=...` / `no-cache=...` field-name forms are rare on
-                // responses and intentionally ignored (we only act on the bare token).
             }
         }
     }
@@ -394,6 +443,77 @@ mod tests {
     fn std_cc_quoted_seconds() {
         let cc = parse_std_cache_control("max-age=\"600\"");
         assert_eq!(cc.max_age, Some(600));
+    }
+
+    #[test]
+    fn std_cc_duplicate_numeric_directives_keep_the_first_value() {
+        let cc = parse_std_cache_control(
+            "public, max-age=0, max-age=300, s-maxage=0, s-maxage=600, \
+             stale-if-error=0, stale-if-error=90",
+        );
+        assert_eq!(cc.max_age, Some(0));
+        assert_eq!(cc.s_maxage, Some(0));
+        assert_eq!(cc.stale_if_error, Some(0));
+
+        let reversed = parse_std_cache_control("max-age=300, max-age=0");
+        assert_eq!(reversed.max_age, Some(300));
+    }
+
+    #[test]
+    fn std_cc_qualified_restrictions_forbid_shared_storage() {
+        let private = parse_std_cache_control("public, max-age=60, private=\"x-user\"");
+        assert!(private.private);
+        assert!(private.forbids_cache());
+
+        let no_cache = parse_std_cache_control("public, max-age=60, no-cache=\"set-cookie\"");
+        assert!(no_cache.no_cache);
+        assert!(no_cache.forbids_cache());
+    }
+
+    #[test]
+    fn std_cc_s_maxage_implies_shared_revalidation() {
+        let cc = parse_std_cache_control("public, s-maxage=60");
+        assert!(cc.must_revalidate);
+        assert_eq!(cc.shared_ttl(), Some(60));
+    }
+
+    #[test]
+    fn cache_control_quoted_commas_are_opaque_and_malformed_quotes_fail_closed() {
+        let hidden = parse_std_cache_control(
+            "extension=\"ignore, public, max-age=300, no-cache\", another=1",
+        );
+        assert!(!hidden.public);
+        assert_eq!(hidden.max_age, None);
+        assert!(!hidden.no_cache);
+
+        assert_eq!(
+            parse_lscache_control("extension=\"ignore, public, max-age=300, no-cache\""),
+            LsCacheControl::Absent
+        );
+        assert_eq!(
+            parse_lscache_control(
+                "extension=\"ignore\\\", public, max-age=300\", public, max-age=60"
+            ),
+            LsCacheControl::Public {
+                ttl_secs: 60,
+                stale_secs: 0,
+                stale_if_error_secs: 0,
+            }
+        );
+
+        assert!(
+            parse_std_cache_control("public, extension=\"unterminated").forbids_cache(),
+            "a malformed standard field must fail closed"
+        );
+        assert_eq!(
+            parse_lscache_control("public, extension=\"unterminated"),
+            LsCacheControl::NoCache
+        );
+
+        let ordinary = parse_std_cache_control("public, max-age=60, stale-if-error=30");
+        assert!(ordinary.public);
+        assert_eq!(ordinary.max_age, Some(60));
+        assert_eq!(ordinary.stale_if_error, Some(30));
     }
 
     #[test]

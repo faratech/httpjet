@@ -34,7 +34,8 @@ use hj_compress::{ACCEPT_ENCODING_ENV, AcceptEncoding, Encoding, decode_bytes};
 use hj_core::{Body, FileBody, ReqCtx, Request, Response};
 use hj_pagecache::{
     CachedResponse, Disposition, PageBody, PageScope, Purge, QsStrip, classify_response,
-    compute_vary_value, normalize_query, parse_purge, parse_tags, parse_vary, public_with_vary,
+    compute_vary_value, normalize_query, parse_purge, parse_std_cache_control, parse_tags,
+    parse_vary, public_with_vary,
 };
 use hj_rewrite::{CacheKeyModifier, Htaccess, chain_cacheable_for_default};
 
@@ -1525,19 +1526,9 @@ fn stored_cc_forbids_stale(headers: &HeaderMap) -> bool {
     headers
         .get_all(http::header::CACHE_CONTROL)
         .iter()
-        .any(|v| {
-            v.to_str().is_ok_and(|s| {
-                let s = s.to_ascii_lowercase();
-                [
-                    "must-revalidate",
-                    "proxy-revalidate",
-                    "no-store",
-                    "no-cache",
-                ]
-                .iter()
-                .any(|d| s.contains(d))
-            })
-        })
+        .filter_map(|v| v.to_str().ok())
+        .map(parse_std_cache_control)
+        .any(|cc| cc.must_revalidate || cc.no_store || cc.no_cache || cc.private)
 }
 
 fn parse_capsule_control(headers: &HeaderMap, fallback_ttl_secs: u32) -> Option<CapsuleControl> {
@@ -2643,37 +2634,20 @@ pub async fn cache_store(
     // (#9) A `Body::File` CAN be eligible (an `.htaccess` `Header set
     // X-LiteSpeed-Cache-Control: public` on a static file, applied by
     // `apply_response_headers` BEFORE this store runs). `collect_body` reads it into
-    // memory; only if THAT read fails do we recover the original File response below —
-    // a valid file must never be replaced by a 502. Capture the descriptor first since
-    // `collect_body` consumes the body.
-    let file_recover: Option<(std::path::PathBuf, u64, Option<(u64, u64)>)> = match &body {
-        Body::File(f) => Some((f.path.clone(), f.len, f.range)),
-        _ => None,
-    };
+    // memory; if THAT exact read fails, `collect_body` returns the original File response
+    // with its selected descriptor/cache lease intact. A valid file must never become a 502,
+    // and fallback must never reopen a replacement pathname under stale validators.
     let mut bytes = match collect_body(body, cfg.max_obj_bytes).await {
         Collected::Buffered(b) => b,
-        Collected::OverCap(passthrough) => {
+        Collected::Passthrough(passthrough) => {
             // An unknown-length (chunked) stream exceeded the cap mid-buffer: serve it through,
-            // uncached, control headers stripped — never buffering the whole body. (A File or a
-            // Stream that DECLARED a length over the cap was already rejected before buffering.)
+            // or a selected File could not be read to its advertised length. Preserve the exact
+            // body/descriptor/cache lease and serve uncached with control headers stripped.
             strip_control_headers(&mut parts.headers);
             return Response::from_parts(parts, passthrough);
         }
         Collected::Error => {
             strip_control_headers(&mut parts.headers);
-            if let Some((path, len, range)) = file_recover {
-                // (#9) File read failed: serve the ORIGINAL file response (control
-                // headers stripped), never a 502. The transport re-opens the file.
-                tracing::warn!(path = %req_path, "page-cache: file body unreadable for cache; serving file uncached");
-                let fb = Body::File(hj_core::FileBody {
-                    path,
-                    file: None,
-                    len,
-                    range,
-                    cached: None,
-                });
-                return Response::from_parts(parts, fb);
-            }
             // A genuine backend STREAM error mid-flight; the body is unrecoverable.
             tracing::warn!(path = %req_path, "page-cache: backend stream error while buffering");
             return error_502();
@@ -3021,11 +2995,11 @@ impl http_body::Body for PrefixedBody {
 enum Collected {
     /// Fully buffered within `max_obj_bytes` — eligible to cache.
     Buffered(Bytes),
-    /// An unknown-length stream exceeded `max_obj_bytes` while buffering: NOT cacheable. Carries
-    /// a pass-through `Body` — the bytes read so far re-attached AHEAD of the unread remainder —
-    /// so the response is served in full WITHOUT ever holding it all in RAM.
-    OverCap(Body),
-    /// Stream/file read error mid-buffer (unrecoverable here).
+    /// The body must be served uncached: either an unknown-length stream exceeded
+    /// `max_obj_bytes` (with its consumed prefix reattached), or an exact File read failed
+    /// (with the original descriptor/cache lease retained).
+    Passthrough(Body),
+    /// Stream read error mid-buffer, or a blocking worker failure (unrecoverable here).
     Error,
 }
 
@@ -3035,32 +3009,45 @@ enum Collected {
 /// (chunked, no Content-Length) is collected frame-by-frame and stops the MOMENT it crosses the
 /// cap — so a large or adversarial chunked response marked cacheable can't be slurped unboundedly
 /// into RAM (an OOM/DoS vector the old `s.collect()` had). On overflow it is handed back as
-/// `OverCap` to serve through, uncached.
+/// `Passthrough` to serve through, uncached.
 async fn collect_body(body: Body, max_obj_bytes: u64) -> Collected {
     match body {
         Body::Full(b) => Collected::Buffered(b),
         Body::Empty => Collected::Buffered(Bytes::new()),
         Body::File(mut f) => {
+            let (start, len) = match f.range {
+                Some((start, end)) => (start, end.saturating_sub(start) + 1),
+                None => (0, f.len),
+            };
+            // `cached` always holds the whole file; apply the inclusive range through
+            // FileBody's single-sourced helper, then require the exact advertised size.
+            if let Some(bytes) = f.cached_ranged() {
+                return if bytes.len() as u64 == len {
+                    Collected::Buffered(bytes)
+                } else {
+                    Collected::Passthrough(Body::File(f))
+                };
+            }
             match tokio::task::spawn_blocking(move || {
-                use std::io::{Read, Seek};
-
-                let mut file = match f.file.take() {
-                    Some(file) => file,
-                    None => std::fs::File::open(&f.path)?,
-                };
-                let (start, len) = match f.range {
-                    Some((start, end)) => (start, end.saturating_sub(start) + 1),
-                    None => (0, f.len),
-                };
-                file.seek(std::io::SeekFrom::Start(start))?;
-                let mut bytes = Vec::with_capacity(len.min(usize::MAX as u64) as usize);
-                file.take(len).read_to_end(&mut bytes)?;
-                Ok::<_, std::io::Error>(bytes)
+                if f.file.is_none() {
+                    match std::fs::File::open(&f.path) {
+                        Ok(file) => f.file = Some(file),
+                        Err(_) => return (None, f),
+                    }
+                }
+                let bytes = usize::try_from(len).ok().and_then(|len| {
+                    let mut bytes = vec![0; len];
+                    use std::os::unix::fs::FileExt;
+                    f.file.as_ref()?.read_exact_at(&mut bytes, start).ok()?;
+                    Some(Bytes::from(bytes))
+                });
+                (bytes, f)
             })
             .await
             {
-                Ok(Ok(v)) => Collected::Buffered(Bytes::from(v)),
-                _ => Collected::Error,
+                Ok((Some(bytes), _)) => Collected::Buffered(bytes),
+                Ok((None, f)) => Collected::Passthrough(Body::File(f)),
+                Err(_) => Collected::Error,
             }
         }
         Body::Stream(mut s) => {
@@ -3080,7 +3067,7 @@ async fn collect_body(body: Body, max_obj_bytes: u64) -> Collected {
                                     prefix: Some(buf.freeze()),
                                     rest: s,
                                 };
-                                return Collected::OverCap(Body::Stream(passthrough.boxed()));
+                                return Collected::Passthrough(Body::Stream(passthrough.boxed()));
                             }
                         }
                     }
@@ -4662,7 +4649,7 @@ mod tests {
             Collected::Buffered(b) => assert_eq!(b.as_ref(), b"static-file-body"),
             _ => panic!("file body must buffer to its bytes"),
         }
-        // A missing file is an Error (caller serves the original file, not 502).
+        // A missing file is returned unchanged for uncached pass-through, not a 502.
         let _ = std::fs::remove_file(&path);
         let missing = Body::File(hj_core::FileBody {
             path,
@@ -4673,8 +4660,111 @@ mod tests {
         });
         assert!(matches!(
             collect_body(missing, 1024).await,
-            Collected::Error
+            Collected::Passthrough(Body::File(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn collect_file_requires_exact_advertised_length() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("httpjet_collect_short_{n}"));
+        std::fs::write(&path, b"short").unwrap();
+        let body = Body::File(hj_core::FileBody {
+            path: path.clone(),
+            file: None,
+            len: 8,
+            range: None,
+            cached: None,
+        });
+        match collect_body(body, 1024).await {
+            Collected::Passthrough(Body::File(f)) => {
+                assert!(
+                    f.file.is_some(),
+                    "the opened fallback descriptor stays pinned"
+                );
+                assert_eq!(f.len, 8);
+            }
+            _ => panic!("a short EOF must never become cacheable buffered bytes"),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn collect_file_reads_the_pinned_version_after_atomic_replacement() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("httpjet_collect_replace_{n}"));
+        let replacement = path.with_extension("new");
+        std::fs::write(&path, b"OLD-BODY").unwrap();
+        let pinned = std::fs::File::open(&path).unwrap();
+        std::fs::write(&replacement, b"NEW-BODY").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let body = Body::File(hj_core::FileBody {
+            path: path.clone(),
+            file: Some(pinned),
+            len: 8,
+            range: None,
+            cached: None,
+        });
+        match collect_body(body, 1024).await {
+            Collected::Buffered(bytes) => assert_eq!(bytes.as_ref(), b"OLD-BODY"),
+            _ => panic!("the selected descriptor is exact and must buffer"),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn collect_file_failure_preserves_selected_descriptor_identity() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("httpjet_collect_fallback_{n}"));
+        let replacement = path.with_extension("new");
+        std::fs::write(&path, b"OLD").unwrap();
+        let pinned = std::fs::File::open(&path).unwrap();
+        std::fs::write(&replacement, b"NEW-BODY").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let body = Body::File(hj_core::FileBody {
+            path: path.clone(),
+            file: Some(pinned),
+            len: 8,
+            range: None,
+            cached: None,
+        });
+        let fallback = match collect_body(body, 1024).await {
+            Collected::Passthrough(Body::File(f)) => f,
+            _ => panic!("short selected inode must pass through uncached"),
+        };
+        let (served, truncated) = crate::uring::bridge::buffer_body(Body::File(fallback)).await;
+        assert!(
+            truncated,
+            "the selected inode is shorter than its old metadata"
+        );
+        assert_eq!(served.as_ref(), b"OLD", "fallback must not reopen NEW-BODY");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn collect_file_cached_bytes_apply_the_inclusive_range_once() {
+        let body = Body::File(hj_core::FileBody {
+            path: std::path::PathBuf::from("unused-cached-path"),
+            file: None,
+            len: 8,
+            range: Some((2, 5)),
+            cached: Some(Bytes::from_static(b"01234567")),
+        });
+        match collect_body(body, 1024).await {
+            Collected::Buffered(bytes) => assert_eq!(bytes.as_ref(), b"2345"),
+            _ => panic!("a complete cached range must buffer without reopening"),
+        }
     }
 
     #[tokio::test]
@@ -4777,10 +4867,10 @@ mod tests {
 
     #[tokio::test]
     async fn collect_stream_over_cap_serves_through_uncached() {
-        // 10 bytes over a 4-byte cap: OverCap, and the pass-through body must reproduce the
+        // 10 bytes over a 4-byte cap: Passthrough, and the body must reproduce the
         // FULL original bytes (prefix read so far + the unread remainder), never truncated.
         match collect_body(stream_of(&[b"abcd", b"efgh", b"ij"]), 4).await {
-            Collected::OverCap(Body::Stream(s)) => {
+            Collected::Passthrough(Body::Stream(s)) => {
                 let bytes = s.collect().await.expect("pass-through collects").to_bytes();
                 assert_eq!(
                     bytes.as_ref(),
@@ -4788,8 +4878,23 @@ mod tests {
                     "over-cap pass-through must be complete"
                 );
             }
-            _ => panic!("over-cap stream must be OverCap(Stream), not buffered"),
+            _ => panic!("over-cap stream must be Passthrough(Stream), not buffered"),
         }
+    }
+
+    #[test]
+    fn capsule_stale_guard_uses_parsed_cache_control_directives() {
+        let s_maxage = hdrs(&[("cache-control", "public, s-maxage=60")]);
+        assert!(stored_cc_forbids_stale(&s_maxage));
+
+        let quoted = hdrs(&[(
+            "cache-control",
+            "public, extension=\"ignore, no-cache, private\"",
+        )]);
+        assert!(!stored_cc_forbids_stale(&quoted));
+
+        let malformed = hdrs(&[("cache-control", "public, extension=\"unterminated")]);
+        assert!(stored_cc_forbids_stale(&malformed));
     }
 
     #[test]
