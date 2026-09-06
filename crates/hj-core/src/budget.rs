@@ -24,6 +24,7 @@ pub const DEFAULT_BODY_BUFFER_MEM: u64 = 512 * 1024 * 1024;
 pub struct BodyBufferBudget {
     max_bytes: u64,
     in_flight: AtomicU64,
+    rejected: AtomicU64,
 }
 
 impl BodyBufferBudget {
@@ -31,6 +32,7 @@ impl BodyBufferBudget {
         Self {
             max_bytes,
             in_flight: AtomicU64::new(0),
+            rejected: AtomicU64::new(0),
         }
     }
 
@@ -42,6 +44,7 @@ impl BodyBufferBudget {
         let mut cur = self.in_flight.load(Ordering::Relaxed);
         loop {
             if cur.saturating_add(n) > self.max_bytes {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             match self.in_flight.compare_exchange_weak(
@@ -67,6 +70,14 @@ impl BodyBufferBudget {
     /// Bytes currently reserved by live buffered bodies.
     pub fn in_flight(&self) -> u64 {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.max_bytes
+    }
+
+    pub fn rejected(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
     }
 }
 
@@ -104,6 +115,22 @@ impl BodyBufferLease {
         }
         self.budget.release(n);
         self.held -= n;
+    }
+
+    /// Keep the reservation until the last alias of this allocation is dropped,
+    /// including DATA frames moved out of the request into an asynchronous writer.
+    pub fn into_bytes(self, data: Vec<u8>) -> bytes::Bytes {
+        struct OwnedBody {
+            data: Vec<u8>,
+            _lease: BodyBufferLease,
+        }
+        impl AsRef<[u8]> for OwnedBody {
+            fn as_ref(&self) -> &[u8] {
+                &self.data
+            }
+        }
+        debug_assert!(self.held >= data.len() as u64);
+        bytes::Bytes::from_owner(OwnedBody { data, _lease: self })
     }
 }
 
@@ -149,6 +176,34 @@ mod tests {
         let b = BodyBufferBudget::new(0);
         assert!(b.try_acquire(u64::MAX));
         assert_eq!(b.in_flight(), 0);
+    }
+
+    #[test]
+    fn owned_bytes_keep_reservation_through_clones_and_slices() {
+        let budget = Arc::new(BodyBufferBudget::new(12));
+        let mut lease = BodyBufferLease::new(budget.clone());
+        assert!(lease.reserve(12));
+        let bytes = lease.into_bytes(vec![1; 8]);
+        let alias = bytes.slice(2..4);
+        drop(bytes);
+        assert_eq!(budget.in_flight(), 12);
+        assert!(!budget.try_acquire(1));
+        assert_eq!(budget.rejected(), 1);
+        assert_eq!(budget.capacity(), 12);
+        drop(alias);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[test]
+    fn disabled_budget_allows_owned_bytes() {
+        let budget = Arc::new(BodyBufferBudget::new(0));
+        let mut lease = BodyBufferLease::new(budget.clone());
+        assert!(lease.reserve(8));
+        let bytes = lease.into_bytes(vec![0; 8]);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(budget.in_flight(), 0);
+        drop(bytes);
+        assert_eq!(budget.rejected(), 0);
     }
 }
 

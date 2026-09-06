@@ -227,7 +227,7 @@ fn per_core_h3(core: usize, std_sock: std::net::UdpSocket, rustls_cfg: Arc<rustl
             "uring h3: per-core quinn-proto endpoint serving (fixed-response smoke)"
         );
         // Fixed-response handler (the original smoke behavior).
-        let smoke = |_bytes: Vec<u8>, _cc: bool, _peer: SocketAddr| async { h3_response_bytes() };
+        let smoke = |_bytes: Bytes, _cc: bool, _peer: SocketAddr| async { h3_response_bytes() };
         if let Err(e) = endpoint_loop(udp, endpoint, smoke).await {
             tracing::error!(core, error = %e, "uring h3: endpoint loop ended");
         }
@@ -263,9 +263,9 @@ struct H3State {
     /// installed by the connection driver. Accumulated request bytes reserve
     /// against it so pre-dispatch buffering stays server-bounded.
     body_budget: Option<std::sync::Arc<hj_core::budget::BodyBufferBudget>>,
-    /// Per-stream reservation outstanding against `body_budget`; released exactly
-    /// when the stream's buffer is reclaimed (`reclaim_request`/dispatch).
-    budget_charged: std::collections::HashMap<StreamId, u64>,
+    /// Owned reservations follow request buffers into dispatch or release on every
+    /// state teardown, including a connection lost before a request finishes.
+    body_leases: std::collections::HashMap<StreamId, hj_core::budget::BodyBufferLease>,
     /// Every accepted peer unidirectional stream remains here until FIN/reset. HTTP/3
     /// control and QPACK streams are critical and must be continuously drained; accepting
     /// and reading them once loses split stream-type/SETTINGS delivery and hides closure.
@@ -536,33 +536,6 @@ impl Drop for RequestChargeGuard {
     }
 }
 
-/// RAII reservation of a finished request's committed bytes against the server-wide
-/// buffered-body cap shared with H1/H2/LSAPI (#236 residual). Held for the life of the
-/// dispatched task; released on completion, drop, or panic.
-struct BudgetGuard {
-    budget: std::sync::Arc<hj_core::budget::BodyBufferBudget>,
-    bytes: u64,
-}
-
-impl BudgetGuard {
-    fn acquire(budget: &std::sync::Arc<hj_core::budget::BodyBufferBudget>, n: u64) -> Option<Self> {
-        if n == 0 || budget.try_acquire(n) {
-            Some(Self {
-                budget: budget.clone(),
-                bytes: n,
-            })
-        } else {
-            None
-        }
-    }
-}
-
-impl Drop for BudgetGuard {
-    fn drop(&mut self) {
-        self.budget.release(self.bytes);
-    }
-}
-
 /// Per-core cap on concurrently-dispatched H3 requests (bounds RAM: each in-flight request
 /// pins its bytes + a PHP/pipeline request). At the cap the driver sheds with a 503 rather
 /// than spawning, so a flood can't OOM the core.
@@ -753,29 +726,37 @@ where
 /// returning whatever was buffered. Used when a stream is gone (reset/closed),
 /// oversize, or fully received — every removal from `requests` goes through here so a
 /// stream can never be dropped from one map but left in the other.
-fn release_stream_budget(st: &mut H3State, id: StreamId) {
-    if let Some(n) = st.budget_charged.remove(&id) {
-        if let Some(b) = &st.body_budget {
-            b.release(n);
-        }
+fn reclaim_request(st: &mut H3State, id: StreamId) -> Bytes {
+    let (bytes, lease) = take_request_for_dispatch(st, id);
+    st.total_req_bytes
+        .set(st.total_req_bytes.get().saturating_sub(bytes.len()));
+    match lease {
+        Some(lease) => lease.into_bytes(bytes),
+        None => Bytes::from(bytes),
     }
 }
 
-fn reclaim_request(st: &mut H3State, id: StreamId) -> Vec<u8> {
+fn take_request_for_dispatch(
+    st: &mut H3State,
+    id: StreamId,
+) -> (Vec<u8>, Option<hj_core::budget::BodyBufferLease>) {
     st.requests.remove(&id);
     st.req_frames.remove(&id);
-    release_stream_budget(st, id);
-    let bytes = st.req_buf.remove(&id).unwrap_or_default();
-    st.total_req_bytes
-        .set(st.total_req_bytes.get().saturating_sub(bytes.len()));
-    bytes
+    (
+        st.req_buf.remove(&id).unwrap_or_default(),
+        st.body_leases.remove(&id),
+    )
 }
 
-fn take_request_for_dispatch(st: &mut H3State, id: StreamId) -> Vec<u8> {
-    st.requests.remove(&id);
-    st.req_frames.remove(&id);
-    release_stream_budget(st, id);
-    st.req_buf.remove(&id).unwrap_or_default()
+/// Release unfinished request allocations as soon as the connection is lost.
+/// Dispatched requests own separate leases and keep their remaining charge.
+fn reclaim_buffered_requests(st: &mut H3State) {
+    let bytes: usize = st.req_buf.values().map(Vec::len).sum();
+    st.requests.clear();
+    st.req_frames.clear();
+    st.req_buf.clear();
+    st.body_leases.clear();
+    release_request_charge(st, bytes);
 }
 
 fn release_request_charge(st: &mut H3State, bytes: usize) {
@@ -925,11 +906,13 @@ fn append_request_bytes(
         .consume(bytes, limits)?;
     // (security #263) Reserve against the server-wide budget BEFORE extending, so
     // pre-dispatch accumulation is bounded by the same cap as H1/H2/LSAPI. The
-    // reservation is released when the stream's buffer is reclaimed.
+    // owned reservation follows the buffer through dispatch and every drop path.
     if let Some(budget) = st.body_budget.clone() {
-        if budget.try_acquire(bytes.len() as u64) {
-            *st.budget_charged.entry(id).or_insert(0) += bytes.len() as u64;
-        } else {
+        let lease = st
+            .body_leases
+            .entry(id)
+            .or_insert_with(|| hj_core::budget::BodyBufferLease::new(budget));
+        if !lease.reserve(bytes.len() as u64) {
             return Err(RequestFrameError::Limit);
         }
     }
@@ -1298,7 +1281,7 @@ async fn endpoint_loop<H, Fut>(
     handle_request: H,
 ) -> io::Result<()>
 where
-    H: Fn(Vec<u8>, bool, SocketAddr) -> Fut,
+    H: Fn(Bytes, bool, SocketAddr) -> Fut,
     Fut: std::future::Future<Output = Vec<u8>>,
 {
     let mut conns: HashMap<ConnectionHandle, quinn_proto::Connection> = HashMap::new();
@@ -1547,6 +1530,7 @@ fn service_conn(
     }
     if connection_lost {
         cancel_all_dispatched_requests(st);
+        reclaim_buffered_requests(st);
         st.rejected = true;
         return;
     }
@@ -1769,7 +1753,7 @@ async fn drive_connections<H, Fut>(
     handle_request: &H,
     tx_scratch: &mut Vec<u8>,
 ) where
-    H: Fn(Vec<u8>, bool, SocketAddr) -> Fut,
+    H: Fn(Bytes, bool, SocketAddr) -> Fut,
     Fut: std::future::Future<Output = Vec<u8>>,
 {
     let handles: Vec<ConnectionHandle> = conns.keys().copied().collect();
@@ -2013,7 +1997,6 @@ async fn drive_one_conn(
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     comp_tx: &flume::Sender<Completion>,
     request_limits: H3RequestLimits,
-    body_budget: &std::sync::Arc<hj_core::budget::BodyBufferBudget>,
     accepting_requests: bool,
     tx_scratch: &mut Vec<u8>,
 ) -> bool {
@@ -2103,7 +2086,7 @@ async fn drive_one_conn(
         return flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
     }
     for id in finished {
-        let req_bytes = take_request_for_dispatch(st, id);
+        let (req_bytes, body_lease) = take_request_for_dispatch(st, id);
         let req_charge = req_bytes.len();
         // Peer + TLS params captured up front (no connection borrow into the task). QUIC is
         // always TLS 1.3 (RFC 9001); quinn-proto exposes the client cert chain but not the
@@ -2132,17 +2115,6 @@ async fn drive_one_conn(
         }
         inflight.set(inflight.get() + 1);
         let guard = InflightGuard(inflight.clone());
-        // (#236 residual) Reserve the request's committed bytes against the server-wide
-        // cap before spawning its work; the guard releases them when the task ends.
-        let Some(budget_guard) = BudgetGuard::acquire(body_budget, req_charge as u64) else {
-            if let Some(c) = conns.get_mut(&hd) {
-                let mut ss = c.send_stream(id);
-                let _ = ss.write(&h3_error(http::StatusCode::SERVICE_UNAVAILABLE));
-                let _ = ss.finish();
-            }
-            release_request_charge(st, req_charge);
-            continue;
-        };
         let charge = RequestChargeGuard {
             total: st.total_req_bytes.clone(),
             bytes: req_charge,
@@ -2154,7 +2126,6 @@ async fn drive_one_conn(
         // spawn() is synchronous (no await) — `st`'s borrow of `h3` is not held across an await.
         let work = async move {
             let _g = guard; // frees the in-flight slot on completion / drop / panic
-            let _bg = budget_guard; // releases the server-wide body reservation likewise
             let send = |kind| {
                 tx.send_async(Completion {
                     conn: hd,
@@ -2165,6 +2136,7 @@ async fn drive_one_conn(
             };
             let outcome = handle_h3_request(
                 req_bytes,
+                body_lease,
                 has_client_cert,
                 tls,
                 peer,
@@ -2462,7 +2434,6 @@ async fn pump(
                 inflight,
                 comp_tx,
                 runtime.request_limits(),
-                &runtime.body_budget,
                 accepting,
                 tx_scratch,
             )
@@ -2919,7 +2890,15 @@ enum H3RequestParseError {
 /// Parse an HTTP/3 request stream while preserving the initial and trailing field sections.
 /// DATA payloads are compacted into the input allocation as frames are decoded, so a large
 /// request never coexists with a second full-body allocation.
-fn parse_h3_request(mut data: Vec<u8>) -> Result<ParsedH3Request, H3RequestParseError> {
+#[cfg(test)]
+fn parse_h3_request(data: Vec<u8>) -> Result<ParsedH3Request, H3RequestParseError> {
+    parse_h3_request_leased(data, None)
+}
+
+fn parse_h3_request_leased(
+    mut data: Vec<u8>,
+    lease: Option<hj_core::budget::BodyBufferLease>,
+) -> Result<ParsedH3Request, H3RequestParseError> {
     let mut pos = 0usize;
     let mut field: Option<Vec<u8>> = None;
     let mut body_len = 0usize;
@@ -2965,7 +2944,10 @@ fn parse_h3_request(mut data: Vec<u8>) -> Result<ParsedH3Request, H3RequestParse
         Bytes::new()
     } else {
         data.truncate(body_len);
-        Bytes::from(data)
+        match lease {
+            Some(lease) => lease.into_bytes(data),
+            None => Bytes::from(data),
+        }
     };
     Ok(ParsedH3Request {
         field,
@@ -3201,6 +3183,7 @@ fn build_h3_request_head(
 /// encode the response. App-layer mTLS mirrors the TCP TLS path.
 async fn handle_h3_request(
     req_bytes: Vec<u8>,
+    body_lease: Option<hj_core::budget::BodyBufferLease>,
     has_client_cert: bool,
     tls: Option<hj_core::TlsParams>,
     peer: SocketAddr,
@@ -3212,7 +3195,7 @@ async fn handle_h3_request(
     if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
         return H3Outcome::Full(h3_error(http::StatusCode::FORBIDDEN));
     }
-    let parsed = match parse_h3_request(req_bytes) {
+    let parsed = match parse_h3_request_leased(req_bytes, body_lease) {
         Ok(v) => v,
         Err(_) => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
@@ -4096,7 +4079,7 @@ mod h3_codec_tests {
         let mut st = H3State::default();
         st.requests.extend([first, second]);
         assert!(append_request_bytes(&mut st, first, &[0x00, 4, 1, 2, 3, 4], limits).is_ok());
-        let dispatched = take_request_for_dispatch(&mut st, first);
+        let (dispatched, _lease) = take_request_for_dispatch(&mut st, first);
         assert_eq!(dispatched.len(), 6);
         assert_eq!(
             st.total_req_bytes.get(),
@@ -4112,6 +4095,115 @@ mod h3_codec_tests {
         drop(charge);
         assert_eq!(st.total_req_bytes.get(), 0);
         assert!(append_request_bytes(&mut st, second, &[0x00, 4, 5, 6, 7, 8], limits).is_ok());
+    }
+
+    #[test]
+    fn global_request_budget_is_released_on_connection_loss_and_state_drop() {
+        let limits = H3RequestLimits::new(16, 16);
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        for explicit_loss in [false, true] {
+            let mut st = H3State {
+                body_budget: Some(budget.clone()),
+                ..Default::default()
+            };
+            st.requests.insert(id);
+            append_request_bytes(&mut st, id, &[0x00, 4, 1, 2, 3, 4], limits).unwrap();
+            assert_eq!(budget.in_flight(), 6);
+            if explicit_loss {
+                // The same helper is called when quinn reports ConnectionLost.
+                reclaim_buffered_requests(&mut st);
+                assert_eq!(budget.in_flight(), 0);
+                assert_eq!(st.total_req_bytes.get(), 0);
+                assert!(st.requests.is_empty());
+            }
+            // Covers direct cancellation/error/drop as well as the drained map's
+            // removal; explicit-loss followed by drop must not double-release.
+            let mut states = HashMap::new();
+            states.insert(ConnectionHandle(1), st);
+            states.remove(&ConnectionHandle(1));
+            assert_eq!(budget.in_flight(), 0);
+            assert!(budget.try_acquire(16), "an unrelated upload must still fit");
+            budget.release(16);
+        }
+    }
+
+    #[test]
+    fn reclaim_return_keeps_global_request_budget_until_bytes_drop() {
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        let mut st = H3State {
+            body_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        st.requests.insert(id);
+        append_request_bytes(
+            &mut st,
+            id,
+            &[0x00, 4, 1, 2, 3, 4],
+            H3RequestLimits::new(16, 16),
+        )
+        .unwrap();
+        let bytes = reclaim_request(&mut st, id);
+        assert_eq!(st.total_req_bytes.get(), 0);
+        assert_eq!(
+            budget.in_flight(),
+            6,
+            "smoke/reclaim callers still own these bytes"
+        );
+        drop(st);
+        assert_eq!(budget.in_flight(), 6);
+        drop(bytes);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[test]
+    fn dispatched_body_retains_global_budget_through_compaction_and_cloning() {
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        let mut st = H3State {
+            body_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        st.requests.insert(id);
+        let wire = [0x01, 2, 0, 0, 0x00, 4, 1, 2, 3, 4];
+        append_request_bytes(&mut st, id, &wire, H3RequestLimits::new(16, 16)).unwrap();
+        let (bytes, lease) = take_request_for_dispatch(&mut st, id);
+        let allocation = bytes.as_ptr();
+        assert_eq!(
+            budget.in_flight(),
+            10,
+            "dispatch must transfer, never release/reacquire"
+        );
+        drop(st);
+        let parsed = parse_h3_request_leased(bytes, lease).unwrap();
+        assert_eq!(parsed.body.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(
+            parsed.body.as_ptr(),
+            allocation,
+            "compaction must retain the allocation"
+        );
+        assert_eq!(
+            budget.in_flight(),
+            10,
+            "wire allocation remains charged after truncation"
+        );
+        assert!(!budget.try_acquire(7));
+        let slice = parsed.body.slice(1..);
+        drop(parsed);
+        assert_eq!(budget.in_flight(), 10);
+        drop(slice);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[test]
+    fn malformed_dispatched_request_returns_global_budget() {
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        let mut lease = hj_core::budget::BodyBufferLease::new(budget.clone());
+        assert!(lease.reserve(3));
+        // Truncated field section fails before any body is dispatched.
+        assert!(parse_h3_request_leased(vec![0x01, 4, 0], Some(lease)).is_err());
+        assert_eq!(budget.in_flight(), 0);
     }
 
     #[test]
@@ -4247,7 +4339,7 @@ mod h3_codec_tests {
             .set(b"partial body".len() + b"keep".len());
 
         let drained = reclaim_request(&mut st, id);
-        assert_eq!(drained, b"partial body");
+        assert_eq!(drained.as_ref(), b"partial body");
         assert!(!st.requests.contains(&id), "slot must be removed");
         assert!(!st.req_buf.contains_key(&id), "buffer must be removed");
         // The unrelated open stream is retained.

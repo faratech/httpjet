@@ -1,6 +1,6 @@
 //! `.htaccess` HTTP Basic authentication (Tier 1.3).
 //!
-//! [`crate::htaccess::AuthRealm`] captures `AuthType Basic` + `AuthName` +
+//! [`AuthRealm`] captures `AuthType Basic` + `AuthName` +
 //! `AuthUserFile` (+ `Require valid-user` / `Require user …`). Verification
 //! reads the htpasswd file at authorization time (admin-controlled path, low
 //! traffic trees) and supports the standard hash formats:
@@ -95,12 +95,7 @@ pub fn decode_basic_credentials(encoded: &str) -> Option<(String, String)> {
 
 /// Constant-time string comparison (realm/user checks).
 pub fn ct_eq_str(a: &str, b: &str) -> bool {
-    let (x, y) = (a.as_bytes(), b.as_bytes());
-    let mut acc = (x.len() ^ y.len()) as u8;
-    for (i, ch) in y.iter().enumerate() {
-        acc |= x.get(i).unwrap_or(&0) ^ ch;
-    }
-    acc == 0
+    ct_eq(a.as_bytes(), b.as_bytes())
 }
 
 #[cfg(test)]
@@ -145,10 +140,18 @@ mod tests {
         assert!(decode_basic_credentials("!!!").is_none());
         assert!(decode_basic_credentials("dXNlcg==").is_none(), "no colon");
     }
+
+    #[test]
+    fn usernames_require_exact_case_and_length() {
+        assert!(!ct_eq_str("Admin", "admin"));
+        let long = format!("admin{}", "x".repeat(256));
+        assert!(!ct_eq_str(&long, "admin"));
+        assert!(!ct_eq_str("admin", &long));
+    }
 }
 
 /// (Tier 1.3) A resolved Basic-auth realm from one `.htaccess` file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthRealm {
     pub realm: String,
     pub user_file: std::path::PathBuf,
@@ -159,7 +162,8 @@ pub struct AuthRealm {
 impl AuthRealm {
     /// `WWW-Authenticate` challenge value for a 401 response.
     pub fn challenge(&self) -> String {
-        format!("Basic realm=\"{}\"", self.realm)
+        let escaped = self.realm.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("Basic realm=\"{escaped}\"")
     }
 
     /// True when `user` satisfies the realm's `Require` directives.

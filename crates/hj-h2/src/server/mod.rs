@@ -2097,6 +2097,8 @@ mod tests {
         // (GOAWAY ENHANCE_YOUR_CALM) and release exactly what was buffered when a stream
         // un-buffers, so the H1/H2/H3/LSAPI layers share one honest ledger.
         let budget = std::sync::Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        let mut body_lease = hj_core::budget::BodyBufferLease::new(budget.clone());
+        assert!(body_lease.reserve(8));
         use super::recv::process_frame;
         use crate::frame::kind;
         let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
@@ -2105,6 +2107,7 @@ mod tests {
             StreamState {
                 headers_done: true,
                 body: vec![0u8; 8],
+                body_lease: Some(body_lease),
                 recv_window: 65535,
                 ..Default::default()
             },
@@ -2134,10 +2137,6 @@ mod tests {
         let mut cancelled: FxHashSet<u32> = FxHashSet::default();
         let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
         let service = |_req: Request| std::future::ready(Response::new(hj_core::Body::Empty));
-        // The stream's already-buffered 8 bytes were reserved before the test (as the
-        // connection would have); reflect that on the ledger.
-        assert!(budget.try_acquire(8));
-
         // A DATA frame that fits every per-stream/per-conn cap but exhausts the global one.
         let data = [0u8; 32];
         let hdr = FrameHeader {
@@ -2172,9 +2171,203 @@ mod tests {
             "the refused reservation must not have mutated the ledger"
         );
 
-        // Un-buffering releases exactly what was reserved.
+        // The receive counter and the buffer allocation have separate lifetimes.
         recv.buffer_sub(8);
-        assert_eq!(budget.in_flight(), 0, "buffer_sub must release the budget");
+        assert_eq!(budget.in_flight(), 8, "live bytes must remain charged");
+        drop(streams);
+        assert_eq!(budget.in_flight(), 0, "teardown must release the budget");
+    }
+
+    fn body_budget_request_wire(end_stream: bool) -> Vec<u8> {
+        let mut wire = crate::conn::PREFACE.to_vec();
+        frame::write_settings(&mut wire, &[]);
+        let mut block = Vec::new();
+        let mut encoder = Encoder::new();
+        for (name, value) in [
+            (":method", "POST"),
+            (":path", "/upload"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            ("content-length", "8"),
+        ] {
+            encoder.encode_header(&mut block, name, value);
+        }
+        frame::write_frame(
+            &mut wire,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS,
+            1,
+            &block,
+        );
+        frame::write_frame(
+            &mut wire,
+            frame::kind::DATA,
+            if end_stream {
+                frame::flags::END_STREAM
+            } else {
+                0
+            },
+            1,
+            b"12345678",
+        );
+        wire
+    }
+
+    async fn wait_for_body_budget(budget: &hj_core::budget::BodyBufferBudget, bytes: u64) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.in_flight() != bytes {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("body budget did not reach the expected allocation charge");
+    }
+
+    #[tokio::test]
+    async fn incomplete_request_budget_is_released_on_connection_teardown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Both transport drivers use the same receive state/leases. Exercise actual
+        // connection exits through the in-memory tokio conformance driver, without
+        // binding sockets or sending malformed requests to a running server.
+        for exit in [
+            "eof",
+            "cancel",
+            "stream_reset",
+            "goaway",
+            "protocol_error",
+            "idle_timeout",
+        ] {
+            let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+            let (mut client, server) = tokio::io::duplex(16 * 1024);
+            let config = Config {
+                body_budget: Some(budget.clone()),
+                conn_idle_timeout: (exit == "idle_timeout").then_some(Duration::from_millis(20)),
+                ..Config::default()
+            };
+            let task = tokio::spawn(async move {
+                serve(
+                    server,
+                    |_req| async { Response::new(hj_core::Body::Empty) },
+                    config,
+                    None,
+                )
+                .await
+            });
+            client
+                .write_all(&body_budget_request_wire(false))
+                .await
+                .unwrap();
+            wait_for_body_budget(&budget, 8).await;
+
+            match exit {
+                "eof" => drop(client),
+                "cancel" => {
+                    task.abort();
+                    drop(client);
+                }
+                "stream_reset" => {
+                    let mut wire = Vec::new();
+                    frame::write_rst_stream(&mut wire, 1, frame::error_code::CANCEL);
+                    client.write_all(&wire).await.unwrap();
+                    wait_for_body_budget(&budget, 0).await;
+                    drop(client);
+                }
+                _ => {
+                    let mut wire = Vec::new();
+                    if exit == "goaway" {
+                        frame::write_goaway(&mut wire, 1, frame::error_code::NO_ERROR);
+                    } else if exit == "protocol_error" {
+                        // PING payload must be exactly eight bytes.
+                        frame::write_frame(&mut wire, frame::kind::PING, 0, 0, &[0]);
+                    }
+                    client.write_all(&wire).await.unwrap();
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        client.read_to_end(&mut Vec::new()),
+                    )
+                    .await
+                    .expect("connection teardown must finish")
+                    .unwrap();
+                    drop(client);
+                }
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("connection task must terminate");
+            if exit != "cancel" {
+                result.unwrap().unwrap();
+            }
+            assert_eq!(budget.in_flight(), 0, "{exit} leaked a reservation");
+            assert!(
+                budget.try_acquire(16),
+                "an unrelated upload must still fit after {exit}"
+            );
+            budget.release(16);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatched_body_budget_follows_retained_frames_beyond_connection() {
+        use http_body_util::BodyExt;
+        use tokio::io::AsyncWriteExt;
+
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let config = Config {
+            body_budget: Some(budget.clone()),
+            ..Config::default()
+        };
+        let task = tokio::spawn(async move {
+            serve(
+                server,
+                move |req| {
+                    sender.send(req).unwrap();
+                    std::future::ready(Response::new(hj_core::Body::Empty))
+                },
+                config,
+                None,
+            )
+            .await
+        });
+        client
+            .write_all(&body_budget_request_wire(true))
+            .await
+            .unwrap();
+        let req = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            budget.in_flight(),
+            8,
+            "END_STREAM must not release retained bytes"
+        );
+        assert!(
+            !budget.try_acquire(9),
+            "retained handler bodies count against admission"
+        );
+        task.abort();
+        let _ = task.await;
+        drop(client);
+        assert_eq!(
+            budget.in_flight(),
+            8,
+            "connection drop cannot release a transferred body"
+        );
+
+        let bytes = req.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&bytes[..], b"12345678");
+        let tail = bytes.slice(4..);
+        drop(bytes);
+        assert_eq!(
+            budget.in_flight(),
+            8,
+            "slices retain the complete body allocation"
+        );
+        drop(tail);
+        assert_eq!(budget.in_flight(), 0);
     }
 }
 

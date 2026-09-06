@@ -624,10 +624,13 @@ where
             // (#236 residual) Server-wide cap shared with the H1/H3 transports and LSAPI:
             // reserve BEFORE extending/accounting so aggregate buffered bodies stay bounded
             // even when every connection is individually under its per-stream/per-conn caps.
-            if let Some(b) = &recv.body_budget
-                && !b.try_acquire(data.len() as u64)
-            {
-                goaway!(error_code::ENHANCE_YOUR_CALM);
+            if let Some(b) = &recv.body_budget {
+                let lease = st
+                    .body_lease
+                    .get_or_insert_with(|| hj_core::budget::BodyBufferLease::new(b.clone()));
+                if !lease.reserve(data.len() as u64) {
+                    goaway!(error_code::ENHANCE_YOUR_CALM);
+                }
             }
             recv.total_buffered = recv.total_buffered.saturating_add(data.len());
             st.body.extend_from_slice(data);
@@ -1118,7 +1121,11 @@ fn build_request(mut st: StreamState) -> Option<Request> {
     let body: IncomingBody = if st.body.is_empty() {
         hj_core::empty_incoming()
     } else {
-        http_body_util::Full::new(Bytes::from(st.body))
+        let bytes = match st.body_lease.take() {
+            Some(lease) => lease.into_bytes(st.body),
+            None => Bytes::from(st.body),
+        };
+        http_body_util::Full::new(bytes)
             .map_err(|e| Box::new(e) as hj_core::BoxError)
             .boxed()
     };

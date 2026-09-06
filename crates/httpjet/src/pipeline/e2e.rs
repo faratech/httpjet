@@ -25,6 +25,12 @@ use http::header;
 use crate::pipeline::{fast_serve, handle};
 use crate::state::ServerState;
 
+#[path = "security_regressions.rs"]
+mod security_regressions;
+
+#[path = "scoped_auth_tests.rs"]
+mod scoped_auth_tests;
+
 const LISTENER: &str = "http";
 const VHOST: &str = "testvh";
 const CANON_HOST: &str = "canon.test";

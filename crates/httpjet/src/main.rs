@@ -2320,33 +2320,25 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
             }
         }
 
-        // Auth directives collapse to deny-all (HTTP auth is not implemented): a
-        // shipped .htaccess using them silently locks every visitor out.
+        // Lint parsed auth groups: comments are not directives and sibling
+        // metadata is not guaranteed to match the same resource.
         let htaccess = config.doc_root.join(config.access_file_name_or_default());
         if config.overrides_enabled(config.rewrite.auto_load_htaccess)
             && let Ok(text) = std::fs::read_to_string(&htaccess)
         {
-            // Basic auth IS implemented (AuthType Basic + AuthUserFile + Require
-            // valid-user/user). Warn only for the shapes still unsupported.
-            let low = text.to_ascii_lowercase();
-            let basic_block = low.contains("authtype basic") && low.contains("authuserfile");
-            if !basic_block {
-                let auth_line = text.lines().enumerate().find(|(_, l)| {
-                    let t = l.trim();
-                    t.starts_with("AuthType ")
-                        || t.starts_with("AuthUserFile ")
-                        || t.starts_with("AuthName ")
-                        || t.starts_with("Require valid-user")
-                        || t.starts_with("Require user ")
-                        || t.starts_with("Require group ")
-                });
-                if let Some((lineno, _line)) = auth_line {
-                    warnings.push(format!(
-                        "vhost {name}: {}:{} auth directives other than a complete AuthType Basic + AuthUserFile block collapse to deny-all — every visitor to this tree is 403'd",
-                        htaccess.display(),
-                        lineno + 1
+            match hj_rewrite::Htaccess::parse(&text) {
+                Ok(ht) => {
+                    for lineno in ht.auth_warnings() {
+                        warnings.push(format!(
+                        "vhost {name}: {}:{lineno} authentication configuration may be incomplete or unsupported; unresolved matching resources fail closed (403)",
+                        htaccess.display()
                     ));
+                    }
                 }
+                Err(err) => warnings.push(format!(
+                    "vhost {name}: {} could not be parsed; access fails closed: {err}",
+                    htaccess.display()
+                )),
             }
         }
     }

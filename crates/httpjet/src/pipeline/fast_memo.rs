@@ -100,6 +100,7 @@ pub(super) struct MemoKey<'a> {
 
 /// The ruleset a [`VaryItem::UaClass`] bitmap was computed against, pinned so a
 /// reparse can never be judged with stale bits (the entry dies with its TTL).
+#[derive(Clone)]
 pub(super) enum UaRules {
     Chain(Arc<Htaccess>),
     Inline(Arc<RuleSet>),

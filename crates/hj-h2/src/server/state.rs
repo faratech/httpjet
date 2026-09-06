@@ -75,7 +75,8 @@ pub(super) struct Recv {
     /// Per-connection SUM cap = `4 × max_request_body`; over it ⇒ GOAWAY(ENHANCE_YOUR_CALM).
     pub(super) per_conn_request_body: usize,
     /// Server-wide buffered-body budget shared with the H1/H3 transports (#236 residual).
-    /// Reservations mirror `total_buffered` exactly; released at every site that un-buffers.
+    /// Each stream owns its reservation and transfers it with the body at dispatch.
+    /// Unlike `total_buffered`, global accounting lasts until the body allocation dies.
     pub(super) body_budget: Option<std::sync::Arc<hj_core::budget::BodyBufferBudget>>,
     /// (CVE-2019-9512/9515/9518 class) Count of frames processed since the last forward
     /// progress on this connection. Bounds a "no-progress" frame flood — empty DATA / non-ACK
@@ -86,15 +87,11 @@ pub(super) struct Recv {
 }
 
 impl Recv {
-    /// Drop `n` buffered request-body bytes: the per-connection counter AND the
-    /// server-wide budget reservation taken when they were buffered (#236 residual).
-    /// Every site that un-buffers a body must go through here so the two ledgers
-    /// can never drift.
+    /// Stop counting `n` bytes against the connection's unfinished-body limit.
+    /// The stream/body's owned lease independently retains global accounting until
+    /// its bytes are freed, including after dispatch and on connection teardown.
     pub(super) fn buffer_sub(&mut self, n: usize) {
         self.total_buffered = self.total_buffered.saturating_sub(n);
-        if let Some(b) = &self.body_budget {
-            b.release(n as u64);
-        }
     }
 }
 
@@ -121,6 +118,9 @@ pub(super) struct StreamState {
     /// site (`refuse_if_marked` in recv.rs) instead of firing when the HEADERS frame first arrives.
     pub(super) refused: bool,
     pub(super) body: Vec<u8>,
+    /// Own the global reservation while buffering; move it into the body Bytes at
+    /// dispatch so every clone/slice keeps the allocation charged until final drop.
+    pub(super) body_lease: Option<hj_core::budget::BodyBufferLease>,
     /// Declared `content-length`, if any — validated against the actual body at completion
     /// (§8.1.2.6). `Some(None)` would be a parse error; we store the parsed value or flag
     /// malformed at decode time.

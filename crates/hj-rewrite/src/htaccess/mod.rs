@@ -8,7 +8,9 @@
 //! `<IfModule LiteSpeed>` LSCache directives) are preserved because their
 //! `[E=...]` env sets still flow through the embedded [`RuleSet`].
 
+mod auth_scope;
 mod cache;
+pub use auth_scope::{AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request};
 mod mod_access;
 mod parse;
 mod php;
@@ -424,12 +426,9 @@ pub struct Htaccess {
     /// it captures top-level `Deny from all` (#4), `<If>`-nested `Require`
     /// (#5), and fail-closed unrecognized `Require` predicates (#2).
     pub access_rules: Vec<AccessRule>,
-    /// (Tier 1.3) `AuthType Basic` + `AuthName` + `AuthUserFile` (+ `Require
-    /// valid-user`/`user …`) resolved into a Basic-auth realm covering this
-    /// directory tree. Enforcement (401 challenge + credential verification)
-    /// happens in the pipeline; `None` = no auth directives (or an incomplete
-    /// block, which keeps the historical fail-closed deny collapse).
-    pub auth: Option<crate::auth::AuthRealm>,
+    /// Ordered, scoped auth configuration. Resolve across the full inherited
+    /// chain with [`resolve_auth`] before credential verification.
+    pub auth: Option<AuthPolicy>,
     /// `SetEnvIf`/`SetEnvIfNoCase`.
     pub set_env_if: Vec<SetEnvIf>,
     /// `CacheLookup [public|private] on|off` — `Some(true/false)` if present in

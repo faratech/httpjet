@@ -32,6 +32,32 @@ fn existing_expires_suppresses_the_entire_generated_pair() {
 }
 
 #[test]
+fn authenticated_expiry_preserves_explicit_application_policies() {
+    let rules = hj_compress::ExpiresRules::from_pairs([("text/plain", "A604800")]);
+    for policy in ["private, max-age=60", "no-store", "public, max-age=60"] {
+        let mut resp = response_with_content_type();
+        resp.extensions_mut().insert(AuthSensitiveResponse);
+        resp.headers_mut()
+            .insert(http::header::CACHE_CONTROL, policy.parse().unwrap());
+        apply_expires(&rules, 1_700_000_000, &mut resp);
+        assert_eq!(resp.headers()[http::header::CACHE_CONTROL], policy);
+        assert!(!resp.headers().contains_key(http::header::EXPIRES));
+    }
+    let mut resp = response_with_content_type();
+    resp.extensions_mut().insert(AuthSensitiveResponse);
+    resp.headers_mut().insert(
+        http::header::EXPIRES,
+        "Thu, 01 Jan 1970 00:00:01 GMT".parse().unwrap(),
+    );
+    apply_expires(&rules, 1_700_000_000, &mut resp);
+    assert!(!resp.headers().contains_key(http::header::CACHE_CONTROL));
+    assert_eq!(
+        resp.headers()[http::header::EXPIRES],
+        "Thu, 01 Jan 1970 00:00:01 GMT"
+    );
+}
+
+#[test]
 fn huge_accepted_rules_render_a_bounded_coherent_header_pair() {
     let now = 1_700_000_000;
     for value in [

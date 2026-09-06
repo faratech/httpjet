@@ -64,6 +64,14 @@ impl Htaccess {
     /// method is currently advisory (Apache `<Limit>` is not modelled here), so
     /// any matching `denied` section produces [`AccessDecision::Denied`].
     pub fn access_decision(&self, rel_path: &str, method: &str) -> AccessDecision {
+        // Standalone convenience check: incomplete auth cannot be satisfied.
+        // The pipeline uses access_decision_for for host ACLs and separately
+        // resolves auth across the full inherited chain before any handler.
+        if self.has_auth()
+            && crate::htaccess::resolve_auth(std::iter::once(self), rel_path).is_err()
+        {
+            return AccessDecision::Denied;
+        }
         self.access_decision_for(rel_path, method, &AccessSubject::default())
     }
 

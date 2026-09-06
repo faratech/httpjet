@@ -15,6 +15,7 @@ pub(crate) mod h3;
 #[cfg(feature = "ktls")]
 pub(crate) mod ktls;
 pub(crate) mod proxy_protocol;
+mod request_body;
 
 use std::io;
 use std::net::SocketAddr;
@@ -1288,12 +1289,10 @@ async fn handle_h1_bridged<S>(
         if keepalive_exhausted(served, max_keepalive) {
             keep_alive = false;
         }
-        // Server-wide buffered-body reservation (#236 residual): the transport commits
-        // body bytes to heap BEFORE any handler runs, so the cap must be enforced here,
-        // not only in hj-lsapi's collect_to_cap. The lease is held for the rest of this
-        // keep-alive iteration (the buffered Bytes live exactly that long).
+        // The reservation follows the allocation into dispatch, including body
+        // frames retained by a backend writer after the response completes.
         let mut body_lease: Option<hj_core::budget::BodyBufferLease> = None;
-        let body_bytes: bytes::Bytes = match framing {
+        let body_bytes: Vec<u8> = match framing {
             BodyFraming::Reject => {
                 write_status_close(&mut stream, 400, "Bad Request").await;
                 return;
@@ -1360,7 +1359,7 @@ async fn handle_h1_bridged<S>(
                         _ => return,
                     }
                 }
-                let bb = bytes::Bytes::copy_from_slice(&acc[head_len..total]);
+                let bb = acc[head_len..total].to_vec();
                 acc.drain(..total);
                 bb
             }
@@ -1413,7 +1412,7 @@ async fn handle_h1_bridged<S>(
                         }
                     }
                 };
-                let bb = bytes::Bytes::from(std::mem::take(&mut dec.body));
+                let bb = std::mem::take(&mut dec.body);
                 acc.drain(..end);
                 // Right-size the lease: the raw chunk framing drained above was charged
                 // alongside the decoded body, but only the decoded copy (`bb`) lives on
@@ -1434,33 +1433,23 @@ async fn handle_h1_bridged<S>(
             }
         };
 
-        // Build the full hj_core::Request.
-        // (Tier 2) Request-body decompression: when Content-Encoding is gzip,
-        // decode the body before handing it to the pipeline so backends see plain
-        // bytes with the correct Content-Length. Only the gzip codec is decoded
-        // (br/zstd request bodies are rare and can be added later).
-        let body_bytes = if headers
-            .get(http::header::CONTENT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.trim().eq_ignore_ascii_case("gzip"))
-            && !body_bytes.is_empty()
-        {
-            match hj_compress::decode_bytes(hj_compress::Encoding::Gzip, &body_bytes) {
-                Some(decoded) => {
-                    let decoded = bytes::Bytes::from(decoded);
-                    if let Ok(v) = http::HeaderValue::from_str(&decoded.len().to_string()) {
-                        headers.insert(http::header::CONTENT_LENGTH, v);
-                    }
-                    headers.remove(http::header::CONTENT_ENCODING);
-                    decoded
-                }
-                None => {
-                    tracing::debug!(%ctx.peer, "uring h1: gzip request-body decode failed; forwarding as-is");
-                    body_bytes
-                }
+        let body_bytes = match request_body::finish_body(
+            &mut headers,
+            body_bytes,
+            body_lease,
+            &state.body_budget,
+            max_body,
+        ) {
+            Ok(bytes) => bytes,
+            Err(status) => {
+                write_status_close(
+                    &mut stream,
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Bad Request"),
+                )
+                .await;
+                return;
             }
-        } else {
-            body_bytes
         };
         let body: hj_core::IncomingBody = if body_bytes.is_empty() {
             hj_core::empty_incoming()

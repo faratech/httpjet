@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use crate::error::RewriteError;
 use crate::rules::{CacheKeyVar, RuleSet};
 
+use super::auth_scope::{AuthGroup, AuthRequirement};
 use super::cache::{cache_scope_path, parse_cache_key_modify};
 use super::mod_access::parse_host_entries;
 use super::*;
@@ -28,16 +29,7 @@ impl Htaccess {
 
         // Section parsing state: a stack of currently-open access sections.
         let mut section_stack: Vec<PendingSection> = Vec::new();
-        // (Tier 1.3) Basic-auth block pre-scan: order-independent (AuthType may
-        // follow the Require lines it governs). A complete block intercepts
-        // `Require valid-user`/`user …` into a realm; an incomplete one keeps the
-        // fail-closed deny collapse.
-        let lower = text.to_ascii_lowercase();
-        let basic_auth_block = lower.contains("authtype basic") && lower.contains("authuserfile");
-        let mut auth_realm: Option<String> = None;
-        let mut auth_user_file: Option<PathBuf> = None;
-        let mut auth_valid_user = false;
-        let mut auth_users: Vec<String> = Vec::new();
+        let mut malformed_sections = false;
         // The legacy mod_access block of each scope (keyed by the innermost open
         // section's line, `None` = top level): its `Order`/`Allow`/`Deny` lines
         // accumulate into ONE `AccessRule` so they are judged together (#359).
@@ -59,13 +51,18 @@ impl Htaccess {
                     .iter()
                     .rposition(|s| s.kind_name.eq_ignore_ascii_case(&tag))
                 {
+                    malformed_sections |= idx + 1 != section_stack.len();
                     section_stack.remove(idx);
+                } else {
+                    malformed_sections = true;
                 }
                 continue;
             }
 
             // Opening tags.
             if line.starts_with('<') {
+                malformed_sections |= !line.ends_with('>');
+                malformed_sections |= auth_tokens(line).is_none();
                 if let Some(pending) = PendingSection::open(line, lineno) {
                     section_stack.push(pending);
                 }
@@ -84,29 +81,13 @@ impl Htaccess {
                     rewrite_stream.push('\n');
                     continue;
                 }
-                "authtype" | "authname" | "authuserfile" => {
-                    if dlow == "authname" {
-                        auth_realm = Some(rest.trim().trim_matches('"').to_string());
-                    } else if dlow == "authuserfile" {
-                        auth_user_file = Some(PathBuf::from(rest.trim().trim_matches('"')));
-                    }
-                    continue;
-                }
                 _ => {}
             }
 
-            // (Tier 1.3) In a complete Basic-auth block, auth-capable Require
-            // predicates feed the realm instead of the deny collapse.
-            if basic_auth_block && dlow == "require" {
-                let rlow = rest.trim().to_ascii_lowercase();
-                if rlow == "valid-user" {
-                    auth_valid_user = true;
-                    continue;
-                }
-                if let Some(list) = rlow.strip_prefix("user ") {
-                    auth_users.extend(list.split_whitespace().map(String::from));
-                    continue;
-                }
+            // Auth directives are parsed as real directives, never discovered by
+            // substrings in comments. Metadata and Require retain lexical scope.
+            if record_auth(&mut h, &section_stack, &dlow, rest) {
+                continue;
             }
 
             // Access directives. `Require` is recorded as an [`AccessRule`]
@@ -264,8 +245,14 @@ impl Htaccess {
             }
         }
 
-        // Any sections left open at EOF (malformed) are simply dropped; their
-        // access rules, if any, were already recorded when parsed.
+        // An ambiguous auth scope must never become a different usable scope.
+        // The cache handles parse errors with its existing deny-all sentinel.
+        if h.has_auth() && (malformed_sections || !section_stack.is_empty()) {
+            return Err(RewriteError::Malformed {
+                line: 1,
+                msg: "unbalanced or malformed authentication section".into(),
+            });
+        }
         drop(section_stack);
 
         // Build the load-time scope indices once, now that `access_rules` and
@@ -273,19 +260,10 @@ impl Htaccess {
         // TTL and can never be stale vs the rules they index).
         h.has_resp_op = !h.headers.is_empty();
         h.has_handler_override = !h.set_handlers.is_empty() || !h.add_php_exts.is_empty();
-        // (Tier 1.3) Resolve the Basic-auth realm. Auth directives alone (no
-        // Require) are inert in Apache — mirror that; an INCOMPLETE block (no
-        // AuthUserFile / non-Basic AuthType) keeps the fail-closed deny collapse.
-        if basic_auth_block
-            && let Some(uf) = auth_user_file
-            && (auth_valid_user || !auth_users.is_empty())
-        {
-            h.auth = Some(crate::auth::AuthRealm {
-                realm: auth_realm.unwrap_or_else(|| "Restricted".into()),
-                user_file: uf,
-                require_valid_user: auth_valid_user,
-                require_users: auth_users,
-            });
+        if let Some(policy) = &mut h.auth {
+            // Root metadata applies regardless of its line position. Enclosing
+            // sections precede their descendants; sibling order remains intact.
+            policy.groups.sort_by_key(|g| g.scope_id);
         }
         h.access_index = build_access_index(&h.access_rules);
         h.header_index = build_header_index(&h.headers);
@@ -312,6 +290,147 @@ impl Htaccess {
             crate::directives::AccessDecision::Denied
         )
     }
+}
+
+/// Returns true when this directive belongs solely to auth (so it must not
+/// also become a blanket access deny). Other Require predicates keep their
+/// existing host-access semantics as well as replacing inherited auth groups.
+fn record_auth(h: &mut Htaccess, stack: &[PendingSection], directive: &str, rest: &str) -> bool {
+    let is_metadata = directive.starts_with("auth");
+    if !is_metadata && directive != "require" {
+        return false;
+    }
+    let parsed_tokens = auth_tokens(rest);
+    let tokens = parsed_tokens.clone().unwrap_or_default();
+    let provider = tokens
+        .first()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_users = directive == "require" && matches!(provider.as_str(), "valid-user" | "user");
+    let policy = h.auth.get_or_insert_with(AuthPolicy::default);
+    policy.sensitive |= is_metadata || is_users || provider == "group" || parsed_tokens.is_none();
+    // IfModule is transparent, like the existing parser; all other unknown
+    // containers (RequireAny/All/None, Limit, Location, ...) are unsupported.
+    let sections: Vec<_> = stack
+        .iter()
+        .filter(|s| !s.kind_name.eq_ignore_ascii_case("ifmodule"))
+        .collect();
+    let scope_id = sections.last().map_or(0, |s| s.lineno);
+    let slot = if let Some(i) = policy.groups.iter().position(|g| g.scope_id == scope_id) {
+        i
+    } else {
+        let mut matchers = Vec::new();
+        let mut invalid_scope = false;
+        for s in &sections {
+            match &s.auth_matcher {
+                Some(matcher) => matchers.push(matcher.clone()),
+                None => invalid_scope = true,
+            }
+        }
+        policy.groups.push(AuthGroup {
+            scope_id,
+            matchers,
+            invalid_scope,
+            ..Default::default()
+        });
+        policy.groups.len() - 1
+    };
+    let group = &mut policy.groups[slot];
+    group.invalid_scope |= parsed_tokens.is_none();
+    if is_metadata {
+        let value = if tokens.len() == 1 {
+            tokens[0].clone()
+        } else {
+            String::new()
+        };
+        match directive {
+            "authtype" => group.auth_type = Some(value),
+            "authname" => group.realm = Some(value),
+            "authuserfile" => group.user_file = Some(PathBuf::from(value)),
+            _ => group.invalid_scope = true, // unimplemented auth provider/merge controls
+        }
+        // Malformed metadata must not be repaired by an unrelated directive.
+        group.invalid_scope |= tokens.len() != 1 || tokens[0].is_empty();
+        return true;
+    }
+    let requirement = match provider.as_str() {
+        "valid-user" if tokens.len() == 1 => AuthRequirement::Users {
+            valid_user: true,
+            users: Vec::new(),
+        },
+        "user" if tokens.len() > 1 => AuthRequirement::Users {
+            valid_user: false,
+            users: tokens[1..].to_vec(),
+        },
+        "granted" if tokens.len() == 1 => AuthRequirement::Granted,
+        "all" if tokens.len() == 2 && tokens[1].eq_ignore_ascii_case("granted") => {
+            AuthRequirement::Granted
+        }
+        _ => AuthRequirement::Denied,
+    };
+    // Only user predicates in the SAME lexical section form an implicit OR.
+    // Mixed/unsupported boolean requirements cannot be safely modeled.
+    group.require = Some(match (group.require.take(), requirement) {
+        (None, next) => next,
+        (
+            Some(AuthRequirement::Users {
+                valid_user: a,
+                mut users,
+            }),
+            AuthRequirement::Users {
+                valid_user: b,
+                users: more,
+            },
+        ) => {
+            users.extend(more);
+            AuthRequirement::Users {
+                valid_user: a || b,
+                users,
+            }
+        }
+        (Some(AuthRequirement::Granted), AuthRequirement::Granted) => AuthRequirement::Granted,
+        _ => AuthRequirement::Denied,
+    });
+    is_users
+}
+
+// Auth tokens must not silently accept an unterminated quoted value. Preserve
+// case, spaces within quoted usernames/realms, and both Apache quote forms.
+fn auth_tokens(text: &str) -> Option<Vec<String>> {
+    let mut result = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut have = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else if ch == '\\' && chars.peek().is_some_and(|c| *c == q || *c == '\\') {
+                token.push(chars.next()?);
+            } else {
+                token.push(ch);
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            have = true;
+        } else if ch.is_whitespace() {
+            if have {
+                result.push(std::mem::take(&mut token));
+                have = false;
+            }
+        } else {
+            token.push(ch);
+            have = true;
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if have {
+        result.push(token);
+    }
+    Some(result)
 }
 
 // ===========================================================================
@@ -485,6 +604,7 @@ struct PendingSection {
     kind: Option<SectionKind>,
     kind_name: String,
     regex: Option<Regex>,
+    auth_matcher: Option<AccessMatcher>,
     /// Source line of the opening tag — the identity of this scope for the
     /// per-scope legacy `Order`/`Allow`/`Deny` accumulation.
     lineno: usize,
@@ -570,9 +690,39 @@ impl PendingSection {
             kind,
             kind_name,
             regex,
+            auth_matcher: auth_section_matcher(kind, &tag_low, args),
             lineno,
             scope,
         })
+    }
+}
+
+fn auth_section_matcher(kind: Option<SectionKind>, tag: &str, args: &str) -> Option<AccessMatcher> {
+    let tokens = auth_tokens(args)?;
+    let (pattern, regex_marker) = match tokens.as_slice() {
+        [pattern] if !pattern.is_empty() => (pattern, false),
+        [marker, pattern] if marker == "~" && !pattern.is_empty() => (pattern, true),
+        _ => return None,
+    };
+    match kind {
+        Some(SectionKind::Files) if !regex_marker => Some(AccessMatcher::Basename(
+            Regex::new(&fnmatch_to_regex(pattern)).ok()?,
+        )),
+        Some(SectionKind::Files | SectionKind::FilesMatch) => {
+            Some(AccessMatcher::Basename(Regex::new(pattern).ok()?))
+        }
+        Some(SectionKind::Directory) if !regex_marker => {
+            let glob = fnmatch_to_regex(pattern.trim_end_matches('/'));
+            let regex = Regex::new(&format!("{}(?:/|$)", glob.trim_end_matches('$'))).ok()?;
+            Some(AccessMatcher::Path(regex))
+        }
+        Some(SectionKind::Directory | SectionKind::DirectoryMatch) => {
+            Some(AccessMatcher::Path(Regex::new(pattern).ok()?))
+        }
+        None if tag == "if" => parse_if_scope(pattern)?
+            .uri_expr
+            .map(AccessMatcher::IfUriExpr),
+        None => None,
     }
 }
 

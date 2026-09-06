@@ -342,6 +342,7 @@ fn render(state: &ServerState) -> String {
         state.metrics.tls_handshakes_resumed.load(Ordering::Relaxed),
         state.page_cache.as_ref().map(|pc| pc.stats()),
     );
+    append_body_budget_metrics(&mut body, &state.body_budget);
     body.push_str(&format!(
         "# HELP httpjet_proxy_failover_total Requests served by a failover upstream peer because the primary was marked bad (Tier 1.2).\n# TYPE httpjet_proxy_failover_total counter\nhttpjet_proxy_failover_total {}\n",
         state.proxy.pool().failovers_total()
@@ -779,6 +780,35 @@ fn request_target(req: &[u8]) -> Option<String> {
 /// Render the live page-cache contents (loopback debug): per-URL-class histogram + the largest
 /// entries, so an operator can see EXACTLY what is cached (and whether it's the recurring set or
 /// junk) instead of inferring from aggregate counters.
+fn append_body_budget_metrics(out: &mut String, budget: &hj_core::budget::BodyBufferBudget) {
+    use std::fmt::Write;
+    for (name, kind, help, value) in [
+        (
+            "httpjet_body_buffer_bytes",
+            "gauge",
+            "Bytes reserved by live request body allocations.",
+            budget.in_flight(),
+        ),
+        (
+            "httpjet_body_buffer_capacity_bytes",
+            "gauge",
+            "Shared request body byte limit; zero disables accounting.",
+            budget.capacity(),
+        ),
+        (
+            "httpjet_body_buffer_rejected_total",
+            "counter",
+            "Request body reservations rejected by the shared byte limit.",
+            budget.rejected(),
+        ),
+    ] {
+        let _ = writeln!(
+            out,
+            "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}"
+        );
+    }
+}
+
 fn render_cache_entries(state: &ServerState) -> String {
     let Some(pc) = state.page_cache.as_ref() else {
         return "page cache not enabled (start with --page-cache)\n".to_string();
@@ -1293,6 +1323,19 @@ fn render_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_budget_metrics_report_capacity_usage_and_rejections() {
+        let budget = hj_core::budget::BodyBufferBudget::new(8);
+        assert!(budget.try_acquire(5));
+        assert!(!budget.try_acquire(4));
+        let mut out = String::new();
+        append_body_budget_metrics(&mut out, &budget);
+        assert!(out.contains("httpjet_body_buffer_bytes 5\n"));
+        assert!(out.contains("httpjet_body_buffer_capacity_bytes 8\n"));
+        assert!(out.contains("httpjet_body_buffer_rejected_total 1\n"));
+        budget.release(5);
+    }
 
     #[test]
     fn metrics_bind_only_allows_loopback() {

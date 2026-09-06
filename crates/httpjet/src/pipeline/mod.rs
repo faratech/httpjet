@@ -43,6 +43,7 @@ mod response_util;
 #[cfg(test)]
 mod rewrite_differential;
 mod rewrite_glue;
+mod scoped_auth;
 mod suffix_routing;
 
 pub(crate) use rewrite_glue::{DEFAULT_REWRITE_OUTCOME_TTL, RewriteOutcomeCache, UaClassifyCache};
@@ -370,7 +371,9 @@ pub(crate) async fn fast_serve(
         chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
     // (Tier 1.3) An auth-protected tree never serves on-core: dispatch() enforces
     // the 401 challenge / credential verification before anything else.
-    if chain.iter().any(|h| h.auth.is_some()) {
+    if chain.iter().any(|h| h.has_auth())
+        || scoped_auth::target_has_auth(state, &ctx, &orig_path, &chain)
+    {
         return None;
     }
     // (#349) Memo store eligibility — the response must be a pure function of
@@ -637,6 +640,11 @@ pub(crate) async fn fast_serve(
     .await;
     // (Tier 2) Stamp BEFORE the transform loop so SubFilterTransform sees the plan.
     stamp_sub_filter(&ctx, &orig_path, &mut resp);
+    mark_auth_sensitive(
+        req.headers().contains_key(http::header::AUTHORIZATION),
+        &ctx,
+        &mut resp,
+    );
     // Header transforms (expires / Alt-Svc / compress) — they see an in-memory body now,
     // so CacheStaticTransform is a no-op (no block_in_place) and Compress negotiates per AE.
     for t in &state.transforms {
@@ -737,10 +745,14 @@ fn memo_vary_set(
                         let bits = state
                             .ua_classify
                             .get_or_compute(rs, &fast_memo::ua_for_classify(req));
-                        vary.push(fast_memo::VaryItem::UaClass { rules: pin, bits });
-                        return true;
+                        vary.push(fast_memo::VaryItem::UaClass {
+                            rules: pin.clone(),
+                            bits,
+                        });
+                        true
+                    } else {
+                        push_header(vary, "user-agent")
                     }
-                    push_header(vary, "user-agent")
                 }
             };
             if !ok {
@@ -1086,6 +1098,7 @@ pub async fn handle(
     // (telemetry) Total wall time, recorded at the single response funnel below.
     let req_start = std::time::Instant::now();
 
+    let has_authorization = req.headers().contains_key(http::header::AUTHORIZATION);
     // Normalize a trailing empty query ("/x?" -> "/x") before anything reads the URI. See
     // strip_empty_query for the rationale (it prevents the backend-canonicalization redirect
     // that the self-redirect guard would otherwise burn a re-render on and refuse to cache).
@@ -1332,6 +1345,7 @@ pub async fn handle(
         stamp_sub_filter(&ctx, p, &mut resp);
     }
 
+    mark_auth_sensitive(has_authorization, &ctx, &mut resp);
     // ---- Response-transform pipeline (the post-handler stage) --------------
     // Runs ServerState::transforms in order: cache-small-static (so gzip can compress it)
     // -> expires -> compress -> deny-CDN-cache-on-redirects (the "Too Many Redirects" loop
@@ -2257,6 +2271,44 @@ async fn dispatch(
         return error_doc_or_page(state, ctx, &chain, &orig_path, StatusCode::FORBIDDEN).await;
     }
 
+    // Authorize the source resource before rewrite can return a redirect,
+    // proxy response, or replace its directory chain with a different one.
+    let mut authenticated_realms = Vec::new();
+    if let Err(resp) = scoped_auth::enforce_chain(
+        ctx,
+        req.headers(),
+        &chain,
+        &orig_rel,
+        &orig_path,
+        &mut authenticated_realms,
+    )
+    .await
+    {
+        return resp;
+    }
+    let original_indexes = effective_index_files(state, ctx, &chain);
+    let original_script_split = split_script_path(state, ctx, &orig_path, original_indexes, &chain);
+    let original_target = original_script_split
+        .as_ref()
+        .and_then(|(path, _, _)| opened_target_path(path).ok());
+    if let Err(resp) = scoped_auth::enforce_mapped_resources(
+        state,
+        ctx,
+        req.headers(),
+        &orig_path,
+        &orig_path,
+        &chain,
+        original_script_split
+            .as_ref()
+            .map(|(path, _, _)| path.as_path()),
+        original_target.as_deref(),
+        &mut authenticated_realms,
+    )
+    .await
+    {
+        return resp;
+    }
+
     // ---- 3. Rewrite -------------------------------------------------------
     let _rt = state
         .telemetry
@@ -2407,7 +2459,11 @@ async fn dispatch(
     // need the identical split. Computed here so the MISS path doesn't scan + stat-lookup twice;
     // a cache HIT / WS / proxy returns before step 7 and simply drops it (one call, as before).
     let index_files = effective_index_files(state, ctx, &chain);
-    let script_split = split_script_path(state, ctx, &cur_path, index_files, &chain);
+    let script_split = if rewritten {
+        split_script_path(state, ctx, &cur_path, index_files, &chain)
+    } else {
+        original_script_split
+    };
     let mut pinned_script_target = None;
     if let Some((script_abs, _script_name, _path_info)) = &script_split {
         // `accessDenyDir` is a filesystem-target policy. The lexical request-path check above
@@ -2445,6 +2501,25 @@ async fn dispatch(
                     .await;
             }
         }
+    }
+
+    // Independently authorize the final URL and the resources it maps to. The
+    // original source check above remains in force; credentials for a sibling
+    // realm cannot substitute for either resource's own effective requirements.
+    if let Err(resp) = scoped_auth::enforce_mapped_resources(
+        state,
+        ctx,
+        req.headers(),
+        &orig_path,
+        &cur_path,
+        &chain,
+        script_split.as_ref().map(|(path, _, _)| path.as_path()),
+        pinned_script_target.as_deref(),
+        &mut authenticated_realms,
+    )
+    .await
+    {
+        return resp;
     }
 
     // ---- 4c. Origin full-page cache lookup (LSCache equivalent) ----------
@@ -2543,47 +2618,6 @@ async fn dispatch(
         host_foreign: cache_host_foreign,
         vary_value: (cache_on && state.page_cache.is_some()).then_some(cache_vary.as_str()),
     };
-
-    // (Tier 1.3) Basic auth: the deepest `.htaccess` realm in the chain governs
-    // this tree. Missing/invalid credentials → 401 + WWW-Authenticate BEFORE any
-    // cache lookup or backend runs; valid credentials set REMOTE_USER for the app.
-    if let Some(realm) = chain.iter().rev().find_map(|h| h.auth.as_ref()) {
-        // A relative AuthUserFile resolves against the vhost docroot.
-        let user_file = if realm.user_file.is_absolute() {
-            realm.user_file.clone()
-        } else {
-            ctx.vhost.doc_root.join(&realm.user_file)
-        };
-        let creds = req
-            .headers()
-            .get(http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Basic "))
-            .and_then(hj_rewrite::auth::decode_basic_credentials);
-        let authorized = match &creds {
-            Some((user, pass)) => {
-                let uf = user_file;
-                let (u, p) = (user.clone(), pass.clone());
-                let ok = tokio::task::spawn_blocking(move || {
-                    hj_rewrite::auth::verify_credentials(&uf, &u, &p)
-                })
-                .await
-                .unwrap_or(false);
-                ok && realm.user_satisfies(user)
-            }
-            None => false,
-        };
-        if !authorized {
-            let mut resp = error_page(StatusCode::UNAUTHORIZED);
-            if let Ok(v) = http::HeaderValue::from_str(&realm.challenge()) {
-                resp.headers_mut().insert(http::header::WWW_AUTHENTICATE, v);
-            }
-            return resp;
-        }
-        if let Some((user, _)) = &creds {
-            ctx.set_env("REMOTE_USER", user.clone());
-        }
-    }
 
     // ---- 4d. Deferred terminal `[P]` proxy, with page-cache participation ------------
     // Mirrors the proxy-<context> arm (lookup -> render -> store) but for a rewrite `[P]`
@@ -3119,7 +3153,25 @@ async fn dispatch(
         .shard()
         .served_static
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut auth_headers = http::HeaderMap::new();
+    if let Some(value) = req.headers().get(http::header::AUTHORIZATION) {
+        auth_headers.insert(http::header::AUTHORIZATION, value.clone());
+    }
     let mut resp = run_handler(&state.static_handler, ctx, req).await;
+    if htaccess_enabled && let Some(target) = scoped_auth::served_target(&resp) {
+        if let Err(auth_resp) = scoped_auth::enforce_target(
+            state,
+            ctx,
+            &auth_headers,
+            &target,
+            &orig_path,
+            &mut authenticated_realms,
+        )
+        .await
+        {
+            return auth_resp;
+        }
+    }
     if resolved_static_target_denied(&state.acl, &resp) {
         return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN).await;
     }
@@ -3833,10 +3885,16 @@ fn unix_now() -> i64 {
 
 /// Apply `expiresByType` Cache-Control/Expires headers to cacheable static
 /// responses (200/206 with a content-type, no existing cache-expiry headers).
-pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp: &mut Response) {
-    if expires.is_empty() {
-        return;
+#[derive(Clone, Copy)]
+struct AuthSensitiveResponse;
+
+fn mark_auth_sensitive(has_authorization: bool, ctx: &ReqCtx, resp: &mut Response) {
+    if has_authorization || ctx.get_env("REMOTE_USER").is_some() {
+        resp.extensions_mut().insert(AuthSensitiveResponse);
     }
+}
+
+pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp: &mut Response) {
     let status = resp.status();
     if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
         return;
@@ -3844,6 +3902,16 @@ pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp:
     if resp.headers().contains_key(http::header::CACHE_CONTROL)
         || resp.headers().contains_key(http::header::EXPIRES)
     {
+        return;
+    }
+    if resp.extensions().get::<AuthSensitiveResponse>().is_some() {
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        return;
+    }
+    if expires.is_empty() {
         return;
     }
     let rule = match resp
