@@ -95,6 +95,19 @@ pub(super) fn convert_vhost_decls(
 
 /// Load every vhost's per-vhost XML file into its `VHostDecl::config`.
 pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
+    load_vhost_sources(cfg, false, |_, path| {
+        std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })
+}
+
+pub(super) fn load_vhost_sources(
+    cfg: &mut ServerConfig,
+    strict: bool,
+    mut source: impl FnMut(&str, &std::path::Path) -> Result<String>,
+) -> Result<()> {
     let server_root = cfg.server_root.clone();
     let hostname = cfg.server_name.clone();
     let follow_symlink = cfg.security.follow_symlink;
@@ -109,8 +122,9 @@ pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
                 decl.restrained,
             )
         };
-        let text = match std::fs::read_to_string(&config_file) {
+        let text = match source(&name, &config_file) {
             Ok(t) => t,
+            Err(e) if strict => return Err(e),
             Err(e) => {
                 tracing::warn!(vhost = %name, path = %config_file.display(), error = %e, "skipping vhost: cannot read config file");
                 continue;
@@ -138,7 +152,7 @@ pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
                     decl.config = Some(Arc::new(vc));
                 }
             }
-            Err(e @ ConfigError::InvalidValue { .. }) => return Err(e),
+            Err(e) if strict || matches!(e, ConfigError::InvalidValue { .. }) => return Err(e),
             Err(e) => {
                 tracing::warn!(vhost = %name, error = %e, "skipping vhost: parse error");
             }
@@ -404,7 +418,7 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         vhssl,
         expires: raw.expires.map(|e| convert_expires(Some(e))),
         cache_policy: convert_vhost_cache(raw.cache),
-        extra_ext_processors: convert_ext_list(raw.ext_processor_list, ctx),
+        extra_ext_processors: convert_ext_list(raw.ext_processor_list, ctx, &config_path)?,
         isolation,
         allow_override,
         allow_override_explicit,

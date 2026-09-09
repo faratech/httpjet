@@ -12,6 +12,9 @@ name = "httpjet"
 path = "src/main.rs"
 
 [features]
+ocsp = ["hj-tls/ocsp"]
+acme = ["dep:hj-acme"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:opentelemetry-http", "dep:reqwest", "dep:opentelemetry-proto", "dep:prost", "dep:futures-executor"]
 # On-demand CPU profiles via a loopback+secret endpoint (raw pprof protobuf).
 # Default-OFF so plain `cargo build`/CI stays lean; the PGO/prod build opts in
 # with `--features profiling`. Zero runtime cost until the endpoint is hit.
@@ -20,16 +23,30 @@ profiling = ["dep:pprof"]
 # measurement harness). Read/reset via the loopback /__alloc-count route. Default-OFF
 # (one Relaxed atomic per alloc); measurement builds only, never PGO/prod.
 allocount = []
-# Kernel-TLS egress on the monoio TLS path (STAGED, opt-in at BOTH build AND runtime).
+# Kernel-TLS egress on the monoio TLS path (STAGED, build-gated and runtime-policy-gated).
 # The prod/PGO binary is built WITHOUT this, so its extra dep tree (ktls-sys/nix) and the
-# proven userspace TLS path are untouched; the `--ktls` runtime flag is inert unless this
-# feature is compiled in. After the rustls handshake on a monoio core the socket fd is
-# upgraded to a kTLS socket (kernel encrypt/decrypt) and H1/H2 serve plaintext over the raw
-# fd — killing the userspace AEAD copy on large-body egress. Validate on an alt port first.
+# proven userspace TLS path are untouched. In a feature build `--ktls=auto` enables only
+# for a physical default-route NIC with active TLS TX offload; `on` forces and `off` denies.
+# After the rustls handshake on a monoio core the socket fd is
+# upgraded to a kTLS socket (kernel encrypt/decrypt), H1/H2 serve plaintext over the raw
+# fd, and H1 `Body::File` can use sendfile into NIC TLS TX offload. Validate on an alt port first.
 ktls = ["dep:ktls-sys", "dep:nix", "dep:aws-lc-rs"]
 
 [dependencies]
+hj-acme = { path = "../hj-acme", optional = true }
+futures-executor = { version = "0.3", optional = true }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "metrics", "trace"], optional = true }
+prost = { version = "0.14", optional = true }
+opentelemetry-http = { version = "0.32", default-features = false, optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 sha2 = { workspace = true }
+subtle = "2.6"
+serde = { workspace = true }
+serde_json = "1"
+thiserror = { workspace = true }
 # Optional: in-process sampling profiler → raw pprof protobuf (gated by `profiling`).
 # Rendering is intentionally left to `go tool pprof` or another external viewer,
 # keeping the CDDL-licensed inferno renderer out of httpjet's dependency graph.
@@ -80,15 +97,19 @@ aws-lc-rs = { version = "1", optional = true }
 libc = { version = "0.2" }
 hj-config = { workspace = true }
 hj-core = { workspace = true }
+hj-extension = { workspace = true }
 hj-http = { workspace = true }
 hj-static = { workspace = true }
 hj-lsapi = { workspace = true }
+hj-fastcgi = { workspace = true }
 hj-proxy = { workspace = true }
 hj-rewrite = { workspace = true }
 hj-acl = { workspace = true }
 hj-geo = { workspace = true }
 hj-cache = { workspace = true }
 hj-compress = { workspace = true }
+brotli = { workspace = true }
+zstd = { workspace = true }
 hj-pagecache = { workspace = true }
 hj-log = { workspace = true }
 hj-tls = { workspace = true }

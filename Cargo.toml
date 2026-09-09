@@ -25,6 +25,7 @@ hj-config = { path = "crates/hj-config" }
 sha2 = "0.10"
 hmac = "0.12"
 hj-core = { path = "crates/hj-core" }
+hj-extension = { path = "crates/hj-extension" }
 hj-tls = { path = "crates/hj-tls" }
 hj-http = { path = "crates/hj-http" }
 hj-static = { path = "crates/hj-static" }
@@ -33,6 +34,7 @@ hj-compress = { path = "crates/hj-compress" }
 hj-log = { path = "crates/hj-log" }
 hj-acl = { path = "crates/hj-acl" }
 hj-lsapi = { path = "crates/hj-lsapi" }
+hj-fastcgi = { path = "crates/hj-fastcgi" }
 hj-rewrite = { path = "crates/hj-rewrite" }
 hj-proxy = { path = "crates/hj-proxy" }
 hj-pagecache = { path = "crates/hj-pagecache" }

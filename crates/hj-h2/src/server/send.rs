@@ -140,6 +140,7 @@ pub(super) fn begin_response(
     block_scratch: &mut Vec<u8>,
 ) {
     let (mut head, body) = response.into_parts();
+    let mut completion = head.extensions.remove::<hj_core::ResponseCompletion>();
     // §8.2.2: connection-specific ("hop-by-hop") fields are illegal on an h2 response — strip
     // them before encoding so a backend that emits e.g. `Connection`/`Transfer-Encoding`
     // (PHP over LSAPI, a proxied upstream) can't produce a malformed frame stream.
@@ -220,8 +221,9 @@ pub(super) fn begin_response(
     let credit = pending_window.remove(&stream_id).unwrap_or(0);
     let window = (peer.initial_window + credit).min(i32::MAX as i64);
 
-    let headers_only = |out: &mut OutQueue| {
+    let headers_only = |out: &mut OutQueue, completion: Option<hj_core::ResponseCompletion>| {
         out.frames(|b| write_field_block(b, stream_id, flags::END_STREAM, block, mf));
+        out.completions.extend(completion);
     };
     let headers_open = |out: &mut OutQueue| {
         out.frames(|b| write_field_block(b, stream_id, 0, block, mf));
@@ -230,10 +232,12 @@ pub(super) fn begin_response(
                     send_schedule: &mut VecDeque<u32>,
                     pending,
                     body,
-                    eof| {
+                    eof,
+                    completion| {
         outstreams.insert(
             stream_id,
             OutStream {
+                completion,
                 pending,
                 body,
                 pulling: false,
@@ -249,21 +253,28 @@ pub(super) fn begin_response(
     // HEAD and body-forbidden statuses send the header block only. HEAD keeps the
     // representation headers a GET would have; body-forbidden statuses are sanitized above.
     if body_forbidden {
-        headers_only(out);
+        headers_only(out, completion.take());
         return;
     }
 
     match body {
-        Body::Empty => headers_only(out),
+        Body::Empty => headers_only(out, completion.take()),
         Body::Stream(s) => {
             headers_open(out);
-            register(outstreams, send_schedule, Bytes::new(), Some(s), false);
+            register(
+                outstreams,
+                send_schedule,
+                Bytes::new(),
+                Some(s),
+                false,
+                completion.take(),
+            );
         }
         // Uncached file: stream it asynchronously (64 KiB chunks off tokio's blocking
         // pool) so a large file never blocks the connection task or its other streams.
         Body::File(f) if f.cached.is_none() => {
             if f.len == 0 {
-                headers_only(out);
+                headers_only(out, completion.take());
             } else {
                 headers_open(out);
                 register(
@@ -272,16 +283,24 @@ pub(super) fn begin_response(
                     Bytes::new(),
                     Some(file_stream_body(f.path, f.file, f.range, f.len)),
                     false,
+                    completion.take(),
                 );
             }
         }
         other => {
             let bytes = body_to_bytes(other); // Body::Full or a cached file — already in memory
             if bytes.is_empty() {
-                headers_only(out);
+                headers_only(out, completion.take());
             } else {
                 headers_open(out);
-                register(outstreams, send_schedule, bytes, None, true);
+                register(
+                    outstreams,
+                    send_schedule,
+                    bytes,
+                    None,
+                    true,
+                    completion.take(),
+                );
             }
         }
     }
@@ -471,6 +490,7 @@ fn pump_one_frame(
         st.window -= n as i64;
         if last {
             st.done = true;
+            out.completions.extend(st.completion.take());
         }
         return true;
     }
@@ -487,6 +507,7 @@ fn pump_one_frame(
             .write(b)
         });
         st.done = true;
+        out.completions.extend(st.completion.take());
         return true;
     }
     false
@@ -572,6 +593,9 @@ pub(super) fn apply_pull(
         }
         None => st.eof = true,
         Some(Err(_e)) => {
+            if let Some(completion) = st.completion.take() {
+                completion.finish(hj_core::ResponseEnd::Error);
+            }
             out.frames(|b| frame::write_rst_stream(b, sid, error_code::INTERNAL_ERROR));
             st.done = true; // dropped by the next pump_streams pass
         }
@@ -674,6 +698,7 @@ mod tests {
     fn send_flow_control_rotates_before_reusing_connection_credit() {
         fn stream(body: &'static [u8]) -> OutStream {
             OutStream {
+                completion: None,
                 pending: Bytes::from_static(body),
                 body: None,
                 pulling: false,
@@ -870,6 +895,7 @@ mod tests {
             outstreams.insert(
                 sid,
                 OutStream {
+                    completion: None,
                     pending: Bytes::new(),
                     body: None,
                     pulling: true,

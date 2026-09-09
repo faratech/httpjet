@@ -72,6 +72,7 @@
 //! # }
 //! ```
 
+mod error_json;
 mod fmt;
 mod syslog;
 mod tracing_layer;
@@ -643,9 +644,18 @@ impl LogLevel {
 /// logger. Emits `2026-05-31 13:55:36.000000 [LEVEL] message` lines.
 #[derive(Clone)]
 pub struct ErrorLogger {
+    format: ErrorLogFormat,
     tx: mpsc::UnboundedSender<Msg>,
     /// Per-logger state: `(depth, gone)` (see [`AccessLogger`]).
     state: LoggerState,
+}
+
+/// Error-file format. Text preserves the historical output byte for byte.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ErrorLogFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 impl ErrorLogger {
@@ -656,6 +666,26 @@ impl ErrorLogger {
         rolling_size: u64,
         keep_days: u64,
         compress_archive: bool,
+    ) -> Self {
+        let format = match std::env::var("HTTPJET_ERROR_LOG_FORMAT").as_deref() {
+            Ok("json") => ErrorLogFormat::Json,
+            Ok("text") | Err(_) => ErrorLogFormat::Text,
+            Ok(_) => {
+                eprintln!(
+                    "httpjet: invalid HTTPJET_ERROR_LOG_FORMAT; expected text or json, using text"
+                );
+                ErrorLogFormat::Text
+            }
+        };
+        Self::spawn_with_format(path, rolling_size, keep_days, compress_archive, format)
+    }
+
+    pub fn spawn_with_format(
+        path: impl AsRef<Path>,
+        rolling_size: u64,
+        keep_days: u64,
+        compress_archive: bool,
+        format: ErrorLogFormat,
     ) -> Self {
         let cfg = RollConfig {
             path: path.as_ref().to_path_buf(),
@@ -669,7 +699,7 @@ impl ErrorLogger {
             tokio::spawn(writer::run(cfg, rx, state.clone(), None)),
             "error-log",
         );
-        ErrorLogger { tx, state }
+        ErrorLogger { tx, state, format }
     }
 
     /// Log a message at `level` using `SystemTime::now()` as the timestamp.
@@ -679,12 +709,32 @@ impl ErrorLogger {
 
     /// Log a message with an explicit timestamp (deterministic; used in tests).
     pub fn log_at(&self, level: LogLevel, ts: SystemTime, msg: impl AsRef<str>) {
+        if self.format == ErrorLogFormat::Json {
+            self.structured_at(level, ts, None, msg.as_ref(), &[]);
+            return;
+        }
         let line = format!(
             "{} [{}] {}",
             fmt::error_time(ts),
             level.as_str(),
             sanitize_msg(msg.as_ref()),
         );
+        send_or_warn(&self.tx, &self.state, Msg::Line(line), "error-log");
+    }
+
+    pub(crate) fn is_json(&self) -> bool {
+        self.format == ErrorLogFormat::Json
+    }
+
+    pub(crate) fn structured_at(
+        &self,
+        level: LogLevel,
+        ts: SystemTime,
+        target: Option<&str>,
+        message: &str,
+        fields: &[(String, String)],
+    ) {
+        let line = error_json::render(level, ts, target, message, fields);
         send_or_warn(&self.tx, &self.state, Msg::Line(line), "error-log");
     }
 

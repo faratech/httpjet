@@ -1,0 +1,7 @@
+# These Apache 2.4 actions/directives are currently ignored by the parser.
+RequestHeader set X-Request changed
+RequestHeader unset Authorization
+Header setifempty X-Default fallback
+Header edit Location ^http: https:
+Header edit* Set-Cookie insecure secure
+Header note X-Upstream upstream_note

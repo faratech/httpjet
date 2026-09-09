@@ -56,7 +56,7 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 pub use headers::is_websocket_upgrade;
-pub use pool::{Upstream, UpstreamPool};
+pub use pool::{PeerSnapshot, RequestReservation, Upstream, UpstreamPool};
 pub use target::{ProxyTarget, TargetParseError};
 
 use crate::error::ProxyError;
@@ -158,9 +158,10 @@ impl Proxy {
     /// generation until its in-flight requests drain; ad-hoc unnamed targets stay
     /// warm because they are not represented in the parsed ext-processor list.
     pub fn next_generation(&self, named_targets: impl IntoIterator<Item = ProxyTarget>) -> Self {
-        Proxy {
+        let targets: Vec<_> = named_targets.into_iter().collect();
+        let next = Proxy {
             pool: self.pool.retained_generation(
-                named_targets,
+                targets.clone(),
                 self.default_max_conns,
                 self.default_keep_alive,
                 self.default_connect_timeout,
@@ -168,7 +169,23 @@ impl Proxy {
             default_max_conns: self.default_max_conns,
             default_keep_alive: self.default_keep_alive,
             default_connect_timeout: self.default_connect_timeout,
-        }
+        };
+        next.prepare_groups(targets);
+        next
+    }
+
+    pub fn with_targets(targets: impl IntoIterator<Item = ProxyTarget>) -> Self {
+        let proxy = Self::new();
+        proxy.prepare_groups(targets);
+        proxy
+    }
+    fn prepare_groups(&self, targets: impl IntoIterator<Item = ProxyTarget>) {
+        self.pool.prepare_groups(
+            targets,
+            self.default_max_conns,
+            self.default_keep_alive,
+            self.default_connect_timeout,
+        );
     }
 
     /// Forward an ordinary HTTP request to `target` and stream the response back.
@@ -200,14 +217,14 @@ impl Proxy {
         target: &ProxyTarget,
         timeout_override: Option<u64>,
     ) -> Result<Response, HandlerError> {
-        let upstream = self.pool.get_or_create(
+        let (upstream, mut reservation) = self.pool.select(
             target,
             target.max_conns.unwrap_or(self.default_max_conns),
             target.keep_alive.unwrap_or(self.default_keep_alive),
             target
                 .connect_timeout
                 .unwrap_or(self.default_connect_timeout),
-        );
+        )?;
         // One response-head duration applies to every forward shape. In particular,
         // a context override must govern bodyless requests and their transparent retry
         // as well as the post-upload wait for body-bearing requests.
@@ -360,6 +377,9 @@ impl Proxy {
         } else {
             (None, None)
         };
+        if let Some(r) = &mut reservation {
+            r.response_received();
+        }
         let downstream_response = into_streaming_response(upstream_resp, response_done_tx);
 
         // Return the sender according to its protocol. An h2 sender can open another
@@ -387,12 +407,14 @@ impl Proxy {
             upstream.release(sender);
             tokio::spawn(async move {
                 let _permit = permit;
+                let _reservation = reservation;
                 let _ = response_done.await;
             });
         } else {
             let up = upstream.clone();
             tokio::spawn(async move {
                 let _permit = permit;
+                let _reservation = reservation;
                 // (#70) Hold the h1 maxConns permit until the upstream connection is
                 // ACTUALLY free. `sender.ready()` resolves when the in-flight response is
                 // fully consumed, its body is dropped, or the upstream closes. There is no
@@ -428,6 +450,26 @@ impl Proxy {
         req: Request,
         target: &ProxyTarget,
     ) -> Result<WebSocketUpgrade, HandlerError> {
+        let (selected, mut reservation) = self.pool.select(
+            target,
+            target.max_conns.unwrap_or(self.default_max_conns),
+            target.keep_alive.unwrap_or(self.default_keep_alive),
+            target
+                .connect_timeout
+                .unwrap_or(self.default_connect_timeout),
+        )?;
+        let mut selected_target = target.clone();
+        if let Some(r) = &mut reservation {
+            r.permit = Some(
+                selected
+                    .acquire()
+                    .await
+                    .ok_or(HandlerError::ServiceUnavailable)?,
+            );
+            selected_target.authority = selected.authority.clone();
+            selected_target.transport = selected.transport().clone();
+        }
+        let target = &selected_target;
         let hostport = match &target.transport {
             TargetTransport::Tcp(hp) => hp.clone(),
             TargetTransport::Uds(_) => {
@@ -436,19 +478,30 @@ impl Proxy {
                 ));
             }
         };
-        if target.is_tls() {
+        if target.is_tls() || target.http2 {
             return Err(HandlerError::BadGateway(
-                "secure websocket upstreams are not supported by the raw websocket relay".into(),
+                "secure websocket and HTTP/2 upstreams are not supported by the raw websocket relay".into(),
             ));
         }
 
         let connect_timeout = target
             .connect_timeout
             .unwrap_or(self.default_connect_timeout);
-        let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(&hostport))
-            .await
-            .map_err(|_| HandlerError::GatewayTimeout)?
-            .map_err(|e| HandlerError::BadGateway(format!("ws connect: {e}")))?;
+        let stream =
+            match tokio::time::timeout(connect_timeout, TcpStream::connect(&hostport)).await {
+                Ok(Ok(stream)) => {
+                    selected.note_dial_success();
+                    stream
+                }
+                Ok(Err(e)) => {
+                    selected.note_dial_failure();
+                    return Err(HandlerError::BadGateway(format!("ws connect: {e}")));
+                }
+                Err(_) => {
+                    selected.note_dial_failure();
+                    return Err(HandlerError::GatewayTimeout);
+                }
+            };
         let _ = stream.set_nodelay(true);
         set_tcp_keepalive(&stream);
 
@@ -481,6 +534,9 @@ impl Proxy {
             };
 
         let status = upstream_resp.status();
+        if let Some(r) = &mut reservation {
+            r.response_received();
+        }
         if status == http::StatusCode::SWITCHING_PROTOCOLS {
             // Capture the upstream's exact 101 head (incl. Sec-WebSocket-Accept,
             // Sec-WebSocket-Protocol/-Extensions) BEFORE consuming the response
@@ -507,6 +563,7 @@ impl Proxy {
                 .or_insert_with(|| HeaderValue::from_static("upgrade"));
 
             return Ok(WebSocketUpgrade {
+                reservation,
                 response: resp,
                 upstream: UpstreamUpgraded::Hyper(upstream_io),
             });
@@ -515,8 +572,12 @@ impl Proxy {
         // Non-101: surface the upstream's response (buffered) to the client.
         drop(driver);
         let mut resp = into_streaming_response(upstream_resp, None);
+        if let Body::Stream(body) = std::mem::replace(resp.body_mut(), Body::Empty) {
+            *resp.body_mut() = Body::Stream(ReservedBody { body, reservation }.boxed());
+        }
         headers::sanitize_response_headers(resp.headers_mut(), false);
         Ok(WebSocketUpgrade {
+            reservation: None,
             response: resp,
             upstream: UpstreamUpgraded::Rejected(status),
         })
@@ -585,6 +646,7 @@ impl Proxy {
 
 /// Result of [`Proxy::proxy_websocket`].
 pub struct WebSocketUpgrade {
+    pub reservation: Option<RequestReservation>,
     /// The response to return to the downstream client (status `101` on
     /// success, or the upstream's rejection response).
     pub response: Response,
@@ -619,6 +681,30 @@ impl UpstreamUpgraded {
 }
 
 // ---- request/response construction helpers ----
+struct ReservedBody {
+    body: StreamBody,
+    reservation: Option<RequestReservation>,
+}
+impl HttpBody for ReservedBody {
+    type Data = Bytes;
+    type Error = BoxError;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let result = std::pin::Pin::new(&mut self.body).poll_frame(cx);
+        if matches!(result, std::task::Poll::Ready(None | Some(Err(_)))) {
+            self.reservation.take();
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
 
 /// Compute the upstream request URI: use the target's explicit path-and-query
 /// when present, otherwise the inbound URI's path-and-query. The authority/host

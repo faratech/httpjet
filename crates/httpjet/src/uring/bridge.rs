@@ -32,6 +32,10 @@ pub(crate) struct BridgeCtx {
     pub local: std::net::SocketAddr,
     pub proto: Proto,
     pub is_tls: bool,
+    /// This connection's H1 writer can consume a pinned `Body::File` directly.
+    /// True only for plain TCP H1 and successfully upgraded TLS 1.3 kTLS H1;
+    /// userspace TLS, H2/H3, and UDS must stream through their existing paths.
+    pub direct_file_egress: bool,
     /// (Tier 2) UDS connection: peer/local are loopback fabrications.
     pub peer_unix: bool,
     /// clientVerify=2 in effect for this listener (app-layer mTLS enforced at accept;
@@ -48,13 +52,13 @@ pub(crate) struct BridgeCtx {
 impl BridgeCtx {
     /// A unix-domain-socket context: peer/local are fabricated loopback, the
     /// filesystem mode is the real access boundary.
-    #[cfg(test)]
     pub(crate) fn unix(local: std::net::SocketAddr, proto: Proto) -> Self {
         BridgeCtx {
             peer: std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
             local,
             proto,
             is_tls: false,
+            direct_file_egress: false,
             peer_unix: true,
             mtls_required: false,
             sni: None,
@@ -73,6 +77,7 @@ impl BridgeCtx {
             local,
             proto,
             is_tls: false,
+            direct_file_egress: proto == Proto::Http1,
             peer_unix: false,
             mtls_required: false,
             sni: None,
@@ -86,6 +91,9 @@ impl BridgeCtx {
 /// drains incrementally (large files, large renders, SSE).
 pub(crate) enum BridgeBody {
     Full(Bytes),
+    /// A pinned file/range retained across the runtime boundary. Produced only
+    /// when the H1 writer can use `sendfile(2)` (plain TCP or TLS 1.3 kTLS).
+    File(hj_core::FileBody),
     /// Incremental chunks from the tokio forwarder. `len` is `Some` when the total length
     /// is known up front (a `Body::File`) so H1 can emit `Content-Length`; `None` ⇒ H1
     /// frames it `Transfer-Encoding: chunked`. An `Err(())` item signals a mid-stream
@@ -99,6 +107,7 @@ pub(crate) enum BridgeBody {
 
 /// A response handed back across the runtime boundary.
 pub(crate) struct BridgeResp {
+    pub completion: Option<hj_core::ResponseCompletion>,
     pub status: http::StatusCode,
     pub headers: http::HeaderMap,
     pub body: BridgeBody,
@@ -390,11 +399,15 @@ impl Bridge {
 pub(crate) fn bridge_resp_to_response(r: BridgeResp) -> Response {
     let body = match r.body {
         BridgeBody::Full(b) => Body::Full(b),
+        BridgeBody::File(f) => Body::File(f),
         BridgeBody::Stream { rx, .. } => Body::Stream(ChannelBody { rx }.boxed()),
     };
     let mut resp = http::Response::new(body);
     *resp.status_mut() = r.status;
     *resp.headers_mut() = r.headers;
+    if let Some(completion) = r.completion {
+        resp.extensions_mut().insert(completion);
+    }
     resp
 }
 
@@ -464,8 +477,9 @@ where
                         biased;
                         _ = cancel.cancelled() => {}
                         _ = async move {
+                            let direct_file = ctx.direct_file_egress;
                             let response = handler(req, ctx).await;
-                            forward_response(response, resp).await;
+                            forward_response(response, resp, direct_file).await;
                         } => {}
                     }
                     drop(permit);
@@ -482,6 +496,7 @@ where
 /// mid-stream error instead aborts the response (see `BridgeBody::Stream`).
 pub(crate) fn bad_gateway() -> BridgeResp {
     BridgeResp {
+        completion: None,
         status: http::StatusCode::BAD_GATEWAY,
         headers: http::HeaderMap::new(),
         body: BridgeBody::Full(Bytes::from_static(b"upstream body truncated\n")),
@@ -493,6 +508,7 @@ pub(crate) fn bad_gateway() -> BridgeResp {
 /// server capacity, not a client error.
 pub(crate) fn service_unavailable_resp() -> BridgeResp {
     BridgeResp {
+        completion: None,
         status: http::StatusCode::SERVICE_UNAVAILABLE,
         headers: http::HeaderMap::new(),
         body: BridgeBody::Full(Bytes::from_static(b"server busy\n")),
@@ -500,15 +516,71 @@ pub(crate) fn service_unavailable_resp() -> BridgeResp {
     }
 }
 
-fn full_resp(parts: http::response::Parts, body: Bytes, bw_rate: Option<u64>) -> BridgeResp {
+fn full_resp(mut parts: http::response::Parts, body: Bytes, bw_rate: Option<u64>) -> BridgeResp {
+    let status = parts.status;
+    observe_response_head(&mut parts, status);
     // The Full arms own `parts` outright — move the header map instead of cloning it per
     // bridged response.
     BridgeResp {
+        completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
         status: parts.status,
         headers: parts.headers,
         body: BridgeBody::Full(body),
         bw_rate,
     }
+}
+
+/// Convert an on-core fast-path response without discarding a direct-egress H1
+/// file descriptor. Non-file bodies retain the historical fully-buffered fast
+/// path; only an uncached `Body::File` eligible for direct egress stays a file.
+pub(crate) async fn fast_response(r: Response, direct_file: bool) -> BridgeResp {
+    let (mut parts, body) = r.into_parts();
+    let bw_rate = parts
+        .extensions
+        .remove::<crate::pipeline::PerConnBandwidth>()
+        .map(|b| b.0);
+    match body {
+        Body::Empty => full_resp(parts, Bytes::new(), bw_rate),
+        Body::Full(bytes) => full_resp(parts, bytes, bw_rate),
+        Body::File(file) if file.cached.is_some() => {
+            full_resp(parts, file.cached_ranged().unwrap_or_default(), bw_rate)
+        }
+        Body::File(file) if direct_file => {
+            let status = parts.status;
+            observe_response_head(&mut parts, status);
+            BridgeResp {
+                completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+                status: parts.status,
+                headers: strip_framing(parts.headers),
+                body: BridgeBody::File(file),
+                bw_rate,
+            }
+        }
+        body => {
+            let (bytes, truncated) = buffer_body(body).await;
+            if truncated {
+                bad_gateway_for(parts)
+            } else {
+                full_resp(parts, bytes, bw_rate)
+            }
+        }
+    }
+}
+
+fn bad_gateway_for(mut parts: http::response::Parts) -> BridgeResp {
+    observe_response_head(&mut parts, http::StatusCode::BAD_GATEWAY);
+    let mut response = bad_gateway();
+    response.completion = parts.extensions.remove::<hj_core::ResponseCompletion>();
+    response
+}
+
+fn observe_response_head(parts: &mut http::response::Parts, status: http::StatusCode) {
+    #[cfg(feature = "otel")]
+    if let Some(head) = parts.extensions.remove::<crate::otel::ResponseHead>() {
+        head.record(status);
+    }
+    #[cfg(not(feature = "otel"))]
+    let _ = (parts, status);
 }
 
 /// Hop-by-hop framing headers the bridge re-derives when it streams a response (it picks
@@ -535,7 +607,7 @@ fn is_event_stream(h: &http::HeaderMap) -> bool {
 /// Classify the handler's `Body` and hand it back across the bridge. Small / in-memory
 /// bodies stay `Full` (byte-identical to the pre-streaming path, zero extra copy); large
 /// files and large/SSE streams are forwarded incrementally.
-async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>) {
+async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>, direct_file: bool) {
     let (mut parts, body) = r.into_parts();
     let bw_rate = parts
         .extensions
@@ -558,6 +630,17 @@ async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>) {
                 bw_rate,
             ));
         }
+        Body::File(f) if direct_file => {
+            let status = parts.status;
+            observe_response_head(&mut parts, status);
+            let _ = resp.send(BridgeResp {
+                completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+                status: parts.status,
+                headers: strip_framing(parts.headers),
+                body: BridgeBody::File(f),
+                bw_rate,
+            });
+        }
         Body::File(f) => forward_file(parts, f, resp, bw_rate).await,
         Body::Stream(s) => forward_stream(parts, s, resp, bw_rate).await,
     }
@@ -567,7 +650,7 @@ async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>) {
 /// files, so one reaching the bridge is large or ranged). `Content-Length` is known, so H1
 /// emits it and writes raw (resumable downloads); a mid-read error aborts.
 async fn forward_file(
-    parts: http::response::Parts,
+    mut parts: http::response::Parts,
     mut f: hj_core::FileBody,
     resp: oneshot::Sender<BridgeResp>,
     bw_rate: Option<u64>,
@@ -583,18 +666,21 @@ async fn forward_file(
         None => match tokio::fs::File::open(&f.path).await {
             Ok(file) => file,
             Err(_) => {
-                let _ = resp.send(bad_gateway());
+                let _ = resp.send(bad_gateway_for(parts));
                 return;
             }
         },
     };
     if (pinned || start > 0) && file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
-        let _ = resp.send(bad_gateway());
+        let _ = resp.send(bad_gateway_for(parts));
         return;
     }
+    let status = parts.status;
+    observe_response_head(&mut parts, status);
     let headers = strip_framing(parts.headers);
     let (tx, rrx) = mpsc::channel(STREAM_CHANNEL_DEPTH);
     let _ = resp.send(BridgeResp {
+        completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
         status: parts.status,
         headers,
         body: BridgeBody::Stream {
@@ -651,16 +737,19 @@ async fn forward_file(
 /// switches to incremental delivery past it. An error BEFORE the switch is a clean 502;
 /// after it, the stream is aborted.
 async fn forward_stream(
-    parts: http::response::Parts,
+    mut parts: http::response::Parts,
     mut s: hj_core::StreamBody,
     resp: oneshot::Sender<BridgeResp>,
     bw_rate: Option<u64>,
 ) {
     use http_body_util::BodyExt;
     if is_event_stream(&parts.headers) {
+        let status = parts.status;
+        observe_response_head(&mut parts, status);
         let headers = strip_framing(parts.headers);
         let (tx, rrx) = mpsc::channel(STREAM_CHANNEL_DEPTH);
         let _ = resp.send(BridgeResp {
+            completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
             status: parts.status,
             headers,
             body: BridgeBody::Stream { rx: rrx, len: None },
@@ -676,9 +765,12 @@ async fn forward_stream(
                 if let Some(d) = frame.data_ref() {
                     acc.extend_from_slice(d);
                     if acc.len() > STREAM_THRESHOLD {
+                        let status = parts.status;
+                        observe_response_head(&mut parts, status);
                         let headers = strip_framing(parts.headers);
                         let (tx, rrx) = mpsc::channel(STREAM_CHANNEL_DEPTH);
                         let _ = resp.send(BridgeResp {
+                            completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
                             status: parts.status,
                             headers,
                             body: BridgeBody::Stream { rx: rrx, len: None },
@@ -693,11 +785,14 @@ async fn forward_stream(
                 }
             }
             Some(Err(_)) => {
-                let _ = resp.send(bad_gateway());
+                let _ = resp.send(bad_gateway_for(parts));
                 return;
             }
             None => {
+                let status = parts.status;
+                observe_response_head(&mut parts, status);
                 let _ = resp.send(BridgeResp {
+                    completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
                     status: parts.status,
                     headers: parts.headers,
                     body: BridgeBody::Full(Bytes::from(acc)),
@@ -1223,6 +1318,7 @@ mod tests {
                 local: "127.0.0.1:80".parse().unwrap(),
                 proto: Proto::Http1,
                 is_tls: false,
+                direct_file_egress: true,
                 peer_unix: false,
                 mtls_required: false,
                 sni: None,
@@ -1233,6 +1329,7 @@ mod tests {
             match resp.body {
                 BridgeBody::Full(b) => assert_eq!(&b[..], b"bridged /hello"),
                 BridgeBody::Stream { .. } => panic!("small response must stay Full"),
+                BridgeBody::File(_) => panic!("small response must not become File"),
             }
         });
     }
@@ -1479,8 +1576,95 @@ mod tests {
 
     async fn run_forward(r: Response) -> BridgeResp {
         let (tx, rx) = oneshot::channel();
-        forward_response(r, tx).await;
+        forward_response(r, tx, false).await;
         rx.await.unwrap()
+    }
+
+    async fn run_forward_direct(r: Response) -> BridgeResp {
+        let (tx, rx) = oneshot::channel();
+        forward_response(r, tx, true).await;
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn direct_plain_h1_forwarding_preserves_pinned_file_and_range() {
+        let path = std::env::temp_dir().join(format!(
+            "httpjet-bridge-direct-file-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let response = http::Response::new(Body::File(hj_core::FileBody {
+            path: path.clone(),
+            file: Some(std::fs::File::open(&path).unwrap()),
+            len: 10,
+            range: Some((2, 7)),
+            cached: None,
+        }));
+        match run_forward_direct(response).await.body {
+            BridgeBody::File(file) => {
+                assert!(file.file.is_some(), "the selected inode must stay pinned");
+                assert_eq!(file.range, Some((2, 7)));
+            }
+            _ => panic!("eligible plaintext H1 file must remain a file"),
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn forwarding_preserves_completion_for_buffered_streamed_and_error_responses() {
+        for (mut response, status) in [
+            (
+                http::Response::new(Body::Full(Bytes::from_static(b"full"))),
+                200,
+            ),
+            (
+                stream_resp(vec![Bytes::from_static(b"small")], false, None),
+                200,
+            ),
+            (
+                stream_resp(
+                    vec![Bytes::from_static(b"event")],
+                    false,
+                    Some("text/event-stream"),
+                ),
+                200,
+            ),
+            (stream_resp(vec![], true, None), 502),
+            (
+                http::Response::new(Body::File(hj_core::FileBody {
+                    path: "/nonexistent-httpjet-test/path".into(),
+                    file: None,
+                    len: 4,
+                    range: None,
+                    cached: None,
+                })),
+                502,
+            ),
+        ] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let copy = events.clone();
+            response
+                .extensions_mut()
+                .insert(hj_core::ResponseCompletion::new(move |end| {
+                    copy.lock().unwrap().push(end)
+                }));
+            let mut forwarded = run_forward(response).await;
+            assert_eq!(forwarded.status.as_u16(), status);
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "bridge production is not transport completion"
+            );
+            forwarded
+                .completion
+                .take()
+                .unwrap()
+                .finish(hj_core::ResponseEnd::Complete);
+            drop(forwarded);
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![hj_core::ResponseEnd::Complete]
+            );
+        }
     }
 
     async fn drain(mut rx: mpsc::Receiver<Result<Bytes, ()>>) -> Result<Vec<u8>, ()> {
@@ -1519,6 +1703,7 @@ mod tests {
         match run_forward(r).await.body {
             BridgeBody::Full(b) => assert_eq!(&b[..], b"hello world"),
             BridgeBody::Stream { .. } => panic!("sub-threshold stream must buffer to Full"),
+            BridgeBody::File(_) => panic!("stream must not become File"),
         }
     }
 
@@ -1542,6 +1727,7 @@ mod tests {
                 assert_eq!(&got[big.len()..], &tail[..]);
             }
             BridgeBody::Full(_) => panic!("over-threshold stream must switch to Stream"),
+            BridgeBody::File(_) => panic!("stream must not become File"),
         }
         // Framing headers are stripped on the streamed path.
         assert!(resp.headers.get(http::header::CONTENT_LENGTH).is_none());
@@ -1560,6 +1746,7 @@ mod tests {
                 assert_eq!(drain(rx).await.unwrap(), b"data: 1\n\n");
             }
             BridgeBody::Full(_) => panic!("SSE must stream immediately, not buffer"),
+            BridgeBody::File(_) => panic!("SSE must not become File"),
         }
     }
 
@@ -1571,6 +1758,7 @@ mod tests {
         match resp.body {
             BridgeBody::Full(b) => assert_eq!(&b[..], b"upstream body truncated\n"),
             BridgeBody::Stream { .. } => panic!("pre-header error must be a buffered 502"),
+            BridgeBody::File(_) => panic!("stream error must not become File"),
         }
     }
 
@@ -1586,6 +1774,7 @@ mod tests {
                 );
             }
             BridgeBody::Full(_) => panic!("over-threshold stream must switch to Stream"),
+            BridgeBody::File(_) => panic!("stream must not become File"),
         }
     }
 
@@ -1622,6 +1811,7 @@ mod tests {
                 );
             }
             BridgeBody::Full(_) => panic!("an uncached Body::File must stream via forward_file"),
+            BridgeBody::File(_) => panic!("non-direct forwarding must stream files"),
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -1650,6 +1840,7 @@ mod tests {
                 assert_eq!(drain(rx).await.expect("clean stream"), data);
             }
             BridgeBody::Full(_) => panic!("an uncached Body::File must stream via forward_file"),
+            BridgeBody::File(_) => panic!("non-direct forwarding must stream files"),
         }
         let _ = std::fs::remove_file(&path);
     }

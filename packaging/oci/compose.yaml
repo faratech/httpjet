@@ -1,0 +1,28 @@
+services:
+  httpjet:
+    build:
+      context: ../..
+      dockerfile: packaging/oci/Containerfile
+    image: httpjet:example
+    user: "10001:10001"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./seccomp-httpjet.json
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    ports:
+      - "8080:8080/tcp"
+      - "8443:8443/tcp"
+      - "8443:8443/udp"
+    volumes:
+      - ./certs:/run/httpjet-certs:ro
+      - httpjet-data:/var/lib/httpjet
+      - httpjet-logs:/etc/httpjet/litespeed/logs
+    restart: unless-stopped
+
+volumes:
+  httpjet-data:
+  httpjet-logs:

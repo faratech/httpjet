@@ -11,19 +11,27 @@
 pub(crate) mod bridge;
 pub(crate) mod codec;
 pub(crate) mod directio;
+#[cfg(test)]
+mod generation_test;
 pub(crate) mod h3;
 #[cfg(feature = "ktls")]
 pub(crate) mod ktls;
+pub(crate) mod ktls_policy;
 pub(crate) mod proxy_protocol;
-mod request_body;
+pub(crate) mod request_body;
+mod unix_path;
+pub(crate) mod worker_group;
+pub(crate) use worker_group::WorkerGroup;
 
 use std::io;
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 
 use monoio::io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use socket2::{Domain, Protocol, Socket, Type};
 
+use crate::serving_generation::{RequestGeneration, ServingView};
 use crate::state::ServerState;
 use bridge::{Bridge, BridgeCtx};
 use codec::{
@@ -75,19 +83,97 @@ pub(crate) struct ListenerBinding {
 /// What each monoio connection handler needs to serve a request: the on-core
 /// cache-hit fast path (`pipeline::fast_serve`, no runtime hop) plus the bridge to
 /// the tokio side-runtime for everything the fast path declines (miss / dynamic).
-/// `holder` gives the live `ServerState` generation (SIGHUP-safe); `listener_name`
-/// is the routing key for vhost resolution.
+/// `holder` follows compatible application generations, while retaining the
+/// accepted connection's trust epoch. `listener_name` is the vhost routing key.
 #[derive(Clone)]
 pub(crate) struct CoreHandler {
     bridge: Bridge,
-    holder: Arc<arc_swap::ArcSwap<ServerState>>,
+    holder: ServingView,
     listener_name: Arc<str>,
 }
 
 impl CoreHandler {
+    fn pin_connection(&self) -> Self {
+        Self {
+            holder: self.holder.pin_connection(),
+            ..self.clone()
+        }
+    }
+
+    #[cfg(feature = "otel")]
+    fn trace_request(
+        &self,
+        ctx: &BridgeCtx,
+        req: &mut hj_core::Request,
+    ) -> Option<crate::otel::RequestTrace> {
+        if !crate::otel::enabled() {
+            return None;
+        }
+        let state = req
+            .extensions()
+            .get::<RequestGeneration>()
+            .map(|snapshot| arc_swap::Guard::from_inner(snapshot.0.clone()))
+            .unwrap_or_else(|| self.holder.load());
+        let direct_peer = !ctx.peer_unix
+            && state
+                .server
+                .listeners
+                .iter()
+                .find(|l| l.name == self.listener_name.as_ref())
+                .is_some_and(|l| !l.proxy_protocol);
+        let parent = crate::otel::inbound_parent(req.headers_mut(), ctx.peer.ip(), direct_peer);
+        let trace = crate::otel::RequestTrace::new(parent);
+        req.extensions_mut()
+            .insert(crate::otel::TransportContext(trace.context()));
+        Some(trace)
+    }
+
+    async fn dispatch_h1(
+        &self,
+        ctx: BridgeCtx,
+        mut req: hj_core::Request,
+        upgrade: bool,
+    ) -> Option<bridge::BridgeResp> {
+        req.extensions_mut()
+            .insert(RequestGeneration(self.holder.load_full()));
+        if !upgrade && let Some(response) = self.fast(&ctx, &req).await {
+            return Some(bridge::fast_response(response, ctx.direct_file_egress).await);
+        }
+        #[cfg(feature = "otel")]
+        crate::otel::execution_path(false);
+        self.bridge.dispatch(req, ctx).await
+    }
+
+    async fn dispatch_h2(&self, ctx: BridgeCtx, mut req: hj_core::Request) -> hj_core::Response {
+        req.extensions_mut()
+            .insert(RequestGeneration(self.holder.load_full()));
+        #[cfg(feature = "otel")]
+        let trace = self.trace_request(&ctx, &mut req);
+        let future = async {
+            if let Some(response) = self.fast(&ctx, &req).await {
+                return response;
+            }
+            #[cfg(feature = "otel")]
+            crate::otel::execution_path(false);
+            self.bridge.dispatch_response(req, ctx).await
+        };
+        #[cfg(feature = "otel")]
+        if let Some(trace) = trace {
+            let mut response = crate::otel::in_context(trace.context(), future).await;
+            trace.response_head(response.status());
+            response.extensions_mut().insert(trace.completion());
+            return response;
+        }
+        future.await
+    }
+
     /// Try the on-core cache-hit fast path; `Some(resp)` if served without the bridge.
     async fn fast(&self, ctx: &BridgeCtx, req: &hj_core::Request) -> Option<hj_core::Response> {
-        let st = self.holder.load_full();
+        let st = req
+            .extensions()
+            .get::<RequestGeneration>()
+            .map(|snapshot| snapshot.0.clone())
+            .unwrap_or_else(|| self.holder.load_full());
         // Stamp Date here (insert-if-absent): the page cache strips the stored Date
         // expecting the serve boundary to re-add one, and the uring writers never do — the
         // tokio path stamps at server::stamp_date, this is its on-core fast-path twin.
@@ -104,7 +190,11 @@ impl CoreHandler {
             req,
         )
         .await
-        .map(hj_core::stamp_date)
+        .map(|response| {
+            #[cfg(feature = "otel")]
+            crate::otel::execution_path(true);
+            hj_core::stamp_date(response)
+        })
     }
 }
 
@@ -113,6 +203,8 @@ impl CoreHandler {
 /// for live connections to finish (H1 closes idle keep-alives, H2 GOAWAYs + drains)
 /// before the process exits. Mirrors the tokio path's bounded graceful shutdown.
 const URING_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(all(test, feature = "otel"))]
+mod otel_test;
 const WORKER_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(super) type WorkerReadyTx = std::sync::mpsc::Sender<Result<(), String>>;
@@ -176,6 +268,8 @@ async fn accept_drain_loop<F, Fut>(
     shutdown: CancellationToken,
     secure: bool,
     core: CoreHandler,
+    mut accept_stopped: worker_group::AcceptRetirement,
+    raced: Option<flume::Receiver<std::net::TcpStream>>,
     mut on_accept: F,
 ) where
     F: FnMut(TcpStream, SocketAddr) -> Fut,
@@ -219,7 +313,16 @@ async fn accept_drain_loop<F, Fut>(
     };
     loop {
         crate::memtrim::collect_if_requested_on_thread();
-        let next = async {
+        // The default multishot path does not allocate a cancellation handle
+        // per accepted connection; only the single-shot fallback needs one.
+        let single_canceller = std::cell::RefCell::new(None);
+        let mut next = std::pin::pin!(async {
+            if let Some(queued) = &raced {
+                if let Ok(stream) = queued.try_recv() {
+                    let peer = stream.peer_addr()?;
+                    return TcpStream::from_std(stream).map(|stream| (stream, peer));
+                }
+            }
             loop {
                 match multi.as_mut() {
                     Some(stream) => match stream.next().await {
@@ -243,14 +346,31 @@ async fn accept_drain_loop<F, Fut>(
                             continue;
                         }
                     },
-                    None => return listener.accept().await,
+                    None => {
+                        let canceller = monoio::io::Canceller::new();
+                        let cancel_handle = canceller.handle();
+                        *single_canceller.borrow_mut() = Some(canceller);
+                        return listener.cancelable_accept(cancel_handle).await;
+                    }
                 }
             }
-        };
+        });
         monoio::select! {
             biased;
-            _ = shutdown.cancelled() => break,
-            accepted = next => {
+            _ = shutdown.cancelled() => {
+                let pending = single_canceller.borrow_mut().take();
+                if let Some(canceller) = pending {
+                    // Keep the accept future alive through cancellation. Dropping
+                    // it would leave kernel completion/descriptor cleanup pending
+                    // while the successor starts consuming this accept queue.
+                    canceller.cancel();
+                    if let Ok((stream, _)) = next.await {
+                        transfer_accepted(&accept_stopped, stream);
+                    }
+                }
+                break;
+            },
+            accepted = &mut next => {
                 match accepted {
                     Ok((stream, peer)) => {
                         let state = core.holder.load();
@@ -290,6 +410,25 @@ async fn accept_drain_loop<F, Fut>(
             }
         }
     }
+    // Stop the kernel accept SQE before waiting on existing responses. Merely
+    // breaking the user-space loop leaves a multishot accept armed throughout
+    // the drain, consuming connections from a socket a successor may inherit.
+    if let Some(accepts) = multi.as_mut() {
+        accepts.cancel();
+        while let Some(completion) = accepts.next().await {
+            if let Ok(stream) = completion {
+                transfer_accepted(&accept_stopped, stream);
+            }
+        }
+    }
+    drop(multi);
+    drop(listener);
+    if let Some(queued) = raced {
+        for stream in queued.try_iter() {
+            accept_stopped.transfer(stream);
+        }
+    }
+    accept_stopped.cancel();
     tracing::info!(
         core = core_idx,
         secure,
@@ -310,6 +449,14 @@ async fn accept_drain_loop<F, Fut>(
     } else {
         tracing::info!(core = core_idx, secure, "uring core: drained cleanly");
     }
+}
+
+fn transfer_accepted(retirement: &worker_group::AcceptRetirement, stream: TcpStream) {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    // No read/write operation has been issued on a just-accepted stream. Taking
+    // its sole fd owner detaches it from this monoio runtime before thread transfer.
+    let stream = unsafe { std::net::TcpStream::from_raw_fd(stream.into_raw_fd()) };
+    retirement.transfer(stream);
 }
 
 /// Dev smoke hook for H1 over the real pipeline with a minimal ServerState.
@@ -361,7 +508,7 @@ pub(crate) fn serve_uring(
         .expect("bridge ServerState construction is config-validated upstream");
         let holder = Arc::new(arc_swap::ArcSwap::from(state));
         let admission = pipeline_admission(holder.clone());
-        spawn_uring_http(
+        let http_workers = spawn_uring_http(
             holder,
             listener_name,
             http_addr,
@@ -370,6 +517,7 @@ pub(crate) fn serve_uring(
             admission,
             ListenerBinding::default(),
         )?;
+        http_workers.activate();
         // Keep this runtime alive to drive the bridge; the monoio cores run independently.
         std::future::pending::<()>().await;
         Ok::<(), anyhow::Error>(())
@@ -380,18 +528,20 @@ pub(crate) fn serve_uring(
 /// CURRENT tokio runtime (each request loads the live `ServerState` generation
 /// from `holder`, so SIGHUP reloads are honored) + one pinned-core monoio
 /// io_uring runtime per worker, each adopting its own `SO_REUSEPORT` socket. The
-/// monoio cores run on detached threads (process exit tears them down); the
-/// returned `Ok(())` means the cores are up. Shared by `serve` (full
+/// returned group owns the monoio threads and stops/joins them on drop; success
+/// means every core has acknowledged readiness, but none accepts traffic until
+/// the caller activates the group. Shared by `serve` (full
 /// state) and the `serve_uring` smoke hook (minimal state).
 pub(crate) fn spawn_uring_http(
-    holder: Arc<arc_swap::ArcSwap<ServerState>>,
+    holder: impl Into<ServingView>,
     listener_name: Arc<str>,
     http_addr: SocketAddr,
     workers: usize,
     inherited: Option<Vec<std::net::TcpListener>>,
     admission: bridge::BridgeAdmission,
     binding: ListenerBinding,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WorkerGroup> {
+    let holder = holder.into();
     let shutdown = holder.load().shutdown.clone();
     let active_conns = holder.load().metrics.active_conns.clone();
     let bridge = build_pipeline_bridge(holder.clone(), listener_name.clone(), admission);
@@ -407,15 +557,25 @@ pub(crate) fn spawn_uring_http(
     let listeners = uring_listeners(inherited, http_addr, workers)?;
     let worker_count = listeners.len();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let mut group = WorkerGroup::for_tcp_epoch(
+        &shutdown,
+        core.holder.trust_epoch(),
+        worker_group::TcpListenerId {
+            name: core.listener_name.clone(),
+            tls: false,
+        },
+    );
     for (core_i, std_listener) in listeners.into_iter().enumerate() {
         let core = core.clone();
-        let shutdown = shutdown.clone();
         let active_conns = active_conns.clone();
         let ready = ready_tx.clone();
-        std::thread::Builder::new()
-            .name(format!("hj-uring-{core_i}"))
-            .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
-            .spawn(move || {
+        let activation = group.activation_gate();
+        let accept_stopped = group.register_acceptor(&std_listener)?;
+        group.spawn(
+            std::thread::Builder::new()
+                .name(format!("hj-uring-{core_i}"))
+                .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
+            move |shutdown| {
                 maybe_pin_core_thread(core_i, worker_count);
                 per_core_bridged(
                     core_i,
@@ -425,13 +585,16 @@ pub(crate) fn spawn_uring_http(
                     shutdown,
                     active_conns,
                     ready,
+                    activation,
                     binding,
+                    accept_stopped,
                 )
-            })?;
+            },
+        )?;
     }
     drop(ready_tx);
     wait_for_worker_readiness("HTTP", worker_count, ready_rx)?;
-    Ok(())
+    Ok(group)
 }
 
 /// (#296) Kill switch for per-core thread pinning (`--no-core-pinning`).
@@ -548,7 +711,7 @@ fn uring_listeners(
 /// runs `pipeline::handle` with the per-connection context (peer/TLS/mTLS/SNI).
 /// Shared by the plaintext (`spawn_uring_http`) and TLS (`spawn_uring_https`) paths.
 fn build_pipeline_bridge(
-    holder: Arc<arc_swap::ArcSwap<ServerState>>,
+    holder: impl Into<ServingView>,
     listener_name: Arc<str>,
     admission: bridge::BridgeAdmission,
 ) -> Bridge {
@@ -562,10 +725,37 @@ fn build_pipeline_bridge(
     // The pipeline only reads the name; share the Arc instead of re-allocating a String
     // for every bridged request (the closure runs concurrently across tokio workers).
     let lname = listener_name;
-    bridge::spawn_on_current_with_admission(admission, move |req, ctx: BridgeCtx| {
-        let state = holder.load_full();
+    let view = holder.into();
+    bridge::spawn_on_current_with_admission(admission, move |mut req, ctx: BridgeCtx| {
+        let state = req
+            .extensions_mut()
+            .remove::<RequestGeneration>()
+            .map(|snapshot| snapshot.0)
+            .unwrap_or_else(|| view.load_full());
         let lname = lname.clone();
         async move {
+            // H1 already calls the same helper before bridging so it can retain
+            // its historical refusal/connection semantics. H2/H3 arrive here
+            // as one lease-backed full body; a second H1 pass is a no-op after
+            // successful decoding removed Content-Encoding.
+            let req = match request_body::finish_bridged_request(
+                req,
+                &state.body_budget,
+                state.serve_config.max_req_body_size,
+                state.request_decompression,
+            )
+            .await
+            {
+                Ok(req) => req,
+                Err(status) => {
+                    return hj_core::stamp_date(
+                        http::Response::builder()
+                            .status(status)
+                            .body(hj_core::Body::Empty)
+                            .expect("static request-decompression response"),
+                    );
+                }
+            };
             // Stamp Date (insert-if-absent) on EVERY bridged response (H1/H2/H3): the uring
             // writers + native h2/h3 encoders don't add it and the cache strips the stored
             // one. Mirrors the tokio service boundary (server::stamp_date) so the two
@@ -603,7 +793,7 @@ pub(crate) fn pipeline_admission(
 /// H1/H2 paths. This is the sole production H3 transport.
 /// Must be called from within the ambient tokio runtime (the bridge receiver runs there).
 pub(crate) fn spawn_uring_h3(
-    holder: Arc<arc_swap::ArcSwap<ServerState>>,
+    holder: impl Into<ServingView>,
     listener_name: Arc<str>,
     https_addr: SocketAddr,
     workers: usize,
@@ -611,13 +801,15 @@ pub(crate) fn spawn_uring_h3(
     require_client_cert: bool,
     inherited: Option<Vec<std::net::UdpSocket>>,
     admission: bridge::BridgeAdmission,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(WorkerGroup, h3::QuicReloadHandle)> {
+    let holder = holder.into();
     let shutdown = holder.load().shutdown.clone();
     let runtime = {
         let st = holder.load();
         let active_conns = st.metrics.active_conns.clone();
         drop(st);
-        let config_holder = holder.clone();
+        let serving_view = holder.clone();
+        let config_holder = serving_view.clone();
         h3::H3RuntimeConfig::new(
             move || {
                 let state = config_holder.load();
@@ -636,9 +828,10 @@ pub(crate) fn spawn_uring_h3(
                 b.body_budget.clone()
             },
         )
+        .with_serving_view(serving_view)
     };
     let bridge = build_pipeline_bridge(holder, listener_name, admission);
-    h3::serve_h3_pipeline(
+    let group = h3::serve_h3_pipeline(
         https_addr,
         workers,
         rustls_cfg,
@@ -648,7 +841,7 @@ pub(crate) fn spawn_uring_h3(
         inherited,
         shutdown,
     )?;
-    Ok(())
+    Ok(group)
 }
 
 /// Spawn the io_uring TLS-HTTP transport on `https_addr`: one pinned-core monoio
@@ -658,8 +851,9 @@ pub(crate) fn spawn_uring_h3(
 /// pipeline bridge. mTLS (clientVerify=2) is enforced at the application layer
 /// exactly as the tokio path: a non-internal peer presenting no client cert is
 /// refused post-handshake.
+/// Returns a prepared group; call `activate` before expecting any handshake.
 pub(crate) fn spawn_uring_https(
-    holder: Arc<arc_swap::ArcSwap<ServerState>>,
+    holder: impl Into<ServingView>,
     listener_name: Arc<str>,
     https_addr: SocketAddr,
     workers: usize,
@@ -669,7 +863,8 @@ pub(crate) fn spawn_uring_https(
     inherited: Option<Vec<std::net::TcpListener>>,
     admission: bridge::BridgeAdmission,
     binding: ListenerBinding,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WorkerGroup> {
+    let holder = holder.into();
     let shutdown = holder.load().shutdown.clone();
     let active_conns = holder.load().metrics.active_conns.clone();
     let bridge = build_pipeline_bridge(holder.clone(), listener_name.clone(), admission);
@@ -681,17 +876,27 @@ pub(crate) fn spawn_uring_https(
     let listeners = uring_listeners(inherited, https_addr, workers)?;
     let worker_count = listeners.len();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let mut group = WorkerGroup::for_tcp_epoch(
+        &shutdown,
+        core.holder.trust_epoch(),
+        worker_group::TcpListenerId {
+            name: core.listener_name.clone(),
+            tls: true,
+        },
+    );
     for (core_i, std_listener) in listeners.into_iter().enumerate() {
         let core = core.clone();
-        let shutdown = shutdown.clone();
         let active_conns = active_conns.clone();
         let acceptor: monoio_rustls::TlsAcceptor = tls_config.clone().into();
         let ktls_template = ktls_template.clone();
         let ready = ready_tx.clone();
-        std::thread::Builder::new()
-            .name(format!("hj-uring-tls-{core_i}"))
-            .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
-            .spawn(move || {
+        let activation = group.activation_gate();
+        let accept_stopped = group.register_acceptor(&std_listener)?;
+        group.spawn(
+            std::thread::Builder::new()
+                .name(format!("hj-uring-tls-{core_i}"))
+                .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
+            move |shutdown| {
                 maybe_pin_core_thread(core_i, worker_count);
                 per_core_https(
                     core_i,
@@ -704,13 +909,16 @@ pub(crate) fn spawn_uring_https(
                     shutdown,
                     active_conns,
                     ready,
+                    activation,
                     binding,
+                    accept_stopped,
                 )
-            })?;
+            },
+        )?;
     }
     drop(ready_tx);
     wait_for_worker_readiness("HTTPS", worker_count, ready_rx)?;
-    Ok(())
+    Ok(group)
 }
 
 fn per_core_https(
@@ -724,7 +932,9 @@ fn per_core_https(
     shutdown: CancellationToken,
     _active_conns: Arc<std::sync::atomic::AtomicU64>,
     ready: WorkerReadyTx,
+    activation: worker_group::ActivationGate,
     binding: ListenerBinding,
+    accept_stopped: worker_group::AcceptRetirement,
 ) {
     let mut rt = match build_core_runtime() {
         Ok(runtime) => runtime,
@@ -742,10 +952,12 @@ fn per_core_https(
                 return;
             }
         };
-        let _ = ready.send(Ok(()));
+        if ready.send(Ok(())).is_err() || !activation.wait().await {
+            return;
+        }
         tracing::info!(core = core_idx, "uring tls: per-core runtime serving (H1/H2 over TLS → real pipeline)");
-        accept_drain_loop(core_idx, listener, shutdown.clone(), true, core.clone(), move |stream, peer| {
-            handle_tls_bridged(stream, peer, local, core.clone(), acceptor.clone(), require_client_cert, ktls_template.clone(), shutdown.clone(), binding)
+        accept_drain_loop(core_idx, listener, shutdown.clone(), true, core.clone(), accept_stopped, activation.raced_connections(), move |stream, peer| {
+            handle_tls_bridged(stream, peer, local, core.pin_connection(), acceptor.clone(), require_client_cert, ktls_template.clone(), shutdown.clone(), binding)
         })
         .await;
     });
@@ -894,6 +1106,7 @@ async fn handle_tls_bridged(
         local,
         proto,
         is_tls: true,
+        direct_file_egress: false,
         peer_unix: false,
         mtls_required: require_client_cert,
         sni,
@@ -931,7 +1144,19 @@ async fn handle_tls_bridged(
                                     serve_h2_bridged(ks, prefix, ctx, core, shutdown, Some(fd))
                                         .await
                                 }
-                                _ => handle_h1_bridged(ks, prefix, ctx, core, shutdown).await,
+                                _ => {
+                                    let mut ktls_ctx = ctx;
+                                    ktls_ctx.direct_file_egress = true;
+                                    handle_h1_bridged(
+                                        ks,
+                                        prefix,
+                                        ktls_ctx,
+                                        core,
+                                        shutdown,
+                                        Some(fd),
+                                    )
+                                    .await
+                                }
                             }
                             return;
                         }
@@ -962,7 +1187,7 @@ async fn handle_tls_bridged(
     );
     match proto {
         Proto::Http2 => serve_h2_bridged(stream, prefix, ctx, core, shutdown, None).await,
-        _ => handle_h1_bridged(stream, prefix, ctx, core, shutdown).await,
+        _ => handle_h1_bridged(stream, prefix, ctx, core, shutdown, None).await,
     }
 }
 
@@ -974,7 +1199,9 @@ fn per_core_bridged(
     shutdown: CancellationToken,
     _active_conns: Arc<std::sync::atomic::AtomicU64>,
     ready: WorkerReadyTx,
+    activation: worker_group::ActivationGate,
     binding: ListenerBinding,
+    accept_stopped: worker_group::AcceptRetirement,
 ) {
     let mut rt = match build_core_runtime() {
         Ok(runtime) => runtime,
@@ -992,10 +1219,12 @@ fn per_core_bridged(
                 return;
             }
         };
-        let _ = ready.send(Ok(()));
+        if ready.send(Ok(())).is_err() || !activation.wait().await {
+            return;
+        }
         tracing::info!(core = core_idx, "uring serve: per-core runtime serving (H1/h2c → real pipeline)");
-        accept_drain_loop(core_idx, listener, shutdown.clone(), false, core.clone(), move |stream, peer| {
-            handle_conn_bridged(stream, peer, local, core.clone(), shutdown.clone(), binding)
+        accept_drain_loop(core_idx, listener, shutdown.clone(), false, core.clone(), accept_stopped, activation.raced_connections(), move |stream, peer| {
+            handle_conn_bridged(stream, peer, local, core.pin_connection(), shutdown.clone(), binding, false)
         })
         .await;
     });
@@ -1019,8 +1248,13 @@ async fn handle_conn_bridged<S>(
     core: CoreHandler,
     shutdown: CancellationToken,
     binding: ListenerBinding,
+    peer_unix: bool,
 ) where
-    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
+    S: monoio::io::AsyncReadRent
+        + monoio::io::AsyncWriteRent
+        + monoio::io::Split
+        + AsRawFd
+        + 'static,
 {
     let state = core.holder.load();
     let header_read_timeout = state.serve_config.header_read_timeout;
@@ -1067,24 +1301,20 @@ async fn handle_conn_bridged<S>(
         }
     };
     if is_h2 {
-        serve_h2_bridged(
-            stream,
-            acc,
-            BridgeCtx::plain(peer, local, Proto::Http2),
-            core,
-            shutdown,
-            None,
-        )
-        .await;
+        let ctx = if peer_unix {
+            BridgeCtx::unix(local, Proto::Http2)
+        } else {
+            BridgeCtx::plain(peer, local, Proto::Http2)
+        };
+        serve_h2_bridged(stream, acc, ctx, core, shutdown, None).await;
     } else {
-        handle_h1_bridged(
-            stream,
-            acc,
-            BridgeCtx::plain(peer, local, Proto::Http1),
-            core,
-            shutdown,
-        )
-        .await;
+        let sendfile_fd = (!peer_unix).then(|| stream.as_raw_fd());
+        let ctx = if peer_unix {
+            BridgeCtx::unix(local, Proto::Http1)
+        } else {
+            BridgeCtx::plain(peer, local, Proto::Http1)
+        };
+        handle_h1_bridged(stream, acc, ctx, core, shutdown, sendfile_fd).await;
     }
 }
 
@@ -1119,13 +1349,7 @@ async fn serve_h2_bridged<S>(
     let service = move |req: hj_core::Request| {
         let core = core.clone();
         let ctx = ctx.clone();
-        async move {
-            // On-core cache-hit fast path (no bridge hop); else dispatch to the pipeline.
-            if let Some(resp) = core.fast(&ctx, &req).await {
-                return resp;
-            }
-            core.bridge.dispatch_response(req, ctx).await
-        }
+        async move { core.dispatch_h2(ctx, req).await }
     };
     // `ktls_fd` (Some only for a kTLS connection) lets the h2 flush writev plaintext directly
     // from the OutQueue to the kernel-TLS socket (zero-copy); None ⇒ the coalesce path.
@@ -1161,6 +1385,7 @@ async fn handle_h1_bridged<S>(
     ctx: BridgeCtx,
     core: CoreHandler,
     shutdown: CancellationToken,
+    sendfile_fd: Option<std::os::fd::RawFd>,
 ) where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
 {
@@ -1439,6 +1664,7 @@ async fn handle_h1_bridged<S>(
             body_lease,
             &state.body_budget,
             max_body,
+            state.request_decompression,
         ) {
             Ok(bytes) => bytes,
             Err(status) => {
@@ -1475,39 +1701,23 @@ async fn handle_h1_bridged<S>(
             req.extensions_mut().insert(upgrade);
             upgrade_ready = Some(ready);
         }
-        // On-core cache-hit fast path first (no bridge hop); else dispatch across the bridge.
-        let resp: bridge::BridgeResp = if upgrade_ready.is_none() {
-            match core.fast(&ctx, &req).await {
-                Some(r) => {
-                    let (mut p, b) = r.into_parts();
-                    // The fast path is buffered; a failed/short file read becomes a clean 502 before
-                    // any success headers are committed.
-                    let (body_bytes, truncated) = bridge::buffer_body(b).await;
-                    if truncated {
-                        bridge::bad_gateway()
-                    } else {
-                        bridge::BridgeResp {
-                            status: p.status,
-                            headers: p.headers,
-                            body: bridge::BridgeBody::Full(body_bytes),
-                            bw_rate: p
-                                .extensions
-                                .remove::<crate::pipeline::PerConnBandwidth>()
-                                .map(|b| b.0),
-                        }
-                    }
-                }
-                _ => match core.bridge.dispatch(req, ctx.clone()).await {
-                    Some(br) => br,
-                    None => return,
-                },
-            }
-        } else {
-            match core.bridge.dispatch(req, ctx.clone()).await {
-                Some(br) => br,
-                None => return,
-            }
+        #[cfg(feature = "otel")]
+        let mut trace = core.trace_request(&ctx, &mut req);
+        let dispatch = core.dispatch_h1(ctx.clone(), req, upgrade_ready.is_some());
+        #[cfg(feature = "otel")]
+        let response = match &trace {
+            Some(trace) => crate::otel::in_context(trace.context(), dispatch).await,
+            None => dispatch.await,
         };
+        #[cfg(not(feature = "otel"))]
+        let response = dispatch.await;
+        let Some(resp) = response else {
+            return;
+        };
+        #[cfg(feature = "otel")]
+        if let Some(trace) = &trace {
+            trace.response_head(resp.status);
+        }
         if resp.status == http::StatusCode::SWITCHING_PROTOCOLS {
             let Some(mut ready) = upgrade_ready else {
                 write_status_close(&mut stream, 502, "Bad Gateway").await;
@@ -1521,6 +1731,10 @@ async fn handle_h1_bridged<S>(
             let (written, _) = stream.write_all(head).await;
             if written.is_err() {
                 return;
+            }
+            #[cfg(feature = "otel")]
+            if let Some(trace) = trace.take() {
+                trace.finish("upgraded");
             }
             relay_h1_upgrade(stream, std::mem::take(&mut acc), upgrade, &shutdown).await;
             return;
@@ -1549,9 +1763,20 @@ async fn handle_h1_bridged<S>(
         if throttle.as_ref().is_none_or(|t| t.rate_bps() != want_rate) {
             throttle = hj_http::BandwidthThrottle::new(want_rate);
         }
-        let must_close =
-            write_h1_response(&mut stream, resp, is_head, keep_alive, &mut throttle).await;
-        if must_close {
+        let outcome = write_h1_response(
+            &mut stream,
+            resp,
+            is_head,
+            keep_alive,
+            &mut throttle,
+            sendfile_fd,
+        )
+        .await;
+        #[cfg(feature = "otel")]
+        if let Some(trace) = trace.take() {
+            trace.finish(if outcome.failed { "error" } else { "complete" });
+        }
+        if outcome.close {
             let _ = stream.shutdown().await;
             return;
         }
@@ -2001,17 +2226,33 @@ mod early_hints_tests {
     }
 }
 
+struct WriteOutcome {
+    close: bool,
+    #[allow(dead_code)] // observed by optional telemetry
+    failed: bool,
+}
+impl WriteOutcome {
+    fn new(failed: bool, keep_alive: bool) -> Self {
+        Self {
+            close: failed || !keep_alive,
+            failed,
+        }
+    }
+}
+
 async fn write_h1_response<S>(
     stream: &mut S,
-    resp: bridge::BridgeResp,
+    mut resp: bridge::BridgeResp,
     is_head: bool,
     keep_alive: bool,
     throttle: &mut Option<hj_http::BandwidthThrottle>,
-) -> bool
+    sendfile_fd: Option<std::os::fd::RawFd>,
+) -> WriteOutcome
 where
     S: AsyncWriteRent,
 {
-    match resp.body {
+    let completion = resp.completion.take();
+    let outcome = match resp.body {
         bridge::BridgeBody::Full(body) => {
             let head = serialize_h1_response_head(
                 resp.status,
@@ -2028,7 +2269,21 @@ where
             } else {
                 write_h1_vectored(stream, vec![bytes::Bytes::from(head), body]).await
             };
-            result.is_err() || !keep_alive
+            WriteOutcome::new(result.is_err(), keep_alive)
+        }
+        bridge::BridgeBody::File(file) => {
+            let result = write_h1_file(
+                stream,
+                resp.status,
+                &resp.headers,
+                file,
+                is_head,
+                keep_alive,
+                throttle,
+                sendfile_fd,
+            )
+            .await;
+            WriteOutcome::new(result.is_err(), keep_alive)
         }
         bridge::BridgeBody::Stream { rx, len } => {
             write_h1_stream(
@@ -2043,6 +2298,150 @@ where
             )
             .await
         }
+    };
+    if let Some(completion) = completion {
+        completion.finish(if outcome.failed {
+            hj_core::ResponseEnd::Error
+        } else {
+            hj_core::ResponseEnd::Complete
+        });
+    }
+    outcome
+}
+
+/// Send a pinned file/range over plain TCP or TLS 1.3 kTLS H1. `sendfile(2)` is attempted in
+/// bounded chunks; unsupported descriptor/filesystem combinations fall back at
+/// the exact current offset to monoio positional reads, preserving correctness
+/// even after a partial zero-copy transfer.
+async fn write_h1_file<S>(
+    stream: &mut S,
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    mut body: hj_core::FileBody,
+    is_head: bool,
+    keep_alive: bool,
+    throttle: &mut Option<hj_http::BandwidthThrottle>,
+    sendfile_fd: Option<std::os::fd::RawFd>,
+) -> io::Result<()>
+where
+    S: AsyncWriteRent,
+{
+    use std::os::fd::BorrowedFd;
+
+    let (start, len) = body.range.map_or((0, body.len), |(start, end)| {
+        (start, end.saturating_sub(start) + 1)
+    });
+    let head = serialize_h1_stream_head(status, headers, Some(len), is_head, keep_alive);
+    stream.write_all(head).await.0?;
+    if hj_core::response_body_forbidden(is_head, status) || len == 0 {
+        return Ok(());
+    }
+
+    let file = match body.file.take() {
+        Some(file) => monoio::fs::File::from_std(file)?,
+        None => monoio::fs::File::open(&body.path).await?,
+    };
+    let mut offset = start;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file range overflow"))?;
+    let mut use_sendfile = sendfile_fd.is_some_and(enable_nonblocking_sendfile);
+    const CHUNK: usize = 1024 * 1024;
+
+    while offset < end {
+        let chunk = if throttle.is_some() { 64 * 1024 } else { CHUNK };
+        let want = (end - offset).min(chunk as u64) as usize;
+        if use_sendfile {
+            let out_fd = sendfile_fd.expect("enabled sendfile has an output fd");
+            // SAFETY: the connection owns `out_fd` for this entire response and
+            // the file object owns its descriptor until the loop completes.
+            let sent = rustix::fs::sendfile(
+                unsafe { BorrowedFd::borrow_raw(out_fd) },
+                unsafe { BorrowedFd::borrow_raw(file.as_raw_fd()) },
+                Some(&mut offset),
+                want,
+            );
+            match sent {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "sendfile reached EOF before Content-Length",
+                    ));
+                }
+                Ok(written) => {
+                    observe_h1_sendfile(written);
+                    if let Some(bucket) = throttle.as_mut() {
+                        let wait = bucket.acquire(written as u64);
+                        if wait > 0 {
+                            monoio::time::sleep(std::time::Duration::from_micros(wait)).await;
+                        }
+                    }
+                    continue;
+                }
+                Err(error) if error == rustix::io::Errno::INTR => continue,
+                Err(error) if error == rustix::io::Errno::AGAIN => {
+                    monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    continue;
+                }
+                Err(
+                    rustix::io::Errno::INVAL
+                    | rustix::io::Errno::NOSYS
+                    | rustix::io::Errno::OPNOTSUPP,
+                ) => {
+                    use_sendfile = false;
+                    continue;
+                }
+                Err(error) => return Err(io::Error::from_raw_os_error(error.raw_os_error())),
+            }
+        }
+
+        let (read, buffer) = file.read_at(vec![0u8; want], offset).await;
+        let read = read?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "file reached EOF before Content-Length",
+            ));
+        }
+        if let Some(bucket) = throttle.as_mut() {
+            let wait = bucket.acquire(read as u64);
+            if wait > 0 {
+                monoio::time::sleep(std::time::Duration::from_micros(wait)).await;
+            }
+        }
+        stream
+            .write_all(bytes::Bytes::from(buffer).slice(..read))
+            .await
+            .0?;
+        offset += read as u64;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+static H1_SENDFILE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn observe_h1_sendfile(written: usize) {
+    #[cfg(test)]
+    H1_SENDFILE_BYTES.fetch_add(written as u64, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(test))]
+    let _ = written;
+}
+
+/// `sendfile(2)` itself is synchronous. Monoio may own a blocking socket fd,
+/// which would pin the entire thread-per-core worker when a client stops
+/// reading. Switch the shared file description to nonblocking before the first
+/// call; monoio's socket operations and the direct-write wrapper already
+/// support this mode.
+fn enable_nonblocking_sendfile(fd: std::os::fd::RawFd) -> bool {
+    // SAFETY: `fd` is the live connection descriptor and both fcntl operations
+    // only inspect/update its status flags.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        flags >= 0
+            && (flags & libc::O_NONBLOCK != 0
+                || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) == 0)
     }
 }
 
@@ -2088,18 +2487,18 @@ async fn write_h1_stream<S>(
     is_head: bool,
     keep_alive: bool,
     throttle: &mut Option<hj_http::BandwidthThrottle>,
-) -> bool
+) -> WriteOutcome
 where
     S: AsyncWriteRent,
 {
     let head = serialize_h1_stream_head(status, headers, len, is_head, keep_alive);
     let (wres, _h) = stream.write_all(head).await;
     if wres.is_err() {
-        return true;
+        return WriteOutcome::new(true, keep_alive);
     }
     if hj_core::response_body_forbidden(is_head, status) {
         rx.close();
-        return !keep_alive;
+        return WriteOutcome::new(false, keep_alive);
     }
     let chunked = len.is_none();
     while let Some(item) = rx.recv().await {
@@ -2131,10 +2530,10 @@ where
                     stream.write_all(b).await.0.map(|_| ())
                 };
                 if result.is_err() {
-                    return true;
+                    return WriteOutcome::new(true, keep_alive);
                 }
             }
-            Err(()) => return true, // mid-stream upstream abort → close (framing desynced)
+            Err(()) => return WriteOutcome::new(true, keep_alive), // upstream abort
         }
     }
     if chunked {
@@ -2142,10 +2541,10 @@ where
             .write_all(bytes::Bytes::from_static(b"0\r\n\r\n"))
             .await;
         if w.is_err() {
-            return true;
+            return WriteOutcome::new(true, keep_alive);
         }
     }
-    !keep_alive
+    WriteOutcome::new(false, keep_alive)
 }
 
 /// Serialize the HEAD of a STREAMED H1 response. `len: Some(n)` ⇒ `content-length: n`;
@@ -2450,6 +2849,51 @@ mod chunked_tests {
     use super::codec::*;
     use super::*;
 
+    #[test]
+    fn multishot_cancel_observes_terminal_and_cannot_touch_reused_slot() {
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let inherited = socket.try_clone().unwrap();
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(socket).unwrap();
+            let mut old = listener.accept_multi().unwrap();
+            let client = std::thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+            let accepted = old.next().await.unwrap().unwrap();
+            old.cancel();
+            monoio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(completion) = old.next().await {
+                    match completion {
+                        Ok(connection) => drop(connection),
+                        Err(error) => assert_eq!(error.raw_os_error(), Some(libc::ECANCELED)),
+                    }
+                }
+            })
+            .await
+            .expect("kernel must acknowledge multishot cancellation");
+            // A fresh op can reuse the terminal operation's slab slot. All old
+            // stream methods must remain inert rather than detach/cancel it.
+            let successor = TcpListener::from_std(inherited).unwrap();
+            let mut replacement = successor.accept_multi().unwrap();
+            assert!(old.next().await.is_none());
+            old.cancel();
+            drop(old);
+            drop(listener);
+            let next = std::thread::spawn(move || std::net::TcpStream::connect(address).unwrap());
+            let connection =
+                monoio::time::timeout(std::time::Duration::from_secs(2), replacement.next())
+                    .await
+                    .expect("old stream must not cancel replacement")
+                    .unwrap()
+                    .unwrap();
+            drop(connection);
+            drop(accepted);
+            drop(client.join().unwrap());
+            drop(next.join().unwrap());
+        });
+    }
+
     /// (#334) The monoio-fork multishot accept: one armed SQE yields every
     /// inbound connection; peer addrs come from getpeername (multishot CQEs
     /// carry no sockaddr); dropping the stream cancels the armed SQE without
@@ -2639,10 +3083,198 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             runtime,
             CoreHandler {
                 bridge,
-                holder,
+                holder: ServingView::new(holder),
                 listener_name: Arc::from("test"),
             },
         )
+    }
+
+    #[cfg(feature = "ktls")]
+    fn ktls_file_test_core(
+        root: &std::path::Path,
+        source: std::path::PathBuf,
+        source_len: u64,
+        completion: Option<std::sync::mpsc::Sender<hj_core::ResponseEnd>>,
+    ) -> (
+        tokio::runtime::Runtime,
+        CoreHandler,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = runtime.block_on(async {
+            std::fs::create_dir_all(root.join("logs")).unwrap();
+            let mut config = hj_core::config::ServerConfig::default();
+            config.server_root = root.to_path_buf();
+            config.tuning.max_keep_alive_req = 4;
+            crate::state::ServerState::new(
+                Arc::new(config),
+                None,
+                None,
+                None,
+                Arc::new(hj_compress::PageDictRegistry::empty()),
+                1,
+                crate::state::XfCapsuleConfig::disabled(),
+                None,
+                false,
+                None,
+                false,
+                crate::state::RewriteTuning::default(),
+            )
+            .unwrap()
+        });
+        let observed_direct = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_in_handler = observed_direct.clone();
+        let bridge = bridge::spawn_bridge(1, move |req: hj_core::Request, ctx| {
+            let source = source.clone();
+            let completion = completion.clone();
+            observed_in_handler.store(ctx.direct_file_egress, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if req.uri().path() == "/short" {
+                    return http::Response::new(hj_core::Body::Full(bytes::Bytes::from_static(
+                        b"short-after-key-update",
+                    )));
+                }
+                let is_range = req.uri().path() == "/range";
+                let mut response = http::Response::builder()
+                    .status(if is_range {
+                        http::StatusCode::PARTIAL_CONTENT
+                    } else {
+                        http::StatusCode::OK
+                    })
+                    .body(hj_core::Body::File(hj_core::FileBody {
+                        path: source.clone(),
+                        file: Some(std::fs::File::open(&source).unwrap()),
+                        len: source_len,
+                        range: is_range.then_some((117, source_len - 219)),
+                        cached: None,
+                    }))
+                    .unwrap();
+                // Keep the transfer live long enough for the client to inject a
+                // KeyUpdate while sendfile owns the response write side.
+                response
+                    .extensions_mut()
+                    .insert(crate::pipeline::PerConnBandwidth(2 * 1024 * 1024));
+                if let Some(completion) = completion {
+                    response
+                        .extensions_mut()
+                        .insert(hj_core::ResponseCompletion::new(move |end| {
+                            let _ = completion.send(end);
+                        }));
+                }
+                response
+            }
+        })
+        .unwrap();
+        let holder = Arc::new(arc_swap::ArcSwap::from(state));
+        (
+            runtime,
+            CoreHandler {
+                bridge,
+                holder: ServingView::new(holder),
+                listener_name: Arc::from("test"),
+            },
+            observed_direct,
+        )
+    }
+
+    #[cfg(feature = "ktls")]
+    fn ktls_test_configs(
+        root: &std::path::Path,
+    ) -> (
+        rustls::pki_types::CertificateDer<'static>,
+        monoio_rustls::TlsAcceptor,
+        Arc<hj_tls::KtlsConfigTemplate>,
+    ) {
+        hj_tls::install_crypto_provider().unwrap();
+        let signed = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certificate = signed.cert.der().clone();
+        let cert_file = root.join("cert.pem");
+        let key_file = root.join("key.pem");
+        std::fs::write(&cert_file, signed.cert.pem()).unwrap();
+        std::fs::write(&key_file, signed.signing_key.serialize_pem()).unwrap();
+        let listener = hj_core::config::Listener {
+            name: "test-tls".into(),
+            address: "127.0.0.1:0".into(),
+            secure: true,
+            vhost_map: Vec::new(),
+            tls: Some(hj_core::config::ListenerTls {
+                key_file,
+                cert_file,
+                cert_chain: false,
+                ca_cert_file: None,
+                client_verify: 0,
+                verify_depth: 1,
+                enable_stapling: false,
+                crl_file: None,
+            }),
+            uds_path: None,
+            proxy_protocol: false,
+        };
+        let mut server = hj_core::config::ServerConfig::default();
+        server.server_root = root.to_path_buf();
+        let bundle =
+            hj_tls::PreparedListenerTls::prepare(&server, &listener, false, false, true).unwrap();
+        (
+            certificate,
+            monoio_rustls::TlsAcceptor::from(bundle.tcp),
+            Arc::new(bundle.ktls.unwrap()),
+        )
+    }
+
+    #[cfg(feature = "ktls")]
+    fn ktls_test_client(
+        address: SocketAddr,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+    ) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+        ktls_test_client_version(address, certificate, true)
+    }
+
+    #[cfg(feature = "ktls")]
+    fn ktls_test_client_version(
+        address: SocketAddr,
+        certificate: rustls::pki_types::CertificateDer<'static>,
+        tls13: bool,
+    ) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let versions = if tls13 {
+            &[&rustls::version::TLS13][..]
+        } else {
+            &[&rustls::version::TLS12][..]
+        };
+        let mut config = rustls::ClientConfig::builder_with_protocol_versions(versions)
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let socket = std::net::TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(std::time::Duration::from_secs(15)))
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost")
+            .unwrap()
+            .to_owned();
+        let connection = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        rustls::StreamOwned::new(connection, socket)
+    }
+
+    #[cfg(feature = "ktls")]
+    fn h1_content_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+            })
+            .expect("response content-length")
     }
 
     fn read_h1_head(reader: &mut impl std::io::Read) -> Vec<u8> {
@@ -3090,6 +3722,17 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         response: bridge::BridgeResp,
         throttle: &mut Option<hj_http::BandwidthThrottle>,
     ) -> Vec<u8> {
+        let (wire, failed) = capture_h1_response_options(response, throttle, false, false);
+        assert!(!failed);
+        wire
+    }
+
+    fn capture_h1_response_options(
+        response: bridge::BridgeResp,
+        throttle: &mut Option<hj_http::BandwidthThrottle>,
+        is_head: bool,
+        use_sendfile: bool,
+    ) -> (Vec<u8>, bool) {
         use std::io::Read;
 
         let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -3105,13 +3748,168 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             wire
         });
         let mut runtime = build_core_runtime().unwrap();
-        runtime.block_on(async move {
+        let failed = runtime.block_on(async move {
             let listener = TcpListener::from_std(std_listener).unwrap();
             let (mut stream, _) = listener.accept().await.unwrap();
-            assert!(write_h1_response(&mut stream, response, false, false, throttle).await);
+            let sendfile_fd = use_sendfile.then(|| stream.as_raw_fd());
+            let result =
+                write_h1_response(&mut stream, response, is_head, false, throttle, sendfile_fd)
+                    .await;
+            assert!(result.close);
             let _ = stream.shutdown().await;
+            result.failed
         });
-        client.join().unwrap()
+        (client.join().unwrap(), failed)
+    }
+
+    #[test]
+    fn plaintext_h1_sendfile_preserves_large_range_and_content_length() {
+        use std::sync::atomic::Ordering;
+
+        let sendfile_before = H1_SENDFILE_BYTES.load(Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "httpjet-sendfile-range-{}-{}.bin",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let bytes: Vec<u8> = (0..(2 * 1024 * 1024 + 333))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let start = 117u64;
+        let end = bytes.len() as u64 - 219;
+        let response = bridge::BridgeResp {
+            completion: None,
+            status: http::StatusCode::PARTIAL_CONTENT,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::File(hj_core::FileBody {
+                path: path.clone(),
+                file: Some(std::fs::File::open(&path).unwrap()),
+                len: bytes.len() as u64,
+                range: Some((start, end)),
+                cached: None,
+            }),
+            bw_rate: None,
+        };
+        let (wire, failed) = capture_h1_response_options(response, &mut None, false, true);
+        assert!(!failed);
+        let split = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&wire[..split]).to_ascii_lowercase();
+        let expected = (end - start + 1) as usize;
+        assert!(head.contains(&format!("content-length: {expected}\r\n")));
+        assert_eq!(&wire[split..], &bytes[start as usize..=end as usize]);
+        assert!(
+            H1_SENDFILE_BYTES
+                .load(Ordering::Relaxed)
+                .saturating_sub(sendfile_before)
+                >= expected as u64,
+            "the selected range must traverse sendfile"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plaintext_h1_file_short_read_fails_closed_after_partial_body() {
+        let path =
+            std::env::temp_dir().join(format!("httpjet-sendfile-short-{}.bin", std::process::id()));
+        std::fs::write(&path, b"short").unwrap();
+        let response = bridge::BridgeResp {
+            completion: None,
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::File(hj_core::FileBody {
+                path: path.clone(),
+                file: Some(std::fs::File::open(&path).unwrap()),
+                len: 100,
+                range: None,
+                cached: None,
+            }),
+            bw_rate: None,
+        };
+        let (wire, failed) = capture_h1_response_options(response, &mut None, false, true);
+        assert!(failed, "short source must close the connection as an error");
+        assert!(wire.ends_with(b"short"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plaintext_h1_sendfile_client_abort_is_an_error() {
+        use std::io::Read;
+
+        let path =
+            std::env::temp_dir().join(format!("httpjet-sendfile-abort-{}.bin", std::process::id()));
+        let source = std::fs::File::create(&path).unwrap();
+        source.set_len(32 * 1024 * 1024).unwrap();
+        drop(source);
+        let response = bridge::BridgeResp {
+            completion: None,
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::File(hj_core::FileBody {
+                path: path.clone(),
+                file: Some(std::fs::File::open(&path).unwrap()),
+                len: 32 * 1024 * 1024,
+                range: None,
+                cached: None,
+            }),
+            bw_rate: None,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut socket = std::net::TcpStream::connect(address).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            drop(socket);
+        });
+        let mut runtime = build_core_runtime().unwrap();
+        let failed = runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let fd = socket.as_raw_fd();
+            let outcome =
+                write_h1_response(&mut socket, response, false, false, &mut None, Some(fd)).await;
+            outcome.failed
+        });
+        client.join().unwrap();
+        assert!(
+            failed,
+            "a peer abort must not complete a partial file response"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn plaintext_h1_head_never_sends_file_bytes() {
+        let path =
+            std::env::temp_dir().join(format!("httpjet-sendfile-head-{}.bin", std::process::id()));
+        std::fs::write(&path, b"body-must-not-appear").unwrap();
+        let response = bridge::BridgeResp {
+            completion: None,
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::File(hj_core::FileBody {
+                path: path.clone(),
+                file: Some(std::fs::File::open(&path).unwrap()),
+                len: 20,
+                range: None,
+                cached: None,
+            }),
+            bw_rate: None,
+        };
+        let (wire, failed) = capture_h1_response_options(response, &mut None, true, true);
+        assert!(!failed);
+        assert!(wire.ends_with(b"\r\n\r\n"));
+        assert!(!wire.windows(4).any(|w| w == b"body"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3122,6 +3920,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let body = bytes::Bytes::from(vec![b'x'; 512 * 1024]);
         let tail = body.slice(body.len() - 16..);
         let response = bridge::BridgeResp {
+            completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Full(body),
@@ -3149,6 +3948,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         let body = bytes::Bytes::from(vec![b'y'; 512 * 1024]);
         let tail = body.slice(body.len() - 16..);
         let response = bridge::BridgeResp {
+            completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Full(body),
@@ -3166,6 +3966,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
     #[test]
     fn full_and_stream_writers_discard_forbidden_response_bodies() {
         let full = capture_h1_response(bridge::BridgeResp {
+            completion: None,
             status: http::StatusCode::NO_CONTENT,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Full(bytes::Bytes::from_static(b"full-sentinel")),
@@ -3176,6 +3977,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         tx.try_send(Ok(bytes::Bytes::from_static(b"stream-sentinel")))
             .unwrap();
         let streamed = capture_h1_response(bridge::BridgeResp {
+            completion: None,
             status: http::StatusCode::NO_CONTENT,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Stream { rx, len: Some(15) },
@@ -3200,6 +4002,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .unwrap();
         drop(tx);
         let wire = capture_h1_response(bridge::BridgeResp {
+            completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
             body: bridge::BridgeBody::Stream { rx, len: None },
@@ -3276,6 +4079,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 BridgeCtx::plain(peer, local, Proto::Http1),
                 core,
                 CancellationToken::new(),
+                None,
             )
             .await;
         });
@@ -3341,6 +4145,266 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
         client.join().unwrap();
     }
 
+    #[cfg(feature = "ktls")]
+    #[test]
+    fn ktls_h1_sendfile_preserves_range_across_mid_transfer_key_update() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let sendfile_before = H1_SENDFILE_BYTES.load(Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "httpjet-ktls-sendfile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("large.bin");
+        let bytes: Vec<u8> = (0..(4 * 1024 * 1024 + 333))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let source_len = bytes.len() as u64;
+        let start = 117usize;
+        let end = source_len as usize - 219;
+        let expected = bytes[start..=end].to_vec();
+        let expected_len = expected.len();
+        let (tokio_runtime, core, observed_direct) =
+            ktls_file_test_core(&root, source, source_len, None);
+        let (certificate, acceptor, template) = ktls_test_configs(&root);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = ktls_test_client(local, certificate);
+            stream
+                .write_all(
+                    b"GET /range HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            let head = read_h1_head(&mut stream);
+            let head_text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            assert!(head_text.starts_with("http/1.1 206 partial content\r\n"));
+            assert_eq!(h1_content_length(&head), expected.len());
+            assert_eq!(
+                stream.conn.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_3)
+            );
+
+            let split = 128 * 1024;
+            let mut received = vec![0u8; expected.len()];
+            stream.read_exact(&mut received[..split]).unwrap();
+            assert_eq!(&received[..split], &expected[..split]);
+
+            // Queue UpdateRequested plus the next pipelined request while the
+            // throttled response still owns the server's sendfile loop. H1's
+            // single-task ordering fences the TX transfer: the server consumes
+            // and applies the KeyUpdate before writing the following response.
+            stream.conn.refresh_traffic_keys().unwrap();
+            stream
+                .write_all(b"GET /short HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            stream.read_exact(&mut received[split..]).unwrap();
+            assert_eq!(received, expected);
+
+            let second_head = read_h1_head(&mut stream);
+            let second_len = h1_content_length(&second_head);
+            let mut second = vec![0u8; second_len];
+            stream.read_exact(&mut second).unwrap();
+            assert_eq!(&second, b"short-after-key-update");
+        });
+
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tls_bridged(
+                stream,
+                peer,
+                local,
+                core,
+                acceptor,
+                false,
+                Some(template),
+                CancellationToken::new(),
+                ListenerBinding::default(),
+            )
+            .await;
+        });
+        client.join().unwrap();
+        assert!(
+            H1_SENDFILE_BYTES
+                .load(Ordering::Relaxed)
+                .saturating_sub(sendfile_before)
+                >= expected_len as u64,
+            "the TLS 1.3 kTLS range must traverse sendfile"
+        );
+        assert!(observed_direct.load(Ordering::Relaxed));
+        drop(runtime);
+        drop(tokio_runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "ktls")]
+    #[test]
+    fn ktls_h1_sendfile_client_abort_reports_transport_error() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+
+        let root = std::env::temp_dir().join(format!(
+            "httpjet-ktls-abort-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("abort.bin");
+        let file = std::fs::File::create(&source).unwrap();
+        file.set_len(32 * 1024 * 1024).unwrap();
+        drop(file);
+        let (completion_tx, completion_rx) = std::sync::mpsc::channel();
+        let (tokio_runtime, core, observed_direct) =
+            ktls_file_test_core(&root, source, 32 * 1024 * 1024, Some(completion_tx));
+        let (certificate, acceptor, template) = ktls_test_configs(&root);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = ktls_test_client(local, certificate);
+            stream
+                .write_all(b"GET /abort HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            let _ = read_h1_head(&mut stream);
+            let mut first = [0u8; 1];
+            stream.read_exact(&mut first).unwrap();
+            let reset = libc::linger {
+                l_onoff: 1,
+                l_linger: 0,
+            };
+            // SAFETY: the option buffer is valid for this synchronous call and
+            // the client owns the socket until the StreamOwned is dropped.
+            let result = unsafe {
+                libc::setsockopt(
+                    stream.sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_LINGER,
+                    (&reset as *const libc::linger).cast(),
+                    std::mem::size_of_val(&reset) as libc::socklen_t,
+                )
+            };
+            assert_eq!(result, 0);
+            drop(stream);
+        });
+
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tls_bridged(
+                stream,
+                peer,
+                local,
+                core,
+                acceptor,
+                false,
+                Some(template),
+                CancellationToken::new(),
+                ListenerBinding::default(),
+            )
+            .await;
+        });
+        client.join().unwrap();
+        assert_eq!(
+            completion_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            hj_core::ResponseEnd::Error
+        );
+        assert!(observed_direct.load(std::sync::atomic::Ordering::Relaxed));
+        drop(runtime);
+        drop(tokio_runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "ktls")]
+    #[test]
+    fn ktls_policy_tls12_connection_keeps_userspace_file_streaming() {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let root = std::env::temp_dir().join(format!(
+            "httpjet-ktls-tls12-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("tls12.bin");
+        let bytes: Vec<u8> = (0..(512 * 1024 + 17))
+            .map(|index| (index % 239) as u8)
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+        let source_len = bytes.len() as u64;
+        let expected = bytes[117..=source_len as usize - 219].to_vec();
+        let (tokio_runtime, core, observed_direct) =
+            ktls_file_test_core(&root, source, source_len, None);
+        let (certificate, acceptor, template) = ktls_test_configs(&root);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = ktls_test_client_version(local, certificate, false);
+            stream
+                .write_all(b"GET /range HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            let head = read_h1_head(&mut stream);
+            assert_eq!(h1_content_length(&head), expected.len());
+            assert_eq!(
+                stream.conn.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_2)
+            );
+            let mut body = vec![0u8; expected.len()];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(body, expected);
+        });
+
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tls_bridged(
+                stream,
+                peer,
+                local,
+                core,
+                acceptor,
+                false,
+                Some(template),
+                CancellationToken::new(),
+                ListenerBinding::default(),
+            )
+            .await;
+        });
+        client.join().unwrap();
+        assert!(
+            !observed_direct.load(Ordering::Relaxed),
+            "TLS 1.2 must retain the userspace streaming path"
+        );
+        drop(runtime);
+        drop(tokio_runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn h1_websocket_non_switching_response_uses_normal_framing() {
         let (_tokio_runtime, core) = websocket_test_core();
@@ -3376,6 +4440,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 BridgeCtx::plain(peer, local, Proto::Http1),
                 core,
                 CancellationToken::new(),
+                None,
             )
             .await;
         });
@@ -3526,13 +4591,20 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
 /// fabricated loopback peer (the socket file's mode/owner is the real access
 /// boundary). AF_UNIX has no SO_REUSEPORT, so the listener runs on ONE core —
 /// sized for the few on-box peers a UDS listener serves.
+/// Returns a prepared group; call `activate` to begin accepting requests.
+pub(crate) enum UdsListenerInput {
+    Inherited(std::os::unix::net::UnixListener),
+    Handoff(worker_group::PreparedUdsHandoff),
+}
+
 pub(crate) fn spawn_uring_uds(
-    holder: Arc<arc_swap::ArcSwap<ServerState>>,
+    holder: impl Into<ServingView>,
     listener_name: Arc<str>,
     path: std::path::PathBuf,
-    inherited: Option<std::os::unix::net::UnixListener>,
+    input: Option<UdsListenerInput>,
     admission: bridge::BridgeAdmission,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<WorkerGroup> {
+    let holder = holder.into();
     let shutdown = holder.load().shutdown.clone();
     let bridge = build_pipeline_bridge(holder.clone(), listener_name.clone(), admission);
     let core = CoreHandler {
@@ -3540,28 +4612,56 @@ pub(crate) fn spawn_uring_uds(
         holder,
         listener_name,
     };
-    let inherited = inherited.map(|l| {
-        let _ = l.set_nonblocking(true);
-        l
-    });
+    let (listener, path_owner, predecessor) = match input {
+        Some(UdsListenerInput::Inherited(listener)) => (listener, None, None),
+        Some(UdsListenerInput::Handoff(prepared)) => {
+            let (listener, predecessor, owner) = prepared.into_parts();
+            (listener, owner, Some(predecessor))
+        }
+        None => {
+            let (listener, owner) = unix_path::OwnedUnixPath::bind(&path)?;
+            (listener, Some(Arc::new(owner)), None)
+        }
+    };
+    listener.set_nonblocking(true)?;
+    let listener = Arc::new(listener);
+    let thread_listener = listener.try_clone()?;
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("hj-uring-uds".into())
-        .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
-        .spawn(move || {
+    let mut group = WorkerGroup::for_uds_epoch(&shutdown, core.holder.trust_epoch(), path.clone());
+    let retirement = group.register_uds_acceptor(listener, path_owner)?;
+    if let Some(predecessor) = predecessor {
+        group.follow_uds_acceptor(predecessor)?;
+    }
+    let activation = group.activation_gate();
+    group.spawn(
+        std::thread::Builder::new()
+            .name("hj-uring-uds".into())
+            .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
+        move |shutdown| {
             maybe_pin_core_thread(0, 1);
-            per_core_uds(core, path, inherited, shutdown, ready_tx)
-        })?;
+            per_core_uds(
+                core,
+                path,
+                thread_listener,
+                shutdown,
+                ready_tx,
+                activation,
+                retirement,
+            )
+        },
+    )?;
     wait_for_worker_readiness("UDS", 1, ready_rx)?;
-    Ok(())
+    Ok(group)
 }
 
 fn per_core_uds(
     core: CoreHandler,
     path: std::path::PathBuf,
-    inherited: Option<std::os::unix::net::UnixListener>,
+    listener: std::os::unix::net::UnixListener,
     shutdown: CancellationToken,
     ready: WorkerReadyTx,
+    activation: worker_group::ActivationGate,
+    mut retirement: worker_group::UdsAcceptRetirement,
 ) {
     let mut rt = match build_core_runtime() {
         Ok(rt) => rt,
@@ -3571,49 +4671,20 @@ fn per_core_uds(
         }
     };
     rt.block_on(async move {
-        let listener = match inherited {
-            Some(l) => match monoio::net::UnixListener::from_std(l) {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = ready.send(Err(format!("adopt unix listener: {e}")));
-                    return;
-                }
-            },
-            None => {
-                // Stale socket file (crashed previous run): connect proves it is
-                // dead before the unlink.
-                if path.exists()
-                    && std::os::unix::net::UnixStream::connect(&path).is_err()
-                    && std::fs::remove_file(&path).is_err()
-                {
-                    let _ = ready.send(Err(format!(
-                        "stale unix socket {} could not be removed",
-                        path.display()
-                    )));
-                    return;
-                }
-                // SO_REUSEPORT (monoio's bind default) is unsupported on
-                // AF_UNIX — opt out explicitly.
-                let mut opts = monoio::net::ListenerOpts::default();
-                opts.reuse_port = false;
-                match monoio::net::UnixListener::bind_with_config(&path, &opts) {
-                    Ok(l) => {
-                        // Group-writable so local services in the run group can
-                        // dial; ownership is the unit's job (User=/Group=).
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
-                        l
-                    }
-                    Err(e) => {
-                        let _ = ready.send(Err(format!("bind unix listener: {e}")));
-                        return;
-                    }
-                }
+        let listener = match monoio::net::UnixListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                retirement.cancel();
+                let _ = ready.send(Err(format!("adopt unix listener: {error}")));
+                return;
             }
         };
-        let _ = ready.send(Ok(()));
+        if ready.send(Ok(())).is_err() || !activation.wait().await {
+            retirement.cancel();
+            return;
+        }
         tracing::info!(path = %path.display(), "uring UDS listener serving (H1/h2c → real pipeline, one core)");
-        accept_drain_loop_unix(listener, shutdown, core).await;
+        accept_drain_loop_unix(listener, shutdown, core, &mut retirement).await;
     });
 }
 
@@ -3623,6 +4694,7 @@ async fn accept_drain_loop_unix(
     listener: monoio::net::UnixListener,
     shutdown: CancellationToken,
     core: CoreHandler,
+    retirement: &mut worker_group::UdsAcceptRetirement,
 ) {
     use std::cell::Cell;
     use std::rc::Rc;
@@ -3667,9 +4739,10 @@ async fn accept_drain_loop_unix(
                             stream,
                             peer,
                             local,
-                            core.clone(),
+                            core.pin_connection(),
                             shutdown.clone(),
                             ListenerBinding::default(),
+                            true,
                         );
                         let cnt = inflight.clone();
                         cnt.set(cnt.get() + 1);
@@ -3685,6 +4758,9 @@ async fn accept_drain_loop_unix(
             }
         }
     }
+    // Release the successor as soon as this accept loop is quiescent; existing
+    // connections drain independently on the retiring generation.
+    retirement.cancel();
     let start = std::time::Instant::now();
     while inflight.get() > 0 && start.elapsed() < URING_DRAIN_GRACE {
         monoio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3706,6 +4782,25 @@ mod uds_tests {
     /// knowledge. The access log must render the fabricated peer as `unix:`.
     #[test]
     fn uds_listener_serves_h1_and_h2c_with_unix_peer() {
+        uds_listener_lifecycle(false, true);
+    }
+
+    #[test]
+    fn inherited_uds_listener_retirement_preserves_manager_path() {
+        uds_listener_lifecycle(true, true);
+    }
+
+    #[test]
+    fn prepared_uds_rollback_never_serves_and_removes_owned_path() {
+        uds_listener_lifecycle(false, false);
+    }
+
+    #[test]
+    fn prepared_inherited_uds_rollback_preserves_manager_path() {
+        uds_listener_lifecycle(true, false);
+    }
+
+    fn uds_listener_lifecycle(inherit: bool, activate: bool) {
         use std::io::{Read, Write};
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -3722,6 +4817,8 @@ mod uds_tests {
         std::fs::create_dir_all(&doc_root).unwrap();
         std::fs::write(doc_root.join("index.html"), b"<html>uds ok</html>").unwrap();
         let sock_path = dir.join("http.sock");
+        let inherited =
+            inherit.then(|| std::os::unix::net::UnixListener::bind(&sock_path).unwrap());
 
         // Minimal real ServerState (mirror of the e2e/smoke constructions).
         let mut by_suffix = std::collections::BTreeMap::new();
@@ -3783,7 +4880,7 @@ mod uds_tests {
             .enable_all()
             .build()
             .unwrap();
-        rt.block_on(async {
+        let workers = rt.block_on(async {
             let state = crate::state::ServerState::new(
                 Arc::new(server),
                 None,
@@ -3805,10 +4902,10 @@ mod uds_tests {
                 holder.clone(),
                 Arc::from("uds-test"),
                 sock_path.clone(),
-                None,
+                inherited.map(UdsListenerInput::Inherited),
                 admission,
             )
-            .expect("UDS listener spawns");
+            .expect("UDS listener spawns")
         });
 
         // Wait for the socket file, then serve an H1 request.
@@ -3822,6 +4919,30 @@ mod uds_tests {
         client
             .write_all(b"GET /index.html HTTP/1.1\r\nHost: uds.test\r\nConnection: close\r\n\r\n")
             .unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let mut probe = [0u8; 1];
+        let error = client
+            .read(&mut probe)
+            .expect_err("prepared listener must not respond");
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        if !activate {
+            drop(workers);
+            match client.read(&mut probe) {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("rolled-back listener retained queued connection: {other:?}"),
+            }
+            assert_eq!(sock_path.exists(), inherit);
+            drop(client);
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        workers.activate();
         let mut buf = String::new();
         let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
         let _ = client.read_to_string(&mut buf);
@@ -3843,6 +4964,14 @@ mod uds_tests {
         }
         let _ = AtomicU64::new(0).load(Ordering::Relaxed);
 
+        drop(client);
+        drop(workers);
+        assert!(std::os::unix::net::UnixStream::connect(&sock_path).is_err());
+        assert_eq!(
+            sock_path.exists(),
+            inherit,
+            "only self-owned paths are removed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

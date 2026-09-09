@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<httpServerConfig>
+  <serverName>example.test</serverName>
+  <user>httpjet</user>
+  <group>httpjet</group>
+  <indexFiles>index.html</indexFiles>
+
+  <tuning>
+    <maxConnections>256</maxConnections>
+    <keepAliveTimeout>5</keepAliveTimeout>
+    <maxKeepAliveReq>100</maxKeepAliveReq>
+  </tuning>
+
+  <quic>
+    <quicEnable>1</quicEnable>
+  </quic>
+
+  <virtualHostList>
+    <virtualHost>
+      <name>example.test</name>
+      <vhRoot>$SERVER_ROOT/example</vhRoot>
+      <configFile>$SERVER_ROOT/conf/vhosts/example.test.xml</configFile>
+      <allowSymbolLink>0</allowSymbolLink>
+      <enableScript>0</enableScript>
+    </virtualHost>
+  </virtualHostList>
+
+  <listenerList>
+    <listener>
+      <name>http</name>
+      <address>0.0.0.0:8080</address>
+      <secure>0</secure>
+      <vhostMapList>
+        <vhostMap>
+          <vhost>example.test</vhost>
+          <domain>example.test,www.example.test</domain>
+        </vhostMap>
+      </vhostMapList>
+    </listener>
+    <listener>
+      <name>https</name>
+      <address>0.0.0.0:8443</address>
+      <secure>1</secure>
+      <keyFile>/run/httpjet-certs/tls.key</keyFile>
+      <certFile>/run/httpjet-certs/tls.crt</certFile>
+      <clientVerify>0</clientVerify>
+      <vhostMapList>
+        <vhostMap>
+          <vhost>example.test</vhost>
+          <domain>example.test,www.example.test</domain>
+        </vhostMap>
+      </vhostMapList>
+    </listener>
+  </listenerList>
+</httpServerConfig>

@@ -4,6 +4,7 @@
 
 pub mod body;
 pub mod budget;
+pub mod completion;
 pub mod context;
 pub mod handler;
 pub mod http_util;
@@ -12,6 +13,7 @@ pub mod reqid;
 pub mod router;
 
 pub use body::{Body, BoxError, CountingBody, FileBody, IncomingBody, StreamBody, empty_incoming};
+pub use completion::{ResponseCompletion, ResponseEnd};
 pub use context::{ClientCert, Proto, RedirectGuard, ReqCtx, TlsParams};
 pub use handler::{Handler, HandlerError, Request, Response, ResponseTransform, text_response};
 pub use http_util::{

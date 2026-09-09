@@ -1,6 +1,6 @@
 //! Kernel-TLS (kTLS) for the monoio io_uring TLS path, **with TLS 1.3 KeyUpdate
 //! handling** so it survives a mid-stream rekey instead of dropping the connection.
-//! Compiled only with `--features ktls`, activated only by `--ktls` (OFF by default).
+//! Compiled only with `--features ktls`; runtime policy is `--ktls=auto|on|off`.
 //!
 //! Flow: a per-connection [`hj_tls`] `KeyLog` captures this connection's raw TLS 1.3
 //! traffic secrets during the handshake (rustls only surfaces them via `KeyLog`, and
@@ -9,9 +9,11 @@
 //! generation). After the handshake we derive the AEAD key/iv from each secret
 //! (HKDF-Expand-Label, RFC 8446 §7.1, via aws-lc-rs — already the rustls provider),
 //! program the kernel socket (`TCP_ULP=tls` + `TLS_TX`/`TLS_RX`), and serve H1/H2 as
-//! plaintext over the raw fd (kernel encrypt/decrypt) — killing the userspace AEAD +
-//! copy on large-body egress. The drained post-handshake plaintext is handed to the
-//! serve loop as a prefix, so the kernel RX resumes at the correct record sequence.
+//! plaintext over the raw fd (kernel encrypt/decrypt). H1 file bodies additionally use
+//! `sendfile(2)`, so a NIC with TLS TX offload can consume the pinned page-cache/static
+//! file range without copying it through userspace. The drained post-handshake
+//! plaintext is handed to the serve loop as a prefix, so the kernel RX resumes at the
+//! correct record sequence.
 //!
 //! **KeyUpdate:** the kernel surfaces a post-handshake non-application-data record as a
 //! `recvmsg` control message that a plain read returns as `EIO`. [`KtlsStream`] catches

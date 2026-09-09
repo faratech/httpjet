@@ -343,6 +343,13 @@ pub struct AcceptMultiStream {
 
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 impl AcceptMultiStream {
+    /// Stop accepting without discarding queued accepted connections. Continue
+    /// calling `next` until it returns `None` to observe kernel termination.
+    /// The terminal cancellation error is yielded like any other completion.
+    pub fn cancel(&mut self) {
+        self.op.cancel();
+    }
+
     pub async fn next(&mut self) -> Option<io::Result<TcpStream>> {
         let meta = std::future::poll_fn(|cx| self.op.poll_next_completion(cx)).await?;
         Some(match meta.result {

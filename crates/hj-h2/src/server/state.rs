@@ -135,6 +135,7 @@ pub(super) struct StreamState {
 /// In-memory bodies (`Full` / `File`) seed `pending` and finish in one pass; streaming
 /// bodies (`Stream` — LSAPI / proxy / SSE) pull chunks asynchronously into `pending`.
 pub(super) struct OutStream {
+    pub(super) completion: Option<hj_core::ResponseCompletion>,
     /// Bytes pulled but not yet sent (the window-blocked remainder of the current chunk).
     pub(super) pending: Bytes,
     /// The streaming source while it is "at home" (not currently being pulled). `None`

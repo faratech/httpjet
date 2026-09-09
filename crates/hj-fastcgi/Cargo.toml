@@ -1,0 +1,19 @@
+[package]
+name = "hj-fastcgi"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hj-core = { workspace = true }
+hj-lsapi = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true, features = ["channel"] }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

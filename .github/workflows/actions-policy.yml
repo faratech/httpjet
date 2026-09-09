@@ -9,8 +9,6 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/dependabot.yml'
-  schedule:
-    - cron: '53 4 * * 1'
   workflow_dispatch:
 
 permissions:

@@ -62,6 +62,9 @@
 //! * [`build_certified_key`] — assemble a [`CertifiedKey`] from cert + key files.
 //! * [`build_sni_resolver`] — build the per-listener SNI resolver.
 
+#[cfg(feature = "ocsp")]
+pub mod ocsp;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -106,17 +109,32 @@ pub(crate) const ALPN_PROTOCOLS: &[&[u8]] = &[b"h2", b"http/1.1"];
 /// [`CertifiedKey`] regardless of the cert's SAN/CN. Lookup and insertion keys
 /// are ASCII-lowercased, mirroring OLS `getLcaseServerName`/`strnlower`
 /// (rustls also hands us an already-lowercased servername).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct SniCertMap {
     by_name: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    #[cfg(feature = "ocsp")]
+    stapling: Option<Arc<ocsp::Slots>>,
 }
 
 impl SniCertMap {
+    /// Managed wildcard certificates match exactly one leftmost DNS label.
+    /// Keep legacy file-based SNI behavior separate and unchanged.
+    fn resolve_managed_name(
+        &self,
+        name: Option<&str>,
+        schemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        if self.by_name.is_empty() {
+            return None;
+        }
+        self.resolve_name(name, schemes).or_else(|| {
+            let (_, suffix) = name?.split_once('.')?;
+            self.resolve_name(Some(&format!("*.{suffix}")), schemes)
+        })
+    }
     /// Create an empty map.
     pub(crate) fn new() -> Self {
-        Self {
-            by_name: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Register `name` → `ck`. Unlike rustls's resolver this performs **no**
@@ -183,10 +201,12 @@ impl SniCertMap {
 /// explicitly mapped to a vhost cert (including raw-IP TLS with no SNI). This
 /// matches OLS `VHostMapFindSslContext`, which falls back to the listener-level
 /// `pMap->getSslContext()` when no mapped vhost supplies a context.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SniWithDefault {
     sni: SniCertMap,
-    default: Arc<CertifiedKey>,
+    default: Option<Arc<CertifiedKey>>,
+    #[cfg(feature = "ocsp")]
+    stapling: Option<Arc<ocsp::Slots>>,
 }
 
 impl ResolvesServerCert for SniWithDefault {
@@ -195,7 +215,7 @@ impl ResolvesServerCert for SniWithDefault {
         // fall back to the listener default cert.
         self.sni
             .resolve_name(client_hello.server_name(), client_hello.signature_schemes())
-            .or_else(|| Some(self.default.clone()))
+            .or_else(|| self.default.clone())
     }
 }
 
@@ -205,7 +225,7 @@ impl ResolvesServerCert for SniWithDefault {
 /// Per handshake it is one atomic load + the existing exact-SNI lookup;
 /// in-flight connections keep the cert they negotiated, new handshakes pick up
 /// the swapped certs. The swap handle is [`CertReloadHandle`].
-struct ReloadableResolver(Arc<ArcSwap<SniWithDefault>>);
+struct ReloadableResolver(Arc<ArcSwap<SniWithDefault>>, Arc<ArcSwap<SniCertMap>>);
 
 impl std::fmt::Debug for ReloadableResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -215,7 +235,23 @@ impl std::fmt::Debug for ReloadableResolver {
 
 impl ResolvesServerCert for ReloadableResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.0.load().resolve(client_hello)
+        let managed = self.1.load();
+        if let Some(key) = managed
+            .resolve_managed_name(client_hello.server_name(), client_hello.signature_schemes())
+        {
+            #[cfg(feature = "ocsp")]
+            if let Some(slots) = &managed.stapling {
+                return slots.resolve(key);
+            }
+            return Some(key);
+        }
+        let generation = self.0.load();
+        let key = generation.resolve(client_hello)?;
+        #[cfg(feature = "ocsp")]
+        if let Some(slots) = &generation.stapling {
+            return slots.resolve(key);
+        }
+        Some(key)
     }
 }
 
@@ -224,15 +260,63 @@ impl ResolvesServerCert for ReloadableResolver {
 /// the running resolver — an ACME renewal (new cert at the same path) takes
 /// effect with no restart. Cheaply cloneable.
 #[derive(Clone)]
-pub struct CertReloadHandle(Arc<ArcSwap<SniWithDefault>>);
+pub struct CertReloadHandle(
+    Arc<ArcSwap<SniWithDefault>>,
+    Arc<ArcSwap<SniCertMap>>,
+    #[cfg(feature = "ocsp")] Arc<arc_swap::ArcSwapOption<ocsp::Stapling>>,
+);
 
 impl CertReloadHandle {
+    /// Atomically replace an explicitly managed SNI overlay. The caller validates
+    /// trust, validity and the exact SAN set before this method; it rechecks the
+    /// key pair and bounds here. File-based SIGHUP reloads cannot erase the overlay.
+    /// This never changes client-certificate verification or listener properties.
+    pub fn replace_managed(&self, domains: &[String], key: Arc<CertifiedKey>) -> Result<()> {
+        anyhow::ensure!(
+            !domains.is_empty() && domains.len() <= 100,
+            "invalid managed certificate domain count"
+        );
+        key.keys_match()
+            .map_err(|_| anyhow!("managed certificate key mismatch"))?;
+        let mut map = SniCertMap::new();
+        for domain in domains {
+            anyhow::ensure!(
+                !domain.is_empty()
+                    && domain.len() <= 253
+                    && domain.is_ascii()
+                    && !domain.strip_prefix("*.").unwrap_or(domain).contains('*'),
+                "invalid managed certificate domain"
+            );
+            map.add(domain, key.clone());
+        }
+        #[cfg(feature = "ocsp")]
+        if let Some(stapling) = self.2.load_full() {
+            map.stapling = Some(stapling.register(map.by_name.values().flatten().cloned())?);
+        }
+        self.1.store(Arc::new(map));
+        Ok(())
+    }
+
     /// Re-read `listener`'s default + per-vhost certificates from `server` and
     /// atomically swap them into the live resolver. On any load error the CURRENT
     /// certs stay in place (a failed reload never breaks TLS); new handshakes use
     /// the new certs once this returns `Ok`.
     pub fn reload(&self, server: &ServerConfig, listener: &Listener) -> Result<()> {
-        let next = build_sni_with_default(server, listener)?;
+        #[allow(unused_mut)]
+        let mut next = build_sni_with_default(server, listener)?;
+        #[cfg(feature = "ocsp")]
+        if let Some(stapling) = self.2.load_full() {
+            next.stapling = Some(
+                stapling.register(
+                    next.sni
+                        .by_name
+                        .values()
+                        .flatten()
+                        .cloned()
+                        .chain(next.default.iter().cloned()),
+                )?,
+            );
+        }
         self.0.store(Arc::new(next));
         Ok(())
     }
@@ -262,7 +346,9 @@ fn build_sni_with_default(server: &ServerConfig, listener: &Listener) -> Result<
     })?;
     Ok(SniWithDefault {
         sni,
-        default: Arc::new(default_ck),
+        default: Some(Arc::new(default_ck)),
+        #[cfg(feature = "ocsp")]
+        stapling: None,
     })
 }
 
@@ -399,11 +485,10 @@ pub(crate) fn build_certified_key(
 ) -> Result<CertifiedKey> {
     let chain = load_cert_chain(cert_file, chain_file)?;
     let key = load_private_key(key_file)?;
-    // NB: the listener's `enable_stapling` (OCSP stapling) is intentionally NOT wired
-    // here — no OCSP response is fetched/attached to the CertifiedKey. It is a parsed
-    // config knob with no implementation (the startup banner reports it as a no-op).
-    // Unneeded in the live deployment: Cloudflare terminates TLS to browsers and does
-    // not require origin-side stapling.
+    // Loading key material never fetches OCSP. The opt-in OCSP manager attaches
+    // only authenticated, fresh responses through generation-bound resolver slots.
+    // XML enableStapling alone does not initiate network traffic; the binary
+    // requires an explicit responder endpoint and an OCSP-enabled build.
     Ok(CertifiedKey::new(chain, key))
 }
 
@@ -776,6 +861,7 @@ pub fn build_server_config_reloadable(
         cfg,
         listener,
         ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect(),
+        false,
     )
 }
 
@@ -798,6 +884,7 @@ fn build_server_config_inner(
     cfg: &ServerConfig,
     listener: &Listener,
     alpn: Vec<Vec<u8>>,
+    bootstrap: bool,
 ) -> Result<(Arc<RustlsServerConfig>, CertReloadHandle)> {
     let tls = listener
         .tls
@@ -811,10 +898,18 @@ fn build_server_config_inner(
 
     // 2. SNI resolver + listener default certificate, held behind an ArcSwap so
     //    renewed certs can be live-reloaded (OPS9) without rebuilding this config.
-    let cert_swap = Arc::new(ArcSwap::from_pointee(build_sni_with_default(
-        cfg, listener,
-    )?));
-    let resolver = Arc::new(ReloadableResolver(cert_swap.clone()));
+    let cert_swap = Arc::new(ArcSwap::from_pointee(if bootstrap {
+        SniWithDefault {
+            sni: build_sni_resolver(cfg, listener)?,
+            default: None,
+            #[cfg(feature = "ocsp")]
+            stapling: None,
+        }
+    } else {
+        build_sni_with_default(cfg, listener)?
+    }));
+    let managed = Arc::new(ArcSwap::from_pointee(SniCertMap::new()));
+    let resolver = Arc::new(ReloadableResolver(cert_swap.clone(), managed.clone()));
 
     // 3. Assemble the ServerConfig on the installed provider so the resolver,
     //    verifier, and key material all share one crypto backend.
@@ -857,7 +952,15 @@ fn build_server_config_inner(
     // `httpjet_tls_handshakes_{full,resumed}_total` observe the split in production.
     config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
 
-    Ok((Arc::new(config), CertReloadHandle(cert_swap)))
+    Ok((
+        Arc::new(config),
+        CertReloadHandle(
+            cert_swap,
+            managed,
+            #[cfg(feature = "ocsp")]
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+        ),
+    ))
 }
 
 /// Resumable TLS sessions retained per process (stateful tickets / session IDs). 32 Ki
@@ -932,9 +1035,15 @@ pub struct KtlsConfigTemplate {
     resolver: Arc<ReloadableResolver>,
     alpn: Vec<Vec<u8>>,
     session_storage: Arc<dyn rustls::server::StoresServerSessions + Send + Sync>,
+    #[cfg(feature = "ocsp")]
+    ocsp_no_resumption: bool,
 }
 
 impl KtlsConfigTemplate {
+    #[cfg(feature = "ocsp")]
+    pub fn disable_ocsp_resumption(&mut self) {
+        self.ocsp_no_resumption = true;
+    }
     /// Assemble a fresh `ServerConfig` (cheap: shares the Arc'd verifier/resolver/cache)
     /// installing `key_log` as this connection's secret sink.
     pub fn server_config_with_key_log(
@@ -950,6 +1059,10 @@ impl KtlsConfigTemplate {
         config.max_early_data_size = 0;
         config.session_storage = self.session_storage.clone();
         config.key_log = key_log;
+        #[cfg(feature = "ocsp")]
+        if self.ocsp_no_resumption {
+            ocsp::disable_resumption(&mut config);
+        }
         // kTLS programs the kernel TLS keys at the connection's CURRENT record sequence, which
         // we read from `dangerous_extract_secrets` after the handshake — so NewSessionTickets
         // (emitted under the server app key during the final flush, advancing the TX sequence)
@@ -966,16 +1079,33 @@ pub fn build_ktls_template(
     cfg: &ServerConfig,
     listener: &Listener,
 ) -> Result<(KtlsConfigTemplate, CertReloadHandle)> {
+    build_ktls_template_with_bootstrap(cfg, listener, false)
+}
+
+/// Explicit certificate-free bootstrap; verifier policy remains unchanged.
+pub fn build_ktls_template_with_bootstrap(
+    cfg: &ServerConfig,
+    listener: &Listener,
+    bootstrap: bool,
+) -> Result<(KtlsConfigTemplate, CertReloadHandle)> {
     let tls = listener
         .tls
         .as_ref()
         .ok_or_else(|| anyhow!("listener {} has no TLS configuration", listener.name))?;
     let provider = provider()?;
     let verifier = build_listener_verifier(tls, listener)?;
-    let cert_swap = Arc::new(ArcSwap::from_pointee(build_sni_with_default(
-        cfg, listener,
-    )?));
-    let resolver = Arc::new(ReloadableResolver(cert_swap.clone()));
+    let cert_swap = Arc::new(ArcSwap::from_pointee(if bootstrap {
+        SniWithDefault {
+            sni: build_sni_resolver(cfg, listener)?,
+            default: None,
+            #[cfg(feature = "ocsp")]
+            stapling: None,
+        }
+    } else {
+        build_sni_with_default(cfg, listener)?
+    }));
+    let managed = Arc::new(ArcSwap::from_pointee(SniCertMap::new()));
+    let resolver = Arc::new(ReloadableResolver(cert_swap.clone(), managed.clone()));
     // (security, 2026-08-30) Mirror the TCP builder: the stateful session cache is
     // enabled on client-cert-verifying listeners as well — see the rationale at
     // `build_server_config_inner` (chain⇄ticket binding, single-use tickets, 0-RTT off).
@@ -989,8 +1119,18 @@ pub fn build_ktls_template(
         resolver,
         alpn: ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect(),
         session_storage,
+        #[cfg(feature = "ocsp")]
+        ocsp_no_resumption: false,
     };
-    Ok((template, CertReloadHandle(cert_swap)))
+    Ok((
+        template,
+        CertReloadHandle(
+            cert_swap,
+            managed,
+            #[cfg(feature = "ocsp")]
+            Arc::new(arc_swap::ArcSwapOption::empty()),
+        ),
+    ))
 }
 
 /// QUIC/HTTP3 entry point. Like [`build_server_config`] (the TCP entry), uses
@@ -1014,7 +1154,62 @@ pub fn build_server_config_alpn_reloadable(
     listener: &Listener,
     alpn: Vec<Vec<u8>>,
 ) -> Result<(Arc<RustlsServerConfig>, CertReloadHandle)> {
-    build_server_config_inner(cfg, listener, alpn)
+    build_server_config_inner(cfg, listener, alpn, false)
+}
+
+/// Opt-in ACME bootstrap with no default certificate. Unmanaged/no-SNI
+/// handshakes without a configured vhost certificate FAIL until provisioned;
+/// no self-signed identity or no-auth verifier is substituted. HTTP-01 can run
+/// independently while TCP/QUIC client-auth requirements stay unchanged.
+pub fn build_server_config_alpn_with_bootstrap(
+    cfg: &ServerConfig,
+    listener: &Listener,
+    alpn: Vec<Vec<u8>>,
+    bootstrap: bool,
+) -> Result<(Arc<RustlsServerConfig>, CertReloadHandle)> {
+    build_server_config_inner(cfg, listener, alpn, bootstrap)
+}
+
+/// A listener's transport configurations prepared from one certificate/verifier
+/// load. New resource generations receive fresh session stores; TCP and kTLS
+/// share their store, while QUIC has a separate resumption namespace.
+///
+/// Preparation does not publish or attach background certificate managers. One
+/// certificate handle updates the shared resolver for every included transport.
+pub struct PreparedListenerTls {
+    pub tcp: Arc<RustlsServerConfig>,
+    pub quic: Option<Arc<RustlsServerConfig>>,
+    pub ktls: Option<KtlsConfigTemplate>,
+    pub certificates: CertReloadHandle,
+}
+
+impl PreparedListenerTls {
+    pub fn prepare(
+        cfg: &ServerConfig,
+        listener: &Listener,
+        bootstrap: bool,
+        quic: bool,
+        ktls: bool,
+    ) -> Result<Self> {
+        // This builder owns the sole file/verifier read. Deriving the other
+        // transports must not reread paths that may change during acquisition.
+        let (template, certificates) =
+            build_ktls_template_with_bootstrap(cfg, listener, bootstrap)?;
+        let mut tcp = (*template.server_config_with_key_log(Arc::new(rustls::NoKeyLog))?).clone();
+        tcp.enable_secret_extraction = false;
+        let quic = quic.then(|| {
+            let mut config = tcp.clone();
+            config.alpn_protocols = vec![b"h3".to_vec()];
+            config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
+            Arc::new(config)
+        });
+        Ok(Self {
+            tcp: Arc::new(tcp),
+            quic,
+            ktls: ktls.then_some(template),
+            certificates,
+        })
+    }
 }
 
 /// Extract the per-request [`TlsParams`] from a completed [`rustls::ServerConnection`]
@@ -1604,7 +1799,9 @@ mod tests {
         );
         let wrapper = SniWithDefault {
             sni,
-            default: default_ck.clone(),
+            default: Some(default_ck.clone()),
+            #[cfg(feature = "ocsp")]
+            stapling: None,
         };
 
         // Mapped (but SAN-uncovered) name -> the vhost cert, not the default.
@@ -1744,6 +1941,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepared_listener_tls_shares_resolver_but_isolates_generation_sessions() {
+        ensure_provider();
+        let dir = tmpdir();
+        let certificate = gen_cert(&["prepared.example.com"]);
+        let listener = Listener {
+            name: "TLS".into(),
+            address: "127.0.0.1:8443".into(),
+            secure: true,
+            vhost_map: vec![],
+            proxy_protocol: false,
+            uds_path: None,
+            tls: Some(ListenerTls {
+                key_file: write_tmp(&dir, "key.pem", &certificate.key_pem),
+                cert_file: write_tmp(&dir, "cert.pem", &certificate.cert_pem),
+                cert_chain: false,
+                ca_cert_file: None,
+                client_verify: 0,
+                verify_depth: 1,
+                enable_stapling: false,
+                crl_file: None,
+            }),
+        };
+        let server = base_server();
+        let bundle = PreparedListenerTls::prepare(&server, &listener, false, true, true).unwrap();
+        let quic = bundle.quic.as_ref().unwrap();
+        let ktls = bundle
+            .ktls
+            .as_ref()
+            .unwrap()
+            .server_config_with_key_log(Arc::new(rustls::NoKeyLog))
+            .unwrap();
+        assert!(Arc::ptr_eq(&bundle.tcp.cert_resolver, &quic.cert_resolver));
+        assert!(Arc::ptr_eq(&bundle.tcp.cert_resolver, &ktls.cert_resolver));
+        assert!(Arc::ptr_eq(
+            &bundle.tcp.session_storage,
+            &ktls.session_storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &bundle.tcp.session_storage,
+            &quic.session_storage
+        ));
+        assert_eq!(quic.alpn_protocols, vec![b"h3".to_vec()]);
+        assert!(!bundle.tcp.enable_secret_extraction);
+        assert!(!quic.enable_secret_extraction);
+        assert!(ktls.enable_secret_extraction);
+        assert_eq!(bundle.tcp.max_early_data_size, 0);
+        assert_eq!(quic.max_early_data_size, 0);
+        let next = PreparedListenerTls::prepare(&server, &listener, false, false, false).unwrap();
+        assert!(next.quic.is_none() && next.ktls.is_none());
+        assert!(!Arc::ptr_eq(
+            &bundle.tcp.session_storage,
+            &next.tcp.session_storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &bundle.tcp.cert_resolver,
+            &next.tcp.cert_resolver
+        ));
+        let snapshot = bundle.certificates.0.load_full();
+        std::fs::write(
+            &listener.tls.as_ref().unwrap().cert_file,
+            b"invalid certificate",
+        )
+        .unwrap();
+        assert!(PreparedListenerTls::prepare(&server, &listener, false, true, true).is_err());
+        assert!(Arc::ptr_eq(&snapshot, &bundle.certificates.0.load_full()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// (OPS9) Live cert reload: overwriting the cert file at the SAME path (the
     /// ACME-renewal case) and calling `CertReloadHandle::reload` swaps the new
     /// cert into the live resolver — observed through the handle's ArcSwap — while
@@ -1781,11 +2047,44 @@ mod tests {
         let (_cfg, handle) =
             build_server_config_reloadable(&server, &listener).expect("build reloadable config");
 
-        let leaf_now = || handle.0.load().default.cert[0].as_ref().to_vec();
+        let leaf_now = || {
+            handle.0.load().default.as_ref().unwrap().cert[0]
+                .as_ref()
+                .to_vec()
+        };
         let expect_a = load_cert_chain(&cert_path, None).expect("load A")[0]
             .as_ref()
             .to_vec();
         assert_eq!(leaf_now(), expect_a, "resolver initially presents cert A");
+        let managed_a = Arc::new(
+            build_certified_key(&cert_path, None, &listener.tls.as_ref().unwrap().key_file)
+                .unwrap(),
+        );
+        handle
+            .replace_managed(&["managed.example.com".to_owned()], managed_a)
+            .unwrap();
+        let wildcard_key = handle
+            .1
+            .load()
+            .resolve_name(Some("managed.example.com"), P256_SCHEMES)
+            .unwrap();
+        let mut wildcard = SniCertMap::new();
+        wildcard.add("*.example.com", wildcard_key);
+        assert!(
+            wildcard
+                .resolve_managed_name(Some("one.example.com"), P256_SCHEMES)
+                .is_some()
+        );
+        assert!(
+            wildcard
+                .resolve_managed_name(Some("two.one.example.com"), P256_SCHEMES)
+                .is_none()
+        );
+        assert!(
+            wildcard
+                .resolve_managed_name(Some("example.com"), P256_SCHEMES)
+                .is_none()
+        );
 
         // Renew: overwrite the SAME paths with a fresh cert/key (B).
         let b = gen_cert(&["default.example.com"]);
@@ -1805,6 +2104,35 @@ mod tests {
             leaf_now(),
             expect_b,
             "resolver presents cert B after reload()"
+        );
+        assert_eq!(
+            handle
+                .1
+                .load()
+                .resolve_name(Some("managed.example.com"), P256_SCHEMES)
+                .unwrap()
+                .cert[0]
+                .as_ref(),
+            expect_a
+        );
+        let bootstrap =
+            build_server_config_alpn_with_bootstrap(&server, &listener, vec![b"h2".to_vec()], true)
+                .unwrap();
+        assert!(
+            bootstrap.1.0.load().default.is_none(),
+            "bootstrap never substitutes an untrusted default identity"
+        );
+        let mut missing_ca = listener.clone();
+        missing_ca.tls.as_mut().unwrap().client_verify = 1;
+        assert!(
+            build_server_config_alpn_with_bootstrap(
+                &server,
+                &missing_ca,
+                vec![b"h2".to_vec()],
+                true
+            )
+            .is_err(),
+            "bootstrap cannot bypass client CA validation"
         );
     }
 

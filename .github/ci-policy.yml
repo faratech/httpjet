@@ -1,0 +1,5 @@
+version: 1
+workflows:
+  .github/workflows/ci.yml: fast
+  .github/workflows/fuzz.yml: deep
+  .github/workflows/interoperability.yml: deep

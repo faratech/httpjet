@@ -12,7 +12,12 @@ pub mod units;
 
 pub use error::{ConfigError, Result};
 pub use model::*;
-pub use parse::load;
+pub use parse::{load, parse_bundle};
+
+/// Redacted failure for an in-memory configuration submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("invalid configuration submission")]
+pub struct BundleError;
 
 /// Whether a vhostMap `<domain>` token is a wildcard PATTERN httpjet does not support: it contains
 /// a glob char (`*`/`?`) but is not the bare `*` catch-all (the only supported wildcard). Such a

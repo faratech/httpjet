@@ -1,9 +1,13 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+  schedule:
+    - cron: '7 3 * * 1'
 
 permissions:
   contents: read
@@ -14,6 +18,7 @@ concurrency:
 
 jobs:
   build-and-test:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -27,6 +32,11 @@ jobs:
           rustup toolchain install 1.97.0 --profile minimal --component rustfmt
           rustup default 1.97.0
 
+      - name: Install optional OCSP build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -35,6 +45,9 @@ jobs:
 
       - name: Check profiling build
         run: cargo check -p httpjet --bin httpjet --features profiling --locked
+
+      - name: Replay HTTP/1 framing and chunked corpus
+        run: cargo test --locked -p httpjet --test h1_corpus -- --nocapture
 
       - name: Reject the CDDL flamegraph dependency
         run: |
@@ -77,3 +90,49 @@ jobs:
 
       - name: Verify DCO sign-offs
         run: scripts/check-dco.sh "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  linux-matrix:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.97.0 --profile minimal
+      - name: Install optional OCSP build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+      - name: Record platform and check feature builds
+        run: |
+          uname -a
+          rustc +1.97.0 -Vv
+          cargo +1.97.0 check --locked -p httpjet --all-features
+      - name: Replay parser corpus
+        run: cargo +1.97.0 test --locked -p httpjet --test h1_corpus -- --nocapture
+      - name: Exercise native io_uring H1 and H2
+        # A denied io_uring operation fails the job; it is not silently skipped.
+        run: cargo +1.97.0 test --locked -p httpjet uring::uds_tests::uds_listener_serves_h1_and_h2c_with_unix_peer
+
+  oci-smoke:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install HTTP/3 smoke client
+        run: python3 -m pip install --disable-pip-version-check aioquic==1.3.0
+      - name: Build and run non-privileged OCI example
+        run: bash scripts/oci-smoke.sh

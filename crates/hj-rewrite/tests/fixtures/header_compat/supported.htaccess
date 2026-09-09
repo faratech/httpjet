@@ -1,0 +1,8 @@
+# Current implemented response-header subset.
+Header set X-Set replacement
+Header add Set-Cookie a=1
+Header append Vary Accept-Encoding
+Header merge Cache-Control no-store
+Header unset X-Remove
+Header always set X-Always present
+Header set X-Env "%{FEATURE}e" env=FEATURE

@@ -1,0 +1,7 @@
+# These lines parse, but have narrower semantics than Apache mod_headers.
+Header merge Cache-Control no-cache
+Header echo ^X-Request-
+Header always set X-Expr-Guard guarded "expr=%{REQUEST_STATUS} == 200"
+Header set X-Expr-Value "expr=%{md5:foo}"
+Header always set X-Early late-only early
+Header set X-Colon: value

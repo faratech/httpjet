@@ -474,4 +474,31 @@ mod tests {
         );
         assert!(!resp.headers().contains_key("x-cache"));
     }
+
+    #[test]
+    fn compatibility_fixture_pins_final_response_semantic_gaps() {
+        const FIXTURE: &str =
+            include_str!("../../../hj-rewrite/tests/fixtures/header_compat/semantic-gaps.htaccess");
+        let chain = vec![Arc::new(Htaccess::parse(FIXTURE).unwrap())];
+        let ctx = super::super::tests::bare_ctx_for_headers();
+        let mut resp: Response = Response::new(hj_core::Body::Empty);
+        resp.headers_mut().insert(
+            http::header::CACHE_CONTROL,
+            http::HeaderValue::from_static("no-cache"),
+        );
+
+        apply_response_headers_for_request(&ctx, &chain, "/index.html", "/index.html", &mut resp);
+
+        assert_eq!(
+            resp.headers().get(http::header::CACHE_CONTROL).unwrap(),
+            "no-cache, no-cache",
+            "Merge currently behaves as Append without list de-duplication"
+        );
+        assert!(
+            !resp.headers().contains_key("x-colon"),
+            "Apache's optional trailing colon is currently rejected as an invalid field name"
+        );
+        assert_eq!(resp.headers().get("x-expr-value").unwrap(), "");
+        assert_eq!(resp.headers().get("x-early").unwrap(), "late-only");
+    }
 }

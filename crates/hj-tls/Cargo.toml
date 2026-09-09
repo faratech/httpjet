@@ -7,7 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+ocsp = ["dep:hj-ocsp", "dep:tokio"]
+
 [dependencies]
+hj-ocsp = { path = "../hj-ocsp", optional = true }
+tokio = { workspace = true, optional = true }
 hj-config = { workspace = true }
 hj-core = { workspace = true }
 rustls = { workspace = true }

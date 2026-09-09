@@ -25,6 +25,9 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::ProxyError;
 use crate::target::{ProxyTarget, TargetTransport};
+mod balance;
+mod health;
+pub use balance::{PeerSnapshot, RequestReservation};
 
 /// Process-shared rustls client config for upstream TLS, built once on first use: the webpki
 /// (Mozilla) root store, server-auth only, no client certificate. The default crypto provider
@@ -213,6 +216,9 @@ pub struct Upstream {
 }
 
 impl Upstream {
+    pub(crate) fn transport(&self) -> &TargetTransport {
+        &self.transport
+    }
     /// Create an upstream from a [`ProxyTarget`] with the given pool limits.
     pub(crate) fn new(
         target: &ProxyTarget,
@@ -318,7 +324,7 @@ impl Upstream {
 
     /// Record a successful dial: reset the failure count and close the breaker
     /// (and clear the pool-level failover mark).
-    fn note_dial_success(&self) {
+    pub(crate) fn note_dial_success(&self) {
         self.fail_count.store(0, Ordering::Relaxed);
         *self.tripped_at.lock() = None;
         if let Some(b) = self.bad_until.lock().as_ref() {
@@ -329,7 +335,7 @@ impl Upstream {
     /// Record a failed dial: trip the breaker once the threshold is reached. A
     /// trip also marks the peer bad at the POOL level for one half-open window,
     /// so new requests fail over to the next peer instead of fast-failing here.
-    fn note_dial_failure(&self) {
+    pub(crate) fn note_dial_failure(&self) {
         let n = self.fail_count.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= CB_THRESHOLD {
             *self.tripped_at.lock() = Some(Instant::now());
@@ -581,6 +587,9 @@ impl Upstream {
 /// rewrite targets.
 #[derive(Default)]
 pub struct UpstreamPool {
+    health_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    published_groups: Arc<Mutex<Option<Vec<Arc<balance::Group>>>>>,
+    groups: Mutex<HashMap<balance::GroupKey, Arc<balance::Group>>>,
     pools: Mutex<HashMap<PoolKey, Arc<Upstream>>>,
     /// (Tier 1.2) Per-peer failover marks: epoch-ms until which the peer is skipped
     /// for NEW requests (set when the peer's breaker trips, cleared on a successful
@@ -599,6 +608,7 @@ fn now_epoch_ms() -> u64 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PoolKey {
+    scope: Option<String>,
     name: Option<String>,
     scheme: String,
     authority: String,
@@ -618,6 +628,7 @@ impl PoolKey {
         connect_timeout: Duration,
     ) -> Self {
         PoolKey {
+            scope: target.scope.clone(),
             name: target.name.clone(),
             scheme: target.scheme.to_ascii_lowercase(),
             authority: target.authority.clone(),
@@ -642,6 +653,9 @@ impl PoolKey {
 impl UpstreamPool {
     pub fn new() -> Self {
         UpstreamPool {
+            health_tasks: Mutex::new(Vec::new()),
+            published_groups: Arc::new(Mutex::new(None)),
+            groups: Mutex::new(HashMap::new()),
             pools: Mutex::new(HashMap::new()),
             bad_until: Mutex::new(HashMap::new()),
             failovers: AtomicU64::new(0),
@@ -730,8 +744,28 @@ impl UpstreamPool {
         default_keep_alive: Duration,
         default_connect_timeout: Duration,
     ) -> Self {
+        let named_targets: Vec<_> = named_targets.into_iter().collect();
+        let retained_groups: HashSet<_> = named_targets
+            .iter()
+            .map(|t| {
+                balance::GroupKey::new(
+                    t,
+                    default_max_conns,
+                    default_keep_alive,
+                    default_connect_timeout,
+                )
+            })
+            .collect();
+        let groups = self
+            .groups
+            .lock()
+            .iter()
+            .filter(|(k, _)| retained_groups.contains(*k) && !k.authenticated())
+            .map(|(k, g)| (k.clone(), g.clone()))
+            .collect();
         let retained_named: HashSet<PoolKey> = named_targets
             .into_iter()
+            .flat_map(|target| target.peers())
             .filter(|target| target.name.is_some())
             .map(|target| {
                 PoolKey::new(
@@ -757,6 +791,9 @@ impl UpstreamPool {
             .collect();
         UpstreamPool {
             pools: Mutex::new(retained),
+            health_tasks: Mutex::new(Vec::new()),
+            published_groups: self.published_groups.clone(),
+            groups: Mutex::new(groups),
             bad_until: Mutex::new(HashMap::new()),
             failovers: AtomicU64::new(0),
         }
@@ -767,6 +804,19 @@ impl UpstreamPool {
 mod tests {
     use super::*;
     use crate::Proxy;
+
+    #[test]
+    fn equally_named_vhost_processors_have_distinct_pools() {
+        let mut a = ProxyTarget::parse_url("http://127.0.0.1:29001")
+            .unwrap()
+            .in_scope("vhost:a");
+        a.name = Some("backend".into());
+        let b = a.clone().in_scope("vhost:b");
+        let pool = UpstreamPool::new();
+        let ua = pool.get_or_create(&a, 10, Duration::from_secs(5), Duration::from_secs(1));
+        let ub = pool.get_or_create(&b, 10, Duration::from_secs(5), Duration::from_secs(1));
+        assert!(!Arc::ptr_eq(&ua, &ub));
+    }
 
     fn ensure_crypto_provider() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -780,6 +830,7 @@ mod tests {
         use hj_core::config::{ExtAddress, ExtKind, ExtProcessor};
 
         let ep = ExtProcessor {
+            load_balance: Default::default(),
             name: "lb".into(),
             kind: ExtKind::Proxy,
             address: ExtAddress::Tcp("127.0.0.1:29001".parse().unwrap()),

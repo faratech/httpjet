@@ -26,6 +26,9 @@ pub(crate) enum TargetTransport {
 /// A resolved reverse-proxy destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyTarget {
+    /// Configured scope distinguishes equally named vhost processors.
+    pub scope: Option<String>,
+    pub load_balance: hj_core::config::LoadBalanceConfig,
     /// Scheme as written (`http` / `https` / `ws` / `wss` / `h2` / `h2s`).
     /// `https`/`wss`/`h2s` indicate the *upstream* leg is TLS (rare for LSWS
     /// backends, but parsed).
@@ -64,6 +67,10 @@ pub struct ProxyTarget {
 }
 
 impl ProxyTarget {
+    pub fn in_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = Some(scope.into());
+        self
+    }
     /// (Tier 1.2) Ordered peer list for pool selection: `self` (primary) first,
     /// then the failover transports as peer targets. Len 1 = single peer.
     pub(crate) fn peers(&self) -> Vec<ProxyTarget> {
@@ -133,6 +140,8 @@ impl ProxyTarget {
             }
             let sock = format!("/{}", sock.trim_start_matches('/'));
             return Ok(ProxyTarget {
+                scope: None,
+                load_balance: Default::default(),
                 scheme: "http".into(),
                 authority: "localhost".into(),
                 transport: TargetTransport::Uds(sock),
@@ -179,6 +188,8 @@ impl ProxyTarget {
         let authority = authority_raw_with_port(authority_raw, &scheme);
 
         Ok(ProxyTarget {
+            scope: None,
+            load_balance: Default::default(),
             transport: TargetTransport::Tcp(authority.clone()),
             failover: Vec::new(),
             client_cert_file: None,
@@ -198,6 +209,12 @@ impl ProxyTarget {
 
     /// Build a target from an `ExtProcessor` of kind `Proxy`.
     pub fn from_ext_processor(ep: &ExtProcessor) -> ProxyTarget {
+        let parsed = match &ep.address {
+            ExtAddress::HostPort(address) if address.contains("://") => {
+                Self::parse_url(address).ok()
+            }
+            _ => None,
+        };
         let (authority, transport) = match &ep.address {
             ExtAddress::Tcp(sa) => (sa.to_string(), TargetTransport::Tcp(sa.to_string())),
             ExtAddress::HostPort(hp) => {
@@ -214,17 +231,27 @@ impl ProxyTarget {
             .iter()
             .map(|a| match a {
                 ExtAddress::Tcp(sa) => TargetTransport::Tcp(sa.to_string()),
-                ExtAddress::HostPort(hp) => {
-                    TargetTransport::Tcp(hp.trim_start_matches("UDS://").to_string())
-                }
+                ExtAddress::HostPort(hp) => Self::parse_url(hp)
+                    .map(|p| p.transport)
+                    .unwrap_or_else(|_| {
+                        TargetTransport::Tcp(hp.trim_start_matches("UDS://").to_string())
+                    }),
                 ExtAddress::Uds(p) => TargetTransport::Uds(p.to_string_lossy().into_owned()),
             })
             .collect();
         ProxyTarget {
-            scheme: "http".into(),
-            http2: false,
-            authority,
-            transport,
+            scheme: parsed
+                .as_ref()
+                .map(|p| p.scheme.clone())
+                .unwrap_or_else(|| "http".into()),
+            scope: Some("server".into()),
+            load_balance: ep.load_balance.clone(),
+            http2: parsed.as_ref().is_some_and(|p| p.http2),
+            authority: parsed
+                .as_ref()
+                .map(|p| p.authority.clone())
+                .unwrap_or(authority),
+            transport: parsed.map(|p| p.transport).unwrap_or(transport),
             failover,
             path_and_query: String::new(),
             name: Some(ep.name.clone()),
@@ -248,12 +275,15 @@ impl ProxyTarget {
                 if t.scheme == "http" {
                     t.scheme = "ws".into();
                 }
+                t.name = Some(format!("websocket:{}", ws.uri));
                 return t;
             }
         }
         let authority = authority_raw_with_port(addr, "ws");
         ProxyTarget {
             scheme: "ws".into(),
+            scope: None,
+            load_balance: Default::default(),
             http2: false,
             authority: authority.clone(),
             transport: TargetTransport::Tcp(authority),
@@ -261,7 +291,7 @@ impl ProxyTarget {
             client_cert_file: None,
             client_key_file: None,
             path_and_query: String::new(),
-            name: None,
+            name: Some(format!("websocket:{}", ws.uri)),
             max_conns: None,
             keep_alive: None,
             connect_timeout: None,
@@ -403,6 +433,7 @@ mod tests {
     #[test]
     fn from_ext_processor_tcp() {
         let ep = ExtProcessor {
+            load_balance: Default::default(),
             name: "mcp-api".into(),
             kind: ExtKind::Proxy,
             address: ExtAddress::Tcp("127.0.0.1:8002".parse::<SocketAddr>().unwrap()),
@@ -447,6 +478,12 @@ mod tests {
         let t = ProxyTarget::from_websocket_map(&ws);
         assert!(t.is_websocket());
         assert_eq!(t.authority, "127.0.0.1:8001");
+        assert_eq!(t.name.as_deref(), Some("websocket:/"));
+        let explicit = ProxyTarget::from_websocket_map(&WebSocketMap {
+            uri: "/chat".into(),
+            address: "ws://127.0.0.1:8001/socket".into(),
+        });
+        assert_eq!(explicit.name.as_deref(), Some("websocket:/chat"));
     }
 
     #[test]
