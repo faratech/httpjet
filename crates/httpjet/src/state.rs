@@ -219,6 +219,10 @@ pub struct ServerState {
     /// Opt-in FastCGI handlers keyed by `(vhost scope, processor name)`.
     /// A scoped processor always wins over a global processor of the same name.
     pub fastcgi: HashMap<(Option<String>, String), Arc<FastCgi>>,
+    /// True when any loaded vhost declares an explicit CGI/FastCGI suffix route.
+    /// Kept independently of `fastcgi`: a declared route whose processor is
+    /// missing must still resolve as executable and fail closed with 503.
+    pub(crate) has_cgi_script_routes: bool,
     /// Reverse-proxy engine for this config generation. Reload retains unchanged
     /// upstream Arcs while obsolete named definitions drain with the old state.
     pub proxy: Arc<Proxy>,
@@ -494,6 +498,7 @@ struct ConfigDerived {
     inline_rules: HashMap<String, Arc<RuleSet>>,
     ext_by_name: HashMap<String, ExtProcessor>,
     php_suffixes: HashSet<String>,
+    has_cgi_script_routes: bool,
     acl: Arc<AccessControl>,
     client_throttle: hj_acl::ClientThrottle,
     compress: Arc<Compress>,
@@ -515,6 +520,19 @@ fn build_config_derived(
         .as_ref()
         .map(|p| p.suffixes.iter().map(|s| s.to_ascii_lowercase()).collect())
         .unwrap_or_default();
+    // This summarizes DECLARED suffix routes, not successfully constructed
+    // FastCGI processors. Keeping those concepts separate preserves the
+    // source-disclosure guard: a route that names a missing processor must
+    // still enter script dispatch and return 503. The common configuration has
+    // no CGI routes, so request routing can skip both per-vhost suffix scans.
+    let has_cgi_script_routes = server.vhosts.values().any(|declaration| {
+        declaration.config.as_ref().is_some_and(|vhost| {
+            vhost
+                .script_handlers
+                .iter()
+                .any(|handler| handler.kind == hj_core::config::ContextKind::Cgi)
+        })
+    });
 
     // Pre-parse each vhost's inline rewrite rules once.
     let mut inline_rules = HashMap::new();
@@ -580,6 +598,7 @@ fn build_config_derived(
         inline_rules,
         ext_by_name,
         php_suffixes,
+        has_cgi_script_routes,
         acl,
         client_throttle,
         compress,
@@ -946,6 +965,7 @@ impl ServerState {
             static_handler: cd.static_handler,
             lsapi,
             fastcgi,
+            has_cgi_script_routes: cd.has_cgi_script_routes,
             proxy,
             rewrite_cache: Arc::new(HtaccessCache::new()),
             inline_rules: cd.inline_rules,
@@ -1092,6 +1112,7 @@ impl ServerState {
             // ---- runtime half: carried forward (proxy filtered to new config) ----
             lsapi: old.lsapi.clone(),
             fastcgi,
+            has_cgi_script_routes: cd.has_cgi_script_routes,
             proxy,
             // Candidate construction must not clear live caches. Separate generations
             // also prevent an in-flight old request repopulating the new rule memo.

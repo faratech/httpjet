@@ -376,6 +376,56 @@ async fn static_get_serves_litespeed_etag_and_revalidates_to_304() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cgi_route_summary_reloads_and_missing_processor_fails_closed() {
+    let root = temp_root("cgi-route-summary");
+    const SOURCE: &[u8] = b"<?php echo 'must never be served';";
+    std::fs::write(root.join("app.fcgi"), SOURCE).unwrap();
+
+    let initial = build_state(root);
+    assert!(!initial.has_cgi_script_routes);
+    assert!(initial.fastcgi.is_empty());
+
+    // A declared CGI suffix is security-significant even when its named
+    // processor is absent: the script must resolve as executable and return
+    // 503, never fall through to static source serving. The summary is rebuilt
+    // from config on reload rather than inferred from the handler map.
+    let mut with_route = (*initial.server).clone();
+    let vhost = with_route
+        .vhosts
+        .get_mut(VHOST)
+        .unwrap()
+        .config
+        .as_mut()
+        .unwrap();
+    Arc::make_mut(vhost).script_handlers.push(ScriptHandler {
+        suffix: "fcgi".into(),
+        kind: ContextKind::Cgi,
+        handler: "missing-fastcgi".into(),
+    });
+    let routed = ServerState::reload(&initial, Arc::new(with_route)).unwrap();
+    assert!(routed.has_cgi_script_routes);
+    assert!(routed.fastcgi.is_empty());
+
+    let response = run(&routed, get(CANON_HOST, "/app.fcgi", None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(body_bytes(response.into_body()).as_ref(), SOURCE);
+
+    let mut without_route = (*routed.server).clone();
+    let vhost = without_route
+        .vhosts
+        .get_mut(VHOST)
+        .unwrap()
+        .config
+        .as_mut()
+        .unwrap();
+    Arc::make_mut(vhost)
+        .script_handlers
+        .retain(|handler| handler.kind != ContextKind::Cgi);
+    let restored = ServerState::reload(&routed, Arc::new(without_route)).unwrap();
+    assert!(!restored.has_cgi_script_routes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn waf_runs_before_static_cache_and_can_block_a_previously_allowed_path() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

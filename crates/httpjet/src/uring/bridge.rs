@@ -22,10 +22,12 @@ use tokio_util::sync::CancellationToken;
 
 use hj_core::{Body, Proto, Request, Response};
 
+use crate::serving_generation::RequestGeneration;
+
 /// Per-request connection context the pipeline needs (peer/local addr, protocol,
 /// TLS + mTLS state, SNI, SSL_* params). Carried across the runtime boundary
-/// alongside the request. Built once per connection (TLS metadata is per-handshake)
-/// and cloned per request.
+/// alongside the request. Its connection metadata is built once per handshake
+/// and cloned per request; dispatch may then attach a request-generation snapshot.
 #[derive(Clone)]
 pub(crate) struct BridgeCtx {
     pub peer: std::net::SocketAddr,
@@ -47,6 +49,11 @@ pub(crate) struct BridgeCtx {
     /// SSL_* CGI params (protocol/cipher/client-cert) for the LSAPI env, mirroring
     /// the tokio TLS path's `extract_tls_meta`.
     pub tls: Option<hj_core::TlsParams>,
+    /// Application generation selected by the transport before dispatch. This
+    /// travels beside the request instead of through `http::Extensions`, so a
+    /// normal bridged request does not allocate an extension map merely to pin
+    /// its reload snapshot.
+    pub request_generation: Option<RequestGeneration>,
 }
 
 impl BridgeCtx {
@@ -63,6 +70,7 @@ impl BridgeCtx {
             mtls_required: false,
             sni: None,
             tls: None,
+            request_generation: None,
         }
     }
 
@@ -82,6 +90,7 @@ impl BridgeCtx {
             mtls_required: false,
             sni: None,
             tls: None,
+            request_generation: None,
         }
     }
 }
@@ -516,13 +525,24 @@ pub(crate) fn service_unavailable_resp() -> BridgeResp {
     }
 }
 
+#[inline]
+fn take_response_completion(
+    extensions: &mut http::Extensions,
+) -> Option<hj_core::ResponseCompletion> {
+    if extensions.is_empty() {
+        None
+    } else {
+        extensions.remove::<hj_core::ResponseCompletion>()
+    }
+}
+
 fn full_resp(mut parts: http::response::Parts, body: Bytes, bw_rate: Option<u64>) -> BridgeResp {
     let status = parts.status;
     observe_response_head(&mut parts, status);
     // The Full arms own `parts` outright — move the header map instead of cloning it per
     // bridged response.
     BridgeResp {
-        completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+        completion: take_response_completion(&mut parts.extensions),
         status: parts.status,
         headers: parts.headers,
         body: BridgeBody::Full(body),
@@ -549,7 +569,7 @@ pub(crate) async fn fast_response(r: Response, direct_file: bool) -> BridgeResp 
             let status = parts.status;
             observe_response_head(&mut parts, status);
             BridgeResp {
-                completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+                completion: take_response_completion(&mut parts.extensions),
                 status: parts.status,
                 headers: strip_framing(parts.headers),
                 body: BridgeBody::File(file),
@@ -570,7 +590,7 @@ pub(crate) async fn fast_response(r: Response, direct_file: bool) -> BridgeResp 
 fn bad_gateway_for(mut parts: http::response::Parts) -> BridgeResp {
     observe_response_head(&mut parts, http::StatusCode::BAD_GATEWAY);
     let mut response = bad_gateway();
-    response.completion = parts.extensions.remove::<hj_core::ResponseCompletion>();
+    response.completion = take_response_completion(&mut parts.extensions);
     response
 }
 
@@ -634,7 +654,7 @@ async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>, direct
             let status = parts.status;
             observe_response_head(&mut parts, status);
             let _ = resp.send(BridgeResp {
-                completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+                completion: take_response_completion(&mut parts.extensions),
                 status: parts.status,
                 headers: strip_framing(parts.headers),
                 body: BridgeBody::File(f),
@@ -680,7 +700,7 @@ async fn forward_file(
     let headers = strip_framing(parts.headers);
     let (tx, rrx) = mpsc::channel(STREAM_CHANNEL_DEPTH);
     let _ = resp.send(BridgeResp {
-        completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+        completion: take_response_completion(&mut parts.extensions),
         status: parts.status,
         headers,
         body: BridgeBody::Stream {
@@ -749,7 +769,7 @@ async fn forward_stream(
         let headers = strip_framing(parts.headers);
         let (tx, rrx) = mpsc::channel(STREAM_CHANNEL_DEPTH);
         let _ = resp.send(BridgeResp {
-            completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+            completion: take_response_completion(&mut parts.extensions),
             status: parts.status,
             headers,
             body: BridgeBody::Stream { rx: rrx, len: None },
@@ -770,7 +790,7 @@ async fn forward_stream(
                         let headers = strip_framing(parts.headers);
                         let (tx, rrx) = mpsc::channel(STREAM_CHANNEL_DEPTH);
                         let _ = resp.send(BridgeResp {
-                            completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+                            completion: take_response_completion(&mut parts.extensions),
                             status: parts.status,
                             headers,
                             body: BridgeBody::Stream { rx: rrx, len: None },
@@ -792,7 +812,7 @@ async fn forward_stream(
                 let status = parts.status;
                 observe_response_head(&mut parts, status);
                 let _ = resp.send(BridgeResp {
-                    completion: parts.extensions.remove::<hj_core::ResponseCompletion>(),
+                    completion: take_response_completion(&mut parts.extensions),
                     status: parts.status,
                     headers: parts.headers,
                     body: BridgeBody::Full(Bytes::from(acc)),
@@ -1323,6 +1343,7 @@ mod tests {
                 mtls_required: false,
                 sni: None,
                 tls: None,
+                request_generation: None,
             };
             let resp = bridge.dispatch(req, ctx).await.expect("bridged response");
             assert_eq!(resp.status, http::StatusCode::OK);

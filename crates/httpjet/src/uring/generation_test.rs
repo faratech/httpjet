@@ -941,9 +941,9 @@ async fn bridge_uses_request_snapshot_across_application_publication() {
         "127.0.0.1:8080".parse().unwrap(),
         Proto::Http1,
     );
-    let mut pinned = make_request();
-    pinned.extensions_mut().insert(RequestGeneration(old));
-    let response = bridge.dispatch_response(pinned, ctx.clone()).await;
+    let mut pinned_ctx = ctx.clone();
+    pinned_ctx.request_generation = Some(RequestGeneration(old));
+    let response = bridge.dispatch_response(make_request(), pinned_ctx).await;
     assert_eq!(response.status(), http::StatusCode::OK);
     let (body, truncated) = bridge::buffer_body(response.into_body()).await;
     assert!(!truncated);

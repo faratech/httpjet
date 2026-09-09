@@ -103,17 +103,13 @@ impl CoreHandler {
     #[cfg(feature = "otel")]
     fn trace_request(
         &self,
+        state: &ServerState,
         ctx: &BridgeCtx,
         req: &mut hj_core::Request,
     ) -> Option<crate::otel::RequestTrace> {
         if !crate::otel::enabled() {
             return None;
         }
-        let state = req
-            .extensions()
-            .get::<RequestGeneration>()
-            .map(|snapshot| arc_swap::Guard::from_inner(snapshot.0.clone()))
-            .unwrap_or_else(|| self.holder.load());
         let direct_peer = !ctx.peer_unix
             && state
                 .server
@@ -130,29 +126,37 @@ impl CoreHandler {
 
     async fn dispatch_h1(
         &self,
-        ctx: BridgeCtx,
-        mut req: hj_core::Request,
+        state: Arc<ServerState>,
+        mut ctx: BridgeCtx,
+        req: hj_core::Request,
         upgrade: bool,
     ) -> Option<bridge::BridgeResp> {
-        req.extensions_mut()
-            .insert(RequestGeneration(self.holder.load_full()));
-        if !upgrade && let Some(response) = self.fast(&ctx, &req).await {
+        if !upgrade && let Some(response) = self.fast(&state, &ctx, &req).await {
             return Some(bridge::fast_response(response, ctx.direct_file_egress).await);
         }
+        // Only a request that crosses to the Tokio runtime carries its selected
+        // generation. Keep it in the bridge sideband so ordinary misses do not
+        // allocate and hash an `http::Extensions` map.
+        ctx.request_generation = Some(RequestGeneration(state));
         #[cfg(feature = "otel")]
         crate::otel::execution_path(false);
         self.bridge.dispatch(req, ctx).await
     }
 
-    async fn dispatch_h2(&self, ctx: BridgeCtx, mut req: hj_core::Request) -> hj_core::Response {
-        req.extensions_mut()
-            .insert(RequestGeneration(self.holder.load_full()));
+    #[cfg(feature = "otel")]
+    async fn dispatch_h2(
+        &self,
+        mut ctx: BridgeCtx,
+        mut req: hj_core::Request,
+    ) -> hj_core::Response {
+        let state = self.holder.load_full();
         #[cfg(feature = "otel")]
-        let trace = self.trace_request(&ctx, &mut req);
+        let trace = self.trace_request(&state, &ctx, &mut req);
         let future = async {
-            if let Some(response) = self.fast(&ctx, &req).await {
+            if let Some(response) = self.fast(&state, &ctx, &req).await {
                 return response;
             }
+            ctx.request_generation = Some(RequestGeneration(state));
             #[cfg(feature = "otel")]
             crate::otel::execution_path(false);
             self.bridge.dispatch_response(req, ctx).await
@@ -168,17 +172,17 @@ impl CoreHandler {
     }
 
     /// Try the on-core cache-hit fast path; `Some(resp)` if served without the bridge.
-    async fn fast(&self, ctx: &BridgeCtx, req: &hj_core::Request) -> Option<hj_core::Response> {
-        let st = req
-            .extensions()
-            .get::<RequestGeneration>()
-            .map(|snapshot| snapshot.0.clone())
-            .unwrap_or_else(|| self.holder.load_full());
+    async fn fast(
+        &self,
+        st: &Arc<ServerState>,
+        ctx: &BridgeCtx,
+        req: &hj_core::Request,
+    ) -> Option<hj_core::Response> {
         // Stamp Date here (insert-if-absent): the page cache strips the stored Date
         // expecting the serve boundary to re-add one, and the uring writers never do — the
         // tokio path stamps at server::stamp_date, this is its on-core fast-path twin.
         crate::pipeline::fast_serve(
-            &st,
+            st,
             &self.listener_name,
             ctx.peer.ip(),
             ctx.local,
@@ -726,10 +730,10 @@ fn build_pipeline_bridge(
     // for every bridged request (the closure runs concurrently across tokio workers).
     let lname = listener_name;
     let view = holder.into();
-    bridge::spawn_on_current_with_admission(admission, move |mut req, ctx: BridgeCtx| {
-        let state = req
-            .extensions_mut()
-            .remove::<RequestGeneration>()
+    bridge::spawn_on_current_with_admission(admission, move |req, mut ctx: BridgeCtx| {
+        let state = ctx
+            .request_generation
+            .take()
             .map(|snapshot| snapshot.0)
             .unwrap_or_else(|| view.load_full());
         let lname = lname.clone();
@@ -737,24 +741,32 @@ fn build_pipeline_bridge(
             // H1 already calls the same helper before bridging so it can retain
             // its historical refusal/connection semantics. H2/H3 arrive here
             // as one lease-backed full body; a second H1 pass is a no-op after
-            // successful decoding removed Content-Encoding.
-            let req = match request_body::finish_bridged_request(
-                req,
-                &state.body_budget,
-                state.serve_config.max_req_body_size,
-                state.request_decompression,
-            )
-            .await
-            {
-                Ok(req) => req,
-                Err(status) => {
-                    return hj_core::stamp_date(
-                        http::Response::builder()
-                            .status(status)
-                            .body(hj_core::Body::Empty)
-                            .expect("static request-decompression response"),
-                    );
+            // successful decoding removed Content-Encoding. Keep the decoder
+            // future out of the common bridge task entirely: its codec state is
+            // large, while an allocation on the explicitly encoded path is both
+            // bounded and negligible beside decompression.
+            let policy = state.request_decompression;
+            let req = if request_body::needs_bridged_decompression(&req, policy) {
+                match Box::pin(request_body::finish_bridged_request(
+                    req,
+                    &state.body_budget,
+                    state.serve_config.max_req_body_size,
+                    policy,
+                ))
+                .await
+                {
+                    Ok(req) => req,
+                    Err(status) => {
+                        return hj_core::stamp_date(
+                            http::Response::builder()
+                                .status(status)
+                                .body(hj_core::Body::Empty)
+                                .expect("static request-decompression response"),
+                        );
+                    }
                 }
+            } else {
+                req
             };
             // Stamp Date (insert-if-absent) on EVERY bridged response (H1/H2/H3): the uring
             // writers + native h2/h3 encoders don't add it and the cache strips the stored
@@ -965,10 +977,10 @@ fn per_core_https(
 
 /// Terminate TLS on a monoio io_uring connection, enforce mTLS, then serve H1/H2
 /// (by ALPN) over the encrypted stream via the bridge. The connection metadata
-/// (SNI, ALPN proto, SSL_* params, client-cert presence) is extracted by detaching
-/// the rustls `ServerConnection` (only public accessor), draining any pipelined
-/// post-handshake plaintext into the handler prefix (lossless), then reconstructing
-/// the stream to serve.
+/// (SNI, ALPN proto, SSL_* params, client-cert presence) is borrowed from the
+/// rustls `ServerConnection`. Any decrypted post-handshake plaintext becomes the
+/// handler prefix, while the TLS adapter and its raw-ciphertext read-ahead stay
+/// intact across the direct-write I/O wrapper transition.
 async fn handle_tls_bridged(
     mut stream: TcpStream,
     mut peer: SocketAddr,
@@ -1025,7 +1037,7 @@ async fn handle_tls_bridged(
         }
     }
     let handshake_timeout = state.serve_config.header_read_timeout;
-    let tls = match handshake_timeout {
+    let mut tls = match handshake_timeout {
         Some(d) => match monoio::time::timeout(d, acceptor.accept(stream)).await {
             Ok(Ok(t)) => t,
             Ok(Err(e)) => {
@@ -1045,22 +1057,22 @@ async fn handle_tls_bridged(
             }
         },
     };
-    // Detach the session to read the handshake metadata (the `session` field is not
-    // otherwise accessible), drain any early app-data, then rebuild the stream.
-    let (io, mut session) = tls.into_parts();
-    let sni: Option<Arc<str>> = session.server_name().map(Arc::from);
-    let proto = match session.alpn_protocol() {
+    let sni: Option<Arc<str>> = tls.session().server_name().map(Arc::from);
+    let proto = match tls.session().alpn_protocol() {
         Some(b"h2") => Proto::Http2,
         _ => Proto::Http1,
     };
-    let has_client_cert = session.peer_certificates().is_some_and(|c| !c.is_empty());
+    let has_client_cert = tls
+        .session()
+        .peer_certificates()
+        .is_some_and(|c| !c.is_empty());
     // Full-vs-resumed split sizes the resumption win the client-verify
     // `NoServerSessions` posture forfeits (every CF-cycled origin connection is a
     // full handshake today). Counted once, at handshake completion.
     {
         use std::sync::atomic::Ordering;
         let m = core.holder.load();
-        match session.handshake_kind() {
+        match tls.session().handshake_kind() {
             Some(rustls::HandshakeKind::Resumed) => {
                 m.metrics
                     .tls_handshakes_resumed
@@ -1074,7 +1086,7 @@ async fn handle_tls_bridged(
             None => {}
         }
     }
-    let tls_params = hj_tls::tls_params_from_conn(&session);
+    let tls_params = hj_tls::tls_params_from_conn(tls.session());
     // Application-layer mTLS (clientVerify=2): refuse a non-internal peer that
     // presented no valid client cert — mirrors server.rs::mtls_refused exactly.
     // On a RESUMED handshake `peer_certificates` is the chain rustls reinstated
@@ -1091,7 +1103,7 @@ async fn handle_tls_bridged(
     let mut prefix: Vec<u8> = Vec::new();
     {
         use std::io::Read;
-        let mut reader = session.reader();
+        let mut reader = tls.session_mut().reader();
         let mut buf = [0u8; 8192];
         loop {
             match reader.read(&mut buf) {
@@ -1111,6 +1123,7 @@ async fn handle_tls_bridged(
         mtls_required: require_client_cert,
         sni,
         tls: tls_params,
+        request_generation: None,
     };
 
     // kTLS path: upgrade the socket to kernel-TLS and serve plaintext over the RAW fd
@@ -1119,11 +1132,16 @@ async fn handle_tls_bridged(
     // schedule + no KeyUpdate on 1.2 ⇒ a 1.2 connection just falls through to userspace).
     #[cfg(feature = "ktls")]
     if let Some(kl) = conn_key_log {
-        let is_tls13 = session.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3);
-        let suite = session.negotiated_cipher_suite();
+        let is_tls13 = tls.session().protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3);
+        let suite = tls.session().negotiated_cipher_suite();
         if is_tls13 {
             match (kl.secrets(), suite) {
                 (Some((rx, tx)), Some(suite)) => {
+                    // kTLS needs ownership of the raw socket and rustls connection to
+                    // extract traffic secrets. Keep this destructive split confined to
+                    // the committed kernel-TLS path; every userspace fallback retains
+                    // the adapter's raw-ciphertext read-ahead via `map_io` below.
+                    let (io, session) = tls.into_parts();
                     use std::os::fd::AsRawFd;
                     let fd = io.as_raw_fd();
                     // Read the true post-handshake record sequence for each direction (tickets
@@ -1180,11 +1198,10 @@ async fn handle_tls_bridged(
 
     // Wrap the socket so monoio-rustls writes the encrypted bytes via a direct write(2)
     // syscall (not an io_uring write) — matching tokio's write path on loopback bulk egress.
-    // rustls/aws-lc-rs still does the AEAD; this only changes the socket write.
-    let stream = monoio_rustls::ServerTlsStream::new(
-        directio::DirectWriteSocket::new_for(io, proto != Proto::Http2),
-        session,
-    );
+    // rustls/aws-lc-rs still does the AEAD; this only changes the socket write. Mapping
+    // the I/O in place is essential: the adapter may have read ciphertext beyond the
+    // final handshake record which rustls has not consumed yet.
+    let stream = tls.map_io(|io| directio::DirectWriteSocket::new_for(io, proto != Proto::Http2));
     match proto {
         Proto::Http2 => serve_h2_bridged(stream, prefix, ctx, core, shutdown, None).await,
         _ => handle_h1_bridged(stream, prefix, ctx, core, shutdown, None).await,
@@ -1346,10 +1363,33 @@ async fn serve_h2_bridged<S>(
     // rate is connection-wide here; the per-context override is an H1 refinement).
     h2_cfg.bandwidth_limit = state.serve_config.bandwidth_limit;
 
+    // H2 clones its service captures for every stream.  Keep the connection-local
+    // handler behind one Arc so that does not clone every Arc-bearing field in
+    // CoreHandler (in particular the live and pinned ServerState generations).
+    let core = Arc::new(core);
     let service = move |req: hj_core::Request| {
         let core = core.clone();
         let ctx = ctx.clone();
-        async move { core.dispatch_h2(ctx, req).await }
+        #[cfg(feature = "otel")]
+        {
+            async move { core.dispatch_h2(ctx, req).await }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            // Keep the ordinary build's fast/bridge state machine directly in
+            // the service future.  An extra async dispatch wrapper made every
+            // FuturesUnordered node substantially larger on the H2 hot path.
+            async move {
+                let req = req;
+                let mut ctx = ctx;
+                let state = core.holder.load_full();
+                if let Some(response) = core.fast(&state, &ctx, &req).await {
+                    return response;
+                }
+                ctx.request_generation = Some(RequestGeneration(state));
+                core.bridge.dispatch_response(req, ctx).await
+            }
+        }
     };
     // `ktls_fd` (Some only for a kTLS connection) lets the h2 flush writev plaintext directly
     // from the OutQueue to the kernel-TLS socket (zero-copy); None ⇒ the coalesce path.
@@ -1398,13 +1438,6 @@ async fn handle_h1_bridged<S>(
     let mut throttle =
         hj_http::BandwidthThrottle::new(core.holder.load().serve_config.bandwidth_limit);
     loop {
-        let state = core.holder.load();
-        // Request-size caps from the LiteSpeed config (maxReqHeaderSize/maxReqBodySize),
-        // matching the tokio path — mirror hyper's `max_buf_size` 8 KiB floor for the head.
-        let max_head = state.serve_config.max_req_header_size.max(8192);
-        let max_body = state.serve_config.max_req_body_size;
-        // maxKeepAliveReq: 0 = unlimited; else close the connection after N requests.
-        let max_keepalive = state.serve_config.max_keepalive_requests;
         // Graceful drain: at a clean request boundary (no buffered bytes = idle
         // keep-alive), wait for either the next request OR the shutdown signal — on
         // shutdown, close the idle connection promptly instead of holding it open.
@@ -1421,7 +1454,9 @@ async fn handle_h1_bridged<S>(
             // keeps idle origin connections well past a 5s keepAliveTimeout, and an
             // unpadded H1 idle wait closes them almost immediately (constant
             // reconnect + TLS-handshake churn). H2 has padded to >=90s for a while.
-            let keep_alive_timeout = state
+            let keep_alive_timeout = core
+                .holder
+                .load()
                 .serve_config
                 .keep_alive_timeout
                 .map(|t| t.max(std::time::Duration::from_secs(90)));
@@ -1439,6 +1474,17 @@ async fn handle_h1_bridged<S>(
                 }
             }
         }
+        // Select the request's generation only after idle waiting has received
+        // bytes. Compatible SIGHUPs must therefore remain visible to the next
+        // request on a persistent H1 connection. This exact Arc is then used
+        // for intake limits, the on-core fast path and any bridge dispatch.
+        let state = core.holder.load_full();
+        // Request-size caps from the LiteSpeed config (maxReqHeaderSize/maxReqBodySize),
+        // matching the tokio path — mirror hyper's `max_buf_size` 8 KiB floor for the head.
+        let max_head = state.serve_config.max_req_header_size.max(8192);
+        let max_body = state.serve_config.max_req_body_size;
+        // maxKeepAliveReq: 0 = unlimited; else close the connection after N requests.
+        let max_keepalive = state.serve_config.max_keepalive_requests;
         // Parse a complete request head (drops the borrow before mutating `acc`).
         let request_start = std::time::Instant::now();
         let header_read_timeout = state.serve_config.header_read_timeout;
@@ -1702,8 +1748,8 @@ async fn handle_h1_bridged<S>(
             upgrade_ready = Some(ready);
         }
         #[cfg(feature = "otel")]
-        let mut trace = core.trace_request(&ctx, &mut req);
-        let dispatch = core.dispatch_h1(ctx.clone(), req, upgrade_ready.is_some());
+        let mut trace = core.trace_request(&state, &ctx, &mut req);
+        let dispatch = core.dispatch_h1(state, ctx.clone(), req, upgrade_ready.is_some());
         #[cfg(feature = "otel")]
         let response = match &trace {
             Some(trace) => crate::otel::in_context(trace.context(), dispatch).await,
@@ -3039,6 +3085,26 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .unwrap()
         });
         let bridge = bridge::spawn_bridge(1, |mut req: hj_core::Request, _ctx| async move {
+            if req.uri().path() == "/body" {
+                use http_body_util::BodyExt;
+
+                let body = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect test request body")
+                    .to_bytes();
+                let valid = body.len() == 64 * 1024 && body.iter().all(|byte| *byte == b'x');
+                return hj_core::text_response(
+                    if valid {
+                        http::StatusCode::OK
+                    } else {
+                        http::StatusCode::BAD_REQUEST
+                    },
+                    body.len().to_string(),
+                );
+            }
+
             if req.uri().path() == "/reject" {
                 return http::Response::builder()
                     .status(http::StatusCode::FORBIDDEN)
@@ -4123,6 +4189,115 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 .to_owned();
             let connection = rustls::ClientConnection::new(client_config, name).unwrap();
             websocket_client(rustls::StreamOwned::new(connection, socket), prefix);
+        });
+
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(std_listener).unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_tls_bridged(
+                stream,
+                peer,
+                local,
+                core,
+                acceptor,
+                false,
+                None,
+                CancellationToken::new(),
+                ListenerBinding::default(),
+            )
+            .await;
+        });
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn h1_tls_preserves_read_ahead_after_coalesced_finished_and_large_post() {
+        use std::io::{Read, Write};
+
+        let (_tokio_runtime, core) = websocket_test_core();
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+            .unwrap();
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = monoio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let mut client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let client_config = Arc::new(client_config);
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut socket = std::net::TcpStream::connect(local).unwrap();
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let name = rustls::pki_types::ServerName::try_from("localhost")
+                .unwrap()
+                .to_owned();
+            let mut connection = rustls::ClientConnection::new(client_config, name).unwrap();
+            connection.set_buffer_limit(Some(128 * 1024));
+
+            let mut request = format!(
+                "POST /body HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                64 * 1024
+            )
+            .into_bytes();
+            request.resize(request.len() + 64 * 1024, b'x');
+            // rustls buffers pre-handshake plaintext. Once the server flight is
+            // processed, the next write contains the client Finished followed by
+            // application records, reproducing a client that pipelines its POST.
+            connection.writer().write_all(&request).unwrap();
+
+            let mut initial_flight = Vec::new();
+            while connection.wants_write() {
+                assert!(connection.write_tls(&mut initial_flight).unwrap() > 0);
+            }
+            socket.write_all(&initial_flight).unwrap();
+            socket.flush().unwrap();
+
+            let mut sent_coalesced_large_flight = false;
+            while connection.is_handshaking() {
+                let read = connection.read_tls(&mut socket).unwrap();
+                assert!(read > 0, "server closed during TLS handshake");
+                connection.process_new_packets().unwrap();
+
+                if connection.wants_write() {
+                    let mut flight = Vec::new();
+                    while connection.wants_write() {
+                        assert!(connection.write_tls(&mut flight).unwrap() > 0);
+                    }
+                    sent_coalesced_large_flight |= flight.len() > 16 * 1024;
+                    socket.write_all(&flight).unwrap();
+                    socket.flush().unwrap();
+                }
+            }
+            assert!(
+                sent_coalesced_large_flight,
+                "fixture must coalesce Finished with more than one adapter read of POST data"
+            );
+
+            let mut stream = rustls::StreamOwned::new(connection, socket);
+            let head = read_h1_head(&mut stream);
+            assert!(head.starts_with(b"HTTP/1.1 200 OK\r\n"));
+            let mut body = [0u8; 5];
+            stream.read_exact(&mut body).unwrap();
+            assert_eq!(&body, b"65536");
         });
 
         let mut runtime = build_core_runtime().unwrap();

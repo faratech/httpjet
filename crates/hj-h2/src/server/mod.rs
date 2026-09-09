@@ -789,7 +789,11 @@ pub(super) struct OutQueue {
 mod completion_tests;
 
 impl OutQueue {
+    #[inline]
     fn finish_responses(&mut self, success: bool) {
+        if self.completions.is_empty() {
+            return;
+        }
         for completion in self.completions.drain(..) {
             completion.finish(if success {
                 hj_core::ResponseEnd::Complete
