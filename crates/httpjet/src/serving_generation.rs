@@ -64,7 +64,8 @@ impl From<Arc<ArcSwap<ServerState>>> for ServingView {
     }
 }
 
-/// Selected once before dispatch and carried through a fast-path miss into the
-/// Tokio bridge. Remote request headers cannot manufacture this extension.
+/// Selected once before dispatch and carried through a fast-path miss beside
+/// the request in the transport bridge context. Remote request data cannot
+/// manufacture or replace this snapshot.
 #[derive(Clone)]
 pub(crate) struct RequestGeneration(pub(crate) Arc<ServerState>);

@@ -3458,9 +3458,6 @@ async fn handle_h3_request(
         Err(_) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
     hj_core::coalesce_cookie_crumbs(req.headers_mut());
-    if let Some(generation) = request_generation {
-        req.extensions_mut().insert(generation);
-    }
     let ctx = BridgeCtx {
         peer,
         local,
@@ -3471,6 +3468,7 @@ async fn handle_h3_request(
         mtls_required: require_client_cert,
         sni,
         tls,
+        request_generation,
     };
     // A HEAD response must carry no DATA (RFC 9114): even if the pipeline streams a body,
     // emit headers only and don't open a streamed body.
@@ -4019,7 +4017,7 @@ mod h3_codec_tests {
 
     #[tokio::test]
     async fn accepted_quic_view_pins_limits_and_dispatch_generation() {
-        use crate::serving_generation::{RequestGeneration, ServingView};
+        use crate::serving_generation::ServingView;
         use std::sync::atomic::Ordering;
         let root = std::env::temp_dir().join(format!(
             "hj-quic-generation-{}-{}",
@@ -4076,13 +4074,9 @@ mod h3_codec_tests {
         // publication travels through dispatch, rather than reloading live state.
         let seen = Arc::new(AtomicU64::new(0));
         let observed = seen.clone();
-        let bridge = crate::uring::bridge::spawn_on_current(2, move |req, _| {
+        let bridge = crate::uring::bridge::spawn_on_current(2, move |_req, ctx| {
             observed.store(
-                req.extensions()
-                    .get::<RequestGeneration>()
-                    .unwrap()
-                    .0
-                    .generation,
+                ctx.request_generation.as_ref().unwrap().0.generation,
                 Ordering::SeqCst,
             );
             async { http::Response::new(hj_core::Body::Empty) }

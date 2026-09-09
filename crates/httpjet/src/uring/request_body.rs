@@ -94,6 +94,26 @@ impl ContentCoding {
     }
 }
 
+#[inline]
+fn enabled_content_coding(
+    headers: &HeaderMap,
+    policy: RequestDecompression,
+) -> Option<ContentCoding> {
+    ContentCoding::from_headers(headers).filter(|coding| policy.allows(*coding))
+}
+
+/// Whether a bridged request needs the asynchronous collect/decode path.
+///
+/// Keep this synchronous probe outside the bridge task's ordinary future so
+/// requests without an enabled coding do not carry decoder state at all.
+#[inline]
+pub(super) fn needs_bridged_decompression(
+    req: &hj_core::Request,
+    policy: RequestDecompression,
+) -> bool {
+    enabled_content_coding(req.headers(), policy).is_some()
+}
+
 pub(super) fn finish_body(
     headers: &mut HeaderMap,
     data: Vec<u8>,
@@ -127,6 +147,14 @@ pub(super) async fn finish_bridged_request(
     max_body: usize,
     policy: RequestDecompression,
 ) -> Result<hj_core::Request, StatusCode> {
+    // The overwhelmingly common request has no supported Content-Encoding.
+    // Preserve its body and parts verbatim instead of collecting, unboxing and
+    // rebuilding the request merely for decode_body() to return the same bytes.
+    // This also makes H1's second bridge-side pass free after finish_body()
+    // removed a coding decoded on the monoio intake path.
+    if !needs_bridged_decompression(&req, policy) {
+        return Ok(req);
+    }
     let (mut parts, body) = req.into_parts();
     let encoded = body
         .collect()
@@ -151,12 +179,14 @@ fn decode_body(
     max_body: usize,
     policy: RequestDecompression,
 ) -> Result<Bytes, StatusCode> {
-    let Some(coding) = ContentCoding::from_headers(headers) else {
-        return Ok(encoded);
-    };
-    if encoded.is_empty() || !policy.allows(coding) {
+    // Bodyless requests dominate GET traffic. Avoid even probing the header
+    // map for Content-Encoding when there is nothing a decoder could consume.
+    if encoded.is_empty() {
         return Ok(encoded);
     }
+    let Some(coding) = enabled_content_coding(headers, policy) else {
+        return Ok(encoded);
+    };
 
     // Charge the codec before constructing it. This makes concurrent decoder
     // windows participate in the same process-wide request-body ledger as the
@@ -619,5 +649,73 @@ mod tests {
         assert_eq!(budget.in_flight(), body.len() as u64);
         drop(body);
         assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn disabled_or_unencoded_bridged_body_is_not_polled_or_rebuilt() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+
+        struct MustNotPoll;
+        impl http_body::Body for MustNotPoll {
+            type Data = Bytes;
+            type Error = hj_core::BoxError;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                panic!("unencoded bridge fast path must preserve the body without polling it")
+            }
+        }
+
+        let budget = Arc::new(BodyBufferBudget::new(1024));
+        for coding in [None, Some("unknown"), Some("br"), Some("zstd")] {
+            let body = http_body_util::BodyExt::boxed(MustNotPoll);
+            let mut builder = http::Request::builder()
+                .method("POST")
+                .uri("/opaque")
+                .header("x-test", "retained");
+            if let Some(coding) = coding {
+                builder = builder.header(header::CONTENT_ENCODING, coding);
+            }
+            let mut req = builder.body(body).unwrap();
+            req.extensions_mut().insert(42_u32);
+            assert!(!needs_bridged_decompression(
+                &req,
+                RequestDecompression::default()
+            ));
+
+            let req = finish_bridged_request(req, &budget, 1024, RequestDecompression::default())
+                .await
+                .unwrap();
+            assert_eq!(req.uri(), "/opaque");
+            assert_eq!(req.headers()["x-test"], "retained");
+            assert_eq!(req.extensions().get::<u32>(), Some(&42));
+        }
+
+        for (coding, policy) in [
+            ("gzip", RequestDecompression::default()),
+            (
+                "br",
+                RequestDecompression {
+                    brotli: true,
+                    zstd: false,
+                },
+            ),
+            (
+                "zstd",
+                RequestDecompression {
+                    brotli: false,
+                    zstd: true,
+                },
+            ),
+        ] {
+            let req = http::Request::builder()
+                .header(header::CONTENT_ENCODING, coding)
+                .body(hj_core::empty_incoming())
+                .unwrap();
+            assert!(needs_bridged_decompression(&req, policy));
+        }
     }
 }

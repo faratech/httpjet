@@ -1096,12 +1096,54 @@ fn strip_empty_query(uri: &http::Uri) -> Option<http::Uri> {
 /// while keeping cache-safety, compression and transport headers under httpjet's
 /// final control. Every full and on-core response funnel calls this helper.
 async fn apply_response_transforms(state: &ServerState, ctx: &ReqCtx, resp: &mut Response) {
-    state.extensions.run_response_transforms(ctx, resp).await;
+    // The distributed binary ships an empty compile-time registry. Avoid
+    // constructing and polling its no-op async dispatcher on every response.
+    if !state.extensions.is_empty() {
+        state.extensions.run_response_transforms(ctx, resp).await;
+    }
     for transform in &state.transforms {
         transform.transform(ctx, resp).await;
     }
 }
 
+/// Default-build entry point: return the pipeline future directly so every
+/// request does not pay for a redundant outer async state machine. The OTel
+/// build keeps its wrapper below because it may need to establish trace context
+/// around that future.
+#[cfg(not(feature = "otel"))]
+#[allow(clippy::too_many_arguments)]
+pub fn handle<'a>(
+    state: Arc<ServerState>,
+    listener: &'a str,
+    peer_ip: IpAddr,
+    local_addr: std::net::SocketAddr,
+    peer_port: u16,
+    is_tls: bool,
+    peer_unix: bool,
+    mtls_required: bool,
+    tls: Option<hj_core::TlsParams>,
+    proto: Proto,
+    sni: Option<&'a str>,
+    req: Request,
+) -> impl std::future::Future<Output = Response> + 'a {
+    handle_inner(
+        state,
+        listener,
+        peer_ip,
+        local_addr,
+        peer_port,
+        is_tls,
+        peer_unix,
+        mtls_required,
+        tls,
+        proto,
+        sni,
+        req,
+    )
+}
+
+#[cfg(feature = "otel")]
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     state: Arc<ServerState>,
     listener: &str,
@@ -1116,7 +1158,6 @@ pub async fn handle(
     sni: Option<&str>,
     req: Request,
 ) -> Response {
-    #[cfg(feature = "otel")]
     if crate::otel::enabled() {
         let mut req = req;
         let transport = req
@@ -1466,22 +1507,26 @@ async fn handle_inner(
             ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
         }
         set_redirect_guard(&mut ctx, req.uri(), &req_host);
-        match state.extensions.run_pre_handlers(&ctx, &req).await {
-            Ok(hj_extension::PreHandlerDecision::Continue) => {
-                dispatch(&state, host_foreign, req_host, &mut ctx, req).await
+        if state.extensions.has_pre_handlers() {
+            match state.extensions.run_pre_handlers(&ctx, &req).await {
+                Ok(hj_extension::PreHandlerDecision::Continue) => {
+                    dispatch(&state, host_foreign, req_host, &mut ctx, req).await
+                }
+                Ok(hj_extension::PreHandlerDecision::Respond(response)) => response,
+                Err(error) => {
+                    let status = error.status();
+                    tracing::warn!(
+                        request_id = %ctx.request_id,
+                        vhost = %ctx.vhost_name,
+                        status = status.as_u16(),
+                        error = %error,
+                        "compile-time pre-handler extension failed"
+                    );
+                    error_page(status)
+                }
             }
-            Ok(hj_extension::PreHandlerDecision::Respond(response)) => response,
-            Err(error) => {
-                let status = error.status();
-                tracing::warn!(
-                    request_id = %ctx.request_id,
-                    vhost = %ctx.vhost_name,
-                    status = status.as_u16(),
-                    error = %error,
-                    "compile-time pre-handler extension failed"
-                );
-                error_page(status)
-            }
+        } else {
+            dispatch(&state, host_foreign, req_host, &mut ctx, req).await
         }
     };
 
@@ -3018,7 +3063,9 @@ async fn dispatch(
     // ---- 7. Suffix routing: LSAPI (php/html) or static -------------------
     // Reuse the split resolved once above (B5) — `cur_path` is unchanged since.
     if let Some((script_abs, script_name, path_info)) = script_split {
-        if let Some(handler_name) = fastcgi_handler_for_script(ctx, &script_abs) {
+        if state.has_cgi_script_routes
+            && let Some(handler_name) = fastcgi_handler_for_script(ctx, &script_abs)
+        {
             let Some(handler) = state
                 .fastcgi_handler(&ctx.vhost_name, handler_name)
                 .cloned()

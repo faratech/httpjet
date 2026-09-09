@@ -66,22 +66,26 @@ pub(super) fn split_script_path(
     // resolution and authorization path. Dispatch later selects FastCGI only
     // when the named processor is explicitly type=fcgi; unsupported CGI still
     // resolves as executable and fails 503 rather than serving source bytes.
-    let cgi_suffixes: Vec<String> = ctx
-        .vhost
-        .script_handlers
-        .iter()
-        .filter(|handler| handler.kind == hj_core::config::ContextKind::Cgi)
-        .map(|handler| handler.suffix.to_ascii_lowercase())
-        .collect();
-    let php_suffixes = if cgi_suffixes
-        .iter()
-        .all(|suffix| php_suffixes.contains(suffix))
-    {
+    let php_suffixes = if !state.has_cgi_script_routes {
         php_suffixes
     } else {
-        let mut combined = php_suffixes.into_owned();
-        combined.extend(cgi_suffixes);
-        std::borrow::Cow::Owned(combined)
+        let cgi_suffixes: Vec<String> = ctx
+            .vhost
+            .script_handlers
+            .iter()
+            .filter(|handler| handler.kind == hj_core::config::ContextKind::Cgi)
+            .map(|handler| handler.suffix.to_ascii_lowercase())
+            .collect();
+        if cgi_suffixes
+            .iter()
+            .all(|suffix| php_suffixes.contains(suffix))
+        {
+            php_suffixes
+        } else {
+            let mut combined = php_suffixes.into_owned();
+            combined.extend(cgi_suffixes);
+            std::borrow::Cow::Owned(combined)
+        }
     };
     // Hot-path gate: only chains that actually carry a `SetHandler`/`AddHandler`/
     // `AddType` directive pay the per-prefix scope-match cost. Bool-field scan over

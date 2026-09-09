@@ -69,12 +69,97 @@ impl<IO, C> Stream<IO, C> {
         (self.io, self.session)
     }
 
+    /// Borrow the rustls connection without detaching it from the transport
+    /// adapter's read-ahead and pending-write buffers.
+    #[inline]
+    pub fn session(&self) -> &C {
+        &self.session
+    }
+
+    /// Mutably borrow the rustls connection without detaching it from the
+    /// transport adapter's read-ahead and pending-write buffers.
+    #[inline]
+    pub fn session_mut(&mut self) -> &mut C {
+        &mut self.session
+    }
+
+    /// Replace only the underlying I/O object, retaining the rustls connection
+    /// and both adapter buffers exactly as they stood before the mapping.
+    ///
+    /// This is the lossless way to wrap an accepted stream after its handshake:
+    /// [`Stream::into_parts`] intentionally returns only the public I/O/session
+    /// pair and therefore cannot preserve ciphertext already read ahead by the
+    /// adapter.
+    #[inline]
+    pub fn map_io<IO2, F>(self, map: F) -> Stream<IO2, C>
+    where
+        F: FnOnce(IO) -> IO2,
+    {
+        Stream {
+            io: map(self.io),
+            session: self.session,
+            r_buffer: self.r_buffer,
+            w_buffer: self.w_buffer,
+        }
+    }
+
     pub(crate) fn map_conn<C2, F: FnOnce(C) -> C2>(self, f: F) -> Stream<IO, C2> {
         Stream {
             io: self.io,
             session: f(self.session),
             r_buffer: self.r_buffer,
             w_buffer: self.w_buffer,
+        }
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use std::future::Future;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
+
+    use super::{Stream, WriteBuffer};
+
+    fn ready<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("in-memory I/O unexpectedly yielded"),
+        }
+    }
+
+    #[test]
+    fn map_io_preserves_session_and_adapter_buffers() {
+        let session = Arc::new("session-marker");
+        let mut stream = Stream::new("original-io", session.clone());
+
+        let mut read_ahead: &[u8] = b"ciphertext-read-ahead";
+        assert_eq!(
+            ready(stream.r_buffer.do_io(&mut read_ahead)).unwrap(),
+            b"ciphertext-read-ahead".len()
+        );
+        stream.w_buffer.write_all(b"pending-ciphertext").unwrap();
+
+        let mut mapped = stream.map_io(|io| {
+            assert_eq!(io, "original-io");
+            "wrapped-io"
+        });
+        assert_eq!(mapped.io, "wrapped-io");
+        assert!(Arc::ptr_eq(mapped.session(), &session));
+
+        let mut received = [0u8; 21];
+        mapped.r_buffer.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"ciphertext-read-ahead");
+        match &mapped.w_buffer {
+            WriteBuffer::Safe(buffer) => assert_eq!(
+                buffer.buffer.as_ref().expect("write buffer").len(),
+                b"pending-ciphertext".len()
+            ),
+            #[cfg(feature = "unsafe_io")]
+            WriteBuffer::Unsafe(_) => panic!("safe constructor selected unsafe buffer"),
         }
     }
 }

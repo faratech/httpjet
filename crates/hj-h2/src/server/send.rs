@@ -140,7 +140,14 @@ pub(super) fn begin_response(
     block_scratch: &mut Vec<u8>,
 ) {
     let (mut head, body) = response.into_parts();
-    let mut completion = head.extensions.remove::<hj_core::ResponseCompletion>();
+    // ResponseCompletion is opt-in (currently OpenTelemetry). The normal
+    // production response has no extensions, so avoid a TypeId/hash-table
+    // lookup on every H2 response.
+    let mut completion = if head.extensions.is_empty() {
+        None
+    } else {
+        head.extensions.remove::<hj_core::ResponseCompletion>()
+    };
     // §8.2.2: connection-specific ("hop-by-hop") fields are illegal on an h2 response — strip
     // them before encoding so a backend that emits e.g. `Connection`/`Transfer-Encoding`
     // (PHP over LSAPI, a proxied upstream) can't produce a malformed frame stream.
@@ -223,7 +230,9 @@ pub(super) fn begin_response(
 
     let headers_only = |out: &mut OutQueue, completion: Option<hj_core::ResponseCompletion>| {
         out.frames(|b| write_field_block(b, stream_id, flags::END_STREAM, block, mf));
-        out.completions.extend(completion);
+        if let Some(completion) = completion {
+            out.completions.push(completion);
+        }
     };
     let headers_open = |out: &mut OutQueue| {
         out.frames(|b| write_field_block(b, stream_id, 0, block, mf));
@@ -490,7 +499,9 @@ fn pump_one_frame(
         st.window -= n as i64;
         if last {
             st.done = true;
-            out.completions.extend(st.completion.take());
+            if let Some(completion) = st.completion.take() {
+                out.completions.push(completion);
+            }
         }
         return true;
     }
@@ -507,7 +518,9 @@ fn pump_one_frame(
             .write(b)
         });
         st.done = true;
-        out.completions.extend(st.completion.take());
+        if let Some(completion) = st.completion.take() {
+            out.completions.push(completion);
+        }
         return true;
     }
     false

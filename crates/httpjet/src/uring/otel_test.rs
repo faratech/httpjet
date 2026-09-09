@@ -84,6 +84,7 @@ fn traced_fast_and_bridged_requests() {
         mtls_required: false,
         sni: None,
         tls: None,
+        request_generation: None,
     };
     // Drive the same H2 service dispatcher with both on-core and bridged requests.
     runtime.block_on(async {
