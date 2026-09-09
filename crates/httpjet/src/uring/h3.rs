@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
+use arc_swap::ArcSwap;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use bytes::{Bytes, BytesMut};
@@ -42,6 +43,84 @@ const H3_EXCESSIVE_LOAD: u32 = 0x0107;
 const H3_SETTINGS_ERROR: u32 = 0x0109;
 const H3_MISSING_SETTINGS: u32 = 0x010a;
 const MAX_SETTINGS_PAYLOAD: usize = 64 * 1024;
+
+/// One coherent accept-time QUIC policy. The quinn configuration and serving
+/// view must move together: a connection may use either the old or new policy
+/// during publication, but must never combine one generation's TLS verifier
+/// with another generation's request policy.
+struct QuicServerPolicy {
+    config: Arc<ServerConfig>,
+    serving_view: Option<crate::serving_generation::ServingView>,
+    require_client_cert: bool,
+}
+
+/// Fully validated replacement for future QUIC handshakes. Preparing this is
+/// fallible; publishing it is one infallible ArcSwap store.
+pub(crate) struct PreparedQuicPolicy(Arc<QuicServerPolicy>);
+
+impl PreparedQuicPolicy {
+    pub(crate) fn prepare(
+        serving_view: crate::serving_generation::ServingView,
+        rustls: Arc<rustls::ServerConfig>,
+        require_client_cert: bool,
+    ) -> io::Result<Self> {
+        Ok(Self(Arc::new(QuicServerPolicy {
+            config: Arc::new(server_config(rustls)?),
+            serving_view: Some(serving_view),
+            require_client_cert,
+        })))
+    }
+
+    fn prepare_unscoped(
+        rustls: Arc<rustls::ServerConfig>,
+        require_client_cert: bool,
+    ) -> io::Result<Self> {
+        Ok(Self(Arc::new(QuicServerPolicy {
+            config: Arc::new(server_config(rustls)?),
+            serving_view: None,
+            require_client_cert,
+        })))
+    }
+
+    pub(crate) fn is_prepared_for(&self, epoch: &Arc<()>) -> bool {
+        self.0
+            .serving_view
+            .as_ref()
+            .is_some_and(|view| Arc::ptr_eq(&view.trust_epoch(), epoch))
+    }
+}
+
+/// Shared by the coordinator and every per-core endpoint. Workers observe the
+/// replacement without restarting or rebinding UDP sockets; quinn-proto applies
+/// `set_server_config` only to future connections.
+#[derive(Clone)]
+pub(crate) struct QuicReloadHandle(Arc<ArcSwap<QuicServerPolicy>>);
+
+impl QuicReloadHandle {
+    fn new(initial: PreparedQuicPolicy) -> Self {
+        Self(Arc::new(ArcSwap::from(initial.0)))
+    }
+
+    pub(crate) fn publish(&self, next: PreparedQuicPolicy) {
+        self.0.store(next.0);
+    }
+
+    fn load_full(&self) -> Arc<QuicServerPolicy> {
+        self.0.load_full()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(&self) -> (bool, Option<Arc<()>>) {
+        let policy = self.load_full();
+        (
+            policy.require_client_cert,
+            policy
+                .serving_view
+                .as_ref()
+                .map(crate::serving_generation::ServingView::trust_epoch),
+        )
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct H3RequestLimits {
@@ -70,6 +149,7 @@ impl H3RequestLimits {
 #[derive(Clone)]
 pub(crate) struct H3RuntimeConfig {
     config: Arc<dyn Fn() -> (H3RequestLimits, u32) + Send + Sync>,
+    serving_view: Option<crate::serving_generation::ServingView>,
     active_conns: Arc<AtomicU64>,
     /// (#236 residual) Server-wide buffered-body cap shared with H1/H2/LSAPI. H3 commits
     /// the whole request-stream buffer before parse, so the reservation is taken when a
@@ -89,9 +169,18 @@ impl H3RuntimeConfig {
     {
         Self {
             config: Arc::new(config),
+            serving_view: None,
             active_conns,
             body_budget,
         }
+    }
+
+    pub(crate) fn with_serving_view(
+        mut self,
+        view: crate::serving_generation::ServingView,
+    ) -> Self {
+        self.serving_view = Some(view);
+        self
     }
 
     fn request_limits(&self) -> H3RequestLimits {
@@ -100,6 +189,36 @@ impl H3RuntimeConfig {
 
     fn max_connections(&self) -> u32 {
         (self.config)().1
+    }
+
+    #[cfg(test)]
+    fn accepted_state(&self, permit: super::ConnectionPermit, epoch: u64) -> H3State {
+        H3State {
+            _connection_permit: Some(permit),
+            serving_view: self.serving_view.as_ref().map(|view| view.pin_connection()),
+            epoch,
+            body_budget: Some(self.body_budget.clone()),
+            ..Default::default()
+        }
+    }
+
+    fn accepted_state_with_policy(
+        &self,
+        permit: super::ConnectionPermit,
+        epoch: u64,
+        policy: &QuicServerPolicy,
+    ) -> H3State {
+        H3State {
+            _connection_permit: Some(permit),
+            serving_view: policy
+                .serving_view
+                .as_ref()
+                .map(|view| view.pin_connection()),
+            require_client_cert: policy.require_client_cert,
+            epoch,
+            body_budget: Some(self.body_budget.clone()),
+            ..Default::default()
+        }
     }
 }
 
@@ -238,6 +357,7 @@ fn per_core_h3(core: usize, std_sock: std::net::UdpSocket, rustls_cfg: Arc<rustl
 #[derive(Default)]
 struct H3State {
     _connection_permit: Option<super::ConnectionPermit>,
+    serving_view: Option<crate::serving_generation::ServingView>,
     connected: bool,
     control_setup: bool,
     control_stream: Option<StreamId>,
@@ -278,6 +398,9 @@ struct H3State {
     total_req_bytes: std::rc::Rc<std::cell::Cell<usize>>,
     /// Set once a required-client-certificate decision closes the connection.
     rejected: bool,
+    /// Accept-time mTLS policy. Established connections retain the decision
+    /// from the QUIC configuration that authenticated their handshake.
+    require_client_cert: bool,
     /// Encoded response bytes not yet fully written to the send stream, with the
     /// byte offset already accepted. QUIC stream flow control bounds how much
     /// `SendStream::write` accepts at once, so a large response (> the peer's stream
@@ -295,6 +418,31 @@ struct H3State {
     /// a NEW connection) must be dropped — guarded by comparing this epoch (see
     /// [`Completion`] / `write_completion`).
     epoch: u64,
+}
+
+impl H3State {
+    fn request_snapshot(
+        &self,
+        fallback: H3RequestLimits,
+    ) -> (
+        H3RequestLimits,
+        Option<crate::serving_generation::RequestGeneration>,
+    ) {
+        let generation = self
+            .serving_view
+            .as_ref()
+            .map(|view| crate::serving_generation::RequestGeneration(view.load_full()));
+        let limits = generation
+            .as_ref()
+            .map(|generation| {
+                H3RequestLimits::new(
+                    generation.0.serve_config.max_req_header_size,
+                    generation.0.serve_config.max_req_body_size,
+                )
+            })
+            .unwrap_or(fallback);
+        (limits, generation)
+    }
 }
 
 #[derive(Default)]
@@ -338,9 +486,9 @@ struct Completion {
 /// the body flows out as the backend produces it instead of being buffered whole.
 enum CompletionKind {
     /// Whole encoded response (HEADERS [+ DATA]) — finish the stream once drained.
-    Full(Vec<u8>),
+    Full(Vec<u8>, Option<hj_core::ResponseCompletion>),
     /// HEADERS frame only; DATA `Chunk`s follow. The stream stays open until `Chunk{fin}`.
-    Head(Vec<u8>),
+    Head(Vec<u8>, Option<hj_core::ResponseCompletion>),
     /// One DATA payload; the driver emits its frame header without copying the payload.
     /// `fin` marks the last chunk (then finish the stream).
     Chunk {
@@ -357,8 +505,27 @@ enum CompletionKind {
 /// Streamed DATA keeps the bridge's original `Bytes` and an inline frame header, avoiding both
 /// copies formerly made while framing and appending each chunk.
 struct PendingSend {
+    completion: Option<hj_core::ResponseCompletion>,
     parts: std::collections::VecDeque<PendingPart>,
     fin: bool,
+}
+impl PendingSend {
+    /// Report completion only after every queued byte has entered QUIC and its
+    /// FIN is accepted. This is not acknowledgement by the remote application.
+    fn finish_if_drained(&mut self, finish: impl FnOnce() -> bool) -> bool {
+        if !self.fin || !self.parts.is_empty() {
+            return false;
+        }
+        let accepted = finish();
+        if let Some(completion) = self.completion.take() {
+            completion.finish(if accepted {
+                hj_core::ResponseEnd::Complete
+            } else {
+                hj_core::ResponseEnd::Cancelled
+            });
+        }
+        true
+    }
 }
 
 enum PendingPart {
@@ -1459,7 +1626,6 @@ fn service_conn(
     h3: &mut HashMap<ConnectionHandle, H3State>,
     hd: ConnectionHandle,
     now: Instant,
-    require_client_cert: bool,
     accepting_requests: bool,
 ) {
     let due = conns
@@ -1503,7 +1669,11 @@ fn service_conn(
                         })
                 });
                 let eligible = conns.get(&hd).is_some_and(|conn| {
-                    h3_client_eligible(require_client_cert, leaf.is_some(), conn.remote_address())
+                    h3_client_eligible(
+                        st.require_client_cert,
+                        leaf.is_some(),
+                        conn.remote_address(),
+                    )
                 });
                 if eligible {
                     st.client_leaf = leaf;
@@ -1758,7 +1928,7 @@ async fn drive_connections<H, Fut>(
 {
     let handles: Vec<ConnectionHandle> = conns.keys().copied().collect();
     for hd in handles {
-        service_conn(endpoint, conns, h3, hd, now, false, true);
+        service_conn(endpoint, conns, h3, hd, now, true);
         if h3.get(&hd).is_some_and(|state| state.rejected) {
             flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
             continue;
@@ -1872,11 +2042,7 @@ fn pump_stream(conn: &mut quinn_proto::Connection, st: &mut H3State, id: StreamI
     let mut cancelled = false;
     let done = loop {
         let Some(part) = entry.parts.front_mut() else {
-            if entry.fin {
-                let _ = ss.finish();
-                break true;
-            }
-            break false;
+            break entry.finish_if_drained(|| ss.finish().is_ok());
         };
         match part.write(&mut ss) {
             Ok(true) => {
@@ -1925,21 +2091,23 @@ async fn write_completion(
     };
     match kind {
         // A whole buffered response: send and finish when drained.
-        CompletionKind::Full(resp) => {
+        CompletionKind::Full(resp, completion) => {
             st.request_cancellations.remove(&stream);
             st.pending.insert(
                 stream,
                 PendingSend {
+                    completion,
                     parts: std::iter::once(PendingPart::contiguous(resp)).collect(),
                     fin: true,
                 },
             );
         }
         // HEADERS of a streamed response: DATA chunks follow, so don't finish yet.
-        CompletionKind::Head(head) => {
+        CompletionKind::Head(head, completion) => {
             st.pending.insert(
                 stream,
                 PendingSend {
+                    completion,
                     parts: std::iter::once(PendingPart::contiguous(head)).collect(),
                     fin: false,
                 },
@@ -1963,7 +2131,11 @@ async fn write_completion(
         // a clean finish, so the peer sees the body was truncated (mirrors the H1 path).
         CompletionKind::Abort => {
             st.request_cancellations.remove(&stream);
-            st.pending.remove(&stream);
+            if let Some(mut pending) = st.pending.remove(&stream) {
+                if let Some(completion) = pending.completion.take() {
+                    completion.finish(hj_core::ResponseEnd::Error);
+                }
+            }
             let _ = conn
                 .send_stream(stream)
                 .reset(quinn_proto::VarInt::from_u32(0x0102));
@@ -1993,7 +2165,6 @@ async fn drive_one_conn(
     now: Instant,
     local: SocketAddr,
     bridge: &Bridge,
-    require_client_cert: bool,
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     comp_tx: &flume::Sender<Completion>,
     request_limits: H3RequestLimits,
@@ -2003,20 +2174,16 @@ async fn drive_one_conn(
     if !conns.contains_key(&hd) {
         return false;
     }
-    service_conn(
-        endpoint,
-        conns,
-        h3,
-        hd,
-        now,
-        require_client_cert,
-        accepting_requests,
-    );
+    service_conn(endpoint, conns, h3, hd, now, accepting_requests);
     if h3.get(&hd).is_some_and(|state| state.rejected) {
         return flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
     }
     let epoch = h3.get(&hd).map(|s| s.epoch).unwrap_or(0);
     let st = h3.entry(hd).or_default();
+    let require_client_cert = st.require_client_cert;
+    // One compatible snapshot supplies both parsing limits and bridge dispatch.
+    // It is selected before reading this batch, not later on the Tokio runtime.
+    let (request_limits, request_generation) = st.request_snapshot(request_limits);
     let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
     let mut finished = Vec::new();
     for id in req_ids {
@@ -2123,6 +2290,7 @@ async fn drive_one_conn(
         st.request_cancellations.insert(id, cancel.clone());
         let bridge = bridge.clone();
         let tx = comp_tx.clone();
+        let request_generation = request_generation.clone();
         // spawn() is synchronous (no await) — `st`'s borrow of `h3` is not held across an await.
         let work = async move {
             let _g = guard; // frees the in-flight slot on completion / drop / panic
@@ -2144,18 +2312,24 @@ async fn drive_one_conn(
                 &bridge,
                 require_client_cert,
                 request_limits,
+                request_generation,
             )
             .await;
             drop(charge);
             let _ = async {
-                match outcome {
-                    H3Outcome::Full(resp) => {
-                        send(CompletionKind::Full(resp)).await.map_err(|_| ())?;
+                let H3Outcome { body, completion } = outcome;
+                match body {
+                    H3Body::Full(resp) => {
+                        send(CompletionKind::Full(resp, completion))
+                            .await
+                            .map_err(|_| ())?;
                     }
-                    H3Outcome::Stream { head, mut rx } => {
+                    H3Body::Stream { head, mut rx } => {
                         // The driver is the sole stream writer: send the HEADERS, then forward each
                         // DATA chunk in order. Each chunk is acknowledged only after QUIC drains it.
-                        send(CompletionKind::Head(head)).await.map_err(|_| ())?;
+                        send(CompletionKind::Head(head, completion))
+                            .await
+                            .map_err(|_| ())?;
                         loop {
                             match rx.recv().await {
                                 Some(Ok(chunk)) => {
@@ -2215,6 +2389,7 @@ async fn recv_drain(
     h3: &mut HashMap<ConnectionHandle, H3State>,
     epoch_ctr: &mut u64,
     runtime: &H3RuntimeConfig,
+    policy: &QuicServerPolicy,
     accepting_connections: bool,
     now: Instant,
 ) -> std::collections::HashSet<ConnectionHandle> {
@@ -2320,7 +2495,12 @@ async fn recv_drain(
                         }
                         DatagramEvent::NewConnection(incoming) => {
                             scratch.clear();
-                            let permit = accepting_connections.then(|| {
+                            let permit = (accepting_connections
+                                && policy
+                                    .serving_view
+                                    .as_ref()
+                                    .is_none_or(|view| view.is_current_trust_epoch()))
+                            .then(|| {
                                 super::ConnectionPermit::try_acquire(
                                     runtime.active_conns.clone(),
                                     runtime.max_connections(),
@@ -2343,12 +2523,8 @@ async fn recv_drain(
                                     conns.insert(handle, conn);
                                     h3.insert(
                                         handle,
-                                        H3State {
-                                            _connection_permit: Some(permit),
-                                            epoch: *epoch_ctr,
-                                            body_budget: Some(runtime.body_budget.clone()),
-                                            ..Default::default()
-                                        },
+                                        runtime
+                                            .accepted_state_with_policy(permit, *epoch_ctr, policy),
                                     );
                                     affected.insert(handle);
                                 }
@@ -2405,9 +2581,9 @@ async fn pump(
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     bridge: &Bridge,
     local: SocketAddr,
-    require_client_cert: bool,
     comp_tx: &flume::Sender<Completion>,
     runtime: &H3RuntimeConfig,
+    policy: &QuicServerPolicy,
     accepting: bool,
     mut to_drive: std::collections::HashSet<ConnectionHandle>,
 ) {
@@ -2430,7 +2606,6 @@ async fn pump(
                 now,
                 local,
                 bridge,
-                require_client_cert,
                 inflight,
                 comp_tx,
                 runtime.request_limits(),
@@ -2445,7 +2620,7 @@ async fn pump(
         // Process ACKs our sends elicited so cwnd/loss-detection stay current.
         for hd in recv_drain(
             udp, udp_state, recv_bufs, recv_metas, scratch, tx_scratch, endpoint, conns, h3,
-            epoch_ctr, runtime, accepting, now,
+            epoch_ctr, runtime, policy, accepting, now,
         )
         .await
         {
@@ -2507,9 +2682,11 @@ async fn endpoint_loop_concurrent(
     mut endpoint: Endpoint,
     local: SocketAddr,
     bridge: Bridge,
-    require_client_cert: bool,
+    policy_handle: QuicReloadHandle,
     runtime: H3RuntimeConfig,
     shutdown: CancellationToken,
+    ready: super::WorkerReadyTx,
+    activation: super::worker_group::ActivationGate,
 ) -> io::Result<()> {
     let mut conns: HashMap<ConnectionHandle, quinn_proto::Connection> = HashMap::new();
     let mut h3: HashMap<ConnectionHandle, H3State> = HashMap::new();
@@ -2533,8 +2710,19 @@ async fn endpoint_loop_concurrent(
     let mut recv_metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
     let mut draining = false;
     let mut drain_deadline: Option<Instant> = None;
+    // Socket capability probing and driver allocations belong to preparation,
+    // not the published serving lifetime. No packet is consumed before release.
+    if ready.send(Ok(())).is_err() || !activation.wait().await {
+        return Ok(());
+    }
+    let mut policy = policy_handle.load_full();
     loop {
         crate::memtrim::collect_if_requested_on_thread();
+        let latest = policy_handle.load_full();
+        if !Arc::ptr_eq(&policy, &latest) {
+            endpoint.set_server_config(Some(latest.config.clone()));
+            policy = latest;
+        }
         if draining && h3_drain_complete(&h3, inflight.get(), comp_rx.is_empty()) {
             close_h3_connections(
                 &udp,
@@ -2582,7 +2770,7 @@ async fn endpoint_loop_concurrent(
                 let now = Instant::now();
                 drain_deadline = Some(now + super::URING_DRAIN_GRACE);
                 let handles = conns.keys().copied().collect();
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, require_client_cert, &comp_tx, &runtime, false, handles).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
             }
             // (1) Finished request(s): write each response into its stream, then pump the
             // sends (the response streams out cooperatively, interleaved with ACK processing).
@@ -2599,14 +2787,14 @@ async fn endpoint_loop_concurrent(
                     write_completion(&udp, &udp_state, max_gso, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
                     to_drive.insert(hd);
                 }
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, require_client_cert, &comp_tx, &runtime, !draining, to_drive).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
             }
             // (2) Socket readable: GRO-drain queued datagrams, then pump (drive affected conns
             // + interleave further ACK processing). `readable()` is a poll op (cancel-safe).
             _ = udp.readable(false) => {
                 let now = Instant::now();
-                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &runtime, !draining, now).await;
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, require_client_cert, &comp_tx, &runtime, !draining, affected).await;
+                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &runtime, &policy, !draining, now).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
             }
             // (3) A quinn-proto timer fired (handshake retransmit / idle / pacing) — pump the
             // connections whose timer is due.
@@ -2616,7 +2804,7 @@ async fn endpoint_loop_concurrent(
                     .iter_mut()
                     .filter_map(|(hd, c)| c.poll_timeout().filter(|t| *t <= now).map(|_| *hd))
                     .collect();
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, require_client_cert, &comp_tx, &runtime, !draining, due).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
             }
         }
     }
@@ -3026,7 +3214,19 @@ fn h3_error(status: http::StatusCode) -> Vec<u8> {
 /// small/HIT bodies — sent as one `Completion::Full`) or a streamed response (HEADERS frame
 /// + a chunk source the spawn task forwards as `Completion::Chunk`s, so a large body flows
 /// out as the backend produces it instead of buffering whole).
-enum H3Outcome {
+struct H3Outcome {
+    body: H3Body,
+    completion: Option<hj_core::ResponseCompletion>,
+}
+impl H3Outcome {
+    fn full(data: Vec<u8>) -> Self {
+        Self {
+            body: H3Body::Full(data),
+            completion: None,
+        }
+    }
+}
+enum H3Body {
     Full(Vec<u8>),
     Stream {
         head: Vec<u8>,
@@ -3191,21 +3391,22 @@ async fn handle_h3_request(
     bridge: &Bridge,
     require_client_cert: bool,
     request_limits: H3RequestLimits,
+    request_generation: Option<crate::serving_generation::RequestGeneration>,
 ) -> H3Outcome {
     if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
-        return H3Outcome::Full(h3_error(http::StatusCode::FORBIDDEN));
+        return H3Outcome::full(h3_error(http::StatusCode::FORBIDDEN));
     }
     let parsed = match parse_h3_request_leased(req_bytes, body_lease) {
         Ok(v) => v,
-        Err(_) => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
+        Err(_) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
     if parsed.body.len() > request_limits.max_body_bytes {
-        return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
+        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     }
     let (headers, initial_field_size) =
         match qpack_decode_limited(&parsed.field, request_limits.max_header_bytes) {
             Some(decoded) => decoded,
-            None => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
+            None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
         };
     if parsed.trailers.as_deref().is_some_and(|field| {
         !valid_h3_trailers(
@@ -3215,11 +3416,11 @@ async fn handle_h3_request(
                 .saturating_sub(initial_field_size),
         )
     }) {
-        return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
+        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     }
     let head = match split_h3_request_headers(headers) {
         Some(h) => h,
-        None => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
+        None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
     // (N2) §4.1.2: a Content-Length that disagrees with the DATA length is malformed.
     // Parsed with the SAME strict resolver as H1 (#232 residual): ASCII-OWS trim,
@@ -3233,15 +3434,15 @@ async fn handle_h3_request(
             .map(|(_, v)| v.as_slice());
         match super::codec::resolve_content_length(values) {
             Ok(cl) => cl,
-            Err(()) => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
+            Err(()) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
         }
     };
     if declared_cl.is_some_and(|cl| cl != parsed.body.len()) {
-        return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST));
+        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     }
     let (builder, sni) = match build_h3_request_head(head) {
         Some(head) => head,
-        None => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
+        None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
     let body_b = parsed.body;
     let inbody: hj_core::IncomingBody = if body_b.is_empty() {
@@ -3254,14 +3455,18 @@ async fn handle_h3_request(
     };
     let mut req = match builder.body(inbody) {
         Ok(r) => r,
-        Err(_) => return H3Outcome::Full(h3_error(http::StatusCode::BAD_REQUEST)),
+        Err(_) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
     hj_core::coalesce_cookie_crumbs(req.headers_mut());
+    if let Some(generation) = request_generation {
+        req.extensions_mut().insert(generation);
+    }
     let ctx = BridgeCtx {
         peer,
         local,
         proto: Proto::Http3,
         is_tls: true,
+        direct_file_egress: false,
         peer_unix: false,
         mtls_required: require_client_cert,
         sni,
@@ -3272,6 +3477,7 @@ async fn handle_h3_request(
     let is_head = req.method() == http::Method::HEAD;
     match bridge.dispatch(req, ctx).await {
         Some(r) => {
+            let completion = r.completion;
             let status = r.status;
             let mut headers = r.headers;
             let streaming_unknown_len = matches!(
@@ -3280,12 +3486,15 @@ async fn handle_h3_request(
             );
             let body_forbidden =
                 prepare_h3_response_headers(&mut headers, is_head, status, streaming_unknown_len);
-            match r.body {
+            let mut outcome = match r.body {
                 // Small / HIT / sub-threshold dynamic bodies: buffered + sent whole — byte-identical
                 // to the previous path.
                 crate::uring::bridge::BridgeBody::Full(b) => {
                     let body = if body_forbidden { &[][..] } else { &b[..] };
-                    H3Outcome::Full(encode_h3_response(status, &headers, body))
+                    H3Outcome::full(encode_h3_response(status, &headers, body))
+                }
+                crate::uring::bridge::BridgeBody::File(_) => {
+                    unreachable!("direct file bridge bodies are plaintext H1-only")
                 }
                 // Large / SSE / proxy bodies: stream the HEADERS now and forward DATA chunks as the
                 // backend produces them, instead of buffering the whole body first.
@@ -3293,20 +3502,26 @@ async fn handle_h3_request(
                     let head = encode_h3_headers_frame(status, &headers);
                     if body_forbidden {
                         rx.close();
-                        H3Outcome::Full(head)
+                        H3Outcome::full(head)
                     } else {
-                        H3Outcome::Stream { head, rx }
+                        H3Outcome {
+                            body: H3Body::Stream { head, rx },
+                            completion: None,
+                        }
                     }
                 }
-            }
+            };
+            outcome.completion = completion;
+            outcome
         }
-        None => H3Outcome::Full(h3_error(http::StatusCode::BAD_GATEWAY)),
+        None => H3Outcome::full(h3_error(http::StatusCode::BAD_GATEWAY)),
     }
 }
 
 /// Real-pipeline io_uring H3 listener: per-core monoio runtimes driving quinn-proto, each
 /// dispatching requests through `bridge`. This is the ONLY H3 transport (the tokio/quinn
 /// adapter was removed 2026-06-21); production serves H3 here unconditionally.
+/// The returned group is prepared, not serving; its owner must call `activate`.
 pub(crate) fn serve_h3_pipeline(
     addr: SocketAddr,
     workers: usize,
@@ -3316,37 +3531,49 @@ pub(crate) fn serve_h3_pipeline(
     runtime: H3RuntimeConfig,
     inherited: Option<Vec<std::net::UdpSocket>>,
     shutdown: CancellationToken,
-) -> io::Result<()> {
+) -> io::Result<(super::WorkerGroup, QuicReloadHandle)> {
+    let serving_view = runtime.serving_view.clone();
+    let policy = match serving_view.clone() {
+        Some(view) => PreparedQuicPolicy::prepare(view, rustls_cfg, require_client_cert)?,
+        None => PreparedQuicPolicy::prepare_unscoped(rustls_cfg, require_client_cert)?,
+    };
+    let policy_handle = QuicReloadHandle::new(policy);
     let sockets = h3_udp_sockets(inherited, addr, workers)?;
     let worker_count = sockets.len();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let mut group = match serving_view {
+        Some(view) => super::WorkerGroup::for_epoch(&shutdown, view.trust_epoch()),
+        None => super::WorkerGroup::new(&shutdown),
+    };
     for (core, std_sock) in sockets.into_iter().enumerate() {
-        let cfg = rustls_cfg.clone();
         let bridge = bridge.clone();
         let runtime = runtime.clone();
-        let shutdown = shutdown.clone();
+        let policy_handle = policy_handle.clone();
         let ready = ready_tx.clone();
-        std::thread::Builder::new()
-            .name(format!("hj-uring-h3p-{core}"))
-            .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
-            .spawn(move || {
+        let activation = group.activation_gate();
+        group.spawn(
+            std::thread::Builder::new()
+                .name(format!("hj-uring-h3p-{core}"))
+                .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
+            move |shutdown| {
                 super::maybe_pin_core_thread(core, worker_count);
                 per_core_h3_pipeline(
                     core,
                     std_sock,
                     addr,
-                    cfg,
                     bridge,
-                    require_client_cert,
+                    policy_handle,
                     runtime,
                     shutdown,
                     ready,
+                    activation,
                 )
-            })?;
+            },
+        )?;
     }
     drop(ready_tx);
     super::wait_for_worker_readiness("HTTP/3", worker_count, ready_rx)?;
-    Ok(())
+    Ok((group, policy_handle))
 }
 
 /// The per-core UDP socket set for the io_uring H3 transport: the inherited
@@ -3388,21 +3615,14 @@ fn per_core_h3_pipeline(
     core: usize,
     std_sock: std::net::UdpSocket,
     local: SocketAddr,
-    rustls_cfg: Arc<rustls::ServerConfig>,
     bridge: Bridge,
-    require_client_cert: bool,
+    policy_handle: QuicReloadHandle,
     runtime: H3RuntimeConfig,
     shutdown: CancellationToken,
     ready: super::WorkerReadyTx,
+    activation: super::worker_group::ActivationGate,
 ) {
-    let server_cfg = match server_config(rustls_cfg) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            let _ = ready.send(Err(format!("build QUIC server config: {e}")));
-            tracing::error!(core, error = %e, "uring h3-pipeline: server config build failed");
-            return;
-        }
-    };
+    let initial_policy = policy_handle.load_full();
     let mut rt = match super::build_core_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {
@@ -3419,10 +3639,28 @@ fn per_core_h3_pipeline(
                 return;
             }
         };
-        let endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), Some(server_cfg), true, None);
-        let _ = ready.send(Ok(()));
-        tracing::info!(core, "uring h3-pipeline: per-core quinn-proto endpoint serving (real pipeline via bridge, concurrent dispatch)");
-        if let Err(e) = endpoint_loop_concurrent(udp, endpoint, local, bridge, require_client_cert, runtime, shutdown).await {
+        let endpoint = Endpoint::new(
+            Arc::new(EndpointConfig::default()),
+            Some(initial_policy.config.clone()),
+            true,
+            None,
+        );
+        if let Err(e) = endpoint_loop_concurrent(
+            udp,
+            endpoint,
+            local,
+            bridge,
+            policy_handle,
+            runtime,
+            shutdown,
+            ready.clone(),
+            activation,
+        )
+        .await
+        {
+            // Before readiness this rejects the entire candidate; after readiness
+            // the receiver is gone and the error is a serving-runtime failure.
+            let _ = ready.send(Err(format!("prepare or drive QUIC endpoint: {e}")));
             tracing::error!(core, error = %e, "uring h3-pipeline: endpoint loop ended");
         }
     });
@@ -3777,6 +4015,190 @@ mod h3_codec_tests {
         assert_eq!(runtime.max_connections(), 7);
         assert_eq!(runtime.request_limits().max_header_bytes, 8_192);
         assert_eq!(runtime.request_limits().max_body_bytes, 32 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn accepted_quic_view_pins_limits_and_dispatch_generation() {
+        use crate::serving_generation::{RequestGeneration, ServingView};
+        use std::sync::atomic::Ordering;
+        let root = std::env::temp_dir().join(format!(
+            "hj-quic-generation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let initial = crate::pipeline::e2e::build_state(root.clone());
+        let server_root = initial.server.server_root.clone();
+        let holder = Arc::new(arc_swap::ArcSwap::from(initial.clone()));
+        let runtime = H3RuntimeConfig::new(
+            || (H3RequestLimits::new(1, 1), 8),
+            Arc::new(AtomicU64::new(0)),
+            initial.body_budget.clone(),
+        )
+        .with_serving_view(ServingView::new(holder.clone()));
+        let permit = || {
+            crate::uring::ConnectionPermit::try_acquire(runtime.active_conns.clone(), 8).unwrap()
+        };
+        let early = runtime.accepted_state(permit(), 1);
+        let mut application =
+            crate::state::ServerState::reload(&initial, initial.server.clone()).unwrap();
+        Arc::get_mut(&mut application)
+            .unwrap()
+            .serve_config
+            .max_req_body_size = 512;
+        holder.store(application.clone());
+        let (limits, selected) = early.request_snapshot(runtime.request_limits());
+        assert_eq!(limits.max_body_bytes, 512);
+        assert!(Arc::ptr_eq(&selected.as_ref().unwrap().0, &application));
+        let later = runtime.accepted_state(permit(), 2);
+        let mut replacement =
+            crate::state::ServerState::reload(&application, application.server.clone()).unwrap();
+        Arc::get_mut(&mut replacement).unwrap().trust_epoch = Arc::new(());
+        Arc::get_mut(&mut replacement)
+            .unwrap()
+            .serve_config
+            .max_req_body_size = 4096;
+        holder.store(replacement);
+        let (old_limits, old_snapshot) = early.request_snapshot(runtime.request_limits());
+        assert_eq!(
+            old_limits.max_body_bytes,
+            initial.serve_config.max_req_body_size
+        );
+        assert!(Arc::ptr_eq(&old_snapshot.unwrap().0, &initial));
+        let (later_limits, later_snapshot) = later.request_snapshot(runtime.request_limits());
+        assert_eq!(later_limits.max_body_bytes, 512);
+        assert!(Arc::ptr_eq(&later_snapshot.unwrap().0, &application));
+
+        // Decode a real H3 HEADERS frame and prove the generation selected before
+        // publication travels through dispatch, rather than reloading live state.
+        let seen = Arc::new(AtomicU64::new(0));
+        let observed = seen.clone();
+        let bridge = crate::uring::bridge::spawn_on_current(2, move |req, _| {
+            observed.store(
+                req.extensions()
+                    .get::<RequestGeneration>()
+                    .unwrap()
+                    .0
+                    .generation,
+                Ordering::SeqCst,
+            );
+            async { http::Response::new(hj_core::Body::Empty) }
+        });
+        let fields = literal_qpack_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"canon.test"),
+            (b":path", b"/"),
+        ]);
+        let mut wire = Vec::new();
+        write_varint(&mut wire, 1);
+        write_varint(&mut wire, fields.len() as u64);
+        wire.extend(fields);
+        let _response = handle_h3_request(
+            wire,
+            None,
+            false,
+            None,
+            "127.0.0.1:32000".parse().unwrap(),
+            "127.0.0.1:8443".parse().unwrap(),
+            &bridge,
+            false,
+            limits,
+            selected,
+        )
+        .await;
+        assert_eq!(seen.load(Ordering::SeqCst), application.generation);
+        drop(early);
+        drop(later);
+        assert_eq!(runtime.active_conns.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(server_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quic_policy_publication_is_coherent_and_preserves_old_views() {
+        use crate::serving_generation::ServingView;
+
+        let root = std::env::temp_dir().join(format!(
+            "hj-quic-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let initial = crate::pipeline::e2e::build_state(root.clone());
+        let server_root = initial.server.server_root.clone();
+        let holder = Arc::new(arc_swap::ArcSwap::from(initial.clone()));
+        let old = PreparedQuicPolicy::prepare(
+            ServingView::new(holder.clone()),
+            self_signed_config().unwrap(),
+            false,
+        )
+        .unwrap();
+        let old_policy = old.0.clone();
+        let handle = QuicReloadHandle::new(old);
+
+        let mut candidate =
+            crate::state::ServerState::reload(&initial, initial.server.clone()).unwrap();
+        Arc::get_mut(&mut candidate).unwrap().trust_epoch = Arc::new(());
+        let replacement = PreparedQuicPolicy::prepare(
+            ServingView::candidate(holder.clone(), candidate.clone()),
+            self_signed_config().unwrap(),
+            true,
+        )
+        .unwrap();
+        let replacement_policy = replacement.0.clone();
+
+        assert!(
+            old_policy
+                .serving_view
+                .as_ref()
+                .unwrap()
+                .is_current_trust_epoch()
+        );
+        assert!(
+            !replacement_policy
+                .serving_view
+                .as_ref()
+                .unwrap()
+                .is_current_trust_epoch()
+        );
+        holder.store(candidate.clone());
+        assert!(
+            !old_policy
+                .serving_view
+                .as_ref()
+                .unwrap()
+                .is_current_trust_epoch()
+        );
+        assert!(
+            replacement_policy
+                .serving_view
+                .as_ref()
+                .unwrap()
+                .is_current_trust_epoch()
+        );
+
+        handle.publish(replacement);
+        let published = handle.load_full();
+        assert!(Arc::ptr_eq(&published, &replacement_policy));
+        assert!(published.require_client_cert);
+        assert!(Arc::ptr_eq(
+            &published.serving_view.as_ref().unwrap().load_full(),
+            &candidate
+        ));
+        assert!(Arc::ptr_eq(
+            &old_policy.serving_view.as_ref().unwrap().load_full(),
+            &initial
+        ));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(server_root).unwrap();
     }
 
     #[test]
@@ -4211,12 +4633,43 @@ mod h3_codec_tests {
         let (ack_tx, ack_rx) = flume::bounded(1);
         let part = PendingPart::data_frame(Bytes::from_static(b"abc"), Some(ack_tx));
         let mut pending = PendingSend {
+            completion: None,
             parts: std::iter::once(part).collect(),
             fin: false,
         };
         assert!(matches!(ack_rx.try_recv(), Err(flume::TryRecvError::Empty)));
         assert!(acknowledge_front_part(&mut pending));
         assert_eq!(ack_rx.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn completion_waits_for_drained_parts_and_accepted_fin() {
+        for accepted in [false, true] {
+            let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let copy = events.clone();
+            let mut pending = PendingSend {
+                completion: Some(hj_core::ResponseCompletion::new(move |end| {
+                    copy.lock().unwrap().push(end)
+                })),
+                parts: std::iter::once(PendingPart::contiguous(vec![1, 2, 3])).collect(),
+                fin: false,
+            };
+            assert!(!pending.finish_if_drained(|| panic!("body not drained")));
+            assert!(acknowledge_front_part(&mut pending));
+            assert!(!pending.finish_if_drained(|| panic!("FIN not available")));
+            assert!(events.lock().unwrap().is_empty());
+            pending.fin = true;
+            assert!(pending.finish_if_drained(|| accepted));
+            drop(pending);
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![if accepted {
+                    hj_core::ResponseEnd::Complete
+                } else {
+                    hj_core::ResponseEnd::Cancelled
+                }]
+            );
+        }
     }
 
     #[test]
@@ -4252,6 +4705,7 @@ mod h3_codec_tests {
         let (ack_tx, ack_rx) = flume::bounded(1);
         let part = PendingPart::data_frame(Bytes::from_static(b"abc"), Some(ack_tx));
         let pending = PendingSend {
+            completion: None,
             parts: std::iter::once(part).collect(),
             fin: false,
         };
@@ -4264,6 +4718,8 @@ mod h3_codec_tests {
 
     #[test]
     fn cancelling_response_stream_cancels_dispatch_and_drops_pending_chunks() {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copy = events.clone();
         let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
         let token = CancellationToken::new();
         let (ack_tx, ack_rx) = flume::bounded(1);
@@ -4272,6 +4728,9 @@ mod h3_codec_tests {
         state.pending.insert(
             id,
             PendingSend {
+                completion: Some(hj_core::ResponseCompletion::new(move |end| {
+                    copy.lock().unwrap().push(end)
+                })),
                 parts: std::iter::once(PendingPart::data_frame(
                     Bytes::from_static(b"backend chunk"),
                     Some(ack_tx),
@@ -4286,6 +4745,10 @@ mod h3_codec_tests {
         assert!(token.is_cancelled());
         assert!(!state.request_cancellations.contains_key(&id));
         assert!(!state.pending.contains_key(&id));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![hj_core::ResponseEnd::Cancelled]
+        );
         assert!(matches!(
             ack_rx.try_recv(),
             Err(flume::TryRecvError::Disconnected)

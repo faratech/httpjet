@@ -128,6 +128,10 @@ pub(crate) struct RewriteOutcomeCache {
 }
 
 impl RewriteOutcomeCache {
+    pub(crate) fn empty_generation(&self) -> Self {
+        Self::new(self.ttl)
+    }
+
     pub(crate) fn new(ttl: Duration) -> Self {
         RewriteOutcomeCache {
             map: DashMap::new(),
@@ -149,15 +153,6 @@ impl RewriteOutcomeCache {
             last_prune: std::sync::atomic::AtomicU64::new(0),
             last_sync_prune: std::sync::atomic::AtomicU64::new(0),
         }
-    }
-
-    /// Drop every memoized outcome and reset the count. Called on SIGHUP reload so a
-    /// changed INLINE RewriteRule takes effect immediately, mirroring the sibling
-    /// `rewrite_cache.clear()` (the OutcomeKey carries no rule version, so a warm entry
-    /// would otherwise replay the pre-reload decision for up to one TTL).
-    pub(crate) fn clear(&self) {
-        self.map.clear();
-        self.count.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Fresh cached outcome for `key`, or `None` if absent/expired/disabled.
@@ -391,7 +386,7 @@ impl UaClassifyCache {
         self.clear();
     }
 
-    /// Wholesale invalidation (SIGHUP config reload).
+    /// Wholesale invalidation when reclaiming a full memo.
     pub(crate) fn clear(&self) {
         self.map.clear();
         self.count.store(0, Ordering::Relaxed);
@@ -429,6 +424,8 @@ pub(super) fn run_rewrite(
     path: &str,
     query: &str,
 ) -> RwResult {
+    #[cfg(feature = "otel")]
+    let _trace_stage = crate::otel::stage(crate::otel::StageKind::Rewrite);
     if !state.rewrite_outcomes.enabled() {
         // `--rewrite-outcome-ttl-ms 0`: the cache is off entirely — no key build,
         // no counters (disabled is not "uncacheable").
@@ -1081,6 +1078,20 @@ mod tests {
         );
         // No Host header → fall back to the vhost name.
         assert_eq!(rewrite_host(&ctx, &mk(None)), "fallback.example");
+    }
+
+    #[test]
+    fn empty_generation_preserves_old_outcomes_and_ttl() {
+        let old = Arc::new(RewriteOutcomeCache::new(Duration::from_secs(45)));
+        old.insert(okey("/a"), RwResult::Forbidden);
+        let next = Arc::new(old.empty_generation());
+        assert_eq!(next.ttl, Duration::from_secs(45));
+        assert!(next.get(&okey("/a")).is_none());
+        assert!(matches!(old.get(&okey("/a")), Some(RwResult::Forbidden)));
+        old.insert(okey("/late"), RwResult::Forbidden);
+        assert!(next.get(&okey("/late")).is_none());
+        next.insert(okey("/a"), RwResult::Gone);
+        assert!(matches!(old.get(&okey("/a")), Some(RwResult::Forbidden)));
     }
 
     #[test]

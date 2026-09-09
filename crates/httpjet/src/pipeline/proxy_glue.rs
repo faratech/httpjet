@@ -29,6 +29,14 @@ pub(super) struct ProxyHandler {
 #[async_trait]
 impl Handler for ProxyHandler {
     async fn handle(&self, ctx: &mut ReqCtx, req: Request) -> Result<Response, HandlerError> {
+        #[cfg(feature = "otel")]
+        let req = {
+            let mut req = req;
+            if crate::otel::enabled() && self.target.name.is_some() {
+                crate::otel::inject(req.headers_mut());
+            }
+            req
+        };
         // Capture before `forward` consumes `req`, for the 5xx-with-cause log.
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -66,6 +74,27 @@ impl Handler for ProxyHandler {
 pub(super) async fn proxy_websocket(
     state: &ServerState,
     ctx: &ReqCtx,
+    req: Request,
+    target: ProxyTarget,
+) -> Response {
+    #[cfg(feature = "otel")]
+    if crate::otel::enabled() {
+        return crate::otel::backend(crate::otel::BackendKind::WebSocket, async {
+            let mut req = req;
+            if target.name.is_some() {
+                crate::otel::inject(req.headers_mut());
+            }
+            Ok(proxy_websocket_inner(state, ctx, req, target).await)
+        })
+        .await
+        .unwrap_or_else(|e| error_page(e.status()));
+    }
+    proxy_websocket_inner(state, ctx, req, target).await
+}
+
+async fn proxy_websocket_inner(
+    state: &ServerState,
+    ctx: &ReqCtx,
     mut req: Request,
     target: ProxyTarget,
 ) -> Response {
@@ -74,7 +103,7 @@ pub(super) async fn proxy_websocket(
         .is_none()
         .then(|| hyper::upgrade::on(&mut req));
 
-    let upgrade = match state.proxy.proxy_websocket(ctx, req, &target).await {
+    let mut upgrade = match state.proxy.proxy_websocket(ctx, req, &target).await {
         Ok(u) => u,
         Err(e) => {
             // Backend down on a WS upgrade → genuine fault (item 3).
@@ -92,9 +121,10 @@ pub(super) async fn proxy_websocket(
         None => return error_page(StatusCode::BAD_GATEWAY),
     };
     let resp = upgrade.response;
+    let reservation = upgrade.reservation.take();
 
     if let Some(handoff) = uring_upgrade {
-        let io = start_uring_upgrade_relay(hyper_util::rt::TokioIo::new(upstream_io));
+        let io = start_uring_upgrade_relay(hyper_util::rt::TokioIo::new(upstream_io), reservation);
         if handoff.handoff(io).await.is_err() {
             return error_page(StatusCode::BAD_GATEWAY);
         }
@@ -104,6 +134,7 @@ pub(super) async fn proxy_websocket(
     // After we return `resp` (101), hyper upgrades the client connection; the
     // future resolves with the client IO, which we bridge to the upstream.
     tokio::spawn(async move {
+        let _reservation = reservation;
         match client_on_upgrade
             .expect("hyper upgrade future present")
             .await
@@ -120,7 +151,10 @@ pub(super) async fn proxy_websocket(
     resp
 }
 
-fn start_uring_upgrade_relay<U>(upstream: U) -> UringUpgradeIo
+fn start_uring_upgrade_relay<U>(
+    upstream: U,
+    reservation: Option<hj_proxy::RequestReservation>,
+) -> UringUpgradeIo
 where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -129,6 +163,7 @@ where
     let (to_upstream, mut downstream_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
     let (upstream_tx, from_upstream) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, ()>>(8);
     tokio::spawn(async move {
+        let _reservation = reservation;
         let (mut reader, mut writer) = tokio::io::split(upstream);
         let downstream_to_upstream = async {
             while let Some(bytes) = downstream_rx.recv().await {
@@ -198,7 +233,9 @@ pub(super) fn resolve_proxy_target(
         .iter()
         .find(|e| e.name == handler)
     {
-        return Some(ProxyTarget::from_ext_processor(ep));
+        return Some(
+            ProxyTarget::from_ext_processor(ep).in_scope(format!("vhost:{}", ctx.vhost_name)),
+        );
     }
     state
         .ext_by_name
@@ -214,7 +251,7 @@ mod tests {
     #[tokio::test]
     async fn uring_upgrade_relay_moves_bytes_both_directions() {
         let (client, mut upstream_peer) = tokio::io::duplex(1024);
-        let mut io = start_uring_upgrade_relay(client);
+        let mut io = start_uring_upgrade_relay(client, None);
 
         io.to_upstream
             .send(bytes::Bytes::from_static(b"client-frame"))

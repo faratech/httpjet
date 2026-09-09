@@ -191,6 +191,15 @@ async fn h2_upstream_serves_requests_with_normalized_version() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_max_conns_counts_an_open_response_stream() {
+    held_response(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn weighted_group_counts_h2_response_until_drop() {
+    held_response(true).await;
+}
+
+async fn held_response(weighted: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let request_count = Arc::new(AtomicU32::new(0));
@@ -223,7 +232,12 @@ async fn h2_max_conns_counts_an_open_response_stream() {
         Duration::from_secs(60),
         Duration::from_secs(2),
     ));
-    let target = ProxyTarget::parse_url(&format!("h2://{addr}")).unwrap();
+    let mut target = ProxyTarget::parse_url(&format!("h2://{addr}")).unwrap();
+    if weighted {
+        target.name = Some("held".into());
+        target.scope = Some("test".into());
+        target.load_balance.policy = hj_core::config::LoadBalancePolicy::WeightedLeastActive;
+    }
     let first = proxy
         .forward(
             &ctx(),
@@ -237,6 +251,9 @@ async fn h2_max_conns_counts_an_open_response_stream() {
         )
         .await
         .expect("first h2 forward");
+    if weighted {
+        assert_eq!(proxy.pool().peer_snapshots()[0].active, 1);
+    }
 
     let second_proxy = proxy.clone();
     let second_target = target.clone();
@@ -270,6 +287,15 @@ async fn h2_max_conns_counts_an_open_response_stream() {
         .expect("second task")
         .expect("second h2 forward");
     drop(second_resp);
+    if weighted {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while proxy.pool().peer_snapshots()[0].active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all selected request reservations released");
+    }
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
 
     server.abort();

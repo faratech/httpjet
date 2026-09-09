@@ -14,39 +14,8 @@ mod codec;
 
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // One-shot.
-    let mut one = codec::ChunkedDecoder::new(0);
-    let one_body = match one.advance(data) {
-        codec::ChunkStep::Done(end) => {
-            assert!(
-                end <= data.len(),
-                "chunked Done offset {end} past buffer len {}",
-                data.len()
-            );
-            Some(std::mem::take(&mut one.body))
-        }
-        _ => None,
-    };
+#[path = "../h1_properties.rs"]
+#[allow(dead_code)]
+mod properties;
 
-    // Incremental: feed one byte at a time into a growing buffer (the resumable
-    // contract). Must agree with one-shot on the decoded body when both complete.
-    let mut inc = codec::ChunkedDecoder::new(0);
-    let mut buf = Vec::with_capacity(data.len());
-    let mut inc_body = None;
-    for &b in data {
-        buf.push(b);
-        match inc.advance(&buf) {
-            codec::ChunkStep::Done(_) => {
-                inc_body = Some(std::mem::take(&mut inc.body));
-                break;
-            }
-            codec::ChunkStep::Bad => break,
-            codec::ChunkStep::NeedMore => {}
-        }
-    }
-
-    if let (Some(o), Some(i)) = (one_body, inc_body) {
-        assert_eq!(o, i, "one-shot vs incremental chunked body mismatch");
-    }
-});
+fuzz_target!(|data: &[u8]| properties::h1_chunked_decode(data));

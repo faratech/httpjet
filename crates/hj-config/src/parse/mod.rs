@@ -5,6 +5,7 @@
 //! substitution and interpreting unions/booleans. The raw layer absorbs the
 //! liberal/legacy XML LiteSpeed tolerates (empty elements, missing fields).
 
+mod balance;
 mod raw;
 mod scalar;
 mod vhost;
@@ -43,13 +44,98 @@ pub fn load(server_root: impl AsRef<Path>) -> Result<ServerConfig> {
     Ok(cfg)
 }
 
+/// Parse a complete in-memory configuration without reading config files.
+/// Vhost documents are keyed by declaration name, not by submitted file paths.
+/// Resource paths are normalized but NOT authorized here; callers must validate
+/// them before building runtime state. Errors intentionally contain no input.
+pub fn parse_bundle(
+    server_root: &Path,
+    server_xml: &str,
+    vhosts: &std::collections::BTreeMap<String, String>,
+    mime: &str,
+) -> std::result::Result<ServerConfig, crate::BundleError> {
+    use crate::BundleError;
+    let size = vhosts.iter().try_fold(
+        server_xml
+            .len()
+            .checked_add(mime.len())
+            .ok_or(BundleError)?,
+        |size, (name, xml)| size.checked_add(name.len())?.checked_add(xml.len()),
+    );
+    if size.is_none_or(|size| size > 1024 * 1024) || vhosts.len() > 128 {
+        return Err(BundleError);
+    }
+    bundle_document(server_xml, "httpServerConfig")?;
+    for xml in vhosts.values() {
+        bundle_document(xml, "virtualHostConfig")?;
+    }
+    // Legacy file parsing logs operator diagnostics that can contain XML values.
+    // A synchronous submission must not emit those values to ambient sinks.
+    tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+        let mut cfg = parse_server_text(server_root, Path::new("<submission>"), server_xml)
+            .map_err(|_| BundleError)?;
+        if cfg.vhost_order.len() != cfg.vhosts.len()
+            || cfg.vhosts.len() != vhosts.len()
+            || cfg.vhosts.keys().ne(vhosts.keys())
+        {
+            return Err(BundleError);
+        }
+        vhost::load_vhost_sources(&mut cfg, true, |name, _| Ok(vhosts[name].clone()))
+            .map_err(|_| BundleError)?;
+        cfg.mime = parse_mime(mime);
+        Ok(cfg)
+    })
+}
+
+fn bundle_document(text: &str, root: &str) -> std::result::Result<(), crate::BundleError> {
+    use crate::BundleError;
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(text);
+    let mut depth = 0usize;
+    let mut seen_root = false;
+    loop {
+        let event = reader.read_event().map_err(|_| BundleError)?;
+        let opens = matches!(event, Event::Start(_));
+        match event {
+            Event::Start(tag) | Event::Empty(tag) => {
+                if depth >= 64 {
+                    return Err(BundleError);
+                }
+                if depth == 0 {
+                    if seen_root || tag.name().as_ref() != root {
+                        return Err(BundleError);
+                    }
+                    seen_root = true;
+                }
+                if opens {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => depth = depth.checked_sub(1).ok_or(BundleError)?,
+            Event::DocType(_) => return Err(BundleError),
+            Event::Text(value) if depth == 0 => {
+                if !value.as_ref().bytes().all(|b| b.is_ascii_whitespace()) {
+                    return Err(BundleError);
+                }
+            }
+            Event::CData(_) | Event::GeneralRef(_) if depth == 0 => return Err(BundleError),
+            Event::Eof => return (seen_root && depth == 0).then_some(()).ok_or(BundleError),
+            _ => {}
+        }
+    }
+}
+
 /// Parse just the server file (no vhost-file loading); useful for tests.
 pub(crate) fn load_server_file(server_root: &Path, path: &Path) -> Result<ServerConfig> {
     let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;
-    let raw: RawServer = quick_xml::de::from_str(&text).map_err(|e| ConfigError::Xml {
+    parse_server_text(server_root, path, &text)
+}
+
+fn parse_server_text(server_root: &Path, path: &Path, text: &str) -> Result<ServerConfig> {
+    let raw: RawServer = quick_xml::de::from_str(text).map_err(|e| ConfigError::Xml {
         path: path.to_path_buf(),
         msg: e.to_string(),
     })?;
@@ -68,7 +154,7 @@ pub(crate) fn load_server_file(server_root: &Path, path: &Path) -> Result<Server
     let cache = convert_server_cache(raw.cache);
     let security = convert_security(raw.security, &ctx, path)?;
     let suexec = convert_suexec(raw.suexec);
-    let ext_processors = convert_ext_list(raw.ext_processor_list, &ctx);
+    let ext_processors = convert_ext_list(raw.ext_processor_list, &ctx, path)?;
     let php_config = raw
         .php_config
         .map(|p| convert_php(p, &ctx, security.cgi_cpu_limit_secs));
@@ -342,21 +428,30 @@ fn convert_namespace(r: Option<RawNamespace>) -> Option<NamespacePolicy> {
     })
 }
 
-fn convert_ext_list(r: Option<RawExtList>, ctx: &SubstCtx) -> Vec<ExtProcessor> {
+fn convert_ext_list(
+    r: Option<RawExtList>,
+    ctx: &SubstCtx,
+    path: &Path,
+) -> Result<Vec<ExtProcessor>> {
     let r = match r {
         Some(r) => r,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
-    r.ext_processor
+    for e in &r.ext_processor {
+        balance::parse(e, path)?;
+    }
+    Ok(r.ext_processor
         .into_iter()
         .filter_map(|e| convert_ext(e, ctx))
-        .collect()
+        .collect())
 }
 
 fn convert_ext(e: RawExtProcessor, ctx: &SubstCtx) -> Option<ExtProcessor> {
+    let load_balance = balance::parse(&e, Path::new("<validated>")).ok()?;
     let name = nonempty(e.name)?;
     let kind = match e.kind.as_deref().map(str::trim) {
         Some("lsapi") => ExtKind::Lsapi,
+        Some("fcgi" | "fastcgi") => ExtKind::FastCgi,
         _ => ExtKind::Proxy,
     };
     // (Tier 1.2) Every <address> element is a peer; the first is primary and the
@@ -365,6 +460,7 @@ fn convert_ext(e: RawExtProcessor, ctx: &SubstCtx) -> Option<ExtProcessor> {
     let address = addr_iter.next().unwrap_or(ext_address(""));
     let extra_addresses: Vec<_> = addr_iter.collect();
     Some(ExtProcessor {
+        load_balance,
         name,
         kind,
         address,
@@ -555,6 +651,25 @@ pub(crate) fn parse_mime(text: &str) -> MimeMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fastcgi_processor_has_a_distinct_opt_in_identity() {
+        for kind in ["fcgi", "fastcgi"] {
+            let xml = format!(
+                "<httpServerConfig><extProcessorList><extProcessor><name>app</name>\
+                 <type>{kind}</type><address>uds:///run/app.sock</address>\
+                 </extProcessor></extProcessorList></httpServerConfig>"
+            );
+            let config =
+                parse_server_text(Path::new("/srv/httpjet"), Path::new("test.xml"), &xml).unwrap();
+            assert_eq!(config.ext_processors.len(), 1);
+            assert_eq!(config.ext_processors[0].kind, ExtKind::FastCgi);
+            assert!(matches!(
+                config.ext_processors[0].address,
+                ExtAddress::Uds(_)
+            ));
+        }
+    }
 
     // ----- (Tier 2) per-listener proxyProtocol -----
 

@@ -24,3 +24,6 @@ conf/
 # The public, synthetic quick-start fixture is safe and intentionally versioned.
 !examples/litespeed/conf/
 !examples/litespeed/conf/**
+# The OCI quick-start uses a second synthetic, non-secret config fixture.
+!packaging/oci/litespeed/conf/
+!packaging/oci/litespeed/conf/**

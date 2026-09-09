@@ -87,6 +87,7 @@ pub(super) enum HostSource {
 }
 
 pub(super) struct MemoKey<'a> {
+    pub generation: u64,
     pub listener: &'a str,
     pub https: bool,
     pub trusted_proxy: bool,
@@ -185,6 +186,7 @@ fn vary_same(a: &[VaryItem], b: &[VaryItem]) -> bool {
 }
 
 struct MemoEntry {
+    generation: u64,
     listener: String,
     https: bool,
     trusted_proxy: bool,
@@ -217,6 +219,7 @@ thread_local! {
 
 fn key_hash(k: &MemoKey) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    k.generation.hash(&mut h);
     k.listener.hash(&mut h);
     k.https.hash(&mut h);
     k.trusted_proxy.hash(&mut h);
@@ -232,7 +235,8 @@ fn key_hash(k: &MemoKey) -> u64 {
 /// Identity guard (page-cache rule 2): a hash collision degrades to a miss,
 /// never a wrong response.
 fn matches(e: &MemoEntry, k: &MemoKey) -> bool {
-    e.https == k.https
+    e.generation == k.generation
+        && e.https == k.https
         && e.trusted_proxy == k.trusted_proxy
         && e.host_src == k.host_src
         && e.listener == k.listener
@@ -295,6 +299,7 @@ pub(super) fn store(k: &MemoKey, vary: Vec<VaryItem>, resp: &Response, now: Inst
     }
     let h = key_hash(k);
     let entry = MemoEntry {
+        generation: k.generation,
         listener: k.listener.to_owned(),
         https: k.https,
         trusted_proxy: k.trusted_proxy,
@@ -346,6 +351,7 @@ mod tests {
 
     fn key<'a>(path: &'a str, ae: &'a [u8]) -> MemoKey<'a> {
         MemoKey {
+            generation: 1,
             listener: "l1",
             https: true,
             trusted_proxy: false,
@@ -377,6 +383,23 @@ mod tests {
 
     fn ua_cache() -> UaClassifyCache {
         UaClassifyCache::new()
+    }
+
+    #[test]
+    fn configuration_generation_never_replays_an_old_response() {
+        let now = Instant::now();
+        let request = req(&[]);
+        let cache = ua_cache();
+        let old = key("/generation", b"");
+        store(&old, Vec::new(), &resp(b"old"), now);
+        let mut next = key("/generation", b"");
+        next.generation = 2;
+        assert!(probe(&next, &request, &cache, now).is_none());
+        store(&next, Vec::new(), &resp(b"new"), now);
+        store(&old, Vec::new(), &resp(b"late old"), now);
+        assert!(
+            matches!(probe(&next, &request, &cache, now).unwrap().into_body(), Body::Full(bytes) if bytes.as_ref() == b"new")
+        );
     }
 
     #[test]

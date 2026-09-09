@@ -317,7 +317,7 @@ pub struct NamespacePolicy {
     pub ipc: bool,
 }
 
-/// An external processor: a proxy upstream or an LSAPI (PHP) app.
+/// An external processor: a proxy upstream or an application-protocol gateway.
 #[derive(Debug, Clone)]
 pub struct ExtProcessor {
     pub name: String,
@@ -326,6 +326,7 @@ pub struct ExtProcessor {
     /// (Tier 1.2) Additional upstream addresses — failover peers tried in order
     /// when the primary's circuit breaker is open.
     pub extra_addresses: Vec<ExtAddress>,
+    pub load_balance: LoadBalanceConfig,
     /// (Tier 2) Upstream mTLS: client certificate + key for TLS upstream connections.
     pub client_cert_file: Option<PathBuf>,
     pub client_key_file: Option<PathBuf>,
@@ -344,10 +345,39 @@ pub struct ExtProcessor {
     pub run_on_startup: i32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum LoadBalancePolicy {
+    #[default]
+    PrimaryFirst,
+    WeightedRoundRobin,
+    WeightedLeastActive,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct LoadBalanceConfig {
+    pub health_check: Option<HealthCheckConfig>,
+    /// Empty means unit weights for every address.
+    pub weights: Vec<u16>,
+    pub policy: LoadBalancePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HealthCheckConfig {
+    pub mode: String,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub rise: u32,
+    pub fall: u32,
+    pub path: String,
+    pub host: Option<String>,
+    pub expected_status: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtKind {
     Proxy,
     Lsapi,
+    FastCgi,
 }
 
 /// Address of an external processor: a TCP socket or a Unix domain socket path.

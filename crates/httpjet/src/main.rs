@@ -6,18 +6,37 @@
 //! Production is systemd/socket-activation managed on :80/:443; test instances
 //! should use alternate ports and their own lsphp socket.
 
+#[cfg(feature = "acme")]
+mod acme_runtime;
+mod admin;
+mod admin_auth;
+mod admin_protocol;
+mod admin_resources;
+mod admin_submission;
+mod admin_write;
 mod allocount;
+mod config_transaction;
+mod extensions;
+mod listener_plan;
 mod lscache;
 mod memtrim;
 mod metrics;
+#[cfg(feature = "ocsp")]
+mod ocsp_runtime;
+#[cfg(feature = "otel")]
+mod otel;
 mod peer_purge;
 mod phpslow;
 mod pipeline;
+mod resource_generation;
 mod server;
+mod serving_generation;
 mod statcache;
 mod state;
+mod tcp_candidate;
 mod telemetry;
 mod uring;
+mod waf;
 
 /// Process-wide allocator. mimalloc replaces glibc malloc to cut arena-lock /
 /// futex contention under the multi-thread tokio runtime — the bottleneck
@@ -127,6 +146,12 @@ struct LsphpReloadArgs {
 
 #[derive(Parser, Debug)]
 struct ServeArgs {
+    #[cfg(feature = "ocsp")]
+    #[command(flatten)]
+    ocsp: ocsp_runtime::OcspArgs,
+    #[cfg(feature = "acme")]
+    #[command(flatten)]
+    acme: acme_runtime::AcmeArgs,
     /// Address for the plain-HTTP listener.
     #[arg(long, default_value = "127.0.0.1:8080")]
     http_addr: SocketAddr,
@@ -222,6 +247,39 @@ struct ServeArgs {
     /// number once --page-cache is live) plus request/connection counters.
     #[arg(long, default_value = "127.0.0.1:9090")]
     metrics_addr: String,
+    /// Opt-in read-only operational JSON endpoint (loopback TCP only).
+    #[arg(long, value_parser = admin::parse_addr)]
+    admin_addr: Option<SocketAddr>,
+    /// Authenticated application-config writes on a separate loopback listener.
+    #[arg(long, value_parser = admin::parse_addr, requires_all = ["admin_token_file", "admin_resource_root"])]
+    admin_write_addr: Option<SocketAddr>,
+    /// Private file containing a 64-character lowercase hexadecimal bearer token.
+    #[arg(long, requires = "admin_write_addr")]
+    admin_token_file: Option<PathBuf>,
+    /// Allowed existing filesystem root for submitted resources; repeatable.
+    #[arg(long, requires = "admin_write_addr")]
+    admin_resource_root: Vec<PathBuf>,
+    /// Opt-in loopback HTTP request-inspection sidecar. The sidecar must return
+    /// 204 to allow or 403 to block; absent keeps the WAF seam completely inert.
+    #[arg(long, value_parser = admin::parse_addr)]
+    waf_sidecar_addr: Option<SocketAddr>,
+    #[arg(long, default_value = "/inspect", requires = "waf_sidecar_addr")]
+    waf_sidecar_path: String,
+    #[arg(long, default_value_t = 100, requires = "waf_sidecar_addr")]
+    waf_timeout_ms: u64,
+    #[arg(long, default_value_t = 64 * 1024, requires = "waf_sidecar_addr")]
+    waf_body_max: u64,
+    #[arg(long, default_value_t = 128, requires = "waf_sidecar_addr")]
+    waf_concurrency: usize,
+    /// Continue when the configured WAF sidecar is unavailable or malformed.
+    /// Default is fail-closed (503); this weaker policy requires explicit opt-in.
+    #[arg(long, default_value_t = false, requires = "waf_sidecar_addr")]
+    waf_fail_open: bool,
+    /// Additional request Content-Encoding values to decode before dispatch.
+    /// Gzip remains enabled for compatibility; Brotli and zstd are opt-in.
+    /// Accepted comma-separated values: br,zstd.
+    #[arg(long, default_value = "")]
+    request_decompression_extra: String,
     /// (telemetry) Append a cumulative per-request telemetry snapshot row to this
     /// file every --telemetry-flush-secs: durability across restarts + a
     /// self-contained time-series for the two-node A/B. Empty = no disk flush (the
@@ -290,15 +348,24 @@ struct ServeArgs {
     /// a deploy-time decision.
     #[arg(long = "rewrite-ua-classify", default_value_t = false)]
     rewrite_ua_classify: bool,
-    /// (uring, STAGED) Kernel-TLS the io_uring TLS path: after the rustls handshake,
+    /// (uring, STAGED) Kernel-TLS on the io_uring TLS path: after the rustls handshake,
     /// upgrade the socket to kTLS so H1/H2 serve plaintext over the raw fd (kernel
     /// encrypt/decrypt), removing the userspace AEAD copy on large-body egress. Runs
-    /// only on the io_uring TLS path (the default transport). Only active in a
-    /// `--features ktls` build; otherwise startup fails. TLS 1.3 only (1.2 falls back
-    /// to userspace); peer KeyUpdate is handled (RX rekey + reply). STAGED — validate
-    /// on an alt port before production.
-    #[arg(long = "ktls", default_value_t = false)]
-    ktls: bool,
+    /// only on the io_uring TLS path (the default transport). `auto` (default)
+    /// requires a `--features ktls` build, a physical default-route NIC, and active
+    /// `tls-hw-tx-offload`; otherwise it logs one reason and stays on rustls. `on`
+    /// forces kTLS for isolated benchmarking and fails when the feature is absent;
+    /// `off` never enables it. A bare `--ktls` remains an alias for `--ktls=on`.
+    /// TLS 1.3 only (1.2 falls back to userspace); peer KeyUpdate is handled (RX
+    /// rekey + reply). STAGED — validate on an alt port before production.
+    #[arg(
+        long = "ktls",
+        value_enum,
+        default_value_t = uring::ktls_policy::KtlsMode::Auto,
+        num_args = 0..=1,
+        default_missing_value = "on"
+    )]
+    ktls: uring::ktls_policy::KtlsMode,
 }
 
 /// The `--page-cache-*` flag family, grouped (clap-flattened into the serve args).
@@ -335,6 +402,12 @@ struct PageCacheArgs {
     /// cacheStorePath is intentionally NOT used.
     #[arg(long = "page-cache-store-path", default_value = "none")]
     store_path: String,
+    /// Integrity key used for persistent cache containers.
+    #[arg(
+        long = "page-cache-integrity-key",
+        default_value = "/usr/local/httpjet/conf/.jetcache.key"
+    )]
+    integrity_key: PathBuf,
     /// Byte cap of the in-RAM hot tier in front of the file store (zero-syscall
     /// zero-copy serves for the hottest bodies). Only meaningful with
     /// --page-cache-store-path. Default 192 MiB.
@@ -702,6 +775,31 @@ fn resolve_page_cache_store_path(cli: &str) -> Option<std::path::PathBuf> {
 }
 
 fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
+    let request_decompression =
+        uring::request_body::RequestDecompression::parse_extra(&args.request_decompression_extra)
+            .map_err(anyhow::Error::msg)?;
+    let admin_write_config = match args.admin_write_addr {
+        Some(addr) => {
+            let token = admin_auth::AuthToken::load(
+                args.admin_token_file
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("admin token file required"))?,
+            )
+            .map_err(|_| anyhow::anyhow!("invalid admin token file"))?;
+            let roots = admin_resources::ResourceRoots::new(&args.admin_resource_root)
+                .map_err(|_| anyhow::anyhow!("invalid admin resource roots"))?;
+            Some((addr, Arc::new(token), Arc::new(roots)))
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "otel"))]
+    anyhow::ensure!(
+        std::env::var("HTTPJET_OTEL").as_deref() != Ok("1")
+            && std::env::var("HTTPJET_OTEL_METRICS").as_deref() != Ok("1"),
+        "HTTPJET_OTEL requires a build with --features otel"
+    );
+    #[cfg(feature = "otel")]
+    let _otel = otel::init()?;
     let workers = args
         .workers
         .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
@@ -775,22 +873,6 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     }
     let server = Arc::new(cfg);
 
-    let http_listener = server
-        .listeners
-        .iter()
-        .find(|l| !l.secure)
-        .or_else(|| server.listeners.first());
-    let http_listener_name: Arc<str> = http_listener
-        .map(|l| l.name.clone())
-        .unwrap_or_else(|| "Default".to_string())
-        .into();
-    let http_binding = uring::ListenerBinding {
-        proxy_protocol: http_listener.is_some_and(|l| l.proxy_protocol),
-    };
-
-    // The secure listener (if any) drives the TLS config + routing under :443.
-    let secure_listener = server.listeners.iter().find(|l| l.secure).cloned();
-
     let https_addr: Option<SocketAddr> = match args.https_addr.trim() {
         "" => None,
         s => Some(
@@ -799,59 +881,112 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         ),
     };
 
+    let tcp_launch_policy = listener_plan::TcpLaunchPolicy {
+        http: args.http_addr,
+        https: https_addr,
+    };
+    let tcp_plan = tcp_launch_policy.plan(&server);
+    let http_bind_addr = tcp_plan.http.address;
+    let https_bind_addr = tcp_plan.https.as_ref().map(|target| target.address);
+    let http_listener_name = tcp_plan.http.identity.name.clone();
+    let http_binding = uring::ListenerBinding {
+        proxy_protocol: tcp_plan.http.listener.is_some_and(|l| l.proxy_protocol),
+    };
+    let secure_listener = tcp_plan.secure_listener.cloned();
+
     // Build the unified rustls config up front (surfaces cert errors before bind).
+    #[cfg(feature = "acme")]
+    let mut acme = acme_runtime::Prepared::open(
+        &args.acme,
+        server.clone(),
+        &http_listener_name,
+        secure_listener.as_ref(),
+        args.http_addr,
+        https_addr,
+    )?;
     // (OPS9) The `_reloadable` variants also return a CertReloadHandle: the cert
     // material lives behind an ArcSwap inside the (fixed) ServerConfig, so SIGHUP
     // can re-read renewed cert files and swap them in without a restart.
     hj_tls::install_crypto_provider()?;
-    let want_ktls = args.ktls && cfg!(feature = "ktls");
-    let (tls_config, tls_cert_handle) = match (&secure_listener, https_addr) {
-        (Some(l), Some(_)) => {
-            let (cfg, handle) = hj_tls::build_server_config_reloadable(&server, l)?;
-            (Some(cfg), Some(handle))
-        }
-        _ => (None, None),
-    };
-    // kTLS (staged, io_uring only) needs a per-connection KeyLog to recover the TLS 1.3
-    // traffic secrets for a KeyUpdate rekey — built from a shared config TEMPLATE so each
-    // connection cheaply gets its own config+KeyLog. Built only when `--ktls` is active in a
-    // `--features ktls` build; otherwise `None` (the userspace TLS path is used).
-    let (ktls_template, ktls_cert_handle): (
-        Option<std::sync::Arc<hj_tls::KtlsConfigTemplate>>,
-        Option<hj_tls::CertReloadHandle>,
-    ) = match (&secure_listener, https_addr) {
-        (Some(l), Some(_)) if want_ktls => {
-            let (template, handle) = hj_tls::build_ktls_template(&server, l)?;
-            (Some(std::sync::Arc::new(template)), Some(handle))
-        }
-        _ => (None, None),
-    };
-    let _ = &ktls_template; // consumed only on the io_uring TLS path
-    // HTTP/3 (QUIC) config: same SNI resolver + Cloudflare mTLS verifier, ALPN h3.
-    // Raw h3-ALPN rustls config captured for the io_uring H3 path (it builds its own
-    // quinn-proto ServerConfig); `None` unless the uring H3 driver is requested. `rustls`
-    // is a uring-only optional dep, so this binding only exists in a uring build.
-    // Raw h3-ALPN rustls config for the io_uring H3 driver (it builds its own quinn-proto
-    // ServerConfig). `quic_cert_handle` is the reloadable cert handle registered for SIGHUP.
-    let mut h3_rustls_cfg: Option<std::sync::Arc<rustls::ServerConfig>> = None;
-    let quic_cert_handle = match (&secure_listener, https_addr) {
-        (Some(l), Some(_)) if server.quic_enable => {
-            let (h3_tls, handle) =
-                hj_tls::build_server_config_alpn_reloadable(&server, l, vec![b"h3".to_vec()])?;
-            h3_rustls_cfg = Some(h3_tls);
-            Some(handle)
-        }
-        _ => None,
-    };
+    #[cfg(feature = "acme")]
+    let acme_bootstrap = args.acme.acme_bootstrap;
+    #[cfg(not(feature = "acme"))]
+    let acme_bootstrap = false;
+    let ktls_decision = uring::ktls_policy::resolve(args.ktls)?;
+    let want_ktls = ktls_decision.enabled;
+    tracing::info!(
+        mode = ?args.ktls,
+        enabled = ktls_decision.enabled,
+        interface = ktls_decision.interface.as_deref().unwrap_or("none"),
+        driver = ktls_decision.driver.as_deref().unwrap_or("none"),
+        reason = %ktls_decision.reason,
+        "kTLS startup policy resolved"
+    );
+    #[allow(unused_mut)]
+    let (mut tls_config, mut ktls_template, mut h3_rustls_cfg, tls_cert_handle) =
+        match (&secure_listener, https_addr) {
+            (Some(l), Some(_)) => {
+                let bundle = hj_tls::PreparedListenerTls::prepare(
+                    &server,
+                    l,
+                    acme_bootstrap,
+                    server.quic_enable,
+                    want_ktls,
+                )?;
+                (
+                    Some(bundle.tcp),
+                    bundle.ktls.map(std::sync::Arc::new),
+                    bundle.quic,
+                    Some(bundle.certificates),
+                )
+            }
+            _ => (None, None, None, None),
+        };
+    // All transports share one resolver and certificate handle. Keep that handle
+    // singular through manager attachment and SIGHUP; reloading cloned handles
+    // repeatedly would re-read files and undermine the coherent certificate swap.
     let alt_svc = https_addr
         .filter(|_| h3_rustls_cfg.is_some())
         .map(|a| format!("h3=\":{}\"; ma=86400", a.port()));
+
+    #[cfg(feature = "acme")]
+    if let Some(acme) = acme.as_mut() {
+        let name: Arc<str> = secure_listener
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("ACME requires a secure listener"))?
+            .name
+            .clone()
+            .into();
+        acme.attach_handles(
+            tls_cert_handle
+                .clone()
+                .into_iter()
+                .map(|handle| (name.clone(), handle))
+                .collect(),
+        )?;
+    }
+    #[cfg(feature = "acme")]
+    let acme_targets = acme
+        .as_ref()
+        .map(acme_runtime::Prepared::certificate_targets);
+
+    #[cfg(feature = "ocsp")]
+    let ocsp = ocsp_runtime::prepare(
+        &args.ocsp,
+        args.http_addr,
+        https_addr,
+        &mut tls_config,
+        &mut ktls_template,
+        &mut h3_rustls_cfg,
+        tls_cert_handle.clone().into_iter(),
+    )?;
 
     let php_socket = args.php_socket.clone();
     let php_children = args.php_children;
     let no_php = args.no_php;
     let lsphp_external = args.lsphp_external.clone();
     let metrics_addr = args.metrics_addr.trim().to_string();
+    let admin_addr = args.admin_addr;
     let profile_token = {
         let t = args.profile_token.trim();
         (!t.is_empty()).then(|| t.to_string())
@@ -1017,7 +1152,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 // read it too — an accepted residual documented in issue #260 (the
                 // full fix is a dedicated PHP uid).
                 if let Err(e) = hj_pagecache::diskstore::init_integrity_key(
-                    &PathBuf::from("/usr/local/httpjet/conf/.jetcache.key"),
+                    &args.page_cache.integrity_key,
                 ) {
                     tracing::warn!(error = %e, "jetcache integrity key unavailable; persisted containers run WITHOUT integrity tags");
                 }
@@ -1151,6 +1286,48 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             );
         }
         let state = ServerState::new(server, php_registry.clone(), alt_svc, page_cache, page_cache_dicts, args.page_cache.admit_threshold, xf_capsule, peer_purge, cf_send_zstd, php_slow, args.request_id_header, rewrite_tuning).map_err(anyhow::Error::msg)?;
+        let state = {
+            let mut state = state;
+            Arc::get_mut(&mut state)
+                .expect("unshared boot state")
+                .request_decompression = request_decompression;
+            if request_decompression.brotli || request_decompression.zstd {
+                tracing::info!(
+                    brotli = request_decompression.brotli,
+                    zstd = request_decompression.zstd,
+                    "additional request decompression ENABLED"
+                );
+            }
+            state
+        };
+        #[cfg(feature = "acme")]
+        let state = {
+            let mut state = state;
+            if let Some(prepared) = &acme {
+                Arc::get_mut(&mut state).expect("unshared boot state").acme = Some(prepared.routing.clone());
+            }
+            state
+        };
+        let state = {
+            let mut state = state;
+            if let Some(address) = args.waf_sidecar_addr {
+                let policy = if args.waf_fail_open {
+                    waf::FailurePolicy::Open
+                } else {
+                    waf::FailurePolicy::Closed
+                };
+                let sidecar = waf::Sidecar::new(
+                    address,
+                    args.waf_sidecar_path.clone(),
+                    std::time::Duration::from_millis(args.waf_timeout_ms),
+                    args.waf_body_max,
+                    args.waf_concurrency,
+                    policy,
+                )?;
+                Arc::get_mut(&mut state).expect("unshared boot state").waf = Some(Arc::new(sidecar));
+            }
+            state
+        };
         // (persist) Rebuild the page-cache index from the tmpfs file tier in the
         // background — the server serves from request #1, with not-yet-scanned keys
         // simply missing during the ~seconds-long walk. Each kept key pre-warms the
@@ -1200,6 +1377,29 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // runtime half — counters, shutdown, caches, pools — is shared across
         // generations, so gen-0 reflects current totals after any reload).
         let holder: Arc<ArcSwap<ServerState>> = Arc::new(ArcSwap::from(state.clone()));
+        let transactions = config_transaction::Coordinator::new(holder.clone())?
+            .with_tcp_launch_policy(tcp_launch_policy);
+        let transactions = if let Some(path) = args.http_uds.clone() {
+            transactions.with_uds_launch_policy(listener_plan::UdsLaunchPolicy { path })
+        } else {
+            transactions
+        };
+        #[cfg(feature = "acme")]
+        let transactions = transactions.with_acme_targets(acme_targets);
+        #[cfg(feature = "ocsp")]
+        let transactions = transactions.with_ocsp_policy(args.ocsp.clone());
+        let transactions = Arc::new(transactions);
+        let admin_write_listener = if let Some((addr, token, roots)) = admin_write_config {
+            Some((tokio::net::TcpListener::bind(addr).await?, token, roots))
+        } else {
+            None
+        };
+        state.proxy.pool().activate_health_checks();
+        let admin_listener = if let Some(addr) = admin_addr {
+            Some(tokio::net::TcpListener::bind(addr).await?)
+        } else {
+            None
+        };
 
         // (OPS8) Adopt systemd socket-activation fds when present so a binary
         // deploy (`systemctl restart httpjet.service`) never closes the listen
@@ -1221,10 +1421,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // socket-activation fds (bound as root, passed to this `nobody` process); alt-port /
         // manual runs self-bind one SO_REUSEPORT socket per worker inside `uring`.
         // kTLS (staged) runs on the io_uring TLS path of a `--features ktls` build.
-        let use_ktls = args.ktls && want_ktls;
-        if args.ktls && !use_ktls && !cfg!(feature = "ktls") {
-            anyhow::bail!("--ktls requires a `--features ktls` build");
-        }
+        let use_ktls = want_ktls;
         if use_ktls {
             tracing::warn!("kTLS ENABLED (staged): serving TLS 1.3 over kernel-TLS sockets on the io_uring path (TLS 1.2 falls back to userspace). Peer KeyUpdate is handled (RX rekey + reply). Validate before production.");
         }
@@ -1233,15 +1430,16 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             .map(|v| v.into_iter().map(|l| l.into_std()).collect::<std::io::Result<Vec<_>>>())
             .transpose()?;
         let bridge_admission = uring::pipeline_admission(holder.clone());
-        uring::spawn_uring_http(
+        let mut transport_workers = vec![uring::spawn_uring_http(
             holder.clone(),
             http_listener_name.clone(),
-            args.http_addr,
+            http_bind_addr,
             workers,
             inh_http_std,
             bridge_admission.clone(),
             http_binding,
-        )?;
+        )?];
+        let mut quic_resources = None;
         tracing::info!(%args.http_addr, listener = %http_listener_name, workers, "plain HTTP up (io_uring thread-per-core transport)");
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
@@ -1249,25 +1447,25 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // one core, fabricated loopback peers. TLS-over-UDS is unsupported.
         if let Some(uds) = args.http_uds.clone() {
             let inherited = inh_unix.unwrap_or_default().into_iter().next();
-            uring::spawn_uring_uds(
+            transport_workers.push(uring::spawn_uring_uds(
                 holder.clone(),
                 http_listener_name.clone(),
                 uds.clone(),
-                inherited,
+                inherited.map(uring::UdsListenerInput::Inherited),
                 bridge_admission.clone(),
-            )?;
+            )?);
             tracing::info!(path = %uds.display(), "unix socket HTTP up");
         }
 
         if let (Some(addr), Some(tls_config), Some(l)) =
-            (https_addr, tls_config, secure_listener.as_ref())
+            (https_bind_addr, tls_config, secure_listener.as_ref())
         {
             let name: Arc<str> = l.name.clone().into();
             let mtls = if args.no_mtls { 0 } else { l.tls.as_ref().map(|t| t.client_verify).unwrap_or(0) };
             let inh_https_std = inh_https
                 .map(|v| v.into_iter().map(|l| l.into_std()).collect::<std::io::Result<Vec<_>>>())
                 .transpose()?;
-            uring::spawn_uring_https(
+            transport_workers.push(uring::spawn_uring_https(
                 holder.clone(),
                 name.clone(),
                 addr,
@@ -1280,13 +1478,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 uring::ListenerBinding {
                     proxy_protocol: l.proxy_protocol,
                 },
-            )?;
+            )?);
             tracing::info!(%addr, listener = %name, client_verify = mtls, workers, ktls = use_ktls, "TLS up (io_uring thread-per-core transport; H1/H2 over rustls-on-monoio; mTLS required for external peers when client_verify=2, loopback/private-LAN exempt)");
         }
 
         // HTTP/3 (QUIC) on the same address (UDP) — io_uring quinn-proto driver → real pipeline.
         if let (Some(addr), Some(h3cfg), Some(l)) =
-            (https_addr, h3_rustls_cfg.take(), secure_listener.as_ref())
+            (https_bind_addr, h3_rustls_cfg.take(), secure_listener.as_ref())
         {
             let name: Arc<str> = l.name.clone().into();
             let mtls = if args.no_mtls { 0 } else { l.tls.as_ref().map(|t| t.client_verify).unwrap_or(0) };
@@ -1300,13 +1498,21 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 inh_quic.take(),
                 bridge_admission.clone(),
             ) {
-                Ok(()) => tracing::warn!(%addr, listener = %name, client_verify = mtls, "h3/QUIC up (io_uring quinn-proto driver → real pipeline; mTLS required for external peers when client_verify=2, loopback/private-LAN exempt)"),
+                Ok((group, policy)) => {
+                    quic_resources = Some(resource_generation::QuicResources::new(
+                        group,
+                        policy,
+                        &state.trust_epoch,
+                    )?);
+                    tracing::warn!(%addr, listener = %name, client_verify = mtls, "h3/QUIC up (io_uring quinn-proto driver → real pipeline; mTLS required for external peers when client_verify=2, loopback/private-LAN exempt)");
+                },
                 Err(e) => anyhow::bail!("failed to start io_uring h3 listener: {e}"),
             }
         }
 
         // (OPS1) Loopback metrics endpoint (default 127.0.0.1:9090; empty = off).
         if !metrics_addr.is_empty() {
+            // The independent admin listener does not expose metrics control routes.
             match metrics_addr.parse::<SocketAddr>() {
                 Ok(addr) if !metrics::metrics_bind_allowed(&addr) => {
                     tracing::error!(
@@ -1330,6 +1536,26 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 },
                 Err(e) => tracing::error!(error = %e, addr = %metrics_addr, "invalid --metrics-addr"),
             }
+        }
+        if let Some(listener) = admin_listener {
+            handles.push(tokio::spawn(admin::serve(listener, holder.clone())));
+        }
+        if let Some((listener, token, roots)) = admin_write_listener {
+            let admission = bridge_admission.clone();
+            let control = Arc::new(admin_write::Control::new(
+                transactions.clone(), roots, args.no_mtls, args.per_ip_rate,
+                Arc::new(move || admission.limit_changed()),
+            )
+            .with_tcp_replacement(admin_write::TcpReplacementPolicy {
+                #[cfg(feature = "acme")]
+                acme_bootstrap: args.acme.acme_bootstrap,
+                #[cfg(not(feature = "acme"))]
+                acme_bootstrap: false,
+                ktls: use_ktls,
+                admission: bridge_admission.clone(),
+            }));
+            tracing::info!(address = %listener.local_addr()?, "authenticated config-write endpoint active; changes are volatile");
+            handles.push(tokio::spawn(admin_write::serve(listener, token, control)));
         }
 
         // (mem) Periodic mimalloc OS-trim: return retained/cold arena memory so it
@@ -1359,6 +1585,15 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         }
 
         tracing::info!(workers, vhosts = state.server.vhosts.len(), "httpjet serving. Ctrl-C to stop.");
+        #[cfg(feature = "acme")]
+        if let Some(acme) = acme {
+            let shutdown = state.shutdown.clone();
+            handles.push(tokio::spawn(async move {
+                if let Err(error) = acme.run(shutdown).await {
+                    tracing::error!(%error, "ACME manager stopped; operator reconciliation required");
+                }
+            }));
+        }
         // Serve until SIGINT/SIGTERM (systemctl stop / kill). SIGUSR1 reopens the
         // logs (logrotate); SIGUSR2 toggles the log level at runtime — neither
         // exits, so the wait is a loop.
@@ -1367,9 +1602,28 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         let mut sigusr1 = signal(SignalKind::user_defined1()).expect("install SIGUSR1 handler");
         let mut sigusr2 = signal(SignalKind::user_defined2()).expect("install SIGUSR2 handler");
         let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        // All transport groups and process-level setup are ready before any
+        // worker accepts. A startup error above retires still-inactive groups.
+        let resources = resource_generation::TransportResources::new(
+            state.trust_epoch.clone(), transport_workers,
+        )?;
+        let resources = if let (Some(handle), Some(listener)) = (tls_cert_handle, secure_listener.as_ref()) {
+            resources.with_certificate(uring::worker_group::TcpListenerId {
+                name: listener.name.clone().into(), tls: true,
+            }, handle)?
+        } else { resources };
+        #[cfg(feature = "ocsp")]
+        let resources = if let Some(manager) = ocsp {
+            resources.with_ocsp(manager, &state.shutdown)?
+        } else { resources };
+        transactions
+            .install_initial_resources_with_quic(resources, quic_resources)
+            .map_err(|_| anyhow::anyhow!("resource ownership installation rejected"))?;
+        let mut resource_reaper = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut debug_on = false;
         loop {
             tokio::select! {
+                _ = resource_reaper.tick() => { transactions.reap_retired(); },
                 _ = tokio::signal::ctrl_c() => break,
                 _ = sigterm.recv() => break,
                 _ = sighup.recv() => {
@@ -1388,8 +1642,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                             // with the already-built TLS acceptor (else --no-mtls would
                             // make every reload look like a TLS change and get rejected).
                             apply_no_mtls(&mut cfg, args.no_mtls);
+                            if let Some(rate) = args.per_ip_rate {
+                                cfg.tuning.per_ip_rate = rate;
+                            }
                             let new_server = Arc::new(cfg);
-                            let cur = holder.load_full();
+                            let transaction = transactions.begin().await;
+                            let revision = transaction.revision();
+                            let cur = transaction.current.clone();
                             if let Some(reason) = hard_config_change(&cur.server, &new_server) {
                                 tracing::warn!(
                                     reason,
@@ -1405,24 +1664,23 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                     "SIGHUP: reload would 404 mapped vhost(s) whose per-vhost config file failed to load — keeping current config"
                                 );
                             } else {
+                                // Complete fallible application-state construction
+                                // before touching independent certificate resolvers.
+                                // Multi-resource atomic publication is tracked in #428.
+                                let next = match ServerState::reload(&cur, new_server.clone()) {
+                                    Ok(next) => next,
+                                    Err(error) => {
+                                        tracing::error!(%error, "SIGHUP: reload rejected, keeping the current generation");
+                                        continue;
+                                    }
+                                };
                                 // (OPS9) Live cert reload: re-read the (possibly
                                 // renewed) cert files and swap them into the running
                                 // resolver — new handshakes use the new certs, no
                                 // restart. A load failure keeps the current certs.
-                                // Done BEFORE new_server is consumed by reload().
-                                if let Some(secure) = new_server.listeners.iter().find(|l| l.secure) {
-                                    visit_present_named(
-                                        [
-                                            ("TLS", tls_cert_handle.as_ref()),
-                                            ("kTLS", ktls_cert_handle.as_ref()),
-                                            ("QUIC", quic_cert_handle.as_ref()),
-                                        ],
-                                        |kind, handle| {
-                                            if let Err(e) = handle.reload(&new_server, secure) {
-                                                tracing::error!(error = %e, kind, "SIGHUP: certificate reload failed; keeping current certs");
-                                            }
-                                        },
-                                    );
+                                // Application candidate validation has already passed.
+                                if let Err(e) = transaction.reload_certificates(&new_server) {
+                                    tracing::error!(error = %e, "SIGHUP: active TLS certificate reload failed; retaining certificates whose reload failed");
                                 }
                                 // (audit) Be precise about what "certs" means: only the
                                 // SNI/default SERVER certs are swapped. The client-cert
@@ -1437,16 +1695,12 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                         "SIGHUP: client-CA trust stores are BOOT-frozen; if an origin-pull CA changed, RESTART httpjet"
                                     );
                                 }
-                                match ServerState::reload(&cur, new_server) {
-                                    Ok(next) => {
-                                        holder.store(next);
-                                        bridge_admission.limit_changed();
-                                        tracing::info!("SIGHUP: config hot-reloaded (config + SNI server certs; client-CA stores boot-frozen; cache + lsphp + connections preserved)");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "SIGHUP: reload rejected, keeping the current generation");
-                                    }
+                                if let Err(error) = transaction.publish(&revision, next) {
+                                    tracing::error!(?error, "SIGHUP: publication conflict; keeping current config");
+                                    continue;
                                 }
+                                bridge_admission.limit_changed();
+                                tracing::info!("SIGHUP: config hot-reloaded (config + SNI server certs; client-CA stores boot-frozen; cache + lsphp + connections preserved)");
                             }
                         }
                         Err(e) => {
@@ -1496,7 +1750,9 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // the lsphp drain below) so systemd never SIGKILLs us mid-drain; an
         // unbounded stream (SSE/long-poll) that never ends is cut at the budget.
         tracing::info!("shutdown signal received; draining connections");
+        transactions.close();
         state.shutdown.cancel();
+        holder.load().proxy.pool().stop_health_checks();
         let drain_budget = std::time::Duration::from_secs(12);
         let drain_start = std::time::Instant::now();
         loop {
@@ -1524,6 +1780,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         for h in handles {
             h.abort();
         }
+        transactions.finish_shutdown();
         // Drain every started lsphp pool. drain_all preserves the Phase-3
         // cancel-before-drain semantics per pool: it cancels each monitor ticker
         // (so the monitor does not fight the intentional stop with a restart),
@@ -2026,17 +2283,6 @@ fn apply_no_mtls(cfg: &mut hj_core::config::ServerConfig, no_mtls: bool) {
     }
 }
 
-fn visit_present_named<T>(
-    handles: [(&'static str, Option<&T>); 3],
-    mut visit: impl FnMut(&'static str, &T),
-) {
-    for (name, handle) in handles {
-        if let Some(handle) = handle {
-            visit(name, handle);
-        }
-    }
-}
-
 /// (OPS6) Decide whether a re-parsed config can be hot-reloaded. Returns
 /// `Some(reason)` when a change touches state that lives OUTSIDE the swappable
 /// `ServerState` — the bound listener sockets / TLS acceptor, or the lsphp pool —
@@ -2162,11 +2408,10 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
     for l in &cfg.listeners {
         let tls = match &l.tls {
             Some(t) => {
-                // OCSP stapling is parsed but NOT implemented (no responder fetch); say so
-                // rather than printing `stapling=true`, which falsely implies it is active.
-                // Harmless behind Cloudflare, which terminates TLS to clients.
+                // XML alone never starts responder traffic; runtime requires an
+                // explicit endpoint and an OCSP-enabled build. Do not imply active.
                 let stapling = if t.enable_stapling {
-                    "requested(no-op: unimplemented)"
+                    "requested(requires --features ocsp and --ocsp-responder)"
                 } else {
                     "off"
                 };
@@ -2216,6 +2461,7 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
         let kind = match e.kind {
             ExtKind::Proxy => "proxy",
             ExtKind::Lsapi => "lsapi",
+            ExtKind::FastCgi => "fastcgi",
         };
         println!("    - {} [{}] -> {:?}", e.name, kind, e.address);
     }
@@ -2595,6 +2841,61 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
 mod tests {
     use super::*;
 
+    fn parsed_ktls_mode(args: &[&str]) -> uring::ktls_policy::KtlsMode {
+        let cli = Cli::try_parse_from(["httpjet", "serve"].into_iter().chain(args.iter().copied()))
+            .expect("serve CLI should parse");
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("expected serve command");
+        };
+        args.ktls
+    }
+
+    #[test]
+    fn ktls_cli_defaults_auto_and_accepts_explicit_policy() {
+        use uring::ktls_policy::KtlsMode;
+
+        assert_eq!(parsed_ktls_mode(&[]), KtlsMode::Auto);
+        assert_eq!(parsed_ktls_mode(&["--ktls=auto"]), KtlsMode::Auto);
+        assert_eq!(parsed_ktls_mode(&["--ktls=on"]), KtlsMode::On);
+        assert_eq!(parsed_ktls_mode(&["--ktls=off"]), KtlsMode::Off);
+        assert_eq!(parsed_ktls_mode(&["--ktls"]), KtlsMode::On);
+        assert!(Cli::try_parse_from(["httpjet", "serve", "--ktls=invalid"]).is_err());
+    }
+
+    #[test]
+    fn admin_write_cli_requires_explicit_auth_and_roots() {
+        let base = ["httpjet", "serve"];
+        assert!(Cli::try_parse_from(base).is_ok());
+        for args in [
+            vec!["--admin-write-addr", "127.0.0.1:9092"],
+            vec!["--admin-token-file", "/token"],
+            vec!["--admin-resource-root", "/content"],
+            vec![
+                "--admin-write-addr",
+                "0.0.0.0:9092",
+                "--admin-token-file",
+                "/token",
+                "--admin-resource-root",
+                "/content",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(base.into_iter().chain(args)).is_err());
+        }
+        assert!(
+            Cli::try_parse_from(base.into_iter().chain([
+                "--admin-write-addr",
+                "127.0.0.1:9092",
+                "--admin-token-file",
+                "/token",
+                "--admin-resource-root",
+                "/content",
+                "--admin-resource-root",
+                "/resources",
+            ]))
+            .is_ok()
+        );
+    }
+
     #[test]
     fn pp_bind_classifier_warns_only_on_public_reachable_binds() {
         // Wildcard / any-address binds are reachable by untrusted direct peers.
@@ -2820,22 +3121,5 @@ mod tests {
         let mut routing_only = base.clone();
         routing_only.php_config.as_mut().unwrap().suffixes = vec!["html".into()];
         assert_eq!(hard_config_change(&base, &routing_only), None);
-    }
-
-    #[test]
-    fn certificate_reload_visits_the_ktls_handle() {
-        let tls = 1;
-        let ktls = 2;
-        let quic = 3;
-        let mut visited = Vec::new();
-        visit_present_named(
-            [
-                ("TLS", Some(&tls)),
-                ("kTLS", Some(&ktls)),
-                ("QUIC", Some(&quic)),
-            ],
-            |name, handle| visited.push((name, *handle)),
-        );
-        assert_eq!(visited, vec![("TLS", 1), ("kTLS", 2), ("QUIC", 3)]);
     }
 }

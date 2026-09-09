@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1.97-bookworm AS build
+WORKDIR /src
+COPY . .
+ENV CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2
+RUN cargo build --locked --release -p httpjet
+
+FROM debian:bookworm-slim
+LABEL org.opencontainers.image.source="https://github.com/faratech/httpjet" \
+      org.opencontainers.image.licenses="GPL-3.0-only" \
+      org.opencontainers.image.title="httpjet hardened example"
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 httpjet \
+    && useradd --uid 10001 --gid 10001 --home-dir /nonexistent \
+        --no-create-home --shell /usr/sbin/nologin httpjet
+
+COPY --from=build /src/target/release/httpjet /usr/local/bin/httpjet
+COPY packaging/oci/litespeed/ /etc/httpjet/litespeed/
+
+RUN install -d -o httpjet -g httpjet -m 0750 \
+        /etc/httpjet/litespeed/logs /var/lib/httpjet /var/lib/httpjet/cache \
+    && chown -R root:root /etc/httpjet/litespeed/conf /etc/httpjet/litespeed/example \
+    && chmod -R a-w /etc/httpjet/litespeed/conf /etc/httpjet/litespeed/example
+
+USER 10001:10001
+WORKDIR /var/lib/httpjet
+
+# HTTP, HTTPS-over-TCP, and HTTP/3-over-UDP. Publishing only TCP 8443 does not
+# expose QUIC; both transport mappings are intentional.
+EXPOSE 8080/tcp 8443/tcp 8443/udp
+
+VOLUME ["/etc/httpjet/litespeed/logs", "/var/lib/httpjet", "/run/httpjet-certs"]
+
+HEALTHCHECK --interval=5s --timeout=2s --start-period=10s --retries=12 \
+    CMD ["curl", "--fail", "--silent", "--show-error", "--header", "Host: example.test", "http://127.0.0.1:8080/__hj_cache_ready"]
+
+ENTRYPOINT ["/usr/local/bin/httpjet"]
+STOPSIGNAL SIGTERM
+CMD ["--root", "/etc/httpjet/litespeed", "serve", "--http-addr", "0.0.0.0:8080", "--https-addr", "0.0.0.0:8443", "--workers", "1", "--no-php", "--page-cache", "--page-cache-mem", "16777216", "--page-cache-disk-mem", "67108864", "--page-cache-hot-mem", "8388608", "--page-cache-store-path", "/var/lib/httpjet/cache", "--page-cache-integrity-key", "/var/lib/httpjet/cache.key"]

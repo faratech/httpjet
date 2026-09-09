@@ -1,0 +1,71 @@
+name: Protocol interoperability
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: interop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  protocols:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev pkg-config
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+          python3 -m venv "$RUNNER_TEMP/h3-venv"
+          "$RUNNER_TEMP/h3-venv/bin/pip" install 'aioquic==1.3.0' 'h2==4.4.1' 'cryptography==50.0.1'
+          echo "$RUNNER_TEMP/h3-venv/bin" >> "$GITHUB_PATH"
+          curl --fail --location --max-time 60 https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz -o "$RUNNER_TEMP/h2spec.tar.gz"
+          echo "157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318  $RUNNER_TEMP/h2spec.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/h2spec.tar.gz" -C "$RUNNER_TEMP" h2spec
+      - name: Build synthetic server
+        # Debug is acceptable for correctness; this is not a throughput benchmark.
+        run: cargo build --locked -p httpjet --features otel --bin httpjet
+      - name: H2 canonical conformance against synthetic TLS fixture
+        run: python3 -B scripts/ci-h2spec.py --binary target/debug/httpjet --h2spec "$RUNNER_TEMP/h2spec"
+      - name: H1 WebSocket and H2 dispatch tracing
+        run: cargo test --locked -p httpjet --features otel traced_fast_and_bridged_requests
+      - name: H3 actual QUIC transfers and tracing
+        run: cargo test --locked -p httpjet --features otel traced_quic_roundtrip -- --ignored
+      - name: OCSP real TLS policy and certificate lifecycle
+        run: |
+          cargo test --locked -p hj-ocsp
+          cargo test --locked -p hj-tls --features ocsp ocsp::tests
+          cargo build --locked -p httpjet --features ocsp,acme --bin httpjet
+          python3 -B scripts/ocsp-runtime-test.py --binary target/debug/httpjet
+          python3 -B scripts/ocsp-runtime-test.py --binary target/debug/httpjet --optional
+          python3 -B scripts/ocsp-runtime-test.py --binary target/debug/httpjet --optional --must-staple
+      - name: Build pinned local ACME test CA
+        env:
+          GOTOOLCHAIN: go1.24.2
+          GOMAXPROCS: '2'
+        run: |
+          GOBIN="$RUNNER_TEMP/acme-tools" go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1
+          GOBIN="$RUNNER_TEMP/acme-tools" go install github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1
+          echo "HJ_PEBBLE_BIN=$RUNNER_TEMP/acme-tools/pebble" >> "$GITHUB_ENV"
+          echo "HJ_PEBBLE_DNS_BIN=$RUNNER_TEMP/acme-tools/pebble-challtestsrv" >> "$GITHUB_ENV"
+          echo "HJ_PEBBLE_SOURCE=$(go env GOMODCACHE)/github.com/letsencrypt/pebble/v2@v2.10.1" >> "$GITHUB_ENV"
+      - name: ACME issued-order recovery and renewal
+        run: cargo test --locked -p hj-acme pebble_issuance_recovery_and_renewal -- --ignored
+      - name: ACME real server bootstrap and H1 H2 H3 activation
+        run: |
+          cargo build --locked -p httpjet --features acme --bin httpjet
+          python3 scripts/acme-pebble-test.py --binary target/debug/httpjet --pebble "$HJ_PEBBLE_BIN" --dns "$HJ_PEBBLE_DNS_BIN" --pebble-source "$HJ_PEBBLE_SOURCE" --bootstrap
+          python3 scripts/acme-pebble-test.py --binary target/debug/httpjet --pebble "$HJ_PEBBLE_BIN" --dns "$HJ_PEBBLE_DNS_BIN" --pebble-source "$HJ_PEBBLE_SOURCE" --bootstrap --dns01

@@ -1,0 +1,17 @@
+[package]
+name = "hj-ocsp"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64 = "0.22"
+openssl = "=0.10.81"
+openssl-sys = "=0.9.117"
+foreign-types = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+tokio = { workspace = true }
+parking_lot = { workspace = true }

@@ -52,6 +52,23 @@ impl<S: Subscriber> Layer<S> for ErrorLogLayer {
             return;
         }
 
+        if self.logger.is_json() {
+            let mut collector = crate::error_json::Collector::default();
+            event.record(&mut collector);
+            self.logger.structured_at(
+                if *md.level() == Level::ERROR {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Warn
+                },
+                std::time::SystemTime::now(),
+                Some(md.target()),
+                &collector.message,
+                &collector.fields,
+            );
+            return;
+        }
+
         let mut collector = FieldCollector::default();
         event.record(&mut collector);
 
@@ -133,23 +150,40 @@ mod tests {
 
         let logger = ErrorLogger::spawn(&path, 0, 0, false);
         let layer = ErrorLogLayer::new(logger.clone());
+        let json_path = dir.join(format!("hj-errlayer-json-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&json_path);
+        let json_logger =
+            ErrorLogger::spawn_with_format(&json_path, 0, 0, false, crate::ErrorLogFormat::Json);
         // `set_global_default` (unlike scoped `with_default`) raises the process-wide
         // runtime max level, so the `tracing::*` macros below are actually enabled.
         // This is the only subscriber-installing test in this (writer-only) binary.
         tracing::subscriber::set_global_default(
             tracing_subscriber::registry()
                 .with(layer)
+                .with(ErrorLogLayer::new(json_logger.clone()))
                 .with(tracing_subscriber::filter::LevelFilter::TRACE),
         )
         .expect("install global subscriber for the layer test");
 
         tracing::error!(code = 502, "backend down");
+        tracing::error!(
+            authorization = "Bearer synthetic-secret",
+            code = 401,
+            "denied"
+        );
         tracing::warn!("slow upstream");
         tracing::info!("this should NOT be in the error log");
         tracing::error!(target: "hj_log", "writer self-report should be dropped");
 
         // Flush the writer to disk.
         logger.shutdown().await;
+        json_logger.shutdown().await;
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        std::fs::remove_file(&json_path).unwrap();
+        assert!(json.contains("\"code\":\"502\""));
+        assert!(json.contains("\"authorization\":\"[REDACTED]\""));
+        assert!(!json.contains("synthetic-secret"));
+        assert!(!json.contains("writer self-report") && !json.contains("this should NOT"));
         let body = std::fs::read_to_string(&path).unwrap_or_default();
         let _ = std::fs::remove_file(&path);
 

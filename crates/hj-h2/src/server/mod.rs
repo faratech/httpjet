@@ -783,9 +783,21 @@ enum Seg {
 pub(super) struct OutQueue {
     inline: Vec<u8>,
     segs: Vec<Seg>,
+    completions: Vec<hj_core::ResponseCompletion>,
 }
+#[cfg(test)]
+mod completion_tests;
 
 impl OutQueue {
+    fn finish_responses(&mut self, success: bool) {
+        for completion in self.completions.drain(..) {
+            completion.finish(if success {
+                hj_core::ResponseEnd::Complete
+            } else {
+                hj_core::ResponseEnd::Error
+            });
+        }
+    }
     #[inline]
     fn is_empty(&self) -> bool {
         self.segs.is_empty()
@@ -829,6 +841,12 @@ impl OutQueue {
 /// inline runs and referenced bodies into records without us concatenating them first, so
 /// large bodies skip the body→buffer copy. Handles short writes by advancing the slices.
 async fn flush<W: AsyncWrite + Unpin>(w: &mut W, q: &mut OutQueue) -> std::io::Result<()> {
+    let result = flush_inner(w, q).await;
+    q.finish_responses(result.is_ok());
+    result
+}
+
+async fn flush_inner<W: AsyncWrite + Unpin>(w: &mut W, q: &mut OutQueue) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     if q.is_empty() {
         return Ok(());
@@ -898,6 +916,17 @@ async fn paced_flush<IO: monoio::io::AsyncWriteRent>(
 
 #[cfg(feature = "monoio")]
 async fn monoio_flush<IO: monoio::io::AsyncWriteRent>(
+    stream: &mut IO,
+    q: &mut OutQueue,
+    ktls_fd: Option<i32>,
+) -> std::io::Result<()> {
+    let result = monoio_flush_inner(stream, q, ktls_fd).await;
+    q.finish_responses(result.is_ok());
+    result
+}
+
+#[cfg(feature = "monoio")]
+async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
     stream: &mut IO,
     q: &mut OutQueue,
     ktls_fd: Option<i32>,

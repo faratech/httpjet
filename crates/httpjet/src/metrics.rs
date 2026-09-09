@@ -343,6 +343,41 @@ fn render(state: &ServerState) -> String {
         state.page_cache.as_ref().map(|pc| pc.stats()),
     );
     append_body_budget_metrics(&mut body, &state.body_budget);
+    #[cfg(feature = "otel")]
+    {
+        let (attempts, failures) = crate::otel::export_stats();
+        let (queued, dropped, exported, failed) = crate::otel::span_stats();
+        for (name, value, kind, help) in [
+            (
+                "queue",
+                queued,
+                "gauge",
+                "Spans awaiting batch admission; excludes current batch/export.",
+            ),
+            (
+                "dropped_total",
+                dropped,
+                "counter",
+                "Sampled spans dropped by queue overflow or processor closure.",
+            ),
+            (
+                "exported_total",
+                exported,
+                "counter",
+                "Spans in successful exporter calls; not collector ingestion confirmation.",
+            ),
+            (
+                "export_failed_total",
+                failed,
+                "counter",
+                "Spans in failed exporter calls.",
+            ),
+        ] {
+            body.push_str(&format!("# HELP httpjet_otel_spans_{name} {help}\n# TYPE httpjet_otel_spans_{name} {kind}\nhttpjet_otel_spans_{name} {value}\n"));
+        }
+        body.push_str(&format!("# HELP httpjet_otel_http_exports_total Completed collector HTTP attempts.\n# TYPE httpjet_otel_http_exports_total counter\nhttpjet_otel_http_exports_total {attempts}\n# HELP httpjet_otel_http_export_failures_total Failed collector HTTP attempts.\n# TYPE httpjet_otel_http_export_failures_total counter\nhttpjet_otel_http_export_failures_total {failures}\n"));
+    }
+    append_proxy_peer_metrics(&mut body, &state.proxy.pool().peer_snapshots());
     body.push_str(&format!(
         "# HELP httpjet_proxy_failover_total Requests served by a failover upstream peer because the primary was marked bad (Tier 1.2).\n# TYPE httpjet_proxy_failover_total counter\nhttpjet_proxy_failover_total {}\n",
         state.proxy.pool().failovers_total()
@@ -780,6 +815,65 @@ fn request_target(req: &[u8]) -> Option<String> {
 /// Render the live page-cache contents (loopback debug): per-URL-class histogram + the largest
 /// entries, so an operator can see EXACTLY what is cached (and whether it's the recurring set or
 /// junk) instead of inferring from aggregate counters.
+fn append_proxy_peer_metrics(out: &mut String, peers: &[hj_proxy::PeerSnapshot]) {
+    use std::fmt::Write;
+    let escape = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('\n', "\\n")
+            .replace('"', "\\\"")
+    };
+    for (name, kind, help) in [
+        (
+            "healthy",
+            "gauge",
+            "Active health eligibility; one when probes are disabled.",
+        ),
+        ("probes_total", "counter", "Completed active health probes."),
+        (
+            "health_transitions_total",
+            "counter",
+            "Active health eligibility changes.",
+        ),
+        (
+            "active_requests",
+            "gauge",
+            "Selected requests retained through response or relay completion.",
+        ),
+        (
+            "selections_total",
+            "counter",
+            "Requests selected for a configured peer.",
+        ),
+        (
+            "prehead_failures_total",
+            "counter",
+            "Selected attempts ending before a response head, including cancellation.",
+        ),
+    ] {
+        let _ = writeln!(
+            out,
+            "# HELP httpjet_proxy_peer_{name} {help}\n# TYPE httpjet_proxy_peer_{name} {kind}"
+        );
+        for p in peers {
+            let value = match name {
+                "healthy" => u64::from(p.healthy),
+                "probes_total" => p.probes,
+                "health_transitions_total" => p.transitions,
+                "active_requests" => p.active,
+                "selections_total" => p.selections,
+                _ => p.failures,
+            };
+            let _ = writeln!(
+                out,
+                "httpjet_proxy_peer_{name}{{scope=\"{}\",group=\"{}\",peer=\"{}\"}} {value}",
+                escape(&p.scope),
+                escape(&p.group),
+                p.peer
+            );
+        }
+    }
+}
+
 fn append_body_budget_metrics(out: &mut String, budget: &hj_core::budget::BodyBufferBudget) {
     use std::fmt::Write;
     for (name, kind, help, value) in [

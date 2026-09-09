@@ -249,6 +249,12 @@ pub(super) struct RawExtList {
 
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct RawExtProcessor {
+    #[serde(rename = "healthCheck", default)]
+    pub(super) health_check: Option<RawHealthCheck>,
+    #[serde(rename = "loadBalancePolicy", default)]
+    pub(super) load_balance_policy: Option<String>,
+    #[serde(rename = "addressWeights", default)]
+    pub(super) address_weights: Option<String>,
     #[serde(rename = "type", default)]
     pub(super) kind: Option<String>,
     #[serde(default)]
@@ -281,6 +287,19 @@ pub(super) struct RawExtProcessor {
     pub(super) instances: Option<String>,
     #[serde(rename = "runOnStartUp", default)]
     pub(super) run_on_startup: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawHealthCheck {
+    pub(super) mode: Option<String>,
+    pub(super) interval: Option<String>,
+    pub(super) timeout: Option<String>,
+    pub(super) rise: Option<String>,
+    pub(super) fall: Option<String>,
+    pub(super) path: Option<String>,
+    pub(super) host: Option<String>,
+    #[serde(rename = "expectedStatus", default)]
+    pub(super) expected_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

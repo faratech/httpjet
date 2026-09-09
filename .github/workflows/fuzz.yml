@@ -1,0 +1,46 @@
+name: Bounded fuzzing
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target: [h1_chunked_decode, h1_request_framing, hpack_decode, hpack_roundtrip, lsapi_resp_header]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned fuzz toolchain
+        run: |
+          rustup toolchain install nightly-2026-08-31 --profile minimal --component rust-src
+          cargo +nightly-2026-08-31 install cargo-fuzz --version 0.13.2 --locked
+      - name: Run bounded ASan fuzz target
+        env:
+          FUZZ_SECONDS: '300'
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: bash scripts/fuzz-bounded.sh "$FUZZ_TARGET"
+      - name: Preserve corpus and crash artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+            fuzz/Cargo.lock
+          retention-days: 14

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<virtualHostConfig>
+  <docRoot>$VH_ROOT/public</docRoot>
+  <indexFiles>index.html</indexFiles>
+  <allowSymbolLink>0</allowSymbolLink>
+  <rewrite>
+    <enable>0</enable>
+    <autoLoadHtaccess>0</autoLoadHtaccess>
+  </rewrite>
+</virtualHostConfig>

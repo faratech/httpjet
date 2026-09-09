@@ -22,6 +22,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use hj_compress::ExpiresHeaders;
 use hj_core::{Body, Handler, Proto, ReqCtx, Request, Response, ResponseTransform};
+use hj_fastcgi::FastCgiScript;
 use hj_lsapi::{JailConfig, LsapiScript, SpecialEnvType};
 use hj_proxy::{ProxyTarget, is_websocket_upgrade};
 use hj_rewrite::Htaccess;
@@ -33,7 +34,7 @@ use crate::lscache;
 use crate::state::ServerState;
 
 #[cfg(test)]
-mod e2e;
+pub(crate) mod e2e;
 #[cfg(test)]
 mod expires_tests;
 pub(crate) mod fast_memo;
@@ -190,6 +191,18 @@ pub(crate) async fn fast_serve(
     req: &Request,
 ) -> Option<Response> {
     let req_start = std::time::Instant::now();
+    // The on-core memo/static/page-cache path cannot perform asynchronous WAF
+    // inspection. When a sidecar is configured, force every request through the
+    // bridged full pipeline where inspection precedes every cache/backend path.
+    if state.waf.is_some() || state.extensions.has_pre_handlers() {
+        return None;
+    }
+    #[cfg(feature = "acme")]
+    if state.acme.is_some() && req.uri().path().starts_with("/.well-known/acme-challenge/") {
+        // Never memoize a challenge or let static/page-cache state hide a token
+        // transition. The full funnel checks the raw URI before normalization.
+        return None;
+    }
     // Reserved cache endpoints (`/__hj_cache_purge|_get|_ready`) are intercepted
     // before vhost routing on BOTH entry points: `handle()` checks them below the
     // bridge, but this on-core fast path runs FIRST — without the same gate here,
@@ -291,6 +304,7 @@ pub(crate) async fn fast_serve(
     let memo_inline_ok = memo_inline.is_none_or(|rs| rs.path_cacheable);
     if memo_eligible_req && memo_inline_ok {
         let mk = fast_memo::MemoKey {
+            generation: state.generation,
             listener,
             https: effective_https,
             trusted_proxy,
@@ -538,9 +552,7 @@ pub(crate) async fn fast_serve(
         if let lscache::CacheOutcome::Hit(mut resp) =
             lscache::cache_lookup(state, &ctx, &cc, inm, false, None)
         {
-            for t in &state.transforms {
-                t.transform(&ctx, &mut resp).await;
-            }
+            apply_response_transforms(state, &ctx, &mut resp).await;
             state.telemetry.record_cache_hit(peer_ip.is_loopback());
             if !state.client_throttle.allow(peer_ip) {
                 return None; // over the per-IP rate: dispatch() renders the 429
@@ -647,14 +659,13 @@ pub(crate) async fn fast_serve(
     );
     // Header transforms (expires / Alt-Svc / compress) — they see an in-memory body now,
     // so CacheStaticTransform is a no-op (no block_in_place) and Compress negotiates per AE.
-    for t in &state.transforms {
-        t.transform(&ctx, &mut resp).await;
-    }
+    apply_response_transforms(state, &ctx, &mut resp).await;
     if resp.status() == StatusCode::OK && !resp.headers().contains_key(http::header::SET_COOKIE) {
         if memo_store_ok {
             if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs) {
                 fast_memo::store(
                     &fast_memo::MemoKey {
+                        generation: state.generation,
                         listener,
                         https: effective_https,
                         trusted_proxy,
@@ -1079,7 +1090,88 @@ fn strip_empty_query(uri: &http::Uri) -> Option<http::Uri> {
     http::Uri::from_parts(parts).ok()
 }
 
+/// Apply compile-time response extensions before the host-owned transforms.
+///
+/// This ordering gives extensions the terminal/cache response before compression,
+/// while keeping cache-safety, compression and transport headers under httpjet's
+/// final control. Every full and on-core response funnel calls this helper.
+async fn apply_response_transforms(state: &ServerState, ctx: &ReqCtx, resp: &mut Response) {
+    state.extensions.run_response_transforms(ctx, resp).await;
+    for transform in &state.transforms {
+        transform.transform(ctx, resp).await;
+    }
+}
+
 pub async fn handle(
+    state: Arc<ServerState>,
+    listener: &str,
+    peer_ip: IpAddr,
+    local_addr: std::net::SocketAddr,
+    peer_port: u16,
+    is_tls: bool,
+    peer_unix: bool,
+    mtls_required: bool,
+    tls: Option<hj_core::TlsParams>,
+    proto: Proto,
+    sni: Option<&str>,
+    req: Request,
+) -> Response {
+    #[cfg(feature = "otel")]
+    if crate::otel::enabled() {
+        let mut req = req;
+        let transport = req
+            .extensions_mut()
+            .remove::<crate::otel::TransportContext>();
+        // PROXY protocol replaces peer_ip with an asserted address. Until the
+        // original transport peer is carried separately, never trust it here.
+        let direct_tcp = !peer_unix
+            && state
+                .server
+                .listeners
+                .iter()
+                .find(|configured| configured.name == listener)
+                .is_some_and(|configured| !configured.proxy_protocol);
+        let parent = crate::otel::inbound_parent(req.headers_mut(), peer_ip, direct_tcp);
+        let future = handle_inner(
+            state,
+            listener,
+            peer_ip,
+            local_addr,
+            peer_port,
+            is_tls,
+            peer_unix,
+            mtls_required,
+            tls,
+            proto,
+            sni,
+            req,
+        );
+        return match transport {
+            Some(context) => crate::otel::in_context(context.0, future).await,
+            None if proto == Proto::Http3 => {
+                crate::otel::request_with_completion(parent, future).await
+            }
+            None => crate::otel::request_with_parent(parent, future).await,
+        };
+    }
+    handle_inner(
+        state,
+        listener,
+        peer_ip,
+        local_addr,
+        peer_port,
+        is_tls,
+        peer_unix,
+        mtls_required,
+        tls,
+        proto,
+        sni,
+        req,
+    )
+    .await
+}
+
+async fn handle_inner(
     state: Arc<ServerState>,
     listener: &str,
     peer_ip: IpAddr,
@@ -1097,6 +1189,43 @@ pub async fn handle(
     let _req_guard = RequestGuard::new(&state.metrics.active_requests);
     // (telemetry) Total wall time, recorded at the single response funnel below.
     let req_start = std::time::Instant::now();
+
+    #[cfg(feature = "acme")]
+    if let Some(mut response) = state
+        .acme
+        .as_ref()
+        .and_then(|acme| acme.response(listener, &req, is_tls))
+    {
+        state
+            .metrics
+            .requests_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        state.telemetry.record_request(
+            proto,
+            response.status().as_u16(),
+            req_start.elapsed(),
+            state.telemetry.vhost_idx(""),
+        );
+        if let Some(log) = &state.access_log {
+            let record = hj_log::AccessRecord {
+                client_ip: peer_ip,
+                ts: std::time::SystemTime::now(),
+                method: method_static(req.method()),
+                uri: "/.well-known/acme-challenge/[redacted]".into(),
+                protocol: proto.as_str(),
+                status: response.status().as_u16(),
+                bytes: 0,
+                referer: None,
+                user_agent: None,
+                host: header_str(&req, http::header::HOST),
+                remote_user: None,
+                request_id: Some(hj_core::reqid::next().to_string()),
+                peer_unix,
+            };
+            response = log_access(log, response, record, None);
+        }
+        return response;
+    }
 
     let has_authorization = req.headers().contains_key(http::header::AUTHORIZATION);
     // Normalize a trailing empty query ("/x?" -> "/x") before anything reads the URI. See
@@ -1337,7 +1466,23 @@ pub async fn handle(
             ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
         }
         set_redirect_guard(&mut ctx, req.uri(), &req_host);
-        dispatch(&state, host_foreign, req_host, &mut ctx, req).await
+        match state.extensions.run_pre_handlers(&ctx, &req).await {
+            Ok(hj_extension::PreHandlerDecision::Continue) => {
+                dispatch(&state, host_foreign, req_host, &mut ctx, req).await
+            }
+            Ok(hj_extension::PreHandlerDecision::Respond(response)) => response,
+            Err(error) => {
+                let status = error.status();
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    vhost = %ctx.vhost_name,
+                    status = status.as_u16(),
+                    error = %error,
+                    "compile-time pre-handler extension failed"
+                );
+                error_page(status)
+            }
+        }
     };
 
     if let Some(p) = &bw_path {
@@ -1356,9 +1501,7 @@ pub async fn handle(
         .telemetry
         .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE)
         .then(std::time::Instant::now);
-    for t in &state.transforms {
-        t.transform(&ctx, &mut resp).await;
-    }
+    apply_response_transforms(&state, &ctx, &mut resp).await;
     if let Some(t) = _ct {
         state.telemetry.shard().phase_compress.record(t.elapsed());
     }
@@ -2217,6 +2360,26 @@ async fn dispatch(
     {
         return error_page(status);
     }
+    // Opt-in WAF sidecar runs before rewrite, every cache lookup, and every
+    // terminal backend/static path. Large bodies are described as omitted
+    // instead of being copied beyond the inspection cap; the sidecar still
+    // decides whether that request shape is allowed. Sidecar errors obey the
+    // explicit process-lifetime failure policy (closed by default).
+    if let Some(waf) = &state.waf {
+        let include_body =
+            exact_request_body_size(&req).is_some_and(|length| length <= waf.inspect_body_max());
+        match waf.inspect(ctx, &mut req, &orig_path, include_body).await {
+            Ok(crate::waf::Verdict::Allow) => {}
+            Ok(crate::waf::Verdict::Block) => return error_page(StatusCode::FORBIDDEN),
+            Err(error) if waf.failure_policy() == crate::waf::FailurePolicy::Open => {
+                tracing::warn!(request_id = %ctx.request_id, %error, "WAF sidecar failure allowed by explicit fail-open policy");
+            }
+            Err(error) => {
+                tracing::error!(request_id = %ctx.request_id, %error, "WAF sidecar failure rejected request");
+                return error_page(StatusCode::SERVICE_UNAVAILABLE);
+            }
+        }
+    }
     // Borrow the original path/query; only the `Rewritten` arm below promotes them to Owned, so
     // the common unchanged case (e.g. a static `.bin` whose rewrite is a no-op) clones neither.
     let mut cur_path: Cow<str> = Cow::Borrowed(&orig_path);
@@ -2815,7 +2978,7 @@ async fn dispatch(
             .iter()
             .find(|w| context_uri_matches(&cur_path, &w.uri))
         {
-            let target = ProxyTarget::from_websocket_map(ws);
+            let target = ProxyTarget::from_websocket_map(ws).in_scope(&ctx.vhost_name);
             return proxy_websocket(state, ctx, req, target).await;
         }
     }
@@ -2855,6 +3018,43 @@ async fn dispatch(
     // ---- 7. Suffix routing: LSAPI (php/html) or static -------------------
     // Reuse the split resolved once above (B5) — `cur_path` is unchanged since.
     if let Some((script_abs, script_name, path_info)) = script_split {
+        if let Some(handler_name) = fastcgi_handler_for_script(ctx, &script_abs) {
+            let Some(handler) = state
+                .fastcgi_handler(&ctx.vhost_name, handler_name)
+                .cloned()
+            else {
+                tracing::error!(request_id = %ctx.request_id, vhost = %ctx.vhost_name, handler = handler_name, "CGI script handler is not an enabled FastCGI processor");
+                return lscache::cache_store(
+                    state,
+                    ctx,
+                    &cc,
+                    error_page(StatusCode::SERVICE_UNAVAILABLE),
+                )
+                .await;
+            };
+            let target = pinned_script_target.clone().unwrap_or_else(|| {
+                panic!("script split reached FastCGI without a pinned filesystem target")
+            });
+            let mut fcgi_script = match FastCgiScript::new(target) {
+                Ok(script) => script.script_name(script_name.clone()),
+                Err(error) => {
+                    tracing::error!(request_id = %ctx.request_id, %error, "invalid pinned FastCGI script target");
+                    return error_page(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
+            if !path_info.is_empty() {
+                fcgi_script = fcgi_script.path_info(path_info.clone());
+            }
+            req.extensions_mut().insert(fcgi_script);
+            if rewritten {
+                ctx.set_env("SCRIPT_NAME", script_name);
+                ctx.set_env("QUERY_STRING", cur_query.clone());
+                ctx.set_env("REDIRECT_URL", orig_path.clone());
+            }
+            let mut resp = run_handler(handler.as_ref(), ctx, req).await;
+            apply_response_headers_for_request(ctx, &chain, &rel_path, &orig_path, &mut resp);
+            return lscache::cache_store(state, ctx, &cc, resp).await;
+        }
         if let Some(registry) = state.lsapi.clone() {
             // Resolve this vhost's jail (config-gated + root-gated inside
             // JailConfig::resolve). With suEXEC off / non-root / no per-vhost
@@ -3269,6 +3469,19 @@ pub(super) fn effective_php_suffixes<'s>(
     compute_php_suffixes(&state.php_suffixes, &ctx.vhost.script_handlers)
 }
 
+fn fastcgi_handler_for_script<'a>(ctx: &'a ReqCtx, script: &std::path::Path) -> Option<&'a str> {
+    let suffix = script.extension()?.to_str()?;
+    ctx.vhost
+        .script_handlers
+        .iter()
+        .rev()
+        .find(|handler| {
+            handler.kind == hj_core::config::ContextKind::Cgi
+                && handler.suffix.eq_ignore_ascii_case(suffix)
+        })
+        .map(|handler| handler.handler.as_str())
+}
+
 /// Pure core of [`effective_php_suffixes`]: `global` ∪ (lsapi suffixes) \ (non-lsapi
 /// suffixes). Independent of `ServerState`/`ReqCtx` so it can be unit-tested.
 fn compute_php_suffixes<'a>(
@@ -3326,11 +3539,69 @@ pub(super) fn resolve_vhost_jail(state: &ServerState, ctx: &ReqCtx) -> std::io::
     )
 }
 
-pub(super) async fn run_handler<H: Handler>(h: &H, ctx: &mut ReqCtx, req: Request) -> Response {
+/// Compile-time terminal classification without changing the frozen Handler seam.
+pub(super) trait TelemetryHandler: Handler {
+    #[cfg(feature = "otel")]
+    const KIND: crate::otel::BackendKind;
+}
+impl TelemetryHandler for hj_static::StaticFiles {
+    #[cfg(feature = "otel")]
+    const KIND: crate::otel::BackendKind = crate::otel::BackendKind::Static;
+}
+impl TelemetryHandler for proxy_glue::ProxyHandler {
+    #[cfg(feature = "otel")]
+    const KIND: crate::otel::BackendKind = crate::otel::BackendKind::Proxy;
+}
+impl TelemetryHandler for hj_lsapi::Lsapi {
+    #[cfg(feature = "otel")]
+    const KIND: crate::otel::BackendKind = crate::otel::BackendKind::Lsapi;
+}
+impl TelemetryHandler for hj_fastcgi::FastCgi {
+    #[cfg(feature = "otel")]
+    const KIND: crate::otel::BackendKind = crate::otel::BackendKind::FastCgi;
+}
+
+#[cfg(feature = "otel")]
+pub(crate) async fn instrumented_handler<H: TelemetryHandler>(
+    h: &H,
+    ctx: &mut ReqCtx,
+    mut req: Request,
+) -> Result<Response, hj_core::HandlerError> {
+    crate::otel::backend(H::KIND, async {
+        if matches!(
+            H::KIND,
+            crate::otel::BackendKind::Lsapi | crate::otel::BackendKind::FastCgi
+        ) {
+            crate::otel::inject(req.headers_mut());
+        }
+        h.handle(ctx, req).await
+    })
+    .await
+}
+
+pub(super) async fn run_handler<H: TelemetryHandler>(
+    h: &H,
+    ctx: &mut ReqCtx,
+    req: Request,
+) -> Response {
     // Capture before `handle` consumes `req`, for the 5xx-with-cause log below.
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    match h.handle(ctx, req).await {
+    let result = {
+        #[cfg(feature = "otel")]
+        {
+            if crate::otel::enabled() {
+                instrumented_handler(h, ctx, req).await
+            } else {
+                h.handle(ctx, req).await
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            h.handle(ctx, req).await
+        }
+    };
+    match result {
         Ok(resp) => resp,
         Err(err) => {
             let status = err.status();
@@ -4585,6 +4856,40 @@ mod tests {
         // An lsapi handler for a NEW suffix adds it (additive union still works).
         let added = compute_php_suffixes(&global, &[sh("phtml", ContextKind::Lsapi)]);
         assert!(added.contains("phtml") && added.contains("php") && added.contains("html"));
+    }
+
+    #[test]
+    fn fastcgi_suffix_mapping_is_explicit_case_insensitive_and_last_wins() {
+        use hj_core::config::{ContextKind, ScriptHandler};
+
+        let mut ctx = bare_ctx_for_headers();
+        let mut vhost = hj_core::config::VHostConfig::default();
+        vhost.script_handlers = vec![
+            ScriptHandler {
+                suffix: "FCGI".into(),
+                kind: ContextKind::Cgi,
+                handler: "old".into(),
+            },
+            ScriptHandler {
+                suffix: "fcgi".into(),
+                kind: ContextKind::Cgi,
+                handler: "app".into(),
+            },
+            ScriptHandler {
+                suffix: "php".into(),
+                kind: ContextKind::Lsapi,
+                handler: "php".into(),
+            },
+        ];
+        ctx.vhost = Arc::new(vhost);
+        assert_eq!(
+            fastcgi_handler_for_script(&ctx, std::path::Path::new("/srv/app.FCGI")),
+            Some("app")
+        );
+        assert_eq!(
+            fastcgi_handler_for_script(&ctx, std::path::Path::new("/srv/app.php")),
+            None
+        );
     }
 
     #[test]

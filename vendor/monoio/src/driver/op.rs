@@ -228,13 +228,40 @@ impl<T> MultiOp<T> {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<CompletionMeta>> {
-        self.driver.poll_multi_op(self.index, cx)
+        if self.index == usize::MAX {
+            return Poll::Ready(None);
+        }
+        let result = self.driver.poll_multi_op(self.index, cx);
+        if matches!(result, Poll::Ready(None)) {
+            // poll_multi removes the terminal slot. Never let a later poll,
+            // cancellation or Drop touch a new operation reusing that index.
+            self.index = usize::MAX;
+        }
+        result
+    }
+
+    /// Request cancellation without detaching the completion consumer. The
+    /// caller must keep polling through the terminal CQE to prove quiescence.
+    pub(crate) fn cancel(&mut self) {
+        if self.index != usize::MAX {
+            // SAFETY: this MultiOp still owns the live slab index; the terminal
+            // polling path invalidates it before the index can be reused.
+            unsafe {
+                self.driver.cancel_op(&OpCanceller {
+                    index: self.index,
+                    #[cfg(feature = "legacy")]
+                    direction: None,
+                });
+            }
+        }
     }
 }
 
 impl<T> Drop for MultiOp<T> {
     fn drop(&mut self) {
-        self.driver.drop_multi_op(self.index);
+        if self.index != usize::MAX {
+            self.driver.drop_multi_op(self.index);
+        }
     }
 }
 

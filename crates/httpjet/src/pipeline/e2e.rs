@@ -56,8 +56,96 @@ fn mime() -> MimeMap {
 /// A minimal real `ServerState`: one plaintext listener `http` mapping the exact
 /// host `canon.test` (plus a `*` catch-all, so any OTHER host resolves to the
 /// same vhost but counts as foreign) to a single vhost rooted at `doc_root`.
-fn build_state(doc_root: PathBuf) -> Arc<ServerState> {
+pub(crate) fn build_state(doc_root: PathBuf) -> Arc<ServerState> {
     build_state_with(doc_root, Vec::new(), Vec::new())
+}
+
+#[cfg(feature = "otel")]
+pub(crate) fn build_state_websocket(doc_root: PathBuf, address: String) -> Arc<ServerState> {
+    build_state_inner(
+        doc_root,
+        Vec::new(),
+        Vec::new(),
+        false,
+        None,
+        None,
+        |config| {
+            let vhost = config
+                .vhosts
+                .get_mut(VHOST)
+                .unwrap()
+                .config
+                .as_mut()
+                .unwrap();
+            Arc::make_mut(vhost)
+                .websockets
+                .push(hj_core::config::WebSocketMap {
+                    uri: "/socket".into(),
+                    address,
+                });
+        },
+    )
+}
+
+/// Synthetic handshake fixture; called only by the isolated telemetry process.
+#[cfg(feature = "otel")]
+pub(crate) async fn traced_websocket_handshakes(state: &ServerState) -> Vec<Option<String>> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut observed = Vec::new();
+    for named in [true, false] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    assert!(head.len() < 8192);
+                    head.push(stream.read_u8().await.unwrap());
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let head = String::from_utf8(head).unwrap();
+                assert!(!head.to_ascii_lowercase().contains("baggage:"));
+                assert!(!head.to_ascii_lowercase().contains("tracestate:"));
+                head.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("traceparent")
+                        .then(|| value.trim().to_owned())
+                })
+            })
+            .await
+            .unwrap()
+        });
+        let mut target = hj_proxy::ProxyTarget::parse_url(&format!("ws://{addr}/socket")).unwrap();
+        target.name = named.then(|| "synthetic-websocket".to_owned());
+        let mut req = http::Request::builder()
+            .uri("/socket")
+            .header("host", "canon.test")
+            .header("connection", "Upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("baggage", "secret=value")
+            .header("tracestate", "secret=value")
+            .body(hj_core::empty_incoming())
+            .unwrap();
+        let parent = crate::otel::inbound_parent(req.headers_mut(), addr.ip(), true);
+        let ctx = super::tests::bare_ctx_for_headers();
+        let response = crate::otel::request_with_parent(
+            parent,
+            super::proxy_glue::proxy_websocket(state, &ctx, req, target),
+        )
+        .await;
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        drop(response);
+        observed.push(upstream.await.unwrap());
+    }
+    observed
 }
 
 fn build_state_with(
@@ -70,7 +158,7 @@ fn build_state_with(
 
 /// [`build_state_with`] with an origin page-cache attached (the `--page-cache`
 /// mode); the vhost gets a cache-enabled policy so store-side eligibility holds.
-fn build_state_full(
+pub(crate) fn build_state_full(
     doc_root: PathBuf,
     contexts: Vec<Context>,
     access_deny_dir: Vec<String>,
@@ -285,6 +373,177 @@ async fn static_get_serves_litespeed_etag_and_revalidates_to_304() {
     assert_eq!(resp.status(), 200);
     assert!(matches!(resp.body(), Body::Full(_)));
     assert_eq!(body_bytes(resp.into_body()).as_ref(), b"hello after edit\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waf_runs_before_static_cache_and_can_block_a_previously_allowed_path() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let sidecar = tokio::spawn(async move {
+        for status in ["204 No Content", "403 Forbidden"] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buf[..read]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head = std::str::from_utf8(&request[..header_end]).unwrap();
+            let length: usize = head
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|value| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            while request.len() < header_end + length {
+                let read = stream.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buf[..read]);
+            }
+            let payload: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+            assert_eq!(payload["path"], "/cached.txt");
+            stream
+                .write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    let root = temp_root("waf-before-cache");
+    std::fs::write(root.join("cached.txt"), b"allowed once").unwrap();
+    let mut state = build_state(root);
+    Arc::get_mut(&mut state).unwrap().waf = Some(Arc::new(
+        crate::waf::Sidecar::new(
+            address,
+            "/inspect".into(),
+            std::time::Duration::from_secs(1),
+            1024,
+            2,
+            crate::waf::FailurePolicy::Closed,
+        )
+        .unwrap(),
+    ));
+    let allowed = run(&state, get(CANON_HOST, "/cached.txt", None)).await;
+    assert_eq!(allowed.status(), 200);
+    assert_eq!(body_bytes(allowed.into_body()), "allowed once");
+    assert!(
+        fast_serve_get(&state, "/cached.txt").await.is_none(),
+        "WAF must disable the on-core cache path that bypasses dispatch"
+    );
+    let blocked = run(&state, get(CANON_HOST, "/cached.txt", None)).await;
+    assert_eq!(blocked.status(), 403);
+    sidecar.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waf_sidecar_failure_policy_is_closed_unless_explicitly_opened() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable = listener.local_addr().unwrap();
+    drop(listener);
+    let root = temp_root("waf-failure-policy");
+    std::fs::write(root.join("visible.txt"), b"visible").unwrap();
+
+    for (policy, expected) in [
+        (crate::waf::FailurePolicy::Closed, 503),
+        (crate::waf::FailurePolicy::Open, 200),
+    ] {
+        let mut state = build_state(root.clone());
+        Arc::get_mut(&mut state).unwrap().waf = Some(Arc::new(
+            crate::waf::Sidecar::new(
+                unavailable,
+                "/inspect".into(),
+                std::time::Duration::from_millis(100),
+                1024,
+                1,
+                policy,
+            )
+            .unwrap(),
+        ));
+        let response = run(&state, get(CANON_HOST, "/visible.txt", None)).await;
+        assert_eq!(response.status(), expected);
+    }
+}
+
+struct BlockingExtension;
+
+#[async_trait::async_trait]
+impl hj_extension::PreHandler for BlockingExtension {
+    async fn handle(
+        &self,
+        ctx: &hj_core::ReqCtx,
+        request: hj_extension::RequestView<'_>,
+    ) -> Result<hj_extension::PreHandlerDecision, hj_core::HandlerError> {
+        assert_eq!(ctx.client_ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(request.uri().path(), "/blocked.txt");
+        assert_eq!(request.method(), http::Method::GET);
+        Ok(hj_extension::PreHandlerDecision::Respond(
+            hj_core::text_response(http::StatusCode::IM_A_TEAPOT, "extension blocked"),
+        ))
+    }
+}
+
+struct ExtensionHeader;
+
+#[async_trait::async_trait]
+impl hj_core::ResponseTransform for ExtensionHeader {
+    async fn transform(&self, _ctx: &hj_core::ReqCtx, response: &mut Response) {
+        response
+            .headers_mut()
+            .insert("x-compile-extension", http::HeaderValue::from_static("ran"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compile_time_pre_handler_short_circuits_before_static_and_forces_the_full_funnel() {
+    let root = temp_root("extension-pre-handler");
+    std::fs::write(root.join("blocked.txt"), b"must not be served").unwrap();
+    let mut state = build_state(root);
+    let mut registry = hj_extension::ExtensionRegistry::new();
+    registry
+        .register_pre_handler("test.block", Arc::new(BlockingExtension))
+        .unwrap();
+    Arc::get_mut(&mut state).unwrap().extensions = Arc::new(registry);
+
+    let request = get(CANON_HOST, "/blocked.txt", None);
+    assert!(
+        fast_serve_req(&state, &request).await.is_none(),
+        "a pre-handler must prevent the on-core path from bypassing it"
+    );
+    let response = run(&state, request).await;
+    assert_eq!(response.status(), http::StatusCode::IM_A_TEAPOT);
+    assert_eq!(body_bytes(response.into_body()), "extension blocked");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compile_time_response_transform_runs_on_full_and_on_core_funnels() {
+    let root = temp_root("extension-response");
+    std::fs::write(root.join("visible.txt"), b"visible").unwrap();
+    let mut state = build_state(root);
+    let mut registry = hj_extension::ExtensionRegistry::new();
+    registry
+        .register_response_transform("test.header", Arc::new(ExtensionHeader))
+        .unwrap();
+    Arc::get_mut(&mut state).unwrap().extensions = Arc::new(registry);
+
+    let full = run(&state, get(CANON_HOST, "/visible.txt", None)).await;
+    assert_eq!(full.headers()["x-compile-extension"], "ran");
+
+    let fast = fast_serve_get(&state, "/visible.txt")
+        .await
+        .expect("a response-only extension leaves the on-core path available");
+    assert_eq!(fast.headers()["x-compile-extension"], "ran");
 }
 
 #[cfg(unix)]

@@ -441,6 +441,8 @@ pub fn cache_lookup(
     force_miss: bool,
     gates: Option<&SharedCacheGates>,
 ) -> CacheOutcome {
+    #[cfg(feature = "otel")]
+    let _trace_stage = crate::otel::stage(crate::otel::StageKind::CacheLookup);
     // (#5) The raw request host is no longer a key input (it now keys by the canonical
     // vhost name); it survives inside the caller-built `identity` guard and the serve-time
     // self-redirect re-check below.
@@ -520,7 +522,7 @@ pub fn cache_lookup(
         return CacheOutcome::Bypass;
     }
 
-    let key = build_cache_key(ctx, cc, store, &route);
+    let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
     let key_hash = hash_key(&key);
     // (W-TinyLFU) Record this cacheable lookup in the admission sketch — true access frequency
     // (hit OR miss), so the store-admission gate can reject one-hit-wonders. Cheap atomic bumps.
@@ -1178,6 +1180,19 @@ pub(crate) fn build_cache_key(
     key
 }
 
+fn configuration_key(
+    state: &ServerState,
+    mut key: hj_pagecache::PageCacheKey,
+) -> hj_pagecache::PageCacheKey {
+    if let Some(epoch) = &state.response_cache_epoch {
+        key.vary_value = format!(
+            "\0httpjet-config:{epoch}:{}\0{}",
+            state.generation, key.vary_value
+        );
+    }
+    key
+}
+
 fn capsule_key(
     ctx: &ReqCtx,
     cc: &CacheCtx<'_>,
@@ -1753,7 +1768,7 @@ fn capsule_public_fallback_lookup(
         return CacheOutcome::Miss(dedicated_key_hash);
     }
 
-    let key = capsule_public_fallback_key(ctx, cc, store);
+    let key = configuration_key(state, capsule_public_fallback_key(ctx, cc, store));
     let key_hash = hash_key(&key);
     let (entry, stale) = match store.get_entry_uncounted(&key, cc.identity, now) {
         hj_pagecache::EntryState::Fresh(e) => (e, false),
@@ -1941,7 +1956,7 @@ pub fn capsule_lookup(
         return CacheOutcome::Bypass;
     }
 
-    let key = capsule_key(ctx, cc, store);
+    let key = configuration_key(state, capsule_key(ctx, cc, store));
     let key_hash = hash_key(&key);
     let now = Instant::now();
     let entry = match store.get_entry_uncounted(&key, cc.identity, now) {
@@ -2154,7 +2169,7 @@ fn stale_if_error_fallback(
     {
         return None;
     }
-    let key = build_cache_key(ctx, cc, store, route);
+    let key = configuration_key(state, build_cache_key(ctx, cc, store, route));
     let now = Instant::now();
     let entry = match store.get_entry(&key, identity, now) {
         hj_pagecache::EntryState::Fresh(e)
@@ -2424,6 +2439,8 @@ pub async fn cache_store(
     cc: &CacheCtx<'_>,
     resp: Response,
 ) -> Response {
+    #[cfg(feature = "otel")]
+    let _trace_stage = crate::otel::stage(crate::otel::StageKind::CacheStore);
     let &CacheCtx {
         method,
         host,
@@ -2730,7 +2747,7 @@ pub async fn cache_store(
             // gating the shell store on that guest-only frequency would defeat the capsule exactly
             // for guest-rare-but-member-popular URLs. Eager storage is bounded (the `x-wf-capsule`
             // header is backend-controlled) and capped by the page store.
-            let key = capsule_key(ctx, cc, store);
+            let key = configuration_key(state, capsule_key(ctx, cc, store));
             let stored_at = Instant::now();
             let stored_identity = identity.to_string();
             let sie_secs = match &disposition {
@@ -2791,7 +2808,7 @@ pub async fn cache_store(
         // bounded to the finite set of configured vhosts (no Host-header key inflation).
         // The PageScope owner equals the route owner by construction (the eligibility
         // match binds them from the same PrivateRoute), so the shared builder covers it.
-        let key = build_cache_key(ctx, cc, store, &route);
+        let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
         // (W-TinyLFU admission) Spend RAM (store) + CPU (precompress) only on keys that show
         // REUSE. The frequency sketch is recorded on every cacheable lookup; admit when the
         // estimate meets a SIZE-WEIGHTED bar (a one-hit-wonder is rejected; a larger object needs
@@ -3614,6 +3631,69 @@ mod tests {
 
     fn cache_test_ctx() -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
         cache_test_ctx_with_capsule(crate::state::XfCapsuleConfig::disabled())
+    }
+
+    #[tokio::test]
+    async fn configuration_generations_isolate_late_cache_writers() {
+        let (old, ctx, store) = cache_test_ctx();
+        let mut next = ServerState::reload(&old, old.server.clone()).unwrap();
+        Arc::get_mut(&mut next).unwrap().response_cache_epoch =
+            Some(Arc::from("test-incarnation-1"));
+        let later = ServerState::reload(&next, next.server.clone()).unwrap();
+        let method = Method::GET;
+        let cc = CacheCtx {
+            method: &method,
+            host: "forum.example",
+            cookie: None,
+            identity: "https\nforum.example\n/config",
+            req_path: "/config",
+            req_query: "",
+            chain: &[],
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            vary_value: None,
+            host_foreign: false,
+        };
+        let base = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
+        let old_key = configuration_key(&old, base.clone());
+        let next_key = configuration_key(&next, base.clone());
+        let later_key = configuration_key(&later, base.clone());
+        assert_eq!(old_key, base);
+        assert_ne!(old_key, next_key);
+        assert_ne!(next_key, later_key);
+        for (state, key, text) in [(&next, &next_key, "new"), (&old, &old_key, "late old")] {
+            state.page_cache_admission.record(hash_key(key));
+            let response = http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "text/plain")
+                .header(HDR_CACHE_CONTROL, "public,max-age=600")
+                .body(Body::Full(Bytes::from_static(text.as_bytes())))
+                .unwrap();
+            let _ = cache_store(state, &ctx, &cc, response).await;
+        }
+        let hj_pagecache::EntryState::Fresh(entry) =
+            store.get_entry(&next_key, cc.identity, Instant::now())
+        else {
+            panic!("new generation entry missing");
+        };
+        assert!(matches!(&entry.body, PageBody::InMem(bytes) if bytes.as_ref() == b"new"));
+        let CacheOutcome::Hit(response) = cache_lookup(&next, &ctx, &cc, None, false, None) else {
+            panic!("new generation lookup did not hit");
+        };
+        assert!(matches!(response.into_body(), Body::Full(bytes) if bytes.as_ref() == b"new"));
+        assert!(matches!(
+            store.get_entry(&later_key, cc.identity, Instant::now()),
+            hj_pagecache::EntryState::Miss
+        ));
+        for key in [
+            capsule_key(&ctx, &cc, &store),
+            capsule_public_fallback_key(&ctx, &cc, &store),
+        ] {
+            assert_ne!(
+                configuration_key(&old, key.clone()),
+                configuration_key(&next, key)
+            );
+        }
     }
 
     #[test]
