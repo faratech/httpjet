@@ -436,7 +436,10 @@
       ],
       "action": "SCMP_ACT_ALLOW",
       "includes": {
-        "minKernel": "4.8"
+        "minKernel": "4.8",
+        "caps": [
+          "CAP_SYS_PTRACE"
+        ]
       }
     },
     {

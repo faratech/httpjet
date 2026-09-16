@@ -3,16 +3,14 @@
 //! Implements the LiteSpeed-compatible forwarding semantics:
 //! - hop-by-hop headers are stripped before the request leaves us and before
 //!   the upstream response is handed back to the client;
-//! - `X-Forwarded-For` is *appended to* (never replaced), preserving any chain
-//!   already present;
+//! - client-supplied forwarding aliases are removed and a canonical
+//!   `X-Forwarded-For` is generated from the already-resolved client address;
 //! - `X-Forwarded-Proto`, `X-Forwarded-Host` and `X-Real-IP` are set from the
 //!   request context;
 //! - the original `Host` header is preserved as seen by the client (we do not
 //!   rewrite it to the upstream authority — LiteSpeed forwards the client Host
 //!   so the backend can do name-based vhosting / generate correct absolute
 //!   URLs).
-
-use std::net::IpAddr;
 
 use hj_core::ReqCtx;
 use http::header::{CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue};
@@ -114,34 +112,27 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// Append `ip` to the `X-Forwarded-For` chain, preserving existing entries.
-fn append_xff(headers: &mut HeaderMap, ip: IpAddr) {
-    use std::fmt::Write as _;
-    let xff = HeaderName::from_static("x-forwarded-for");
-    // Build the combined chain directly into ONE String (existing entries + new ip), without
-    // the intermediate Vec<String> + per-token allocation + join the old version did per
-    // proxied request.
-    let mut joined = String::new();
-    for v in headers.get_all(&xff).iter() {
-        if let Ok(s) = v.to_str() {
-            for part in s.split(',') {
-                let part = part.trim();
-                if !part.is_empty() {
-                    if !joined.is_empty() {
-                        joined.push_str(", ");
-                    }
-                    joined.push_str(part);
-                }
-            }
-        }
-    }
-    if !joined.is_empty() {
-        joined.push_str(", ");
-    }
-    let _ = write!(joined, "{ip}");
-    headers.remove(&xff);
-    if let Ok(val) = HeaderValue::from_str(&joined) {
-        headers.insert(xff, val);
+/// Remove every client-controlled spelling commonly interpreted as forwarding
+/// authority. The request pipeline has already authenticated the immediate
+/// proxy and resolved `ReqCtx::client_ip`; downstream applications must see
+/// only that canonical result, never an attacker-chosen alias.
+fn strip_forwarding_authority(headers: &mut HeaderMap) {
+    const NAMES: &[&str] = &[
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-real-ip",
+        "x-original-forwarded-for",
+        "cf-connecting-ip",
+        "true-client-ip",
+        "client-ip",
+        "fastly-client-ip",
+        "x-cluster-client-ip",
+    ];
+    for name in NAMES {
+        headers.remove(*name);
     }
 }
 
@@ -150,7 +141,7 @@ fn append_xff(headers: &mut HeaderMap, ip: IpAddr) {
 ///
 /// Semantics:
 /// - strip hop-by-hop headers,
-/// - append `ctx.client_ip` to `X-Forwarded-For`,
+/// - replace forwarding authority with the resolved `ctx.client_ip`,
 /// - set `X-Forwarded-Proto` (`https` when `ctx.is_tls`, else `http`),
 /// - set `X-Forwarded-Host` from the inbound `Host`,
 /// - set `X-Real-IP` to `ctx.client_ip`,
@@ -163,8 +154,12 @@ pub(crate) fn rewrite_request_headers(headers: &mut HeaderMap, ctx: &ReqCtx, kee
         .map(|s| s.to_string());
 
     strip_hop_by_hop(headers, keep_upgrade);
+    strip_forwarding_authority(headers);
 
-    append_xff(headers, ctx.client_ip);
+    if let Ok(val) = HeaderValue::from_str(&ctx.client_ip.to_string()) {
+        headers.insert(HeaderName::from_static("x-forwarded-for"), val.clone());
+        headers.insert(HeaderName::from_static("x-real-ip"), val);
+    }
 
     let proto = if ctx.is_tls { "https" } else { "http" };
     headers.insert(
@@ -176,10 +171,6 @@ pub(crate) fn rewrite_request_headers(headers: &mut HeaderMap, ctx: &ReqCtx, kee
         if let Ok(val) = HeaderValue::from_str(&host) {
             headers.insert(HeaderName::from_static("x-forwarded-host"), val);
         }
-    }
-
-    if let Ok(val) = HeaderValue::from_str(&ctx.client_ip.to_string()) {
-        headers.insert(HeaderName::from_static("x-real-ip"), val);
     }
 }
 
@@ -204,6 +195,7 @@ pub(crate) fn sanitize_response_headers(headers: &mut HeaderMap, keep_upgrade: b
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::sync::Arc;
 
     use hj_core::config::{ServerConfig, VHostConfig};
@@ -252,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn xff_appends_not_replaces() {
+    fn xff_is_canonicalized_not_appended() {
         let mut h = HeaderMap::new();
         h.insert(
             HeaderName::from_static("x-forwarded-for"),
@@ -261,7 +253,33 @@ mod tests {
         let ctx = dummy_ctx("198.51.100.9".parse().unwrap(), false);
         rewrite_request_headers(&mut h, &ctx, false);
         let xff = h.get("x-forwarded-for").unwrap().to_str().unwrap();
-        assert_eq!(xff, "203.0.113.7, 70.0.0.1, 198.51.100.9");
+        assert_eq!(xff, "198.51.100.9");
+    }
+
+    #[test]
+    fn forwarding_aliases_are_removed_before_proxying() {
+        let mut h = HeaderMap::new();
+        for name in [
+            "forwarded",
+            "x-original-forwarded-for",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-forwarded-port",
+        ] {
+            h.insert(name, HeaderValue::from_static("for=203.0.113.66"));
+        }
+        let ctx = dummy_ctx("198.51.100.9".parse().unwrap(), true);
+        rewrite_request_headers(&mut h, &ctx, false);
+        for name in [
+            "forwarded",
+            "x-original-forwarded-for",
+            "cf-connecting-ip",
+            "true-client-ip",
+            "x-forwarded-port",
+        ] {
+            assert!(!h.contains_key(name), "{name} survived canonicalization");
+        }
+        assert_eq!(h.get("x-forwarded-for").unwrap(), "198.51.100.9");
     }
 
     #[test]

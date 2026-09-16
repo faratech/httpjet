@@ -4,10 +4,12 @@ httpjet is an experimental Linux web server written in Rust. It reads
 LiteSpeed-compatible XML, speaks LSAPI to `lsphp`, and supports H1/H2/H3, TLS,
 static files, proxying, rewrites, compression, and an opt-in page cache.
 
-It is early-stage software. Test on alternate ports before using it in a
-production environment.
+It is early-stage software built around one production configuration. Test on
+alternate ports before using it elsewhere.
 
-Learn more—or at least enjoy the animation—at [httpjet.net](https://httpjet.net).
+httpjet powers [WindowsForum.com](https://windowsforum.com) in production.
+Learn more—or at least enjoy the animation—at
+[httpjet.net](https://httpjet.net).
 
 ## Build and try it
 
@@ -47,10 +49,11 @@ controls and their isolated executable proof are documented in the
 
 A hardened, non-root [OCI example](packaging/oci/README.md) documents the
 required writable mounts, separate TCP/UDP publication for HTTP/3, io_uring
-runtime requirements, and its non-privileged smoke gate.
+runtime requirements, and its non-privileged smoke gate. It is an adoption
+example, not the production deployment model.
 
-Optional certificate automation is available with `--features acme` and
-explicit runtime opt-in. See
+Optional certificate automation is available in the private development branch
+with `--features acme` and explicit runtime opt-in. See
 [HTTP-01](docs/acme-http01.md) and [DNS-01/wildcard configuration](docs/acme-dns01.md); it is disabled by
 default and does not replace existing certbot configuration automatically.
 

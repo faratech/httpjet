@@ -2450,7 +2450,7 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
         // listener is safe only when its direct peers are the trusted LB.
         if l.proxy_protocol && pp_bind_is_public(&l.address) {
             println!(
-                "  lint WARN : proxyProtocol on listener '{}' binds a wildcard/public address ({}); any direct peer can forge its client address — enable only behind a trusted LB",
+                "  lint WARN : proxyProtocol on listener '{}' binds a wildcard/public address ({}); any direct peer can forge its client address — enable only behind a trusted LB (loopback/unspecified claimed sources are refused outright, so the local mTLS exemption and the loopback purge/ready endpoints stay out of reach)",
                 l.name, l.address
             );
         }

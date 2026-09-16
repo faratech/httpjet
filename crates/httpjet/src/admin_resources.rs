@@ -1,4 +1,4 @@
-use hj_core::config::{ExtKind, ExtProcessor, ServerConfig};
+use hj_core::config::{ExtAddress, ExtKind, ExtProcessor, ServerConfig};
 use std::fmt::Debug;
 use std::path::{Component, Path, PathBuf};
 
@@ -69,6 +69,31 @@ impl ResourceRoots {
                     self.check(path, false)?;
                 }
             }
+            // A unix-socket ext-processor address is an explicit filesystem
+            // reference like any other: without this, a submitted config could
+            // relay requests to a socket outside the authorized roots.
+            if let ExtAddress::Uds(path) = &processor.address {
+                self.check_socket(path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A unix-socket address: the socket file may not exist at submission time
+    /// (a supervisor creates it later), so authorize the PARENT directory
+    /// within the roots instead of the socket itself.
+    fn check_socket(&self, path: &Path) -> Result<(), InvalidResource> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            return Err(InvalidResource);
+        }
+        let parent = path.parent().ok_or(InvalidResource)?;
+        let canonical = parent.canonicalize().map_err(|_| InvalidResource)?;
+        if !self.0.iter().any(|root| canonical.starts_with(root)) || !canonical.is_dir() {
+            return Err(InvalidResource);
         }
         Ok(())
     }
@@ -170,6 +195,12 @@ pub(crate) fn classify_replacement(
         || !same(&old_php, &new_php)
         || !same(&old.suexec, &new.suexec)
         || old.security.cgi_cpu_limit_secs != new.security.cgi_cpu_limit_secs
+        // Trust policy the docs pin to operator-controlled transactions:
+        // XFF-honoring mode, the trusted-CIDR lists, followSymlink (collapses
+        // the .htaccess author into arbitrary-read), and the geo ACL. Any
+        // change requires a restart — never a live Application publish.
+        || old.use_ip_in_proxy_header != new.use_ip_in_proxy_header
+        || !same(&old.security, &new.security)
         || !same(&old.cache, &new.cache)
         || caps(old) != caps(new)
         || (old.php_config.is_some()
@@ -288,6 +319,18 @@ mod tests {
             |c| c.tuning.total_in_mem_cache_size += 1,
             |c| c.cache.default_ttl_secs += 1,
             |c| c.suexec.enable = true,
+            // Trust policy: a live publish must never be able to weaken who is
+            // trusted, what XFF-honoring means, or the symlink containment.
+            |c| c.use_ip_in_proxy_header = 1,
+            |c| c.security.follow_symlink = true,
+            |c| {
+                c.security.access_control.push(hj_core::config::AccessRule {
+                    spec: "ALL".into(),
+                    trusted: true,
+                    allow: true,
+                })
+            },
+            |c| c.security.geo_deny.push("RU".into()),
             |c| {
                 Arc::make_mut(c.vhosts.get_mut("site").unwrap().config.as_mut().unwrap())
                     .access_log_file = Some(VhostLogFile {
@@ -446,6 +489,38 @@ mod tests {
         );
         assert!(ResourceRoots::new(&[PathBuf::from("/")]).is_err());
         assert!(ResourceRoots::new(&[]).is_err());
+        // A unix-socket ext-processor address is authorized by its parent dir
+        // (the socket itself may be created after submission) and may not
+        // escape the roots.
+        let mut uds_cfg = config();
+        uds_cfg.vhosts.remove("site");
+        uds_cfg.ext_processors.clear();
+        let socket_ok = ExtProcessor {
+            name: "app".into(),
+            kind: ExtKind::Proxy,
+            address: ExtAddress::Uds(root.join("allowed/app.sock")),
+            extra_addresses: vec![],
+            load_balance: LoadBalanceConfig::default(),
+            client_cert_file: None,
+            client_key_file: None,
+            max_conns: 4,
+            init_timeout: std::time::Duration::from_secs(1),
+            retry_timeout: std::time::Duration::ZERO,
+            pc_keep_alive_timeout: std::time::Duration::from_secs(30),
+            resp_buffer: false,
+            env: vec![],
+            auto_start: 0,
+            path: None,
+            backlog: 16,
+            instances: 1,
+            run_on_startup: 0,
+        };
+        let mut socket_evil = socket_ok.clone();
+        socket_evil.address = ExtAddress::Uds(root.join("outside/evil.sock"));
+        uds_cfg.ext_processors.push(socket_ok.clone());
+        assert!(roots.validate(&uds_cfg).is_ok());
+        *uds_cfg.ext_processors.last_mut().unwrap() = socket_evil;
+        assert_eq!(roots.validate(&uds_cfg), Err(InvalidResource));
         let mut cfg = config();
         let decl = cfg.vhosts.get_mut("site").unwrap();
         decl.vh_root = root.join("allowed/site");

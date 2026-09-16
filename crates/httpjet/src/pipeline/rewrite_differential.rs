@@ -385,7 +385,7 @@ fn replay(docroot: &Path, corpus: &[Line], tag: &str) -> ReplayStats {
         let flat: Vec<Arc<Htaccess>> = chain.iter().map(|(_, h)| h.clone()).collect();
         let mut ctx = make_ctx(&state_off.server, &vhost);
         seed_server_env(&mut ctx);
-        apply_set_env(&mut ctx, &flat, &req, &orig_path, &orig_query);
+        apply_set_env(&mut ctx, &flat, &req, &orig_path, &orig_query).unwrap();
 
         let r_off = run_rewrite(&state_off, &ctx, &req, &chain, &orig_path, &orig_query);
         let r_raw = run_rewrite(&state_raw, &ctx, &req, &chain, &orig_path, &orig_query);
@@ -461,7 +461,7 @@ fn run_one(
     });
     let mut ctx = make_ctx(&state.server, &vhost);
     seed_server_env(&mut ctx);
-    apply_set_env(&mut ctx, &flat, &req, &orig_path, "");
+    apply_set_env(&mut ctx, &flat, &req, &orig_path, "").unwrap();
     run_rewrite(state, &ctx, &req, &chain, &orig_path, "")
 }
 
@@ -596,7 +596,7 @@ async fn seeded_redirect_status_bypasses_outcome_cache() {
     });
     let mut ctx = make_ctx(&state.server, &vhost);
     seed_server_env(&mut ctx);
-    apply_set_env(&mut ctx, &flat, &req, &orig_path, "");
+    apply_set_env(&mut ctx, &flat, &req, &orig_path, "").unwrap();
     assert_eq!(ctx.get_env("REDIRECT_STATUS"), Some("403"));
     let seeded = run_rewrite(&state, &ctx, &req, &chain, &orig_path, "");
     assert_eq!(m.rewrite_outcome_uncacheable.load(Ordering::Relaxed), 1);

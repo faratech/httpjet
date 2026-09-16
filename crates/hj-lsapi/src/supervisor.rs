@@ -586,15 +586,23 @@ impl LsphpSupervisor {
     /// the caller explicitly promotes it into `Inner`.
     async fn spawn_ready_child(&self) -> io::Result<ReadyChild<'_>> {
         // Guard: the lsphp binary must not be setuid/setgid or have file capabilities,
-        // as the kernel silently clears PR_SET_PDEATHSIG at exec() time for such binaries.
+        // as the kernel silently clears PR_SET_PDEATHSIG at exec() time for such binaries —
+        // and after the supervisor's setuid drop, executing a setuid-root binary yields
+        // workers whose EFFECTIVE uid is root (saved-set-uid stays root). That is a
+        // privilege regain, not a pdeathsig inconvenience: refuse the spawn.
         use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(&self.cfg.command)?;
         let mode = meta.mode();
         if (mode & 0o4000) != 0 || (mode & 0o2000) != 0 {
-            tracing::warn!(
-                binary = %self.cfg.command.display(),
-                "lsphp binary has setuid or setgid bit set; PR_SET_PDEATHSIG will be cleared at exec()"
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "lsphp binary {} has the setuid or setgid bit set; workers would regain \
+                     euid 0 at exec() after the credential drop — clear the bit or point \
+                     --php-command at a normal binary",
+                    self.cfg.command.display()
+                ),
+            ));
         }
 
         // Obtain the listen fd for THIS child. The rest of start() (pre_exec dup2 → fd 0,

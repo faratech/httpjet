@@ -11,6 +11,16 @@
 //! pp-enabled listener binds a wildcard/public address. (OLS models the equivalent
 //! server-level `<proxyProtocol>` as a peer allow-list; httpjet's per-listener form
 //! is deliberate — the flag scopes to exactly one accept path.)
+//!
+//! One claim is refused outright: a source that is loopback or unspecified
+//! (127/8, ::1, 0.0.0.0, ::, and v4-mapped forms). Those addresses are how the
+//! origin recognizes its OWN local-trust boundary — the client-cert (mTLS)
+//! exemption, the loopback-gated purge/ready endpoints, and the plaintext
+//! mTLS-gate redirect — so a header claiming one would let an untrusted client
+//! on a pp-enabled listener say "I am loopback" and cross all three. Genuine
+//! load balancers never send loopback sources for relayed clients, so such a
+//! header is malformed: the connection is closed (fail-closed), like any other
+//! unparseable header.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -21,6 +31,13 @@ const V2_SIGNATURE: [u8; 12] = [
 ];
 const V2_HEADER_LEN: usize = 16;
 const V1_MAX_LINE: usize = 107;
+
+/// A claimed source the origin reserves for its own local-trust boundary —
+/// refused as malformed (see the module security note).
+fn claimed_source_forbidden(ip: IpAddr) -> bool {
+    let canonical = ip.to_canonical();
+    canonical.is_loopback() || canonical.is_unspecified()
+}
 
 /// Parsed header outcome. `src` is absent for identity-preserving LOCAL (v2) or
 /// UNKNOWN (v1) commands; callers then retain the socket peer. `consumed` is the
@@ -91,6 +108,9 @@ pub fn parse_v2(buf: &[u8]) -> Option<ProxyHeader> {
         }
         _ => return None,
     };
+    if claimed_source_forbidden(src.ip()) {
+        return None;
+    }
     Some(ProxyHeader {
         src: Some(src),
         consumed: V2_HEADER_LEN + len,
@@ -138,6 +158,9 @@ pub fn parse_v1(line: &[u8]) -> Option<ProxyHeader> {
         _ => return None,
     };
     let consumed = text.len() + 2; // + CRLF
+    if claimed_source_forbidden(ip) {
+        return None;
+    }
     Some(ProxyHeader {
         src: Some(SocketAddr::new(ip, sport)),
         consumed,
@@ -232,6 +255,60 @@ mod tests {
         assert_eq!(h.src, Some(SocketAddr::from(([203, 0, 113, 9], 8080))));
         assert_eq!(h.consumed, line.len());
         assert!(parse_v1(b"GET / HTTP/1.1\r\n").is_none());
+    }
+
+    /// A pp header must not be able to claim the origin's own local-trust
+    /// addresses (loopback/unspecified): those flip the mTLS exemption, the
+    /// purge/ready endpoint gate, and the plaintext mTLS-gate redirect. Such a
+    /// header is malformed — the connection is closed — in both v1 and v2.
+    #[test]
+    fn claimed_loopback_or_unspecified_sources_are_refused() {
+        // v2, IPv4: 127.0.0.1, 127.8.8.8, 0.0.0.0.
+        for src in [[127u8, 0, 0, 1], [127, 8, 8, 8], [0, 0, 0, 0]] {
+            let mut buf = v2_header(12, 0x11);
+            buf.extend_from_slice(&src);
+            buf.extend_from_slice(&[10, 0, 0, 1]);
+            buf.extend_from_slice(&[0x1f, 0x90]);
+            buf.extend_from_slice(&[0x00, 0x50]);
+            assert!(
+                parse_v2(&buf).is_none(),
+                "v2 claimed {src:?} must be refused"
+            );
+        }
+        // v2, IPv6: ::1, ::, ::ffff:127.0.0.1 (v4-mapped loopback).
+        let v6_sources: Vec<[u8; 16]> = vec![
+            {
+                let mut o = [0u8; 16];
+                o[15] = 1; // ::1
+                o
+            },
+            [0u8; 16], // ::
+            {
+                let mut o = [0u8; 16];
+                o[10] = 0xff;
+                o[11] = 0xff;
+                o[12] = 127; // ::ffff:127.0.0.1
+                o
+            },
+        ];
+        for o in v6_sources {
+            let mut buf = v2_header(36, 0x21);
+            buf.extend_from_slice(&o);
+            buf.extend_from_slice(&o);
+            buf.extend_from_slice(&[0x1f, 0x90]);
+            buf.extend_from_slice(&[0x00, 0x50]);
+            assert!(
+                parse_v2(&buf).is_none(),
+                "v2 claimed ::1-form must be refused"
+            );
+        }
+        // v1 text: loopback, unspecified, v4-mapped.
+        assert!(parse_v1(b"PROXY TCP4 127.0.0.1 10.0.0.1 8080 80\r\n").is_none());
+        assert!(parse_v1(b"PROXY TCP4 0.0.0.0 10.0.0.1 8080 80\r\n").is_none());
+        assert!(parse_v1(b"PROXY TCP6 ::1 2001:db8::1 8080 80\r\n").is_none());
+        assert!(parse_v1(b"PROXY TCP6 ::ffff:127.0.0.1 2001:db8::1 8080 80\r\n").is_none());
+        // A real relayed client address still parses.
+        assert!(parse_v1(b"PROXY TCP4 198.51.100.7 10.0.0.1 443 80\r\n").is_some());
     }
 
     #[test]

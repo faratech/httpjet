@@ -386,6 +386,10 @@ pub struct CacheCtx<'a> {
     /// the lookup degrades to a miss and the store is skipped — mirroring LiteSpeed LSCache,
     /// whose key embeds the request Host so a foreign host simply misses.
     pub host_foreign: bool,
+    /// The raw first `Origin` header value (lossy-decoded, `None` = absent,
+    /// `Some("")` = present-but-empty). Only consulted when the applied chain
+    /// reads `Origin` — see [`origin_vary_suffix`].
+    pub origin: Option<&'a str>,
 }
 
 /// Try to look the request up in the page cache. `Some(resp)` ⇒ serve the hit
@@ -1162,10 +1166,11 @@ pub(crate) fn build_cache_key(
     store: &hj_pagecache::PageStore,
     route: &PrivateRoute,
 ) -> hj_pagecache::PageCacheKey {
-    let vary_value = match route {
+    let mut vary_value = match route {
         PrivateRoute::Private { owner2, .. } => owner2.clone(),
         _ => public_vary_value(cc, store),
     };
+    vary_value.push_str(&origin_vary_suffix(cc));
     let mut key = public_with_vary(
         vhost_id_hash(&ctx.vhost_name),
         ctx.is_tls,
@@ -1178,6 +1183,32 @@ pub(crate) fn build_cache_key(
         key.private_owner = *owner;
     }
     key
+}
+
+/// (CORS) An `.htaccess` chain that reads the request `Origin` (`SetEnvIf
+/// Origin`, `RewriteCond %{HTTP:Origin}`) produces origin-CONDITIONAL
+/// responses — typically a reflected `Access-Control-Allow-Origin` — but a
+/// stored entry replays whatever headers the FIRST storer's render produced,
+/// so every later visitor would receive that request's CORS verdict. When the
+/// chain reads `Origin`, fold a bounded hash of the value into the vary
+/// discriminant (applied identically at lookup, store, stale-if-error, and
+/// the capsule keys — they all thread this `CacheCtx`). Absent/empty Origin
+/// keeps the historic base key, so caches populated before this fold stay
+/// hit-able for the (dominant) no-Origin traffic.
+fn origin_vary_suffix(cc: &CacheCtx<'_>) -> String {
+    let reads = cc
+        .chain
+        .iter()
+        .any(|h| h.memo.vary_headers.iter().any(|v| v == "origin"));
+    if !reads {
+        return String::new();
+    }
+    match cc.origin {
+        Some(o) if !o.is_empty() => {
+            format!("\0origin:{:016x}", fnv64(o.as_bytes(), OWNER_BASIS_A))
+        }
+        _ => String::new(),
+    }
 }
 
 fn configuration_key(
@@ -1209,7 +1240,7 @@ fn capsule_key(
         ctx.vhost_name.to_ascii_lowercase(),
         path,
         normalized_query_for(cc.chain, cc.req_query),
-        public_vary_value(cc, store),
+        format!("{}{}", public_vary_value(cc, store), origin_vary_suffix(cc)),
     )
 }
 
@@ -1235,7 +1266,11 @@ fn capsule_public_fallback_key(
         ctx.vhost_name.to_ascii_lowercase(),
         cc.req_path,
         normalized_query_for(cc.chain, cc.req_query),
-        capsule_public_vary_value(cc.cookie, store),
+        format!(
+            "{}{}",
+            capsule_public_vary_value(cc.cookie, store),
+            origin_vary_suffix(cc)
+        ),
     )
 }
 
@@ -3107,6 +3142,58 @@ fn error_502() -> Response {
 mod tests {
     use super::*;
 
+    // (CORS vary) A chain that reads `Origin` (SetEnvIf Origin — the forum's
+    // reflected-ACAO rule) must key origin-conditional renders per origin, or
+    // the first storer's `Access-Control-Allow-Origin` is replayed to every
+    // later visitor. A chain that does not read Origin keeps the historic base
+    // key, and an absent Origin keeps it too (pre-fold entries stay hit-able).
+    #[tokio::test]
+    async fn origin_reading_chain_varies_the_cache_key() {
+        let (_state, ctx, store) = cache_test_ctx();
+        let reads_origin: Vec<Arc<hj_rewrite::Htaccess>> = vec![Arc::new(
+            hj_rewrite::Htaccess::parse("SetEnvIf Origin ^https://a\\.example$ CORS=1\n")
+                .expect("parse"),
+        )];
+        let silent_chain: Vec<Arc<hj_rewrite::Htaccess>> = vec![];
+        let origin_a = "https://a.example".to_string();
+        let origin_b = "https://b.example".to_string();
+
+        let key_for =
+            |chain: &Vec<Arc<hj_rewrite::Htaccess>>, origin: Option<&String>, identity: &str| {
+                let cc = CacheCtx {
+                    method: &Method::GET,
+                    host: "forum.example",
+                    cookie: None,
+                    identity,
+                    req_path: "/config",
+                    req_query: "",
+                    chain,
+                    render_epoch: store.purge_epoch(),
+                    has_range: false,
+                    vary_value: None,
+                    host_foreign: false,
+                    origin: origin.map(|s| s.as_str()),
+                };
+                build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public)
+            };
+
+        assert_ne!(
+            key_for(&reads_origin, Some(&origin_a), "i"),
+            key_for(&reads_origin, Some(&origin_b), "i"),
+            "each origin gets its own entry when the chain reflects Origin"
+        );
+        assert_eq!(
+            key_for(&reads_origin, None, "i"),
+            key_for(&silent_chain, None, "i"),
+            "an absent Origin keeps the historic base key"
+        );
+        assert_eq!(
+            key_for(&silent_chain, Some(&origin_a), "i"),
+            key_for(&silent_chain, Some(&origin_b), "i"),
+            "a chain that does not read Origin ignores Origin entirely"
+        );
+    }
+
     // Regression (#237): private-hit egress forces `private, no-store` onto
     // Cache-Control, but Cloudflare gives `Cloudflare-CDN-Cache-Control` /
     // `CDN-Cache-Control` priority — if the backend's directive survived in the
@@ -3653,6 +3740,7 @@ mod tests {
             has_range: false,
             vary_value: None,
             host_foreign: false,
+            origin: None,
         };
         let base = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
         let old_key = configuration_key(&old, base.clone());
@@ -3820,6 +3908,7 @@ mod tests {
             render_epoch: 0,
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         private_route(state, ctx, store, &cc, count)
@@ -3988,6 +4077,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -4168,6 +4258,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -4234,6 +4325,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -4286,6 +4378,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -4358,6 +4451,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -4431,6 +4525,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -4498,6 +4593,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         // Plant a PRIVATE entry directly at the dedicated capsule key, shell-tagged so the only
@@ -4560,6 +4656,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -4628,6 +4725,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -4670,6 +4768,7 @@ mod tests {
             render_epoch: store.purge_epoch(),
             has_range: false,
             host_foreign: false,
+            origin: None,
             vary_value: None,
         };
         let route = PrivateRoute::Public;

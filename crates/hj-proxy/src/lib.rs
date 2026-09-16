@@ -1452,11 +1452,9 @@ mod tests {
             out.headers().get(http::header::AUTHORIZATION).unwrap(),
             "Bearer t0ken"
         );
-        // The snapshot is pre-rewrite, so the rewrite appends our hop exactly once.
-        assert_eq!(
-            out.headers().get("x-forwarded-for").unwrap(),
-            "198.51.100.7, 9.9.9.9"
-        );
+        // Retry rebuilds also canonicalize authority from the resolved context;
+        // attacker-supplied forwarding prefixes never reappear.
+        assert_eq!(out.headers().get("x-forwarded-for").unwrap(), "9.9.9.9");
         assert_eq!(out.uri().path_and_query().unwrap(), "/tools.json?a=1");
     }
 

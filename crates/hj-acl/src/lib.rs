@@ -259,12 +259,14 @@ impl AccessControl {
     /// ## Header selection
     ///
     /// For modes 2/3: `CF-Connecting-IP` is preferred (single, authoritative
-    /// value set by Cloudflare). Otherwise `X-Forwarded-For` is used: the chain
-    /// is read **left to right** and we return the **left-most entry that is
-    /// not itself one of our trusted proxies** — i.e. the original client, even
-    /// if several trusted hops appended themselves. If every entry is trusted we
-    /// fall back to the left-most entry; if the header is empty/garbage we fall
-    /// back to `peer`. Mode 1 uses the same XFF semantics without `CF-Connecting-IP`.
+    /// value set by Cloudflare). Otherwise `X-Forwarded-For` is walked **right
+    /// to left**, discarding only configured trusted proxies. The first
+    /// untrusted address nearest the origin is the client. This prevents a
+    /// client-controlled left-hand prefix from spoofing the address used by
+    /// ACLs/rate limits. If every entry is trusted we fall back to the left-most
+    /// entry; if the header is empty/garbage we fall back to `peer`. Mode 1 is
+    /// deliberately compatibility-only and still takes the left-most untrusted
+    /// entry without authenticating the immediate peer.
     pub fn resolve_client_ip(
         &self,
         peer: IpAddr,
@@ -310,7 +312,7 @@ impl AccessControl {
             return ip;
         }
 
-        if let Some(ip) = self.leftmost_untrusted_xff(headers) {
+        if let Some(ip) = self.rightmost_untrusted_xff(headers) {
             return ip;
         }
 
@@ -387,6 +389,26 @@ impl AccessControl {
 
         // Every entry was a trusted hop (or only one entry): use the left-most.
         first_parsed
+    }
+
+    /// Resolve an authenticated proxy chain from the origin side. Trusted hops
+    /// are stripped from the right edge only; the first non-trusted hop is the
+    /// address that connected to that trusted suffix. Addresses farther left
+    /// remain untrusted client input and cannot override it.
+    fn rightmost_untrusted_xff(&self, headers: &HeaderMap) -> Option<IpAddr> {
+        let parsed: Vec<IpAddr> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .filter_map(|part| parse_ip(part.trim()))
+            .collect();
+        parsed
+            .iter()
+            .rev()
+            .copied()
+            .find(|ip| !self.is_trusted(*ip))
+            .or_else(|| parsed.first().copied())
     }
 
     /// `true` if `resolved_path` matches any `accessDenyDir` glob and must not
@@ -831,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn xff_leftmost_untrusted_entry() {
+    fn xff_trusted_suffix_resolves_client() {
         let acl = AccessControl::from_security(&cf_security()).unwrap();
         let trusted_peer = ip("173.245.48.5");
         // Real client, then two trusted CF hops appended on the right.
@@ -851,6 +873,19 @@ mod tests {
         assert_eq!(
             acl.resolve_client_ip(trusted_peer, &h, 2, true),
             ip("203.0.113.7")
+        );
+    }
+
+    #[test]
+    fn xff_untrusted_prefix_cannot_spoof_nearer_client() {
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
+        let trusted_peer = ip("173.245.48.5");
+        // The nearest untrusted hop is 198.51.100.9. A client may prepend an
+        // arbitrary address, but an origin-side walk must not select it.
+        let h = xff("203.0.113.66, 198.51.100.9, 162.158.1.1");
+        assert_eq!(
+            acl.resolve_client_ip(trusted_peer, &h, 2, true),
+            ip("198.51.100.9")
         );
     }
 

@@ -1,11 +1,13 @@
 use std::{
+    cell::RefCell,
     io::{self, Read, Write},
     ops::{Deref, DerefMut},
+    rc::Rc,
 };
 
 use monoio::{
     buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut, RawBuf},
-    io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Split},
+    io::{AsyncReadRent, AsyncWriteRent, AsyncWriteRentExt, Splitable},
     BufResult,
 };
 use monoio_io_wrapper::ReadBuffer;
@@ -19,6 +21,23 @@ pub struct Stream<IO, C> {
     pub(crate) io: IO,
     pub(crate) session: C,
     r_buffer: ReadBuffer,
+    w_buffer: WriteBuffer,
+}
+
+/// Read half of a TLS stream. Only the raw transport is split: the rustls
+/// connection remains a single value behind a checked, single-threaded cell.
+/// Every borrow of that connection is released before an I/O await.
+pub struct ReadHalf<IO, C> {
+    io: IO,
+    session: Rc<RefCell<C>>,
+    r_buffer: ReadBuffer,
+}
+
+/// Write half of a TLS stream. The write adapter buffer belongs exclusively
+/// to this half; rustls state is shared with [`ReadHalf`] through `RefCell`.
+pub struct WriteHalf<IO, C> {
+    io: IO,
+    session: Rc<RefCell<C>>,
     w_buffer: WriteBuffer,
 }
 
@@ -36,7 +55,27 @@ impl<IO> Stream<IO, ClientConnection> {
     }
 }
 
-unsafe impl<IO: Split, C> Split for Stream<IO, C> {}
+impl<IO: Splitable, C> Splitable for Stream<IO, C> {
+    type OwnedRead = ReadHalf<IO::OwnedRead, C>;
+    type OwnedWrite = WriteHalf<IO::OwnedWrite, C>;
+
+    fn into_split(self) -> (Self::OwnedRead, Self::OwnedWrite) {
+        let (read_io, write_io) = self.io.into_split();
+        let session = Rc::new(RefCell::new(self.session));
+        (
+            ReadHalf {
+                io: read_io,
+                session: Rc::clone(&session),
+                r_buffer: self.r_buffer,
+            },
+            WriteHalf {
+                io: write_io,
+                session,
+                w_buffer: self.w_buffer,
+            },
+        )
+    }
+}
 
 impl<IO, C> Stream<IO, C> {
     pub fn new(io: IO, session: C) -> Self {
@@ -469,6 +508,16 @@ where
             ));
         }
 
+        // Post-handshake messages such as KeyUpdate can queue TLS output without
+        // yielding plaintext. An unsplit stream can flush it directly here.
+        if !splitted && state.plaintext_bytes_to_read() == 0 {
+            while self.session.wants_write() {
+                if self.write_io().await? == 0 {
+                    break;
+                }
+            }
+        }
+
         Ok(n)
     }
 
@@ -560,6 +609,232 @@ where
                 return (Err(e), buf);
             }
         }
+    }
+}
+
+impl<IO: AsyncReadRent, C, SD: SideData> ReadHalf<IO, C>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
+{
+    async fn read_io(&mut self) -> io::Result<usize> {
+        let n = loop {
+            let result = {
+                let mut session = self.session.borrow_mut();
+                session.read_tls(&mut self.r_buffer)
+            };
+            match result {
+                Ok(n) => break n,
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        self.r_buffer.do_io(&mut self.io).await?
+                    };
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        let state = {
+            let mut session = self.session.borrow_mut();
+            session.process_new_packets()
+        };
+        let state = match state {
+            Ok(state) => state,
+            Err(err) => {
+                // A split reader cannot write the alert queued by rustls. This
+                // matches the pre-fix split behavior: return the protocol error
+                // and let the connection owner close the transport.
+                return Err(io::Error::new(io::ErrorKind::InvalidData, err));
+            }
+        };
+        if state.peer_has_closed() && self.session.borrow().is_handshaking() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tls handshake alert",
+            ));
+        }
+        Ok(n)
+    }
+
+    async fn read_inner<T: IoBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
+        loop {
+            let result = {
+                let mut session = self.session.borrow_mut();
+                session.reader().read(slice)
+            };
+            match result {
+                Ok(n) => {
+                    unsafe { buf.set_init(n) };
+                    return (Ok(n), buf);
+                }
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {}
+                Err(err) => return (Err(err), buf),
+            }
+            if let Err(err) = self.read_io().await {
+                return (Err(err), buf);
+            }
+        }
+    }
+}
+
+impl<IO: AsyncReadRent, C, SD: SideData + 'static> AsyncReadRent for ReadHalf<IO, C>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
+{
+    async fn read<T: IoBufMut>(&mut self, buf: T) -> BufResult<usize, T> {
+        self.read_inner(buf).await
+    }
+
+    async fn readv<T: IoVecBufMut>(&mut self, mut buf: T) -> BufResult<usize, T> {
+        let result = match unsafe { RawBuf::new_from_iovec_mut(&mut buf) } {
+            Some(raw) => self.read(raw).await.0,
+            None => Ok(0),
+        };
+        if let Ok(n) = result {
+            unsafe { buf.set_init(n) };
+        }
+        (result, buf)
+    }
+}
+
+impl<IO: AsyncWriteRent, C, SD: SideData> WriteHalf<IO, C>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
+{
+    async fn write_io(&mut self) -> io::Result<usize> {
+        let n = loop {
+            let result = {
+                let mut session = self.session.borrow_mut();
+                session.write_tls(&mut self.w_buffer)
+            };
+            match result {
+                Ok(n) => {
+                    if self.w_buffer.is_safe() {
+                        self.w_buffer.do_io(&mut self.io).await?;
+                    }
+                    break n;
+                }
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        self.w_buffer.do_io(&mut self.io).await?
+                    };
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        Ok(n)
+    }
+
+    fn wants_write(&self) -> bool {
+        self.session.borrow().wants_write()
+    }
+
+    async fn flush_pending(&mut self) -> io::Result<()> {
+        while self.wants_write() {
+            if self.write_io().await? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<IO: AsyncWriteRent, C, SD: SideData + 'static> AsyncWriteRent for WriteHalf<IO, C>
+where
+    C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
+{
+    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+        if self.wants_write() {
+            if let Err(err) = self.write_io().await {
+                return (Err(err), buf);
+            }
+        }
+        let slice = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
+        let written = {
+            let mut session = self.session.borrow_mut();
+            session.writer().write(slice)
+        };
+        let written = match written {
+            Ok(n) => n,
+            Err(err) => return (Err(err), buf),
+        };
+        if let Err(err) = self.flush_pending().await {
+            return (Err(err), buf);
+        }
+        self.w_buffer.shrink_to_idle();
+        (Ok(written), buf)
+    }
+
+    async fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> BufResult<usize, T> {
+        if self.wants_write() {
+            if let Err(err) = self.write_io().await {
+                return (Err(err), buf_vec);
+            }
+        }
+        let ptr = buf_vec.read_iovec_ptr();
+        let count = buf_vec.read_iovec_len();
+        let total = if count <= 8 {
+            let mut slices = [std::io::IoSlice::new(&[]); 8];
+            for (index, slot) in slices.iter_mut().enumerate().take(count) {
+                *slot = std::io::IoSlice::new(unsafe {
+                    let iov = &*ptr.add(index);
+                    std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
+                });
+            }
+            let result = {
+                let mut session = self.session.borrow_mut();
+                session.writer().write_vectored(&slices[..count])
+            };
+            match result {
+                Ok(n) => n,
+                Err(err) => return (Err(err), buf_vec),
+            }
+        } else {
+            let slices: Vec<std::io::IoSlice<'_>> = (0..count)
+                .map(|index| unsafe {
+                    let iov = &*ptr.add(index);
+                    std::io::IoSlice::new(std::slice::from_raw_parts(
+                        iov.iov_base as *const u8,
+                        iov.iov_len,
+                    ))
+                })
+                .collect();
+            let result = {
+                let mut session = self.session.borrow_mut();
+                session.writer().write_vectored(&slices)
+            };
+            match result {
+                Ok(n) => n,
+                Err(err) => return (Err(err), buf_vec),
+            }
+        };
+        if let Err(err) = self.flush_pending().await {
+            return (Err(err), buf_vec);
+        }
+        self.w_buffer.shrink_to_idle();
+        (Ok(total), buf_vec)
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        {
+            let mut session = self.session.borrow_mut();
+            session.writer().flush()?;
+        }
+        self.flush_pending().await?;
+        let result = self.io.flush().await;
+        if result.is_ok() {
+            self.w_buffer.shrink_to_idle();
+        }
+        result
+    }
+
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.session.borrow_mut().send_close_notify();
+        self.flush_pending().await?;
+        self.w_buffer.shrink_to_idle();
+        self.io.shutdown().await
     }
 }
 

@@ -293,6 +293,9 @@ pub(super) struct EvalState {
     /// jumps; restart-on-URI-change passes are bounded separately by `uri_restarts`
     /// in [`super::evaluate`].
     pub(super) next_loops: usize,
+    /// Set when a successfully-compiled fancy regex fails at match time. The
+    /// current rule becomes a terminal fail-closed outcome.
+    pub(super) regex_failed: bool,
 }
 
 impl EvalState {
@@ -436,6 +439,12 @@ fn apply_rule(
         // an unset slot expands empty (not a stale prior-rule value).
         state.last_cond_caps = empty_caps();
         if !eval_conditions(&rule.conds, input, state, &[]) {
+            if state.regex_failed {
+                return Some(RuleApply::Terminal(RewriteOutcome::Failed {
+                    env: state.env_vec(),
+                    reason: "rewrite condition regex failed at match time",
+                }));
+            }
             return None;
         }
     }
@@ -456,7 +465,15 @@ fn apply_rule(
             }
         }
         None => {
-            let caps = rule.pattern.captures(match_target.as_ref());
+            let caps = match rule.pattern.captures_checked(match_target.as_ref()) {
+                Ok(caps) => caps,
+                Err(()) => {
+                    return Some(RuleApply::Terminal(RewriteOutcome::Failed {
+                        env: state.env_vec(),
+                        reason: "rewrite rule regex failed at match time",
+                    }));
+                }
+            };
             let matched = caps.is_some() ^ rule.negate;
             if !matched {
                 return None;
@@ -478,6 +495,12 @@ fn apply_rule(
 
     // Evaluate this rule's conditions.
     if !eval_conditions(&rule.conds, input, state, &rule_caps) {
+        if state.regex_failed {
+            return Some(RuleApply::Terminal(RewriteOutcome::Failed {
+                env: state.env_vec(),
+                reason: "rewrite condition regex failed at match time",
+            }));
+        }
         return None;
     }
 
@@ -786,8 +809,8 @@ fn eval_one_cond(
         // false, so it must not leak `%1`/`%2` to a later member of an `[OR]` group.
         let mut pending_caps = None;
         let result = match &cond.pattern {
-            CondPattern::Regex(re, _) => match re.captures(test.as_str()) {
-                Some(c) => {
+            CondPattern::Regex(re, _) => match re.captures_checked(test.as_str()) {
+                Ok(Some(c)) => {
                     let mut caps = empty_caps();
                     for (i, slot) in caps.iter_mut().enumerate() {
                         *slot = c.get(i).map(|s| s.to_string());
@@ -795,7 +818,11 @@ fn eval_one_cond(
                     pending_caps = Some(caps);
                     true
                 }
-                None => false,
+                Ok(None) => false,
+                Err(()) => {
+                    state.regex_failed = true;
+                    false
+                }
             },
             CondPattern::FileTest(kind) => file_test(input, test.as_str(), *kind),
             CondPattern::Lexical(ord, rhs) => {

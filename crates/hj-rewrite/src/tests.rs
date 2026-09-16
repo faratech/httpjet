@@ -781,6 +781,22 @@ fn restart_on_uri_change() {
 mod semantics {
     use super::*;
 
+    #[test]
+    fn rewrite_match_error_is_a_terminal_failure() {
+        let mut rs = RuleSet::parse("RewriteEngine On\nRewriteRule ^(a+)+\\1$ - [F]").unwrap();
+        let mut builder = fancy_regex::RegexBuilder::new(r"^(a+)+\1$");
+        builder.backtrack_limit(1);
+        rs.rules[0].pattern = crate::rules::CompiledRegex::Fancy(builder.build().unwrap());
+        rs.rules[0].prefilter_idx = None;
+        rs.rules[0].literal_prefix = Box::from(&b""[..]);
+        rs.prefilter = None;
+        let input = RewriteInput::new("/aaaaaaaaaaaaaaaaX", "/var/www");
+        assert!(matches!(
+            evaluate(&rs, &input),
+            RewriteOutcome::Failed { .. }
+        ));
+    }
+
     // --- 1. [R=200] non-3xx redirect codes -------------------------------
 
     /// The live `/web/news` CORS preflight rule: `- [R=200,L,E=CORS_PREFLIGHT:1]`.

@@ -303,6 +303,29 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         })
     });
 
+    // A present-but-out-of-range isolation mode must fail the vhost load, not
+    // silently degrade to "no isolation" (the OLS-parity default in
+    // convert_isolation is for absent/unparsable values only).
+    for (directive, raw_value) in [
+        ("setUIDMode", &raw.set_uid_mode),
+        ("chrootMode", &raw.chroot_mode),
+    ] {
+        if let Some(v) = raw_value
+            .as_deref()
+            .map(str::trim)
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            if !(0..=2).contains(&v) {
+                return Err(ConfigError::InvalidValue {
+                    path: config_path.clone(),
+                    directive: directive,
+                    value: v.to_string(),
+                    reason: "must be 0 (none), 1, or 2".to_string(),
+                });
+            }
+        }
+    }
+
     let isolation = convert_isolation(
         &raw.set_uid_mode,
         &raw.chroot_mode,

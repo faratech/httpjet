@@ -1757,6 +1757,105 @@ async fn idle_connection_is_goaway_after_timeout() {
 }
 
 #[tokio::test]
+async fn partial_frame_has_an_absolute_deadline() {
+    let (mut client, server) = tokio::io::duplex(16 * 1024);
+    let config = Config {
+        conn_idle_timeout: Some(std::time::Duration::from_secs(2)),
+        frame_read_timeout: Some(std::time::Duration::from_millis(100)),
+        ..Config::default()
+    };
+    let srv = tokio::spawn(async move { serve(server, noop_service, config, None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut settings = Vec::new();
+    frame::write_settings(&mut settings, &[]);
+    client.write_all(&settings).await.unwrap();
+
+    // Announce a frame payload but provide only one byte. The connection idle
+    // timer is deliberately much longer than the frame deadline.
+    let mut partial = Vec::new();
+    frame::write_frame(&mut partial, frame::kind::DATA, 0, 1, &[0; 32]);
+    client
+        .write_all(&partial[..FrameHeader::LEN + 1])
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let (hdr, payload) = read_frame(&mut client).await;
+            if hdr.kind == frame::kind::GOAWAY {
+                return u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("partial frame must expire independently of connection idleness");
+    assert_eq!(code, frame::error_code::PROTOCOL_ERROR);
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn unfinished_request_body_expires_while_other_frames_arrive() {
+    let (mut client, server) = tokio::io::duplex(32 * 1024);
+    let config = Config {
+        conn_idle_timeout: Some(std::time::Duration::from_secs(2)),
+        request_body_timeout: Some(std::time::Duration::from_millis(120)),
+        ..Config::default()
+    };
+    let srv = tokio::spawn(async move { serve(server, noop_service, config, None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut settings = Vec::new();
+    frame::write_settings(&mut settings, &[]);
+    client.write_all(&settings).await.unwrap();
+
+    let mut enc = Encoder::new();
+    let mut block = Vec::new();
+    for (name, value) in [
+        (":method", "POST"),
+        (":scheme", "https"),
+        (":path", "/upload"),
+        ("content-length", "10"),
+    ] {
+        enc.encode_header(&mut block, name, value);
+    }
+    let mut headers = Vec::new();
+    frame::write_frame(
+        &mut headers,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &block,
+    );
+    client.write_all(&headers).await.unwrap();
+    client.flush().await.unwrap();
+
+    // Keep the connection active with control traffic; this must not extend
+    // stream 1's request-body deadline.
+    for nonce in 0..5u8 {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let mut ping = Vec::new();
+        frame::write_frame(&mut ping, frame::kind::PING, 0, 0, &[nonce; 8]);
+        client.write_all(&ping).await.unwrap();
+        client.flush().await.unwrap();
+    }
+
+    let code = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let (hdr, payload) = read_frame(&mut client).await;
+            if hdr.kind == frame::kind::RST_STREAM && hdr.stream_id == 1 {
+                return u32::from_be_bytes(payload[..4].try_into().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("unfinished body must expire despite connection activity");
+    assert_eq!(code, frame::error_code::CANCEL);
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
 async fn rejects_data_on_stream_zero() {
     // DATA on stream 0 is a connection error (§6.1) -> GOAWAY.
     let (mut client, server) = tokio::io::duplex(64 * 1024);

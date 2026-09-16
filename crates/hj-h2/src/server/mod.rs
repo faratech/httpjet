@@ -123,6 +123,12 @@ pub struct Config {
     /// TCP/TLS then stalls is cut here; keep it short regardless of `conn_idle_timeout`.
     /// `None` falls back to `conn_idle_timeout` (the pre-split behavior).
     pub preface_timeout: Option<std::time::Duration>,
+    /// Absolute deadline for completing one frame once any byte of its header
+    /// or payload has arrived. Progress on that frame does not reset it.
+    pub frame_read_timeout: Option<std::time::Duration>,
+    /// Absolute deadline for completing a request body after its initial
+    /// HEADERS block. Traffic on other streams does not reset it.
+    pub request_body_timeout: Option<std::time::Duration>,
     /// (Tier 2) Per-connection egress cap in bytes/sec. 0 (default) = unlimited. When set,
     /// EVERY DATA/header flush on this connection is paced through one token bucket —
     /// connection-level semantics: all streams share the pipe, so a paced stream
@@ -143,6 +149,8 @@ impl Default for Config {
             body_budget: None,
             conn_idle_timeout: Some(std::time::Duration::from_secs(60)),
             preface_timeout: None,
+            frame_read_timeout: Some(std::time::Duration::from_secs(15)),
+            request_body_timeout: Some(std::time::Duration::from_secs(60)),
             bandwidth_limit: 0,
         }
     }
@@ -394,6 +402,9 @@ where
     let mut accepting = true;
     let mut draining = false;
     let cap = config.max_frame_size.min(1 << 24);
+    let frame_read_timeout = config.frame_read_timeout;
+    let request_body_timeout = config.request_body_timeout;
+    let mut partial_frame_deadline: Option<tokio::time::Instant> = None;
 
     // (HTTP/2-Bomb hardening) Connection-idle deadline, reset at the top of every iteration so
     // it measures time spent blocked in `select` with nothing happening. If it elapses, GOAWAY
@@ -414,6 +425,7 @@ where
         // Drain every complete frame already buffered (synchronous — no await, so
         // cancellation can never split a frame). Each completed request is pushed into
         // `inflight`; control responses are queued into `wbuf`.
+        let mut completed_frame = false;
         while inbuf.len() - cursor >= FrameHeader::LEN {
             // The loop guard guarantees 9 bytes, so parse always succeeds; fail closed with
             // a GOAWAY rather than panicking the connection task if that ever breaks.
@@ -437,6 +449,7 @@ where
             }
             let payload = cursor + FrameHeader::LEN..cursor + total;
             cursor += total;
+            completed_frame = true;
             match process_frame(
                 hdr,
                 &inbuf[payload],
@@ -557,6 +570,40 @@ where
             inbuf.drain(..cursor);
             cursor = 0;
         }
+        // A deadline begins with the first bytes of an incomplete frame and is
+        // retained across partial reads. Completing a frame permits a fresh
+        // deadline only for a distinct trailing frame already in the buffer.
+        if inbuf.is_empty() {
+            partial_frame_deadline = None;
+        } else if completed_frame || partial_frame_deadline.is_none() {
+            partial_frame_deadline = frame_read_timeout.map(|d| tokio::time::Instant::now() + d);
+        }
+
+        // Start body deadlines only after the initial header block is fully
+        // decoded. END_STREAM requests are dispatched synchronously above.
+        if let Some(d) = request_body_timeout {
+            let now = tokio::time::Instant::now();
+            for st in streams.values_mut() {
+                if st.headers_done && !st.end_stream && st.body_deadline.is_none() {
+                    st.body_deadline = Some(now + d);
+                }
+            }
+        }
+        let now = tokio::time::Instant::now();
+        let expired: Vec<u32> = streams
+            .iter()
+            .filter_map(|(&sid, st)| {
+                st.body_deadline
+                    .filter(|&deadline| deadline <= now)
+                    .map(|_| sid)
+            })
+            .collect();
+        for sid in expired {
+            if let Some(st) = streams.remove(&sid) {
+                recv.buffer_sub(st.body.len());
+            }
+            out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+        }
         // Release a read buffer that a large body / frame burst grew, once it has fully
         // drained between frames; idle CF keep-alives should not pin their peak capacity.
         // The floor handles normal request HEADERS in one read and grows on demand for
@@ -627,6 +674,18 @@ where
             break;
         }
 
+        let far_future = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
+        let frame_deadline = partial_frame_deadline.unwrap_or(far_future);
+        let body_deadline = streams
+            .values()
+            .filter_map(|st| st.body_deadline)
+            .min()
+            .unwrap_or(far_future);
+        let frame_timer = tokio::time::sleep_until(frame_deadline);
+        let body_timer = tokio::time::sleep_until(body_deadline);
+        tokio::pin!(frame_timer);
+        tokio::pin!(body_timer);
+
         tokio::select! {
             biased;
             // A handler completed: begin its response (the rest batch at the next loop top),
@@ -675,6 +734,15 @@ where
                     Err(e) => return Err(e),
                 }
             }
+            _ = &mut frame_timer, if reading && partial_frame_deadline.is_some() => {
+                out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::PROTOCOL_ERROR));
+                reading = false;
+                accepting = false;
+                draining = false;
+            }
+            // Wake the loop so its centralized expiry pass releases body
+            // accounting and resets every stream whose deadline has elapsed.
+            _ = &mut body_timer, if reading && streams.values().any(|st| st.body_deadline.is_some()) => {}
             // (HTTP/2-Bomb hardening) The connection went idle — no frame for `conn_idle_timeout`.
             // GOAWAY gracefully and stop reading; the loop then drains any in-flight work and
             // closes, freeing streams a silent peer held open. Lowest-priority (biased) so real
@@ -1078,7 +1146,9 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
 #[cfg(feature = "monoio")]
 pub async fn serve_local<IO, S, F>(stream: IO, service: S, config: Config) -> std::io::Result<()>
 where
-    IO: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
+    IO: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Splitable + 'static,
+    IO::OwnedRead: monoio::io::AsyncReadRent + 'static,
+    IO::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
     S: Fn(Request) -> F,
     F: Future<Output = Response> + Send + 'static,
 {
@@ -1086,20 +1156,13 @@ where
 }
 
 #[cfg(feature = "monoio")]
-fn monoio_read_once<IO>(
-    mut reader: monoio::io::OwnedReadHalf<IO>,
+fn monoio_read_once<R>(
+    mut reader: R,
     buffer: Vec<u8>,
-) -> impl Future<
-    Output = (
-        std::io::Result<usize>,
-        Vec<u8>,
-        monoio::io::OwnedReadHalf<IO>,
-    ),
->
+) -> impl Future<Output = (std::io::Result<usize>, Vec<u8>, R)>
 where
-    IO: monoio::io::AsyncReadRent,
+    R: monoio::io::AsyncReadRent,
 {
-    use monoio::io::AsyncReadRent;
     async move {
         let (result, buffer) = reader.read(buffer).await;
         (result, buffer, reader)
@@ -1120,12 +1183,14 @@ pub async fn serve_local_with_prefix<IO, S, F>(
     ktls_fd: Option<i32>,
 ) -> std::io::Result<()>
 where
-    IO: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
+    IO: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Splitable + 'static,
+    IO::OwnedRead: monoio::io::AsyncReadRent + 'static,
+    IO::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
     S: Fn(Request) -> F,
     F: Future<Output = Response> + Send + 'static,
 {
     use futures_util::stream::StreamExt;
-    use monoio::io::{AsyncReadRent, AsyncWriteRent, Splitable};
+    use monoio::io::{AsyncReadRent, AsyncWriteRent};
 
     let _conn_guard = ConnGuard::new();
     // (Tier 2) One bucket per h2 CONNECTION: every flush is paced when a rate is
@@ -1136,8 +1201,8 @@ where
     // ACROSS select! iterations (a handler completing must NOT cancel an in-flight
     // read — some monoio stream wrappers, e.g. monoio-rustls's SafeRead, lose their
     // buffer when a read future is dropped mid-flight). The write half flushes
-    // independently, so there is no &mut aliasing between the persistent read and
-    // the flush. Both monoio TcpStream and the monoio-rustls TLS stream are `Split`.
+    // independently. `Splitable` lets wrappers provide structurally separate halves
+    // instead of monoio's UnsafeCell-based generic `Split` implementation.
     let (mut rh, mut wh) = stream.into_split();
 
     // Client connection preface (24 bytes). Seeded with any pre-read prefix.
@@ -1249,6 +1314,15 @@ where
     // which abandons still-running connection tasks after a grace window.
     let mut draining = false;
     let cap = config.max_frame_size.min(1 << 24);
+    // Deadline state mirroring the tokio `serve` loop: a partially-received frame
+    // gets `frame_read_timeout` to complete, and a request whose headers arrived
+    // but whose END_STREAM body never does gets `request_body_timeout`. Without
+    // these the production (monoio) loop only enforced the preface + idle bounds,
+    // so a peer trickling one byte per idle window could pin the connection and
+    // its buffers indefinitely.
+    let frame_read_timeout = config.frame_read_timeout;
+    let request_body_timeout = config.request_body_timeout;
+    let mut partial_frame_deadline: Option<std::time::Instant> = None;
 
     // The read future stays pinned across select iterations because cancelling a monoio-rustls
     // read can lose its owned buffer. The box is allocated once; after a completed read,
@@ -1258,6 +1332,7 @@ where
 
     loop {
         // 1) Process every complete buffered frame (mirrors serve()).
+        let mut completed_frame = false;
         while inbuf.len() - cursor >= FrameHeader::LEN {
             let Some(hdr) = FrameHeader::parse(&inbuf[cursor..]) else {
                 out.frames(|b| frame::write_goaway(b, 0, error_code::PROTOCOL_ERROR));
@@ -1277,6 +1352,7 @@ where
             }
             let payload = cursor + FrameHeader::LEN..cursor + total;
             cursor += total;
+            completed_frame = true;
             match process_frame(
                 hdr,
                 &inbuf[payload],
@@ -1384,6 +1460,43 @@ where
             inbuf.shrink_to(H2_INBUF_IDLE);
         }
 
+        // Deadline bookkeeping mirroring the tokio `serve` loop. A deadline begins
+        // with the first bytes of an incomplete frame and is retained across partial
+        // reads; completing a frame permits a fresh deadline only for a distinct
+        // trailing frame already in the buffer.
+        if inbuf.is_empty() {
+            partial_frame_deadline = None;
+        } else if completed_frame || partial_frame_deadline.is_none() {
+            partial_frame_deadline = frame_read_timeout.map(|d| std::time::Instant::now() + d);
+        }
+
+        // Start body deadlines only after the initial header block is fully decoded
+        // (END_STREAM requests dispatch synchronously), then expire any stream whose
+        // body never completed: release its body accounting and RST it.
+        if let Some(d) = request_body_timeout {
+            let now = tokio::time::Instant::now();
+            for st in streams.values_mut() {
+                if st.headers_done && !st.end_stream && st.body_deadline.is_none() {
+                    st.body_deadline = Some(now + d);
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        let expired: Vec<u32> = streams
+            .iter()
+            .filter_map(|(&sid, st)| {
+                st.body_deadline
+                    .filter(|&deadline| deadline.into_std() <= now)
+                    .map(|_| sid)
+            })
+            .collect();
+        for sid in expired {
+            if let Some(st) = streams.remove(&sid) {
+                recv.buffer_sub(st.body.len());
+            }
+            out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+        }
+
         // 2) Drain handlers + body pulls ready right now (immediate handlers resolve here).
         while let Some((sid, is_head, resp)) =
             futures_util::FutureExt::now_or_never(inflight.next()).flatten()
@@ -1450,14 +1563,28 @@ where
         // resolves) — this is what makes the non-cancel-safe monoio-rustls read safe.
         // On shutdown: GOAWAY + stop accepting new streams, but keep reading so in-flight
         // response bodies still receive flow-control credit and finish (matches `serve`).
-        let mut read_done: Option<(
-            std::io::Result<usize>,
-            Vec<u8>,
-            monoio::io::OwnedReadHalf<IO>,
-        )> = None;
+        let mut read_done: Option<(std::io::Result<usize>, Vec<u8>, IO::OwnedRead)> = None;
+        let frame_wait = partial_frame_deadline
+            .map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+        let body_wait = streams
+            .values()
+            .filter_map(|st| st.body_deadline)
+            .map(|dl| dl.into_std())
+            .min()
+            .map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
         monoio::select! {
             biased;
             rb = read_fut.as_mut(), if reading => { read_done = Some(rb); }
+            // (c03e287 parity) A partially-received frame that outlives
+            // `frame_read_timeout` is a slowloris: GOAWAY PROTOCOL_ERROR, stop reading.
+            _ = async { match frame_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && frame_wait.is_some() => {
+                out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::PROTOCOL_ERROR));
+                reading = false;
+                accepting = false;
+            }
+            // Wake the loop when the nearest request-body deadline elapses; the
+            // centralized expiry pass at the loop top releases the accounting.
+            _ = async { match body_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && body_wait.is_some() => {}
             Some((sid, is_head, resp)) = inflight.next(), if !inflight.is_empty() => {
                 inflight_sids.remove(&sid);
                 if let Some(resp) = resp && !cancelled.remove(&sid) {
@@ -1569,6 +1696,207 @@ mod tests {
         });
         client.join().unwrap();
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Regression (c03e287 parity): the production monoio loop must enforce
+    /// `frame_read_timeout` on a partially-received frame. The old loop only had
+    /// the preface + idle bounds, so a peer trickling one byte at a time kept the
+    /// connection (and its buffers) pinned forever. The idle timeout is DISABLED
+    /// here so only the frame deadline can close the connection.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_partial_frame_deadline_closes_slow_trickle() {
+        use std::io::{Read, Write};
+        use std::time::Instant;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let mut wire = crate::conn::PREFACE.to_vec();
+            frame::write_settings(&mut wire, &[]);
+            // A HEADERS frame announcing 20 payload bytes; only the first 5 arrive,
+            // then the rest trickle one byte per 30 ms — well past the deadline.
+            let mut block = Vec::new();
+            let mut encoder = Encoder::new();
+            for (name, value) in [
+                (":method", "GET"),
+                (":path", "/"),
+                (":scheme", "https"),
+                (":authority", "example.com"),
+            ] {
+                encoder.encode_header(&mut block, name, value);
+            }
+            let mut head = [0u8; 9];
+            let len = block.len().min(20) as u32;
+            head[0] = (len >> 16) as u8;
+            head[1] = (len >> 8) as u8;
+            head[2] = len as u8;
+            head[3] = frame::kind::HEADERS;
+            head[4] = frame::flags::END_HEADERS;
+            head[5..9].copy_from_slice(&1u32.to_be_bytes());
+            wire.extend_from_slice(&head);
+            wire.extend_from_slice(&block[..5]);
+            stream.write_all(&wire).unwrap();
+
+            let started = Instant::now();
+            let mut last_byte = Instant::now();
+            let mut eof_at: Option<Duration> = None;
+            let mut buf = [0u8; 4096];
+            stream
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .unwrap();
+            let mut sent = 5usize;
+            while started.elapsed() < Duration::from_secs(3) {
+                match stream.read(&mut buf) {
+                    Ok(0) => {
+                        eof_at = Some(started.elapsed());
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break,
+                }
+                if sent < len as usize && last_byte.elapsed() >= Duration::from_millis(30) {
+                    stream.write_all(&block[sent..sent + 1]).unwrap();
+                    sent += 1;
+                    last_byte = Instant::now();
+                }
+            }
+            (eof_at, block.len())
+        });
+
+        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async move {
+            let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = Config {
+                conn_idle_timeout: None,
+                frame_read_timeout: Some(Duration::from_millis(150)),
+                ..Config::default()
+            };
+            serve_local_with_prefix(
+                stream,
+                Vec::new(),
+                |_| {
+                    std::future::ready(hj_core::text_response(
+                        http::StatusCode::OK,
+                        "unexpected request",
+                    ))
+                },
+                config,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let (eof_at, block_len) = client.join().unwrap();
+        assert!(result.is_ok(), "the connection should close cleanly");
+        let eof = eof_at.expect("server must close while the frame is still trickling");
+        assert!(
+            eof < Duration::from_millis(2500),
+            "the frame deadline must close the connection well before the \
+             3 s trickle budget is exhausted (closed after {eof:?}); the frame \
+             needed {} more bytes at 30 ms each",
+            block_len - 5
+        );
+    }
+
+    /// Regression (c03e287 parity): the production monoio loop must enforce
+    /// `request_body_timeout` — headers complete but the promised request body
+    /// never arrives → RST_STREAM(CANCEL) on that stream. The idle timeout is
+    /// DISABLED here so only the body deadline can act.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_body_deadline_resets_withheld_request_body() {
+        use std::io::{Read, Write};
+        use std::time::Instant;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let wire = body_budget_request_wire(false);
+            stream.write_all(&wire).unwrap();
+
+            // Wait for the RST_STREAM(CANCEL) on stream 1.
+            let started = Instant::now();
+            let mut seen = Vec::new();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            let rst_at: Option<Duration> = loop {
+                if started.elapsed() > Duration::from_secs(3) {
+                    break None;
+                }
+                match stream.read(&mut buf) {
+                    Ok(0) => break None,
+                    Ok(n) => {
+                        seen.extend_from_slice(&buf[..n]);
+                        let hit = seen.windows(9).any(|w| {
+                            w[3] == frame::kind::RST_STREAM
+                                && u32::from_be_bytes([w[5], w[6], w[7], w[8]]) == 1
+                        });
+                        if hit {
+                            break Some(started.elapsed());
+                        }
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => break None,
+                }
+            };
+            drop(stream);
+            rst_at
+        });
+
+        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async move {
+            let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = Config {
+                conn_idle_timeout: None,
+                request_body_timeout: Some(Duration::from_millis(200)),
+                ..Config::default()
+            };
+            serve_local_with_prefix(
+                stream,
+                Vec::new(),
+                |_| {
+                    std::future::ready(hj_core::text_response(
+                        http::StatusCode::OK,
+                        "unexpected request",
+                    ))
+                },
+                config,
+                None,
+                None,
+            )
+            .await
+        });
+
+        let rst_at = client.join().unwrap();
+        assert!(result.is_ok(), "the connection should close cleanly on EOF");
+        let rst = rst_at.expect("an incomplete request body must be reset by the deadline");
+        assert!(
+            rst < Duration::from_secs(2),
+            "the body deadline must RST the stream promptly (took {rst:?})"
+        );
     }
 
     /// Regression for the monoio-loop in-flight abandonment bug: once reads stop, the loop

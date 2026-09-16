@@ -851,6 +851,7 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
         render_epoch: store.purge_epoch(),
         has_range: false,
         host_foreign: false,
+        origin: None,
         vary_value: None,
     };
     let key =
@@ -979,6 +980,7 @@ async fn seed_public_entry(
         render_epoch: store.purge_epoch(),
         has_range: false,
         host_foreign: false,
+        origin: None,
         vary_value: None,
     };
     let key =

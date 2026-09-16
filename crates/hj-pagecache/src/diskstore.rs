@@ -1156,12 +1156,23 @@ pub fn init_integrity_key(path: &std::path::Path) -> std::io::Result<()> {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)?;
             }
-            std::fs::write(path, key)?;
+            // O_CREAT|O_EXCL with the final mode (no umask window); O_EXCL also
+            // refuses an existing path INCLUDING a planted symlink, so the write
+            // cannot be redirected. A racing creator is an error, not a clobber.
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)?;
+                f.write_all(&key)?;
+                let _ = f.sync_all();
             }
+            #[cfg(not(unix))]
+            std::fs::write(path, key)?;
         }
         Err(e) => return Err(e),
     }

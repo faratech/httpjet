@@ -365,6 +365,15 @@ pub(crate) fn resolve_credentials(user: &str, group: &str) -> io::Result<Credent
     } else {
         lookup_group(group)?
     };
+    // Never-root, enforced at the shared resolution point: the jail path
+    // re-checks with its own floors, but the LEGACY pool-drop path used this
+    // function unfiltered, so a `<user>root</user>` (or numeric `0`) silently
+    // spawned root workers. Refuse here so every caller is covered.
+    if uid == 0 || gid == 0 {
+        return Err(invalid(
+            "refusing to resolve worker credentials as root (uid==0 or gid==0)",
+        ));
+    }
     Ok(Credentials { uid, gid })
 }
 

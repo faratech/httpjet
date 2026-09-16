@@ -388,6 +388,13 @@ pub(crate) struct RuleFlags {
 /// The outcome of evaluating a [`RuleSet`] against a [`RewriteInput`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewriteOutcome {
+    /// A configured backtracking expression hit a match-time engine limit.
+    /// Callers must fail closed, never reinterpret this as a non-match and
+    /// continue into a protected handler.
+    Failed {
+        env: Vec<(String, String)>,
+        reason: &'static str,
+    },
     /// No rule matched / no change to the URI.
     Unchanged {
         /// Any `[E=...]` env mutations accumulated along the way.
@@ -446,7 +453,8 @@ impl RewriteOutcome {
     /// variant.
     pub fn env(&self) -> &[(String, String)] {
         match self {
-            RewriteOutcome::Unchanged { env, .. }
+            RewriteOutcome::Failed { env, .. }
+            | RewriteOutcome::Unchanged { env, .. }
             | RewriteOutcome::Rewritten { env, .. }
             | RewriteOutcome::Redirect { env, .. }
             | RewriteOutcome::Status { env, .. }
@@ -632,6 +640,11 @@ impl<'t> Caps<'t> {
 }
 
 impl CompiledRegex {
+    #[inline]
+    pub(crate) fn can_fail_at_match_time(&self) -> bool {
+        matches!(self, CompiledRegex::Fancy(_))
+    }
+
     /// Compile `src` (case-insensitive when `nocase`), preferring the linear-time
     /// `regex_automata` engine and falling back to `fancy_regex` for unsupported features.
     fn compile(src: &str, nocase: bool, line: usize) -> Result<CompiledRegex, RewriteError> {
@@ -667,6 +680,20 @@ impl CompiledRegex {
             CompiledRegex::Fancy(r) => r.captures(text).ok().flatten().map(Caps::Fancy),
         }
     }
+
+    /// Checked runtime match used by request authorization/routing. Fancy
+    /// regexes can fail after successful compilation (for example when their
+    /// backtracking limit is exhausted); preserve that distinction.
+    #[inline]
+    pub(crate) fn captures_checked<'t>(&self, text: &'t str) -> Result<Option<Caps<'t>>, ()> {
+        match self {
+            CompiledRegex::Fast(r) => Ok(r.captures(text)),
+            CompiledRegex::Fancy(r) => r
+                .captures(text)
+                .map(|caps| caps.map(Caps::Fancy))
+                .map_err(|_| ()),
+        }
+    }
 }
 
 // ===========================================================================
@@ -700,6 +727,7 @@ pub fn evaluate(rs: &RuleSet, input: &RewriteInput) -> RewriteOutcome {
         last_cond_caps: std::array::from_fn(|_| None),
         prefilter_valid: true,
         next_loops: 0,
+        regex_failed: false,
     };
     // Set true once an `[END]` rule fires, so the final outcome flags the
     // pipeline to stop subsequent rulesets / `.htaccess` processing.

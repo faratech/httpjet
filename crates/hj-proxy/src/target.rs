@@ -119,6 +119,13 @@ impl ProxyTarget {
     /// Unix-socket form `unix:/path/to.sock|/upstream/path` (LiteSpeed `uds://`
     /// style). A missing port defaults to 80 for http/ws/h2 and 443 for
     /// https/wss/h2s. The path (if any) becomes [`Self::path_and_query`].
+    /// True when the physical transport is a unix-domain socket. Rewrite-driven
+    /// `[P]` targets are request-influenceable, so callers screen them against
+    /// local resources before dialing; config-declared targets are operator-trusted.
+    pub fn is_unix_transport(&self) -> bool {
+        matches!(self.transport, TargetTransport::Uds(_))
+    }
+
     pub fn parse_url(url: &str) -> Result<ProxyTarget, TargetParseError> {
         let url = url.trim();
         if url.is_empty() {

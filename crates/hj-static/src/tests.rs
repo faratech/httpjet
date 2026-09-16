@@ -521,10 +521,8 @@ async fn serves_existing_file_200() {
 
 #[tokio::test]
 async fn range_on_symlink_off_vhost_serves_only_the_slice() {
-    // With `followSymbolLink off` the handler serves from symlink-verified bytes via
-    // FileBody.cached, which the transport emits WHOLE (only the uncached disk path seeks by
-    // FileBody.range). A 206 must therefore carry ONLY the requested slice — pre-sliced into
-    // `cached` — not the entire file under a partial Content-Range.
+    // With `followSymbolLink off` the handler reads the selected range from the
+    // pinned descriptor. It must not materialize the whole entity.
     let root = temp_root("rangesymoff");
     let data: Vec<u8> = (0u32..1000).map(|i| (i % 251) as u8).collect();
     fs::write(root.join("blob.bin"), &data).unwrap();
@@ -545,30 +543,42 @@ async fn range_on_symlink_off_vhost_serves_only_the_slice() {
     assert_eq!(resp.headers()[CONTENT_LENGTH], "10");
     assert_eq!(resp.headers()[CONTENT_RANGE], "bytes 10-19/1000");
     match resp.into_body() {
-        Body::File(f) => {
-            // Design: `cached` carries the WHOLE file and `range` stays Some; the transport applies
-            // the range via the single-sourced FileBody::cached_ranged (identical on H1 and H2).
-            let cached = f
-                .cached
-                .as_ref()
-                .expect("symlink-off serve must carry verified cached bytes");
-            assert_eq!(
-                cached.len(),
-                1000,
-                "cached holds the whole file (transport slices)"
-            );
-            assert_eq!(f.range, Some((10, 19)));
-            // The bytes actually served (after the transport applies the range) are exactly the slice.
-            let served = f.cached_ranged().expect("cached present");
-            assert_eq!(
-                served.len(),
-                10,
-                "served body is the requested slice, not the full file"
-            );
-            assert_eq!(&served[..], &data[10..=19]);
-        }
-        _ => panic!("expected file body"),
+        Body::Full(served) => assert_eq!(&served[..], &data[10..=19]),
+        _ => panic!("expected a bounded verified range body"),
     }
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn tiny_verified_range_does_not_buffer_oversized_sparse_entity() {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let root = temp_root("rangesymoff_sparse");
+    let path = root.join("huge.bin");
+    let mut file = fs::File::create(&path).unwrap();
+    file.set_len(513 * 1024 * 1024).unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.write_all(b"Z").unwrap();
+    drop(file);
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        allow_symbol_link: false,
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    let request = http::Request::builder()
+        .method(Method::GET)
+        .uri("/huge.bin")
+        .header(RANGE, "bytes=-1")
+        .body(empty_body())
+        .unwrap();
+    let resp = serve(&mut ctx, request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(resp.headers()[CONTENT_LENGTH], "1");
+    let Body::Full(body) = resp.into_body() else {
+        panic!("verified range must be bounded in memory")
+    };
+    assert_eq!(&body[..], b"Z");
     fs::remove_dir_all(&root).ok();
 }
 
@@ -1202,8 +1212,11 @@ async fn range_request_206() {
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(resp.headers()[CONTENT_RANGE], "bytes 2-5/10");
     assert_eq!(resp.headers()[CONTENT_LENGTH], "4");
-    let (_, range) = body_is_file(resp.body()).unwrap();
-    assert_eq!(range, Some((2, 5)));
+    match resp.into_body() {
+        Body::Full(body) => assert_eq!(&body[..], b"2345"),
+        Body::File(body) => assert_eq!(body.range, Some((2, 5))),
+        _ => panic!("range response must have a bounded body"),
+    }
     fs::remove_dir_all(&root).ok();
 }
 

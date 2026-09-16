@@ -1,14 +1,6 @@
 name: Actions policy
 
 on:
-  push:
-    paths:
-      - '.github/workflows/**'
-      - '.github/dependabot.yml'
-  pull_request:
-    paths:
-      - '.github/workflows/**'
-      - '.github/dependabot.yml'
   workflow_dispatch:
 
 permissions:

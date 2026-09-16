@@ -29,13 +29,14 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::rc::Rc;
 use std::sync::Mutex;
 
 use aws_lc_rs::hkdf::{Algorithm, HKDF_SHA256, HKDF_SHA384, KeyType, Prk};
 use ktls_sys::bindings as kb;
 use monoio::BufResult;
 use monoio::buf::{IoBuf, IoBufMut, IoVecBuf, IoVecBufMut};
-use monoio::io::{AsyncReadRent, AsyncWriteRent, Split};
+use monoio::io::{AsyncReadRent, AsyncWriteRent, Splitable};
 use rustls::{CipherSuite, KeyLog, SupportedCipherSuite};
 
 // ── setsockopt / cmsg constants ───────────────────────────────────────────────
@@ -430,6 +431,22 @@ pub(crate) struct KtlsStream<S> {
     rekey: RekeyState,
 }
 
+/// Structurally split kTLS read half. The raw socket read half is independent;
+/// the rekey gate serializes receive-side KeyUpdate processing with every TX
+/// operation performed by [`KtlsWriteHalf`].
+pub(crate) struct KtlsReadHalf<R> {
+    inner: R,
+    rekey: Rc<tokio::sync::Mutex<RekeyState>>,
+}
+
+/// Structurally split kTLS write half. Holding the rekey gate until a write
+/// completes prevents a peer KeyUpdate from replacing TLS_TX while application
+/// data is still being submitted with the previous generation.
+pub(crate) struct KtlsWriteHalf<W> {
+    inner: W,
+    rekey: Rc<tokio::sync::Mutex<RekeyState>>,
+}
+
 impl<S: AsRawFd> KtlsStream<S> {
     fn fd(&self) -> RawFd {
         self.inner.as_raw_fd()
@@ -562,9 +579,134 @@ impl<S: AsRawFd> AsRawFd for KtlsStream<S> {
     }
 }
 
-// SAFETY: read and write touch disjoint state — writes go straight to the kernel socket;
-// reads use the socket read side plus `rekey` (only mutated on the read path). `S` is itself
-// `Split`, so its own read/write halves are disjoint. This matches monoio's model (and the
-// monoio-rustls TLS stream, which is also `Split`); the h1/h2 serve loops drive read and
-// write from a single task, so the rekey setsockopt is sequenced between socket operations.
-unsafe impl<S: Split> Split for KtlsStream<S> {}
+impl<S: Splitable> Splitable for KtlsStream<S> {
+    type OwnedRead = KtlsReadHalf<S::OwnedRead>;
+    type OwnedWrite = KtlsWriteHalf<S::OwnedWrite>;
+
+    fn into_split(self) -> (Self::OwnedRead, Self::OwnedWrite) {
+        let (read, write) = self.inner.into_split();
+        let rekey = Rc::new(tokio::sync::Mutex::new(self.rekey));
+        (
+            KtlsReadHalf {
+                inner: read,
+                rekey: Rc::clone(&rekey),
+            },
+            KtlsWriteHalf {
+                inner: write,
+                rekey,
+            },
+        )
+    }
+}
+
+impl<R: AsyncReadRent> AsyncReadRent for KtlsReadHalf<R> {
+    fn read<T: IoBufMut>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = BufResult<usize, T>> {
+        async move {
+            let mut buf = buf;
+            loop {
+                let (result, returned) = self.inner.read(buf).await;
+                buf = returned;
+                match result {
+                    Ok(n) => return (Ok(n), buf),
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                        let mut rekey = self.rekey.lock().await;
+                        match handle_rx_control(&mut rekey) {
+                            Ok(RxControl::Continue) => continue,
+                            Ok(RxControl::Closed) => return (Ok(0), buf),
+                            Err(control_error) => return (Err(control_error), buf),
+                        }
+                    }
+                    Err(error) => return (Err(error), buf),
+                }
+            }
+        }
+    }
+
+    fn readv<T: IoVecBufMut>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = BufResult<usize, T>> {
+        async move {
+            let mut buf = buf;
+            loop {
+                let (result, returned) = self.inner.readv(buf).await;
+                buf = returned;
+                match result {
+                    Ok(n) => return (Ok(n), buf),
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                        let mut rekey = self.rekey.lock().await;
+                        match handle_rx_control(&mut rekey) {
+                            Ok(RxControl::Continue) => continue,
+                            Ok(RxControl::Closed) => return (Ok(0), buf),
+                            Err(control_error) => return (Err(control_error), buf),
+                        }
+                    }
+                    Err(error) => return (Err(error), buf),
+                }
+            }
+        }
+    }
+}
+
+impl<W: AsyncWriteRent> AsyncWriteRent for KtlsWriteHalf<W> {
+    fn write<T: IoBuf>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = BufResult<usize, T>> {
+        async move {
+            let rekey = self.rekey.lock().await;
+            let len = buf.bytes_init();
+            if len == 0 {
+                drop(rekey);
+                return (Ok(0), buf);
+            }
+            // SAFETY: `buf` owns `len` initialized bytes for this synchronous call.
+            let n = unsafe { libc::write(rekey.fd, buf.read_ptr() as *const libc::c_void, len) };
+            if n >= 0 {
+                drop(rekey);
+                return (Ok(n as usize), buf);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EAGAIN) {
+                drop(rekey);
+                return (Err(error), buf);
+            }
+            let result = self.inner.write(buf).await;
+            drop(rekey);
+            result
+        }
+    }
+
+    fn writev<T: IoVecBuf>(
+        &mut self,
+        buf: T,
+    ) -> impl std::future::Future<Output = BufResult<usize, T>> {
+        async move {
+            let rekey = self.rekey.lock().await;
+            let result = self.inner.writev(buf).await;
+            drop(rekey);
+            result
+        }
+    }
+
+    fn flush(&mut self) -> impl std::future::Future<Output = io::Result<()>> {
+        async move {
+            let rekey = self.rekey.lock().await;
+            let result = self.inner.flush().await;
+            drop(rekey);
+            result
+        }
+    }
+
+    fn shutdown(&mut self) -> impl std::future::Future<Output = io::Result<()>> {
+        async move {
+            let rekey = self.rekey.lock().await;
+            let result = self.inner.shutdown().await;
+            drop(rekey);
+            result
+        }
+    }
+}

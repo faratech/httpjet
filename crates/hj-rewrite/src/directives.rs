@@ -485,7 +485,10 @@ impl Htaccess {
     /// Directives are applied in source order; a later set for the same `VAR`
     /// overrides an earlier one (the caller should let later entries win, e.g.
     /// by inserting into a map in order).
-    pub fn eval_set_env(&self, attrs: &ReqAttrs<'_>) -> Vec<(String, String)> {
+    pub fn eval_set_env(
+        &self,
+        attrs: &ReqAttrs<'_>,
+    ) -> Result<Vec<(String, String)>, &'static str> {
         let mut out = Vec::new();
         for s in &self.set_env_if {
             let Some(subject) = attrs.resolve(&s.attribute) else {
@@ -501,12 +504,16 @@ impl Htaccess {
             {
                 continue;
             }
-            if let Ok(Some(caps)) = s.regex.captures(subject.as_ref()) {
-                let value = expand_backrefs(&s.value, &caps);
-                out.push((s.var.clone(), value));
+            match s.regex.captures(subject.as_ref()) {
+                Ok(Some(caps)) => {
+                    let value = expand_backrefs(&s.value, &caps);
+                    out.push((s.var.clone(), value));
+                }
+                Ok(None) => {}
+                Err(_) => return Err("SetEnvIf regex failed at match time"),
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -1052,7 +1059,7 @@ mod directive_tests {
             header_lookup: Some(HeaderLookup(&lk)),
             ..Default::default()
         };
-        let env = h.eval_set_env(&attrs);
+        let env = h.eval_set_env(&attrs).unwrap();
         assert_eq!(
             env,
             vec![(
@@ -1067,7 +1074,20 @@ mod directive_tests {
             header_lookup: Some(HeaderLookup(&lk_bad)),
             ..Default::default()
         };
-        assert!(h.eval_set_env(&attrs_bad).is_empty());
+        assert!(h.eval_set_env(&attrs_bad).unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_env_if_match_error_is_not_treated_as_non_match() {
+        let mut h = Htaccess::parse("SetEnvIf Request_URI x SAFE=1").unwrap();
+        let mut builder = fancy_regex::RegexBuilder::new(r"^(a+)+\1$");
+        builder.backtrack_limit(1);
+        h.set_env_if[0].regex = builder.build().unwrap();
+        let attrs = ReqAttrs {
+            request_uri: "aaaaaaaaaaaaaaaaX",
+            ..Default::default()
+        };
+        assert!(h.eval_set_env(&attrs).is_err());
     }
 
     #[test]
@@ -1083,7 +1103,7 @@ mod directive_tests {
             query_string: "amp=1&x=2",
             ..Default::default()
         };
-        let env = h.eval_set_env(&attrs);
+        let env = h.eval_set_env(&attrs).unwrap();
         assert!(env.contains(&("NEWS_API_CC".to_string(), "1".to_string())));
         assert!(env.contains(&("AMP_PAGE".to_string(), "1".to_string())));
         // Non-matching URI -> NEWS_API_CC not set.
@@ -1093,6 +1113,7 @@ mod directive_tests {
         };
         assert!(
             !h.eval_set_env(&attrs2)
+                .unwrap()
                 .iter()
                 .any(|(k, _)| k == "NEWS_API_CC")
         );
@@ -1113,7 +1134,7 @@ mod directive_tests {
             ..Default::default()
         };
         assert_eq!(
-            h.eval_set_env(&attrs),
+            h.eval_set_env(&attrs).unwrap(),
             vec![("IS_BOT".to_string(), "1".to_string())]
         );
     }
@@ -1133,7 +1154,7 @@ mod directive_tests {
             header_lookup: Some(HeaderLookup(&lk)),
             ..Default::default()
         };
-        let env = h.eval_set_env(&attrs);
+        let env = h.eval_set_env(&attrs).unwrap();
         let ops = h.response_headers("/api/x.php", 200, &env);
         assert_eq!(
             ops[0],
@@ -1149,7 +1170,7 @@ mod directive_tests {
             header_lookup: Some(HeaderLookup(&lk_bad)),
             ..Default::default()
         };
-        let env_bad = h.eval_set_env(&attrs_bad);
+        let env_bad = h.eval_set_env(&attrs_bad).unwrap();
         assert!(h.response_headers("/api/x.php", 200, &env_bad).is_empty());
     }
 

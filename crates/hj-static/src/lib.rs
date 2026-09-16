@@ -683,34 +683,24 @@ impl Handler for StaticFiles {
             None
         };
 
-        // (#10/#387) When symlinks are disallowed, serve from bytes read through the
-        // exact symlink-safe descriptor resolved above instead of re-opening the
-        // pathname — closing the resolve→serve TOCTOU. Read once and reuse via
-        // FileBody.cached (which the transports serve range-aware). HEAD has no body. allow_symlink
-        // is true for every prod vhost, so this is inert in prod.
-        let verified_cached: Option<bytes::Bytes> = if !allow_symlink && !is_head {
-            Some(read_verified_file(&resolved)?)
-        } else {
-            None
-        };
-
         if let Some(range_val) = range {
             match parse_ranges(range_val.as_bytes(), resolved.len) {
                 RangeOutcome::Single(start, end) => {
                     let body = if is_head {
                         Body::Empty
+                    } else if !allow_symlink {
+                        // The verified descriptor, not the pathname, remains the
+                        // authority. Read only the requested interval: buffering
+                        // the whole file for a one-byte range allowed trivial
+                        // request-driven memory/IO amplification.
+                        Body::Full(read_verified_range(&resolved, start, end)?)
                     } else {
-                        // `cached` carries the WHOLE verified file; the transport applies `range`
-                        // via the single-sourced, bounds-clamped FileBody::cached_ranged (the
-                        // native-H2 path already did, and the io_uring bridge now does too). Slicing
-                        // here instead would double-slice on H2 and could panic if the file shrank
-                        // between the resolve stat and the verified read.
                         Body::File(FileBody {
                             path: resolved_target.clone(),
                             file: resolved.file.take(),
                             len: resolved.len,
                             range: Some((start, end)),
-                            cached: verified_cached.clone(),
+                            cached: None,
                         })
                     };
                     let mut resp = Response::new(body);
@@ -748,7 +738,7 @@ impl Handler for StaticFiles {
                     if total <= MAX_MULTIPART_PART_BYTES
                         && let Some(parts) = read_multipart_parts(
                             &ranges,
-                            verified_cached.as_ref(),
+                            None,
                             resolved.file.as_ref(),
                             &resolved_target,
                         )
@@ -786,6 +776,15 @@ impl Handler for StaticFiles {
         }
 
         // ---- Full 200 response -------------------------------------------
+        // (#10/#387) When symlinks are disallowed, full responses still use
+        // bytes read through the exact descriptor selected above, closing the
+        // resolve-to-serve pathname race. Range responses were handled earlier
+        // and never pay this whole-entity allocation.
+        let verified_cached: Option<bytes::Bytes> = if !allow_symlink && !is_head {
+            Some(read_verified_file(&resolved)?)
+        } else {
+            None
+        };
         let body = if is_head {
             Body::Empty
         } else {
@@ -1048,6 +1047,31 @@ fn read_verified_file(resolved: &ResolvedFile) -> Result<bytes::Bytes, HandlerEr
     let mut buf = vec![0; len];
     use std::os::unix::fs::FileExt;
     file.read_exact_at(&mut buf, 0)
+        .map_err(|_| HandlerError::NotFound)?;
+    Ok(bytes::Bytes::from(buf))
+}
+
+/// Read one inclusive byte range from the descriptor selected by the confined
+/// resolver. The allocation is proportional to the response, not the backing
+/// entity, and `read_exact_at` keeps a shared descriptor's cursor untouched.
+fn read_verified_range(
+    resolved: &ResolvedFile,
+    start: u64,
+    end: u64,
+) -> Result<bytes::Bytes, HandlerError> {
+    const MAX_VERIFIED_INMEM: u64 = 512 * 1024 * 1024;
+    let len_u64 = end
+        .checked_sub(start)
+        .and_then(|n| n.checked_add(1))
+        .ok_or(HandlerError::PayloadTooLarge)?;
+    if len_u64 > MAX_VERIFIED_INMEM {
+        return Err(HandlerError::PayloadTooLarge);
+    }
+    let len = usize::try_from(len_u64).map_err(|_| HandlerError::PayloadTooLarge)?;
+    let file = resolved.file.as_ref().ok_or(HandlerError::NotFound)?;
+    let mut buf = vec![0; len];
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(&mut buf, start)
         .map_err(|_| HandlerError::NotFound)?;
     Ok(bytes::Bytes::from(buf))
 }

@@ -125,6 +125,9 @@ pub(super) struct StreamState {
     /// (§8.1.2.6). `Some(None)` would be a parse error; we store the parsed value or flag
     /// malformed at decode time.
     pub(super) content_length: Option<u64>,
+    /// Absolute deadline for completing the request body after the initial
+    /// header block. Other active streams and control frames must not extend it.
+    pub(super) body_deadline: Option<tokio::time::Instant>,
     /// Per-stream RECEIVE flow-control window (§6.9): credit granted to the peer for DATA on this
     /// stream. Initialized to our SETTINGS_INITIAL_WINDOW_SIZE when the stream opens (default 0
     /// from `Default` is overwritten at creation), decremented on DATA, replenished as we buffer.

@@ -682,9 +682,14 @@ pub(crate) fn maybe_pin_core_thread(core: usize, workers: usize) {
     if workers != cpus || core >= cpus {
         return;
     }
+    if core >= libc::CPU_SETSIZE as usize {
+        // available_parallelism() can exceed CPU_SETSIZE (1024) on pathological
+        // hosts; CPU_SET would write past the fixed-size mask.
+        return;
+    }
     // SAFETY: a zeroed cpu_set_t is a valid empty mask; CPU_SET stays in
-    // bounds (core < cpus <= CPU_SETSIZE on any host this runs on); pid 0
-    // targets the calling thread.
+    // bounds (core < cpus and core < CPU_SETSIZE are both checked above); pid
+    // 0 targets the calling thread.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(core, &mut set);
@@ -1159,8 +1164,11 @@ async fn handle_tls_bridged(
                         Ok(ks) => {
                             match proto {
                                 Proto::Http2 => {
-                                    serve_h2_bridged(ks, prefix, ctx, core, shutdown, Some(fd))
-                                        .await
+                                    // Route every H2 write through KtlsWriteHalf so its
+                                    // rekey gate serializes TX submission with a peer
+                                    // KeyUpdate. The direct-fd writev shortcut bypasses
+                                    // that gate and must not be used on kTLS streams.
+                                    serve_h2_bridged(ks, prefix, ctx, core, shutdown, None).await
                                 }
                                 _ => {
                                     let mut ktls_ctx = ctx;
@@ -1269,9 +1277,11 @@ async fn handle_conn_bridged<S>(
 ) where
     S: monoio::io::AsyncReadRent
         + monoio::io::AsyncWriteRent
-        + monoio::io::Split
+        + monoio::io::Splitable
         + AsRawFd
         + 'static,
+    S::OwnedRead: monoio::io::AsyncReadRent + 'static,
+    S::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
 {
     let state = core.holder.load();
     let header_read_timeout = state.serve_config.header_read_timeout;
@@ -1346,7 +1356,9 @@ async fn serve_h2_bridged<S>(
     shutdown: CancellationToken,
     ktls_fd: Option<i32>,
 ) where
-    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Splitable + 'static,
+    S::OwnedRead: monoio::io::AsyncReadRent + 'static,
+    S::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
 {
     let state = core.holder.load();
     let mut h2_cfg = hj_h2::server::Config::default();
@@ -1355,6 +1367,8 @@ async fn serve_h2_bridged<S>(
         .keep_alive_timeout
         .map(|t| t.max(std::time::Duration::from_secs(90))); // keep-alive proxy padding
     h2_cfg.preface_timeout = state.serve_config.header_read_timeout;
+    h2_cfg.frame_read_timeout = state.serve_config.header_read_timeout;
+    h2_cfg.request_body_timeout = state.serve_config.header_read_timeout;
     h2_cfg.header_list_size = state.serve_config.max_req_header_size as u32;
     h2_cfg.max_request_body = state.serve_config.max_req_body_size;
     // (#236 residual) share the server-wide buffered-body cap with H1/H3/LSAPI.
@@ -1427,7 +1441,9 @@ async fn handle_h1_bridged<S>(
     shutdown: CancellationToken,
     sendfile_fd: Option<std::os::fd::RawFd>,
 ) where
-    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Splitable + 'static,
+    S::OwnedRead: monoio::io::AsyncReadRent + 'static,
+    S::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
 {
     // Requests served on this keep-alive connection (LiteSpeed maxKeepAliveReq enforcement).
     let mut served: u32 = 0;
@@ -1554,6 +1570,11 @@ async fn handle_h1_bridged<S>(
             }
         };
         let (method, uri, mut headers, head_len, framing, mut keep_alive, expect_continue) = parsed;
+        // One absolute deadline covers the entire request body. Reusing the
+        // full timeout for every successful byte lets a slow client retain a
+        // connection and body-budget lease indefinitely by trickling data.
+        let body_deadline =
+            header_read_timeout.map(|duration| std::time::Instant::now() + duration);
         // maxKeepAliveReq: once this connection has served the configured number of requests,
         // signal close on this (final) response so the client opens a fresh connection.
         served = served.saturating_add(1);
@@ -1612,7 +1633,8 @@ async fn handle_h1_bridged<S>(
                     write_continue(&mut stream).await;
                 }
                 while acc.len() < total {
-                    match read_timeout(&mut stream, header_read_timeout, &mut read_scratch).await {
+                    match read_before_deadline(&mut stream, body_deadline, &mut read_scratch).await
+                    {
                         Ok(n) if n > 0 => {
                             acc.extend_from_slice(&read_scratch[..n]);
                             // Top the reservation up to the bytes actually buffered.
@@ -1674,8 +1696,12 @@ async fn handle_h1_bridged<S>(
                             return;
                         }
                         ChunkStep::NeedMore => {
-                            match read_timeout(&mut stream, header_read_timeout, &mut read_scratch)
-                                .await
+                            match read_before_deadline(
+                                &mut stream,
+                                body_deadline,
+                                &mut read_scratch,
+                            )
+                            .await
                             {
                                 Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
                                 _ => return,
@@ -1911,6 +1937,15 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
             http::HeaderName::from_bytes(h.name.as_bytes()),
             http::HeaderValue::from_bytes(h.value),
         ) {
+            // Identical duplicate CL lines (the only duplicates the framing
+            // check accepts) are forwarded as ONE so a lenient upstream cannot
+            // re-parse two lines differently; conflicting duplicates are
+            // rejected by the framing check regardless of what lands here.
+            if n == http::header::CONTENT_LENGTH
+                && hdr_map.contains_key(http::header::CONTENT_LENGTH)
+            {
+                continue;
+            }
             hdr_map.append(n, v);
         }
     }
@@ -2159,10 +2194,10 @@ async fn relay_h1_upgrade<S>(
     upgrade: bridge::UringUpgradeIo,
     shutdown: &CancellationToken,
 ) where
-    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Split + 'static,
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Splitable + 'static,
+    S::OwnedRead: monoio::io::AsyncReadRent + 'static,
+    S::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
 {
-    use monoio::io::Splitable;
-
     let (mut reader, mut writer) = stream.into_split();
     let bridge::UringUpgradeIo {
         to_upstream,
@@ -2393,6 +2428,15 @@ where
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file range overflow"))?;
     let mut use_sendfile = sendfile_fd.is_some_and(enable_nonblocking_sendfile);
     const CHUNK: usize = 1024 * 1024;
+    // A reader that stops draining (zero-window peer) keeps `sendfile` returning
+    // EAGAIN. Retry with an exponential backoff so that cannot busy-poll the pinned
+    // worker core, and close the connection after this long with ZERO progress —
+    // a transfer that moves any byte resets the clock, so only a truly stalled
+    // reader (or a wedged peer) is cut off.
+    const SENDFILE_STALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    const SENDFILE_BACKOFF_MAX_US: u64 = 12_800;
+    let mut backoff_us: u64 = 100;
+    let mut last_progress = std::time::Instant::now();
 
     while offset < end {
         let chunk = if throttle.is_some() { 64 * 1024 } else { CHUNK };
@@ -2416,6 +2460,8 @@ where
                 }
                 Ok(written) => {
                     observe_h1_sendfile(written);
+                    backoff_us = 100;
+                    last_progress = std::time::Instant::now();
                     if let Some(bucket) = throttle.as_mut() {
                         let wait = bucket.acquire(written as u64);
                         if wait > 0 {
@@ -2426,7 +2472,14 @@ where
                 }
                 Err(error) if error == rustix::io::Errno::INTR => continue,
                 Err(error) if error == rustix::io::Errno::AGAIN => {
-                    monoio::time::sleep(std::time::Duration::from_micros(100)).await;
+                    if last_progress.elapsed() >= SENDFILE_STALL_DEADLINE {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "sendfile stalled: no egress progress",
+                        ));
+                    }
+                    monoio::time::sleep(std::time::Duration::from_micros(backoff_us)).await;
+                    backoff_us = (backoff_us.saturating_mul(2)).min(SENDFILE_BACKOFF_MAX_US);
                     continue;
                 }
                 Err(
@@ -2890,10 +2943,75 @@ where
     }
 }
 
+/// Read under an absolute request deadline. Each successful partial read sees
+/// only the original deadline's remainder; progress never resets the timer.
+async fn read_before_deadline<S>(
+    stream: &mut S,
+    deadline: Option<std::time::Instant>,
+    scratch: &mut Vec<u8>,
+) -> io::Result<usize>
+where
+    S: monoio::io::AsyncReadRent,
+{
+    let timeout =
+        deadline.map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+    if timeout.is_some_and(|remaining| remaining.is_zero()) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "request body deadline exceeded",
+        ));
+    }
+    read_timeout(stream, timeout, scratch).await
+}
+
 #[cfg(test)]
 mod chunked_tests {
     use super::codec::*;
     use super::*;
+
+    #[test]
+    fn h1_request_body_reads_share_one_absolute_deadline() {
+        use std::io::Write;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            for byte in b"abc" {
+                if stream.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                stream.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(70));
+            }
+        });
+
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(std_listener).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
+            let mut scratch = Vec::with_capacity(8);
+            assert_eq!(
+                read_before_deadline(&mut stream, Some(deadline), &mut scratch)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                read_before_deadline(&mut stream, Some(deadline), &mut scratch)
+                    .await
+                    .unwrap(),
+                1
+            );
+            let error = read_before_deadline(&mut stream, Some(deadline), &mut scratch)
+                .await
+                .expect_err("third trickled byte must not receive a fresh timeout");
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        });
+        client.join().unwrap();
+    }
 
     #[test]
     fn multishot_cancel_observes_terminal_and_cannot_touch_reused_slot() {

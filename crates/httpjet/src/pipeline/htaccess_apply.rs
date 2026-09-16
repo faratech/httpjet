@@ -43,15 +43,15 @@ pub(super) fn apply_set_env(
     req: &Request,
     path: &str,
     query: &str,
-) {
+) -> Result<(), &'static str> {
     if chain.is_empty() {
-        return;
+        return Ok(());
     }
     // Skip the per-request header materialization (+ ReqAttrs build) entirely when no dir in
     // the chain declares any SetEnvIf — the common case even when an .htaccess chain exists.
     // Only when at least one SetEnvIf is present do we pay to snapshot the request headers.
     if chain.iter().all(|ht| ht.set_env_if.is_empty()) {
-        return;
+        return Ok(());
     }
     // Lazy header source: SetEnvIf only reads the specific names its rules reference, so resolve
     // them on demand from `req.headers()` instead of cloning the WHOLE header set into a Vec per
@@ -93,7 +93,7 @@ pub(super) fn apply_set_env(
         header_lookup: Some(HeaderLookup(&header_lookup)),
     };
     for ht in chain {
-        for (k, v) in ht.eval_set_env(&attrs) {
+        for (k, v) in ht.eval_set_env(&attrs)? {
             if !env_key_allowed(&k) {
                 tracing::warn!(
                     request_id = %ctx.request_id,
@@ -105,6 +105,7 @@ pub(super) fn apply_set_env(
             ctx.set_env(k, v);
         }
     }
+    Ok(())
 }
 
 /// (#1) Fail-safe access decision across the whole chain: any `denied` section
@@ -259,7 +260,7 @@ mod tests {
         };
         ctx.set_env("HJ_REQUEST_PATH_QUERY", "/original");
 
-        apply_set_env(&mut ctx, &chain, &req, "/x", "");
+        apply_set_env(&mut ctx, &chain, &req, "/x", "").unwrap();
 
         assert_eq!(
             ctx.get_env("HJ_REQUEST_PATH_QUERY"),

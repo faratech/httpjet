@@ -67,3 +67,51 @@ fn deny_all_sentinel_matches_hand_written_semantics() {
             == false
     );
 }
+
+/// Regression: a non-UTF-8 byte in a comment must not memoize the file as
+/// absent (read_to_string used to fail with InvalidData and degrade a
+/// protected directory to "no rules" until the mtime changed).
+#[test]
+fn non_utf8_access_file_keeps_its_rules() {
+    let dir = temp_dir("non-utf8");
+    fs::write(
+        dir.join(".htaccess"),
+        b"Require all denied\n# caf\xe9 latin-1 comment\n",
+    )
+    .unwrap();
+
+    let cache = HtaccessCache::with_revalidate_ttl(Duration::from_secs(0));
+    let parsed = cache
+        .get_or_load_named(&dir, ".htaccess")
+        .expect("non-UTF-8 file still parses (lossy)");
+    assert!(
+        parsed.is_forbidden("/p/x.txt", "x.txt"),
+        "the deny rule must survive a non-UTF-8 comment byte"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Regression: a present-but-unreadable access file (here: a directory
+/// sitting at the access-file path, i.e. EISDIR — works under any uid, unlike
+/// chmod 000 under root) must fail CLOSED, not memoize as "no access file".
+#[test]
+fn unreadable_access_file_fails_closed() {
+    let dir = temp_dir("unreadable");
+    fs::create_dir(dir.join(".htaccess")).unwrap();
+
+    let cache = HtaccessCache::with_revalidate_ttl(Duration::from_secs(0));
+    let sentinel = cache
+        .get_or_load_named(&dir, ".htaccess")
+        .expect("unreadable access file yields the fail-closed sentinel");
+    assert!(
+        sentinel.is_forbidden("/internal_data/config.php", "config.php"),
+        "an unreadable access file must deny its directory"
+    );
+
+    // Removing it entirely restores the absent (serve) behavior.
+    fs::remove_dir(dir.join(".htaccess")).unwrap();
+    assert!(cache.get_or_load_named(&dir, ".htaccess").is_none());
+
+    let _ = fs::remove_dir_all(dir);
+}

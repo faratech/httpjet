@@ -203,7 +203,11 @@ impl HtaccessCache {
         }
 
         // Cache miss or stale: (re)parse (no map guard held during the read/parse).
-        let parsed = match (cur_mtime, std::fs::read_to_string(&file)) {
+        // Bytes, not read_to_string: a non-UTF-8 byte (any comment in a legacy
+        // encoding) must not downgrade a protected directory to "no rules".
+        let read_result =
+            std::fs::read(&file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        let parsed = match (cur_mtime, read_result) {
             (Some(_), Ok(text)) => match Htaccess::parse(&text) {
                 Ok(h) => Some(Arc::new(h)),
                 Err(e) => {
@@ -217,6 +221,14 @@ impl HtaccessCache {
                     Some(deny_all_sentinel())
                 }
             },
+            // A present-but-unreadable file (EACCES, EISDIR, a raced unlink) is
+            // NOT "absent": absent means no rules exist, while unreadable means
+            // rules exist and we cannot know them — deny until it is readable
+            // again (same mtime still matches, so the sentinel self-heals).
+            (Some(_), Err(e)) => {
+                tracing::warn!(path = %file.display(), error = %e, "unreadable .htaccess; failing closed");
+                Some(deny_all_sentinel())
+            }
             _ => None,
         };
 

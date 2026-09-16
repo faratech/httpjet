@@ -432,7 +432,9 @@ pub(crate) async fn fast_serve(
         return None;
     }
     seed_server_env(&mut ctx);
-    apply_set_env(&mut ctx, &chain, req, &orig_path, &orig_query);
+    if apply_set_env(&mut ctx, &chain, req, &orig_path, &orig_query).is_err() {
+        return None;
+    }
     let orig_rel = resolved_rel_path(&orig_path);
     if access_denied(&chain, &orig_rel, method.as_str(), &ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
@@ -468,7 +470,8 @@ pub(crate) async fn fast_serve(
             let rel = resolved_rel_path(&path);
             (Cow::Owned(path), Cow::Owned(rel), false)
         }
-        RwResult::Redirect { .. }
+        RwResult::Failed { .. }
+        | RwResult::Redirect { .. }
         | RwResult::Status { .. }
         | RwResult::Forbidden
         | RwResult::Gone => {
@@ -531,6 +534,10 @@ pub(crate) async fn fast_serve(
             .page_cache
             .as_ref()
             .map(|pc| pc.begin_render(render_epoch));
+        let origin_vary = req
+            .headers()
+            .get(http::header::ORIGIN)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
         let cc = lscache::CacheCtx {
             method: &method,
             host: &req_host,
@@ -544,6 +551,7 @@ pub(crate) async fn fast_serve(
             host_foreign,
             // Cookieless by branch precondition ⇒ the public vary value is "".
             vary_value: Some(""),
+            origin: origin_vary.as_deref(),
         };
         let inm = req
             .headers()
@@ -2237,6 +2245,104 @@ fn effective_response_timeout(ctx: &ReqCtx, path: &str) -> Option<u64> {
         .and_then(|c| c.timeout_override)
 }
 
+/// Why a rewrite-driven `[P]` target must be refused, if it is.
+///
+/// `[P]` URLs are request-influenceable (`.htaccess` authors; `$N`/`%N`
+/// backrefs), so a target that names the origin's own local trust plane would
+/// turn any `.htaccess` writer into a loopback peer: the control endpoints
+/// (purge/ready, metrics, admin listeners) gate on the raw TCP peer being
+/// loopback, and a same-host dial IS loopback. `unix:` transports reach local
+/// sockets directly and are refused wholesale. Config-declared proxy targets
+/// (`<context>` processors, websocket maps) are operator-trusted and skip this.
+fn rewrite_proxy_target_refused(target: &ProxyTarget) -> Option<String> {
+    if target.is_unix_transport() {
+        return Some("unix-socket transports are not allowed in [P] targets".into());
+    }
+    None
+}
+
+/// The address screen for a resolved `[P]` authority: loopback, unspecified,
+/// and link-local (cloud metadata services live there). Name resolution is
+/// included because `/etc/hosts` pins (e.g. vhosts → 127.0.0.1 in R&D) are a
+/// literal-screen bypass. Unresolvable = refused; the dial would fail anyway.
+fn banned_resolved_authority(addrs: &[std::net::SocketAddr]) -> Option<String> {
+    addrs
+        .iter()
+        .filter(|a| {
+            let ip = a.ip().to_canonical();
+            match ip {
+                std::net::IpAddr::V4(v4) => {
+                    v4.is_loopback() || v4.is_unspecified() || v4.is_link_local()
+                }
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local()
+                }
+            }
+        })
+        .map(|a| format!("{} resolves into the local trust plane ({a})", a.ip()))
+        .next()
+}
+
+/// Resolve a `[P]` authority (bounded), returning the addresses or a refusal.
+async fn resolve_p_target_authority(authority: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    let authority = authority.to_string();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || {
+            std::net::ToSocketAddrs::to_socket_addrs(&authority).map(|it| it.collect::<Vec<_>>())
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(addrs))) if !addrs.is_empty() => Ok(addrs),
+        Ok(Ok(Ok(_))) => Err("resolved to no addresses".into()),
+        Ok(Ok(Err(e))) => Err(format!("does not resolve ({e})")),
+        Ok(Err(e)) => Err(format!("resolution task failed ({e})")),
+        Err(_) => Err("resolution timed out".into()),
+    }
+}
+
+#[cfg(test)]
+mod proxy_screen_tests {
+    use super::*;
+
+    fn addr(ip: &str, port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(ip.parse().expect("test ip"), port)
+    }
+
+    #[test]
+    fn unix_transports_are_refused_in_p_targets() {
+        let t = ProxyTarget::parse_url("unix:/run/some.sock|/req/path").unwrap();
+        assert!(rewrite_proxy_target_refused(&t).is_some());
+        let t = ProxyTarget::parse_url("http://203.0.113.9:8080/x").unwrap();
+        assert!(rewrite_proxy_target_refused(&t).is_none());
+    }
+
+    #[test]
+    fn resolved_local_planes_are_refused() {
+        assert!(banned_resolved_authority(&[addr("127.0.0.1", 9090)]).is_some());
+        assert!(banned_resolved_authority(&[addr("127.8.8.8", 80)]).is_some());
+        assert!(banned_resolved_authority(&[addr("0.0.0.0", 80)]).is_some());
+        assert!(banned_resolved_authority(&[addr("169.254.169.254", 80)]).is_some());
+        assert!(banned_resolved_authority(&[addr("::1", 80)]).is_some());
+        assert!(banned_resolved_authority(&[addr("::ffff:127.0.0.1", 80)]).is_some());
+        assert!(banned_resolved_authority(&[addr("fe80::1", 80)]).is_some());
+        assert!(banned_resolved_authority(&[addr("203.0.113.9", 80)]).is_none());
+        assert!(banned_resolved_authority(&[addr("10.1.2.3", 8080)]).is_none());
+        assert!(banned_resolved_authority(&[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn localhost_authority_resolves_into_the_ban_list() {
+        // `/etc/hosts` pins names to loopback on typical hosts; the literal screen
+        // alone would miss exactly that bypass.
+        let addrs = resolve_p_target_authority("localhost:9090")
+            .await
+            .expect("localhost resolves");
+        assert!(banned_resolved_authority(&addrs).is_some());
+    }
+}
+
 /// (Tier 2) The strictest `bandwidthLimit` among the matching contexts that declare one;
 /// the server-wide `<tuning>` rate when none matches. A declared context rate is an
 /// OVERRIDE (it may raise as well as lower) — an operator scoping a limit to a subtree
@@ -2462,7 +2568,10 @@ async fn dispatch(
     // the variables. HTTPS must be seeded first so `Header ... env=HTTPS` (HSTS)
     // and `%{ENV:HTTPS}` observe it, exactly as Apache/OLS set it. ----------------
     seed_server_env(ctx);
-    apply_set_env(ctx, &chain, &req, &orig_path, &orig_query);
+    if let Err(reason) = apply_set_env(ctx, &chain, &req, &orig_path, &orig_query) {
+        tracing::error!(request_id = %ctx.request_id, reason, "SetEnvIf evaluation failed closed");
+        return error_page(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     // ---- 2b. Access control on the ORIGINAL request path, BEFORE rewrite ---
     // Apache/LiteSpeed evaluate <Files>/<FilesMatch>/Require + accessDenyDir
@@ -2531,6 +2640,10 @@ async fn dispatch(
     // cache, like the proxy-<context>/LSAPI/static paths; `None` for every other outcome.
     let mut proxy_target: Option<String> = None;
     match rw_result {
+        RwResult::Failed { reason } => {
+            tracing::error!(request_id = %ctx.request_id, reason, "rewrite evaluation failed closed");
+            return error_page(StatusCode::INTERNAL_SERVER_ERROR);
+        }
         RwResult::Proxy { target_url, env } => {
             // Merge the rewrite chain's env (incl. preceding `[E=]` rulesets) into ctx.env so
             // env-gated `Header ... env=` directives fire on the proxied response, and so
@@ -2813,6 +2926,10 @@ async fn dispatch(
     };
     // Built once, threaded unchanged to the lookup + all three store sites so their
     // keys + identity guard can never drift apart (see lscache::CacheCtx).
+    let origin_vary = req
+        .headers()
+        .get(http::header::ORIGIN)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
     let cc = lscache::CacheCtx {
         method: &cache_method,
         host: &cache_host,
@@ -2825,6 +2942,7 @@ async fn dispatch(
         has_range: cache_has_range,
         host_foreign: cache_host_foreign,
         vary_value: (cache_on && state.page_cache.is_some()).then_some(cache_vary.as_str()),
+        origin: origin_vary.as_deref(),
     };
 
     // ---- 4d. Deferred terminal `[P]` proxy, with page-cache participation ------------
@@ -2851,7 +2969,22 @@ async fn dispatch(
         // (#11) `.htaccess` `Header always set` (HSTS/CSP/CORS/...) applies to a [P] response.
         let rel = resolved_rel_path(&cur_path);
         let mut resp = match ProxyTarget::parse_url(&target_url) {
+            Ok(target) if rewrite_proxy_target_refused(&target).is_some() => {
+                tracing::warn!(request_id = %ctx.request_id, target = %target_url, "[P] target refused: unix transports are reserved for operator config");
+                error_page(StatusCode::FORBIDDEN)
+            }
             Ok(target) => {
+                // Address screen (resolution is I/O): refuse a `[P]` authority that
+                // lands on loopback/unspecified/link-local — any of those reaches a
+                // raw-peer-loopback-gated control plane from a request-controlled URL.
+                let why = match resolve_p_target_authority(&target.authority).await {
+                    Ok(addrs) => banned_resolved_authority(&addrs),
+                    Err(e) => Some(e),
+                };
+                if let Some(why) = why {
+                    tracing::warn!(request_id = %ctx.request_id, target = %target_url, why = %why, "[P] target refused");
+                    return error_page(StatusCode::FORBIDDEN);
+                }
                 let h = ProxyHandler {
                     proxy: state.proxy.clone(),
                     telemetry: state.telemetry.clone(),

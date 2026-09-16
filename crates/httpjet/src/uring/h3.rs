@@ -198,6 +198,7 @@ impl H3RuntimeConfig {
             serving_view: self.serving_view.as_ref().map(|view| view.pin_connection()),
             epoch,
             body_budget: Some(self.body_budget.clone()),
+            egress_budget: Some(H3EgressBudget::new(self.body_budget.clone())),
             ..Default::default()
         }
     }
@@ -217,8 +218,63 @@ impl H3RuntimeConfig {
             require_client_cert: policy.require_client_cert,
             epoch,
             body_budget: Some(self.body_budget.clone()),
+            egress_budget: Some(H3EgressBudget::new(self.body_budget.clone())),
             ..Default::default()
         }
+    }
+}
+
+/// A single H3 connection may retain one maximum-sized cacheable response plus
+/// framing, but cannot pin an arbitrary multiple of those responses while its
+/// peer withholds QUIC flow-control credit. The process-wide side reuses the
+/// existing 512 MiB buffered-memory budget shared by all transports.
+const H3_CONNECTION_EGRESS_MEM: u64 = 128 * 1024 * 1024;
+
+#[derive(Clone)]
+struct H3EgressBudget {
+    global: Arc<hj_core::budget::BodyBufferBudget>,
+    connection: Arc<hj_core::budget::BodyBufferBudget>,
+}
+
+impl H3EgressBudget {
+    fn new(global: Arc<hj_core::budget::BodyBufferBudget>) -> Self {
+        Self {
+            global,
+            connection: Arc::new(hj_core::budget::BodyBufferBudget::new(
+                H3_CONNECTION_EGRESS_MEM,
+            )),
+        }
+    }
+
+    fn reserve(&self, bytes: usize) -> Option<H3EgressLease> {
+        let bytes = u64::try_from(bytes).ok()?;
+        let mut connection = hj_core::budget::BodyBufferLease::new(self.connection.clone());
+        if !connection.reserve(bytes) {
+            return None;
+        }
+        let mut global = hj_core::budget::BodyBufferLease::new(self.global.clone());
+        if !global.reserve(bytes) {
+            return None;
+        }
+        Some(H3EgressLease {
+            _global: global,
+            _connection: connection,
+        })
+    }
+}
+
+struct H3EgressLease {
+    _global: hj_core::budget::BodyBufferLease,
+    _connection: hj_core::budget::BodyBufferLease,
+}
+
+fn reserve_h3_egress(
+    budget: Option<&H3EgressBudget>,
+    bytes: usize,
+) -> Result<Option<H3EgressLease>, ()> {
+    match budget {
+        Some(budget) => budget.reserve(bytes).map(Some).ok_or(()),
+        None => Ok(None),
     }
 }
 
@@ -386,6 +442,9 @@ struct H3State {
     /// Owned reservations follow request buffers into dispatch or release on every
     /// state teardown, including a connection lost before a request finishes.
     body_leases: std::collections::HashMap<StreamId, hj_core::budget::BodyBufferLease>,
+    /// Byte-weighted response retention guard. A lease follows every encoded
+    /// response part until quinn accepts it or the stream/connection is reset.
+    egress_budget: Option<H3EgressBudget>,
     /// Every accepted peer unidirectional stream remains here until FIN/reset. HTTP/3
     /// control and QPACK streams are critical and must be continuously drained; accepting
     /// and reading them once loses split stream-type/SETTINGS delivery and hides closure.
@@ -486,15 +545,24 @@ struct Completion {
 /// the body flows out as the backend produces it instead of being buffered whole.
 enum CompletionKind {
     /// Whole encoded response (HEADERS [+ DATA]) — finish the stream once drained.
-    Full(Vec<u8>, Option<hj_core::ResponseCompletion>),
+    Full(
+        Vec<u8>,
+        Option<hj_core::ResponseCompletion>,
+        Option<H3EgressLease>,
+    ),
     /// HEADERS frame only; DATA `Chunk`s follow. The stream stays open until `Chunk{fin}`.
-    Head(Vec<u8>, Option<hj_core::ResponseCompletion>),
+    Head(
+        Vec<u8>,
+        Option<hj_core::ResponseCompletion>,
+        Option<H3EgressLease>,
+    ),
     /// One DATA payload; the driver emits its frame header without copying the payload.
     /// `fin` marks the last chunk (then finish the stream).
     Chunk {
         data: Bytes,
         fin: bool,
         ack: Option<flume::Sender<()>>,
+        lease: Option<H3EgressLease>,
     },
     /// Mid-stream upstream abort — reset the send stream (RFC 9114 stream error).
     Abort,
@@ -533,6 +601,7 @@ enum PendingPart {
         data: Bytes,
         off: usize,
         ack: Option<flume::Sender<()>>,
+        _lease: Option<H3EgressLease>,
     },
     DataFrame {
         header: [u8; 16],
@@ -541,19 +610,25 @@ enum PendingPart {
         data: Bytes,
         data_off: usize,
         ack: Option<flume::Sender<()>>,
+        _lease: Option<H3EgressLease>,
     },
 }
 
 impl PendingPart {
-    fn contiguous(data: Vec<u8>) -> Self {
+    fn contiguous(data: Vec<u8>, lease: Option<H3EgressLease>) -> Self {
         Self::Contiguous {
             data: Bytes::from(data),
             off: 0,
             ack: None,
+            _lease: lease,
         }
     }
 
-    fn data_frame(data: Bytes, ack: Option<flume::Sender<()>>) -> Self {
+    fn data_frame(
+        data: Bytes,
+        ack: Option<flume::Sender<()>>,
+        lease: Option<H3EgressLease>,
+    ) -> Self {
         let mut header = [0u8; 16];
         let mut header_len = 0;
         write_varint_fixed(&mut header, &mut header_len, 0x00);
@@ -565,6 +640,7 @@ impl PendingPart {
             data,
             data_off: 0,
             ack,
+            _lease: lease,
         }
     }
 
@@ -2091,34 +2167,41 @@ async fn write_completion(
     };
     match kind {
         // A whole buffered response: send and finish when drained.
-        CompletionKind::Full(resp, completion) => {
+        CompletionKind::Full(resp, completion, lease) => {
             st.request_cancellations.remove(&stream);
             st.pending.insert(
                 stream,
                 PendingSend {
                     completion,
-                    parts: std::iter::once(PendingPart::contiguous(resp)).collect(),
+                    parts: std::iter::once(PendingPart::contiguous(resp, lease)).collect(),
                     fin: true,
                 },
             );
         }
         // HEADERS of a streamed response: DATA chunks follow, so don't finish yet.
-        CompletionKind::Head(head, completion) => {
+        CompletionKind::Head(head, completion, lease) => {
             st.pending.insert(
                 stream,
                 PendingSend {
                     completion,
-                    parts: std::iter::once(PendingPart::contiguous(head)).collect(),
+                    parts: std::iter::once(PendingPart::contiguous(head, lease)).collect(),
                     fin: false,
                 },
             );
         }
         // Append a DATA chunk to the open stream; `fin` marks the body complete. No live
         // pending entry ⇒ the stream was cancelled / its conn went away → drop the chunk.
-        CompletionKind::Chunk { data, fin, ack } => match st.pending.get_mut(&stream) {
+        CompletionKind::Chunk {
+            data,
+            fin,
+            ack,
+            lease,
+        } => match st.pending.get_mut(&stream) {
             Some(entry) => {
                 if !data.is_empty() {
-                    entry.parts.push_back(PendingPart::data_frame(data, ack));
+                    entry
+                        .parts
+                        .push_back(PendingPart::data_frame(data, ack, lease));
                 }
                 if fin {
                     entry.fin = true;
@@ -2288,6 +2371,7 @@ async fn drive_one_conn(
         };
         let cancel = CancellationToken::new();
         st.request_cancellations.insert(id, cancel.clone());
+        let egress_budget = st.egress_budget.clone();
         let bridge = bridge.clone();
         let tx = comp_tx.clone();
         let request_generation = request_generation.clone();
@@ -2313,21 +2397,26 @@ async fn drive_one_conn(
                 require_client_cert,
                 request_limits,
                 request_generation,
+                egress_budget.clone(),
             )
             .await;
             drop(charge);
             let _ = async {
                 let H3Outcome { body, completion } = outcome;
                 match body {
-                    H3Body::Full(resp) => {
-                        send(CompletionKind::Full(resp, completion))
+                    H3Body::Full { data, lease } => {
+                        send(CompletionKind::Full(data, completion, lease))
                             .await
                             .map_err(|_| ())?;
                     }
-                    H3Body::Stream { head, mut rx } => {
+                    H3Body::Stream {
+                        head,
+                        head_lease,
+                        mut rx,
+                    } => {
                         // The driver is the sole stream writer: send the HEADERS, then forward each
                         // DATA chunk in order. Each chunk is acknowledged only after QUIC drains it.
-                        send(CompletionKind::Head(head, completion))
+                        send(CompletionKind::Head(head, completion, head_lease))
                             .await
                             .map_err(|_| ())?;
                         loop {
@@ -2337,10 +2426,25 @@ async fn drive_one_conn(
                                         continue;
                                     }
                                     let (ack_tx, ack_rx) = flume::bounded(1);
+                                    let lease = match egress_budget.as_ref() {
+                                        Some(budget) => {
+                                            let Some(lease) =
+                                                budget.reserve(chunk.len().saturating_add(16))
+                                            else {
+                                                send(CompletionKind::Abort)
+                                                    .await
+                                                    .map_err(|_| ())?;
+                                                break;
+                                            };
+                                            Some(lease)
+                                        }
+                                        None => None,
+                                    };
                                     send(CompletionKind::Chunk {
                                         data: chunk,
                                         fin: false,
                                         ack: Some(ack_tx),
+                                        lease,
                                     })
                                     .await
                                     .map_err(|_| ())?;
@@ -2355,6 +2459,7 @@ async fn drive_one_conn(
                                         data: Bytes::new(),
                                         fin: true,
                                         ack: None,
+                                        lease: None,
                                     })
                                     .await
                                     .map_err(|_| ())?;
@@ -3221,15 +3326,19 @@ struct H3Outcome {
 impl H3Outcome {
     fn full(data: Vec<u8>) -> Self {
         Self {
-            body: H3Body::Full(data),
+            body: H3Body::Full { data, lease: None },
             completion: None,
         }
     }
 }
 enum H3Body {
-    Full(Vec<u8>),
+    Full {
+        data: Vec<u8>,
+        lease: Option<H3EgressLease>,
+    },
     Stream {
         head: Vec<u8>,
+        head_lease: Option<H3EgressLease>,
         rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, ()>>,
     },
 }
@@ -3392,6 +3501,7 @@ async fn handle_h3_request(
     require_client_cert: bool,
     request_limits: H3RequestLimits,
     request_generation: Option<crate::serving_generation::RequestGeneration>,
+    egress_budget: Option<H3EgressBudget>,
 ) -> H3Outcome {
     if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
         return H3Outcome::full(h3_error(http::StatusCode::FORBIDDEN));
@@ -3475,7 +3585,7 @@ async fn handle_h3_request(
     let is_head = req.method() == http::Method::HEAD;
     match bridge.dispatch(req, ctx).await {
         Some(r) => {
-            let completion = r.completion;
+            let mut completion = r.completion;
             let status = r.status;
             let mut headers = r.headers;
             let streaming_unknown_len = matches!(
@@ -3484,12 +3594,35 @@ async fn handle_h3_request(
             );
             let body_forbidden =
                 prepare_h3_response_headers(&mut headers, is_head, status, streaming_unknown_len);
-            let mut outcome = match r.body {
+            match r.body {
                 // Small / HIT / sub-threshold dynamic bodies: buffered + sent whole — byte-identical
                 // to the previous path.
                 crate::uring::bridge::BridgeBody::Full(b) => {
                     let body = if body_forbidden { &[][..] } else { &b[..] };
-                    H3Outcome::full(encode_h3_response(status, &headers, body))
+                    let mut data = encode_h3_headers_frame(status, &headers);
+                    let retained = data.len().saturating_add(if body.is_empty() {
+                        0
+                    } else {
+                        body.len().saturating_add(16)
+                    });
+                    let lease = match reserve_h3_egress(egress_budget.as_ref(), retained) {
+                        Ok(lease) => lease,
+                        Err(()) => {
+                            if let Some(completion) = completion.take() {
+                                completion.finish(hj_core::ResponseEnd::Cancelled);
+                            }
+                            return H3Outcome::full(h3_error(
+                                http::StatusCode::SERVICE_UNAVAILABLE,
+                            ));
+                        }
+                    };
+                    if !body.is_empty() {
+                        encode_h3_data_frame(&mut data, body);
+                    }
+                    H3Outcome {
+                        body: H3Body::Full { data, lease },
+                        completion,
+                    }
                 }
                 crate::uring::bridge::BridgeBody::File(_) => {
                     unreachable!("direct file bridge bodies are plaintext H1-only")
@@ -3498,19 +3631,39 @@ async fn handle_h3_request(
                 // backend produces them, instead of buffering the whole body first.
                 crate::uring::bridge::BridgeBody::Stream { mut rx, .. } => {
                     let head = encode_h3_headers_frame(status, &headers);
+                    let head_lease = match reserve_h3_egress(egress_budget.as_ref(), head.len()) {
+                        Ok(lease) => lease,
+                        Err(()) => {
+                            rx.close();
+                            if let Some(completion) = completion.take() {
+                                completion.finish(hj_core::ResponseEnd::Cancelled);
+                            }
+                            return H3Outcome::full(h3_error(
+                                http::StatusCode::SERVICE_UNAVAILABLE,
+                            ));
+                        }
+                    };
                     if body_forbidden {
                         rx.close();
-                        H3Outcome::full(head)
+                        H3Outcome {
+                            body: H3Body::Full {
+                                data: head,
+                                lease: head_lease,
+                            },
+                            completion,
+                        }
                     } else {
                         H3Outcome {
-                            body: H3Body::Stream { head, rx },
-                            completion: None,
+                            body: H3Body::Stream {
+                                head,
+                                head_lease,
+                                rx,
+                            },
+                            completion,
                         }
                     }
                 }
-            };
-            outcome.completion = completion;
-            outcome
+            }
         }
         None => H3Outcome::full(h3_error(http::StatusCode::BAD_GATEWAY)),
     }
@@ -4102,6 +4255,7 @@ mod h3_codec_tests {
             false,
             limits,
             selected,
+            None,
         )
         .await;
         assert_eq!(seen.load(Ordering::SeqCst), application.generation);
@@ -4623,9 +4777,52 @@ mod h3_codec_tests {
     }
 
     #[test]
+    fn response_egress_budget_is_global_per_connection_and_raii_released() {
+        const MIB: usize = 1024 * 1024;
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(200 * MIB as u64));
+        let first_connection = H3EgressBudget::new(global.clone());
+        let second_connection = H3EgressBudget::new(global.clone());
+
+        let first = first_connection
+            .reserve(100 * MIB)
+            .expect("one maximum cache response must fit");
+        assert_eq!(global.in_flight(), 100 * MIB as u64);
+        let extra = first_connection
+            .reserve(28 * MIB)
+            .expect("framing and a parallel response must fit at the connection cap");
+        assert!(
+            first_connection.reserve(1).is_none(),
+            "one peer cannot exceed its 128 MiB retained-response cap"
+        );
+        assert!(
+            second_connection.reserve(73 * MIB).is_none(),
+            "independent peers still share the process-wide cap"
+        );
+
+        drop(first);
+        assert!(second_connection.reserve(72 * MIB).is_some());
+        drop(extra);
+    }
+
+    #[test]
+    fn pending_response_releases_egress_budget_on_reset() {
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        let budget = H3EgressBudget::new(global.clone());
+        let lease = budget.reserve(8).expect("test reservation");
+        let pending = PendingSend {
+            completion: None,
+            parts: std::iter::once(PendingPart::contiguous(vec![1, 2, 3], Some(lease))).collect(),
+            fin: true,
+        };
+        assert_eq!(global.in_flight(), 8);
+        drop(pending);
+        assert_eq!(global.in_flight(), 0);
+    }
+
+    #[test]
     fn streamed_chunk_ack_waits_until_driver_buffer_is_drained() {
         let (ack_tx, ack_rx) = flume::bounded(1);
-        let part = PendingPart::data_frame(Bytes::from_static(b"abc"), Some(ack_tx));
+        let part = PendingPart::data_frame(Bytes::from_static(b"abc"), Some(ack_tx), None);
         let mut pending = PendingSend {
             completion: None,
             parts: std::iter::once(part).collect(),
@@ -4645,7 +4842,7 @@ mod h3_codec_tests {
                 completion: Some(hj_core::ResponseCompletion::new(move |end| {
                     copy.lock().unwrap().push(end)
                 })),
-                parts: std::iter::once(PendingPart::contiguous(vec![1, 2, 3])).collect(),
+                parts: std::iter::once(PendingPart::contiguous(vec![1, 2, 3], None)).collect(),
                 fin: false,
             };
             assert!(!pending.finish_if_drained(|| panic!("body not drained")));
@@ -4670,7 +4867,7 @@ mod h3_codec_tests {
     fn streamed_data_frame_retains_the_bridge_chunk_allocation() {
         let chunk = Bytes::from(vec![0x5a; 4096]);
         let pointer = chunk.as_ptr();
-        let part = PendingPart::data_frame(chunk, None);
+        let part = PendingPart::data_frame(chunk, None, None);
         let PendingPart::DataFrame {
             header,
             header_len,
@@ -4697,7 +4894,7 @@ mod h3_codec_tests {
     #[test]
     fn dropping_reset_stream_disconnects_chunk_acknowledgement() {
         let (ack_tx, ack_rx) = flume::bounded(1);
-        let part = PendingPart::data_frame(Bytes::from_static(b"abc"), Some(ack_tx));
+        let part = PendingPart::data_frame(Bytes::from_static(b"abc"), Some(ack_tx), None);
         let pending = PendingSend {
             completion: None,
             parts: std::iter::once(part).collect(),
@@ -4728,6 +4925,7 @@ mod h3_codec_tests {
                 parts: std::iter::once(PendingPart::data_frame(
                     Bytes::from_static(b"backend chunk"),
                     Some(ack_tx),
+                    None,
                 ))
                 .collect(),
                 fin: false,

@@ -314,8 +314,11 @@ fn compute_ua_classify(rules: &[Rule]) -> (bool, Vec<(usize, usize)>) {
                 return (false, Vec::new());
             }
             if string_refs_ua(&c.test_string) {
-                if !is_exact_ua_var(&c.test_string) || !matches!(c.pattern, CondPattern::Regex(..))
-                {
+                let safe_regex = matches!(
+                    &c.pattern,
+                    CondPattern::Regex(re, _) if !re.can_fail_at_match_time()
+                );
+                if !is_exact_ua_var(&c.test_string) || !safe_regex {
                     return (false, Vec::new());
                 }
                 ua_conds.push((ri, ci));

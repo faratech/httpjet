@@ -370,6 +370,9 @@ impl<'a> CgiEnvBuilder<'a> {
         // Env set by rewrite [E=...] flags (exposed as $_SERVER in PHP too).
         // Borrowed from `ctx.env` (lives as long as `ctx`).
         for (k, v) in &ctx.env {
+            if ctx_env_override_denied(k) {
+                continue;
+            }
             upsert(
                 &mut env,
                 Cow::Borrowed(k.as_str()),
@@ -441,6 +444,41 @@ impl<'a> CgiEnvBuilder<'a> {
 
         env
     }
+}
+
+/// Names a rewrite/`[E=...]`/SetEnvIf `ctx.env` entry may NOT override.
+///
+/// The operator's `extra()`/base_env path is already filtered by
+/// [`safe_extra_env_name`]; `ctx.env` (directory-authored: `.htaccess`
+/// authors, CMS plugins) bypassed that filter, so `[E=SCRIPT_FILENAME:...]`
+/// could re-point execution at an arbitrary file and `[E=REMOTE_ADDR:...]` /
+/// `[E=HTTPS:...]` could forge the server-computed identity vars PHP trusts.
+///
+/// Deliberately still overridable: `SCRIPT_NAME`/`QUERY_STRING` (the
+/// front-controller contract), `REDIRECT_*` (the #129 ErrorDocument
+/// subrequest contract), and `HTTP_*` (header mirrors whose wire values are
+/// computed independently).
+fn ctx_env_override_denied(name: &str) -> bool {
+    const DENIED: &[&str] = &[
+        "SCRIPT_FILENAME",
+        "PATH_TRANSLATED",
+        "DOCUMENT_ROOT",
+        "VH_ROOT",
+        "REMOTE_ADDR",
+        "REMOTE_HOST",
+        "REMOTE_PORT",
+        "REMOTE_USER",
+        "AUTH_TYPE",
+        "HTTPS",
+        "SERVER_NAME",
+        "SERVER_ADDR",
+        "SERVER_PORT",
+        "SERVER_SOFTWARE",
+        "SERVER_ADMIN",
+        "SERVER_PROTOCOL",
+        "REQUEST_SCHEME",
+    ];
+    DENIED.contains(&name) || name.starts_with("LSAPI_") || name.starts_with("HJ_")
 }
 
 fn upsert<'r>(env: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>, key: Cow<'r, str>, val: Cow<'r, str>) {
@@ -612,6 +650,41 @@ mod tests {
             tls: None,
             redirect_guard: None,
         }
+    }
+
+    #[test]
+    fn ctx_env_cannot_override_server_computed_vars() {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/x.php")
+            .header("Host", "forum.example")
+            .body(empty_incoming())
+            .unwrap();
+
+        let mut c = ctx(false);
+        c.env = vec![
+            ("SCRIPT_FILENAME".into(), "/etc/passwd".into()),
+            ("REMOTE_ADDR".into(), "6.6.6.6".into()),
+            ("HTTPS".into(), "on".into()),
+            ("SERVER_PROTOCOL".into(), "HTTP/9".into()),
+            // Contracts that must keep working:
+            ("SCRIPT_NAME".into(), "/index.php".into()),
+            ("QUERY_STRING".into(), "front=controller".into()),
+            ("REDIRECT_STATUS".into(), "403".into()),
+        ];
+        let env = build_cgi_env(&req, &c, Path::new("/web/public_html/x.php"));
+        let m: std::collections::HashMap<String, String> = env
+            .into_iter()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        assert_eq!(m["SCRIPT_FILENAME"], "/web/public_html/x.php");
+        assert_eq!(m["REMOTE_ADDR"], "203.0.113.7");
+        assert!(!m.contains_key("HTTPS"));
+        assert_eq!(m["SERVER_PROTOCOL"], "HTTP/2");
+        assert_eq!(m["SCRIPT_NAME"], "/index.php");
+        assert_eq!(m["QUERY_STRING"], "front=controller");
+        assert_eq!(m["REDIRECT_STATUS"], "403");
     }
 
     #[test]

@@ -26,6 +26,9 @@ fn prune_epoch() -> &'static std::time::Instant {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum RwResult {
+    Failed {
+        reason: &'static str,
+    },
     Proxy {
         target_url: String,
         env: Vec<(String, String)>,
@@ -711,6 +714,7 @@ fn run_rewrite_inner(
         // Merge this ruleset's env regardless of outcome shape.
         let is_end = outcome.is_end();
         match outcome {
+            RewriteOutcome::Failed { reason, .. } => return RwResult::Failed { reason },
             RewriteOutcome::Unchanged { env, .. } => {
                 merged_env.extend(env);
                 // [END] on a `-` rule: stop the whole chain; the URI is unchanged.
