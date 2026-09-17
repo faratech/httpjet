@@ -13,7 +13,7 @@ Learn more—or at least enjoy the animation—at
 
 ## Build and try it
 
-Requires Linux with io_uring and Rust 1.97+.
+Requires Linux with io_uring and Rust 1.98+.
 
 ```bash
 git clone https://github.com/faratech/httpjet.git

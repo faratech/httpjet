@@ -1185,9 +1185,9 @@ fn integrity_tag(prefix: &[u8], meta: &[u8]) -> [u8; TAG_LEN] {
     let Some(key) = INTEGRITY_KEY.get() else {
         return [0u8; TAG_LEN];
     };
-    use hmac::{Mac, SimpleHmac};
+    use hmac::{KeyInit, Mac, SimpleHmac};
     type HmacSha256 = SimpleHmac<sha2::Sha256>;
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key len");
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(key).expect("hmac accepts any key len");
     mac.update(prefix);
     mac.update(meta);
     let out = mac.finalize().into_bytes();

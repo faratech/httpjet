@@ -237,7 +237,7 @@ utils = ["nix"]
 zero-copy = []
 
 [target.'cfg(target_os = "linux")'.dependencies.io-uring]
-version = "0.6"
+version = "0.7"
 optional = true
 
 [target."cfg(unix)".dependencies.nix]

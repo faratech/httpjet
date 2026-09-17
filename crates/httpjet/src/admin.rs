@@ -33,7 +33,13 @@ pub fn fingerprint(config: &hj_core::config::ServerConfig) -> String {
     }
     let mut sink = Sink(Sha256::new());
     write!(&mut sink, "{config:?}").expect("digest writer cannot fail");
-    format!("{:x}", sink.0.finalize())
+    let digest = sink.0.finalize();
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        write!(hex, "{byte:02x}").expect("hex write cannot fail");
+    }
+    hex
 }
 
 fn quoted(value: &str) -> String {

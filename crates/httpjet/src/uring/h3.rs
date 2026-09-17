@@ -1968,7 +1968,7 @@ async fn flush_conn(
         };
         loop {
             let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
-            match udp_state.send(UdpSockRef::from(&bfd), &transmit) {
+            match udp_state.try_send(UdpSockRef::from(&bfd), &transmit) {
                 Ok(()) => break,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     if udp.writable(false).await.is_err() {
