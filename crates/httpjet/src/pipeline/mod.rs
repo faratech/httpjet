@@ -2302,6 +2302,64 @@ async fn resolve_p_target_authority(authority: &str) -> Result<Vec<std::net::Soc
     }
 }
 
+/// Check if a `[P]` authority matches any operator-configured external processor.
+fn matches_configured_ext_processor(
+    global_ext: &std::collections::HashMap<String, hj_core::config::ExtProcessor>,
+    vhost_ext: &[hj_core::config::ExtProcessor],
+    target_authority: &str,
+    addrs: &[std::net::SocketAddr],
+) -> bool {
+    use hj_core::config::ExtAddress;
+
+    let matches_ep = |ep: &hj_core::config::ExtProcessor| -> bool {
+        match &ep.address {
+            ExtAddress::Tcp(sa) => {
+                target_authority == sa.to_string() || addrs.contains(sa)
+            }
+            ExtAddress::HostPort(hp) => {
+                if target_authority.eq_ignore_ascii_case(hp) {
+                    return true;
+                }
+                if let Ok(ep_addrs) = std::net::ToSocketAddrs::to_socket_addrs(hp) {
+                    for ep_addr in ep_addrs {
+                        if addrs.contains(&ep_addr) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ExtAddress::Uds(_) => false,
+        }
+    };
+
+    global_ext.values().any(matches_ep) || vhost_ext.iter().any(matches_ep)
+}
+
+/// Check if a `[P]` authority resolves to an operator-configured backend.
+///
+/// Operator configuration (extProcessors, websocket endpoints) explicitly declares
+/// trusted backends that may legitimately reside on the local trust plane (e.g. mcp-api
+/// on 127.0.0.1:8002).
+fn is_configured_operator_target(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    target_authority: &str,
+    addrs: &[std::net::SocketAddr],
+) -> bool {
+    matches_configured_ext_processor(
+        &state.ext_by_name,
+        &ctx.vhost.extra_ext_processors,
+        target_authority,
+        addrs,
+    ) || ctx.vhost.websockets.iter().any(|ws| {
+        target_authority.eq_ignore_ascii_case(&ws.address)
+            || std::net::ToSocketAddrs::to_socket_addrs(&ws.address)
+                .map(|it| it.into_iter().any(|a| addrs.contains(&a)))
+                .unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod proxy_screen_tests {
     use super::*;
@@ -2340,6 +2398,45 @@ mod proxy_screen_tests {
             .await
             .expect("localhost resolves");
         assert!(banned_resolved_authority(&addrs).is_some());
+    }
+
+    #[test]
+    fn operator_configured_target_matches() {
+        use hj_core::config::{ExtAddress, ExtKind, ExtProcessor};
+        let proc = ExtProcessor {
+            name: "mcp-api".into(),
+            kind: ExtKind::Proxy,
+            address: ExtAddress::Tcp(addr("127.0.0.1", 8002)),
+            extra_addresses: Vec::new(),
+            load_balance: Default::default(),
+            client_cert_file: None,
+            client_key_file: None,
+            max_conns: 10,
+            init_timeout: std::time::Duration::from_secs(5),
+            retry_timeout: std::time::Duration::ZERO,
+            pc_keep_alive_timeout: std::time::Duration::from_secs(60),
+            resp_buffer: false,
+            env: Vec::new(),
+            auto_start: 0,
+            path: None,
+            backlog: 0,
+            instances: 0,
+            run_on_startup: 0,
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("mcp-api".to_string(), proc);
+        assert!(matches_configured_ext_processor(
+            &map,
+            &[],
+            "127.0.0.1:8002",
+            &[addr("127.0.0.1", 8002)],
+        ));
+        assert!(!matches_configured_ext_processor(
+            &map,
+            &[],
+            "127.0.0.1:9090",
+            &[addr("127.0.0.1", 9090)],
+        ));
     }
 }
 
@@ -2977,7 +3074,19 @@ async fn dispatch(
                 // Address screen (resolution is I/O): refuse a `[P]` authority that
                 // lands on loopback/unspecified/link-local — any of those reaches a
                 // raw-peer-loopback-gated control plane from a request-controlled URL.
+                // Config-declared proxy targets (extProcessors, websocket maps) are
+                // operator-trusted and bypass this screen.
                 let why = match resolve_p_target_authority(&target.authority).await {
+                    Ok(addrs)
+                        if is_configured_operator_target(
+                            state,
+                            ctx,
+                            &target.authority,
+                            &addrs,
+                        ) =>
+                    {
+                        None
+                    }
                     Ok(addrs) => banned_resolved_authority(&addrs),
                     Err(e) => Some(e),
                 };
