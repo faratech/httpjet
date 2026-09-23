@@ -21,9 +21,11 @@ scripts/ci-h2spec.py
 scripts/export-public-source.sh
 scripts/fuzz-bounded.sh
 scripts/fuzz-seeds.py
+scripts/h3_generation_client.py
 scripts/h3get.py
 scripts/oci-smoke.sh
 scripts/ocsp-runtime-test.py
+scripts/otel_h3_client.py
 scripts/public-source-files.txt
 scripts/train-pagecache-dict-from-files.sh
 vendor
