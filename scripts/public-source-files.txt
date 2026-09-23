@@ -14,9 +14,16 @@ crates
 examples
 fuzz
 packaging
+scripts/acme-pebble-test.py
 scripts/check-dco.sh
 scripts/check-dependency-licenses.py
+scripts/ci-h2spec.py
 scripts/export-public-source.sh
+scripts/fuzz-bounded.sh
+scripts/fuzz-seeds.py
+scripts/h3get.py
+scripts/oci-smoke.sh
+scripts/ocsp-runtime-test.py
 scripts/public-source-files.txt
 scripts/train-pagecache-dict-from-files.sh
 vendor

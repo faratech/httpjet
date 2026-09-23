@@ -27,10 +27,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust 1.97
+      - name: Install Rust 1.98
         run: |
-          rustup toolchain install 1.97.0 --profile minimal --component rustfmt
-          rustup default 1.97.0
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt
+          rustup default 1.98.1
 
       - name: Install optional OCSP build dependencies
         run: |
@@ -109,7 +109,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install 1.97.0 --profile minimal
+        run: rustup toolchain install 1.98.1 --profile minimal
       - name: Install optional OCSP build dependencies
         run: |
           sudo apt-get update -qq
@@ -117,13 +117,13 @@ jobs:
       - name: Record platform and check feature builds
         run: |
           uname -a
-          rustc +1.97.0 -Vv
-          cargo +1.97.0 check --locked -p httpjet --all-features
+          rustc +1.98.1 -Vv
+          cargo +1.98.1 check --locked -p httpjet --all-features
       - name: Replay parser corpus
-        run: cargo +1.97.0 test --locked -p httpjet --test h1_corpus -- --nocapture
+        run: cargo +1.98.1 test --locked -p httpjet --test h1_corpus -- --nocapture
       - name: Exercise native io_uring H1 and H2
         # A denied io_uring operation fails the job; it is not silently skipped.
-        run: cargo +1.97.0 test --locked -p httpjet uring::uds_tests::uds_listener_serves_h1_and_h2c_with_unix_peer
+        run: cargo +1.98.1 test --locked -p httpjet uring::uds_tests::uds_listener_serves_h1_and_h2c_with_unix_peer
 
   oci-smoke:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
