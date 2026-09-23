@@ -752,10 +752,10 @@ async fn forward_file(
     }
 }
 
-/// Forward a `Body::Stream`. SSE streams immediately; everything else buffers up to
-/// `STREAM_THRESHOLD` (so small dynamic responses stay `Full` + byte-identical) and only
-/// switches to incremental delivery past it. An error BEFORE the switch is a clean 502;
-/// after it, the stream is aborted.
+/// Forward a `Body::Stream`. SSE streams immediately and a progressive body from its first
+/// byte; everything else buffers up to `STREAM_THRESHOLD` (so small dynamic responses stay
+/// `Full` + byte-identical) and only switches to incremental delivery past it. An error
+/// BEFORE the switch is a clean 502; after it, the stream is aborted.
 async fn forward_stream(
     mut parts: http::response::Parts,
     mut s: hj_core::StreamBody,
@@ -778,13 +778,31 @@ async fn forward_stream(
         pump_body(s, tx).await;
         return;
     }
-    let mut acc: Vec<u8> = Vec::new();
+    // A progressive body (a page-cache miss stored while it streams) switches at its first
+    // byte: its early frames are the page head.
+    let threshold = if parts
+        .extensions
+        .get::<hj_compress::ProgressiveBody>()
+        .is_some()
+    {
+        0
+    } else {
+        STREAM_THRESHOLD
+    };
+    // Presize from the declared length (bounded: the buffer never needs more than the stream
+    // threshold before it switches to streaming) instead of doubling up from zero.
+    let declared = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    let mut acc: Vec<u8> = Vec::with_capacity(declared.map_or(0, |n| n.min(threshold)));
     loop {
         match s.frame().await {
             Some(Ok(frame)) => {
                 if let Some(d) = frame.data_ref() {
                     acc.extend_from_slice(d);
-                    if acc.len() > STREAM_THRESHOLD {
+                    if acc.len() > threshold {
                         let status = parts.status;
                         observe_response_head(&mut parts, status);
                         let headers = strip_framing(parts.headers);
@@ -1752,6 +1770,48 @@ mod tests {
         }
         // Framing headers are stripped on the streamed path.
         assert!(resp.headers.get(http::header::CONTENT_LENGTH).is_none());
+    }
+
+    /// A progressive body (a page-cache miss stored while it streams) sends its head with
+    /// the first byte, while the backend is still writing.
+    #[tokio::test]
+    async fn progressive_stream_sends_its_head_with_the_first_byte() {
+        struct ChanBody(mpsc::Receiver<Bytes>);
+        impl http_body::Body for ChanBody {
+            type Data = Bytes;
+            type Error = hj_core::BoxError;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+                self.0
+                    .poll_recv(cx)
+                    .map(|b| b.map(|b| Ok(http_body::Frame::data(b))))
+            }
+        }
+        let (feed, body_rx) = mpsc::channel(4);
+        let mut r = http::Response::builder()
+            .status(200)
+            .header(http::header::CONTENT_TYPE, "text/html")
+            .body(Body::Stream(ChanBody(body_rx).boxed()))
+            .unwrap();
+        r.extensions_mut().insert(hj_compress::ProgressiveBody);
+        let (tx, rx) = oneshot::channel();
+        let pump = tokio::spawn(forward_response(r, tx, false));
+        feed.send(Bytes::from_static(b"<head>")).await.unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("head is sent before the backend finishes")
+            .unwrap();
+        let BridgeBody::Stream { mut rx, len } = resp.body else {
+            panic!("a progressive body streams");
+        };
+        assert_eq!(len, None);
+        assert_eq!(rx.recv().await.unwrap().unwrap(), "<head>");
+        feed.send(Bytes::from_static(b"<body>")).await.unwrap();
+        drop(feed);
+        assert_eq!(drain(rx).await.unwrap(), b"<body>");
+        pump.await.unwrap();
     }
 
     #[tokio::test]

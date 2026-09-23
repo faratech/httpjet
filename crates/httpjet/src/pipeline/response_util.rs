@@ -75,6 +75,12 @@ pub(super) async fn apply_error_document(
             // (#3) A PHP-suffixed error document must be EXECUTED, never served
             // as source. Re-dispatch it as an internal LSAPI subrequest.
             if is_php_error_doc(state, ctx, &abs) {
+                // The PHP pool just failed this request: keep the built-in page (a
+                // stale-if-error copy may still replace it) rather than wait on the same
+                // pool again.
+                if resp.extensions().get::<super::PhpBackendFailed>().is_some() {
+                    return;
+                }
                 let Some(target) = super::allowed_script_target(&state.acl, &abs) else {
                     return;
                 };

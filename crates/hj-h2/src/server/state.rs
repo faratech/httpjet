@@ -87,6 +87,15 @@ pub(super) struct Recv {
 }
 
 impl Recv {
+    /// Remember a stream WE reset so a late HEADERS on it (trailers racing our
+    /// RST_STREAM) is the tolerated §5.1 close race rather than §5.1.1 id reuse.
+    /// Past the cap the id is not recorded, failing closed into a connection error.
+    pub(super) fn note_reset(&mut self, sid: u32) {
+        if self.reset_ids.len() < self.max_concurrent.saturating_mul(2) {
+            self.reset_ids.insert(sid);
+        }
+    }
+
     /// Stop counting `n` bytes against the connection's unfinished-body limit.
     /// The stream/body's owned lease independently retains global accounting until
     /// its bytes are freed, including after dispatch and on connection teardown.

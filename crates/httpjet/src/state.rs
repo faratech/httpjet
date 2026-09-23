@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
@@ -411,6 +411,13 @@ pub struct Metrics {
     pub tls_handshakes_full: Arc<AtomicU64>,
     /// TLS connections that completed a RESUMED handshake (session ticket/PSK).
     pub tls_handshakes_resumed: Arc<AtomicU64>,
+    /// Full handshakes that needed a HelloRetryRequest (an extra round trip), a subset of
+    /// `tls_handshakes_full`.
+    pub tls_handshakes_hello_retry: Arc<AtomicU64>,
+    /// H1 keep-alive connections closed by our idle timer vs. by the peer (the h2 split lives
+    /// in `hj_h2::server::connection_close_counts`).
+    pub h1_idle_closes: Arc<AtomicU64>,
+    pub h1_peer_closes: Arc<AtomicU64>,
     /// Last accepted `/cache-entries` debug render, in unix milliseconds.
     pub cache_entries_last_ms: Arc<AtomicU64>,
     /// Accepted `/cache-entries` renders.
@@ -444,6 +451,14 @@ pub struct Metrics {
     /// admission gate (see `lscache::cache_store`), so this gauges the un-gated store rate —
     /// watch it against capsule evictions for LRU churn before adding a separate admission sketch.
     pub xf_capsule_dedicated_stores: Arc<AtomicU64>,
+    /// Precompressed page-cache variants built by first-hit fills, and hits served from one,
+    /// per codec (zstd, br, gzip — see `lscache::VARIANT_CODECS`).
+    pub pagecache_variant_fills: Arc<[AtomicU64; 3]>,
+    pub pagecache_variant_serves: Arc<[AtomicU64; 3]>,
+    /// Cacheable misses forwarded while the backend was still writing them
+    /// (`--page-cache-stream-fill-vhosts`), and how many of those were stored at the end.
+    pub pagecache_stream_fills: Arc<AtomicU64>,
+    pub pagecache_stream_fill_stores: Arc<AtomicU64>,
     /// Capsule hits served to a logged-in MEMBER request (member opt-in cookie present). Paired
     /// with `xf_capsule_hits_guest` this answers "are members actually hitting the capsule, or
     /// falling through to PHP?" — bumped at every capsule serve site alongside the per-source
@@ -480,12 +495,78 @@ pub struct DictRecompressMetrics {
     pub dropped: AtomicU64,
     pub attempts: AtomicU64,
     pub completed: AtomicU64,
+    /// Total of `skipped_by_reason`, kept as its own series for existing dashboards.
     pub skipped: AtomicU64,
+    /// Indexed by [`DictSkip`].
+    pub skipped_by_reason: [AtomicU64; DictSkip::ALL.len()],
     pub input_bytes: AtomicU64,
     pub output_bytes: AtomicU64,
     pub saved_bytes: AtomicU64,
     /// Per-vhost Unix timestamp for the rate-limited saturation warning.
     pub last_saturation_warn_epoch_secs: AtomicU64,
+}
+
+impl DictRecompressMetrics {
+    pub fn skip(&self, why: DictSkip, n: u64) {
+        self.skipped.fetch_add(n, Ordering::Relaxed);
+        self.skipped_by_reason[why as usize].fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Why a stored entry was left as its identity body instead of being dict-compressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictSkip {
+    /// Already attempted, or no longer the current version when the job claimed it.
+    Claimed,
+    /// The resident body could not be read back for the hit-path retry.
+    BodyMissing,
+    /// The encode saved less than the 12.5% savings gate.
+    Savings,
+    /// Replaced, purged, or evicted while the encode ran.
+    LostRace,
+    /// Not a compressible content type (images, archives), so never encoded.
+    ContentType,
+    /// Below the compressor's minimum size (e.g. a cached redirect's empty body).
+    TooSmall,
+}
+
+impl DictSkip {
+    pub const ALL: [DictSkip; 6] = [
+        DictSkip::Claimed,
+        DictSkip::BodyMissing,
+        DictSkip::Savings,
+        DictSkip::LostRace,
+        DictSkip::ContentType,
+        DictSkip::TooSmall,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DictSkip::Claimed => "claimed",
+            DictSkip::BodyMissing => "body_missing",
+            DictSkip::Savings => "savings",
+            DictSkip::LostRace => "lost_race",
+            DictSkip::ContentType => "content_type",
+            DictSkip::TooSmall => "too_small",
+        }
+    }
+}
+
+/// Where a log file actually goes. Test and benchmark instances (the PGO gather, the h2spec
+/// gate) load the PRODUCTION config; with `HTTPJET_LOG_DIR` set, every log file they would
+/// open lands in that directory under its own file name instead, so they never write to,
+/// rotate, or create root-owned files in the production log directory.
+pub(crate) fn redirect_log_path(path: &std::path::Path) -> std::path::PathBuf {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        std::env::var_os("HTTPJET_LOG_DIR")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    });
+    match (dir, path.file_name()) {
+        (Some(dir), Some(name)) => dir.join(name),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// The config-derived half of [`ServerState`] — everything rebuilt from a parsed
@@ -825,7 +906,7 @@ impl ServerState {
         // traffic); forensic value past a week is low, and disk headroom on the
         // single node matters more than deep access history.
         let access_log = {
-            let path = server.server_root.join("logs/httpjet_access.log");
+            let path = redirect_log_path(&server.server_root.join("logs/httpjet_access.log"));
             // This combined log is the unified access record for every vhost that
             // does not declare its OWN <logging><accessLog> (#248), and it rolled
             // at just 10MB x 7 days — too thin for incident forensics
@@ -868,7 +949,7 @@ impl ServerState {
                 name.clone(),
                 VhostAccessLogger {
                     logger: Arc::new(AccessLogger::spawn(
-                        &spec.path,
+                        &redirect_log_path(&spec.path),
                         crate::state::access_log_format(),
                         spec.rolling_bytes,
                         spec.keep_days,
@@ -883,7 +964,7 @@ impl ServerState {
                 vhost_error_logs.insert(
                     name.clone(),
                     Arc::new(AccessLogger::spawn(
-                        &err.path,
+                        &redirect_log_path(&err.path),
                         crate::state::access_log_format(),
                         err.rolling_bytes,
                         err.keep_days,

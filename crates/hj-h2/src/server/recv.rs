@@ -146,9 +146,7 @@ where
             // (#357) Record the reset id (never consumed; skip at the cap — fail
             // closed into a connection error on a later reuse) so a subsequent
             // HEADERS on it is the tolerated §5.1 close race, not §5.1.1 reuse.
-            if recv.reset_ids.len() < recv.max_concurrent.saturating_mul(2) {
-                recv.reset_ids.insert($sid);
-            }
+            recv.note_reset($sid);
             // (#242) After WE emit RST_STREAM for a stream, RFC 9113 §5.1 forbids
             // sending ANY further frames on it. Tear down the outbound side (a
             // half-written response body would otherwise keep streaming past the
@@ -579,9 +577,13 @@ where
             if recv.conn_recv_window < 0 {
                 goaway!(error_code::FLOW_CONTROL_ERROR);
             }
-            if flow > 0 {
-                recv.conn_recv_window += flow;
-                out.frames(|b| frame::write_window_update(b, 0, flow as u32));
+            // Replenish in batches (as nghttp2 and nginx do): once half the advertised window
+            // is consumed, ONE WINDOW_UPDATE restores it, instead of one per DATA frame.
+            let conn_target = recv.our_initial_window.max(65535);
+            if recv.conn_recv_window <= conn_target / 2 {
+                let credit = conn_target - recv.conn_recv_window;
+                recv.conn_recv_window = conn_target;
+                out.frames(|b| frame::write_window_update(b, 0, credit as u32));
             }
             // §5.1/§6.1: DATA on an IDLE stream (never opened, `sid > last_client_stream`) is a
             // connection error; DATA on a CLOSED stream (already completed/reset and removed from
@@ -634,12 +636,13 @@ where
             }
             recv.total_buffered = recv.total_buffered.saturating_add(data.len());
             st.body.extend_from_slice(data);
-            // Refresh the PER-STREAM window on receipt (§5.2.2) — which was previously never
-            // sent — so a single upload can exceed SETTINGS_INITIAL_WINDOW_SIZE without
-            // stalling. Skip it once the stream has ended (no further DATA will arrive).
-            if flow > 0 && hdr.flags & flags::END_STREAM == 0 {
-                st.recv_window += flow;
-                out.frames(|b| frame::write_window_update(b, sid, flow as u32));
+            // Refresh the PER-STREAM window (§5.2.2) so a single upload can exceed
+            // SETTINGS_INITIAL_WINDOW_SIZE without stalling — batched like the connection
+            // window above. Skip it once the stream has ended (no further DATA will arrive).
+            if hdr.flags & flags::END_STREAM == 0 && st.recv_window <= recv.our_initial_window / 2 {
+                let credit = recv.our_initial_window - st.recv_window;
+                st.recv_window = recv.our_initial_window;
+                out.frames(|b| frame::write_window_update(b, sid, credit as u32));
             }
             if hdr.flags & flags::END_STREAM != 0
                 && streams.get(&sid).is_some_and(|s| s.headers_done)
@@ -663,9 +666,7 @@ where
             // churn never resets `no_progress_frames`, so a flood still GOAWAYs).
             // Unlike the `cancelled` insert below, this must NOT be gated on a live
             // handler — `cancelled` is consumed on drain, this set is not.
-            if recv.reset_ids.len() < recv.max_concurrent.saturating_mul(2) {
-                recv.reset_ids.insert(sid);
-            }
+            recv.note_reset(sid);
             // If the handler future is still running in `inflight`, cancel it and mark the stream
             // so the aborted completion is discarded. ONLY record sids with a live future:
             // a RST arriving AFTER the handler already resolved+drained has nothing to cancel,

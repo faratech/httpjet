@@ -323,9 +323,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.4.6"
+version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3eb0f42d6c360dc3f8a821f6bf2fdea7f72bfd36b3076eb0e6d1e9e0752fff4"
+checksum = "54413ede23c2daf518f35156dfde027feb2374004d63bd497f983c8db9c0e313"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -677,9 +677,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
+checksum = "ef25905e51abafe4dcea6c15fec58c57b601cdbd0ee53d22ea1d3016c587d39b"
 
 [[package]]
 name = "findshlibs"
@@ -957,7 +957,7 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "hj-acl"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "globset",
  "hj-core",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "hj-acme"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "hj-cache"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "hj-config",
  "parking_lot",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "hj-compress"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "brotli",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "hj-config"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "quick-xml",
  "serde",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "hj-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "hj-extension"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "hj-core",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "hj-fastcgi"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1071,14 +1071,14 @@ dependencies = [
 
 [[package]]
 name = "hj-geo"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "ipnet",
 ]
 
 [[package]]
 name = "hj-h2"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1096,14 +1096,14 @@ dependencies = [
 
 [[package]]
 name = "hj-http"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "hj-core",
 ]
 
 [[package]]
 name = "hj-log"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "flate2",
  "tokio",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "hj-lsapi"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1132,7 +1132,7 @@ dependencies = [
 
 [[package]]
 name = "hj-ocsp"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.23.1",
  "foreign-types",
@@ -1145,7 +1145,7 @@ dependencies = [
 
 [[package]]
 name = "hj-pagecache"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "hj-proxy"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "bytes",
  "hj-core",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "hj-rewrite"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.23.1",
  "bcrypt",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "hj-static"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "hj-tls"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1292,7 +1292,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "httpjet"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1398,9 +1398,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.9"
+version = "0.27.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
+checksum = "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53"
 dependencies = [
  "http",
  "hyper",
@@ -2038,9 +2038,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
+checksum = "6cdb0b1b267eb9db3331b434ed9ddab10d50e280a9adf9d13e5233e2002b61b5"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -2051,9 +2051,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-http"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
+checksum = "ee2c3625b8aa04209f7e01e513bc8044da9687fa38a9eacf59628ca5f3b87300"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2064,11 +2064,12 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-otlp"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
+checksum = "699a67345e21962a231955b9059a157e428b219fa5df8efe11f08346fb23a344"
 dependencies = [
  "http",
+ "httpdate",
  "opentelemetry",
  "opentelemetry-http",
  "opentelemetry-proto",
@@ -2080,9 +2081,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry-proto"
-version = "0.32.0"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
+checksum = "25da1ac11a0aeccf38d7f77ee0348715adaf8340f65ad46c94a02c6b20e2f65d"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -2091,9 +2092,9 @@ dependencies = [
 
 [[package]]
 name = "opentelemetry_sdk"
-version = "0.32.1"
+version = "0.33.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b59f80e1ac4d5ff7a2db8fb6c80badb7f0f3f858211fba08dd9aaec750894f9"
+checksum = "cb39533d9d1c912123efd7d41d7e0c29d16917b60ce15b4c8d87cb1af7f67520"
 dependencies = [
  "futures-channel",
  "futures-executor",
@@ -2379,7 +2380,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -2452,9 +2453,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -3362,9 +3363,9 @@ checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.25"
+version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab72a15cf68d77cb0987d3684aa8a45c5ef827e8cb49ee2f30bfd7ba2feb519f"
+checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "untrusted"

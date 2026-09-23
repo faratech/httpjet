@@ -87,6 +87,13 @@ pub const DEFAULT_MIN_SIZE: u64 = 201;
 /// size/CPU tradeoff for on-the-fly compression.
 pub(crate) const DEFAULT_LEVEL: u32 = 6;
 
+/// Response-extension marker: the body is a backend render still in progress whose early
+/// bytes are useful on their own (a page-cache miss stored while it streams). The transport
+/// sends the head with the first bytes instead of buffering the body, and a streamed
+/// compressor emits its first block when the backend stalls.
+#[derive(Clone, Copy, Debug)]
+pub struct ProgressiveBody;
+
 /// Response compression transform.
 ///
 /// Holds only configuration, so it is cheap to share behind an `Arc` from the
@@ -306,6 +313,7 @@ impl Compress {
     fn apply(&self, resp: &mut Response, enc: Encoding) {
         let levels = self.levels();
 
+        let progressive = resp.extensions().get::<ProgressiveBody>().is_some();
         // Swap the body out so we can transform it.
         let body = std::mem::replace(resp.body_mut(), Body::Empty);
 
@@ -319,7 +327,13 @@ impl Compress {
             },
             Body::Stream(s) => {
                 resp.headers_mut().remove(CONTENT_LENGTH);
-                Body::Stream(CompressStream::new(s, enc, &levels).boxed_stream())
+                let stream = CompressStream::new(s, enc, &levels);
+                let stream = if progressive {
+                    stream.flush_first_when_idle()
+                } else {
+                    stream
+                };
+                Body::Stream(stream.boxed_stream())
             }
             Body::File(f) => match &f.cached {
                 // Only reached when cached bytes exist (see should_compress).

@@ -403,6 +403,9 @@ fn render(state: &ServerState) -> String {
     append_xf_capsule_metrics(&mut body, &state.metrics);
     append_shared_path_metrics(&mut body, state);
     append_dict_recompress_metrics(&mut body, &state.page_cache_dict_metrics);
+    append_variant_metrics(&mut body, &state.metrics);
+    append_stream_fill_metrics(&mut body, &state.metrics);
+    append_connection_metrics(&mut body, &state.metrics);
     // Point-in-time gauge: stale-while-revalidate background refreshes in flight.
     if state.page_cache.is_some() {
         body.push_str(
@@ -500,11 +503,15 @@ fn append_dict_recompress_metrics(
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     out.push_str(
-        "# HELP httpjet_pagecache_dict_recompress_total First-hit dictionary recompression jobs by result.\n",
+        "# HELP httpjet_pagecache_dict_recompress_total Store-time dictionary recompression jobs by result.\n",
     );
     out.push_str("# TYPE httpjet_pagecache_dict_recompress_total counter\n");
     out.push_str(
-        "# HELP httpjet_pagecache_dict_recompress_bytes_total First-hit dictionary recompression bytes by stage.\n",
+        "# HELP httpjet_pagecache_dict_recompress_skipped_total Entries left as identity bodies, by reason.\n",
+    );
+    out.push_str("# TYPE httpjet_pagecache_dict_recompress_skipped_total counter\n");
+    out.push_str(
+        "# HELP httpjet_pagecache_dict_recompress_bytes_total Store-time dictionary recompression bytes by stage.\n",
     );
     out.push_str("# TYPE httpjet_pagecache_dict_recompress_bytes_total counter\n");
     for (vhost, metrics) in rows {
@@ -532,6 +539,13 @@ fn append_dict_recompress_metrics(
             "httpjet_pagecache_dict_recompress_total{{vhost=\"{vhost}\",result=\"skipped\"}} {}\n",
             metrics.skipped.load(Ordering::Relaxed)
         ));
+        for why in crate::state::DictSkip::ALL {
+            out.push_str(&format!(
+                "httpjet_pagecache_dict_recompress_skipped_total{{vhost=\"{vhost}\",reason=\"{}\"}} {}\n",
+                why.label(),
+                metrics.skipped_by_reason[why as usize].load(Ordering::Relaxed)
+            ));
+        }
         out.push_str(&format!(
             "httpjet_pagecache_dict_recompress_bytes_total{{vhost=\"{vhost}\",stage=\"input\"}} {}\n",
             metrics.input_bytes.load(Ordering::Relaxed)
@@ -545,6 +559,70 @@ fn append_dict_recompress_metrics(
             metrics.saved_bytes.load(Ordering::Relaxed)
         ));
     }
+}
+
+/// Who closes connections (our idle timer vs. the peer), the trusted-proxy idle window, and
+/// handshakes that paid a HelloRetryRequest round trip.
+fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) {
+    let (h2_idle, h2_peer) = hj_h2::server::connection_close_counts();
+    let h1_idle = metrics.h1_idle_closes.load(Ordering::Relaxed);
+    let h1_peer = metrics.h1_peer_closes.load(Ordering::Relaxed);
+    out.push_str(&format!(
+        "# HELP httpjet_conn_idle_closes_total Connections closed by this server's idle timer.\n\
+         # TYPE httpjet_conn_idle_closes_total counter\n\
+         httpjet_conn_idle_closes_total{{proto=\"h1\"}} {h1_idle}\n\
+         httpjet_conn_idle_closes_total{{proto=\"h2\"}} {h2_idle}\n\
+         # HELP httpjet_conn_peer_closes_total Connections the peer closed first.\n\
+         # TYPE httpjet_conn_peer_closes_total counter\n\
+         httpjet_conn_peer_closes_total{{proto=\"h1\"}} {h1_peer}\n\
+         httpjet_conn_peer_closes_total{{proto=\"h2\"}} {h2_peer}\n\
+         # HELP httpjet_trusted_proxy_idle_seconds Idle window for client-certified connections (0 = normal floor).\n\
+         # TYPE httpjet_trusted_proxy_idle_seconds gauge\n\
+         httpjet_trusted_proxy_idle_seconds {}\n\
+         # HELP httpjet_tls_handshakes_hello_retry_total Full TLS handshakes that needed a HelloRetryRequest.\n\
+         # TYPE httpjet_tls_handshakes_hello_retry_total counter\n\
+         httpjet_tls_handshakes_hello_retry_total {}\n",
+        crate::uring::trusted_proxy_idle_secs(),
+        metrics.tls_handshakes_hello_retry.load(Ordering::Relaxed),
+    ));
+}
+
+/// Precompressed page-cache variants: built by first-hit fills vs served, per codec.
+fn append_variant_metrics(out: &mut String, metrics: &crate::state::Metrics) {
+    for (name, help, counts) in [
+        (
+            "httpjet_pagecache_variant_fill_total",
+            "Precompressed page-cache variants built by first-hit fills, per codec.",
+            &metrics.pagecache_variant_fills,
+        ),
+        (
+            "httpjet_pagecache_variant_serve_total",
+            "Page-cache hits served from a stored precompressed variant, per codec.",
+            &metrics.pagecache_variant_serves,
+        ),
+    ] {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+        for (codec, count) in ["zstd", "br", "gzip"].iter().zip(counts.iter()) {
+            out.push_str(&format!(
+                "{name}{{codec=\"{codec}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
+    }
+}
+
+/// Page-cache misses streamed to the client before the backend finished, and how many stored.
+fn append_stream_fill_metrics(out: &mut String, metrics: &crate::state::Metrics) {
+    out.push_str(&format!(
+        "# HELP httpjet_pagecache_stream_fills_total Cacheable misses forwarded while the backend was still writing them.\n\
+         # TYPE httpjet_pagecache_stream_fills_total counter\n\
+         httpjet_pagecache_stream_fills_total {}\n\
+         # HELP httpjet_pagecache_stream_fill_stores_total Streamed misses stored once the backend finished.\n\
+         # TYPE httpjet_pagecache_stream_fill_stores_total counter\n\
+         httpjet_pagecache_stream_fill_stores_total {}\n",
+        metrics.pagecache_stream_fills.load(Ordering::Relaxed),
+        metrics.pagecache_stream_fill_stores.load(Ordering::Relaxed),
+    ));
 }
 
 /// Rewrite-outcome cache effectiveness + the UA-classification memo size.
@@ -580,6 +658,18 @@ fn append_rewrite_metrics(out: &mut String, state: &ServerState) {
         "gauge",
         "Entries in the (ruleset, User-Agent) -> match-bitmap classification memo.",
         state.ua_classify.len() as u64,
+    );
+    metric(
+        "httpjet_htaccess_cache_entries",
+        "gauge",
+        "Directories memoized by the .htaccess cache; at capacity, new directories are re-read per request.",
+        state.rewrite_cache.len() as u64,
+    );
+    metric(
+        "httpjet_htaccess_cache_capacity",
+        "gauge",
+        "Soft cap on .htaccess cache entries (never evicted until a config reload).",
+        hj_rewrite::HtaccessCache::MAX_ENTRIES as u64,
     );
 }
 
@@ -1660,7 +1750,8 @@ mod tests {
         metrics.queued.store(5, Ordering::Relaxed);
         metrics.attempts.store(5, Ordering::Relaxed);
         metrics.completed.store(3, Ordering::Relaxed);
-        metrics.skipped.store(2, Ordering::Relaxed);
+        metrics.skip(crate::state::DictSkip::Savings, 1);
+        metrics.skip(crate::state::DictSkip::ContentType, 1);
         metrics.input_bytes.store(1_000, Ordering::Relaxed);
         metrics.output_bytes.store(400, Ordering::Relaxed);
         metrics.saved_bytes.store(600, Ordering::Relaxed);
@@ -1673,6 +1764,9 @@ mod tests {
             "result=\"attempted\"} 5\n",
             "result=\"completed\"} 3\n",
             "result=\"skipped\"} 2\n",
+            "reason=\"savings\"} 1\n",
+            "reason=\"content_type\"} 1\n",
+            "reason=\"lost_race\"} 0\n",
             "stage=\"input\"} 1000\n",
             "stage=\"output\"} 400\n",
             "stage=\"saved\"} 600\n",

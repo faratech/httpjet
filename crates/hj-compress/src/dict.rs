@@ -15,32 +15,48 @@
 //! (re)build a precompressed variant).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use zstd::dict::{DecoderDictionary, EncoderDictionary};
+use zstd::bulk::Compressor;
+use zstd::dict::DecoderDictionary;
+use zstd::zstd_safe::CParameter;
 
-/// Default zstd level for dict-compressing a stored body. Level 15 (btopt) — the highest level
-/// *below* zstd's optimal-parser cliff: levels ≥16 switch to `ZSTD_compressBlock_opt*` (btultra /
-/// btultra2), whose match search is far more CPU-hungry for almost no extra ratio on our
-/// tens-of-KiB bodies. The store-path compress is NOT free: it runs on a background task on the
-/// tokio worker pool, so at our store rate "ultra" (level 22) was measured burning ~half a core
-/// continuously and competing with request serving — a live `perf` profile was ~70%
-/// `ZSTD_compressBlock_opt2`. Level 22 cost ~3× the CPU of 19 and ~8× of 15 to shave <1% off the
-/// stored size (the real cross-page size win comes from the dictionary, not the level). zstd
-/// *decompression* speed is independent of the level, so the cache-HIT serve path is unaffected,
-/// and the level is NOT part of `dict_gen` (that hashes the dict bytes), so changing it does not
-/// invalidate already-stored bodies — they keep decoding, new bodies just store at the new level.
-pub const DEFAULT_DICT_LEVEL: i32 = 15;
+/// Default zstd level for dict-compressing a stored body. Level 12 is the last level on zstd's
+/// row-based lazy matcher; 13-15 switch to the binary-tree btlazy2 search, which was ~55% of all
+/// httpjet CPU in a live `perf` profile (`ZSTD_DUBT_findBestMatch`). Measured with the prod
+/// per-vhost dictionaries on real pages (2026-09-22): windowsforum 44 pages / 7.3 MiB took
+/// 411 ms at 15 vs 152 ms at 12 for 960 vs 979 KiB out (+2%); moontimenow 25 pages / 2.8 MiB
+/// took 112 ms vs 38 ms for 199 vs 201 KiB (+1%). The cross-page size win comes from the
+/// dictionary, not the level. The store-path compress runs on the tokio worker pool, so its CPU
+/// competes with request serving. zstd *decompression* speed is independent of the level, so
+/// the cache-HIT serve path is unaffected, and the level is NOT part of `dict_gen` (that hashes
+/// the dict bytes), so changing it does not invalidate already-stored bodies — they keep
+/// decoding, new bodies just store at the new level.
+pub const DEFAULT_DICT_LEVEL: i32 = 12;
+
+/// Hash-table size for the pooled encode contexts. zstd sizes a CDict's tables for a small
+/// assumed source, and the 256 KiB dictionaries push that onto a 4 MiB hash + 1 MiB row-tag
+/// table which, above lazy2's 32 KB attach cutoff (every real page), is COPIED into the
+/// context on every frame. Loading the dictionary into a context configured with HashLog 18
+/// shrinks what each frame copies. Measured 2026-09-22 on real pages with the prod
+/// dictionaries: windowsforum −20% time for +0.6% size, moontimenow −32% for +0%.
+const DICT_HASH_LOG: u32 = 18;
+
+/// Encode contexts kept per dictionary. Matches the page cache's dict-fill concurrency, so
+/// steady state never builds a context; it is a global pool (not thread-local) because the
+/// encode runs under `block_in_place`, which moves between threads.
+const ENCODE_POOL_CAP: usize = 2;
 
 /// A prepared shared dictionary for page-cache internal storage. Holds the raw dictionary bytes, a
 /// non-zero **generation id** (so a cached body can be tied to the exact dictionary that decodes
-/// it — a different dictionary ⇒ the entry is undecodable and must degrade to a miss), and the
-/// zstd encoder/decoder dictionaries (prepared once; a per-call bulk (de)compressor is cheap to
-/// derive). Shared behind an `Arc` from `ServerState`.
+/// it — a different dictionary ⇒ the entry is undecodable and must degrade to a miss), a small
+/// pool of encode contexts with the dictionary loaded, and the prepared decoder dictionary.
+/// Shared behind an `Arc` from `ServerState`.
 pub struct PageDict {
     raw: Vec<u8>,
     generation: u32,
-    enc: EncoderDictionary<'static>,
+    level: i32,
+    encoders: Mutex<Vec<Compressor<'static>>>,
     dec: DecoderDictionary<'static>,
 }
 
@@ -54,16 +70,25 @@ impl PageDict {
         // generation: FNV-1a 32 of the dict bytes, forced non-zero (0 == "not dict-compressed"
         // sentinel on a cached entry).
         let generation = fnv1a32(&dict).max(1);
-        // `copy` (vs `new`) owns the dictionary bytes → `'static`, so the prepared dictionaries
+        // `copy` (vs `new`) owns the dictionary bytes → `'static`, so the prepared dictionary
         // can live in an `Arc<PageDict>` on `ServerState` without borrowing `raw`.
-        let enc = EncoderDictionary::copy(&dict, level);
         let dec = DecoderDictionary::copy(&dict);
         Some(PageDict {
             raw: dict,
             generation,
-            enc,
+            level,
+            encoders: Mutex::new(Vec::with_capacity(ENCODE_POOL_CAP)),
             dec,
         })
+    }
+
+    /// A context with the dictionary loaded under [`DICT_HASH_LOG`]. Parameters are set before
+    /// the load so zstd builds the context's local dictionary tables at that size.
+    fn new_encoder(&self) -> Option<Compressor<'static>> {
+        let mut c = Compressor::new(self.level).ok()?;
+        c.set_parameter(CParameter::HashLog(DICT_HASH_LOG)).ok()?;
+        c.set_dictionary(self.level, &self.raw).ok()?;
+        Some(c)
     }
 
     /// The dictionary generation id (always non-zero).
@@ -78,8 +103,23 @@ impl PageDict {
 
     /// Compress `input` against the dictionary (zstd). `None` only on a zstd failure.
     pub fn encode(&self, input: &[u8]) -> Option<Vec<u8>> {
-        let mut c = zstd::bulk::Compressor::with_prepared_dictionary(&self.enc).ok()?;
+        let pooled = self
+            .encoders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let mut c = match pooled {
+            Some(c) => c,
+            None => self.new_encoder()?,
+        };
+        // A failed frame may leave the context mid-stream, so only a clean one goes back.
         let mut out = c.compress(input).ok()?;
+        {
+            let mut pool = self.encoders.lock().unwrap_or_else(PoisonError::into_inner);
+            if pool.len() < ENCODE_POOL_CAP {
+                pool.push(c);
+            }
+        }
         // zstd sizes this Vec at compress_bound(input) ≈ input.len() and the page cache keeps
         // it for the entry's whole TTL — unshrunk, every "8-20 KiB" stored body pins an
         // identity-size (~60-150 KiB) heap block, usually one already fully faulted by an
@@ -282,6 +322,28 @@ mod tests {
             b.decode(&comp, 1 << 20).is_none(),
             "decode with the wrong dict must fail"
         );
+    }
+
+    #[test]
+    fn pooled_encoders_are_reused_deterministically_and_capped() {
+        let d = dict();
+        let body = CHROME.repeat(8);
+        let first = d.encode(&body).expect("encode");
+        let second = d.encode(&body).expect("encode on a reused context");
+        assert_eq!(
+            first, second,
+            "a reused context must produce the same frame"
+        );
+        assert_eq!(
+            d.decode(&second, crate::MAX_DECODE as usize).as_deref(),
+            Some(body.as_slice())
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| d.encode(&body).expect("concurrent encode"));
+            }
+        });
+        assert!(d.encoders.lock().unwrap().len() <= ENCODE_POOL_CAP);
     }
 
     #[test]

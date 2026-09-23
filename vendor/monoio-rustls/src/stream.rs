@@ -15,6 +15,34 @@ use rustls::{ClientConnection, ConnectionCommon, ServerConnection, SideData};
 
 const TLS_WRITE_BUFFER_IDLE: usize = 64 * 1024;
 const TLS_WRITE_BUFFER_BURST: usize = 512 * 1024;
+/// Idle-size write buffers kept warm per thread (see [`take_idle_box`]).
+const IDLE_BUFFER_POOL_CAP: usize = 32;
+
+thread_local! {
+    static IDLE_BUFFERS: RefCell<Vec<Box<[u8]>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// httpjet fork: a connection holds a write buffer only while it has ciphertext to send.
+/// Idle origin connections are numerous (thousands of Cloudflare connections held open
+/// between requests) and each used to keep a 64 KiB buffer; a flushed buffer now returns
+/// to this thread's pool and the next write takes a warm one, so there is no allocation
+/// or page fault per response.
+fn take_idle_box() -> Box<[u8]> {
+    IDLE_BUFFERS
+        .try_with(|pool| pool.borrow_mut().pop())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| uninit_box(TLS_WRITE_BUFFER_IDLE))
+}
+
+fn put_idle_box(buf: Box<[u8]>) {
+    let _ = IDLE_BUFFERS.try_with(move |pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < IDLE_BUFFER_POOL_CAP {
+            pool.push(buf);
+        }
+    });
+}
 
 #[derive(Debug)]
 pub struct Stream<IO, C> {
@@ -83,10 +111,10 @@ impl<IO, C> Stream<IO, C> {
             io,
             session,
             r_buffer: Default::default(),
-            // httpjet fork: adaptive TLS write buffer. Idle Cloudflare origin connections
-            // are numerous, so keep the resident baseline small; large writes still grow to
-            // the old 512 KiB batching ceiling for throughput, then shrink after the flush.
-            w_buffer: WriteBuffer::new(TLS_WRITE_BUFFER_IDLE),
+            // httpjet fork: adaptive TLS write buffer. Nothing is held while idle; a write
+            // takes a pooled 64 KiB buffer, large writes still grow to the old 512 KiB
+            // batching ceiling for throughput, and the flush releases it again.
+            w_buffer: WriteBuffer::idle(),
         }
     }
 
@@ -159,6 +187,8 @@ mod transition_tests {
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
 
+    use monoio::buf::IoBuf;
+
     use super::{Stream, WriteBuffer};
 
     fn ready<F: Future>(future: F) -> F::Output {
@@ -168,6 +198,100 @@ mod transition_tests {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("in-memory I/O unexpectedly yielded"),
         }
+    }
+
+    /// An in-memory transport that records what the write buffer flushed.
+    #[derive(Default)]
+    struct Sink(Vec<u8>);
+
+    impl monoio::io::AsyncWriteRent for Sink {
+        async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            // SAFETY: an IoBuf guarantees `bytes_init` initialized bytes at `read_ptr`.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.read_ptr(), buf.bytes_init()) };
+            self.0.extend_from_slice(bytes);
+            (Ok(bytes.len()), buf)
+        }
+        async fn writev<T: monoio::buf::IoVecBuf>(
+            &mut self,
+            _buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            unreachable!("the write buffer flushes with write_all")
+        }
+        async fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capacity(buffer: &WriteBuffer) -> usize {
+        match buffer {
+            WriteBuffer::Safe(b) => b.buffer.as_ref().expect("not in flight").capacity(),
+            #[cfg(feature = "unsafe_io")]
+            WriteBuffer::Unsafe(_) => unreachable!(),
+        }
+    }
+
+    fn storage(buffer: &WriteBuffer) -> *const u8 {
+        match buffer {
+            WriteBuffer::Safe(b) => b.buffer.as_ref().expect("not in flight").buf.as_ptr(),
+            #[cfg(feature = "unsafe_io")]
+            WriteBuffer::Unsafe(_) => unreachable!(),
+        }
+    }
+
+    /// Idle holds nothing; a write takes a pooled buffer, and the flushed buffer goes back
+    /// to the pool for the next connection instead of being freed and re-faulted.
+    #[test]
+    fn idle_write_buffer_is_released_to_a_warm_pool() {
+        super::IDLE_BUFFERS.with(|pool| pool.borrow_mut().clear());
+        let mut a = WriteBuffer::idle();
+        assert_eq!(capacity(&a), 0, "a fresh connection holds no write buffer");
+        assert_eq!(a.write(b"").unwrap(), 0);
+        assert_eq!(capacity(&a), 0, "an empty write takes nothing");
+
+        a.write_all(b"record one").unwrap();
+        assert_eq!(capacity(&a), super::TLS_WRITE_BUFFER_IDLE);
+        let first = storage(&a);
+        a.shrink_to_idle();
+        assert_eq!(
+            capacity(&a),
+            super::TLS_WRITE_BUFFER_IDLE,
+            "unflushed data is kept"
+        );
+
+        let mut sink = Sink::default();
+        ready(a.do_io(&mut sink)).unwrap();
+        assert_eq!(sink.0, b"record one");
+        a.shrink_to_idle();
+        assert_eq!(capacity(&a), 0, "a drained buffer is released");
+
+        let mut b = WriteBuffer::idle();
+        b.write_all(b"record two").unwrap();
+        assert_eq!(
+            storage(&b),
+            first,
+            "the next writer reuses the pooled buffer"
+        );
+        ready(b.do_io(&mut sink)).unwrap();
+        assert_eq!(sink.0, b"record onerecord two");
+    }
+
+    /// A buffer grown past the idle size for a burst is freed, never pooled.
+    #[test]
+    fn grown_write_buffer_is_not_pooled() {
+        super::IDLE_BUFFERS.with(|pool| pool.borrow_mut().clear());
+        let mut a = WriteBuffer::idle();
+        let burst = vec![7u8; super::TLS_WRITE_BUFFER_IDLE + 1];
+        a.write_all(&burst).unwrap();
+        assert!(capacity(&a) > super::TLS_WRITE_BUFFER_IDLE);
+        let mut sink = Sink::default();
+        ready(a.do_io(&mut sink)).unwrap();
+        assert_eq!(sink.0, burst);
+        a.shrink_to_idle();
+        assert_eq!(capacity(&a), 0);
+        assert!(super::IDLE_BUFFERS.with(|pool| pool.borrow().is_empty()));
     }
 
     #[test]
@@ -211,8 +335,8 @@ enum WriteBuffer {
 }
 
 impl WriteBuffer {
-    fn new(buffer_size: usize) -> Self {
-        Self::Safe(SafeWriteBuffer::new(buffer_size))
+    fn idle() -> Self {
+        Self::Safe(SafeWriteBuffer::idle())
     }
 
     #[cfg(feature = "unsafe_io")]
@@ -243,7 +367,7 @@ impl WriteBuffer {
 
     fn shrink_to_idle(&mut self) {
         match self {
-            Self::Safe(buf) => buf.shrink_to(TLS_WRITE_BUFFER_IDLE),
+            Self::Safe(buf) => buf.release_idle(),
             #[cfg(feature = "unsafe_io")]
             Self::Unsafe(_) => {}
         }
@@ -281,9 +405,9 @@ enum WriteStatus {
 }
 
 impl SafeWriteBuffer {
-    fn new(buffer_size: usize) -> Self {
+    fn idle() -> Self {
         Self {
-            buffer: Some(Buffer::new(buffer_size)),
+            buffer: Some(Buffer::empty()),
             status: WriteStatus::Ok,
         }
     }
@@ -311,12 +435,18 @@ impl SafeWriteBuffer {
         }
     }
 
-    fn shrink_to(&mut self, target: usize) {
+    /// Give a drained buffer back. `None` means an io_uring write owns it right now.
+    fn release_idle(&mut self) {
         let Some(buffer) = self.buffer.as_mut() else {
             return;
         };
-        if buffer.is_empty() && buffer.capacity() > target {
-            *buffer = Buffer::new(target);
+        if !buffer.is_empty() || buffer.capacity() == 0 {
+            return;
+        }
+        let released = std::mem::replace(buffer, Buffer::empty());
+        // A buffer grown for a burst is freed rather than pooled.
+        if released.capacity() == TLS_WRITE_BUFFER_IDLE {
+            put_idle_box(released.buf);
         }
     }
 }
@@ -328,11 +458,14 @@ impl io::Write for SafeWriteBuffer {
             WriteStatus::Err(e) => return Err(e),
             WriteStatus::Ok => {}
         }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if buffer.capacity() == 0 {
+            *buffer = Buffer::pooled();
+        }
 
-        if !buf.is_empty()
-            && buffer.available() < buf.len()
-            && buffer.capacity() < TLS_WRITE_BUFFER_BURST
-        {
+        if buffer.available() < buf.len() && buffer.capacity() < TLS_WRITE_BUFFER_BURST {
             let needed = buffer.len().saturating_add(buf.len());
             let grown = buffer
                 .capacity()
@@ -378,11 +511,22 @@ fn uninit_box(size: usize) -> Box<[u8]> {
 }
 
 impl Buffer {
-    fn new(size: usize) -> Self {
+    /// No storage: what an idle connection holds.
+    fn empty() -> Self {
         Self {
             read: 0,
             write: 0,
-            buf: uninit_box(size),
+            buf: Box::default(),
+        }
+    }
+
+    /// An idle-size buffer from this thread's pool. Its old bytes are never read: everything
+    /// below `write` (0 here) is written first, as with a fresh uninitialized allocation.
+    fn pooled() -> Self {
+        Self {
+            read: 0,
+            write: 0,
+            buf: take_idle_box(),
         }
     }
 

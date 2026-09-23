@@ -174,6 +174,23 @@ struct ServeArgs {
     /// worsens tail latency.
     #[arg(long)]
     no_core_pinning: bool,
+    /// (#486) Idle window in seconds for connections whose peer presented a VERIFIED client
+    /// certificate (in prod, only Cloudflare's authenticated-origin-pull cert). Cloudflare never
+    /// resumes TLS to the origin, so closing a connection it would have reused costs a full
+    /// TCP + TLS + mTLS handshake. 0 (default) keeps the normal 90 s floor for everyone;
+    /// uncertified peers always keep it.
+    #[arg(long, default_value_t = 0)]
+    trusted_proxy_idle_secs: u64,
+    /// Above this many open connections, certified connections fall back to the normal idle
+    /// floor (bounds idle state during a connection surge).
+    #[arg(long, default_value_t = 6000)]
+    trusted_proxy_idle_max_conns: u64,
+    /// TLS 1.3 session tickets issued per full handshake (rustls default 2). 0 stops minting
+    /// them and shrinks the session cache to TLS 1.2 session IDs: Cloudflare's origin pull
+    /// never resumes (httpjet_tls_handshakes_resumed_total stays 0), so the tickets only cost
+    /// two records per handshake plus a cached copy of its client-cert chain.
+    #[arg(long, default_value_t = 2)]
+    tls_session_tickets: usize,
     /// (#330) io_uring ring setup for the per-core transport runtimes.
     /// `legacy` (default) = flagless rings — the A/B measured `coop`
     /// (COOP_TASKRUN + SUBMIT_ALL) as noise and `defer` (+SINGLE_ISSUER +
@@ -319,12 +336,12 @@ struct ServeArgs {
     /// the swap retention seen in prod after a burst). 0 = disable.
     #[arg(long, default_value_t = 120)]
     mimalloc_trim_secs: u64,
-    /// (mem) Only run the mimalloc trim when process RSS+swap (read from
-    /// /proc/self/status) is at least this many MiB; 0 = always. Lets a small,
-    /// healthy process skip the collect entirely. Default 768: well above the
-    /// measured healthy steady-state (x86 ~360 MiB, ARM ~240 MiB) so a process
-    /// at rest never pays the force-collect cost, while genuine post-burst
-    /// arena retention still trips the safety-net reclaim.
+    /// (mem) Only run the mimalloc trim (periodic and after a connection close) when
+    /// process RSS+swap (read from /proc/self/status) is at least this many MiB;
+    /// 0 = always. Lets a healthy process skip the collect entirely. Default 768:
+    /// above a cache-less steady state (~360 MiB). Size it above the deployment's
+    /// healthy peak (a large page cache holds 1-2 GiB) so only genuine post-burst
+    /// arena retention trips the safety-net reclaim.
     #[arg(long, default_value_t = 768)]
     mimalloc_trim_threshold_mib: u64,
     /// (profiling) Optional shared token guarding the /debug/pprof/profile endpoint
@@ -429,6 +446,28 @@ struct PageCacheArgs {
     /// `forum.example=conf/pagecache-forum.dict,moon.example=conf/pagecache-moon.dict`.
     #[arg(long = "page-cache-dict-vhost", default_value = "")]
     dict_vhost: String,
+    /// Comma-separated `vhost=level` pairs overriding the store-time zstd level (1-19, default
+    /// 12) of that vhost's dictionary. A vhost whose compressed bodies round to the same 4 KiB
+    /// tmpfs pages at a cheaper level gains nothing from 12: moontimenow's pages cost 5x less at
+    /// level 3 with no footprint change (measured 2026-09-22). A malformed pair aborts startup.
+    #[arg(long = "page-cache-dict-level", default_value = "")]
+    dict_level: String,
+    /// Comma-separated extra statuses (from 303, 404, 410) cached only when the app sends an
+    /// explicit `X-LiteSpeed-Cache-Control: public`, with the TTL capped at 300 s and no
+    /// stale windows. Empty = off (only 200/301 are cached).
+    #[arg(long = "page-cache-opt-in-status", default_value = "")]
+    opt_in_status: String,
+    /// Comma-separated request-path prefixes under which an opted-in 303 may be stored
+    /// (e.g. `/whats-new/`). A 303 anywhere else is never stored.
+    #[arg(long = "page-cache-303-prefixes", default_value = "")]
+    opt_in_303_prefixes: String,
+    /// Comma-separated vhost names whose cacheable page-cache misses WITHOUT a Content-Length
+    /// (progressive template output, e.g. moontimenow) are sent to the client as the backend
+    /// writes them and stored once the backend finishes, instead of being buffered whole
+    /// first. Only identity-encoded public 200s; a body that errors, is cut short or grows
+    /// past the object cap is served but never stored. Empty = off.
+    #[arg(long = "page-cache-stream-fill-vhosts", default_value = "")]
+    stream_fill_vhosts: String,
     /// (W-TinyLFU) Base admission bar: minimum frequency a cacheable response must show before it
     /// is STORED. 2 = store on the 2nd sighting (miss-miss-hit; rejects the long-tail of
     /// one-hit-wonders — the default). 1 = store on the 1st sighting (miss-hit; cache everything —
@@ -689,7 +728,7 @@ fn init_logging(root: &std::path::Path) -> (LogReloadHandle, hj_log::ErrorLogger
     // keep_days=30 (unlike access/php-slow at 7): errors are low-volume but
     // high-value — postmortems reach back weeks, so they get the deeper window.
     let err_logger = hj_log::ErrorLogger::spawn(
-        root.join("logs/httpjet_error.log"),
+        state::redirect_log_path(&root.join("logs/httpjet_error.log")),
         20 * 1024 * 1024,
         30,
         true,
@@ -734,11 +773,11 @@ fn split_csv(s: &str) -> Vec<String> {
 
 /// Load + prepare a page-cache dict from `path`; `role` (a vhost name, or "fallback") is only for
 /// the log line. `None` on a missing/unreadable/empty file — logged, never fatal.
-fn load_page_dict(path: &str, role: &str) -> Option<Arc<hj_compress::PageDict>> {
+fn load_page_dict(path: &str, role: &str, level: i32) -> Option<Arc<hj_compress::PageDict>> {
     match std::fs::read(path) {
-        Ok(bytes) => match hj_compress::PageDict::new(bytes, hj_compress::DEFAULT_DICT_LEVEL) {
+        Ok(bytes) => match hj_compress::PageDict::new(bytes, level) {
             Some(d) => {
-                tracing::info!(path = %path, role = %role, dict_bytes = d.raw_len(), generation = d.generation(), "page-cache dedup dictionary loaded");
+                tracing::info!(path = %path, role = %role, level, dict_bytes = d.raw_len(), generation = d.generation(), "page-cache dedup dictionary loaded");
                 Some(Arc::new(d))
             }
             None => {
@@ -751,6 +790,40 @@ fn load_page_dict(path: &str, role: &str) -> Option<Arc<hj_compress::PageDict>> 
             None
         }
     }
+}
+
+/// Parse `--page-cache-dict-level`: `vhost=level` pairs, level 1-19. Vhost names are lowercased
+/// to match the registry.
+fn parse_dict_levels(spec: &str) -> Result<HashMap<String, i32>, String> {
+    let mut levels = HashMap::new();
+    for entry in split_csv(spec) {
+        let (vhost, level) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("{entry:?}: expected vhost=level"))?;
+        let vhost = vhost.trim().to_ascii_lowercase();
+        let level: i32 = level
+            .trim()
+            .parse()
+            .map_err(|_| format!("{entry:?}: level is not a number"))?;
+        if vhost.is_empty() || !(1..=19).contains(&level) {
+            return Err(format!(
+                "{entry:?}: expected a vhost and a level from 1 to 19"
+            ));
+        }
+        levels.insert(vhost, level);
+    }
+    Ok(levels)
+}
+
+/// Parse `--page-cache-opt-in-status`: only 303, 404 and 410 may be admitted this way.
+fn parse_opt_in_status(spec: &str) -> Result<Vec<u16>, String> {
+    split_csv(spec)
+        .into_iter()
+        .map(|code| match code.parse::<u16>() {
+            Ok(status @ (303 | 404 | 410)) => Ok(status),
+            _ => Err(format!("{code:?}: only 303, 404 and 410 may be opted in")),
+        })
+        .collect()
 }
 
 /// httpjet's OWN persistent file-tier root when the operator explicitly asks for
@@ -827,6 +900,12 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     };
 
     let mut cfg = hj_config::load(root)?;
+
+    uring::configure_trusted_proxy_idle(
+        args.trusted_proxy_idle_secs,
+        args.trusted_proxy_idle_max_conns,
+    );
+    hj_tls::configure_session_tickets(args.tls_session_tickets);
 
     if args.no_core_pinning {
         uring::CORE_PINNING.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1107,9 +1186,21 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // that entry (bodies stored as identity) — never fatal. Held behind an Arc on ServerState.
         // Loaded BEFORE the store is built: the store's boot scan needs the dict GENERATIONS to
         // keep persisted dict-compressed bodies.
+        let dict_levels = parse_dict_levels(&args.page_cache.dict_level)
+            .map_err(|e| anyhow::anyhow!("--page-cache-dict-level: {e}"))?;
+        let opt_in_status = parse_opt_in_status(&args.page_cache.opt_in_status)
+            .map_err(|e| anyhow::anyhow!("--page-cache-opt-in-status: {e}"))?;
+        let opt_in_303_prefixes = split_csv(&args.page_cache.opt_in_303_prefixes);
+        if let Some(bad) = opt_in_303_prefixes.iter().find(|p| !p.starts_with('/')) {
+            anyhow::bail!("--page-cache-303-prefixes: {bad:?} must start with '/'");
+        }
         let page_cache_dicts: Arc<hj_compress::PageDictRegistry> = if args.page_cache.enabled {
             let fallback = if !args.page_cache.dict.trim().is_empty() {
-                load_page_dict(args.page_cache.dict.trim(), "fallback")
+                load_page_dict(
+                    args.page_cache.dict.trim(),
+                    "fallback",
+                    hj_compress::DEFAULT_DICT_LEVEL,
+                )
             } else {
                 None
             };
@@ -1118,7 +1209,11 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 match entry.split_once('=') {
                     Some((vhost, path)) if !vhost.trim().is_empty() && !path.trim().is_empty() => {
                         let vhost = vhost.trim().to_ascii_lowercase();
-                        if let Some(d) = load_page_dict(path.trim(), &vhost) {
+                        let level = dict_levels
+                            .get(&vhost)
+                            .copied()
+                            .unwrap_or(hj_compress::DEFAULT_DICT_LEVEL);
+                        if let Some(d) = load_page_dict(path.trim(), &vhost, level) {
                             by_vhost.insert(vhost, d);
                         }
                     }
@@ -1171,10 +1266,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                     cc.default_private_ttl_secs as u64,
                 ),
                 cacheable_status: cc.cacheable_status.clone(),
+                opt_in_status: opt_in_status.clone(),
+                opt_in_303_prefixes: opt_in_303_prefixes.clone(),
                 cache_post: cc.enable_post_cache,
                 vary_cookies: split_csv(&args.page_cache.vary_cookies),
                 private_cookies: split_csv(&args.page_cache.private_cookies),
                 standard_cc_vhosts: split_csv(&args.page_cache.standard_vhosts),
+                stream_fill_vhosts: split_csv(&args.page_cache.stream_fill_vhosts),
                 default_stale_secs: args.page_cache.stale_default_secs,
                 default_sie_secs: args.page_cache.stale_if_error_default_secs,
                 max_stale_secs: args.page_cache.stale_max_secs,
@@ -2840,6 +2938,35 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opt_in_status_accepts_only_redirect_and_gone_codes() {
+        assert_eq!(
+            parse_opt_in_status("404, 410,303").unwrap(),
+            vec![404, 410, 303]
+        );
+        assert!(parse_opt_in_status("").unwrap().is_empty());
+        for bad in ["500", "302", "200", "abc"] {
+            assert!(parse_opt_in_status(bad).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn dict_levels_parse_and_reject_typos() {
+        let levels = parse_dict_levels(" MoonTimeNow.com=3 , windowsforum.com=12 ").unwrap();
+        assert_eq!(levels.get("moontimenow.com"), Some(&3));
+        assert_eq!(levels.get("windowsforum.com"), Some(&12));
+        assert!(parse_dict_levels("").unwrap().is_empty());
+        for bad in [
+            "moontimenow.com",
+            "moontimenow.com=fast",
+            "moontimenow.com=0",
+            "=3",
+            "a=20",
+        ] {
+            assert!(parse_dict_levels(bad).is_err(), "{bad} must be rejected");
+        }
+    }
 
     fn parsed_ktls_mode(args: &[&str]) -> uring::ktls_policy::KtlsMode {
         let cli = Cli::try_parse_from(["httpjet", "serve"].into_iter().chain(args.iter().copied()))

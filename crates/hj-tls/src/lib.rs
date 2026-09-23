@@ -950,7 +950,8 @@ fn build_server_config_inner(
     // connection, while a resumed CERTIFIED session carries the previously verified chain,
     // which also keeps `mtls_ok` (client-IP honoring) working across resumes.
     // `httpjet_tls_handshakes_{full,resumed}_total` observe the split in production.
-    config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
+    config.session_storage = new_session_storage();
+    config.send_tls13_tickets = session_tickets();
 
     Ok((
         Arc::new(config),
@@ -967,6 +968,36 @@ fn build_server_config_inner(
 /// entries (~a few hundred bytes each) comfortably exceeds a node's live + churning
 /// connection set, so the resumption hit rate stays high without unbounded growth.
 const TLS_SESSION_CACHE_SIZE: usize = 1 << 15;
+/// Session cache size with TLS 1.3 tickets off: only TLS 1.2 session IDs are stored then.
+const TLS12_SESSION_CACHE_SIZE: usize = 256;
+
+static SESSION_TICKETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
+
+/// TLS 1.3 tickets issued per full handshake by configs built after this call (rustls'
+/// default is 2). 0 stops minting them: a peer that never resumes (Cloudflare origin pull)
+/// otherwise costs two ticket records per handshake, and each stored session holds its
+/// verified client-cert chain in the cache.
+pub fn configure_session_tickets(tickets: usize) {
+    SESSION_TICKETS.store(tickets, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn session_tickets() -> usize {
+    SESSION_TICKETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn new_session_storage() -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
+    session_storage_for(session_tickets())
+}
+
+fn session_storage_for(
+    tickets: usize,
+) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
+    ServerSessionMemoryCache::new(if tickets == 0 {
+        TLS12_SESSION_CACHE_SIZE
+    } else {
+        TLS_SESSION_CACHE_SIZE
+    })
+}
 
 /// Build the listener's client-cert verifier from `clientVerify`.
 ///
@@ -1058,6 +1089,7 @@ impl KtlsConfigTemplate {
         config.alpn_protocols = self.alpn.clone();
         config.max_early_data_size = 0;
         config.session_storage = self.session_storage.clone();
+        config.send_tls13_tickets = session_tickets();
         config.key_log = key_log;
         #[cfg(feature = "ocsp")]
         if self.ocsp_no_resumption {
@@ -1111,8 +1143,7 @@ pub fn build_ktls_template_with_bootstrap(
     // `build_server_config_inner` (chain⇄ticket binding, single-use tickets, 0-RTT off).
     // kTLS's ticket/sequence accounting (see `server_config_with_key_log`) already
     // handles post-handshake NewSessionTicket records via its KeyUpdate path.
-    let session_storage: Arc<dyn rustls::server::StoresServerSessions + Send + Sync> =
-        ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
+    let session_storage = new_session_storage();
     let template = KtlsConfigTemplate {
         provider,
         verifier,
@@ -1200,7 +1231,7 @@ impl PreparedListenerTls {
         let quic = quic.then(|| {
             let mut config = tcp.clone();
             config.alpn_protocols = vec![b"h3".to_vec()];
-            config.session_storage = ServerSessionMemoryCache::new(TLS_SESSION_CACHE_SIZE);
+            config.session_storage = new_session_storage();
             Arc::new(config)
         });
         Ok(Self {
@@ -1260,7 +1291,45 @@ pub fn tls_params_from_parts(
     cipher: String,
     leaf: Option<&CertificateDer<'_>>,
 ) -> TlsParams {
-    TlsParams::new(protocol, cipher, leaf.and_then(parse_client_cert))
+    let Some(leaf) = leaf else {
+        return TlsParams::new(protocol, cipher, None);
+    };
+    {
+        let memo = TLS_PARAMS_MEMO.lock();
+        if let Some(m) = memo.iter().find(|m| {
+            m.protocol == protocol && m.cipher == cipher && m.leaf.as_slice() == leaf.as_ref()
+        }) {
+            return m.params.clone();
+        }
+    }
+    let params = TlsParams::new(protocol, cipher.clone(), parse_client_cert(leaf));
+    let mut memo = TLS_PARAMS_MEMO.lock();
+    if memo.len() >= TLS_PARAMS_MEMO_CAP {
+        memo.remove(0);
+    }
+    memo.push(TlsParamsMemo {
+        protocol,
+        cipher,
+        leaf: leaf.as_ref().to_vec(),
+        params: params.clone(),
+    });
+    params
+}
+
+/// Per-connection TLS parameters for recently seen client certificates. Every Cloudflare
+/// origin-pull connection presents the same leaf, and parsing it (x509 decode, two DN
+/// renders, two timestamps) ran once per handshake. Keyed by the exact leaf DER bytes plus
+/// protocol and cipher, so a hit is the value a fresh parse would build. Only certificates
+/// the verifier accepted get here.
+static TLS_PARAMS_MEMO: parking_lot::Mutex<Vec<TlsParamsMemo>> =
+    parking_lot::Mutex::new(Vec::new());
+const TLS_PARAMS_MEMO_CAP: usize = 8;
+
+struct TlsParamsMemo {
+    protocol: &'static str,
+    cipher: String,
+    leaf: Vec<u8>,
+    params: TlsParams,
 }
 
 /// Parse a verified client leaf certificate (DER) into a [`ClientCert`].
@@ -2536,6 +2605,62 @@ mod tests {
 mod resumption_tests {
     use super::*;
     use crate::tests::{base_server, ensure_provider, gen_cert, tmpdir, write_tmp};
+
+    /// A repeat client certificate reuses the TlsParams built for it; a different leaf or
+    /// cipher gets its own, and every value equals a fresh parse.
+    #[test]
+    fn repeat_client_cert_reuses_its_tls_params() {
+        let der = |name: &str| {
+            rcgen::generate_simple_self_signed(vec![name.to_string()])
+                .expect("generate cert")
+                .cert
+                .der()
+                .clone()
+        };
+        let (a, b) = (der("memo-a.example"), der("memo-b.example"));
+        let cipher = "TEST_MEMO_CIPHER".to_string();
+        let first = tls_params_from_parts("TLSv1.3", cipher.clone(), Some(&a));
+        let again = tls_params_from_parts("TLSv1.3", cipher.clone(), Some(&a));
+        assert!(
+            std::ptr::eq(&*first, &*again),
+            "repeat leaf reuses the memo"
+        );
+        let fresh = parse_client_cert(&a).expect("parse");
+        let got = first.client_cert.as_ref().expect("client cert");
+        assert_eq!(got.subject_dn, fresh.subject_dn);
+        assert_eq!(got.serial_hex, fresh.serial_hex);
+        assert_eq!(got.not_after, fresh.not_after);
+
+        let other = tls_params_from_parts("TLSv1.3", cipher.clone(), Some(&b));
+        assert!(!std::ptr::eq(&*first, &*other));
+        assert_ne!(
+            other.client_cert.as_ref().unwrap().serial_hex,
+            got.serial_hex
+        );
+        let other_cipher = tls_params_from_parts("TLSv1.3", "TEST_MEMO_OTHER".into(), Some(&a));
+        assert!(!std::ptr::eq(&*first, &*other_cipher));
+        assert_eq!(other_cipher.cipher, "TEST_MEMO_OTHER");
+        assert!(
+            tls_params_from_parts("TLSv1.3", cipher, None)
+                .client_cert
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn session_cache_shrinks_when_tickets_are_off() {
+        use rustls::server::StoresServerSessions;
+        let fill = |store: &Arc<dyn StoresServerSessions + Send + Sync>| {
+            for i in 0..1000u32 {
+                store.put(i.to_le_bytes().to_vec(), vec![0; 8]);
+            }
+            (0..1000u32)
+                .filter(|i| store.get(&i.to_le_bytes()).is_some())
+                .count()
+        };
+        assert!(fill(&session_storage_for(0)) <= TLS12_SESSION_CACHE_SIZE);
+        assert_eq!(fill(&session_storage_for(2)), 1000);
+    }
 
     /// (#301) The depth-limited verifier memoizes POSITIVE chain verdicts by
     /// exact DER bytes: the second handshake with the same chain skips webpki

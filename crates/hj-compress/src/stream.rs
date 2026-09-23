@@ -28,8 +28,11 @@ use http_body_util::BodyExt;
 
 use std::io::{self, Write};
 
+use std::sync::{Mutex, PoisonError};
+
 use brotli::CompressorWriter as BrotliCompressor;
-use zstd::stream::write::Encoder as ZstdEncoder;
+use zstd::stream::raw::{Encoder as RawZstdEncoder, Operation};
+use zstd::stream::zio::Writer as ZioWriter;
 
 use crate::encoding::{Encoding, Levels};
 
@@ -69,21 +72,73 @@ impl BlockEncoder for GzipEnc {
     }
 }
 
-struct ZstdEnc(ZstdEncoder<'static, Vec<u8>>);
+/// zstd contexts reused across streamed responses. A fresh streaming context at the egress
+/// level allocates a multi-MiB window buffer and zeroes its match tables, and under the
+/// prod allocator settings those pages are decommitted on free and faulted back in for the
+/// next response. Global (not per-thread) and small: streamed responses are a few per second,
+/// and a per-thread pool would keep a multi-MiB context resident on every runtime thread.
+static ZSTD_STREAM_POOL: Mutex<Vec<(i32, RawZstdEncoder<'static>)>> = Mutex::new(Vec::new());
+const ZSTD_STREAM_POOL_CAP: usize = 4;
+
+fn take_zstd_stream_encoder(level: i32) -> io::Result<RawZstdEncoder<'static>> {
+    let pooled = {
+        let mut pool = ZSTD_STREAM_POOL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        pool.iter()
+            .position(|(l, _)| *l == level)
+            .map(|i| pool.swap_remove(i).1)
+    };
+    match pooled {
+        Some(enc) => Ok(enc),
+        None => RawZstdEncoder::new(level),
+    }
+}
+
+/// Return a context whose frame finished cleanly; `reinit` resets the session and keeps the
+/// level. One dropped mid-stream (client gone) is simply freed.
+fn return_zstd_stream_encoder(level: i32, mut enc: RawZstdEncoder<'static>) {
+    if enc.reinit().is_err() {
+        return;
+    }
+    let mut pool = ZSTD_STREAM_POOL
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if pool.len() < ZSTD_STREAM_POOL_CAP {
+        pool.push((level, enc));
+    }
+}
+
+/// `zio::Writer` over a pooled raw encoder: the same pairing `zstd::stream::write::Encoder`
+/// wraps, so the frames are identical, but `into_inner` hands the context back at the end.
+struct ZstdEnc {
+    writer: Option<ZioWriter<Vec<u8>, RawZstdEncoder<'static>>>,
+    level: i32,
+}
 impl BlockEncoder for ZstdEnc {
     fn write_block(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
-        self.0.write_all(buf)?;
-        self.0.flush()?;
-        let out = std::mem::take(self.0.get_mut());
+        let w = self
+            .writer
+            .as_mut()
+            .expect("zstd stream writer is present until finish");
+        w.write_all(buf)?;
+        w.flush()?;
+        let out = std::mem::take(w.writer_mut());
         // `take` left the encoder's sink at zero capacity; pre-grow it so the NEXT
         // streamed frame doesn't reallocate from scratch (each PHP DATA frame would
         // otherwise force a fresh Vec). Capped at 16 KiB to bound over-allocation.
-        self.0.get_mut().reserve(buf.len().min(16 * 1024));
+        w.writer_mut().reserve(buf.len().min(16 * 1024));
         Ok(out)
     }
-    fn finish(self: Box<Self>) -> io::Result<Vec<u8>> {
-        let ZstdEnc(enc) = *self;
-        enc.finish()
+    fn finish(mut self: Box<Self>) -> io::Result<Vec<u8>> {
+        let mut w = self
+            .writer
+            .take()
+            .expect("zstd stream writer is present until finish");
+        w.finish()?;
+        let (sink, enc) = w.into_inner();
+        return_zstd_stream_encoder(self.level, enc);
+        Ok(sink)
     }
 }
 
@@ -127,6 +182,9 @@ pub struct CompressStream {
     /// (#326) Upstream bytes accumulated but not yet written to the encoder;
     /// flushed as one block once it reaches [`FLUSH_THRESHOLD`] or at EOF.
     pending_in: Vec<u8>,
+    /// Emit the first block as soon as the upstream stalls instead of waiting for a
+    /// full batch (see [`CompressStream::flush_first_when_idle`]).
+    flush_first_when_idle: bool,
 }
 
 impl CompressStream {
@@ -137,10 +195,14 @@ impl CompressStream {
                 Vec::new(),
                 Compression::new(levels.gzip),
             ))),
-            Encoding::Zstd => Box::new(ZstdEnc(
-                ZstdEncoder::new(Vec::new(), levels.zstd)
-                    .expect("zstd encoder init over a Vec sink is infallible for a valid level"),
-            )),
+            Encoding::Zstd => Box::new(ZstdEnc {
+                writer: Some(ZioWriter::new(
+                    Vec::new(),
+                    take_zstd_stream_encoder(levels.zstd)
+                        .expect("zstd encoder init is infallible for a valid level"),
+                )),
+                level: levels.zstd,
+            }),
             Encoding::Brotli => Box::new(BrotliEnc(BrotliCompressor::new(
                 Vec::new(),
                 4096,
@@ -152,7 +214,16 @@ impl CompressStream {
             inner,
             state: EncState::Active(encoder),
             pending_in: Vec::new(),
+            flush_first_when_idle: false,
         }
+    }
+
+    /// For a body the backend is still producing (`crate::ProgressiveBody`): its first
+    /// bytes usually carry the page head, which a browser acts on before the rest arrives,
+    /// so they go out when the upstream first stalls. Later blocks keep the batching.
+    pub fn flush_first_when_idle(mut self) -> Self {
+        self.flush_first_when_idle = true;
+        self
     }
 
     /// Box this into the workspace [`StreamBody`] type.
@@ -174,7 +245,24 @@ impl Body for CompressStream {
                 EncState::Active(_) => {
                     // Pull the next upstream frame.
                     match Pin::new(&mut self.inner).poll_frame(cx) {
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => {
+                            if !self.flush_first_when_idle || self.pending_in.is_empty() {
+                                return Poll::Pending;
+                            }
+                            let this = &mut *self;
+                            this.flush_first_when_idle = false;
+                            let EncState::Active(enc) = &mut this.state else {
+                                unreachable!("state is Active in this arm");
+                            };
+                            let written = enc.write_block(&this.pending_in);
+                            this.pending_in.clear();
+                            // The upstream registered the waker, so an empty write can wait.
+                            return match written {
+                                Ok(buf) if buf.is_empty() => Poll::Pending,
+                                Ok(buf) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(buf))))),
+                                Err(e) => Poll::Ready(Some(Err(Box::new(e) as BoxError))),
+                            };
+                        }
                         Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                         Poll::Ready(Some(Ok(frame))) => {
                             let data = match frame.into_data() {
@@ -235,11 +323,16 @@ impl Body for CompressStream {
                             if self.pending_in.len() < FLUSH_THRESHOLD {
                                 continue;
                             }
-                            let batch = std::mem::take(&mut self.pending_in);
-                            let EncState::Active(enc) = &mut self.state else {
+                            let this = &mut *self;
+                            this.flush_first_when_idle = false;
+                            let EncState::Active(enc) = &mut this.state else {
                                 unreachable!("state is Active in this arm");
                             };
-                            match enc.write_block(&batch) {
+                            // Compress in place and keep the batch buffer's capacity: the
+                            // next batch refills it instead of regrowing from zero.
+                            let written = enc.write_block(&this.pending_in);
+                            this.pending_in.clear();
+                            match written {
                                 Ok(buf) if buf.is_empty() => continue, // encoder buffering
                                 Ok(buf) => {
                                     return Poll::Ready(Some(Ok(Frame::data(Bytes::from(buf)))));
@@ -403,6 +496,26 @@ mod tests {
         multi_frame(Encoding::Brotli).await;
     }
 
+    /// (#497) Streamed zstd responses reuse pooled contexts. A reused context must start a clean
+    /// frame: back-to-back responses with the same input produce identical, decodable output
+    /// (and match a fresh `zstd::stream::write::Encoder`), and the pool stays capped.
+    #[tokio::test]
+    async fn pooled_zstd_stream_contexts_start_clean_frames() {
+        use futures_like::iter_body;
+        let chunks: Vec<Bytes> = (0..40)
+            .map(|i| Bytes::from(format!("<div class=\"row-{i}\">stream</div>").repeat(60)))
+            .collect();
+        let expected: Vec<u8> = chunks.iter().flat_map(|c| c.to_vec()).collect();
+        let first = compress(Encoding::Zstd, into_stream_body(iter_body(chunks.clone()))).await;
+        let second = compress(Encoding::Zstd, into_stream_body(iter_body(chunks.clone()))).await;
+        assert_eq!(unzstd(&first), expected);
+        assert_eq!(
+            first, second,
+            "a reused context must not carry state between frames"
+        );
+        assert!(ZSTD_STREAM_POOL.lock().unwrap().len() <= ZSTD_STREAM_POOL_CAP);
+    }
+
     /// (#326) Many small upstream frames must (a) still round-trip exactly, and
     /// (b) compress better than the old per-frame-flush shape did, because the
     /// input is now batched into >=FLUSH_THRESHOLD blocks before a flush.
@@ -429,7 +542,10 @@ mod tests {
                 Encoding::Gzip => {
                     Box::new(GzipEnc(GzEncoder::new(Vec::new(), Compression::new(6))))
                 }
-                Encoding::Zstd => Box::new(ZstdEnc(ZstdEncoder::new(Vec::new(), 3).unwrap())),
+                Encoding::Zstd => Box::new(ZstdEnc {
+                    writer: Some(ZioWriter::new(Vec::new(), RawZstdEncoder::new(3).unwrap())),
+                    level: 3,
+                }),
                 Encoding::Brotli => {
                     Box::new(BrotliEnc(BrotliCompressor::new(Vec::new(), 4096, 5, 19)))
                 }
@@ -556,6 +672,74 @@ mod tests {
                     "{enc:?}: trailer preserved"
                 );
             }
+        }
+    }
+
+    /// Yields `first`, stalls once, then yields `rest` and ends.
+    struct StallAfterFirst {
+        step: u8,
+        first: Bytes,
+        rest: Bytes,
+    }
+    impl Body for StallAfterFirst {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.step += 1;
+            match self.step {
+                1 => Poll::Ready(Some(Ok(Frame::data(self.first.clone())))),
+                2 => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                3 => Poll::Ready(Some(Ok(Frame::data(self.rest.clone())))),
+                _ => Poll::Ready(None),
+            }
+        }
+    }
+
+    #[test]
+    fn progressive_body_emits_its_first_block_when_the_upstream_stalls() {
+        use std::task::Waker;
+        let first = Bytes::from(b"<head>early</head>".repeat(100));
+        let rest = Bytes::from(b"<p>late body</p>".repeat(3000));
+        for (idle_flush, expect_early) in [(true, true), (false, false)] {
+            let inner = into_stream_body(StallAfterFirst {
+                step: 0,
+                first: first.clone(),
+                rest: rest.clone(),
+            });
+            let stream = CompressStream::new(inner, Encoding::Zstd, &Levels::default());
+            let mut body = if idle_flush {
+                stream.flush_first_when_idle()
+            } else {
+                stream
+            }
+            .boxed_stream();
+            let mut cx = Context::from_waker(Waker::noop());
+            let first_poll = Pin::new(&mut body).poll_frame(&mut cx);
+            assert_eq!(
+                matches!(first_poll, Poll::Ready(Some(Ok(_)))),
+                expect_early,
+                "idle_flush={idle_flush}: first block before the stall ends"
+            );
+            let mut out = match first_poll {
+                Poll::Ready(Some(Ok(f))) => f.into_data().unwrap().to_vec(),
+                _ => Vec::new(),
+            };
+            loop {
+                match Pin::new(&mut body).poll_frame(&mut cx) {
+                    Poll::Ready(Some(Ok(f))) => out.extend_from_slice(&f.into_data().unwrap()),
+                    Poll::Ready(None) => break,
+                    Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+                    Poll::Pending => panic!("only the first poll stalls"),
+                }
+            }
+            let expected: Vec<u8> = [first.as_ref(), rest.as_ref()].concat();
+            assert_eq!(unzstd(&out), expected, "idle_flush={idle_flush}");
         }
     }
 

@@ -103,10 +103,18 @@ pub(super) fn build_hit_response(
     // bytes and still fail closed on a missing/corrupt file.
     let (body, encoding) = match pick_variant(entry, accept_encoding) {
         Some((tok, b)) => (HitBody::Bytes(b), Some(tok)),
-        None => (
-            resolve_identity(entry, dict, store, stored, stored_file)?,
-            None,
-        ),
+        None => {
+            // The compress transform skips a ranged File body, so a client that accepts
+            // compression (every Cloudflare request) gets bytes it can encode; only an
+            // identity-only client streams the payload range straight from tmpfs.
+            let prefer_file = !DEFAULT_PRIORITY
+                .iter()
+                .any(|enc| accept_encoding.accepts(*enc));
+            (
+                resolve_identity(entry, dict, store, prefer_file, stored, stored_file)?,
+                None,
+            )
+        }
     };
     if body.is_empty() && body_required(entry.status) {
         tracing::error!(
@@ -185,6 +193,7 @@ fn resolve_identity(
     entry: &CachedResponse,
     dict: Option<&PageDict>,
     store: Option<&hj_pagecache::PageStore>,
+    prefer_file: bool,
     stored: impl FnOnce() -> Option<Bytes>,
     stored_file: impl FnOnce() -> Option<FileBody>,
 ) -> Option<HitBody> {
@@ -196,22 +205,23 @@ fn resolve_identity(
             .map(Bytes::from)
             .map(HitBody::Bytes);
     }
-    if entry.dict_gen == 0 {
-        if let Some(file) = stored_file() {
-            return Some(HitBody::File(file));
-        }
+    if entry.dict_gen == 0
+        && prefer_file
+        && let Some(file) = stored_file()
+    {
+        return Some(HitBody::File(file));
     }
-    identity_body(entry, stored()?, dict, store).map(HitBody::Bytes)
+    identity_body(entry, stored, dict, store).map(HitBody::Bytes)
 }
 
 fn identity_body(
     entry: &CachedResponse,
-    stored: Bytes,
+    stored: impl FnOnce() -> Option<Bytes>,
     dict: Option<&PageDict>,
     store: Option<&hj_pagecache::PageStore>,
 ) -> Option<Bytes> {
     if entry.dict_gen == 0 {
-        return Some(stored);
+        return stored();
     }
     // (#311) Decode ONCE per body generation into the tagged hot tier: without this,
     // every AE-mismatch identity serve ran a full-page zstd-dict decode (~50-150us
@@ -225,12 +235,15 @@ fn identity_body(
             return Some(warm);
         }
     }
+    // Fetched only now: a warm decoded identity above needs no compressed bytes at all.
+    let stored = stored()?;
     match dict.and_then(|d| d.decode(stored.as_ref(), MAX_DECODE as usize)) {
         Some(v) => {
+            let identity = Bytes::from(v);
             if let (Some(id), Some(store)) = (body_id, store) {
-                store.hot_identity_put(id, Bytes::from(v.clone()));
+                store.hot_identity_put(id, identity.clone());
             }
-            Some(Bytes::from(v))
+            Some(identity)
         }
         None => {
             tracing::error!(
@@ -332,10 +345,19 @@ pub(super) fn not_modified(entry: &CachedResponse, etag: &str, now: Instant) -> 
 /// semantically-equivalent representations under RFC 7232. Fast + deterministic + changes
 /// with content; computed once per cache fill, never per hit.
 pub(super) fn weak_etag(bytes: &[u8]) -> String {
+    // FNV-1a over 8-byte words: one serial multiply per word instead of per byte. The byte
+    // loop ran over every stored body (100+ KiB pages) and showed up in the store's CPU.
+    // Multiplying by the odd prime is a bijection, so any single-word change still changes h.
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in bytes {
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        h ^= u64::from_le_bytes(word.try_into().expect("chunks_exact(8)"));
+        h = h.wrapping_mul(PRIME);
+    }
+    for &b in words.remainder() {
         h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        h = h.wrapping_mul(PRIME);
     }
     format!("W/\"pc{h:016x}\"")
 }
@@ -396,7 +418,9 @@ fn fill_encodings(
     if cf_zstd_egress && !encs.contains(&Encoding::Zstd) {
         encs.push(Encoding::Zstd);
     }
-    if capsule_shell {
+    // Capsule shells also keep a gzip copy for direct gzip-only clients — unless every trusted
+    // (Cloudflare) request is forced to zstd, in which case nothing can ever select it.
+    if capsule_shell && !cf_zstd_egress {
         add_encoding_once(&mut encs, Encoding::Gzip);
     }
     encs
@@ -609,10 +633,11 @@ mod tests {
     }
 
     #[test]
-    fn fill_encodings_adds_gzip_for_capsule_shells() {
+    fn fill_encodings_adds_gzip_for_capsule_shells_unless_cf_forces_zstd() {
         assert_eq!(
             fill_encodings(true, AcceptEncoding::parse("zstd, br, gzip"), true),
-            vec![Encoding::Zstd, Encoding::Gzip]
+            vec![Encoding::Zstd],
+            "with forced zstd egress no request can select a gzip variant"
         );
         assert_eq!(
             fill_encodings(false, AcceptEncoding::parse("br, gzip"), true),
@@ -860,6 +885,27 @@ mod tests {
         }
     }
 
+    /// #495: the compress transform skips a ranged File body, so a client that accepts
+    /// compression must get identity BYTES when no stored variant matches, not the file range
+    /// (which used to reach Cloudflare uncompressed on the first hit of an identity-file entry).
+    #[test]
+    fn compressing_client_gets_identity_bytes_not_a_file_range() {
+        let e = entry_with_variants(b"identity-body", &[]);
+        let r = build_hit_response(
+            &e,
+            Instant::now(),
+            AcceptEncoding::parse("zstd, gzip"),
+            false,
+            None,
+            None,
+            || Some(Bytes::from_static(b"identity-body")),
+            || -> Option<FileBody> { panic!("a compressing client must not get the file range") },
+        )
+        .unwrap();
+        assert!(matches!(r.body(), Body::Full(b) if b.as_ref() == b"identity-body"));
+        assert!(r.headers().get(CONTENT_ENCODING).is_none());
+    }
+
     #[test]
     fn precompressed_hit_merges_into_backend_vary() {
         // The stored entry carries a backend `Vary: Cookie`; a precompressed hit must KEEP it
@@ -940,6 +986,41 @@ mod tests {
         );
     }
 
+    /// A warm decoded identity must be served without reading the stored (dict-compressed)
+    /// form at all: that read is a hot-tier promotion or a tmpfs read the serve never needs.
+    #[test]
+    fn warm_decoded_identity_skips_the_stored_body() {
+        let dir = std::env::temp_dir().join(format!(
+            "hj-hit-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut cfg = hj_pagecache::StoreConfig::default();
+        cfg.store_path = Some(dir.clone());
+        cfg.hot_mem_bytes = 1 << 20;
+        let store = hj_pagecache::PageStore::new(cfg);
+        let mut e = entry_with_variants(b"unused", &[]);
+        e.dict_gen = 42;
+        e.body = PageBody::File {
+            path: std::sync::Arc::from(dir.join("unused").as_path()),
+            len: 6,
+            disk_total: 6,
+            body_id: 7,
+        };
+        store.hot_identity_put(7, Bytes::from_static(b"identity"));
+        let identity = identity_body(
+            &e,
+            || panic!("the stored body was fetched although the decoded identity was warm"),
+            None,
+            Some(&store),
+        );
+        assert_eq!(identity.as_deref(), Some(&b"identity"[..]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn build_hit_fails_closed_on_empty_200() {
         // An empty-bodied 200 (a mis-stored render) must never be served — it would blank the page.
@@ -1000,6 +1081,16 @@ mod tests {
         assert_eq!(weak_etag(b"hello world"), weak_etag(b"hello world"));
         assert_ne!(weak_etag(b"hello world"), weak_etag(b"hello worle"));
         assert!(weak_etag(b"x").starts_with("W/\"pc"));
+        // Every byte position (word bodies and the tail) and every bit must reach the tag.
+        let base = b"0123456789abcdefXYZ".to_vec();
+        let tag = weak_etag(&base);
+        for i in 0..base.len() {
+            for bit in 0..8 {
+                let mut changed = base.clone();
+                changed[i] ^= 1 << bit;
+                assert_ne!(weak_etag(&changed), tag, "byte {i} bit {bit}");
+            }
+        }
     }
 
     #[test]

@@ -558,7 +558,7 @@ pub(crate) async fn fast_serve(
             .get(http::header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok());
         if let lscache::CacheOutcome::Hit(mut resp) =
-            lscache::cache_lookup(state, &ctx, &cc, inm, false, None)
+            lscache::cache_lookup_fast_path(state, &ctx, &cc, inm)
         {
             apply_response_transforms(state, &ctx, &mut resp).await;
             state.telemetry.record_cache_hit(peer_ip.is_loopback());
@@ -2284,7 +2284,11 @@ fn banned_resolved_authority(addrs: &[std::net::SocketAddr]) -> Option<String> {
 }
 
 /// Resolve a `[P]` authority (bounded), returning the addresses or a refusal.
+/// A literal `ip:port` authority is parsed in place (no blocking-pool hop).
 async fn resolve_p_target_authority(authority: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    if let Ok(addr) = authority.parse::<std::net::SocketAddr>() {
+        return Ok(vec![addr]);
+    }
     let authority = authority.to_string();
     match tokio::time::timeout(
         std::time::Duration::from_secs(3),
@@ -2302,62 +2306,73 @@ async fn resolve_p_target_authority(authority: &str) -> Result<Vec<std::net::Soc
     }
 }
 
-/// Check if a `[P]` authority matches any operator-configured external processor.
-fn matches_configured_ext_processor(
+/// The address to dial when a `[P]` authority names an operator-declared backend
+/// (a global or vhost extProcessor, including its extra load-balance addresses, or a
+/// vhost websocket map). A literal backend matches a resolved address exactly and
+/// that exact address is dialed; a hostname backend matches only when the `[P]`
+/// authority names it verbatim. No resolution happens here: this runs on every
+/// `[P]` request, and a blocking lookup would stall the async worker.
+fn operator_target_addr(
     global_ext: &std::collections::HashMap<String, hj_core::config::ExtProcessor>,
     vhost_ext: &[hj_core::config::ExtProcessor],
+    websockets: &[hj_core::config::WebSocketMap],
     target_authority: &str,
     addrs: &[std::net::SocketAddr],
-) -> bool {
+) -> Option<std::net::SocketAddr> {
     use hj_core::config::ExtAddress;
 
-    let matches_ep = |ep: &hj_core::config::ExtProcessor| -> bool {
-        match &ep.address {
-            ExtAddress::Tcp(sa) => {
-                target_authority == sa.to_string() || addrs.contains(sa)
-            }
-            ExtAddress::HostPort(hp) => {
-                if target_authority.eq_ignore_ascii_case(hp) {
-                    return true;
-                }
-                if let Ok(ep_addrs) = std::net::ToSocketAddrs::to_socket_addrs(hp) {
-                    for ep_addr in ep_addrs {
-                        if addrs.contains(&ep_addr) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            }
-            ExtAddress::Uds(_) => false,
-        }
+    let by_literal = |sa: std::net::SocketAddr| addrs.contains(&sa).then_some(sa);
+    let by_host_port = |hp: &str| match hp.parse::<std::net::SocketAddr>() {
+        Ok(sa) => by_literal(sa),
+        Err(_) => target_authority
+            .eq_ignore_ascii_case(hp)
+            .then(|| addrs.first().copied())
+            .flatten(),
+    };
+    let by_address = |address: &ExtAddress| match address {
+        ExtAddress::Tcp(sa) => by_literal(*sa),
+        ExtAddress::HostPort(hp) => by_host_port(hp),
+        ExtAddress::Uds(_) => None,
+    };
+    let by_processor = |ep: &hj_core::config::ExtProcessor| {
+        std::iter::once(&ep.address)
+            .chain(ep.extra_addresses.iter())
+            .find_map(by_address)
     };
 
-    global_ext.values().any(matches_ep) || vhost_ext.iter().any(matches_ep)
+    global_ext
+        .values()
+        .chain(vhost_ext.iter())
+        .find_map(by_processor)
+        .or_else(|| websockets.iter().find_map(|ws| by_host_port(&ws.address)))
 }
 
-/// Check if a `[P]` authority resolves to an operator-configured backend.
+/// Screen a rewrite `[P]` authority and return the single address the proxy must dial.
 ///
-/// Operator configuration (extProcessors, websocket endpoints) explicitly declares
-/// trusted backends that may legitimately reside on the local trust plane (e.g. mcp-api
-/// on 127.0.0.1:8002).
-fn is_configured_operator_target(
+/// Loopback/unspecified/link-local addresses reach the raw-peer-loopback-gated control
+/// plane, so they are refused unless the authority names an operator-declared backend
+/// (e.g. mcp-api on 127.0.0.1:8002). The caller pins the dial to the returned address:
+/// letting the proxy resolve the name again would let a rebinding name answer the screen
+/// with a public address and the dial with 127.0.0.1.
+async fn screen_p_target(
     state: &ServerState,
     ctx: &ReqCtx,
-    target_authority: &str,
-    addrs: &[std::net::SocketAddr],
-) -> bool {
-    matches_configured_ext_processor(
+    authority: &str,
+) -> Result<std::net::SocketAddr, String> {
+    let addrs = resolve_p_target_authority(authority).await?;
+    if let Some(addr) = operator_target_addr(
         &state.ext_by_name,
         &ctx.vhost.extra_ext_processors,
-        target_authority,
-        addrs,
-    ) || ctx.vhost.websockets.iter().any(|ws| {
-        target_authority.eq_ignore_ascii_case(&ws.address)
-            || std::net::ToSocketAddrs::to_socket_addrs(&ws.address)
-                .map(|it| it.into_iter().any(|a| addrs.contains(&a)))
-                .unwrap_or(false)
-    })
+        &ctx.vhost.websockets,
+        authority,
+        &addrs,
+    ) {
+        return Ok(addr);
+    }
+    if let Some(why) = banned_resolved_authority(&addrs) {
+        return Err(why);
+    }
+    Ok(addrs[0])
 }
 
 #[cfg(test)]
@@ -2400,13 +2415,11 @@ mod proxy_screen_tests {
         assert!(banned_resolved_authority(&addrs).is_some());
     }
 
-    #[test]
-    fn operator_configured_target_matches() {
-        use hj_core::config::{ExtAddress, ExtKind, ExtProcessor};
-        let proc = ExtProcessor {
-            name: "mcp-api".into(),
-            kind: ExtKind::Proxy,
-            address: ExtAddress::Tcp(addr("127.0.0.1", 8002)),
+    fn ext(name: &str, address: hj_core::config::ExtAddress) -> hj_core::config::ExtProcessor {
+        hj_core::config::ExtProcessor {
+            name: name.into(),
+            kind: hj_core::config::ExtKind::Proxy,
+            address,
             extra_addresses: Vec::new(),
             load_balance: Default::default(),
             client_cert_file: None,
@@ -2422,21 +2435,106 @@ mod proxy_screen_tests {
             backlog: 0,
             instances: 0,
             run_on_startup: 0,
-        };
+        }
+    }
+
+    #[test]
+    fn operator_backend_is_dialed_at_its_declared_address() {
+        use hj_core::config::ExtAddress;
         let mut map = std::collections::HashMap::new();
-        map.insert("mcp-api".to_string(), proc);
-        assert!(matches_configured_ext_processor(
-            &map,
-            &[],
-            "127.0.0.1:8002",
-            &[addr("127.0.0.1", 8002)],
-        ));
-        assert!(!matches_configured_ext_processor(
-            &map,
-            &[],
-            "127.0.0.1:9090",
-            &[addr("127.0.0.1", 9090)],
-        ));
+        map.insert(
+            "mcp-api".to_string(),
+            ext("mcp-api", ExtAddress::Tcp(addr("127.0.0.1", 8002))),
+        );
+        assert_eq!(
+            operator_target_addr(&map, &[], &[], "127.0.0.1:8002", &[addr("127.0.0.1", 8002)]),
+            Some(addr("127.0.0.1", 8002))
+        );
+        assert_eq!(
+            operator_target_addr(&map, &[], &[], "127.0.0.1:9090", &[addr("127.0.0.1", 9090)]),
+            None
+        );
+        // A name answering {link-local, backend} is exempt only for the backend
+        // address, and that is the one dialed.
+        assert_eq!(
+            operator_target_addr(
+                &map,
+                &[],
+                &[],
+                "rebind.example:8002",
+                &[addr("169.254.169.254", 8002), addr("127.0.0.1", 8002)],
+            ),
+            Some(addr("127.0.0.1", 8002))
+        );
+    }
+
+    #[test]
+    fn hostname_backends_match_verbatim_without_resolution() {
+        use hj_core::config::{ExtAddress, WebSocketMap};
+        let vhost_ext = [ext(
+            "api",
+            ExtAddress::HostPort("backend.internal:8080".into()),
+        )];
+        let resolved = [addr("10.0.0.5", 8080)];
+        assert_eq!(
+            operator_target_addr(
+                &Default::default(),
+                &vhost_ext,
+                &[],
+                "BACKEND.internal:8080",
+                &resolved
+            ),
+            Some(addr("10.0.0.5", 8080))
+        );
+        assert_eq!(
+            operator_target_addr(
+                &Default::default(),
+                &vhost_ext,
+                &[],
+                "other.internal:8080",
+                &resolved
+            ),
+            None
+        );
+        let ws = [WebSocketMap {
+            uri: "/ws".into(),
+            address: "127.0.0.1:8003".into(),
+        }];
+        assert_eq!(
+            operator_target_addr(
+                &Default::default(),
+                &[],
+                &ws,
+                "127.0.0.1:8003",
+                &[addr("127.0.0.1", 8003)]
+            ),
+            Some(addr("127.0.0.1", 8003))
+        );
+    }
+
+    #[test]
+    fn load_balance_peers_count_as_operator_backends() {
+        use hj_core::config::ExtAddress;
+        let mut pool = ext("lb", ExtAddress::Tcp(addr("127.0.0.1", 8000)));
+        pool.extra_addresses = vec![ExtAddress::Tcp(addr("127.0.0.1", 8001))];
+        let mut map = std::collections::HashMap::new();
+        map.insert("lb".to_string(), pool);
+        assert_eq!(
+            operator_target_addr(&map, &[], &[], "127.0.0.1:8001", &[addr("127.0.0.1", 8001)]),
+            Some(addr("127.0.0.1", 8001))
+        );
+    }
+
+    #[tokio::test]
+    async fn literal_authorities_resolve_in_place() {
+        assert_eq!(
+            resolve_p_target_authority("203.0.113.9:80").await,
+            Ok(vec![addr("203.0.113.9", 80)])
+        );
+        assert_eq!(
+            resolve_p_target_authority("[::1]:8080").await,
+            Ok(vec![addr("::1", 8080)])
+        );
     }
 }
 
@@ -2502,7 +2600,7 @@ fn spawn_revalidate(
         // `sub` carries the original request's host header, so this equals the triggering
         // request's host; recomputed here (off the hot path — revalidation only).
         let sub_host = lscache::request_host(&sub, &ctx);
-        let _ = dispatch(&state, host_foreign, sub_host, &mut ctx, sub).await;
+        drain_response(dispatch(&state, host_foreign, sub_host, &mut ctx, sub).await).await;
     });
 }
 
@@ -2527,8 +2625,17 @@ fn spawn_capsule_revalidate(
     tokio::spawn(async move {
         let _guard = guard;
         let sub_host = lscache::request_host(&sub, &ctx);
-        let _ = dispatch(&state, host_foreign, sub_host, &mut ctx, sub).await;
+        drain_response(dispatch(&state, host_foreign, sub_host, &mut ctx, sub).await).await;
     });
+}
+
+/// Read a background render's response to the end: a page-cache miss stored while it streams
+/// (`--page-cache-stream-fill-vhosts`) commits only once its body has been fully read.
+async fn drain_response(resp: Response) {
+    if let Body::Stream(mut body) = resp.into_body() {
+        use http_body_util::BodyExt;
+        while let Some(Ok(_)) = body.frame().await {}
+    }
 }
 
 async fn dispatch(
@@ -3070,29 +3177,13 @@ async fn dispatch(
                 tracing::warn!(request_id = %ctx.request_id, target = %target_url, "[P] target refused: unix transports are reserved for operator config");
                 error_page(StatusCode::FORBIDDEN)
             }
-            Ok(target) => {
-                // Address screen (resolution is I/O): refuse a `[P]` authority that
-                // lands on loopback/unspecified/link-local — any of those reaches a
-                // raw-peer-loopback-gated control plane from a request-controlled URL.
-                // Config-declared proxy targets (extProcessors, websocket maps) are
-                // operator-trusted and bypass this screen.
-                let why = match resolve_p_target_authority(&target.authority).await {
-                    Ok(addrs)
-                        if is_configured_operator_target(
-                            state,
-                            ctx,
-                            &target.authority,
-                            &addrs,
-                        ) =>
-                    {
-                        None
+            Ok(mut target) => {
+                match screen_p_target(state, ctx, &target.authority).await {
+                    Ok(addr) => target.pin_tcp_addr(addr),
+                    Err(why) => {
+                        tracing::warn!(request_id = %ctx.request_id, target = %target_url, why = %why, "[P] target refused");
+                        return error_page(StatusCode::FORBIDDEN);
                     }
-                    Ok(addrs) => banned_resolved_authority(&addrs),
-                    Err(e) => Some(e),
-                };
-                if let Some(why) = why {
-                    tracing::warn!(request_id = %ctx.request_id, target = %target_url, why = %why, "[P] target refused");
-                    return error_page(StatusCode::FORBIDDEN);
                 }
                 let h = ProxyHandler {
                     proxy: state.proxy.clone(),
@@ -3144,8 +3235,10 @@ async fn dispatch(
             // can never converge back to fresh (the homepage perpetual-stale loop). Rides to
             // lsphp as `$_SERVER['HJ_CACHE_REFRESH']`; unforgeable since a client header would
             // arrive as `HTTP_*` (see `hj_lsapi::cgi`).
-            ctx.env
-                .push(("HJ_CACHE_REFRESH".to_string(), "1".to_string()));
+            ctx.env.push((
+                hj_lsapi::cgi::CACHE_REFRESH_ENV.to_string(),
+                "1".to_string(),
+            ));
         }
         let inm = req
             .headers()
@@ -3297,7 +3390,7 @@ async fn dispatch(
             // (#2/#7) `.htaccess` Header directives still apply to a proxied
             // response, but NOT error documents — the body is upstream's.
             apply_response_headers_for_request(ctx, &chain, &rel_path, &orig_path, &mut resp);
-            return lscache::cache_store(state, ctx, &cc, resp).await;
+            return lscache::cache_store_leading(state, ctx, &cc, resp, &mut _sf_leader).await;
         }
         tracing::debug!(handler, "proxy context references unknown ext processor");
     }
@@ -3342,7 +3435,7 @@ async fn dispatch(
             }
             let mut resp = run_handler(handler.as_ref(), ctx, req).await;
             apply_response_headers_for_request(ctx, &chain, &rel_path, &orig_path, &mut resp);
-            return lscache::cache_store(state, ctx, &cc, resp).await;
+            return lscache::cache_store_leading(state, ctx, &cc, resp, &mut _sf_leader).await;
         }
         if let Some(registry) = state.lsapi.clone() {
             // Resolve this vhost's jail (config-gated + root-gated inside
@@ -3557,11 +3650,12 @@ async fn dispatch(
                     retry_kind,
                 );
             }
+            mark_php_backend_failure(&mut resp);
             finalize_response(
                 state, ctx, &chain, &rel_path, &orig_path, &cur_path, &mut resp,
             )
             .await;
-            return lscache::cache_store(state, ctx, &cc, resp).await;
+            return lscache::cache_store_leading(state, ctx, &cc, resp, &mut _sf_leader).await;
         }
         // The path resolved to a script handler (php/html), but no lsphp pool is
         // available (PHP disabled, or lsphp failed to start). NEVER fall through
@@ -4449,7 +4543,10 @@ fn unix_now() -> i64 {
 struct AuthSensitiveResponse;
 
 fn mark_auth_sensitive(has_authorization: bool, ctx: &ReqCtx, resp: &mut Response) {
-    if has_authorization || ctx.get_env("REMOTE_USER").is_some() {
+    if has_authorization
+        || ctx.get_env(hj_lsapi::cgi::AUTH_USER_ENV).is_some()
+        || ctx.get_env("REMOTE_USER").is_some()
+    {
         resp.extensions_mut().insert(AuthSensitiveResponse);
     }
 }
@@ -4659,6 +4756,22 @@ impl ResponseTransform for AltSvcTransform {
 /// error page. See `is_generated_error_body`.
 #[derive(Clone, Copy)]
 pub(super) struct GeneratedErrorPage;
+
+/// Marker on a generated 502/503/504 from a failed PHP (LSAPI) dispatch. A PHP
+/// `ErrorDocument` would render through the pool that just failed and wait out a second
+/// backend timeout; during a PHP outage that pushed the stale-if-error copy (applied
+/// later, in `cache_store`) past Cloudflare's origin timeout, so visitors got a 524
+/// instead of the retained page.
+#[derive(Clone, Copy)]
+pub(super) struct PhpBackendFailed;
+
+fn mark_php_backend_failure(resp: &mut Response) {
+    if matches!(resp.status().as_u16(), 502..=504)
+        && resp.extensions().get::<GeneratedErrorPage>().is_some()
+    {
+        resp.extensions_mut().insert(PhpBackendFailed);
+    }
+}
 
 fn error_page(status: StatusCode) -> Response {
     let reason = status.canonical_reason().unwrap_or("Error");
@@ -5179,6 +5292,62 @@ mod tests {
             fastcgi_handler_for_script(&ctx, std::path::Path::new("/srv/app.php")),
             None
         );
+    }
+
+    /// A background refresh discards its response, but a streamed page-cache miss stores only
+    /// when its body is read to the end, so the refresher must drain it.
+    #[tokio::test]
+    async fn background_refresh_reads_a_streamed_response_to_the_end() {
+        struct Tracked(u8, Arc<std::sync::atomic::AtomicBool>);
+        impl http_body::Body for Tracked {
+            type Data = bytes::Bytes;
+            type Error = hj_core::BoxError;
+            fn poll_frame(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>>
+            {
+                self.0 += 1;
+                std::task::Poll::Ready(if self.0 <= 2 {
+                    Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(b"x"))))
+                } else {
+                    self.1.store(true, std::sync::atomic::Ordering::Relaxed);
+                    None
+                })
+            }
+        }
+        use http_body_util::BodyExt;
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        drain_response(Response::new(Body::Stream(
+            Tracked(0, ended.clone()).boxed(),
+        )))
+        .await;
+        assert!(ended.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// Only httpjet's own 502/503/504 for a failed PHP dispatch is marked; PHP's own
+    /// error output and other statuses keep their normal ErrorDocument handling.
+    #[test]
+    fn php_backend_failure_marks_only_generated_gateway_errors() {
+        for (status, marked) in [
+            (StatusCode::BAD_GATEWAY, true),
+            (StatusCode::SERVICE_UNAVAILABLE, true),
+            (StatusCode::GATEWAY_TIMEOUT, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, false),
+            (StatusCode::NOT_FOUND, false),
+        ] {
+            let mut resp = error_page(status);
+            mark_php_backend_failure(&mut resp);
+            assert_eq!(
+                resp.extensions().get::<PhpBackendFailed>().is_some(),
+                marked,
+                "{status}"
+            );
+        }
+        let mut app_page = Response::new(Body::Full(bytes::Bytes::from_static(b"maintenance")));
+        *app_page.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+        mark_php_backend_failure(&mut app_page);
+        assert!(app_page.extensions().get::<PhpBackendFailed>().is_none());
     }
 
     #[test]

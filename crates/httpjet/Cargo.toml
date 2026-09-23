@@ -35,13 +35,13 @@ ktls = ["dep:ktls-sys", "dep:nix", "dep:aws-lc-rs"]
 [dependencies]
 hj-acme = { path = "../hj-acme", optional = true }
 futures-executor = { version = "0.3", optional = true }
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "metrics", "trace"], optional = true }
+opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "metrics", "trace"], optional = true }
 prost = { version = "0.14", optional = true }
-opentelemetry-http = { version = "0.32", default-features = false, optional = true }
+opentelemetry-http = { version = "0.33", default-features = false, optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
-opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"], optional = true }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"], optional = true }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls"], optional = true }
 sha2 = { workspace = true }
 subtle = "2.6"
 serde = { workspace = true }

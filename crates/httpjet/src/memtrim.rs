@@ -20,7 +20,6 @@ static THREAD_COLLECT_EPOCH: AtomicU64 = AtomicU64::new(0);
 static CLOSE_COLLECT_THRESHOLD_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_CLOSE_COLLECT_MS: AtomicU64 = AtomicU64::new(0);
 
-const DEFAULT_CLOSE_COLLECT_THRESHOLD_BYTES: u64 = 384 * 1024 * 1024;
 const CLOSE_COLLECT_MIN_INTERVAL_MS: u64 = 30_000;
 
 thread_local! {
@@ -95,13 +94,12 @@ pub fn collect_if_requested_on_thread() {
     });
 }
 
-pub fn configure_connection_close_trim(periodic_threshold_bytes: u64) {
-    let threshold = if periodic_threshold_bytes == 0 {
-        0
-    } else {
-        periodic_threshold_bytes.min(DEFAULT_CLOSE_COLLECT_THRESHOLD_BYTES)
-    };
-    CLOSE_COLLECT_THRESHOLD_BYTES.store(threshold, Ordering::Release);
+/// Arm the collect that follows a connection close with the same RSS+swap gate as the
+/// periodic trim. It used to be capped at 384 MiB, sized for a ~360 MiB process; with the
+/// page cache a healthy process holds 1-2 GiB, so the capped gate forced every runtime
+/// thread to collect (and re-fault what it released) every 30 s.
+pub fn configure_connection_close_trim(threshold_bytes: u64) {
+    CLOSE_COLLECT_THRESHOLD_BYTES.store(threshold_bytes, Ordering::Release);
 }
 
 pub fn disable_connection_close_trim() {

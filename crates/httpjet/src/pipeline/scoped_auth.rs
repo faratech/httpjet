@@ -48,7 +48,7 @@ pub(super) async fn enforce_chain(
             .await
             .unwrap_or(false);
             if valid {
-                ctx.set_env("REMOTE_USER", user);
+                ctx.set_env(hj_lsapi::cgi::AUTH_USER_ENV, user);
                 authenticated.push(realm);
                 return Ok(());
             }

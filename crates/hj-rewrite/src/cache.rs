@@ -39,6 +39,16 @@ struct Entry {
     parsed: Option<Arc<Htaccess>>,
     mtime: Option<SystemTime>,
     checked_at: Instant,
+    /// The file exists but could not be read, so `parsed` is the deny-all
+    /// sentinel standing in for rules we could not see. Re-read on every
+    /// revalidation instead of trusting an unchanged mtime: fixing permissions
+    /// (`chmod`) or recovering from a transient `read()` failure (EMFILE, EIO)
+    /// leaves the mtime untouched.
+    read_failed: bool,
+    /// The directory itself does not exist (or is not a directory), so neither
+    /// it nor anything beneath it can hold an access file: the chain walk stops
+    /// here. Re-checked on every revalidation, because the directory may appear.
+    dir_missing: bool,
 }
 
 /// Thread-safe cache of parsed `.htaccess` files, keyed by absolute directory.
@@ -64,6 +74,10 @@ impl Default for HtaccessCache {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn is_dir(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_dir())
 }
 
 /// The fail-closed stand-in for "this request must not be served": an
@@ -153,14 +167,22 @@ impl HtaccessCache {
             return vec![(docroot.to_path_buf(), deny_all_sentinel())];
         }
 
+        // A directory that does not exist ends the walk: nothing beneath it can hold an
+        // access file. Front-controller URLs (`/threads/slug.123/`) name directories that
+        // never exist, and walking (and memoizing) every such level used to fill the
+        // cache with one entry per URL.
         let mut cur = docroot.to_path_buf();
-        if let Some(h) = self.get_or_load_named(&cur, access_file_name) {
-            chain.push((cur.clone(), h));
-        }
-        for seg in rel.split('/').filter(|s| !s.is_empty()).take(dir_count) {
-            cur.push(seg);
-            if let Some(h) = self.get_or_load_named(&cur, access_file_name) {
+        let segs = rel.split('/').filter(|s| !s.is_empty()).take(dir_count);
+        for seg in std::iter::once(None).chain(segs.map(Some)) {
+            if let Some(seg) = seg {
+                cur.push(seg);
+            }
+            let (parsed, dir_missing) = self.load(&cur, access_file_name);
+            if let Some(h) = parsed {
                 chain.push((cur.clone(), h));
+            }
+            if dir_missing {
+                break;
             }
         }
         chain
@@ -179,6 +201,12 @@ impl HtaccessCache {
     /// so two vhosts that share a directory but use different access file names
     /// do not collide.
     pub fn get_or_load_named(&self, dir: &Path, access_file_name: &str) -> Option<Arc<Htaccess>> {
+        self.load(dir, access_file_name).0
+    }
+
+    /// [`get_or_load_named`](Self::get_or_load_named) plus whether `dir` itself is
+    /// missing (the chain walk stops there).
+    fn load(&self, dir: &Path, access_file_name: &str) -> (Option<Arc<Htaccess>>, bool) {
         let file = dir.join(access_file_name);
 
         // Fast path: within the revalidation window, trust the cache — no stat.
@@ -186,18 +214,22 @@ impl HtaccessCache {
         // insert below to avoid a same-shard deadlock.)
         if let Some(entry) = self.inner.get(&file) {
             if !self.revalidate_ttl.is_zero() && entry.checked_at.elapsed() < self.revalidate_ttl {
-                return entry.parsed.clone();
+                return (entry.parsed.clone(), entry.dir_missing);
             }
         }
 
         let cur_mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
 
         // Revalidate: if mtime is unchanged, refresh the check timestamp and reuse.
+        // A missing directory must still be missing: a newly created one may carry rules.
         {
             if let Some(mut entry) = self.inner.get_mut(&file) {
-                if entry.mtime == cur_mtime {
+                if entry.mtime == cur_mtime
+                    && !entry.read_failed
+                    && (!entry.dir_missing || !is_dir(dir))
+                {
                     entry.checked_at = Instant::now();
-                    return entry.parsed.clone();
+                    return (entry.parsed.clone(), entry.dir_missing);
                 }
             }
         }
@@ -207,6 +239,8 @@ impl HtaccessCache {
         // encoding) must not downgrade a protected directory to "no rules".
         let read_result =
             std::fs::read(&file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+        let read_failed = cur_mtime.is_some() && read_result.is_err();
+        let dir_missing = cur_mtime.is_none() && !is_dir(dir);
         let parsed = match (cur_mtime, read_result) {
             (Some(_), Ok(text)) => match Htaccess::parse(&text) {
                 Ok(h) => Some(Arc::new(h)),
@@ -224,7 +258,7 @@ impl HtaccessCache {
             // A present-but-unreadable file (EACCES, EISDIR, a raced unlink) is
             // NOT "absent": absent means no rules exist, while unreadable means
             // rules exist and we cannot know them — deny until it is readable
-            // again (same mtime still matches, so the sentinel self-heals).
+            // again (`read_failed` makes every revalidation retry the read).
             (Some(_), Err(e)) => {
                 tracing::warn!(path = %file.display(), error = %e, "unreadable .htaccess; failing closed");
                 Some(deny_all_sentinel())
@@ -246,13 +280,15 @@ impl HtaccessCache {
                     parsed: parsed.clone(),
                     mtime: cur_mtime,
                     checked_at: Instant::now(),
+                    read_failed,
+                    dir_missing,
                 },
             );
             if prev.is_none() {
                 self.count.fetch_add(1, Ordering::Relaxed);
             }
         }
-        parsed
+        (parsed, dir_missing)
     }
 
     /// Number of cached directory entries (for diagnostics/tests).

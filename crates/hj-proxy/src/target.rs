@@ -126,6 +126,17 @@ impl ProxyTarget {
         matches!(self.transport, TargetTransport::Uds(_))
     }
 
+    /// Dial exactly `addr` — an address the caller already screened — while keeping
+    /// [`Self::authority`] for the upstream `Host` and TLS SNI. Without this the dial
+    /// resolves the authority again, and a rebinding name can answer the screen with
+    /// one address and the dial with another. A unix transport is left unchanged.
+    pub fn pin_tcp_addr(&mut self, addr: std::net::SocketAddr) {
+        if matches!(self.transport, TargetTransport::Tcp(_)) {
+            self.transport = TargetTransport::Tcp(addr.to_string());
+            self.failover.clear();
+        }
+    }
+
     pub fn parse_url(url: &str) -> Result<ProxyTarget, TargetParseError> {
         let url = url.trim();
         if url.is_empty() {
@@ -375,6 +386,20 @@ mod tests {
         assert_eq!(t.path_and_query, "/tools.json");
         assert!(!t.is_tls());
         assert!(!t.is_websocket());
+    }
+
+    #[test]
+    fn pinned_target_dials_the_screened_address_but_keeps_the_authority() {
+        let mut t = ProxyTarget::parse_url("https://rebind.example/x").unwrap();
+        let addr: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        t.pin_tcp_addr(addr);
+        assert_eq!(t.transport, TargetTransport::Tcp("203.0.113.9:443".into()));
+        assert_eq!(t.authority, "rebind.example:443");
+        assert_eq!(t.pool_key(), "tcp:https://203.0.113.9:443");
+
+        let mut uds = ProxyTarget::parse_url("unix:/run/app.sock|/x").unwrap();
+        uds.pin_tcp_addr(addr);
+        assert!(uds.is_unix_transport());
     }
 
     #[test]

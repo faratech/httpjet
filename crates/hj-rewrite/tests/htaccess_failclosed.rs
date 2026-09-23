@@ -115,3 +115,45 @@ fn unreadable_access_file_fails_closed() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+/// Regression: the unreadable-file sentinel must heal once the file is readable
+/// again even when its mtime did not change — `chmod` and a transient `read()`
+/// failure (EMFILE, EIO) both leave the mtime untouched. Simulated with a
+/// directory at the access-file path replaced by a real file stamped with the
+/// directory's mtime (chmod 000 is no barrier to a root test run).
+#[test]
+fn unreadable_sentinel_heals_without_an_mtime_change() {
+    let dir = temp_dir("unreadable-heal");
+    let access = dir.join(".htaccess");
+    fs::create_dir(&access).unwrap();
+    let stuck_mtime = fs::metadata(&access).unwrap().modified().unwrap();
+
+    let cache = HtaccessCache::with_revalidate_ttl(Duration::from_secs(0));
+    let sentinel = cache
+        .get_or_load_named(&dir, ".htaccess")
+        .expect("unreadable access file yields the fail-closed sentinel");
+    assert!(sentinel.is_forbidden("/internal_data/config.php", "config.php"));
+
+    fs::remove_dir(&access).unwrap();
+    fs::write(&access, "Require all granted\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&access)
+        .unwrap()
+        .set_modified(stuck_mtime)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(&access).unwrap().modified().unwrap(),
+        stuck_mtime
+    );
+
+    let healed = cache
+        .get_or_load_named(&dir, ".htaccess")
+        .expect("readable file parses");
+    assert!(
+        !healed.is_forbidden("/internal_data/config.php", "config.php"),
+        "a now-readable access file must take effect even with an unchanged mtime"
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}

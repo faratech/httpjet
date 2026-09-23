@@ -202,7 +202,8 @@ impl<'a> CgiEnvBuilder<'a> {
         // `Authorization` header into them let ANY unauthenticated request forge
         // `$_SERVER['REMOTE_USER']` for apps that trust it. They are now emitted only
         // from an authenticated source: a VERIFIED TLS client certificate (see the
-        // SSL_CLIENT_* block below — apps check `SSL_CLIENT_VERIFY === 'SUCCESS'`).
+        // SSL_CLIENT_* block below — apps check `SSL_CLIENT_VERIFY === 'SUCCESS'`) or a
+        // Basic-auth realm the pipeline verified ([`AUTH_USER_ENV`], mapped below).
 
         // TLS / SSL_* vars (present on TLS/QUIC connections).
         if let Some(tls) = &ctx.tls {
@@ -370,6 +371,15 @@ impl<'a> CgiEnvBuilder<'a> {
         // Env set by rewrite [E=...] flags (exposed as $_SERVER in PHP too).
         // Borrowed from `ctx.env` (lives as long as `ctx`).
         for (k, v) in &ctx.env {
+            if k == AUTH_USER_ENV {
+                upsert(
+                    &mut env,
+                    Cow::Borrowed("REMOTE_USER"),
+                    Cow::Borrowed(v.as_str()),
+                );
+                upsert(&mut env, Cow::Borrowed("AUTH_TYPE"), Cow::Borrowed("Basic"));
+                continue;
+            }
             if ctx_env_override_denied(k) {
                 continue;
             }
@@ -452,7 +462,8 @@ impl<'a> CgiEnvBuilder<'a> {
 /// [`safe_extra_env_name`]; `ctx.env` (directory-authored: `.htaccess`
 /// authors, CMS plugins) bypassed that filter, so `[E=SCRIPT_FILENAME:...]`
 /// could re-point execution at an arbitrary file and `[E=REMOTE_ADDR:...]` /
-/// `[E=HTTPS:...]` could forge the server-computed identity vars PHP trusts.
+/// `[E=HTTPS:...]` / `SSL_CLIENT_VERIFY=SUCCESS` could forge the server-computed
+/// identity vars PHP trusts.
 ///
 /// Deliberately still overridable: `SCRIPT_NAME`/`QUERY_STRING` (the
 /// front-controller contract), `REDIRECT_*` (the #129 ErrorDocument
@@ -478,8 +489,25 @@ fn ctx_env_override_denied(name: &str) -> bool {
         "SERVER_PROTOCOL",
         "REQUEST_SCHEME",
     ];
-    DENIED.contains(&name) || name.starts_with("LSAPI_") || name.starts_with("HJ_")
+    DENIED.contains(&name)
+        || name.starts_with("LSAPI_")
+        || name.starts_with("SSL_")
+        || (name.starts_with("HJ_") && !FORWARDED_INTERNAL_ENV.contains(&name))
 }
+
+/// Internal `HJ_*` pipeline names that ARE forwarded to the app. Config-driven
+/// writers (SetEnvIf, rewrite `[E=]`) already refuse the whole `HJ_` namespace,
+/// so anything under it in `ctx.env` was set by the pipeline itself.
+const FORWARDED_INTERNAL_ENV: &[&str] = &[CACHE_REFRESH_ENV];
+
+/// Set on a stale-while-revalidate refresh so the app's own page cache
+/// (`pagecache.php`) renders fresh instead of replaying its aging copy.
+pub const CACHE_REFRESH_ENV: &str = "HJ_CACHE_REFRESH";
+
+/// `ctx.env` name carrying a user the pipeline VERIFIED against a Basic-auth
+/// realm. Emitted as `REMOTE_USER` + `AUTH_TYPE=Basic`; a directory-authored
+/// `REMOTE_USER` stays refused (see [`ctx_env_override_denied`]).
+pub const AUTH_USER_ENV: &str = "HJ_AUTH_USER";
 
 fn upsert<'r>(env: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>, key: Cow<'r, str>, val: Cow<'r, str>) {
     if let Some(slot) = env.iter_mut().find(|(k, _)| k.as_ref() == key.as_ref()) {
@@ -667,6 +695,9 @@ mod tests {
             ("REMOTE_ADDR".into(), "6.6.6.6".into()),
             ("HTTPS".into(), "on".into()),
             ("SERVER_PROTOCOL".into(), "HTTP/9".into()),
+            ("SSL_CLIENT_VERIFY".into(), "SUCCESS".into()),
+            ("REMOTE_USER".into(), "admin".into()),
+            ("HJ_ANYTHING".into(), "x".into()),
             // Contracts that must keep working:
             ("SCRIPT_NAME".into(), "/index.php".into()),
             ("QUERY_STRING".into(), "front=controller".into()),
@@ -682,9 +713,38 @@ mod tests {
         assert_eq!(m["REMOTE_ADDR"], "203.0.113.7");
         assert!(!m.contains_key("HTTPS"));
         assert_eq!(m["SERVER_PROTOCOL"], "HTTP/2");
+        assert!(!m.contains_key("SSL_CLIENT_VERIFY"));
+        assert!(!m.contains_key("REMOTE_USER"));
+        assert!(!m.contains_key("HJ_ANYTHING"));
         assert_eq!(m["SCRIPT_NAME"], "/index.php");
         assert_eq!(m["QUERY_STRING"], "front=controller");
         assert_eq!(m["REDIRECT_STATUS"], "403");
+    }
+
+    #[test]
+    fn pipeline_internal_env_reaches_the_app() {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("Host", "forum.example")
+            .body(empty_incoming())
+            .unwrap();
+
+        let mut c = ctx(false);
+        c.env = vec![
+            (CACHE_REFRESH_ENV.into(), "1".into()),
+            (AUTH_USER_ENV.into(), "alice".into()),
+        ];
+        let env = build_cgi_env(&req, &c, Path::new("/web/public_html/index.php"));
+        let m: std::collections::HashMap<String, String> = env
+            .into_iter()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+
+        assert_eq!(m["HJ_CACHE_REFRESH"], "1");
+        assert_eq!(m["REMOTE_USER"], "alice");
+        assert_eq!(m["AUTH_TYPE"], "Basic");
+        assert!(!m.contains_key(AUTH_USER_ENV));
     }
 
     #[test]

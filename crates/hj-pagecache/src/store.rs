@@ -767,38 +767,15 @@ impl Node {
         }
     }
 
-    /// Decode the metadata at most once per node and rebuild the `(key, CachedResponse)` view.
-    /// Caller holds the shard lock, so the `OnceLock` populate is uncontended. The boolean
-    /// reports whether this call populated the decoded form, which changes the exact RAM weight.
-    fn to_cached_with_decode_state(
-        &self,
-    ) -> Result<(PageCacheKey, CachedResponse, bool), MetaError> {
-        let mut populated = false;
-        let decoded = match self.decoded.get() {
-            Some(d) => d,
-            None => {
-                let d = self.meta.decode()?;
-                let _ = self.decoded.set(d);
-                populated = true;
-                self.decoded.get().expect("OnceLock populated after set")
-            }
-        };
-        let resp = decoded.to_cached_response(
-            self.body.clone(),
-            self.variants.clone(),
-            self.variants_filled,
-            self.dict_gen,
-            self.stored_at,
-            self.ttl,
-            self.swr,
-            self.sie,
-        );
-        Ok((decoded.key.clone(), resp, populated))
-    }
-
-    fn to_cached(&self) -> Result<(PageCacheKey, CachedResponse), MetaError> {
-        self.to_cached_with_decode_state()
-            .map(|(key, response, _)| (key, response))
+    /// Inspect the decoded metadata WITHOUT memoizing it. Guard checks on the store, finalize,
+    /// purge and boot-scan paths must not pin the decoded form — only a real hit
+    /// ([`Self::build_snapshot`]) does — or every stored entry carries it (and its RAM charge)
+    /// for its whole life, although most entries are never served.
+    fn with_decoded<R>(&self, inspect: impl FnOnce(&DecodedMeta) -> R) -> Result<R, MetaError> {
+        match self.decoded.get() {
+            Some(decoded) => Ok(inspect(decoded)),
+            None => self.meta.decode().map(|decoded| inspect(&decoded)),
+        }
     }
 }
 
@@ -1103,6 +1080,13 @@ pub struct StoreConfig {
     pub default_private_ttl: Duration,
     /// Status codes that may be cached (LiteSpeed default: 200, 301).
     pub cacheable_status: Vec<u16>,
+    /// Additional statuses cached ONLY on an explicit `X-LiteSpeed-Cache-Control: public` from
+    /// the app (never the standards-mode path), TTL-capped and with no stale windows — see
+    /// [`crate::classify::OPT_IN_STATUS_TTL_CAP_SECS`]. Empty = off.
+    pub opt_in_status: Vec<u16>,
+    /// Request-path prefixes under which an opted-in 303 may be stored. A 303 anywhere else
+    /// (e.g. a redirect the app expects a CDN URL purge to fix) is never stored.
+    pub opt_in_303_prefixes: Vec<String>,
     /// Whether POST responses may be cached (LiteSpeed `enablePostCache`).
     pub cache_post: bool,
     /// Public-vary cookie names: a cacheable public response may declare an
@@ -1123,6 +1107,10 @@ pub struct StoreConfig {
     /// an unrelated vhost (status/admin APIs) cache a response it merely marked public.
     /// A vhost NOT in this list behaves exactly as before (X-LiteSpeed opt-in only).
     pub standard_cc_vhosts: Vec<String>,
+    /// Canonical vhost names (lowercase) whose cacheable misses without a Content-Length are
+    /// forwarded as the backend produces them and stored once the body completes. Elsewhere a
+    /// miss is buffered whole before its first byte goes out. Empty = off.
+    pub stream_fill_vhosts: Vec<String>,
     /// Stale-while-revalidate window applied when the app declares none (0 ⇒ off).
     pub default_stale_secs: u32,
     /// Stale-if-error window applied when the app declares none (0 ⇒ off): how
@@ -1170,10 +1158,13 @@ impl Default for StoreConfig {
             default_public_ttl: Duration::from_secs(900),
             default_private_ttl: Duration::ZERO,
             cacheable_status: vec![200, 301],
+            opt_in_status: Vec::new(),
+            opt_in_303_prefixes: Vec::new(),
             cache_post: false,
             vary_cookies: Vec::new(),
             private_cookies: Vec::new(),
             standard_cc_vhosts: Vec::new(),
+            stream_fill_vhosts: Vec::new(),
             default_stale_secs: 0,
             default_sie_secs: 0,
             max_stale_secs: 86_400,
@@ -1192,6 +1183,13 @@ impl StoreConfig {
     /// default cache policy, `CacheLookup` default-on). Case-insensitive.
     pub fn is_standards_vhost(&self, vhost_name: &str) -> bool {
         self.standard_cc_vhosts
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(vhost_name))
+    }
+
+    /// True if `vhost_name` streams its cacheable misses (see `stream_fill_vhosts`).
+    pub fn streams_fill(&self, vhost_name: &str) -> bool {
+        self.stream_fill_vhosts
             .iter()
             .any(|v| v.eq_ignore_ascii_case(vhost_name))
     }
@@ -1979,6 +1977,31 @@ impl PageStore {
         )
     }
 
+    /// [`get_entry_hashed`](Self::get_entry_hashed) without bumping the hit/miss counters,
+    /// for a speculative probe that a later full lookup of the same request may repeat
+    /// (the on-core fast path). The caller counts a hit it actually serves with
+    /// [`record_hit`](Self::record_hit).
+    pub fn get_entry_hashed_uncounted(
+        &self,
+        key_hash: u64,
+        key: &PageCacheKey,
+        identity: &str,
+        now: Instant,
+    ) -> EntryState {
+        self.get_entry_inner(
+            key,
+            CacheKeyId::from_raw_page_hash(key_hash),
+            identity,
+            now,
+            false,
+        )
+    }
+
+    /// Count one served hit found by an uncounted probe.
+    pub fn record_hit(&self) {
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Like [`get_entry`](Self::get_entry) but does NOT bump the global hit/miss counters.
     /// Used by the capsule tier's SPECULATIVE probes (dedicated + public-fallback lookups), which
     /// are accounted separately by their own `xf_capsule_*` counters.
@@ -2322,12 +2345,9 @@ impl PageStore {
             let mut previous_tags = Vec::new();
             if let Some(prev) = acc.get(&id).and_then(CacheEntry::as_page) {
                 previous_tags = prev.tags.clone();
-                match prev.to_cached_with_decode_state() {
-                    Ok((prev_key, _, decoded_populated)) => {
-                        if prev_key != key {
-                            if decoded_populated {
-                                acc.reconcile_weights(&id, &id);
-                            }
+                match prev.with_decoded(|d| d.key == key) {
+                    Ok(same_key) => {
+                        if !same_key {
                             // Same power-of-two rate limit as the lookup-side warn (audit).
                             let prev = self.key_id_collisions.fetch_add(1, Ordering::Relaxed);
                             if prev == 0 || prev.is_power_of_two() {
@@ -2464,22 +2484,20 @@ impl PageStore {
             // stored_at mismatch (purged + replaced, or a fresher re-store) aborts the fill.
             match acc.get(&id).and_then(CacheEntry::as_page) {
                 None => return false,
-                Some(node) => match node.to_cached_with_decode_state() {
-                    Ok((k, exp, decoded_populated)) => {
-                        let node_stored_at = node.stored_at;
-                        if decoded_populated && !acc.reconcile_weights(&id, &id) {
-                            return false;
+                Some(node) => {
+                    match node.with_decoded(|d| d.key == *key && d.identity == identity) {
+                        Ok(matches) => {
+                            if !matches || node.stored_at != stored_at {
+                                return false;
+                            }
                         }
-                        if k != *key || exp.identity != identity || node_stored_at != stored_at {
+                        Err(_) => {
+                            self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
+                            acc.teardown(&id, EvictCause::Explicit);
                             return false;
                         }
                     }
-                    Err(_) => {
-                        self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
-                        acc.teardown(&id, EvictCause::Explicit);
-                        return false;
-                    }
-                },
+                }
             }
             // The primitive's `mutate` snapshots the old weights, runs the closure, and on commit
             // re-reads `ram_weight`/`disk_weight`/`deadline` from the `CacheValue` impl, reconciles
@@ -2554,6 +2572,7 @@ impl PageStore {
             }
             node.variants
                 .push((DICT_ATTEMPT_VARIANT_TOKEN.to_owned(), Bytes::new()));
+            node.invalidate_snapshot();
             true
         })
     }
@@ -2627,21 +2646,29 @@ impl PageStore {
                     if node.stored_at != stored_at || node.dict_gen != 0 {
                         return PreCheck::Bail;
                     }
-                    match node.to_cached_with_decode_state() {
-                        Ok((k, exp, decoded_populated)) => {
-                            let is_file = matches!(node.body, PageBody::File { .. });
-                            if decoded_populated && !acc.reconcile_weights(&id, &id) {
-                                return PreCheck::Bail;
-                            }
-                            if k != *key || exp.identity != identity {
-                                PreCheck::Bail
-                            } else if !is_file {
-                                PreCheck::DegradeRam
-                            } else {
-                                PreCheck::Recompress(Box::new(exp))
-                            }
-                        }
-                        Err(_) => PreCheck::Bail,
+                    // The container rebuild needs the full response, so decode transiently:
+                    // this is a background re-encode, not a hit, and must not pin the decode.
+                    let is_file = matches!(node.body, PageBody::File { .. });
+                    let view = node.with_decoded(|d| {
+                        (d.key == *key && d.identity == identity).then(|| {
+                            is_file.then(|| {
+                                d.to_cached_response(
+                                    node.body.clone(),
+                                    node.variants.clone(),
+                                    node.variants_filled,
+                                    node.dict_gen,
+                                    node.stored_at,
+                                    node.ttl,
+                                    node.swr,
+                                    node.sie,
+                                )
+                            })
+                        })
+                    });
+                    match view {
+                        Ok(Some(Some(exp))) => PreCheck::Recompress(Box::new(exp)),
+                        Ok(Some(None)) => PreCheck::DegradeRam,
+                        Ok(None) | Err(_) => PreCheck::Bail,
                     }
                 }
             }
@@ -2694,14 +2721,9 @@ impl PageStore {
                         if node.stored_at == stored_at && node.dict_gen == 0 =>
                     {
                         let old_file = Some((path.clone(), *body_id));
-                        let ok = match node.to_cached_with_decode_state() {
-                            Ok((k, exp, decoded_populated)) => {
-                                (!decoded_populated || acc.reconcile_weights(&id, &id))
-                                    && k == *key
-                                    && exp.identity == identity
-                            }
-                            Err(_) => false,
-                        };
+                        let ok = node
+                            .with_decoded(|d| d.key == *key && d.identity == identity)
+                            .unwrap_or(false);
                         (ok, old_file)
                     }
                     _ => (false, None),
@@ -2948,13 +2970,10 @@ impl PageStore {
             }
             if let Some(cur) = acc.get(&id).and_then(CacheEntry::as_page) {
                 let (cur_key, cur_stored_at, cur_disk_version) =
-                    match cur.to_cached_with_decode_state() {
-                        Ok((k, _, decoded_populated)) => {
+                    match cur.with_decoded(|d| d.key.clone()) {
+                        Ok(k) => {
                             let cur_stored_at = cur.stored_at;
                             let cur_disk_version = file_body_disk_version(&cur.body);
-                            if decoded_populated {
-                                acc.reconcile_weights(&id, &id);
-                            }
                             (k, cur_stored_at, cur_disk_version)
                         }
                         Err(_) => {
@@ -3191,8 +3210,8 @@ impl PageStore {
             None => Action::None,
             Some(node) if !node.tags.iter().any(|t| t == tag) => Action::None,
             Some(node) if node.render_epoch >= purge_epoch => Action::KeepFresh,
-            Some(node) => match node.to_cached() {
-                Ok((full_key, _)) => Action::Remove(
+            Some(node) => match node.with_decoded(|d| d.key.clone()) {
+                Ok(full_key) => Action::Remove(
                     file_body_disk_version(&node.body)
                         .map(|(_, version_seq)| (full_key, version_seq)),
                 ),
@@ -3917,8 +3936,8 @@ mod tests {
         );
         let probe = Node::from_cached(&key, cached.clone(), 0).unwrap();
         let compressed_only_weight = probe.ram_weight();
-        let (_, _, populated) = probe.to_cached_with_decode_state().unwrap();
-        assert!(populated);
+        probe.build_snapshot().unwrap();
+        assert!(probe.decoded.get().is_some());
         assert!(
             probe.ram_weight() > compressed_only_weight,
             "decoded metadata must add a resident RAM charge"
@@ -4494,6 +4513,40 @@ mod tests {
         let got = s.lookup(&k, id, Instant::now()).unwrap();
         assert_eq!(&s.body_bytes(&got).unwrap()[..], b"version-2");
         assert_eq!(s.stats().disk_bytes, pc_allocated_bytes(dir.path()));
+    }
+
+    /// Regression (#488): the store-time finalize path (attempt marker + recompress commit)
+    /// must not memoize decoded metadata. Only a real hit may pin it; otherwise every stored
+    /// entry carries its decoded headers for life although most are never served.
+    #[test]
+    fn finalize_paths_do_not_memoize_decoded_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        s.load_from_disk(|_| {});
+        let k = PageCacheKey::public(1, true, "h", "/finalize", "");
+        let id = "h\n/finalize";
+        let e = entry_id(
+            &vec![b'x'; 16 * 1024],
+            &["T1"],
+            Duration::from_secs(600),
+            id,
+        );
+        let sa = e.stored_at;
+        assert!(s.store(k.clone(), e));
+        assert!(s.mark_dict_compression_attempted(&k, id, sa));
+        assert!(s.fill_recompress_disk(&k, id, sa, Bytes::from(vec![b'z'; 200]), 9));
+        assert_eq!(
+            s.stats().decoded_entries,
+            0,
+            "no hit yet, so nothing may be memoized"
+        );
+
+        assert!(s.lookup(&k, id, Instant::now()).is_some());
+        assert_eq!(
+            s.stats().decoded_entries,
+            1,
+            "the first hit memoizes exactly once"
+        );
     }
 
     #[test]
@@ -5309,6 +5362,30 @@ mod tests {
         assert!(
             matches!(s.get_entry(&k, "id", later), EntryState::Miss),
             "fill preserved stored_at: entry expires on its original deadline, not reset"
+        );
+    }
+
+    /// Regression: the marker must reach hits served from an ALREADY-built snapshot. Without
+    /// the invalidation every later hit saw "never attempted" and queued another no-op
+    /// recompress job.
+    #[test]
+    fn dictionary_attempt_marker_reaches_an_already_served_snapshot() {
+        let s = PageStore::new(cfg());
+        let k = PageCacheKey::public(1, true, "h", "/dict-attempt-served", "");
+        let e = entry(b"hello", &[], Duration::from_secs(60));
+        let (identity, stored_at) = (e.identity.clone(), e.stored_at);
+        s.store(k.clone(), e);
+        assert!(
+            !s.lookup(&k, "id", Instant::now())
+                .unwrap()
+                .dict_compression_attempted()
+        );
+
+        assert!(s.mark_dict_compression_attempted(&k, &identity, stored_at));
+        assert!(
+            s.lookup(&k, "id", Instant::now())
+                .unwrap()
+                .dict_compression_attempted()
         );
     }
 

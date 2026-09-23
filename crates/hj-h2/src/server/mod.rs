@@ -52,6 +52,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// process). Maintained by [`ConnGuard`] around each [`serve`] call; read by [`spare_cores`].
 static ACTIVE_H2_CONNS: AtomicUsize = AtomicUsize::new(0);
 
+/// Connections this server closed on its idle timer vs. ones the peer closed first. Behind a
+/// pooling proxy the split shows who is the closer: if the idle timer dominates, the proxy
+/// would have reused the connection and every close costs it a fresh handshake.
+static IDLE_CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PEER_CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(closed by our idle timer, closed by the peer)` for the io_uring (monoio) loop.
+pub fn connection_close_counts() -> (u64, u64) {
+    (
+        IDLE_CLOSES.load(Ordering::Relaxed),
+        PEER_CLOSES.load(Ordering::Relaxed),
+    )
+}
+
 const H2_INBUF_IDLE: usize = 8 * 1024;
 const H2_READ_CHUNK: usize = 8 * 1024;
 const H2_INBUF_SHRINK_TRIGGER: usize = 64 * 1024;
@@ -366,19 +380,16 @@ where
         body_budget: config.body_budget.clone(),
         no_progress_frames: 0,
     };
-    // Pre-size the per-stream maps to the multiplex degree we advertise (capped, so a large
-    // MAX_CONCURRENT_STREAMS can't pre-allocate an oversized table) — avoids the handful of
-    // table-growth reallocations as the first streams of a busy CF connection arrive. Bounded
-    // by max_concurrent_streams either way, so this only moves the growth earlier, never higher.
-    let stream_cap = (config.max_concurrent_streams as usize).min(32);
-    let mut streams: FxHashMap<u32, StreamState> =
-        FxHashMap::with_capacity_and_hasher(stream_cap, Default::default());
+    // The per-stream maps start EMPTY and grow with the first streams. Pre-sizing them to 32
+    // streams saved a few early reallocations on busy connections but made every connection
+    // hold 64-bucket tables of `StreamState`/`OutStream` — and most Cloudflare connections
+    // carry a couple of requests (29% none) while sitting idle for the keep-alive window.
+    let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
     let mut inflight: Inflight<F> = Inflight::new();
     // Outgoing response bodies still being written, plus their async chunk pulls and the
     // connection-level send window (RFC 7540 §6.9, default 65535 until the peer grows it).
-    let mut outstreams: FxHashMap<u32, OutStream> =
-        FxHashMap::with_capacity_and_hasher(stream_cap, Default::default());
-    let mut send_schedule = VecDeque::with_capacity(stream_cap);
+    let mut outstreams: FxHashMap<u32, OutStream> = FxHashMap::default();
+    let mut send_schedule = VecDeque::new();
     let mut pulls: Pulls = Pulls::new();
     let mut send_conn: i64 = 65535;
     // Per-stream send-window credit that arrived (WINDOW_UPDATE) before the response was
@@ -386,8 +397,7 @@ where
     // slow handler (LSAPI render) produces the body. Held here and folded into the stream's
     // window when `begin_response` creates it; without this a streamed body stalls at the
     // 65535 initial window. Consumed/cleared in `begin_response` and on RST.
-    let mut pending_window: FxHashMap<u32, i64> =
-        FxHashMap::with_capacity_and_hasher(stream_cap, Default::default());
+    let mut pending_window: FxHashMap<u32, i64> = FxHashMap::default();
     // Streams the peer reset (RST_STREAM) whose cancelled handler still has an aborted
     // completion queued in `inflight`. The marker is consumed with that completion and is a
     // second guard against ever sending a response on the closed stream.
@@ -528,7 +538,17 @@ where
                         // is dropped (it just uses the initial window when its response
                         // begins, and the peer can re-grant). Streams already tracked keep
                         // accruing credit. (Don't insert-then-remove the same entry.)
-                        if pending_window.len() < 4096 || pending_window.contains_key(&stream_id) {
+                        //
+                        // Only a stream still receiving its request or awaiting its handler
+                        // can take pre-response credit: a WINDOW_UPDATE racing the END_STREAM
+                        // of a finished response (§6.9 allows ignoring it) would otherwise be
+                        // parked forever and fill the map on a long-lived connection.
+                        let awaiting_response = streams.contains_key(&stream_id)
+                            || inflight_sids.contains_key(&stream_id);
+                        if awaiting_response
+                            && (pending_window.len() < 4096
+                                || pending_window.contains_key(&stream_id))
+                        {
                             let c = pending_window.entry(stream_id).or_insert(0);
                             *c += increment as i64;
                             if peer.initial_window + *c > i32::MAX as i64 {
@@ -603,6 +623,7 @@ where
                 recv.buffer_sub(st.body.len());
             }
             out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+            recv.note_reset(sid);
         }
         // Release a read buffer that a large body / frame burst grew, once it has fully
         // drained between frames; idle CF keep-alives should not pin their peak capacity.
@@ -1291,17 +1312,14 @@ where
         body_budget: config.body_budget.clone(),
         no_progress_frames: 0,
     };
-    let stream_cap = (config.max_concurrent_streams as usize).min(32);
-    let mut streams: FxHashMap<u32, StreamState> =
-        FxHashMap::with_capacity_and_hasher(stream_cap, Default::default());
+    // Empty until the first streams arrive (see the tokio loop above).
+    let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
     let mut inflight: Inflight<F> = Inflight::new();
-    let mut outstreams: FxHashMap<u32, OutStream> =
-        FxHashMap::with_capacity_and_hasher(stream_cap, Default::default());
-    let mut send_schedule = VecDeque::with_capacity(stream_cap);
+    let mut outstreams: FxHashMap<u32, OutStream> = FxHashMap::default();
+    let mut send_schedule = VecDeque::new();
     let mut pulls: Pulls = Pulls::new();
     let mut send_conn: i64 = 65535;
-    let mut pending_window: FxHashMap<u32, i64> =
-        FxHashMap::with_capacity_and_hasher(stream_cap, Default::default());
+    let mut pending_window: FxHashMap<u32, i64> = FxHashMap::default();
     let mut cancelled: FxHashSet<u32> = FxHashSet::default();
     let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
     let mut cursor = 0usize;
@@ -1418,8 +1436,12 @@ where
                             // never-blocked streams do NOT clear the flood counter.
                             recv.no_progress_frames = 0;
                         }
-                    } else if pending_window.len() < 4096 || pending_window.contains_key(&stream_id)
+                    } else if (streams.contains_key(&stream_id)
+                        || inflight_sids.contains_key(&stream_id))
+                        && (pending_window.len() < 4096 || pending_window.contains_key(&stream_id))
                     {
+                        // Pre-response credit only (see the tokio loop): a grant racing a
+                        // finished response's END_STREAM is ignored rather than leaked.
                         let c = pending_window.entry(stream_id).or_insert(0);
                         *c += increment as i64;
                         if peer.initial_window + *c > i32::MAX as i64 {
@@ -1495,6 +1517,7 @@ where
                 recv.buffer_sub(st.body.len());
             }
             out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+            recv.note_reset(sid);
         }
 
         // 2) Drain handlers + body pulls ready right now (immediate handlers resolve here).
@@ -1609,6 +1632,7 @@ where
             // the monoio path otherwise never timed out (the tokio `serve` does this).
             _ = async { match config.conn_idle_timeout { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading => {
                 if accepting {
+                    IDLE_CLOSES.fetch_add(1, Ordering::Relaxed);
                     out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::NO_ERROR));
                     accepting = false;
                     draining = true;
@@ -1620,11 +1644,17 @@ where
         if let Some((res, b, reader)) = read_done {
             match res {
                 Ok(0) => {
+                    if accepting {
+                        PEER_CLOSES.fetch_add(1, Ordering::Relaxed);
+                    }
                     reading = false;
                     accepting = false;
                 }
                 Ok(n) => inbuf.extend_from_slice(&b[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    if accepting {
+                        PEER_CLOSES.fetch_add(1, Ordering::Relaxed);
+                    }
                     reading = false;
                     accepting = false;
                 }
@@ -2729,6 +2759,262 @@ mod tests {
         );
         drop(tail);
         assert_eq!(budget.in_flight(), 0);
+    }
+
+    /// Raw frames the server wrote, as `(kind, flags, stream_id, payload)`.
+    #[cfg(feature = "monoio")]
+    fn read_frames_until(
+        stream: &mut std::net::TcpStream,
+        seen: &mut Vec<u8>,
+        limit: Duration,
+        mut done: impl FnMut(&[(u8, u8, u32, Vec<u8>)]) -> bool,
+    ) -> Vec<(u8, u8, u32, Vec<u8>)> {
+        use std::io::Read;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut frames = Vec::new();
+        let mut buf = [0u8; 16384];
+        while started.elapsed() < limit {
+            while seen.len() >= 9 {
+                let len = (usize::from(seen[0]) << 16)
+                    | (usize::from(seen[1]) << 8)
+                    | usize::from(seen[2]);
+                if seen.len() < 9 + len {
+                    break;
+                }
+                let sid = u32::from_be_bytes([seen[5], seen[6], seen[7], seen[8]]) & 0x7fff_ffff;
+                frames.push((seen[3], seen[4], sid, seen[9..9 + len].to_vec()));
+                seen.drain(..9 + len);
+            }
+            if done(&frames) {
+                return frames;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+        }
+        frames
+    }
+
+    #[cfg(feature = "monoio")]
+    fn get_headers(encoder: &mut Encoder, sid: u32, path: &str, out: &mut Vec<u8>) {
+        let mut block = Vec::new();
+        for (name, value) in [
+            (":method", "GET"),
+            (":path", path),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+        ] {
+            encoder.encode_header(&mut block, name, value);
+        }
+        frame::write_frame(
+            out,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS | frame::flags::END_STREAM,
+            sid,
+            &block,
+        );
+    }
+
+    #[cfg(feature = "monoio")]
+    fn serve_one_monoio_connection(std_listener: std::net::TcpListener, config: Config) {
+        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(async move {
+            let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_local_with_prefix(
+                stream,
+                Vec::new(),
+                |req: Request| {
+                    let body = if req.uri().path() == "/body" {
+                        "0123456789"
+                    } else {
+                        ""
+                    };
+                    std::future::ready(hj_core::text_response(http::StatusCode::OK, body))
+                },
+                config,
+                None,
+                None,
+            )
+            .await
+        });
+    }
+
+    /// Regression: a stream the body deadline reset must be recorded like every other
+    /// server RST. Otherwise the client's trailers racing our RST_STREAM look like
+    /// §5.1.1 stream-id reuse and GOAWAY every stream on the connection.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_trailers_after_body_deadline_reset_keep_the_connection() {
+        use std::io::Write;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream.write_all(&body_budget_request_wire(false)).unwrap();
+            let mut seen = Vec::new();
+            let frames = read_frames_until(&mut stream, &mut seen, Duration::from_secs(3), |f| {
+                f.iter()
+                    .any(|&(kind, _, sid, _)| kind == frame::kind::RST_STREAM && sid == 1)
+            });
+            assert!(
+                frames
+                    .iter()
+                    .any(|&(kind, _, sid, _)| kind == frame::kind::RST_STREAM && sid == 1),
+                "the body deadline must reset stream 1"
+            );
+
+            // Trailers for the reset stream, then a fresh request on stream 3.
+            let mut wire = Vec::new();
+            let mut trailer_block = Vec::new();
+            let mut trailer_encoder = Encoder::new();
+            trailer_encoder.encode_header(&mut trailer_block, "x-trailer", "1");
+            frame::write_frame(
+                &mut wire,
+                frame::kind::HEADERS,
+                frame::flags::END_HEADERS | frame::flags::END_STREAM,
+                1,
+                &trailer_block,
+            );
+            let mut encoder = Encoder::new();
+            get_headers(&mut encoder, 3, "/", &mut wire);
+            stream.write_all(&wire).unwrap();
+            let frames = read_frames_until(&mut stream, &mut seen, Duration::from_secs(3), |f| {
+                f.iter().any(|&(kind, _, sid, _)| {
+                    kind == frame::kind::GOAWAY || (kind == frame::kind::HEADERS && sid == 3)
+                })
+            });
+            frames
+        });
+
+        serve_one_monoio_connection(
+            std_listener,
+            Config {
+                conn_idle_timeout: Some(Duration::from_secs(2)),
+                request_body_timeout: Some(Duration::from_millis(100)),
+                ..Config::default()
+            },
+        );
+
+        let frames = client.join().unwrap();
+        assert!(
+            !frames.iter().any(|&(kind, ..)| kind == frame::kind::GOAWAY),
+            "late trailers on a stream we reset must not tear down the connection"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|&(kind, _, sid, _)| kind == frame::kind::HEADERS && sid == 3),
+            "the next request on the same connection must still be answered"
+        );
+    }
+
+    /// Regression: WINDOW_UPDATEs for streams whose responses already finished used to be
+    /// parked as "pre-response credit" forever. Once 4096 had accumulated on a long-lived
+    /// connection, real pre-response credit was dropped and a response that needed it
+    /// stalled. The peer here advertises a zero initial window, so the final response body
+    /// can only flow on the credit granted before the response begins.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_finished_stream_credit_does_not_starve_new_streams() {
+        use std::io::Write;
+
+        const BATCH: u32 = 128;
+        const WARMUP_STREAMS: u32 = 4096;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let mut encoder = Encoder::new();
+            let mut wire = crate::conn::PREFACE.to_vec();
+            frame::write_settings(&mut wire, &[(frame::settings::INITIAL_WINDOW_SIZE, 0)]);
+            stream.write_all(&wire).unwrap();
+
+            let mut seen = Vec::new();
+            let mut next_sid = 1u32;
+            let mut finished = 0u32;
+            while finished < WARMUP_STREAMS {
+                let first = next_sid;
+                let mut wire = Vec::new();
+                for _ in 0..BATCH {
+                    get_headers(&mut encoder, next_sid, "/", &mut wire);
+                    next_sid += 2;
+                }
+                stream.write_all(&wire).unwrap();
+                let last = next_sid - 2;
+                let frames =
+                    read_frames_until(&mut stream, &mut seen, Duration::from_secs(10), |f| {
+                        f.iter().any(|&(kind, flags, sid, _)| {
+                            kind == frame::kind::HEADERS
+                                && sid == last
+                                && flags & frame::flags::END_STREAM != 0
+                        })
+                    });
+                assert!(
+                    !frames.iter().any(|&(kind, ..)| kind == frame::kind::GOAWAY),
+                    "warm-up must not trip a connection error"
+                );
+                // Credit for every stream that just finished — the grants that leaked.
+                let mut wire = Vec::new();
+                let mut sid = first;
+                while sid <= last {
+                    frame::write_window_update(&mut wire, sid, 1);
+                    sid += 2;
+                }
+                stream.write_all(&wire).unwrap();
+                finished += BATCH;
+            }
+
+            let body_sid = next_sid;
+            let mut wire = Vec::new();
+            get_headers(&mut encoder, body_sid, "/body", &mut wire);
+            frame::write_window_update(&mut wire, body_sid, 10);
+            stream.write_all(&wire).unwrap();
+            let frames = read_frames_until(&mut stream, &mut seen, Duration::from_secs(3), |f| {
+                f.iter().any(|&(kind, flags, sid, _)| {
+                    kind == frame::kind::DATA
+                        && sid == body_sid
+                        && flags & frame::flags::END_STREAM != 0
+                })
+            });
+            (frames, body_sid)
+        });
+
+        serve_one_monoio_connection(
+            std_listener,
+            Config {
+                conn_idle_timeout: Some(Duration::from_secs(5)),
+                ..Config::default()
+            },
+        );
+
+        let (frames, body_sid) = client.join().unwrap();
+        let body: Vec<u8> = frames
+            .iter()
+            .filter(|&&(kind, _, sid, _)| kind == frame::kind::DATA && sid == body_sid)
+            .flat_map(|(_, _, _, payload)| payload.iter().copied())
+            .collect();
+        assert_eq!(
+            body, b"0123456789",
+            "pre-response credit must reach the new stream despite earlier late grants"
+        );
     }
 }
 

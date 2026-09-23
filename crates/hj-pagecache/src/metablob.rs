@@ -39,9 +39,11 @@ const MAGIC: [u8; 4] = *b"HJPM";
 // session hashing to owner 0 previously decoded as Public). RAM-only format, rebuilt each
 // process, so the bump needs no migration.
 const VERSION: u16 = 2;
-/// High level: metadata is encoded off the hot path (only at store time) and held for the entry's
-/// whole TTL, while decode (the hot path) is level-independent — so a high level is free shrink.
-const ZSTD_LEVEL: i32 = 19;
+/// Level 6, not "free" 19: the encode runs synchronously inside every store — before the miss
+/// response is built, twice per capsule render — and once per entry in the boot scan. Measured on
+/// 3,000 real prod entries (avg 2.6 KB raw, 2026-09-22, `meta_level_sweep`): L19 309 µs / 1,098 B,
+/// L6 34 µs / 1,109 B (+1%), L3 14 µs / 1,188 B (+8%). Decode speed is level-independent.
+const ZSTD_LEVEL: i32 = 6;
 const MAX_RAW_META: usize = 4 << 20;
 const MAX_COMP_META: usize = 4 << 20;
 
@@ -413,6 +415,79 @@ pub fn cloned_file_path(body: &PageBody) -> Option<Arc<Path>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Offline level sweep over REAL metadata (#487). Read-only against a file-tier root:
+    /// `HJ_META_SWEEP_DIR=/dev/shm/jetcache cargo test -p hj-pagecache --release --lib \
+    ///  -- --ignored meta_level_sweep --nocapture`
+    #[test]
+    #[ignore]
+    fn meta_level_sweep() {
+        let root =
+            std::env::var("HJ_META_SWEEP_DIR").unwrap_or_else(|_| "/dev/shm/jetcache".into());
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        let mut raws = Vec::new();
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if raws.len() < 3000
+                    && let Ok(se) = crate::diskstore::read_meta(&p)
+                {
+                    let entry = CachedResponse {
+                        status: se.status,
+                        identity: se.identity.clone(),
+                        headers: se.headers.clone(),
+                        body: PageBody::InMem(Bytes::new()),
+                        variants: Vec::new(),
+                        variants_filled: false,
+                        dict_gen: se.dict_gen,
+                        tags: se.tags.clone(),
+                        vary_cookie_name: se.vary_cookie_name.clone(),
+                        vary_value: se.vary_value.clone(),
+                        scope: se.scope,
+                        stored_at: Instant::now(),
+                        ttl: se.ttl,
+                        swr: se.swr,
+                        sie: se.sie,
+                    };
+                    raws.push(encode_raw(&se.key, &entry).expect("encode_raw"));
+                }
+            }
+        }
+        assert!(
+            !raws.is_empty(),
+            "no scannable entries under the sweep root"
+        );
+        let raw_total: usize = raws.iter().map(Vec::len).sum();
+        println!(
+            "entries={} raw_total={} avg_raw={}",
+            raws.len(),
+            raw_total,
+            raw_total / raws.len()
+        );
+        for level in [1, 3, 5, 6, 9, 12, 15, 19] {
+            let enc = EncoderDictionary::copy(META_DICT, level);
+            let mut c = Compressor::with_prepared_dictionary(&enc).unwrap();
+            for r in raws.iter().take(50) {
+                c.compress(r).unwrap();
+            }
+            let t = Instant::now();
+            let mut out = 0usize;
+            for r in &raws {
+                out += c.compress(r).unwrap().len();
+            }
+            let us = t.elapsed().as_secs_f64() * 1e6 / raws.len() as f64;
+            println!(
+                "L{level:>2}: {us:>8.1} us/encode  avg_out={:>5} B  ratio={:.2}",
+                out / raws.len(),
+                raw_total as f64 / out as f64
+            );
+        }
+    }
     use http::header::{
         CACHE_CONTROL, CONTENT_LANGUAGE, CONTENT_TYPE, REFERRER_POLICY, STRICT_TRANSPORT_SECURITY,
         VARY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,

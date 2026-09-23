@@ -2219,6 +2219,59 @@ mod cache_tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn walk_stops_at_the_first_missing_directory() {
+        // Front-controller URLs name directories that never exist. Walking every level
+        // memoized one entry per URL (`/threads/slug.1/`, `/threads/slug.2/`, ...) and
+        // filled the never-evicting cap; nothing below a missing directory can hold an
+        // access file, so the walk ends there.
+        let root = tmp_dir("missing_walk");
+        fs::write(root.join(".htaccess"), "Header set X-Root 1\n").unwrap();
+        let cache = HtaccessCache::new();
+        for n in 0..50 {
+            let chain = cache.load_chain(&root, &format!("/threads/slug.{n}/page-2/"));
+            assert_eq!(chain.len(), 1, "the docroot rules still apply");
+        }
+        assert_eq!(
+            cache.cap_count(),
+            2,
+            "docroot + the one missing `threads` level, not one entry per URL"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_created_later_is_walked_into() {
+        // The missing-directory memo must not hide a directory (and its deny rules)
+        // created after it was first seen.
+        let root = tmp_dir("missing_then_created");
+        let cache = HtaccessCache::with_revalidate_ttl(std::time::Duration::ZERO);
+        assert!(cache.load_chain(&root, "/later/secret/x.txt").is_empty());
+
+        let secret = root.join("later").join("secret");
+        fs::create_dir_all(&secret).unwrap();
+        fs::write(secret.join(".htaccess"), "Require all denied\n").unwrap();
+        let chain = cache.load_chain(&root, "/later/secret/x.txt");
+        assert_eq!(chain.len(), 1, "the new directory's rules must be found");
+        assert!(chain[0].is_forbidden("/later/secret/x.txt", "x.txt"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_in_the_path_ends_the_walk() {
+        // `/index.php/extra/path` (PATH_INFO): `index.php` is a file, not a directory.
+        let root = tmp_dir("file_in_path");
+        fs::write(root.join("index.php"), "<?php\n").unwrap();
+        let cache = HtaccessCache::new();
+        assert!(
+            cache
+                .load_chain(&root, "/index.php/extra/deeper/")
+                .is_empty()
+        );
+        assert_eq!(cache.cap_count(), 2, "docroot + index.php, then stop");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 // ===========================================================================

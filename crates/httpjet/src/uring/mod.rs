@@ -1083,7 +1083,12 @@ async fn handle_tls_bridged(
                     .tls_handshakes_resumed
                     .fetch_add(1, Ordering::Relaxed);
             }
-            Some(_) => {
+            Some(kind) => {
+                if kind == rustls::HandshakeKind::FullWithHelloRetryRequest {
+                    m.metrics
+                        .tls_handshakes_hello_retry
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 m.metrics
                     .tls_handshakes_full
                     .fetch_add(1, Ordering::Relaxed);
@@ -1345,6 +1350,63 @@ async fn handle_conn_bridged<S>(
     }
 }
 
+/// Idle floor for keep-alive and h2 connections: Cloudflare keeps pooled origin connections
+/// well past a short `keepAliveTimeout`, so an unpadded idle wait closes them almost at once.
+const IDLE_FLOOR: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// (#486) Idle window for a connection whose peer presented a VERIFIED client certificate
+/// (in prod only Cloudflare's authenticated-origin-pull cert). Cloudflare never resumes TLS to
+/// the origin, so each reconnect is a full TCP + TLS + mTLS handshake before PHP starts; at the
+/// 90 s floor our timer closed the connections it would have reused. Set once at startup from
+/// `--trusted-proxy-idle-secs`; 0 keeps the normal floor.
+static TRUSTED_PROXY_IDLE_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Above this many open connections the certified window falls back to the normal floor, so a
+/// connection surge can't pin unbounded idle state.
+static TRUSTED_PROXY_IDLE_MAX_CONNS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+pub(crate) fn configure_trusted_proxy_idle(secs: u64, max_conns: u64) {
+    TRUSTED_PROXY_IDLE_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+    TRUSTED_PROXY_IDLE_MAX_CONNS.store(max_conns, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn trusted_proxy_idle_secs() -> u64 {
+    TRUSTED_PROXY_IDLE_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The idle window for this connection: the configured keep-alive padded to [`IDLE_FLOOR`],
+/// raised to the trusted-proxy window for a certified peer while the connection count allows.
+fn conn_idle_timeout(state: &ServerState, ctx: &BridgeCtx) -> Option<std::time::Duration> {
+    use std::sync::atomic::Ordering;
+    let certified = ctx
+        .tls
+        .as_ref()
+        .and_then(|t| t.client_cert.as_ref())
+        .is_some_and(|c| c.verified);
+    idle_window(
+        state.serve_config.keep_alive_timeout,
+        certified,
+        state.metrics.active_conns.load(Ordering::Relaxed),
+        TRUSTED_PROXY_IDLE_SECS.load(Ordering::Relaxed),
+        TRUSTED_PROXY_IDLE_MAX_CONNS.load(Ordering::Relaxed),
+    )
+}
+
+fn idle_window(
+    keep_alive: Option<std::time::Duration>,
+    certified: bool,
+    active_conns: u64,
+    trusted_secs: u64,
+    trusted_max_conns: u64,
+) -> Option<std::time::Duration> {
+    let floor = keep_alive.map(|t| t.max(IDLE_FLOOR))?;
+    if certified && trusted_secs > 0 && active_conns <= trusted_max_conns {
+        Some(floor.max(std::time::Duration::from_secs(trusted_secs)))
+    } else {
+        Some(floor)
+    }
+}
+
 /// Serve an H2 connection over `stream` (plaintext or TLS) via the bridge: a
 /// per-stream service closure dispatches each request to the real pipeline with a
 /// clone of the connection `ctx`. `prefix` seeds the h2 preface bytes already read.
@@ -1362,10 +1424,7 @@ async fn serve_h2_bridged<S>(
 {
     let state = core.holder.load();
     let mut h2_cfg = hj_h2::server::Config::default();
-    h2_cfg.conn_idle_timeout = state
-        .serve_config
-        .keep_alive_timeout
-        .map(|t| t.max(std::time::Duration::from_secs(90))); // keep-alive proxy padding
+    h2_cfg.conn_idle_timeout = conn_idle_timeout(&state, &ctx);
     h2_cfg.preface_timeout = state.serve_config.header_read_timeout;
     h2_cfg.frame_read_timeout = state.serve_config.header_read_timeout;
     h2_cfg.request_body_timeout = state.serve_config.header_read_timeout;
@@ -1470,18 +1529,21 @@ async fn handle_h1_bridged<S>(
             // keeps idle origin connections well past a 5s keepAliveTimeout, and an
             // unpadded H1 idle wait closes them almost immediately (constant
             // reconnect + TLS-handshake churn). H2 has padded to >=90s for a while.
-            let keep_alive_timeout = core
-                .holder
-                .load()
-                .serve_config
-                .keep_alive_timeout
-                .map(|t| t.max(std::time::Duration::from_secs(90)));
+            let keep_alive_timeout = conn_idle_timeout(&core.holder.load(), &ctx);
             monoio::select! {
                 biased;
                 res = read_timeout(&mut stream, keep_alive_timeout, &mut read_scratch) => {
                     match res {
                         Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
-                        _ => return, // EOF, error, or keep-alive timeout
+                        Ok(_) => {
+                            core.holder.load().metrics.h1_peer_closes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            core.holder.load().metrics.h1_idle_closes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        Err(_) => return,
                     }
                 }
                 _ = shutdown.cancelled() => {
@@ -2267,6 +2329,30 @@ fn build_103_early_hints(headers: &http::HeaderMap) -> Option<Vec<u8>> {
     }
     interim.push_str("\r\n");
     Some(interim.into_bytes())
+}
+
+#[cfg(test)]
+mod idle_window_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn certified_peers_get_the_trusted_window_until_the_connection_cap() {
+        let ka = Some(Duration::from_secs(5));
+        // Everyone keeps the 90 s floor by default.
+        assert_eq!(idle_window(ka, true, 10, 0, 6000), Some(IDLE_FLOOR));
+        // Uncertified peers never get the longer window.
+        assert_eq!(idle_window(ka, false, 10, 300, 6000), Some(IDLE_FLOOR));
+        assert_eq!(
+            idle_window(ka, true, 10, 300, 6000),
+            Some(Duration::from_secs(300))
+        );
+        // A connection surge falls back to the floor.
+        assert_eq!(idle_window(ka, true, 6001, 300, 6000), Some(IDLE_FLOOR));
+        // A window shorter than the floor never lowers it; no keep-alive means no timeout.
+        assert_eq!(idle_window(ka, true, 10, 30, 6000), Some(IDLE_FLOOR));
+        assert_eq!(idle_window(None, true, 10, 300, 6000), None);
+    }
 }
 
 #[cfg(test)]

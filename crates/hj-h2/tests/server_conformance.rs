@@ -2626,12 +2626,12 @@ async fn stream_rst_replenishes_connection_window() {
     client.write_all(&buf).await.unwrap();
     client.flush().await.unwrap();
 
-    // Count, per reset stream, that we saw an RST_STREAM and a connection WINDOW_UPDATE
-    // (stream 0). The connection-window replenish is what the fix restores; a missing one
-    // would (after enough RSTs) surface as a GOAWAY FLOW_CONTROL_ERROR, which must NOT appear.
-    let (rsts, conn_updates) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // Every over-window stream is RST'd. The connection window is replenished in batches
+    // (one WINDOW_UPDATE(0) per half-window consumed — see
+    // `conn_window_update_precedes_stream_rst` for the credit accounting); a leak would
+    // surface as a GOAWAY FLOW_CONTROL_ERROR, which must NOT appear.
+    let rsts = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut rsts = 0u32;
-        let mut conn_updates = 0u32;
         loop {
             let (hdr, payload) = read_frame(&mut client).await;
             match hdr.kind {
@@ -2642,7 +2642,6 @@ async fn stream_rst_replenishes_connection_window() {
                     );
                     rsts += 1;
                 }
-                frame::kind::WINDOW_UPDATE if hdr.stream_id == 0 => conn_updates += 1,
                 frame::kind::GOAWAY => panic!(
                     "connection-window leak regressed: a stream RST drove the conn window to a GOAWAY"
                 ),
@@ -2652,15 +2651,11 @@ async fn stream_rst_replenishes_connection_window() {
                 break;
             }
         }
-        (rsts, conn_updates)
+        rsts
     })
     .await
     .expect("server must reset each over-window stream");
     assert_eq!(rsts, n_streams, "every over-window stream must be RST'd");
-    assert!(
-        conn_updates >= n_streams,
-        "each stream RST must emit a connection WINDOW_UPDATE(0) replenishing the conn window (got {conn_updates})"
-    );
 
     // A fresh stream with a within-window (4-byte) body must still be served normally — proof
     // the connection window survived the RST storm (no spurious FLOW_CONTROL_ERROR GOAWAY).
@@ -2718,13 +2713,69 @@ async fn stream_rst_replenishes_connection_window() {
 }
 
 #[tokio::test]
+async fn upload_window_updates_are_batched() {
+    // A 1.6 MB upload in 100 DATA frames used to draw 100 connection + 100 stream
+    // WINDOW_UPDATEs. Replenishment is now batched at half the advertised window (2 MiB by
+    // default), so this upload crosses the threshold exactly once on each level.
+    let (mut client, server) = tokio::io::duplex(256 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut buf = Vec::new();
+    frame::write_settings(&mut buf, &[]);
+    let mut enc = Encoder::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get(&mut enc, "/upload"),
+    );
+    let chunk = vec![b'x'; 16_000];
+    for i in 0..100 {
+        let flags = if i == 99 { frame::flags::END_STREAM } else { 0 };
+        frame::write_frame(&mut buf, frame::kind::DATA, flags, 1, &chunk);
+    }
+    let writer = tokio::spawn(async move {
+        client.write_all(&buf).await.unwrap();
+        client.flush().await.unwrap();
+        client
+    });
+    let mut client = writer.await.unwrap();
+
+    let (conn_updates, stream_updates) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (mut conn_updates, mut stream_updates) = (0u32, 0u32);
+            loop {
+                let (hdr, _) = read_frame(&mut client).await;
+                match hdr.kind {
+                    frame::kind::WINDOW_UPDATE if hdr.stream_id == 0 => conn_updates += 1,
+                    frame::kind::WINDOW_UPDATE if hdr.stream_id == 1 => stream_updates += 1,
+                    frame::kind::HEADERS if hdr.stream_id == 1 => break,
+                    frame::kind::GOAWAY => panic!("the upload must not GOAWAY"),
+                    _ => {}
+                }
+            }
+            (conn_updates, stream_updates)
+        })
+        .await
+        .expect("the upload must be answered");
+    // The opening connection WINDOW_UPDATE (65535 -> 2 MiB) plus one refill.
+    assert_eq!(conn_updates, 2, "connection window updates must be batched");
+    assert_eq!(stream_updates, 1, "stream window updates must be batched");
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
 async fn conn_window_update_precedes_stream_rst() {
-    // FIX 3 (parallel-path guarantee): the connection-window replenish + WINDOW_UPDATE(0)
-    // now sits ABOVE both stream-level early returns (the §6.9 FLOW_CONTROL_ERROR rst! AND
-    // the MAX_REQUEST_BODY REFUSED_STREAM rst!), so NEITHER can skip it. Overflowing the
-    // 64 MiB body cap in a fast unit test is impractical, so this asserts the structural
-    // invariant the fix establishes — the conn WINDOW_UPDATE(0) of the full flow-controlled
-    // length is emitted alongside the stream RST — on the cheaply-triggered window path.
+    // FIX 3 (parallel-path guarantee): the connection-window accounting sits ABOVE both
+    // stream-level early returns (the §6.9 FLOW_CONTROL_ERROR rst! AND the MAX_REQUEST_BODY
+    // REFUSED_STREAM rst!) and the closed-stream drop, so NONE can skip it. Replenishment is
+    // batched (once half the 65535 connection window is consumed), so the flood here is three
+    // 16000-byte frames: the first overruns stream 1's 4-byte window (RST), the next two land
+    // on the now-closed stream. The single WINDOW_UPDATE(0) must credit all 48000 bytes.
     let (mut client, server) = tokio::io::duplex(64 * 1024);
     let config = Config {
         initial_window_size: 4,
@@ -2745,7 +2796,10 @@ async fn conn_window_update_precedes_stream_rst() {
         1,
         &encode_get(&mut enc, "/u"),
     );
-    frame::write_frame(&mut buf, frame::kind::DATA, 0, 1, b"12345"); // 5 > 4-byte window
+    let chunk = vec![b'x'; 16_000];
+    for _ in 0..3 {
+        frame::write_frame(&mut buf, frame::kind::DATA, 0, 1, &chunk); // first: > 4-byte window
+    }
     client.write_all(&buf).await.unwrap();
     client.flush().await.unwrap();
 
@@ -2757,8 +2811,9 @@ async fn conn_window_update_precedes_stream_rst() {
                 let (hdr, payload) = read_frame(&mut client).await;
                 match hdr.kind {
                     frame::kind::WINDOW_UPDATE if hdr.stream_id == 0 => {
-                        // The replenish must cover the full flow-controlled frame length (5).
-                        assert_eq!(u32::from_be_bytes(payload[..4].try_into().unwrap()), 5);
+                        // The replenish must cover every flow-controlled byte, including the
+                        // frames on the reset stream.
+                        assert_eq!(u32::from_be_bytes(payload[..4].try_into().unwrap()), 48_000);
                         saw_conn_update = true;
                     }
                     frame::kind::RST_STREAM if hdr.stream_id == 1 => saw_rst = true,

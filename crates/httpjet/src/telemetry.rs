@@ -221,6 +221,13 @@ pub struct TelemetryShard {
     pub phase_compress: AtomicHistogram,
     /// (Tier 1.5) Reverse-proxy upstream forward duration (checkout + response head).
     pub phase_upstream: AtomicHistogram,
+    /// Page-cache store block on the miss path (metadata encode + tmpfs write + commit),
+    /// which runs before the miss response is built.
+    pub phase_store: AtomicHistogram,
+    /// Collecting a cacheable backend body before the miss is served, split by framing:
+    /// no Content-Length (progressive template output) vs a declared Content-Length.
+    pub phase_collect_nocl: AtomicHistogram,
+    pub phase_collect_cl: AtomicHistogram,
     /// Monotonic per-request tick used only to drive 1/N phase sampling (a single
     /// relaxed counter; the decision is `tick & (rate-1) == 0`).
     pub sample_tick: AtomicU64,
@@ -338,7 +345,7 @@ impl TelemetryShard {
 
     /// All histograms in stable order: `(prom_name, help, tsv_prefix, &hist)`.
     /// Single source of truth for render / snapshot / header so they can't drift.
-    fn histograms(&self) -> [(&'static str, &'static str, &'static str, &AtomicHistogram); 8] {
+    fn histograms(&self) -> [(&'static str, &'static str, &'static str, &AtomicHistogram); 11] {
         [
             (
                 "httpjet_request_duration_seconds",
@@ -387,6 +394,24 @@ impl TelemetryShard {
                 "Reverse-proxy upstream forward: checkout through response head (sampled).",
                 "phase_upstream",
                 &self.phase_upstream,
+            ),
+            (
+                "httpjet_phase_store_seconds",
+                "Page-cache store before the miss response is built (sampled).",
+                "phase_store",
+                &self.phase_store,
+            ),
+            (
+                "httpjet_phase_collect_nocl_seconds",
+                "Collecting a cacheable body with no Content-Length before serving it (sampled).",
+                "phase_collect_nocl",
+                &self.phase_collect_nocl,
+            ),
+            (
+                "httpjet_phase_collect_cl_seconds",
+                "Collecting a cacheable body with a declared Content-Length before serving it (sampled).",
+                "phase_collect_cl",
+                &self.phase_collect_cl,
             ),
         ]
     }
@@ -1030,8 +1055,8 @@ mod tests {
         let cols = Telemetry::tsv_header().split('\t').count();
         let cells = t.snapshot_row().split('\t').count();
         assert_eq!(cols, cells);
-        // Counters + 8 histograms * (16 buckets + inf + sum + count = 19).
-        assert_eq!(cols, COUNTER_NAMES.len() + 8 * (NB + 3));
+        // Counters + 11 histograms * (16 buckets + inf + sum + count = 19).
+        assert_eq!(cols, COUNTER_NAMES.len() + 11 * (NB + 3));
     }
 
     #[test]

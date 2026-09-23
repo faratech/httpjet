@@ -39,7 +39,7 @@ use hj_pagecache::{
 };
 use hj_rewrite::{CacheKeyModifier, Htaccess, chain_cacheable_for_default};
 
-use crate::state::{ServerState, XfCapsuleSafeGetMode};
+use crate::state::{DictSkip, ServerState, XfCapsuleSafeGetMode};
 
 mod hit;
 mod singleflight;
@@ -437,6 +437,19 @@ fn egress_ae<'a>(state: &ServerState, ctx: &'a ReqCtx) -> &'a str {
     }
 }
 
+/// Who is looking up. A request that misses on the on-core fast path falls through to
+/// `dispatch`, which looks up again — so only one of the two may record the admission
+/// sighting and the hit/miss counters, or a single request counts twice and the
+/// "seen twice" admission bar passes on first sight.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LookupMode {
+    /// The full pipeline: records the sighting and the counters on every lookup.
+    Full,
+    /// The on-core fast path: records only a hit it serves; a miss or a stale entry is
+    /// left, unbuilt and uncounted, to the full lookup that follows.
+    FastPath,
+}
+
 pub fn cache_lookup(
     state: &Arc<ServerState>,
     ctx: &ReqCtx,
@@ -444,6 +457,46 @@ pub fn cache_lookup(
     if_none_match: Option<&str>,
     force_miss: bool,
     gates: Option<&SharedCacheGates>,
+) -> CacheOutcome {
+    lookup(
+        state,
+        ctx,
+        cc,
+        if_none_match,
+        force_miss,
+        gates,
+        LookupMode::Full,
+    )
+}
+
+/// The on-core fast path's probe: returns [`CacheOutcome::Hit`] for a fresh servable entry
+/// and [`CacheOutcome::Miss`] (or `Bypass`) for everything else, which the caller hands to
+/// `dispatch` for the counted lookup.
+pub fn cache_lookup_fast_path(
+    state: &Arc<ServerState>,
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'_>,
+    if_none_match: Option<&str>,
+) -> CacheOutcome {
+    lookup(
+        state,
+        ctx,
+        cc,
+        if_none_match,
+        false,
+        None,
+        LookupMode::FastPath,
+    )
+}
+
+fn lookup(
+    state: &Arc<ServerState>,
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'_>,
+    if_none_match: Option<&str>,
+    force_miss: bool,
+    gates: Option<&SharedCacheGates>,
+    mode: LookupMode,
 ) -> CacheOutcome {
     #[cfg(feature = "otel")]
     let _trace_stage = crate::otel::stage(crate::otel::StageKind::CacheLookup);
@@ -530,7 +583,10 @@ pub fn cache_lookup(
     let key_hash = hash_key(&key);
     // (W-TinyLFU) Record this cacheable lookup in the admission sketch — true access frequency
     // (hit OR miss), so the store-admission gate can reject one-hit-wonders. Cheap atomic bumps.
-    state.page_cache_admission.record(key_hash);
+    // The fast path records only the hits it serves (see `LookupMode`).
+    if mode == LookupMode::Full {
+        state.page_cache_admission.record(key_hash);
+    }
     // A background refresh re-runs the request only to RENDER + store: it has passed the
     // same bypass gates and computed the same key as a real request, but must not serve the
     // stale entry (that would loop). Returning Miss drives the single-flight render + store.
@@ -538,8 +594,16 @@ pub fn cache_lookup(
         return CacheOutcome::Miss(key_hash);
     }
     let now = Instant::now();
-    let entry = match store.get_entry_hashed(key_hash, &key, identity, now) {
+    let probed = match mode {
+        LookupMode::Full => store.get_entry_hashed(key_hash, &key, identity, now),
+        LookupMode::FastPath => store.get_entry_hashed_uncounted(key_hash, &key, identity, now),
+    };
+    let entry = match probed {
         hj_pagecache::EntryState::Fresh(e) => e,
+        // Dispatch serves the stale body and spawns the refresh; don't build it twice.
+        hj_pagecache::EntryState::Stale(_) if mode == LookupMode::FastPath => {
+            return CacheOutcome::Miss(key_hash);
+        }
         hj_pagecache::EntryState::Stale(e) => {
             // (dedup) A dict-compressed body is undecodable under a changed/absent dict → miss.
             if e.dict_gen != 0 && matching_dict(state, e.dict_gen).is_none() {
@@ -571,6 +635,7 @@ pub fn cache_lookup(
                 store.invalidate_key(&key);
                 return CacheOutcome::Miss(key_hash);
             };
+            note_variant_serve(state, &resp);
             apply_stale_cf_egress(resp.headers_mut());
             return CacheOutcome::StaleHit(resp, key_hash);
         }
@@ -617,6 +682,7 @@ pub fn cache_lookup(
                 );
                 strip_shared_cdn_cache_directives(resp.headers_mut());
             }
+            record_fast_path_hit(state, store, mode, key_hash);
             return CacheOutcome::Hit(resp);
         }
     }
@@ -657,6 +723,7 @@ pub fn cache_lookup(
         || stored_file_body(store, &entry),
     ) {
         Some(mut resp) => {
+            note_variant_serve(state, &resp);
             // Belt + suspenders on the cardinal rule: a private-routed lookup must
             // only ever surface a Private entry whose owner matches the key (the
             // exact-Eq key already guarantees this; a scope mismatch means a logic
@@ -678,6 +745,7 @@ pub fn cache_lookup(
                 );
                 strip_shared_cdn_cache_directives(resp.headers_mut());
             }
+            record_fast_path_hit(state, store, mode, key_hash);
             CacheOutcome::Hit(resp)
         }
         // (fail-closed) A fresh entry that can't be rendered (dict-decode failure / empty body /
@@ -687,6 +755,20 @@ pub fn cache_lookup(
             store.invalidate_key(&key);
             CacheOutcome::Miss(key_hash)
         }
+    }
+}
+
+/// A fast-path hit ends the request, so it is the one lookup that counts: record the
+/// sighting and the hit the full lookup would have recorded.
+fn record_fast_path_hit(
+    state: &ServerState,
+    store: &hj_pagecache::PageStore,
+    mode: LookupMode,
+    key_hash: u64,
+) {
+    if mode == LookupMode::FastPath {
+        store.record_hit();
+        state.page_cache_admission.record(key_hash);
     }
 }
 
@@ -843,13 +925,46 @@ fn spawn_variant_fill(
         // resolve_identity would pick (the first decodable one) reproduces the identity
         // byte-for-byte — defense against any codec edge case before discarding the only
         // other copy. `derive_len` carries the identity length for the store's accounting.
-        let derive_len = variants
-            .iter()
-            .find_map(|(tok, b)| Encoding::from_token(tok).and_then(|e| decode_bytes(e, b)))
-            .filter(|id| id.as_slice() == body.as_ref())
-            .and(u32::try_from(body.len()).ok());
+        for (token, _) in &variants {
+            if let Some(index) = variant_codec_index(token) {
+                state.metrics.pagecache_variant_fills[index]
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        // The store only uses this for an InMem body (a file-tier body keeps its tmpfs
+        // identity), so skip the verify decode everywhere else.
+        let derive_len = matches!(entry.body, hj_pagecache::PageBody::InMem(_))
+            .then(|| {
+                variants
+                    .iter()
+                    .find_map(|(tok, b)| Encoding::from_token(tok).and_then(|e| decode_bytes(e, b)))
+                    .filter(|id| id.as_slice() == body.as_ref())
+                    .and(u32::try_from(body.len()).ok())
+            })
+            .flatten();
         store.fill_variants(&key, &entry.identity, entry.stored_at, variants, derive_len);
     });
+}
+
+/// Codecs a stored precompressed variant can carry, indexing the per-codec variant counters.
+const VARIANT_CODECS: [&str; 3] = ["zstd", "br", "gzip"];
+
+fn variant_codec_index(token: &str) -> Option<usize> {
+    VARIANT_CODECS.iter().position(|codec| *codec == token)
+}
+
+/// Count a hit served from a stored variant. A hit response only carries Content-Encoding when
+/// it came from one; identity hits are compressed later by the per-serve transform.
+fn note_variant_serve(state: &ServerState, resp: &Response) {
+    if let Some(index) = resp
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .and_then(variant_codec_index)
+    {
+        state.metrics.pagecache_variant_serves[index]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Where the finalize task gets the identity bytes to compress.
@@ -861,41 +976,75 @@ enum FinalizeBody {
     Resident(Arc<CachedResponse>),
 }
 
-/// Dict-compress a stored identity entry on the bounded background pool. An unsuccessful attempt
-/// leaves a resident marker, while a saturated worker pool leaves it unmarked so a later hit can
-/// retry. Every guard is keyed on `(key, identity, stored_at)`, so a purge, an SWR refresh, or a
-/// fresher re-store landing during the compression window makes the task a no-op — it can neither
-/// resurrect a purged entry nor clobber a newer one.
-fn spawn_finalize(
-    state: &Arc<ServerState>,
+/// One stored version a finalize job may shrink, named by the store's own
+/// `(key, identity, stored_at)` guard.
+struct FinalizeTarget {
     key: hj_pagecache::PageCacheKey,
     key_hash: u64,
     identity: String,
     stored_at: Instant,
+}
+
+/// Dict-compress stored identity entries on the bounded background pool. Every target holds
+/// the SAME body (a capsule render is stored under its dedicated key and its public mirror),
+/// so the body is encoded once and swapped into each target that is still current. An
+/// unsuccessful attempt leaves a resident marker, while a saturated worker pool leaves the
+/// targets unmarked so a later hit can retry. Every guard is keyed on `(key, identity,
+/// stored_at)`, so a purge, an SWR refresh, or a fresher re-store landing during the
+/// compression window makes that target a no-op — it can neither resurrect a purged entry
+/// nor clobber a newer one.
+fn spawn_finalize(
+    state: &Arc<ServerState>,
+    targets: Vec<FinalizeTarget>,
     body: FinalizeBody,
+    content_type: &str,
     vhost: String,
     dict: Arc<hj_compress::PageDict>,
 ) {
-    let registry = state.page_cache_dict_fill.clone();
-    let warn_vhost = vhost.clone();
+    let Some(guard_id) = targets.first().map(|t| t.key_hash) else {
+        return;
+    };
+    let Some(store) = state.page_cache.clone() else {
+        return;
+    };
     let metrics = state
         .page_cache_dict_metrics
-        .entry(vhost)
+        .entry(vhost.clone())
         .or_insert_with(|| Arc::new(crate::state::DictRecompressMetrics::default()))
         .clone();
+    // Bodies that can't clear the savings gate — an image or archive, or a tiny body such as
+    // a cached redirect's empty one — skip the encode (and the pool slot) outright, marked so
+    // the hit-path retry doesn't queue them again.
+    let body_len = match &body {
+        FinalizeBody::Ready(bytes) => bytes.len(),
+        FinalizeBody::Resident(entry) => entry.body.len(),
+    };
+    let ineligible = if (body_len as u64) < hj_compress::DEFAULT_MIN_SIZE {
+        Some(DictSkip::TooSmall)
+    } else if !state.compress.is_compressible_type(content_type) {
+        Some(DictSkip::ContentType)
+    } else {
+        None
+    };
+    if let Some(why) = ineligible {
+        let marked = targets
+            .iter()
+            .filter(|t| store.mark_dict_compression_attempted(&t.key, &t.identity, t.stored_at))
+            .count();
+        metrics.skip(why, marked as u64);
+        return;
+    }
+    let registry = state.page_cache_dict_fill.clone();
+    let warn_vhost = vhost;
     let task_metrics = metrics.clone();
-    let state = state.clone();
-    let start = spawn_guarded(&registry, key_hash, async move {
-        let Some(store) = state.page_cache.as_ref() else {
-            task_metrics
-                .skipped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
-        };
-        if !store.mark_dict_compression_attempted(&key, &identity, stored_at) {
-            task_metrics
-                .skipped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let start = spawn_guarded(&registry, guard_id, async move {
+        let claimed = targets.len();
+        let targets: Vec<FinalizeTarget> = targets
+            .into_iter()
+            .filter(|t| store.mark_dict_compression_attempted(&t.key, &t.identity, t.stored_at))
+            .collect();
+        task_metrics.skip(DictSkip::Claimed, (claimed - targets.len()) as u64);
+        if targets.is_empty() {
             return;
         }
         task_metrics
@@ -906,9 +1055,7 @@ fn spawn_finalize(
             FinalizeBody::Resident(entry) => store.body_bytes_cold(&entry),
         };
         let Some(bytes) = bytes else {
-            task_metrics
-                .skipped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            task_metrics.skip(DictSkip::BodyMissing, targets.len() as u64);
             return;
         };
         task_metrics
@@ -920,36 +1067,34 @@ fn spawn_finalize(
         // every variant fill, so the swap must buy real RAM. An incompressible body (already-
         // minified JSON blobs, binary-ish payloads) that shrinks <12.5% stays the identity file.
         let compressed = match tokio::task::block_in_place(|| dict.encode(&bytes)) {
-            Some(c) if c.len() <= bytes.len().saturating_sub(bytes.len() / 8) => c,
+            Some(c) if c.len() <= bytes.len().saturating_sub(bytes.len() / 8) => Bytes::from(c),
             _ => {
-                task_metrics
-                    .skipped
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                task_metrics.skip(DictSkip::Savings, targets.len() as u64);
                 return;
             }
         };
         let compressed_len = compressed.len() as u64;
-        if store.fill_recompress_disk(
-            &key,
-            &identity,
-            stored_at,
-            Bytes::from(compressed),
-            dict.generation(),
-        ) {
-            task_metrics
-                .completed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            task_metrics
-                .output_bytes
-                .fetch_add(compressed_len, std::sync::atomic::Ordering::Relaxed);
-            task_metrics.saved_bytes.fetch_add(
-                (bytes.len() as u64).saturating_sub(compressed_len),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        } else {
-            task_metrics
-                .skipped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for target in targets {
+            if store.fill_recompress_disk(
+                &target.key,
+                &target.identity,
+                target.stored_at,
+                compressed.clone(),
+                dict.generation(),
+            ) {
+                task_metrics
+                    .completed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                task_metrics
+                    .output_bytes
+                    .fetch_add(compressed_len, std::sync::atomic::Ordering::Relaxed);
+                task_metrics.saved_bytes.fetch_add(
+                    (bytes.len() as u64).saturating_sub(compressed_len),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            } else {
+                task_metrics.skip(DictSkip::LostRace, 1);
+            }
         }
     });
     match start {
@@ -1015,14 +1160,26 @@ fn maybe_spawn_finalize(
     };
     spawn_finalize(
         state,
-        key.clone(),
-        key_hash,
-        entry.identity.clone(),
-        entry.stored_at,
+        vec![FinalizeTarget {
+            key: key.clone(),
+            key_hash,
+            identity: entry.identity.clone(),
+            stored_at: entry.stored_at,
+        }],
         FinalizeBody::Resident(entry.clone()),
+        stored_content_type(&entry.headers),
         vhost,
         dict,
     );
+}
+
+/// The `Content-Type` of a stored entry's headers ("" when absent).
+fn stored_content_type(headers: &[(HeaderName, HeaderValue)]) -> &str {
+    headers
+        .iter()
+        .find(|(name, _)| name == CONTENT_TYPE)
+        .and_then(|(_, value)| value.to_str().ok())
+        .unwrap_or("")
 }
 
 /// (store path) Dict-compress a just-stored entry immediately, off the client path.
@@ -1040,24 +1197,23 @@ fn maybe_spawn_finalize(
 /// miss. The entry is therefore stored as identity and shrunk moments later, in place.
 fn spawn_store_finalize(
     state: &Arc<ServerState>,
-    ctx: &ReqCtx,
-    key: &hj_pagecache::PageCacheKey,
-    key_hash: u64,
-    identity: &str,
-    stored_at: Instant,
+    vhost_name: &str,
+    targets: Vec<FinalizeTarget>,
     body: &Bytes,
+    content_type: &str,
 ) {
-    let vhost = ctx.vhost_name.to_ascii_lowercase();
+    if targets.is_empty() {
+        return;
+    }
+    let vhost = vhost_name.to_ascii_lowercase();
     let Some(dict) = state.page_cache_dicts.for_vhost(&vhost).cloned() else {
         return;
     };
     spawn_finalize(
         state,
-        key.clone(),
-        key_hash,
-        identity.to_owned(),
-        stored_at,
+        targets,
         FinalizeBody::Ready(body.clone()),
+        content_type,
         vhost,
         dict,
     );
@@ -1902,6 +2058,7 @@ fn capsule_public_fallback_lookup(
         || stored_file_body(store, &entry),
     ) {
         Some(mut resp) => {
+            note_variant_serve(state, &resp);
             mark_capsule(
                 resp.headers_mut(),
                 if stale {
@@ -2058,6 +2215,7 @@ pub fn capsule_lookup(
                     if_none_match,
                 );
             };
+            note_variant_serve(state, &resp);
             apply_stale_cf_egress(resp.headers_mut());
             mark_capsule(resp.headers_mut(), "hit,stale");
             mark_hot_path(resp.headers_mut(), "l2-stale");
@@ -2143,6 +2301,7 @@ pub fn capsule_lookup(
         || stored_file_body(store, &entry),
     ) {
         Some(mut resp) => {
+            note_variant_serve(state, &resp);
             mark_capsule(resp.headers_mut(), "hit");
             mark_hot_path(resp.headers_mut(), "l1-fresh");
             let age_secs = mark_shell_age(resp.headers_mut(), &entry, now);
@@ -2228,6 +2387,7 @@ fn stale_if_error_fallback(
         || store.body_bytes(&entry),
         || stored_file_body(store, &entry),
     )?;
+    note_variant_serve(state, &resp);
     // Short-public egress (with Age reset + CDN/Expires strip) so CF never pins the
     // stale body past 30s, then label the serve for operators (apply_stale_cf_egress
     // sets the generic "stale" marker first).
@@ -2474,6 +2634,19 @@ pub async fn cache_store(
     cc: &CacheCtx<'_>,
     resp: Response,
 ) -> Response {
+    cache_store_leading(state, ctx, cc, resp, &mut None).await
+}
+
+/// [`cache_store`] for the single-flight leader of this key. A miss stored while it streams
+/// (`--page-cache-stream-fill-vhosts`) takes `leader` along, so followers wake only once the
+/// entry exists; otherwise `leader` is left for the caller to drop.
+pub async fn cache_store_leading(
+    state: &Arc<ServerState>,
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'_>,
+    resp: Response,
+    leader: &mut Option<InflightLeader>,
+) -> Response {
     #[cfg(feature = "otel")]
     let _trace_stage = crate::otel::stage(crate::otel::StageKind::CacheStore);
     let &CacheCtx {
@@ -2565,6 +2738,9 @@ pub async fn cache_store(
         // cross-scheme variant. The origin still serves THIS one response; it just is not
         // stored or replayed.
         && !is_self_redirect(status, &parts.headers, ctx.is_tls, host, req_path, req_query)
+        // An opted-in 303 is stored only under an allowlisted prefix: redirects elsewhere
+        // (thread `latest`, attachments) rely on CDN purges the origin can't mirror.
+        && (status != 303 || cfg.opt_in_303_prefixes.iter().any(|p| req_path.starts_with(p.as_str())))
         // A standard HTTP `Vary` response header lists request dimensions the content
         // depends on. We key on cookies + the negotiated encoding variant, so the only
         // token we can honor is `Accept-Encoding`; any other (`Accept-Language`,
@@ -2683,13 +2859,86 @@ pub async fn cache_store(
         return Response::from_parts(parts, body);
     }
 
+    // Progressive template output (no Content-Length) reaches the client as the backend
+    // writes it; the body is stored when the backend finishes. Framed (Content-Length) PHP
+    // output arrives in one burst, so buffering it below costs nothing.
+    if capsule_control.is_none()
+        && status == 200
+        && matches!(scope, PageScope::Public)
+        && known_len.is_none()
+        && matches!(body, Body::Stream(_))
+        && cfg.streams_fill(&ctx.vhost_name)
+        && parts
+            .headers
+            .get(CONTENT_ENCODING)
+            .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        let Body::Stream(inner) = body else {
+            unreachable!("matched a stream body above");
+        };
+        parts.headers.remove(CONTENT_ENCODING);
+        let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
+        let commit = FillCommit {
+            state: state.clone(),
+            entry: PendingEntry {
+                key_hash: hash_key(&key),
+                key,
+                identity: identity.to_string(),
+                status,
+                headers: stored_headers_from(&parts.headers),
+                tags,
+                scope,
+                ttl: Duration::from_secs(ttl_secs as u64),
+                swr: Duration::from_secs(stale_secs as u64),
+                sie: Duration::from_secs(sie_secs as u64),
+                render_epoch,
+            },
+            content_type: parts
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string(),
+            vhost_name: ctx.vhost_name.to_string(),
+            leader: leader.take(),
+        };
+        strip_control_headers(&mut parts.headers);
+        parts.headers.remove(TRANSFER_ENCODING);
+        parts
+            .headers
+            .insert(HDR_CACHE_STATUS, HeaderValue::from_static("miss"));
+        parts.extensions.insert(hj_compress::ProgressiveBody);
+        state
+            .metrics
+            .pagecache_stream_fills
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let body = StreamFill {
+            inner,
+            buf: BytesMut::with_capacity(COLLECT_DEFAULT_CAPACITY),
+            max_bytes: cfg.max_obj_bytes,
+            commit: Some(commit),
+        };
+        return Response::from_parts(parts, Body::Stream(body.boxed()));
+    }
+
     // (#9) A `Body::File` CAN be eligible (an `.htaccess` `Header set
     // X-LiteSpeed-Cache-Control: public` on a static file, applied by
     // `apply_response_headers` BEFORE this store runs). `collect_body` reads it into
     // memory; if THAT exact read fails, `collect_body` returns the original File response
     // with its selected descriptor/cache lease intact. A valid file must never become a 502,
     // and fallback must never reopen a replacement pathname under stale validators.
-    let mut bytes = match collect_body(body, cfg.max_obj_bytes).await {
+    // (sampled) How long a streamed body takes to collect before the miss can be served —
+    // split by framing, since progressive no-Content-Length output is what this hides.
+    let collect_timer = (matches!(body, Body::Stream(_))
+        && state
+            .telemetry
+            .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE))
+    .then(|| (Instant::now(), parts.headers.contains_key(CONTENT_LENGTH)));
+    // A doubling BytesMut would pass through 16/32/64/128/256 KiB for a typical 170 KB page.
+    let capacity_hint = known_len.map_or(COLLECT_DEFAULT_CAPACITY, |n| {
+        n.min(COLLECT_PRESIZE_CAP).min(cfg.max_obj_bytes) as usize
+    });
+    let mut bytes = match collect_body(body, cfg.max_obj_bytes, capacity_hint).await {
         Collected::Buffered(b) => b,
         Collected::Passthrough(passthrough) => {
             // An unknown-length (chunked) stream exceeded the cap mid-buffer: serve it through,
@@ -2705,6 +2954,15 @@ pub async fn cache_store(
             return error_502();
         }
     };
+    if let Some((started, declared_len)) = collect_timer {
+        let shard = state.telemetry.shard();
+        let hist = if declared_len {
+            &shard.phase_collect_cl
+        } else {
+            &shard.phase_collect_nocl
+        };
+        hist.record(started.elapsed());
+    }
 
     // (#A/#B) CANONICALIZE TO IDENTITY before caching. The store, PC1 variants, and
     // per-serve compression all assume an identity body; the cache key is NOT
@@ -2767,12 +3025,24 @@ pub async fn cache_store(
     //    (a shared cache entry must never replay one client's cookie — the same
     //    strip CDNs/LiteSpeed apply; the fill response below still carries it to
     //    the originating client).
+    // The validator a committed store carries, so the fill response that Cloudflare caches has
+    // the same ETag every later hit and 304 will use (it is a hash of these exact bytes).
+    let mut fill_etag: Option<HeaderValue> = None;
     if store_ok && !uncacheable_body && bytes.len() as u64 <= cfg.max_obj_bytes {
+        let store_timer = state
+            .telemetry
+            .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE)
+            .then(Instant::now);
         let mut stored_headers = stored_headers_from(&parts.headers);
         // Synthesize a weak validator when the backend gave none (XenForo pages usually
         // don't), so CF can revalidate a stale-but-cacheable page with a conditional GET and
         // get a 304 (headers only) instead of re-pulling the whole body. Served on every hit.
         ensure_stored_etag(&mut stored_headers, &bytes);
+        let stored_etag = stored_headers
+            .iter()
+            .find(|(name, _)| name == ETAG)
+            .map(|(_, value)| value.clone());
+        let mut finalize_targets = Vec::with_capacity(2);
         if let Some(control) = capsule_control {
             // (#99) The dedicated capsule entry is stored WITHOUT the W-TinyLFU `admitted` gate
             // that governs the public mirror below — intentionally. The admission sketch frequency
@@ -2818,15 +3088,12 @@ pub async fn cache_store(
                     .metrics
                     .xf_capsule_dedicated_stores
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                spawn_store_finalize(
-                    state,
-                    ctx,
-                    &key,
-                    hash_key(&key),
-                    &stored_identity,
+                finalize_targets.push(FinalizeTarget {
+                    key_hash: hash_key(&key),
+                    key,
+                    identity: stored_identity,
                     stored_at,
-                    &bytes,
-                );
+                });
             }
         }
         if capsule_control.is_some() {
@@ -2844,67 +3111,50 @@ pub async fn cache_store(
         // The PageScope owner equals the route owner by construction (the eligibility
         // match binds them from the same PrivateRoute), so the shared builder covers it.
         let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
-        // (W-TinyLFU admission) Spend RAM (store) + CPU (precompress) only on keys that show
-        // REUSE. The frequency sketch is recorded on every cacheable lookup; admit when the
-        // estimate meets a SIZE-WEIGHTED bar (a one-hit-wonder is rejected; a larger object needs
-        // more proven reuse) so the long tail behind Cloudflare can't churn out the hot working
-        // set. A rejected response is still served below (just neither precompressed nor stored).
-        let key_hash = hash_key(&key);
-        // Private entries skip the W-TinyLFU frequency bar: per-session keys are
-        // near-unique so the sketch never accumulates reuse for them, and the
-        // whole point is serving the SAME session's next request.
-        let is_private = matches!(scope, PageScope::Private { .. });
-        let admitted = is_private
-            || state.page_cache_admission.estimate(key_hash)
-                >= admission_threshold(state.page_cache_admit_base, bytes.len() as u64);
-        state.telemetry.record_cache_admission(admitted);
-        if admitted {
-            // (PC2-lazy) Store the entry IDENTITY-ONLY (no precompressed serve variant) — variant
-            // precompression is deferred to the first cache HIT (`spawn_variant_fill`), so that CPU
-            // is spent only on entries proven hot by being SERVED. Dictionary compression is NOT
-            // deferred that way: it shrinks the entry's footprint in the capacity-bound file tier,
-            // which it occupies whether or not it is ever served (see `spawn_store_finalize`).
-            let stored_at = Instant::now();
-            let stored_identity = identity.to_string();
-            let stored = store.store_if_not_purged_since_hashed(
-                key_hash,
-                key.clone(),
-                CachedResponse {
-                    status,
-                    identity: stored_identity.clone(),
-                    headers: stored_headers,
-                    body: PageBody::InMem(bytes.clone()),
-                    variants: Vec::new(),
-                    // Private entries never get the lazy variant fill: per-session
-                    // reuse is too low to pay the precompress CPU/RAM.
-                    variants_filled: is_private,
-                    dict_gen: 0,
-                    tags,
-                    vary_cookie_name: String::new(),
-                    vary_value: String::new(),
-                    scope,
-                    stored_at,
-                    ttl: Duration::from_secs(ttl_secs as u64),
-                    swr: Duration::from_secs(stale_secs as u64),
-                    sie: Duration::from_secs(sie_secs as u64),
-                },
-                render_epoch,
-            );
-            if stored {
-                spawn_store_finalize(
-                    state,
-                    ctx,
-                    &key,
-                    key_hash,
-                    &stored_identity,
-                    stored_at,
-                    &bytes,
-                );
-            }
+        let entry = PendingEntry {
+            key_hash: hash_key(&key),
+            key,
+            identity: identity.to_string(),
+            status,
+            headers: stored_headers,
+            tags,
+            scope,
+            ttl: Duration::from_secs(ttl_secs as u64),
+            swr: Duration::from_secs(stale_secs as u64),
+            sie: Duration::from_secs(sie_secs as u64),
+            render_epoch,
+        };
+        finalize_targets.extend(store_admitted(state, store, entry, &bytes));
+        if let Some(started) = store_timer {
+            state
+                .telemetry
+                .shard()
+                .phase_store
+                .record(started.elapsed());
         }
+        if !finalize_targets.is_empty() {
+            fill_etag = stored_etag;
+        }
+        // One encode covers the capsule entry and its public mirror (same bytes).
+        spawn_store_finalize(
+            state,
+            &ctx.vhost_name,
+            finalize_targets,
+            &bytes,
+            parts
+                .headers
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+        );
     }
 
     // 5. Serve the buffered body; strip control headers, mark the fill as a miss.
+    if let Some(etag) = fill_etag
+        && !parts.headers.contains_key(ETAG)
+    {
+        parts.headers.insert(ETAG, etag);
+    }
     strip_control_headers(&mut parts.headers);
     parts.headers.remove(TRANSFER_ENCODING);
     parts
@@ -2925,20 +3175,216 @@ pub async fn cache_store(
 /// in the `<html>` tag), so it's cheap and low-false-positive (`error` is XF's reserved template
 /// name — a normal page reads e.g. `data-template="forum_list"`/`"thread_view"`).
 fn is_xf_error_page(status: u16, headers: &HeaderMap, body: &[u8]) -> bool {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    is_xf_error_body(status, content_type, body)
+}
+
+fn is_xf_error_body(status: u16, content_type: &str, body: &[u8]) -> bool {
     if status != 200 {
         return false; // non-200 errors are excluded by the cacheable-status gate already
     }
-    let is_html = headers
-        .get(CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("text/html"));
-    if !is_html {
+    if !content_type.contains("text/html") {
         return false;
     }
     const SCAN: usize = 8192;
     const MARKER: &[u8] = b"data-template=\"error\"";
     let head = &body[..body.len().min(SCAN)];
     head.windows(MARKER.len()).any(|w| w == MARKER)
+}
+
+/// A fully received miss, keyed and classified, ready for the admission check and store.
+struct PendingEntry {
+    key: hj_pagecache::PageCacheKey,
+    key_hash: u64,
+    identity: String,
+    status: u16,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    tags: Vec<Arc<str>>,
+    scope: PageScope,
+    ttl: Duration,
+    swr: Duration,
+    sie: Duration,
+    render_epoch: u64,
+}
+
+/// Admit and store `entry` with `bytes` as its body; the finalize target when it was stored.
+fn store_admitted(
+    state: &Arc<ServerState>,
+    store: &hj_pagecache::PageStore,
+    entry: PendingEntry,
+    bytes: &Bytes,
+) -> Option<FinalizeTarget> {
+    // (W-TinyLFU admission) Spend RAM (store) + CPU (precompress) only on keys that show
+    // REUSE. The frequency sketch is recorded on every cacheable lookup; admit when the
+    // estimate meets a SIZE-WEIGHTED bar (a one-hit-wonder is rejected; a larger object needs
+    // more proven reuse) so the long tail behind Cloudflare can't churn out the hot working
+    // set. A rejected response is still served (just neither precompressed nor stored).
+    // Private entries skip the W-TinyLFU frequency bar: per-session keys are
+    // near-unique so the sketch never accumulates reuse for them, and the
+    // whole point is serving the SAME session's next request.
+    let is_private = matches!(entry.scope, PageScope::Private { .. });
+    let admitted = is_private
+        || state.page_cache_admission.estimate(entry.key_hash)
+            >= admission_threshold(state.page_cache_admit_base, bytes.len() as u64);
+    state.telemetry.record_cache_admission(admitted);
+    if !admitted {
+        return None;
+    }
+    // (PC2-lazy) Store the entry IDENTITY-ONLY (no precompressed serve variant) — variant
+    // precompression is deferred to the first cache HIT (`spawn_variant_fill`), so that CPU
+    // is spent only on entries proven hot by being SERVED. Dictionary compression is NOT
+    // deferred that way: it shrinks the entry's footprint in the capacity-bound file tier,
+    // which it occupies whether or not it is ever served (see `spawn_store_finalize`).
+    let stored_at = Instant::now();
+    let stored = store.store_if_not_purged_since_hashed(
+        entry.key_hash,
+        entry.key.clone(),
+        CachedResponse {
+            status: entry.status,
+            identity: entry.identity.clone(),
+            headers: entry.headers,
+            body: PageBody::InMem(bytes.clone()),
+            variants: Vec::new(),
+            // Private entries never get the lazy variant fill: per-session
+            // reuse is too low to pay the precompress CPU/RAM.
+            variants_filled: is_private,
+            dict_gen: 0,
+            tags: entry.tags,
+            vary_cookie_name: String::new(),
+            vary_value: String::new(),
+            scope: entry.scope,
+            stored_at,
+            ttl: entry.ttl,
+            swr: entry.swr,
+            sie: entry.sie,
+        },
+        entry.render_epoch,
+    );
+    stored.then(|| FinalizeTarget {
+        key: entry.key,
+        key_hash: entry.key_hash,
+        identity: entry.identity,
+        stored_at,
+    })
+}
+
+/// What a streamed miss needs to store itself once the backend has finished.
+struct FillCommit {
+    state: Arc<ServerState>,
+    entry: PendingEntry,
+    content_type: String,
+    vhost_name: String,
+    /// Held until the store is done, so single-flight followers wake to a hit.
+    leader: Option<InflightLeader>,
+}
+
+impl FillCommit {
+    /// Store off the response's task: the client's end-of-stream never waits for the
+    /// tmpfs write.
+    fn finish(self, bytes: Bytes) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move { self.store(bytes) });
+            }
+            Err(_) => self.store(bytes),
+        }
+    }
+
+    fn store(self, bytes: Bytes) {
+        let FillCommit {
+            state,
+            mut entry,
+            content_type,
+            vhost_name,
+            leader,
+        } = self;
+        if let Some(store) = state.page_cache.as_ref() {
+            if (bytes.is_empty() && hit::body_required(entry.status))
+                || is_xf_error_body(entry.status, &content_type, &bytes)
+            {
+                tracing::warn!(
+                    status = entry.status,
+                    empty = bytes.is_empty(),
+                    "page-cache: refusing to store empty/error streamed body"
+                );
+            } else {
+                ensure_stored_etag(&mut entry.headers, &bytes);
+                if let Some(target) = store_admitted(&state, store, entry, &bytes) {
+                    state
+                        .metrics
+                        .pagecache_stream_fill_stores
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    spawn_store_finalize(&state, &vhost_name, vec![target], &bytes, &content_type);
+                }
+            }
+        }
+        drop(leader);
+    }
+}
+
+/// A page-cache miss served while the backend is still writing it. Each frame is forwarded
+/// as it arrives and copied aside; the copy is stored once the backend finishes cleanly. A
+/// backend error, an early drop (client gone) or a body past the object cap stores nothing,
+/// so a partial body can never become an entry.
+struct StreamFill {
+    inner: hj_core::StreamBody,
+    buf: BytesMut,
+    max_bytes: u64,
+    commit: Option<FillCommit>,
+}
+
+impl StreamFill {
+    fn abandon(&mut self) {
+        self.commit = None;
+        self.buf = BytesMut::new();
+    }
+}
+
+impl http_body::Body for StreamFill {
+    type Data = Bytes;
+    type Error = hj_core::BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref()
+                    && this.commit.is_some()
+                {
+                    if (this.buf.len() + data.len()) as u64 > this.max_bytes {
+                        this.abandon();
+                    } else {
+                        this.buf.extend_from_slice(data);
+                    }
+                }
+            }
+            Poll::Ready(Some(Err(_))) => this.abandon(),
+            Poll::Ready(None) => {
+                if let Some(commit) = this.commit.take() {
+                    commit.finish(std::mem::take(&mut this.buf).freeze());
+                }
+            }
+            Poll::Pending => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        // Not before the end-of-stream poll that commits the store.
+        self.commit.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 fn is_event_stream(content_type: &str) -> bool {
@@ -3062,7 +3508,13 @@ enum Collected {
 /// cap — so a large or adversarial chunked response marked cacheable can't be slurped unboundedly
 /// into RAM (an OOM/DoS vector the old `s.collect()` had). On overflow it is handed back as
 /// `Passthrough` to serve through, uncached.
-async fn collect_body(body: Body, max_obj_bytes: u64) -> Collected {
+/// Start a streamed-body collect at the declared length, but never pre-reserve more than this:
+/// Content-Length is backend-controlled.
+const COLLECT_PRESIZE_CAP: u64 = 1 << 20;
+/// Starting capacity when no length is declared.
+const COLLECT_DEFAULT_CAPACITY: usize = 64 * 1024;
+
+async fn collect_body(body: Body, max_obj_bytes: u64, capacity_hint: usize) -> Collected {
     match body {
         Body::Full(b) => Collected::Buffered(b),
         Body::Empty => Collected::Buffered(Bytes::new()),
@@ -3103,7 +3555,7 @@ async fn collect_body(body: Body, max_obj_bytes: u64) -> Collected {
             }
         }
         Body::Stream(mut s) => {
-            let mut buf = BytesMut::new();
+            let mut buf = BytesMut::with_capacity(capacity_hint);
             loop {
                 match s.frame().await {
                     Some(Ok(frame)) => {
@@ -3720,6 +4172,458 @@ mod tests {
         cache_test_ctx_with_capsule(crate::state::XfCapsuleConfig::disabled())
     }
 
+    /// #492: with the opt-in configured, an app-opted 404 and a `/whats-new/` 303 are stored and
+    /// then hit; a 303 elsewhere, a self-redirecting 303, and a 404 that sets a private cookie
+    /// are not.
+    #[tokio::test]
+    async fn opted_in_404_and_allowlisted_303_are_cached_but_nothing_else() {
+        let (state, ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                cfg.opt_in_status = vec![404, 410, 303];
+                cfg.opt_in_303_prefixes = vec!["/whats-new/".into()];
+                cfg.private_cookies = vec!["xf_session".into()];
+            });
+        let run = |path: &'static str, status: u16, extra: Vec<(&'static str, &'static str)>| {
+            let state = state.clone();
+            let ctx = ctx.clone();
+            let store = store.clone();
+            async move {
+                let method = Method::GET;
+                let identity = format!("https\nforum.example\n{path}");
+                let cc = CacheCtx {
+                    method: &method,
+                    host: "forum.example",
+                    cookie: None,
+                    identity: &identity,
+                    req_path: path,
+                    req_query: "",
+                    chain: &[],
+                    render_epoch: store.purge_epoch(),
+                    has_range: false,
+                    vary_value: None,
+                    host_foreign: false,
+                    origin: None,
+                };
+                let _ = cache_lookup(&state, &ctx, &cc, None, false, None);
+                let mut resp = http::Response::builder()
+                    .status(status)
+                    .header(CONTENT_TYPE, "text/html")
+                    .header(HDR_CACHE_CONTROL, "public,max-age=86400");
+                for (k, v) in extra {
+                    resp = resp.header(k, v);
+                }
+                let body = if status == 404 {
+                    &b"<p>gone</p>"[..]
+                } else {
+                    &b""[..]
+                };
+                let _ = cache_store(
+                    &state,
+                    &ctx,
+                    &cc,
+                    resp.body(Body::Full(Bytes::from_static(body))).unwrap(),
+                )
+                .await;
+                matches!(
+                    cache_lookup(&state, &ctx, &cc, None, false, None),
+                    CacheOutcome::Hit(_)
+                )
+            }
+        };
+        assert!(
+            run("/missing-page/", 404, vec![]).await,
+            "an opted-in 404 is cached"
+        );
+        assert!(
+            run(
+                "/whats-new/posts/",
+                303,
+                vec![("location", "https://forum.example/whats-new/posts/42/")]
+            )
+            .await,
+            "an allowlisted 303 is cached"
+        );
+        assert!(
+            !run(
+                "/threads/slug.1/latest",
+                303,
+                vec![("location", "https://forum.example/threads/slug.1/page-9")]
+            )
+            .await,
+            "a 303 outside the allowlist is not"
+        );
+        assert!(
+            !run(
+                "/whats-new/",
+                303,
+                vec![("location", "https://forum.example/whats-new/")]
+            )
+            .await,
+            "a self-redirect is never cached"
+        );
+        assert!(
+            !run(
+                "/cookie-404/",
+                404,
+                vec![("set-cookie", "xf_session=abc; path=/")]
+            )
+            .await,
+            "a 404 setting a private cookie is not"
+        );
+    }
+
+    /// #490: the fill response Cloudflare caches must carry the same synthesized validator as
+    /// every later hit, and a response that was not stored must carry none.
+    #[tokio::test]
+    async fn fill_response_carries_the_stored_etag() {
+        let (state, ctx, store) = cache_test_ctx();
+        let method = Method::GET;
+        let cc = CacheCtx {
+            method: &method,
+            host: "forum.example",
+            cookie: None,
+            identity: "https\nforum.example\n/etag",
+            req_path: "/etag",
+            req_query: "",
+            chain: &[],
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            vary_value: None,
+            host_foreign: false,
+            origin: None,
+        };
+        // The lookup that precedes a real render records the admission sighting.
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        let fill = cache_store(
+            &state,
+            &ctx,
+            &cc,
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "text/html")
+                .header(HDR_CACHE_CONTROL, "public,max-age=600")
+                .body(Body::Full(Bytes::from_static(b"<p>page</p>")))
+                .unwrap(),
+        )
+        .await;
+        let fill_etag = fill.headers().get(ETAG).cloned().expect("fill has an ETag");
+        assert!(fill_etag.to_str().unwrap().starts_with("W/\"pc"));
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("second request must hit");
+        };
+        assert_eq!(hit.headers().get(ETAG), Some(&fill_etag));
+
+        let not_stored = cache_store(
+            &state,
+            &ctx,
+            &CacheCtx {
+                identity: "https\nforum.example\n/etag-private",
+                req_path: "/etag-private",
+                ..cc
+            },
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "text/html")
+                .header(HDR_CACHE_CONTROL, "no-cache")
+                .body(Body::Full(Bytes::from_static(b"<p>page</p>")))
+                .unwrap(),
+        )
+        .await;
+        assert!(not_stored.headers().get(ETAG).is_none());
+    }
+
+    /// A backend body the test feeds frame by frame.
+    struct FedBody(tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, hj_core::BoxError>>);
+
+    impl http_body::Body for FedBody {
+        type Data = Bytes;
+        type Error = hj_core::BoxError;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            self.0
+                .poll_recv(cx)
+                .map(|item| item.map(|r| r.map(http_body::Frame::data)))
+        }
+    }
+
+    type Feed = tokio::sync::mpsc::UnboundedSender<Result<Bytes, hj_core::BoxError>>;
+
+    fn fed_page(content_length: Option<usize>) -> (Feed, Response) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut b = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600");
+        if let Some(n) = content_length {
+            b = b.header(CONTENT_LENGTH, n);
+        }
+        (tx, b.body(Body::Stream(FedBody(rx).boxed())).unwrap())
+    }
+
+    fn stream_fill_ctx() -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
+        cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+            cfg.stream_fill_vhosts = vec!["forum.example".into()];
+            cfg.max_obj_bytes = 64;
+        })
+    }
+
+    fn page_cc<'a>(
+        method: &'a Method,
+        path: &'a str,
+        identity: &'a str,
+        epoch: u64,
+    ) -> CacheCtx<'a> {
+        CacheCtx {
+            method,
+            host: "forum.example",
+            cookie: None,
+            identity,
+            req_path: path,
+            req_query: "",
+            chain: &[],
+            render_epoch: epoch,
+            has_range: false,
+            vary_value: None,
+            host_foreign: false,
+            origin: None,
+        }
+    }
+
+    async fn next_data(body: &mut hj_core::StreamBody) -> Option<Bytes> {
+        loop {
+            match body.frame().await? {
+                Ok(frame) => {
+                    if let Ok(data) = frame.into_data() {
+                        return Some(data);
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// A miss on a stream-fill vhost reaches the client frame by frame while the backend is
+    /// still writing, and is stored once the backend finishes. Single-flight followers keep
+    /// waiting until the entry exists.
+    #[tokio::test]
+    async fn streamed_miss_is_forwarded_early_and_stored_at_the_end() {
+        let (state, ctx, store) = stream_fill_ctx();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/moon".to_string();
+        let cc = page_cc(&method, "/moon", &identity, store.purge_epoch());
+        let CacheOutcome::Miss(key_hash) = cache_lookup(&state, &ctx, &cc, None, false, None)
+        else {
+            panic!("first request misses");
+        };
+        let Enter::Leader(guard) = state.page_cache_inflight.enter(key_hash) else {
+            panic!("first misser leads");
+        };
+        let mut leader = Some(guard);
+        let (feed, resp) = fed_page(None);
+        let resp = cache_store_leading(&state, &ctx, &cc, resp, &mut leader).await;
+        assert!(leader.is_none(), "the streamed miss owns the leader");
+        assert!(resp.headers().get(CONTENT_LENGTH).is_none());
+        assert_eq!(resp.headers().get(HDR_CACHE_STATUS).unwrap(), "miss");
+        assert!(
+            resp.extensions()
+                .get::<hj_compress::ProgressiveBody>()
+                .is_some()
+        );
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a no-Content-Length miss streams");
+        };
+
+        feed.send(Ok(Bytes::from_static(b"<head>"))).unwrap();
+        assert_eq!(next_data(&mut body).await.unwrap(), "<head>");
+        let Enter::Follower(follower) = state.page_cache_inflight.enter(key_hash) else {
+            panic!("the render is still in flight");
+        };
+        feed.send(Ok(Bytes::from_static(b"<body>"))).unwrap();
+        drop(feed);
+        assert_eq!(next_data(&mut body).await.unwrap(), "<body>");
+        assert!(next_data(&mut body).await.is_none());
+
+        tokio::time::timeout(Duration::from_secs(5), follower.wait())
+            .await
+            .expect("the leader is released after the store");
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("the finished stream was stored before followers woke");
+        };
+        match hit.into_body() {
+            Body::Full(b) => assert_eq!(&b[..], b"<head><body>"),
+            _ => panic!("an in-RAM hit is Full"),
+        }
+        let m = &state.metrics;
+        assert_eq!(
+            m.pagecache_stream_fills
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.pagecache_stream_fill_stores
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// A streamed miss that errors, is dropped by the client, or outgrows the object cap is
+    /// never stored, and its leader is released so followers render for themselves.
+    #[tokio::test]
+    async fn cut_short_or_oversized_streamed_miss_stores_nothing() {
+        let (state, ctx, store) = stream_fill_ctx();
+        let method = Method::GET;
+        for (path, case) in [("/err", 0), ("/drop", 1), ("/big", 2)] {
+            let identity = format!("https\nforum.example\n{path}");
+            let cc = page_cc(&method, path, &identity, store.purge_epoch());
+            let CacheOutcome::Miss(key_hash) = cache_lookup(&state, &ctx, &cc, None, false, None)
+            else {
+                panic!("{path}: first request misses");
+            };
+            let Enter::Leader(guard) = state.page_cache_inflight.enter(key_hash) else {
+                panic!("{path}: first misser leads");
+            };
+            let (feed, resp) = fed_page(None);
+            let resp = cache_store_leading(&state, &ctx, &cc, resp, &mut Some(guard)).await;
+            let Body::Stream(mut body) = resp.into_body() else {
+                panic!("{path}: streams");
+            };
+            feed.send(Ok(Bytes::from_static(b"<head>"))).unwrap();
+            assert_eq!(next_data(&mut body).await.unwrap(), "<head>");
+            match case {
+                0 => {
+                    feed.send(Err("backend died".into())).unwrap();
+                    assert!(matches!(body.frame().await, Some(Err(_))));
+                }
+                1 => drop(body),
+                _ => {
+                    let big = Bytes::from(vec![b'x'; 100]);
+                    feed.send(Ok(big.clone())).unwrap();
+                    drop(feed);
+                    assert_eq!(next_data(&mut body).await.unwrap(), big, "still served");
+                    assert!(next_data(&mut body).await.is_none());
+                }
+            }
+            tokio::task::yield_now().await;
+            assert!(
+                matches!(state.page_cache_inflight.enter(key_hash), Enter::Leader(_)),
+                "{path}: leader released"
+            );
+            assert!(
+                matches!(
+                    cache_lookup(&state, &ctx, &cc, None, false, None),
+                    CacheOutcome::Miss(_)
+                ),
+                "{path}: nothing stored"
+            );
+        }
+        assert_eq!(
+            state
+                .metrics
+                .pagecache_stream_fill_stores
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// Framed (Content-Length) bodies and vhosts without the opt-in keep the buffered miss.
+    #[tokio::test]
+    async fn framed_or_unlisted_misses_are_still_buffered() {
+        for (listed, content_length) in [(true, Some(6)), (false, None)] {
+            let (state, ctx, store) =
+                cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                    if listed {
+                        cfg.stream_fill_vhosts = vec!["forum.example".into()];
+                    }
+                });
+            let method = Method::GET;
+            let identity = "https\nforum.example\n/framed".to_string();
+            let cc = page_cc(&method, "/framed", &identity, store.purge_epoch());
+            let _ = cache_lookup(&state, &ctx, &cc, None, false, None);
+            let (feed, resp) = fed_page(content_length);
+            feed.send(Ok(Bytes::from_static(b"<page>"))).unwrap();
+            drop(feed);
+            let resp = cache_store(&state, &ctx, &cc, resp).await;
+            assert!(
+                resp.extensions()
+                    .get::<hj_compress::ProgressiveBody>()
+                    .is_none()
+            );
+            assert!(
+                matches!(resp.into_body(), Body::Full(b) if &b[..] == b"<page>"),
+                "listed={listed}: buffered"
+            );
+            assert!(matches!(
+                cache_lookup(&state, &ctx, &cc, None, false, None),
+                CacheOutcome::Hit(_)
+            ));
+        }
+    }
+
+    /// Regression (30b7fda): a cookieless request probes on the fast path and, on a miss,
+    /// looks up again in dispatch. Both used to record the admission sighting and the miss,
+    /// so the "seen twice" bar passed on first sight and the miss count doubled.
+    #[tokio::test]
+    async fn fast_path_probe_counts_only_the_hits_it_serves() {
+        let (state, ctx, store) = cache_test_ctx();
+        let method = Method::GET;
+        let cc = CacheCtx {
+            method: &method,
+            host: "forum.example",
+            cookie: None,
+            identity: "https\nforum.example\n/fast",
+            req_path: "/fast",
+            req_query: "",
+            chain: &[],
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            vary_value: None,
+            host_foreign: false,
+            origin: None,
+        };
+        let key = configuration_key(
+            &state,
+            build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public),
+        );
+        let key_hash = hash_key(&key);
+
+        // First request: fast-path miss, then dispatch's lookup — ONE sighting, ONE miss.
+        assert!(matches!(
+            cache_lookup_fast_path(&state, &ctx, &cc, None),
+            CacheOutcome::Miss(_)
+        ));
+        assert_eq!(state.page_cache_admission.estimate(key_hash), 0);
+        assert_eq!(store.stats().misses, 0);
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        assert_eq!(state.page_cache_admission.estimate(key_hash), 1);
+        assert_eq!(store.stats().misses, 1);
+        // (The fixture admits on one sighting.) A fast-path hit ends the request, so it is
+        // the lookup that records the sighting and the hit.
+        let response = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/plain")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .body(Body::Full(Bytes::from_static(b"page")))
+            .unwrap();
+        let _ = cache_store(&state, &ctx, &cc, response).await;
+        let hits_before = store.stats().hits;
+        assert!(matches!(
+            cache_lookup_fast_path(&state, &ctx, &cc, None),
+            CacheOutcome::Hit(_)
+        ));
+        assert_eq!(store.stats().hits, hits_before + 1);
+        assert_eq!(store.stats().misses, 1);
+        assert_eq!(state.page_cache_admission.estimate(key_hash), 2);
+    }
+
     #[tokio::test]
     async fn configuration_generations_isolate_late_cache_writers() {
         let (old, ctx, store) = cache_test_ctx();
@@ -4128,11 +5032,212 @@ mod tests {
         );
     }
 
+    /// An image never clears the 12.5% savings gate, so it must not cost an L15 encode (or a
+    /// pool slot): the entry is marked attempted at store time and left as its identity body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_skips_the_dict_encode_for_incompressible_types() {
+        let (state, ctx, store) = cache_test_ctx_with_dict();
+        let method = Method::GET;
+        let chain: Vec<Arc<Htaccess>> = Vec::new();
+        let identity = "https\nforum.example\n/proxy.php";
+        let cc = CacheCtx {
+            method: &method,
+            host: "forum.example",
+            cookie: None,
+            identity,
+            req_path: "/proxy.php",
+            req_query: "image=x",
+            chain: &chain,
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            host_foreign: false,
+            origin: None,
+            vary_value: None,
+        };
+        let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
+        state.page_cache_admission.record(hash_key(&key));
+        let resp = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "image/png")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .body(Body::Full(Bytes::from(DICT_CORPUS.repeat(8))))
+            .unwrap();
+        let _ = cache_store(&state, &ctx, &cc, resp).await;
+
+        let hj_pagecache::EntryState::Fresh(entry) =
+            store.get_entry_uncounted(&key, identity, std::time::Instant::now())
+        else {
+            panic!("the image must still be cached");
+        };
+        assert_eq!(entry.dict_gen, 0);
+        assert!(
+            entry.dict_compression_attempted(),
+            "marked so the hit-path retry never queues it"
+        );
+        let metrics = state
+            .page_cache_dict_metrics
+            .get("forum.example")
+            .expect("dict metrics for the vhost")
+            .clone();
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(load(&metrics.queued), 0);
+        assert_eq!(load(&metrics.attempts), 0);
+        assert_eq!(
+            load(&metrics.skipped_by_reason[DictSkip::ContentType as usize]),
+            1
+        );
+    }
+
+    /// A cached canonical redirect has an empty body: an encode of it can never clear the
+    /// savings gate, so it must not be queued (it was the bulk of the post-L12 `savings` skips).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_skips_the_dict_encode_for_tiny_bodies() {
+        let (state, ctx, store) = cache_test_ctx_with_dict();
+        let method = Method::GET;
+        let chain: Vec<Arc<Htaccess>> = Vec::new();
+        let identity = "https\nforum.example\n/threads/378554/";
+        let cc = CacheCtx {
+            method: &method,
+            host: "forum.example",
+            cookie: None,
+            identity,
+            req_path: "/threads/378554/",
+            req_query: "",
+            chain: &chain,
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            host_foreign: false,
+            origin: None,
+            vary_value: None,
+        };
+        let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
+        state.page_cache_admission.record(hash_key(&key));
+        let resp = http::Response::builder()
+            .status(301)
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(
+                http::header::LOCATION,
+                "https://forum.example/threads/slug.378554/",
+            )
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .body(Body::Full(Bytes::new()))
+            .unwrap();
+        let _ = cache_store(&state, &ctx, &cc, resp).await;
+
+        let hj_pagecache::EntryState::Fresh(entry) =
+            store.get_entry_uncounted(&key, identity, std::time::Instant::now())
+        else {
+            panic!("the redirect must still be cached");
+        };
+        assert!(entry.dict_compression_attempted());
+        let metrics = state
+            .page_cache_dict_metrics
+            .get("forum.example")
+            .expect("dict metrics for the vhost")
+            .clone();
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(load(&metrics.queued), 0);
+        assert_eq!(
+            load(&metrics.skipped_by_reason[DictSkip::TooSmall as usize]),
+            1
+        );
+    }
+
     /// Enough repeated page boilerplate to train a usable dictionary on.
     const DICT_CORPUS: &[u8] =
         b"<html><head><title>example forum</title></head><body><div class=\"p-nav\">thread</div></body></html>";
 
+    /// A capsule render is stored twice (dedicated capsule entry + public mirror) with the SAME
+    /// bytes. Both must end up dict-compressed from ONE encode: two back-to-back jobs used to
+    /// fill the 2-slot recompress pool and push other stores out as identity bodies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capsule_render_is_dict_encoded_once_for_both_entries() {
+        let capsule = crate::state::XfCapsuleConfig {
+            enabled: true,
+            vhosts: std::collections::HashSet::from(["forum.example".to_string()]),
+            path_prefixes: vec!["/threads/".into()],
+            safe_get_mode: crate::state::XfCapsuleSafeGetMode::Prefixes,
+            stale_secs: 86_400,
+            canary_percent: 100,
+            allow_members: true,
+            member_canary_percent: 100,
+        };
+        let (state, ctx, store) = cache_test_ctx_with_dict_and_capsule(capsule);
+        let method = Method::GET;
+        let chain: Vec<Arc<Htaccess>> = Vec::new();
+        let identity = "https\nforum.example\n/threads/dict-capsule.1/";
+        let cc = CacheCtx {
+            method: &method,
+            host: "forum.example",
+            cookie: None,
+            identity,
+            req_path: "/threads/dict-capsule.1/",
+            req_query: "",
+            chain: &chain,
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            host_foreign: false,
+            origin: None,
+            vary_value: None,
+        };
+        let public_key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
+        let capsule_key = configuration_key(&state, capsule_key(&ctx, &cc, &store));
+        state.page_cache_admission.record(hash_key(&public_key));
+
+        let body = DICT_CORPUS.repeat(8);
+        let resp = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(HDR_CACHE_CONTROL, "public,max-age=60")
+            .header(HDR_TAG, "public, T1")
+            .header(
+                HDR_XF_CAPSULE,
+                "public-shell, hydrate=account-nav-v1, max-age=60",
+            )
+            .header(HDR_XF_CAPSULE_TAGS, "public, T1")
+            .body(Body::Full(Bytes::from(body.clone())))
+            .unwrap();
+        let _ = cache_store(&state, &ctx, &cc, resp).await;
+
+        let compressed = |key: &hj_pagecache::PageCacheKey| {
+            matches!(
+                store.get_entry_uncounted(key, identity, std::time::Instant::now()),
+                hj_pagecache::EntryState::Fresh(e) if e.dict_gen != 0
+            )
+        };
+        for _ in 0..200 {
+            if compressed(&public_key) && compressed(&capsule_key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            compressed(&capsule_key),
+            "the capsule entry must be dict-compressed"
+        );
+        assert!(
+            compressed(&public_key),
+            "the public mirror must be dict-compressed"
+        );
+        let metrics = state
+            .page_cache_dict_metrics
+            .get("forum.example")
+            .expect("dict metrics for the vhost")
+            .clone();
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(load(&metrics.queued), 1, "one job per render");
+        assert_eq!(load(&metrics.attempts), 1, "one encode per render");
+        assert_eq!(load(&metrics.completed), 2, "both entries shrink");
+        assert_eq!(load(&metrics.dropped), 0);
+    }
+
     fn cache_test_ctx_with_dict() -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
+        cache_test_ctx_with_dict_and_capsule(crate::state::XfCapsuleConfig::disabled())
+    }
+
+    fn cache_test_ctx_with_dict_and_capsule(
+        xf_capsule: crate::state::XfCapsuleConfig,
+    ) -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
         let (state, ctx, store) = cache_test_ctx();
         let dict = Arc::new(
             hj_compress::PageDict::new(DICT_CORPUS.to_vec(), hj_compress::DEFAULT_DICT_LEVEL)
@@ -4149,7 +5254,7 @@ mod tests {
             Some(store.clone()),
             Arc::new(registry),
             1,
-            crate::state::XfCapsuleConfig::disabled(),
+            xf_capsule,
             None,
             false,
             None,
@@ -4163,10 +5268,18 @@ mod tests {
     fn cache_test_ctx_with_capsule(
         xf_capsule: crate::state::XfCapsuleConfig,
     ) -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
+        cache_test_ctx_with(xf_capsule, |_| {})
+    }
+
+    fn cache_test_ctx_with(
+        xf_capsule: crate::state::XfCapsuleConfig,
+        tweak: impl FnOnce(&mut hj_pagecache::StoreConfig),
+    ) -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
         let mut cfg = hj_pagecache::StoreConfig::default();
         cfg.standard_cc_vhosts.push("forum.example".into());
         cfg.private_user_cookie = "xf_user".into();
         cfg.private_session_cookie = "xf_session".into();
+        tweak(&mut cfg);
         let store = Arc::new(hj_pagecache::PageStore::new(cfg));
         let mut server = hj_core::config::ServerConfig::default();
         let root = std::env::temp_dir().join(format!(
@@ -4824,7 +5937,7 @@ mod tests {
             range: None,
             cached: None,
         });
-        match collect_body(fb, 1024).await {
+        match collect_body(fb, 1024, 0).await {
             Collected::Buffered(b) => assert_eq!(b.as_ref(), b"static-file-body"),
             _ => panic!("file body must buffer to its bytes"),
         }
@@ -4838,7 +5951,7 @@ mod tests {
             cached: None,
         });
         assert!(matches!(
-            collect_body(missing, 1024).await,
+            collect_body(missing, 1024, 0).await,
             Collected::Passthrough(Body::File(_))
         ));
     }
@@ -4858,7 +5971,7 @@ mod tests {
             range: None,
             cached: None,
         });
-        match collect_body(body, 1024).await {
+        match collect_body(body, 1024, 0).await {
             Collected::Passthrough(Body::File(f)) => {
                 assert!(
                     f.file.is_some(),
@@ -4891,7 +6004,7 @@ mod tests {
             range: None,
             cached: None,
         });
-        match collect_body(body, 1024).await {
+        match collect_body(body, 1024, 0).await {
             Collected::Buffered(bytes) => assert_eq!(bytes.as_ref(), b"OLD-BODY"),
             _ => panic!("the selected descriptor is exact and must buffer"),
         }
@@ -4918,7 +6031,7 @@ mod tests {
             range: None,
             cached: None,
         });
-        let fallback = match collect_body(body, 1024).await {
+        let fallback = match collect_body(body, 1024, 0).await {
             Collected::Passthrough(Body::File(f)) => f,
             _ => panic!("short selected inode must pass through uncached"),
         };
@@ -4940,7 +6053,7 @@ mod tests {
             range: Some((2, 5)),
             cached: Some(Bytes::from_static(b"01234567")),
         });
-        match collect_body(body, 1024).await {
+        match collect_body(body, 1024, 0).await {
             Collected::Buffered(bytes) => assert_eq!(bytes.as_ref(), b"2345"),
             _ => panic!("a complete cached range must buffer without reopening"),
         }
@@ -5033,12 +6146,12 @@ mod tests {
     #[tokio::test]
     async fn collect_stream_under_and_at_cap_buffers() {
         // Under the cap: fully buffered.
-        match collect_body(stream_of(&[b"ab", b"cd", b"ef"]), 1024).await {
+        match collect_body(stream_of(&[b"ab", b"cd", b"ef"]), 1024, 0).await {
             Collected::Buffered(b) => assert_eq!(b.as_ref(), b"abcdef"),
             _ => panic!("under-cap stream must buffer"),
         }
         // Exactly at the cap (6 bytes, cap 6): buffered (the store guard is `<= max_obj_bytes`).
-        match collect_body(stream_of(&[b"abc", b"def"]), 6).await {
+        match collect_body(stream_of(&[b"abc", b"def"]), 6, 0).await {
             Collected::Buffered(b) => assert_eq!(b.as_ref(), b"abcdef"),
             _ => panic!("at-cap stream must buffer"),
         }
@@ -5048,7 +6161,7 @@ mod tests {
     async fn collect_stream_over_cap_serves_through_uncached() {
         // 10 bytes over a 4-byte cap: Passthrough, and the body must reproduce the
         // FULL original bytes (prefix read so far + the unread remainder), never truncated.
-        match collect_body(stream_of(&[b"abcd", b"efgh", b"ij"]), 4).await {
+        match collect_body(stream_of(&[b"abcd", b"efgh", b"ij"]), 4, 0).await {
             Collected::Passthrough(Body::Stream(s)) => {
                 let bytes = s.collect().await.expect("pass-through collects").to_bytes();
                 assert_eq!(

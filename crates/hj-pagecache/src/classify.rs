@@ -30,6 +30,11 @@ pub enum Disposition {
     Bypass(&'static str),
 }
 
+/// TTL ceiling for a status admitted only through [`StoreConfig::opt_in_status`] (404/410, an
+/// allowlisted 303): the app may ask for longer, but its own freshness for these relies on CDN
+/// URL purges the origin cannot mirror.
+pub const OPT_IN_STATUS_TTL_CAP_SECS: u32 = 300;
+
 /// Hard ceiling on a private entry's TTL regardless of what the app declares —
 /// a logged-in page going stale must cost at most this many seconds.
 pub const PRIVATE_TTL_CAP_SECS: u32 = 300;
@@ -64,8 +69,9 @@ pub fn classify_response(
         return Disposition::Bypass("env-no-cache");
     }
 
-    // Status gate (LiteSpeed default: 200, 301).
-    if !cfg.cacheable_status.contains(&status) {
+    // Status gate (LiteSpeed default: 200, 301), plus the explicit-opt-in-only statuses.
+    let opt_in_only = !cfg.cacheable_status.contains(&status);
+    if opt_in_only && !cfg.opt_in_status.contains(&status) {
         return Disposition::Bypass("status");
     }
 
@@ -158,6 +164,20 @@ pub fn classify_response(
         return Disposition::Bypass("cache-control");
     }
 
+    // An opt-in-only status needs an explicit public X-LiteSpeed opt-in: no standards-mode
+    // Cache-Control, no private tier. It stores with a capped TTL and NO stale windows — a
+    // cached 404 must never stand in for a 5xx, and a redirect is re-rendered, not served stale.
+    if opt_in_only {
+        return match (ls_public_ttl, ls_private_ttl) {
+            (Some(ttl), None) => Disposition::StorePublic {
+                ttl_secs: ttl.min(OPT_IN_STATUS_TTL_CAP_SECS),
+                stale_secs: 0,
+                stale_if_error_secs: 0,
+            },
+            _ => Disposition::Bypass("status"),
+        };
+    }
+
     // Private wins over public if the app declared both (more restrictive scope).
     if let Some(t) = ls_private_ttl {
         return Disposition::StorePrivate {
@@ -247,6 +267,53 @@ mod tests {
             stale_secs: 0,
             stale_if_error_secs: 0,
         }
+    }
+
+    #[test]
+    fn opt_in_statuses_need_an_explicit_public_opt_in_and_are_capped() {
+        let mut c = cfg();
+        c.opt_in_status = vec![404, 410, 303];
+        c.default_sie_secs = 30;
+        let public = hdrs(&[("x-litespeed-cache-control", "public,max-age=86400")]);
+        assert_eq!(
+            classify_response(&Method::GET, 404, &public, false, &c, false),
+            sp(OPT_IN_STATUS_TTL_CAP_SECS),
+            "capped TTL and no stale-if-error: a cached 404 must never stand in for a 5xx"
+        );
+        assert_eq!(
+            classify_response(
+                &Method::GET,
+                303,
+                &hdrs(&[("x-litespeed-cache-control", "public,max-age=120")]),
+                false,
+                &c,
+                false
+            ),
+            sp(120)
+        );
+        // Standards-mode Cache-Control alone does not opt these in.
+        let std_only = hdrs(&[("cache-control", "public, max-age=600")]);
+        assert_eq!(
+            classify_response(&Method::GET, 404, &std_only, false, &c, true),
+            Disposition::Bypass("status")
+        );
+        // Neither does the private tier.
+        c.private_enabled = true;
+        let private = hdrs(&[("x-litespeed-cache-control", "private,max-age=60")]);
+        assert_eq!(
+            classify_response(&Method::GET, 404, &private, false, &c, false),
+            Disposition::Bypass("status")
+        );
+        // Not listed: still bypassed.
+        assert_eq!(
+            classify_response(&Method::GET, 302, &public, false, &c, false),
+            Disposition::Bypass("status")
+        );
+        assert_eq!(
+            classify_response(&Method::GET, 404, &public, false, &cfg(), false),
+            Disposition::Bypass("status"),
+            "off by default"
+        );
     }
 
     #[test]
