@@ -12,10 +12,16 @@ DATA_VOLUME="${NAME}-data"
 LOG_VOLUME="${NAME}-logs"
 CERT_DIR="$(mktemp -d)"
 
+# The certificate files must belong to the container user (10001). A non-root host
+# (a CI runner) needs sudo to hand them over and to remove them afterwards.
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo -n "$@"; fi
+}
+
 cleanup() {
     "$ENGINE" rm -f "$NAME" >/dev/null 2>&1 || true
     "$ENGINE" volume rm "$DATA_VOLUME" "$LOG_VOLUME" >/dev/null 2>&1 || true
-    rm -rf "$CERT_DIR"
+    as_root rm -rf "$CERT_DIR"
 }
 trap cleanup EXIT
 
@@ -36,11 +42,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -subj /CN=example.test \
     -addext subjectAltName=DNS:example.test \
     -keyout "$CERT_DIR/tls.key" -out "$CERT_DIR/tls.crt" >/dev/null 2>&1
-chown 10001:10001 "$CERT_DIR/tls.key" "$CERT_DIR/tls.crt"
-chown 10001:10001 "$CERT_DIR"
-chmod 0750 "$CERT_DIR"
-chmod 0400 "$CERT_DIR/tls.key"
-chmod 0444 "$CERT_DIR/tls.crt"
+as_root chown 10001:10001 "$CERT_DIR/tls.key" "$CERT_DIR/tls.crt"
+as_root chown 10001:10001 "$CERT_DIR"
+as_root chmod 0750 "$CERT_DIR"
+as_root chmod 0400 "$CERT_DIR/tls.key"
+as_root chmod 0444 "$CERT_DIR/tls.crt"
 
 "$ENGINE" build --file "$ROOT/packaging/oci/Containerfile" --tag "$IMAGE" "$ROOT"
 "$ENGINE" volume create "$DATA_VOLUME" >/dev/null
