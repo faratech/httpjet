@@ -341,7 +341,7 @@ pub(crate) async fn fast_serve(
             if !state.geo.allows(ctx.client_ip) {
                 return None; // the full pipeline renders the identical geo 403
             }
-            if !state.client_throttle.allow(peer_ip) {
+            if !state.client_throttle.allow(ctx.client_ip) {
                 return None; // over the per-IP rate: dispatch() renders the 429
             }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
@@ -539,6 +539,7 @@ pub(crate) async fn fast_serve(
             .get(http::header::ORIGIN)
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
         let cc = lscache::CacheCtx {
+            enabled: true,
             method: &method,
             host: &req_host,
             cookie: None,
@@ -562,7 +563,7 @@ pub(crate) async fn fast_serve(
         {
             apply_response_transforms(state, &ctx, &mut resp).await;
             state.telemetry.record_cache_hit(peer_ip.is_loopback());
-            if !state.client_throttle.allow(peer_ip) {
+            if !state.client_throttle.allow(ctx.client_ip) {
                 return None; // over the per-IP rate: dispatch() renders the 429
             }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
@@ -616,6 +617,12 @@ pub(crate) async fn fast_serve(
     // `SetHandler`/`AddHandler`/`AddType` force a non-PHP-suffixed file to script
     // here too, so the on-core static fast path never serves its source.
     let index_files = effective_index_files(state, &ctx, &chain);
+    let scripts_enabled = suffix_routing::vhost_scripts_enabled(state, &ctx);
+    if !scripts_enabled
+        && suffix_routing::path_may_resolve_to_script(state, &ctx, &orig_path, index_files, &chain)
+    {
+        return None;
+    }
     if split_script_path(state, &ctx, &orig_path, index_files, &chain).is_some() {
         return None;
     }
@@ -646,6 +653,12 @@ pub(crate) async fn fast_serve(
     if !matches!(resp.status().as_u16(), 200 | 206 | 304) {
         return None; // 404/403/416 → bridge so the ErrorDocument renders on tokio
     }
+    if resolved_static_target_is_script(state, &ctx, &orig_path, &chain, &resp) {
+        // The shared static resolver selected the actual DirectoryIndex (or
+        // direct/precompressed file). Bridge before buffering any bytes;
+        // dispatch returns the fail-closed 503.
+        return None;
+    }
     if let Some(extra) = &static_extra_headers {
         apply_static_context_headers(extra, &mut resp);
     }
@@ -655,7 +668,14 @@ pub(crate) async fn fast_serve(
     // runtime). Small static files become Body::Full and serve on-core.
     let mut resp = buffer_static_file(state, lscache::vhost_id_hash(&ctx.vhost_name), resp)?;
     finalize_response(
-        state, &mut ctx, &chain, &orig_rel, &orig_path, &orig_path, &mut resp,
+        state,
+        &mut ctx,
+        req.headers(),
+        &chain,
+        &orig_rel,
+        &orig_path,
+        &orig_path,
+        &mut resp,
     )
     .await;
     // (Tier 2) Stamp BEFORE the transform loop so SubFilterTransform sees the plan.
@@ -704,7 +724,7 @@ pub(crate) async fn fast_serve(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    if !state.client_throttle.allow(peer_ip) {
+    if !state.client_throttle.allow(ctx.client_ip) {
         return None; // over the per-IP rate: dispatch() renders the 429
     }
     stamp_bandwidth(
@@ -848,7 +868,29 @@ fn fast_post_rewrite_bridges(
         return true;
     }
     let index_files = effective_index_files(state, ctx, chain);
-    if let Some((script_abs, _, _)) = split_script_path(state, ctx, cur_path, index_files, chain) {
+    if suffix_routing::path_may_resolve_to_precompressed_script(
+        state,
+        ctx,
+        cur_path,
+        index_files,
+        chain,
+    ) {
+        return true;
+    }
+    let script_split = split_script_path(state, ctx, cur_path, index_files, chain);
+    let alternate_static_root = matching_static_context(ctx, cur_path)
+        .and_then(|context| context.location.as_ref())
+        .is_some_and(|location| location != &ctx.vhost.doc_root);
+    if script_split.is_none()
+        && (!suffix_routing::vhost_scripts_enabled(state, ctx) || alternate_static_root)
+        && suffix_routing::path_may_resolve_to_script(state, ctx, cur_path, index_files, chain)
+    {
+        return true;
+    }
+    if let Some((script_abs, _, _)) = script_split {
+        if unusable_script_handler_for_script(ctx, &script_abs).is_some() {
+            return true;
+        }
         if allowed_script_target(&state.acl, &script_abs).is_none() {
             return true;
         }
@@ -1499,7 +1541,7 @@ async fn handle_inner(
 
     let mut resp = if !state.acl.check_peer(peer_ip).is_allowed() {
         error_page(StatusCode::FORBIDDEN)
-    } else if !state.client_throttle.allow(peer_ip) {
+    } else if !state.client_throttle.allow(client_ip) {
         error_page(StatusCode::TOO_MANY_REQUESTS)
     } else if !state.geo.allows(client_ip) {
         // (Tier 2) GeoIP/ASN ACL: judged by the resolved client IP, so a
@@ -2789,7 +2831,15 @@ async fn dispatch(
     if access_denied(&chain, &orig_rel, req.method().as_str(), ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
     {
-        return error_doc_or_page(state, ctx, &chain, &orig_path, StatusCode::FORBIDDEN).await;
+        return error_doc_or_page(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &orig_path,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
     }
 
     // Authorize the source resource before rewrite can return a redirect,
@@ -2809,9 +2859,14 @@ async fn dispatch(
     }
     let original_indexes = effective_index_files(state, ctx, &chain);
     let original_script_split = split_script_path(state, ctx, &orig_path, original_indexes, &chain);
-    let original_target = original_script_split
-        .as_ref()
-        .and_then(|(path, _, _)| opened_target_path(path).ok());
+    let scripts_enabled = suffix_routing::vhost_scripts_enabled(state, ctx);
+    let original_target = scripts_enabled
+        .then(|| {
+            original_script_split
+                .as_ref()
+                .and_then(|(path, _, _)| opened_target_path(path).ok())
+        })
+        .flatten();
     if let Err(resp) = scoped_auth::enforce_mapped_resources(
         state,
         ctx,
@@ -2819,9 +2874,13 @@ async fn dispatch(
         &orig_path,
         &orig_path,
         &chain,
-        original_script_split
-            .as_ref()
-            .map(|(path, _, _)| path.as_path()),
+        scripts_enabled
+            .then(|| {
+                original_script_split
+                    .as_ref()
+                    .map(|(path, _, _)| path.as_path())
+            })
+            .flatten(),
         original_target.as_deref(),
         &mut authenticated_realms,
     )
@@ -2879,10 +2938,26 @@ async fn dispatch(
             return resp;
         }
         RwResult::Forbidden => {
-            return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN).await;
+            return error_doc_or_page(
+                state,
+                ctx,
+                req.headers(),
+                &chain,
+                &cur_path,
+                StatusCode::FORBIDDEN,
+            )
+            .await;
         }
         RwResult::Gone => {
-            return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::GONE).await;
+            return error_doc_or_page(
+                state,
+                ctx,
+                req.headers(),
+                &chain,
+                &cur_path,
+                StatusCode::GONE,
+            )
+            .await;
         }
         RwResult::Rewritten { path, query, env } => {
             cur_path = Cow::Owned(path);
@@ -2954,7 +3029,15 @@ async fn dispatch(
     // terminal handler (proxy / LSAPI / static). Fail-safe: any matching
     // `denied` section anywhere in the chain wins. -------------------------
     if access_denied(&chain, &rel_path, req.method().as_str(), ctx) {
-        return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN).await;
+        return error_doc_or_page(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &cur_path,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
     }
     // (M4 security) `accessDenyDir` enforcement: the resolved docroot-relative
     // path is mapped to its absolute on-disk path and tested against the
@@ -2966,7 +3049,15 @@ async fn dispatch(
     // alongside the chain access check above, so e.g. a request for any
     // `.htaccess` is a 403 regardless of which handler would otherwise serve it.
     if access_deny_dir(&state.acl, &ctx.vhost.doc_root, &rel_path) {
-        return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN).await;
+        return error_doc_or_page(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &cur_path,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
     }
     // (#1, PATH_INFO deny bypass) `<Files>`/`<FilesMatch>` are scoped by Apache to
     // the file the request MAPS TO — i.e. the resolved script — not the trailing
@@ -2984,18 +3075,44 @@ async fn dispatch(
     // need the identical split. Computed here so the MISS path doesn't scan + stat-lookup twice;
     // a cache HIT / WS / proxy returns before step 7 and simply drops it (one call, as before).
     let index_files = effective_index_files(state, ctx, &chain);
-    let script_split = if rewritten {
+    let script_split = if !scripts_enabled {
+        None
+    } else if rewritten {
         split_script_path(state, ctx, &cur_path, index_files, &chain)
     } else {
         original_script_split
     };
+    let precompressed_script_candidate = suffix_routing::path_may_resolve_to_precompressed_script(
+        state,
+        ctx,
+        &cur_path,
+        index_files,
+        &chain,
+    );
+    let alternate_static_root = matching_static_context(ctx, &cur_path)
+        .and_then(|context| context.location.as_ref())
+        .is_some_and(|location| location != &ctx.vhost.doc_root);
+    let unresolved_script_candidate = script_split.is_none()
+        && (!scripts_enabled || alternate_static_root)
+        && suffix_routing::path_may_resolve_to_script(state, ctx, &cur_path, index_files, &chain);
+    let disabled_script_candidate = !scripts_enabled && unresolved_script_candidate;
     let mut pinned_script_target = None;
-    if let Some((script_abs, _script_name, _path_info)) = &script_split {
+    if let Some((script_abs, _script_name, _path_info)) = &script_split
+        && scripts_enabled
+    {
         // `accessDenyDir` is a filesystem-target policy. The lexical request-path check above
         // cannot see a PHP symlink whose target is inside a denied tree, so resolve through an
         // opened descriptor and retain that exact target as lsphp's SCRIPT_FILENAME.
         let Some(target) = allowed_script_target(&state.acl, script_abs) else {
-            return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN).await;
+            return error_doc_or_page(
+                state,
+                ctx,
+                req.headers(),
+                &chain,
+                &cur_path,
+                StatusCode::FORBIDDEN,
+            )
+            .await;
         };
         pinned_script_target = Some(target);
         // Re-run the access decision against the RESOLVED script whenever it differs from the
@@ -3022,8 +3139,15 @@ async fn dispatch(
                 && (access_denied(&chain, &script_rel, req.method().as_str(), ctx)
                     || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel))
             {
-                return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN)
-                    .await;
+                return error_doc_or_page(
+                    state,
+                    ctx,
+                    req.headers(),
+                    &chain,
+                    &cur_path,
+                    StatusCode::FORBIDDEN,
+                )
+                .await;
             }
         }
     }
@@ -3038,7 +3162,9 @@ async fn dispatch(
         &orig_path,
         &cur_path,
         &chain,
-        script_split.as_ref().map(|(path, _, _)| path.as_path()),
+        scripts_enabled
+            .then(|| script_split.as_ref().map(|(path, _, _)| path.as_path()))
+            .flatten(),
         pinned_script_target.as_deref(),
         &mut authenticated_realms,
     )
@@ -3057,7 +3183,12 @@ async fn dispatch(
     // Inert unless `--page-cache` is set. `method`/`host`/`cookie` are captured
     // here while `req` is still owned, and reused identically by the store seams
     // below so the lookup and store keys always agree.
-    let cache_on = state.page_cache.is_some();
+    // Do not replay a cached response across a route that is script-shaped but
+    // unresolved in the main docroot (an alternate static root may contain the
+    // source), or across a precompressed script representation.
+    let cache_on = state.page_cache.is_some()
+        && !unresolved_script_candidate
+        && !precompressed_script_candidate;
     let cache_method = req.method().clone();
     // Reuse the host already computed in `handle()` (B4) instead of recomputing the identical
     // value; dropped unused when the cache is off (cache_host stays empty as before).
@@ -3105,15 +3236,23 @@ async fn dispatch(
     // stays cacheable while an unconfigured `www.` does not.
     let cache_host_foreign = cache_on && host_foreign;
     let cache_has_range = cache_on && req.headers().contains_key(http::header::RANGE);
-    let cache_render_epoch = state
-        .page_cache
-        .as_ref()
-        .map(|pc| pc.purge_epoch())
-        .unwrap_or(0);
-    let _cache_render_guard = state
-        .page_cache
-        .as_ref()
-        .map(|pc| pc.begin_render(cache_render_epoch));
+    let cache_render_epoch = if cache_on {
+        state
+            .page_cache
+            .as_ref()
+            .map(|pc| pc.purge_epoch())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let _cache_render_guard = if cache_on {
+        state
+            .page_cache
+            .as_ref()
+            .map(|pc| pc.begin_render(cache_render_epoch))
+    } else {
+        None
+    };
     // (#275) The public vary discriminant, computed ONCE for the lookup + all
     // store sites (build_cache_key/capsule_key otherwise re-split the Cookie
     // header per call).
@@ -3130,11 +3269,15 @@ async fn dispatch(
     };
     // Built once, threaded unchanged to the lookup + all three store sites so their
     // keys + identity guard can never drift apart (see lscache::CacheCtx).
-    let origin_vary = req
-        .headers()
-        .get(http::header::ORIGIN)
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    let origin_vary = if cache_on {
+        req.headers()
+            .get(http::header::ORIGIN)
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+    } else {
+        None
+    };
     let cc = lscache::CacheCtx {
+        enabled: cache_on,
         method: &cache_method,
         host: &cache_host,
         cookie: cache_cookie.as_deref(),
@@ -3205,7 +3348,10 @@ async fn dispatch(
             }
         };
         apply_response_headers_for_request(ctx, &chain, &rel, &orig_path, &mut resp);
-        return if cache_on {
+        // Upstream LSCache controls were removed by hj-proxy. Trusted local
+        // Header directives are applied above and must still execute purges and
+        // be stripped even when this route has lookup/storage disabled.
+        return if state.page_cache.is_some() {
             lscache::cache_store(state, ctx, &cc, resp).await
         } else {
             resp
@@ -3364,7 +3510,9 @@ async fn dispatch(
     }
 
     // ---- 6. Proxy context -------------------------------------------------
-    if let Some(handler) = matching_proxy_context(ctx, &cur_path) {
+    if let Some(handler) =
+        matching_proxy_context(ctx, &cur_path).map(|context| context.handler.clone())
+    {
         // A WebSocket-upgrade request that reached here matched no `websockets` map, so
         // it is being routed to an ORDINARY reverse-proxy context that has no upgrade
         // relay. Forwarding the handshake would produce a non-conformant 101 the client
@@ -3372,6 +3520,21 @@ async fn dispatch(
         if ws_upgrade {
             return error_page(StatusCode::UPGRADE_REQUIRED);
         }
+        let Some(handler) = handler else {
+            tracing::error!(
+                request_id = %ctx.request_id,
+                vhost = %ctx.vhost_name,
+                path = %cur_path,
+                "proxy context has no handler; refusing terminal fallthrough"
+            );
+            return lscache::cache_store(
+                state,
+                ctx,
+                &cc,
+                error_page(StatusCode::SERVICE_UNAVAILABLE),
+            )
+            .await;
+        };
         // (#3) Per-vhost <extProcessorList> takes precedence over the global map
         // so e.g. status.forum.example's `stats_api` resolves locally.
         if let Some(target) = resolve_proxy_target(state, ctx, &handler) {
@@ -3392,14 +3555,59 @@ async fn dispatch(
             apply_response_headers_for_request(ctx, &chain, &rel_path, &orig_path, &mut resp);
             return lscache::cache_store_leading(state, ctx, &cc, resp, &mut _sf_leader).await;
         }
-        tracing::debug!(handler, "proxy context references unknown ext processor");
+        tracing::error!(
+            request_id = %ctx.request_id,
+            vhost = %ctx.vhost_name,
+            path = %cur_path,
+            handler,
+            "proxy context references an unknown or non-proxy ext processor; refusing terminal fallthrough"
+        );
+        return lscache::cache_store(state, ctx, &cc, error_page(StatusCode::SERVICE_UNAVAILABLE))
+            .await;
     }
 
     // ---- 7. Suffix routing: LSAPI (php/html) or static -------------------
+    if !scripts_enabled
+        && disabled_script_candidate
+        && suffix_routing::disabled_path_resolves_to_script(state, ctx, &cur_path, &chain)
+    {
+        tracing::error!(
+            request_id = %ctx.request_id,
+            vhost = %ctx.vhost_name,
+            path = %cur_path,
+            "script-shaped path requested while execution is disabled; refusing to serve as static"
+        );
+        return lscache::cache_store(state, ctx, &cc, error_page(StatusCode::SERVICE_UNAVAILABLE))
+            .await;
+    }
     // Reuse the split resolved once above (B5) — `cur_path` is unchanged since.
     if let Some((script_abs, script_name, path_info)) = script_split {
+        // Parser-built configurations reject these states, but keep the
+        // request boundary fail-closed for normalized configs constructed by
+        // callers or carried across a future parser change. A declared script
+        // suffix must never reach the static terminal because its type was
+        // unsupported or its processor name was empty.
+        let configured_handler = configured_script_handler_for_script(ctx, &script_abs);
+        if let Some(handler) =
+            configured_handler.filter(|handler| script_handler_is_unusable(handler))
+        {
+            tracing::error!(
+                request_id = %ctx.request_id,
+                vhost = %ctx.vhost_name,
+                suffix = %handler.suffix,
+                kind = ?handler.kind,
+                "script handler is unsupported or has no processor; refusing to serve as static"
+            );
+            return lscache::cache_store(
+                state,
+                ctx,
+                &cc,
+                error_page(StatusCode::SERVICE_UNAVAILABLE),
+            )
+            .await;
+        }
         if state.has_cgi_script_routes
-            && let Some(handler_name) = fastcgi_handler_for_script(ctx, &script_abs)
+            && let Some(handler_name) = configured_handler.and_then(script_handler_fastcgi_name)
         {
             let Some(handler) = state
                 .fastcgi_handler(&ctx.vhost_name, handler_name)
@@ -3512,10 +3720,10 @@ async fn dispatch(
             };
             // Never SERVE a self-redirect loop. A backend 3xx whose Location is the request's
             // own URL is a guaranteed loop; it is a transient mis-render (the normal render is
-            // the page), so for an idempotent GET/HEAD keep what's needed to re-render ONCE and
-            // use the retry if it comes back clean. This is the cache-MISS path (hits
-            // short-circuit before dispatch reaches here), so the clone is off the hot serve
-            // path. Pairs with the store-side guard (a self-redirect is never cached either).
+            // the page), so for an idempotent GET/HEAD retain the cheap request identity needed
+            // to decide whether to re-render ONCE. The full header map is cloned only after a
+            // raw self-redirect is confirmed. Pairs with the store-side guard (a self-redirect
+            // is never cached either).
             let sr_retry =
                 matches!(*req.method(), http::Method::GET | http::Method::HEAD).then(|| {
                     let host = if cache_host.is_empty() {
@@ -3523,13 +3731,7 @@ async fn dispatch(
                     } else {
                         cache_host.clone()
                     };
-                    (
-                        req.method().clone(),
-                        req.uri().clone(),
-                        req.headers().clone(),
-                        lsapi_script.clone(),
-                        host,
-                    )
+                    (req.method().clone(), req.uri().clone(), host)
                 });
             req.extensions_mut().insert(lsapi_script);
             if rewritten {
@@ -3567,7 +3769,10 @@ async fn dispatch(
                 .served_php
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let lsapi_start = std::time::Instant::now();
-            let mut resp = run_handler(lsapi.as_ref(), ctx, req).await;
+            // Move the body into LSAPI and retain the owned request head so target
+            // auth/ErrorDocument policy can inspect the original headers without
+            // either cloning the full map or allocating an empty replacement body.
+            let (mut resp, req_head) = run_lsapi_retaining_head(lsapi.as_ref(), ctx, req).await;
             let lsapi_elapsed = lsapi_start.elapsed();
             state.telemetry.shard().lsapi_dispatch.record(lsapi_elapsed);
             // Split: pool-acquire (httpjet contention) vs TTFB (lsphp worker pickup
@@ -3587,7 +3792,7 @@ async fn dispatch(
                 .get::<hj_lsapi::LsapiRetryInfo>()
                 .map(|r| r.kind)
                 .unwrap_or("-");
-            if let Some((method, uri, headers, script, host)) = sr_retry {
+            if let Some((method, uri, host)) = sr_retry {
                 let is_tls = ctx.is_tls;
                 let is_self = |r: &Response| {
                     lscache::is_self_redirect(
@@ -3619,7 +3824,14 @@ async fn dispatch(
                         let mut req2: Request = Request::new(hj_core::empty_incoming());
                         *req2.method_mut() = method;
                         *req2.uri_mut() = uri;
-                        *req2.headers_mut() = headers;
+                        // The retaining LSAPI path returned the original request head.
+                        // Pay for a full clone only on this confirmed retry.
+                        *req2.headers_mut() = req_head.headers.clone();
+                        let script = req_head
+                            .extensions
+                            .get::<LsapiScript>()
+                            .cloned()
+                            .expect("LSAPI request lost its script target after dispatch");
                         req2.extensions_mut().insert(script);
                         let resp2 = run_handler(lsapi.as_ref(), ctx, req2).await;
                         if is_self(&resp2) {
@@ -3652,7 +3864,14 @@ async fn dispatch(
             }
             mark_php_backend_failure(&mut resp);
             finalize_response(
-                state, ctx, &chain, &rel_path, &orig_path, &cur_path, &mut resp,
+                state,
+                ctx,
+                &req_head.headers,
+                &chain,
+                &rel_path,
+                &orig_path,
+                &cur_path,
+                &mut resp,
             )
             .await;
             return lscache::cache_store_leading(state, ctx, &cc, resp, &mut _sf_leader).await;
@@ -3726,8 +3945,15 @@ async fn dispatch(
             // then serve a file other than the one whose access checks just
             // passed. Render 400 like any other rejected request target.
             None => {
-                return error_doc_or_page(state, ctx, &chain, &orig_path, StatusCode::BAD_REQUEST)
-                    .await;
+                return error_doc_or_page(
+                    state,
+                    ctx,
+                    req.headers(),
+                    &chain,
+                    &orig_path,
+                    StatusCode::BAD_REQUEST,
+                )
+                .await;
             }
         }
     }
@@ -3736,16 +3962,20 @@ async fn dispatch(
         .shard()
         .served_static
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut auth_headers = http::HeaderMap::new();
-    if let Some(value) = req.headers().get(http::header::AUTHORIZATION) {
-        auth_headers.insert(http::header::AUTHORIZATION, value.clone());
+    // Static dispatch borrows the request, retaining its headers for final-target
+    // auth and ErrorDocument policy without a per-request HeaderMap clone.
+    let mut resp = run_borrowed_handler(&state.static_handler, ctx, &mut req).await;
+    // StaticFiles never consumes a request body. Drop it as soon as its response
+    // head is ready so target auth or a script ErrorDocument cannot retain an
+    // attacker-supplied GET body while awaiting backend work.
+    if req.body().size_hint().upper() != Some(0) {
+        *req.body_mut() = hj_core::empty_incoming();
     }
-    let mut resp = run_handler(&state.static_handler, ctx, req).await;
     if htaccess_enabled && let Some(target) = scoped_auth::served_target(&resp) {
         if let Err(auth_resp) = scoped_auth::enforce_target(
             state,
             ctx,
-            &auth_headers,
+            req.headers(),
             &target,
             &orig_path,
             &mut authenticated_realms,
@@ -3756,7 +3986,32 @@ async fn dispatch(
         }
     }
     if resolved_static_target_denied(&state.acl, &resp) {
-        return error_doc_or_page(state, ctx, &chain, &cur_path, StatusCode::FORBIDDEN).await;
+        return error_doc_or_page(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &cur_path,
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    }
+    if matches!(resp.status().as_u16(), 200 | 206 | 304)
+        && resolved_static_target_is_script(state, ctx, &cur_path, &chain, &resp)
+    {
+        let target = resp
+            .extensions()
+            .get::<hj_static::ResolvedTargetPath>()
+            .map(|target| target.0.display().to_string())
+            .unwrap_or_default();
+        tracing::error!(
+            request_id = %ctx.request_id,
+            vhost = %ctx.vhost_name,
+            script = %target,
+            "static resolver selected a declared script representation; refusing source bytes"
+        );
+        return lscache::cache_store(state, ctx, &cc, error_page(StatusCode::SERVICE_UNAVAILABLE))
+            .await;
     }
     // Apply the static context's extra headers (Vary / Cache-Control) first,
     // then the .htaccess response-header ops + error documents.
@@ -3764,7 +4019,14 @@ async fn dispatch(
         apply_static_context_headers(&extra, &mut resp);
     }
     finalize_response(
-        state, ctx, &chain, &rel_path, &orig_path, &cur_path, &mut resp,
+        state,
+        ctx,
+        req.headers(),
+        &chain,
+        &rel_path,
+        &orig_path,
+        &cur_path,
+        &mut resp,
     )
     .await;
     lscache::cache_store(state, ctx, &cc, resp).await
@@ -3774,6 +4036,31 @@ fn resolved_static_target_denied(acl: &hj_acl::AccessControl, resp: &Response) -
     resp.extensions()
         .get::<hj_static::ResolvedTargetPath>()
         .is_some_and(|target| acl.deny_dir_match(&target.0))
+}
+
+fn resolved_static_target_is_script(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    request_path: &str,
+    chain: &[Arc<Htaccess>],
+    resp: &Response,
+) -> bool {
+    let Some(resolved) = resp.extensions().get::<hj_static::ResolvedTargetPath>() else {
+        return false;
+    };
+    let selected = resp
+        .extensions()
+        .get::<hj_static::LexicalTargetPath>()
+        .map(|target| target.0.as_path())
+        .unwrap_or(&resolved.0);
+    suffix_routing::target_is_declared_script(
+        state,
+        ctx,
+        request_path,
+        selected,
+        &resolved.0,
+        chain.iter().map(AsRef::as_ref),
+    )
 }
 
 fn allowed_script_target(acl: &hj_acl::AccessControl, script: &Path) -> Option<PathBuf> {
@@ -3822,12 +4109,13 @@ fn effective_static_charset(context: &hj_core::config::Context) -> Option<String
 /// `.htaccess` response-header ops (#2/#7) and, for an httpjet-generated 4xx/5xx,
 /// swap in an `ErrorDocument` body (#8a).
 ///
-/// Async because an `ErrorDocument` whose target is a `.php` file is an internal
-/// LSAPI subrequest that RUNS the script (#3) — Apache/LiteSpeed parity — rather
+/// Async because a script-handled `ErrorDocument` is an internal LSAPI/FastCGI
+/// subrequest that RUNS the script (#3/#507) — Apache/LiteSpeed parity — rather
 /// than reading and disclosing its raw source.
 async fn finalize_response(
     state: &Arc<ServerState>,
     ctx: &mut ReqCtx,
+    request_headers: &http::HeaderMap,
     chain: &[Arc<Htaccess>],
     rel_path: &str,
     request_path: &str,
@@ -3835,16 +4123,15 @@ async fn finalize_response(
     resp: &mut Response,
 ) {
     apply_response_headers_for_request(ctx, chain, rel_path, request_path, resp);
-    apply_error_document(state, ctx, chain, cur_path, resp).await;
+    apply_error_document(state, ctx, request_headers, chain, cur_path, resp).await;
 }
 
-/// (#9a) Build the effective PHP suffix set for a vhost. Per-suffix override,
-/// mirroring OpenLiteSpeed (`HttpMime::mergeHandlerList`): a per-vhost
-/// `<scriptHandler>` whose `<type>` is `lsapi` ADDS its suffix to the global set;
-/// any other (non-LSAPI, e.g. `static`) handler REMOVES its suffix. This lets a
-/// vhost run `.php` through lsphp while serving `.html` statically even when the
-/// global `phpConfig` maps both. Returns a borrowed reference to the global set
-/// (no allocation) when the vhost changes nothing.
+/// (#9a/#505) Build the effective executable-suffix set for a vhost. Per-suffix
+/// declarations mirror OpenLiteSpeed's `HttpMime::mergeHandlerList`: an explicit
+/// `static` mapping removes a global suffix; every executable mapping adds one.
+/// Unsupported normalized kinds stay classified as executable so dispatch can
+/// fail 503 instead of serving source. Returns a borrowed reference to the global
+/// set (no allocation) when the vhost changes nothing.
 pub(super) fn effective_php_suffixes<'s>(
     state: &'s ServerState,
     ctx: &ReqCtx,
@@ -3852,21 +4139,48 @@ pub(super) fn effective_php_suffixes<'s>(
     compute_php_suffixes(&state.php_suffixes, &ctx.vhost.script_handlers)
 }
 
-fn fastcgi_handler_for_script<'a>(ctx: &'a ReqCtx, script: &std::path::Path) -> Option<&'a str> {
+fn configured_script_handler_for_script<'a>(
+    ctx: &'a ReqCtx,
+    script: &std::path::Path,
+) -> Option<&'a hj_core::config::ScriptHandler> {
     let suffix = script.extension()?.to_str()?;
     ctx.vhost
         .script_handlers
         .iter()
         .rev()
-        .find(|handler| {
-            handler.kind == hj_core::config::ContextKind::Cgi
-                && handler.suffix.eq_ignore_ascii_case(suffix)
-        })
-        .map(|handler| handler.handler.as_str())
+        .find(|handler| handler.suffix.eq_ignore_ascii_case(suffix))
 }
 
-/// Pure core of [`effective_php_suffixes`]: `global` ∪ (lsapi suffixes) \ (non-lsapi
-/// suffixes). Independent of `ServerState`/`ReqCtx` so it can be unit-tested.
+fn unusable_script_handler_for_script<'a>(
+    ctx: &'a ReqCtx,
+    script: &std::path::Path,
+) -> Option<&'a hj_core::config::ScriptHandler> {
+    let handler = configured_script_handler_for_script(ctx, script)?;
+    script_handler_is_unusable(handler).then_some(handler)
+}
+
+#[cfg(test)]
+fn fastcgi_handler_for_script<'a>(ctx: &'a ReqCtx, script: &std::path::Path) -> Option<&'a str> {
+    let handler = configured_script_handler_for_script(ctx, script)?;
+    script_handler_fastcgi_name(handler)
+}
+
+fn script_handler_is_unusable(handler: &hj_core::config::ScriptHandler) -> bool {
+    use hj_core::config::ContextKind;
+
+    handler.kind != ContextKind::Static
+        && (!matches!(handler.kind, ContextKind::Lsapi | ContextKind::Cgi)
+            || handler.handler.trim().is_empty())
+}
+
+fn script_handler_fastcgi_name(handler: &hj_core::config::ScriptHandler) -> Option<&str> {
+    (handler.kind == hj_core::config::ContextKind::Cgi).then_some(handler.handler.as_str())
+}
+
+/// Pure core of [`effective_php_suffixes`]. An explicit `static` mapping removes
+/// a suffix; every other declaration keeps the suffix in executable routing so
+/// an unsupported normalized kind can fail 503 instead of disclosing source.
+/// The last declaration for a suffix wins, matching handler selection.
 fn compute_php_suffixes<'a>(
     global: &'a std::collections::HashSet<String>,
     handlers: &[hj_core::config::ScriptHandler],
@@ -3874,25 +4188,40 @@ fn compute_php_suffixes<'a>(
     use hj_core::config::ContextKind;
     use std::borrow::Cow;
 
-    let mut adds: Vec<String> = Vec::new();
-    let mut removes: Vec<String> = Vec::new();
-    for sh in handlers {
-        let suffix = sh.suffix.to_ascii_lowercase();
-        if sh.kind == ContextKind::Lsapi {
-            if !global.contains(&suffix) {
-                adds.push(suffix);
-            }
-        } else if global.contains(&suffix) {
-            removes.push(suffix);
+    fn normalized(suffix: &str) -> Cow<'_, str> {
+        if suffix.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(suffix.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(suffix)
         }
     }
-    if adds.is_empty() && removes.is_empty() {
+    // Parser-built suffixes are already lowercase. When every declaration
+    // agrees with the global set, this is one linear borrowed scan with no
+    // temporary Vec, strings, or HashSet clone.
+    if handlers.iter().all(|handler| {
+        let suffix = normalized(&handler.suffix);
+        global.contains(suffix.as_ref()) == (handler.kind != ContextKind::Static)
+    }) {
         return Cow::Borrowed(global);
     }
+
+    // Walk unique suffixes from the end so each effective declaration is applied
+    // once and the last mapping wins. The borrowed Cow keys avoid allocating for
+    // parser-normalized lowercase suffixes; uppercase test/programmatic configs
+    // allocate only their normalized spelling.
     let mut set = global.clone();
-    set.extend(adds);
-    for r in &removes {
-        set.remove(r);
+    let mut seen = std::collections::HashSet::<Cow<'_, str>>::with_capacity(handlers.len());
+    for handler in handlers.iter().rev() {
+        let suffix = normalized(&handler.suffix);
+        if seen.contains(suffix.as_ref()) {
+            continue;
+        }
+        if handler.kind != ContextKind::Static {
+            set.insert(suffix.as_ref().to_owned());
+        } else {
+            set.remove(suffix.as_ref());
+        }
+        seen.insert(suffix);
     }
     Cow::Owned(set)
 }
@@ -3927,6 +4256,37 @@ pub(super) trait TelemetryHandler: Handler {
     #[cfg(feature = "otel")]
     const KIND: crate::otel::BackendKind;
 }
+
+/// Terminal handlers that can borrow a request while leaving its head with the
+/// pipeline. Static responses need post-dispatch target auth/ErrorDocument
+/// processing. LSAPI uses its consuming `handle_retaining_head` path below so a
+/// streaming body can move without an empty boxed replacement.
+#[async_trait]
+pub(crate) trait BorrowedTelemetryHandler {
+    #[cfg(feature = "otel")]
+    const KIND: crate::otel::BackendKind;
+
+    async fn handle_borrowed(
+        &self,
+        ctx: &mut ReqCtx,
+        req: &mut Request,
+    ) -> Result<Response, hj_core::HandlerError>;
+}
+
+#[async_trait]
+impl BorrowedTelemetryHandler for hj_static::StaticFiles {
+    #[cfg(feature = "otel")]
+    const KIND: crate::otel::BackendKind = crate::otel::BackendKind::Static;
+
+    async fn handle_borrowed(
+        &self,
+        ctx: &mut ReqCtx,
+        req: &mut Request,
+    ) -> Result<Response, hj_core::HandlerError> {
+        hj_static::StaticFiles::handle_borrowed(self, ctx, req).await
+    }
+}
+
 impl TelemetryHandler for hj_static::StaticFiles {
     #[cfg(feature = "otel")]
     const KIND: crate::otel::BackendKind = crate::otel::BackendKind::Static;
@@ -3962,6 +4322,52 @@ pub(crate) async fn instrumented_handler<H: TelemetryHandler>(
     .await
 }
 
+#[cfg(feature = "otel")]
+pub(crate) async fn instrumented_borrowed_handler<H: BorrowedTelemetryHandler>(
+    h: &H,
+    ctx: &mut ReqCtx,
+    req: &mut Request,
+) -> Result<Response, hj_core::HandlerError> {
+    let inject_trace = matches!(H::KIND, crate::otel::BackendKind::Lsapi);
+    let result = if inject_trace {
+        // Inject inside the backend span so lsphp receives that CLIENT span as
+        // its parent, matching the owned-handler path.
+        crate::otel::backend(H::KIND, async {
+            crate::otel::inject(req.headers_mut());
+            h.handle_borrowed(ctx, req).await
+        })
+        .await
+    } else {
+        crate::otel::backend(H::KIND, h.handle_borrowed(ctx, req)).await
+    };
+    if inject_trace {
+        req.headers_mut().remove("traceparent");
+    }
+    result
+}
+
+#[cfg(feature = "otel")]
+pub(crate) async fn instrumented_lsapi_retaining_head(
+    h: &hj_lsapi::Lsapi,
+    ctx: &mut ReqCtx,
+    mut req: Request,
+) -> (
+    Result<Response, hj_core::HandlerError>,
+    http::request::Parts,
+) {
+    let mut retained_parts = None;
+    let result = crate::otel::backend(crate::otel::BackendKind::Lsapi, async {
+        crate::otel::inject(req.headers_mut());
+        let (result, parts) = h.handle_retaining_head(ctx, req).await;
+        retained_parts = Some(parts);
+        result
+    })
+    .await;
+    let mut parts = retained_parts.expect("LSAPI dispatch did not retain its request head");
+    parts.headers.remove("traceparent");
+    (result, parts)
+}
+
 pub(super) async fn run_handler<H: TelemetryHandler>(
     h: &H,
     ctx: &mut ReqCtx,
@@ -3984,6 +4390,71 @@ pub(super) async fn run_handler<H: TelemetryHandler>(
             h.handle(ctx, req).await
         }
     };
+    finish_handler_result(ctx, &method, &path, result)
+}
+
+/// Borrowing counterpart to [`run_handler`] for terminal paths that need the
+/// original request headers after dispatch.  OTel's backend-only trace header is
+/// removed again before target policy evaluates, preserving the old snapshot's
+/// view of the inbound request.
+pub(crate) async fn run_borrowed_handler<H: BorrowedTelemetryHandler>(
+    h: &H,
+    ctx: &mut ReqCtx,
+    req: &mut Request,
+) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let result = {
+        #[cfg(feature = "otel")]
+        {
+            if crate::otel::enabled() {
+                instrumented_borrowed_handler(h, ctx, req).await
+            } else {
+                h.handle_borrowed(ctx, req).await
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            h.handle_borrowed(ctx, req).await
+        }
+    };
+    finish_handler_result(ctx, &method, &path, result)
+}
+
+/// LSAPI counterpart that consumes the request body while returning its owned
+/// head for post-dispatch target auth and ErrorDocument policy. This avoids both
+/// the old eager HeaderMap clone and an empty boxed-body replacement on every
+/// Content-Length request.
+pub(crate) async fn run_lsapi_retaining_head(
+    h: &hj_lsapi::Lsapi,
+    ctx: &mut ReqCtx,
+    req: Request,
+) -> (Response, http::request::Parts) {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let (result, parts) = {
+        #[cfg(feature = "otel")]
+        {
+            if crate::otel::enabled() {
+                instrumented_lsapi_retaining_head(h, ctx, req).await
+            } else {
+                h.handle_retaining_head(ctx, req).await
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            h.handle_retaining_head(ctx, req).await
+        }
+    };
+    (finish_handler_result(ctx, &method, &path, result), parts)
+}
+
+fn finish_handler_result(
+    ctx: &ReqCtx,
+    method: &http::Method,
+    path: &str,
+    result: Result<Response, hj_core::HandlerError>,
+) -> Response {
     match result {
         Ok(resp) => resp,
         Err(err) => {
@@ -5258,6 +5729,22 @@ mod tests {
         // An lsapi handler for a NEW suffix adds it (additive union still works).
         let added = compute_php_suffixes(&global, &[sh("phtml", ContextKind::Lsapi)]);
         assert!(added.contains("phtml") && added.contains("php") && added.contains("html"));
+
+        // An unsupported normalized kind remains executable so dispatch can
+        // return 503; only an explicit static mapping may expose source bytes.
+        let guarded = compute_php_suffixes(&global, &[sh("tmpl", ContextKind::Other)]);
+        assert!(guarded.contains("tmpl"));
+
+        // Duplicate declarations follow the same last-wins rule as handler
+        // selection, including an explicit static opt-out.
+        let last_static = compute_php_suffixes(
+            &global,
+            &[
+                sh("phtml", ContextKind::Lsapi),
+                sh("phtml", ContextKind::Static),
+            ],
+        );
+        assert!(!last_static.contains("phtml"));
     }
 
     #[test]
@@ -5291,6 +5778,19 @@ mod tests {
         assert_eq!(
             fastcgi_handler_for_script(&ctx, std::path::Path::new("/srv/app.php")),
             None
+        );
+
+        Arc::make_mut(&mut ctx.vhost)
+            .script_handlers
+            .push(ScriptHandler {
+                suffix: "fcgi".into(),
+                kind: ContextKind::Lsapi,
+                handler: "php".into(),
+            });
+        assert_eq!(
+            fastcgi_handler_for_script(&ctx, std::path::Path::new("/srv/app.fcgi")),
+            None,
+            "the last mapping for a suffix wins across handler kinds"
         );
     }
 

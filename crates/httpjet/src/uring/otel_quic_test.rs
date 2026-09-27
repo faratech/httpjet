@@ -65,7 +65,15 @@ fn traced_quic_roundtrip() {
         bridge,
         false,
         h3::H3RuntimeConfig::new(
-            || (h3::H3RequestLimits::new(16_384, 1024 * 1024), 8),
+            || {
+                (
+                    h3::H3RequestConfig::new(
+                        h3::H3RequestLimits::new(16_384, 1024 * 1024),
+                        Some(std::time::Duration::from_secs(30)),
+                    ),
+                    8,
+                )
+            },
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(hj_core::budget::BodyBufferBudget::new(8 * 1024 * 1024)),
         )

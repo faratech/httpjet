@@ -490,9 +490,10 @@ fn body_ram_bytes(body: &PageBody) -> u64 {
     }
 }
 
-fn file_body_disk_version(body: &PageBody) -> Option<(u64, u64)> {
+fn file_body_disk_version(disk: Option<&DiskStore>, body: &PageBody) -> Option<(u64, u64)> {
     match body {
-        PageBody::File { path, .. } => crate::diskstore::read_meta(path.as_ref())
+        PageBody::File { path, .. } => disk?
+            .read_meta(path.as_ref())
             .ok()
             .map(|se| (se.stored_unix_ms, se.version_seq)),
         PageBody::InMem(_) | PageBody::Derived { .. } => None,
@@ -1494,7 +1495,9 @@ impl OnEvict<CacheKeyId, CacheEntry> for StoreEvict {
         PENDING_UNLINKS.with(|q| {
             let mut q = q.borrow_mut();
             for path in q.drain(..) {
-                DiskStore::remove(&path);
+                if let Some(disk) = &self.disk {
+                    disk.remove(&path);
+                }
             }
             // A purge-all drains one shard's worth of paths at a time; don't
             // let that burst pin its capacity on the thread forever.
@@ -1862,7 +1865,7 @@ impl PageStore {
     /// path or fail closed.
     pub fn body_file(&self, entry: &CachedResponse) -> Option<StoredBodyFile> {
         match &entry.body {
-            PageBody::File { path, len, .. } => match DiskStore::body_file(path, *len) {
+            PageBody::File { path, len, .. } => match self.disk.as_ref()?.body_file(path, *len) {
                 Ok(f) => Some(f),
                 Err(e) => {
                     self.disk_read_errors.fetch_add(1, Ordering::Relaxed);
@@ -1895,7 +1898,10 @@ impl PageStore {
                         return Some(b);
                     }
                 }
-                match DiskStore::read_body(path, *len) {
+                let Some(disk) = self.disk.as_ref() else {
+                    return None;
+                };
+                match disk.read_body(path, *len) {
                     Ok(b) => {
                         if promote_hot {
                             if let Some(hot) = &self.hot {
@@ -1938,6 +1944,29 @@ impl PageStore {
     /// instead of re-attempting a dead file.
     pub fn invalidate_key(&self, key: &PageCacheKey) {
         self.inner.remove(&CacheKeyId::new(key));
+    }
+
+    /// Remove `key` only when `expected` is still the exact serve snapshot held
+    /// by the resident node. A background enrichment can replace a file-backed
+    /// body after a request has cloned the old snapshot; an unconditional remove
+    /// from that request would otherwise tear down the newer successor.
+    pub fn invalidate_entry_if_current(
+        &self,
+        key: &PageCacheKey,
+        expected: &Arc<CachedResponse>,
+    ) -> bool {
+        let id = CacheKeyId::new(key);
+        self.inner.with_shard(&id, |acc| {
+            let current = acc
+                .get(&id)
+                .and_then(CacheEntry::as_page)
+                .and_then(|node| node.resp_snapshot.get());
+            if !current.is_some_and(|current| Arc::ptr_eq(current, expected)) {
+                return false;
+            }
+            acc.teardown(&id, EvictCause::Explicit);
+            true
+        })
     }
 
     /// The active store limits.
@@ -2148,7 +2177,7 @@ impl PageStore {
             return None;
         }
         match &entry.body {
-            PageBody::File { path, .. } => std::fs::read(path.as_ref()).ok(),
+            PageBody::File { path, .. } => self.disk.as_ref()?.read_container(path).ok(),
             PageBody::InMem(_) | PageBody::Derived { .. } => None,
         }
     }
@@ -2222,11 +2251,11 @@ impl PageStore {
                 return false;
             }
         };
-        let se = match crate::diskstore::read_meta(&path) {
+        let se = match disk.read_meta(&path) {
             Ok(se) => se,
             Err(_) => {
                 self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
-                DiskStore::remove(&path);
+                disk.remove(&path);
                 return false;
             }
         };
@@ -2459,7 +2488,9 @@ impl PageStore {
         self.store_commit_calls.fetch_add(1, Ordering::Relaxed);
         if !installed {
             if let Some(p) = new_file {
-                DiskStore::remove(&p);
+                if let Some(disk) = &self.disk {
+                    disk.remove(&p);
+                }
             }
             return false;
         }
@@ -2770,7 +2801,7 @@ impl PageStore {
             // either and must be removed here as well.
             if committed || !acc.contains(&id) {
                 if let Some((old_path, old_body_id)) = old_file {
-                    DiskStore::remove(&old_path);
+                    disk.remove(&old_path);
                     if let Some(hot) = &self.hot {
                         hot.invalidate(old_body_id);
                     }
@@ -2780,7 +2811,7 @@ impl PageStore {
         });
         if !swapped {
             if let Some(new_path) = published_path {
-                DiskStore::remove(&new_path);
+                disk.remove(&new_path);
             }
         }
         swapped
@@ -2907,8 +2938,8 @@ impl PageStore {
         // of a missing/already-installed file is a no-op, so this is safe for both callers.
         let new_file = cloned_file_path(&entry.body);
         let unlink_new_file = |nf: &Option<Arc<Path>>| {
-            if let Some(p) = nf.as_ref() {
-                DiskStore::remove(p);
+            if let (Some(disk), Some(p)) = (self.disk.as_ref(), nf.as_ref()) {
+                disk.remove(p);
             }
         };
         {
@@ -2973,7 +3004,8 @@ impl PageStore {
                     match cur.with_decoded(|d| d.key.clone()) {
                         Ok(k) => {
                             let cur_stored_at = cur.stored_at;
-                            let cur_disk_version = file_body_disk_version(&cur.body);
+                            let cur_disk_version =
+                                file_body_disk_version(self.disk.as_deref(), &cur.body);
                             (k, cur_stored_at, cur_disk_version)
                         }
                         Err(_) => {
@@ -3070,7 +3102,9 @@ impl PageStore {
         });
         if !installed {
             if let Some(p) = new_file {
-                DiskStore::remove(&p);
+                if let Some(disk) = &self.disk {
+                    disk.remove(&p);
+                }
             }
         }
         installed
@@ -3212,7 +3246,7 @@ impl PageStore {
             Some(node) if node.render_epoch >= purge_epoch => Action::KeepFresh,
             Some(node) => match node.with_decoded(|d| d.key.clone()) {
                 Ok(full_key) => Action::Remove(
-                    file_body_disk_version(&node.body)
+                    file_body_disk_version(self.disk.as_deref(), &node.body)
                         .map(|(_, version_seq)| (full_key, version_seq)),
                 ),
                 Err(_) => {
@@ -3577,7 +3611,9 @@ impl PageStore {
 
         if !installed {
             if let Some(p) = new_file {
-                DiskStore::remove(&p);
+                if let Some(disk) = &self.disk {
+                    disk.remove(&p);
+                }
             }
             return false;
         }
@@ -4591,6 +4627,41 @@ mod tests {
             &vec![b'z'; 200][..],
             "stored form is the compressed bytes"
         );
+    }
+
+    #[test]
+    fn stale_snapshot_cannot_invalidate_recompressed_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        s.load_from_disk(|_| {});
+        let key = PageCacheKey::public(1, true, "h", "/snapshot-race", "");
+        let identity = "h\n/snapshot-race";
+        let cached = entry_id(
+            &vec![b'x'; 16 * 1024],
+            &[],
+            Duration::from_secs(600),
+            identity,
+        );
+        let stored_at = cached.stored_at;
+        assert!(s.store(key.clone(), cached));
+        let stale = s
+            .lookup(&key, identity, Instant::now())
+            .expect("identity snapshot");
+
+        assert!(
+            s.fill_recompress_disk(&key, identity, stored_at, Bytes::from(vec![b'z'; 200]), 9,)
+        );
+        assert!(
+            !s.invalidate_entry_if_current(&key, &stale),
+            "an old hit must not remove the recompressed successor"
+        );
+
+        let current = s
+            .lookup(&key, identity, Instant::now())
+            .expect("recompressed successor remains");
+        assert_eq!(current.dict_gen, 9);
+        assert!(s.invalidate_entry_if_current(&key, &current));
+        assert!(s.lookup(&key, identity, Instant::now()).is_none());
     }
 
     #[test]

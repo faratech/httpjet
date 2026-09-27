@@ -44,13 +44,44 @@ pub(super) fn apply_set_env(
     path: &str,
     query: &str,
 ) -> Result<(), &'static str> {
-    if chain.is_empty() {
-        return Ok(());
-    }
+    apply_set_env_iter(ctx, chain.iter().map(AsRef::as_ref), req, path, query)
+}
+
+pub(super) fn apply_set_env_iter<'a, I>(
+    ctx: &mut ReqCtx,
+    chain: I,
+    req: &Request,
+    path: &str,
+    query: &str,
+) -> Result<(), &'static str>
+where
+    I: Clone + Iterator<Item = &'a Htaccess>,
+{
+    apply_set_env_iter_with_headers(
+        ctx,
+        chain,
+        req.method().as_str(),
+        req.headers(),
+        path,
+        query,
+    )
+}
+
+pub(super) fn apply_set_env_iter_with_headers<'a, I>(
+    ctx: &mut ReqCtx,
+    chain: I,
+    method: &str,
+    headers: &http::HeaderMap,
+    path: &str,
+    query: &str,
+) -> Result<(), &'static str>
+where
+    I: Clone + Iterator<Item = &'a Htaccess>,
+{
     // Skip the per-request header materialization (+ ReqAttrs build) entirely when no dir in
     // the chain declares any SetEnvIf — the common case even when an .htaccess chain exists.
     // Only when at least one SetEnvIf is present do we pay to snapshot the request headers.
-    if chain.iter().all(|ht| ht.set_env_if.is_empty()) {
+    if chain.clone().all(|ht| ht.set_env_if.is_empty()) {
         return Ok(());
     }
     // Lazy header source: SetEnvIf only reads the specific names its rules reference, so resolve
@@ -60,7 +91,7 @@ pub(super) fn apply_set_env(
     // the same string lsphp receives (#360); `_`/`-` folding is applied by
     // ReqAttrs::lookup_header before this is called.
     let header_lookup = |name: &str| -> Option<String> {
-        req.headers()
+        headers
             .get_all(name)
             .iter()
             .next()
@@ -68,15 +99,13 @@ pub(super) fn apply_set_env(
     };
     // `as_str()` already yields a borrow good for the rest of this fn (method borrows `req`,
     // protocol is `&'static`), so feed ReqAttrs the borrows directly — no per-request String.
-    let method = req.method().as_str();
     let protocol = ctx.protocol.as_str();
     let remote_addr = ip_to_string(ctx.client_ip);
     let server_addr = ip_to_string(ctx.local_addr.ip());
     // IPv6-aware host (a naive `split(':')` mangles a bracketed `[::1]:443` to `[`);
     // matches the router / rewrite-host normalization so SetEnvIf/RewriteCond see the
     // same host the vhost was resolved by.
-    let host = req
-        .headers()
+    let host = headers
         .get(http::header::HOST)
         .and_then(|h| h.to_str().ok())
         .map(hj_core::host_without_port)
@@ -120,14 +149,26 @@ pub(super) fn access_denied(
     method: &str,
     ctx: &ReqCtx,
 ) -> bool {
+    access_denied_iter(chain.iter().map(AsRef::as_ref), rel_path, method, ctx)
+}
+
+pub(super) fn access_denied_iter<'a>(
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+    rel_path: &str,
+    method: &str,
+    ctx: &ReqCtx,
+) -> bool {
     let env_set = |name: &str| ctx.get_env(name).is_some();
     let subject = hj_rewrite::AccessSubject {
         client_ip: Some(ctx.client_ip),
         env_set: Some(&env_set),
     };
-    access_denied_for(chain, rel_path, method, &subject)
+    chain
+        .into_iter()
+        .any(|ht| ht.access_decision_for(rel_path, method, &subject) == AccessDecision::Denied)
 }
 
+#[cfg(test)]
 pub(super) fn access_denied_for(
     chain: &[Arc<Htaccess>],
     rel_path: &str,

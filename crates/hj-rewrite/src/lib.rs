@@ -69,6 +69,7 @@ pub use htaccess::{
     AccessMatcher, AccessOrder, AccessRule, AccessSubject, CacheDirectives, CacheKeyModifier,
     HostAccess, HostEntry, Htaccess, MemoClass, ResolvedPhp, Scope, ScopeIndex, ScopeKind,
     cache_directives, chain_cacheable_for_default, php_directives, php_handler_forced,
+    php_handler_forced_iter,
 };
 pub use htaccess::{AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request};
 pub use input::{FileTests, HeaderLookup, RewriteInput, StatSource};

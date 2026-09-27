@@ -503,7 +503,7 @@ fn append_dict_recompress_metrics(
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     out.push_str(
-        "# HELP httpjet_pagecache_dict_recompress_total Store-time dictionary recompression jobs by result.\n",
+        "# HELP httpjet_pagecache_dict_recompress_total Background dictionary recompression jobs by result.\n",
     );
     out.push_str("# TYPE httpjet_pagecache_dict_recompress_total counter\n");
     out.push_str(
@@ -511,7 +511,7 @@ fn append_dict_recompress_metrics(
     );
     out.push_str("# TYPE httpjet_pagecache_dict_recompress_skipped_total counter\n");
     out.push_str(
-        "# HELP httpjet_pagecache_dict_recompress_bytes_total Store-time dictionary recompression bytes by stage.\n",
+        "# HELP httpjet_pagecache_dict_recompress_bytes_total Background dictionary recompression bytes by stage.\n",
     );
     out.push_str("# TYPE httpjet_pagecache_dict_recompress_bytes_total counter\n");
     for (vhost, metrics) in rows {

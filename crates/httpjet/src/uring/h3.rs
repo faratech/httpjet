@@ -10,12 +10,12 @@
 //! it shares the same request pipeline as H1/H2. A separate fixed-response entrypoint
 //! remains below for isolated transport smoke tests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use std::os::fd::{AsRawFd, BorrowedFd};
@@ -34,6 +34,14 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// 64 KiB covers any GRO-coalesced jumbo the kernel hands up).
 const MAX_DATAGRAM: usize = 64 * 1024;
 const GRO_BATCH: usize = 8;
+/// Keep each readiness pass finite without falling back to one syscall at a time.
+/// A full pass accepts up to 64 message slots, each of which may itself contain
+/// multiple GRO-coalesced QUIC datagrams.
+const MAX_RECV_DRAIN_BATCHES: usize = 8;
+/// Keep a continuously-refilled completion queue from starving absolute request
+/// deadlines and the shutdown drain deadline. The first awaited completion is
+/// included in this total.
+const MAX_COMPLETION_DRAIN_BATCH: usize = 64;
 const MAX_PEER_UNI_STREAMS: usize = 16;
 
 const H3_STREAM_CREATION_ERROR: u32 = 0x0103;
@@ -42,6 +50,7 @@ const H3_FRAME_UNEXPECTED: u32 = 0x0105;
 const H3_EXCESSIVE_LOAD: u32 = 0x0107;
 const H3_SETTINGS_ERROR: u32 = 0x0109;
 const H3_MISSING_SETTINGS: u32 = 0x010a;
+const H3_REQUEST_CANCELLED: u32 = 0x010c;
 const MAX_SETTINGS_PAYLOAD: usize = 64 * 1024;
 
 /// One coherent accept-time QUIC policy. The quinn configuration and serving
@@ -146,9 +155,77 @@ impl H3RequestLimits {
     }
 }
 
+/// (#509) Request-stream limits captured together from one configuration generation.
+/// `timeout` is an absolute budget from stream acceptance through FIN; progress
+/// never refreshes it.
+#[derive(Clone, Copy)]
+pub(crate) struct H3RequestConfig {
+    limits: H3RequestLimits,
+    timeout: Option<Duration>,
+}
+
+impl H3RequestConfig {
+    pub(crate) fn new(limits: H3RequestLimits, timeout: Option<Duration>) -> Self {
+        Self { limits, timeout }
+    }
+}
+
+/// The one application/configuration generation selected when a request stream
+/// is accepted. A compatible reload may change the snapshot for later streams
+/// on the same connection, but never for a stream already being received.
+#[derive(Clone)]
+struct H3RequestSnapshot {
+    config: H3RequestConfig,
+    generation: Option<crate::serving_generation::RequestGeneration>,
+    deadline: Option<H3RequestDeadlineKey>,
+}
+
+impl H3RequestSnapshot {
+    #[cfg(test)]
+    fn unscoped(config: H3RequestConfig) -> Self {
+        Self {
+            config,
+            generation: None,
+            deadline: None,
+        }
+    }
+}
+
+/// Ordered node for one unfinished request stream. Sequence, rather than
+/// StreamId, is the tie-breaker because a whole accept batch commonly shares
+/// one deadline.
+#[derive(Clone, Copy, Debug)]
+struct H3RequestDeadlineKey {
+    when: Instant,
+    sequence: u64,
+    stream: StreamId,
+}
+
+impl PartialEq for H3RequestDeadlineKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.when == other.when && self.sequence == other.sequence
+    }
+}
+
+impl Eq for H3RequestDeadlineKey {}
+
+impl PartialOrd for H3RequestDeadlineKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for H3RequestDeadlineKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.when
+            .cmp(&other.when)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct H3RuntimeConfig {
-    config: Arc<dyn Fn() -> (H3RequestLimits, u32) + Send + Sync>,
+    config: Arc<dyn Fn() -> (H3RequestConfig, u32) + Send + Sync>,
     serving_view: Option<crate::serving_generation::ServingView>,
     active_conns: Arc<AtomicU64>,
     /// (#236 residual) Server-wide buffered-body cap shared with H1/H2/LSAPI. H3 commits
@@ -165,7 +242,7 @@ impl H3RuntimeConfig {
         body_budget: std::sync::Arc<hj_core::budget::BodyBufferBudget>,
     ) -> Self
     where
-        F: Fn() -> (H3RequestLimits, u32) + Send + Sync + 'static,
+        F: Fn() -> (H3RequestConfig, u32) + Send + Sync + 'static,
     {
         Self {
             config: Arc::new(config),
@@ -183,8 +260,13 @@ impl H3RuntimeConfig {
         self
     }
 
-    fn request_limits(&self) -> H3RequestLimits {
+    fn request_config(&self) -> H3RequestConfig {
         (self.config)().0
+    }
+
+    #[cfg(test)]
+    fn request_limits(&self) -> H3RequestLimits {
+        self.request_config().limits
     }
 
     fn max_connections(&self) -> u32 {
@@ -431,6 +513,14 @@ struct H3State {
     /// In-flight client request bidi streams (removed once served), so we never
     /// re-scan already-served streams — bounded by concurrent requests, not total.
     requests: std::collections::HashSet<StreamId>,
+    /// Absolute deadlines for unfinished request streams. The same key is held
+    /// in `request_snapshots`, so completion removes it directly in O(log N).
+    /// Equal batch deadlines never trigger a scan of the remaining streams.
+    request_deadlines: BTreeSet<H3RequestDeadlineKey>,
+    next_request_deadline_sequence: u64,
+    /// Limits and dispatch generation captured once when each stream is accepted.
+    /// This travels with the buffered request until dispatch or reclamation.
+    request_snapshots: std::collections::HashMap<StreamId, H3RequestSnapshot>,
     /// Accumulated request bytes per in-flight bidi stream (a request's HEADERS+DATA
     /// frames may arrive across several datagrams); drained + handled on stream fin.
     req_buf: std::collections::HashMap<StreamId, Vec<u8>>,
@@ -480,27 +570,154 @@ struct H3State {
 }
 
 impl H3State {
-    fn request_snapshot(
-        &self,
-        fallback: H3RequestLimits,
-    ) -> (
-        H3RequestLimits,
-        Option<crate::serving_generation::RequestGeneration>,
-    ) {
+    fn request_snapshot(&self, fallback: H3RequestConfig) -> H3RequestSnapshot {
         let generation = self
             .serving_view
             .as_ref()
             .map(|view| crate::serving_generation::RequestGeneration(view.load_full()));
-        let limits = generation
+        let config = generation
             .as_ref()
             .map(|generation| {
-                H3RequestLimits::new(
-                    generation.0.serve_config.max_req_header_size,
-                    generation.0.serve_config.max_req_body_size,
+                H3RequestConfig::new(
+                    H3RequestLimits::new(
+                        generation.0.serve_config.max_req_header_size,
+                        generation.0.serve_config.max_req_body_size,
+                    ),
+                    generation.0.serve_config.header_read_timeout,
                 )
             })
             .unwrap_or(fallback);
-        (limits, generation)
+        H3RequestSnapshot {
+            config,
+            generation,
+            deadline: None,
+        }
+    }
+
+    fn track_request_stream(
+        &mut self,
+        id: StreamId,
+        accepted_at: Instant,
+        mut snapshot: H3RequestSnapshot,
+    ) {
+        // accept(Dir::Bi) yields each stream once. Keeping the insertion guard
+        // makes the absolute deadline non-sliding even if that assumption ever
+        // changes in quinn-proto.
+        if self.requests.insert(id) {
+            self.req_buf.entry(id).or_default();
+            if let Some(timeout) = snapshot.config.timeout {
+                let deadline = accepted_at + timeout;
+                let key = H3RequestDeadlineKey {
+                    when: deadline,
+                    sequence: self.next_request_deadline_sequence,
+                    stream: id,
+                };
+                snapshot.deadline = Some(key);
+                self.request_deadlines.insert(key);
+                self.next_request_deadline_sequence =
+                    self.next_request_deadline_sequence.wrapping_add(1);
+            }
+            self.request_snapshots.insert(id, snapshot);
+        }
+    }
+
+    fn next_request_deadline(&self) -> Option<Instant> {
+        self.request_deadlines.first().map(|key| key.when)
+    }
+
+    fn first_expired_request(&self, now: Instant) -> Option<StreamId> {
+        self.request_deadlines
+            .first()
+            .filter(|key| key.when <= now)
+            .map(|key| key.stream)
+    }
+}
+
+fn recv_drain_should_continue(completed_batches: usize, received_messages: usize) -> bool {
+    received_messages == GRO_BATCH && completed_batches < MAX_RECV_DRAIN_BATCHES
+}
+
+#[derive(Clone, Copy)]
+struct RequestDeadlineKey {
+    when: Instant,
+    sequence: u64,
+    handle: ConnectionHandle,
+}
+
+impl PartialEq for RequestDeadlineKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.when == other.when && self.sequence == other.sequence
+    }
+}
+
+impl Eq for RequestDeadlineKey {}
+
+impl PartialOrd for RequestDeadlineKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RequestDeadlineKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.when
+            .cmp(&other.when)
+            .then_with(|| self.sequence.cmp(&other.sequence))
+    }
+}
+
+/// Per-core index of the nearest absolute request deadline. There is exactly
+/// one node per connection, so packet processing never scans every connection
+/// and the index cannot accumulate lazy tombstones.
+#[derive(Default)]
+struct RequestDeadlineIndex {
+    ordered: BTreeSet<RequestDeadlineKey>,
+    by_connection: HashMap<ConnectionHandle, RequestDeadlineKey>,
+    next_sequence: u64,
+}
+
+impl RequestDeadlineIndex {
+    fn sync(&mut self, handle: ConnectionHandle, deadline: Option<Instant>) {
+        if self.by_connection.get(&handle).map(|key| key.when) == deadline {
+            return;
+        }
+        self.remove(handle);
+        let Some(when) = deadline else {
+            return;
+        };
+        let key = RequestDeadlineKey {
+            when,
+            sequence: self.next_sequence,
+            handle,
+        };
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.ordered.insert(key);
+        self.by_connection.insert(handle, key);
+    }
+
+    fn remove(&mut self, handle: ConnectionHandle) {
+        if let Some(key) = self.by_connection.remove(&handle) {
+            self.ordered.remove(&key);
+        }
+    }
+
+    fn next(&self) -> Option<Instant> {
+        self.ordered.first().map(|key| key.when)
+    }
+
+    fn extend_due(
+        &mut self,
+        affected: &mut std::collections::HashSet<ConnectionHandle>,
+        now: Instant,
+    ) {
+        while let Some(key) = self.ordered.first().copied() {
+            if key.when > now {
+                break;
+            }
+            self.ordered.remove(&key);
+            self.by_connection.remove(&key.handle);
+            affected.insert(key.handle);
+        }
     }
 }
 
@@ -970,7 +1187,7 @@ where
 /// oversize, or fully received — every removal from `requests` goes through here so a
 /// stream can never be dropped from one map but left in the other.
 fn reclaim_request(st: &mut H3State, id: StreamId) -> Bytes {
-    let (bytes, lease) = take_request_for_dispatch(st, id);
+    let (bytes, lease, _snapshot) = take_request_for_dispatch(st, id);
     st.total_req_bytes
         .set(st.total_req_bytes.get().saturating_sub(bytes.len()));
     match lease {
@@ -982,12 +1199,21 @@ fn reclaim_request(st: &mut H3State, id: StreamId) -> Bytes {
 fn take_request_for_dispatch(
     st: &mut H3State,
     id: StreamId,
-) -> (Vec<u8>, Option<hj_core::budget::BodyBufferLease>) {
+) -> (
+    Vec<u8>,
+    Option<hj_core::budget::BodyBufferLease>,
+    Option<H3RequestSnapshot>,
+) {
     st.requests.remove(&id);
     st.req_frames.remove(&id);
+    let snapshot = st.request_snapshots.remove(&id);
+    if let Some(deadline) = snapshot.as_ref().and_then(|snapshot| snapshot.deadline) {
+        st.request_deadlines.remove(&deadline);
+    }
     (
         st.req_buf.remove(&id).unwrap_or_default(),
         st.body_leases.remove(&id),
+        snapshot,
     )
 }
 
@@ -996,10 +1222,24 @@ fn take_request_for_dispatch(
 fn reclaim_buffered_requests(st: &mut H3State) {
     let bytes: usize = st.req_buf.values().map(Vec::len).sum();
     st.requests.clear();
+    st.request_deadlines.clear();
+    st.request_snapshots.clear();
     st.req_frames.clear();
     st.req_buf.clear();
     st.body_leases.clear();
     release_request_charge(st, bytes);
+}
+
+/// Reclaim every request stream whose absolute receive deadline has elapsed.
+/// The caller resets both QUIC halves for each returned id so MAX_STREAMS credit
+/// is released. The empty fast path does not allocate.
+fn reclaim_expired_requests(st: &mut H3State, now: Instant) -> Vec<StreamId> {
+    let mut expired = Vec::new();
+    while let Some(id) = st.first_expired_request(now) {
+        drop(reclaim_request(st, id));
+        expired.push(id);
+    }
+    expired
 }
 
 fn release_request_charge(st: &mut H3State, bytes: usize) {
@@ -1703,6 +1943,7 @@ fn service_conn(
     hd: ConnectionHandle,
     now: Instant,
     accepting_requests: bool,
+    fallback_request_config: H3RequestConfig,
 ) {
     let due = conns
         .get_mut(&hd)
@@ -1796,7 +2037,7 @@ fn service_conn(
             if let Some(conn) = conns.get_mut(&hd) {
                 let _ = conn
                     .send_stream(id)
-                    .reset(quinn_proto::VarInt::from_u32(0x010c));
+                    .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             }
         }
     }
@@ -1819,11 +2060,11 @@ fn service_conn(
         if let Some(conn) = conns.get_mut(&hd) {
             let _ = conn
                 .send_stream(id)
-                .reset(quinn_proto::VarInt::from_u32(0x010c));
+                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             if receiving {
                 let _ = conn
                     .recv_stream(id)
-                    .stop(quinn_proto::VarInt::from_u32(0x010c));
+                    .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             }
         }
     }
@@ -1868,11 +2109,28 @@ fn service_conn(
             return;
         }
     }
+    // Read the clock only if this drive actually accepts a request stream. All
+    // streams already available in the batch share one fresh acceptance time
+    // and configuration generation. Keeping both lazy avoids an Arc clone and
+    // clock read on the much more common packet drive with no newly accepted
+    // request stream.
+    let mut accepted_at = None;
+    let mut request_snapshot = None;
     while let Some(id) = conns.get_mut(&hd).and_then(|c| c.streams().accept(Dir::Bi)) {
         if accepting_requests {
             st.next_request_stream_index = st.next_request_stream_index.max(id.index() + 1);
-            st.requests.insert(id);
-            st.req_buf.entry(id).or_default();
+            let accepted_at = *accepted_at.get_or_insert_with(Instant::now);
+            if request_snapshot.is_none() {
+                request_snapshot = Some(st.request_snapshot(fallback_request_config));
+            }
+            st.track_request_stream(
+                id,
+                accepted_at,
+                request_snapshot
+                    .as_ref()
+                    .expect("accepted request snapshot was initialized")
+                    .clone(),
+            );
         } else if let Some(c) = conns.get_mut(&hd) {
             let code = quinn_proto::VarInt::from_u32(0x010b);
             let _ = c.recv_stream(id).stop(code);
@@ -2004,7 +2262,11 @@ async fn drive_connections<H, Fut>(
 {
     let handles: Vec<ConnectionHandle> = conns.keys().copied().collect();
     for hd in handles {
-        service_conn(endpoint, conns, h3, hd, now, true);
+        // The fixed-response smoke driver has no ServerState/config generation;
+        // production deadlines are enforced by endpoint_loop_concurrent below.
+        let smoke_config =
+            H3RequestConfig::new(H3RequestLimits::new(64 * 1024, MAX_H3_REQ_BYTES), None);
+        service_conn(endpoint, conns, h3, hd, now, true, smoke_config);
         if h3.get(&hd).is_some_and(|state| state.rejected) {
             flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
             continue;
@@ -2013,12 +2275,15 @@ async fn drive_connections<H, Fut>(
         let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
         let mut finished = Vec::new();
         for id in req_ids {
-            let limits = H3RequestLimits::new(64 * 1024, MAX_H3_REQ_BYTES);
+            let Some(snapshot) = st.request_snapshots.get(&id).cloned() else {
+                reclaim_request(st, id);
+                continue;
+            };
             let (end, append) = conns
                 .get_mut(&hd)
                 .map(|c| {
                     for_each_stream_chunk(c, id, |bytes| {
-                        append_request_bytes(st, id, bytes, limits)
+                        append_request_bytes(st, id, bytes, snapshot.config.limits)
                     })
                 })
                 .unwrap_or((ReadEnd::Open, Ok(())));
@@ -2047,7 +2312,10 @@ async fn drive_connections<H, Fut>(
                 if let Some(c) = conns.get_mut(&hd) {
                     let _ = c
                         .recv_stream(id)
-                        .stop(quinn_proto::VarInt::from_u32(0x010c)); // H3_REQUEST_CANCELLED
+                        .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
+                    let _ = c
+                        .send_stream(id)
+                        .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
                 }
                 continue;
             }
@@ -2250,26 +2518,61 @@ async fn drive_one_conn(
     bridge: &Bridge,
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     comp_tx: &flume::Sender<Completion>,
-    request_limits: H3RequestLimits,
+    fallback_request_config: H3RequestConfig,
     accepting_requests: bool,
     tx_scratch: &mut Vec<u8>,
 ) -> bool {
     if !conns.contains_key(&hd) {
         return false;
     }
-    service_conn(endpoint, conns, h3, hd, now, accepting_requests);
+    service_conn(
+        endpoint,
+        conns,
+        h3,
+        hd,
+        now,
+        accepting_requests,
+        fallback_request_config,
+    );
     if h3.get(&hd).is_some_and(|state| state.rejected) {
+        if let Some(state) = h3.get_mut(&hd) {
+            cancel_all_dispatched_requests(state);
+            reclaim_buffered_requests(state);
+        }
         return flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
     }
     let epoch = h3.get(&hd).map(|s| s.epoch).unwrap_or(0);
     let st = h3.entry(hd).or_default();
     let require_client_cert = st.require_client_cert;
-    // One compatible snapshot supplies both parsing limits and bridge dispatch.
-    // It is selected before reading this batch, not later on the Tokio runtime.
-    let (request_limits, request_generation) = st.request_snapshot(request_limits);
+
+    // A live connection can receive traffic on other streams forever, so QUIC's
+    // connection-wide idle timer cannot bound an unfinished request. Expire these
+    // streams independently and reset both halves to return MAX_STREAMS credit.
+    for id in reclaim_expired_requests(st, now) {
+        if let Some(c) = conns.get_mut(&hd) {
+            let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
+            let _ = c.recv_stream(id).stop(code);
+            let _ = c.send_stream(id).reset(code);
+        }
+    }
     let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
     let mut finished = Vec::new();
     for id in req_ids {
+        let Some(request_limits) = st
+            .request_snapshots
+            .get(&id)
+            .map(|snapshot| snapshot.config.limits)
+        else {
+            // Internal invariant failure: never receive under a live-reloaded
+            // policy chosen after this stream began. Reclaim and fail closed.
+            reclaim_request(st, id);
+            if let Some(c) = conns.get_mut(&hd) {
+                let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
+                let _ = c.recv_stream(id).stop(code);
+                let _ = c.send_stream(id).reset(code);
+            }
+            continue;
+        };
         let (end, append) = conns
             .get_mut(&hd)
             .map(|c| {
@@ -2293,7 +2596,7 @@ async fn drive_one_conn(
             if let Some(c) = conns.get_mut(&hd) {
                 let _ = c
                     .send_stream(id)
-                    .reset(quinn_proto::VarInt::from_u32(0x010c));
+                    .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             }
             continue;
         }
@@ -2315,12 +2618,12 @@ async fn drive_one_conn(
             if let Some(c) = conns.get_mut(&hd) {
                 let _ = c
                     .recv_stream(id)
-                    .stop(quinn_proto::VarInt::from_u32(0x010c));
+                    .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
                 // Retire the send half too so the bidi stream is fully freed and its
                 // MAX_STREAMS credit is reissued (same reason as the Gone branch).
                 let _ = c
                     .send_stream(id)
-                    .reset(quinn_proto::VarInt::from_u32(0x010c));
+                    .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             }
             continue;
         }
@@ -2333,11 +2636,22 @@ async fn drive_one_conn(
         for id in finished {
             reclaim_request(st, id);
         }
+        cancel_all_dispatched_requests(st);
+        reclaim_buffered_requests(st);
         return flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
     }
     for id in finished {
-        let (req_bytes, body_lease) = take_request_for_dispatch(st, id);
+        let (req_bytes, body_lease, request_snapshot) = take_request_for_dispatch(st, id);
         let req_charge = req_bytes.len();
+        let Some(request_snapshot) = request_snapshot else {
+            release_request_charge(st, req_charge);
+            if let Some(c) = conns.get_mut(&hd) {
+                let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
+                let _ = c.recv_stream(id).stop(code);
+                let _ = c.send_stream(id).reset(code);
+            }
+            continue;
+        };
         // Peer + TLS params captured up front (no connection borrow into the task). QUIC is
         // always TLS 1.3 (RFC 9001); quinn-proto exposes the client cert chain but not the
         // negotiated cipher, so report the QUIC-mandatory AEAD — same as the tokio H3 path —
@@ -2374,7 +2688,8 @@ async fn drive_one_conn(
         let egress_budget = st.egress_budget.clone();
         let bridge = bridge.clone();
         let tx = comp_tx.clone();
-        let request_generation = request_generation.clone();
+        let request_limits = request_snapshot.config.limits;
+        let request_generation = request_snapshot.generation;
         // spawn() is synchronous (no await) — `st`'s borrow of `h3` is not held across an await.
         let work = async move {
             let _g = guard; // frees the in-flight slot on completion / drop / panic
@@ -2478,9 +2793,10 @@ async fn drive_one_conn(
     flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await
 }
 
-/// Non-blocking GRO drain: pull all currently-queued datagrams (recvmmsg into the reused
-/// buffers, GRO-coalesced, split by `stride`), feed quinn-proto, and return the set of
-/// connections that got new state (to be driven). Stops at `WouldBlock` (socket empty).
+/// Non-blocking GRO drain: pull up to [`MAX_RECV_DRAIN_BATCHES`] batches (recvmmsg into
+/// reused buffers, GRO-coalesced, split by `stride`), feed quinn-proto, and return the set
+/// of connections that got new state. Connections whose absolute request deadline became
+/// due during the bounded drain are included so the caller drives them immediately.
 #[allow(clippy::too_many_arguments)]
 async fn recv_drain(
     udp: &UdpSocket,
@@ -2492,6 +2808,7 @@ async fn recv_drain(
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
+    request_deadlines: &mut RequestDeadlineIndex,
     epoch_ctr: &mut u64,
     runtime: &H3RuntimeConfig,
     policy: &QuicServerPolicy,
@@ -2500,6 +2817,7 @@ async fn recv_drain(
 ) -> std::collections::HashSet<ConnectionHandle> {
     let mut affected: std::collections::HashSet<ConnectionHandle> =
         std::collections::HashSet::new();
+    let mut completed_batches = 0;
     loop {
         let nmsg = {
             // (#333) The kernel receives straight into each slot's spare
@@ -2564,6 +2882,7 @@ async fn recv_drain(
         if nmsg == 0 {
             break;
         }
+        completed_batches += 1;
         for i in 0..nmsg {
             let meta = recv_metas[i];
             if meta.len == 0 {
@@ -2657,10 +2976,11 @@ async fn recv_drain(
                 }
             }
         }
-        if nmsg < GRO_BATCH {
-            break; // fewer than a full batch ⇒ socket drained
+        if !recv_drain_should_continue(completed_batches, nmsg) {
+            break; // short batch drained the socket; full batches stop at the cooperative cap
         }
     }
+    request_deadlines.extend_due(&mut affected, Instant::now());
     affected
 }
 
@@ -2682,6 +3002,7 @@ async fn pump(
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
+    request_deadlines: &mut RequestDeadlineIndex,
     epoch_ctr: &mut u64,
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     bridge: &Bridge,
@@ -2696,11 +3017,14 @@ async fn pump(
     let mut rounds = 0;
     while !to_drive.is_empty() && rounds < MAX_PUMP_ROUNDS {
         rounds += 1;
-        let now = Instant::now();
         let mut next: std::collections::HashSet<ConnectionHandle> =
             std::collections::HashSet::new();
         for hd in to_drive.drain() {
-            if drive_one_conn(
+            // Earlier handles can await UDP writability. Refresh the clock per
+            // handle so QUIC timers and request deadlines never use a stale round
+            // timestamp under load.
+            let now = Instant::now();
+            let more_to_send = drive_one_conn(
                 udp,
                 udp_state,
                 max_gso,
@@ -2713,19 +3037,34 @@ async fn pump(
                 bridge,
                 inflight,
                 comp_tx,
-                runtime.request_limits(),
+                runtime.request_config(),
                 accepting,
                 tx_scratch,
             )
-            .await
-            {
+            .await;
+            request_deadlines.sync(hd, h3.get(&hd).and_then(H3State::next_request_deadline));
+            if more_to_send {
                 next.insert(hd); // hit the per-flush datagram cap → more to send
             }
         }
         // Process ACKs our sends elicited so cwnd/loss-detection stay current.
+        let now = Instant::now();
         for hd in recv_drain(
-            udp, udp_state, recv_bufs, recv_metas, scratch, tx_scratch, endpoint, conns, h3,
-            epoch_ctr, runtime, policy, accepting, now,
+            udp,
+            udp_state,
+            recv_bufs,
+            recv_metas,
+            scratch,
+            tx_scratch,
+            endpoint,
+            conns,
+            h3,
+            request_deadlines,
+            epoch_ctr,
+            runtime,
+            policy,
+            accepting,
+            now,
         )
         .await
         {
@@ -2733,13 +3072,26 @@ async fn pump(
         }
         to_drive = next;
     }
+    // A request deadline can become due in recv_drain() after the final
+    // cooperative round. extend_due() removes its node while adding the handle
+    // to `to_drive`; if the round cap then ends the loop, reinsert that still-due
+    // minimum so the endpoint's outer pre-select check drives it immediately.
+    // Handles retained only for transmit work keep the pre-existing wakeup path.
+    for hd in &to_drive {
+        request_deadlines.sync(*hd, h3.get(hd).and_then(H3State::next_request_deadline));
+    }
+    let mut drained_handles = Vec::new();
     conns.retain(|hd, c| {
         let drained = c.is_drained();
         if drained {
             h3.remove(hd);
+            drained_handles.push(*hd);
         }
         !drained
     });
+    for hd in drained_handles {
+        request_deadlines.remove(hd);
+    }
 }
 
 fn h3_drain_complete(
@@ -2780,7 +3132,7 @@ async fn close_h3_connections(
 
 /// The production io_uring H3 per-core loop: `select!` over (1) a finished-request completion
 /// (write its response back + flush), (2) an inbound datagram (feed quinn-proto), (3) the
-/// nearest quinn-proto timer. Per-request dispatch runs in spawned tasks (see
+/// nearest QUIC, request-stream, or drain timer. Per-request dispatch runs in spawned tasks (see
 /// [`drive_one_conn`]), so PHP/pipeline latency never stalls the datagram loop.
 async fn endpoint_loop_concurrent(
     udp: UdpSocket,
@@ -2813,6 +3165,7 @@ async fn endpoint_loop_concurrent(
     let mut recv_bufs: [BytesMut; GRO_BATCH] =
         std::array::from_fn(|_| BytesMut::with_capacity(MAX_DATAGRAM));
     let mut recv_metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
+    let mut request_deadlines = RequestDeadlineIndex::default();
     let mut draining = false;
     let mut drain_deadline: Option<Instant> = None;
     // Socket capability probing and driver allocations belong to preparation,
@@ -2853,9 +3206,42 @@ async fn endpoint_loop_concurrent(
             .await;
             return Ok(());
         }
+        // The select is intentionally biased toward completions and socket input.
+        // Service overdue request streams before re-entering it so traffic on
+        // unrelated connections cannot starve an absolute deadline indefinitely.
+        let mut due = std::collections::HashSet::new();
+        request_deadlines.extend_due(&mut due, now);
+        if !due.is_empty() {
+            pump(
+                &udp,
+                &udp_state,
+                max_gso,
+                &mut recv_bufs,
+                &mut recv_metas,
+                &mut scratch,
+                &mut tx_scratch,
+                &mut endpoint,
+                &mut conns,
+                &mut h3,
+                &mut request_deadlines,
+                &mut epoch_ctr,
+                &inflight,
+                &bridge,
+                local,
+                &comp_tx,
+                &runtime,
+                &policy,
+                !draining,
+                due,
+            )
+            .await;
+            continue;
+        }
+        let next_request_timeout = request_deadlines.next();
         let next_timeout = conns
             .values_mut()
             .filter_map(|c| c.poll_timeout())
+            .chain(next_request_timeout)
             .chain(drain_deadline)
             .min();
         let timer_base = Instant::now();
@@ -2875,41 +3261,48 @@ async fn endpoint_loop_concurrent(
                 let now = Instant::now();
                 drain_deadline = Some(now + super::URING_DRAIN_GRACE);
                 let handles = conns.keys().copied().collect();
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
             }
             // (1) Finished request(s): write each response into its stream, then pump the
             // sends (the response streams out cooperatively, interleaved with ACK processing).
             comp = comp_rx.recv_async() => {
                 let now = Instant::now();
                 let mut to_drive: std::collections::HashSet<ConnectionHandle> = std::collections::HashSet::new();
+                let mut completed = 0;
                 if let Ok(c) = comp {
                     let hd = c.conn;
                     write_completion(&udp, &udp_state, max_gso, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
                     to_drive.insert(hd);
+                    completed = 1;
                 }
-                while let Ok(c) = comp_rx.try_recv() {
+                while completed < MAX_COMPLETION_DRAIN_BATCH {
+                    let Ok(c) = comp_rx.try_recv() else {
+                        break;
+                    };
                     let hd = c.conn;
                     write_completion(&udp, &udp_state, max_gso, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
                     to_drive.insert(hd);
+                    completed += 1;
                 }
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
             }
             // (2) Socket readable: GRO-drain queued datagrams, then pump (drive affected conns
             // + interleave further ACK processing). `readable()` is a poll op (cancel-safe).
             _ = udp.readable(false) => {
                 let now = Instant::now();
-                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &runtime, &policy, !draining, now).await;
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
+                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &runtime, &policy, !draining, now).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
             }
-            // (3) A quinn-proto timer fired (handshake retransmit / idle / pacing) — pump the
-            // connections whose timer is due.
+            // (3) A QUIC timer (handshake retransmit / idle / pacing) or absolute
+            // request-stream deadline fired — pump every connection now due.
             _ = sleep_until_opt(next_timeout, timer_base) => {
                 let now = Instant::now();
-                let due: std::collections::HashSet<ConnectionHandle> = conns
+                let mut due: std::collections::HashSet<ConnectionHandle> = conns
                     .iter_mut()
                     .filter_map(|(hd, c)| c.poll_timeout().filter(|t| *t <= now).map(|_| *hd))
                     .collect();
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
+                request_deadlines.extend_due(&mut due, now);
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
             }
         }
     }
@@ -4135,20 +4528,25 @@ mod h3_codec_tests {
 
     #[test]
     fn h3_config_accessor_observes_reload_changes() {
-        use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
         let cap = Arc::new(AtomicU32::new(2));
         let header = Arc::new(AtomicUsize::new(16_380));
         let body = Arc::new(AtomicUsize::new(100 * 1024 * 1024));
+        let timeout_secs = Arc::new(AtomicU64::new(30));
         let cap_read = cap.clone();
         let header_read = header.clone();
         let body_read = body.clone();
+        let timeout_read = timeout_secs.clone();
         let runtime = H3RuntimeConfig::new(
             move || {
                 (
-                    H3RequestLimits::new(
-                        header_read.load(Ordering::Relaxed),
-                        body_read.load(Ordering::Relaxed),
+                    H3RequestConfig::new(
+                        H3RequestLimits::new(
+                            header_read.load(Ordering::Relaxed),
+                            body_read.load(Ordering::Relaxed),
+                        ),
+                        Some(Duration::from_secs(timeout_read.load(Ordering::Relaxed))),
                     ),
                     cap_read.load(Ordering::Relaxed),
                 )
@@ -4160,12 +4558,21 @@ mod h3_codec_tests {
         );
         assert_eq!(runtime.max_connections(), 2);
         assert_eq!(runtime.request_limits().max_header_bytes, 16_380);
+        assert_eq!(
+            runtime.request_config().timeout,
+            Some(Duration::from_secs(30))
+        );
         cap.store(7, Ordering::Relaxed);
         header.store(8_192, Ordering::Relaxed);
         body.store(32 * 1024 * 1024, Ordering::Relaxed);
+        timeout_secs.store(45, Ordering::Relaxed);
         assert_eq!(runtime.max_connections(), 7);
         assert_eq!(runtime.request_limits().max_header_bytes, 8_192);
         assert_eq!(runtime.request_limits().max_body_bytes, 32 * 1024 * 1024);
+        assert_eq!(
+            runtime.request_config().timeout,
+            Some(Duration::from_secs(45))
+        );
     }
 
     #[tokio::test]
@@ -4185,7 +4592,12 @@ mod h3_codec_tests {
         let server_root = initial.server.server_root.clone();
         let holder = Arc::new(arc_swap::ArcSwap::from(initial.clone()));
         let runtime = H3RuntimeConfig::new(
-            || (H3RequestLimits::new(1, 1), 8),
+            || {
+                (
+                    H3RequestConfig::new(H3RequestLimits::new(1, 1), Some(Duration::from_secs(1))),
+                    8,
+                )
+            },
             Arc::new(AtomicU64::new(0)),
             initial.body_budget.clone(),
         )
@@ -4193,17 +4605,73 @@ mod h3_codec_tests {
         let permit = || {
             crate::uring::ConnectionPermit::try_acquire(runtime.active_conns.clone(), 8).unwrap()
         };
-        let early = runtime.accepted_state(permit(), 1);
+        let mut early = runtime.accepted_state(permit(), 1);
+        let accepted_at = Instant::now();
+        let first_stream = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let first_snapshot = early.request_snapshot(runtime.request_config());
+        assert!(Arc::ptr_eq(
+            &first_snapshot.generation.as_ref().unwrap().0,
+            &initial
+        ));
+        early.track_request_stream(first_stream, accepted_at, first_snapshot);
         let mut application =
             crate::state::ServerState::reload(&initial, initial.server.clone()).unwrap();
         Arc::get_mut(&mut application)
             .unwrap()
             .serve_config
             .max_req_body_size = 512;
+        Arc::get_mut(&mut application)
+            .unwrap()
+            .serve_config
+            .header_read_timeout = Some(Duration::from_secs(11));
         holder.store(application.clone());
-        let (limits, selected) = early.request_snapshot(runtime.request_limits());
-        assert_eq!(limits.max_body_bytes, 512);
-        assert!(Arc::ptr_eq(&selected.as_ref().unwrap().0, &application));
+        let request_snapshot = early.request_snapshot(runtime.request_config());
+        assert_eq!(request_snapshot.config.limits.max_body_bytes, 512);
+        assert_eq!(
+            request_snapshot.config.timeout,
+            application.serve_config.header_read_timeout
+        );
+        assert!(Arc::ptr_eq(
+            &request_snapshot.generation.as_ref().unwrap().0,
+            &application
+        ));
+        let second_stream = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        early.track_request_stream(second_stream, accepted_at, request_snapshot.clone());
+        let retained = early.request_snapshots.get(&first_stream).unwrap();
+        assert_eq!(
+            retained.config.limits.max_body_bytes,
+            initial.serve_config.max_req_body_size
+        );
+        assert_eq!(
+            retained.config.timeout,
+            initial.serve_config.header_read_timeout
+        );
+        assert!(Arc::ptr_eq(
+            &retained.generation.as_ref().unwrap().0,
+            &initial
+        ));
+        assert!(Arc::ptr_eq(
+            &early
+                .request_snapshots
+                .get(&second_stream)
+                .unwrap()
+                .generation
+                .as_ref()
+                .unwrap()
+                .0,
+            &application
+        ));
+        let (_, _, dispatched_snapshot) = take_request_for_dispatch(&mut early, first_stream);
+        let dispatched_snapshot = dispatched_snapshot.expect("accepted stream keeps its snapshot");
+        assert_eq!(
+            dispatched_snapshot.config.limits.max_body_bytes,
+            initial.serve_config.max_req_body_size
+        );
+        assert!(Arc::ptr_eq(
+            &dispatched_snapshot.generation.unwrap().0,
+            &initial
+        ));
+        assert!(!early.request_snapshots.contains_key(&first_stream));
         let later = runtime.accepted_state(permit(), 2);
         let mut replacement =
             crate::state::ServerState::reload(&application, application.server.clone()).unwrap();
@@ -4212,16 +4680,31 @@ mod h3_codec_tests {
             .unwrap()
             .serve_config
             .max_req_body_size = 4096;
+        Arc::get_mut(&mut replacement)
+            .unwrap()
+            .serve_config
+            .header_read_timeout = Some(Duration::from_secs(22));
         holder.store(replacement);
-        let (old_limits, old_snapshot) = early.request_snapshot(runtime.request_limits());
+        let old_snapshot = early.request_snapshot(runtime.request_config());
         assert_eq!(
-            old_limits.max_body_bytes,
+            old_snapshot.config.limits.max_body_bytes,
             initial.serve_config.max_req_body_size
         );
-        assert!(Arc::ptr_eq(&old_snapshot.unwrap().0, &initial));
-        let (later_limits, later_snapshot) = later.request_snapshot(runtime.request_limits());
-        assert_eq!(later_limits.max_body_bytes, 512);
-        assert!(Arc::ptr_eq(&later_snapshot.unwrap().0, &application));
+        assert_eq!(
+            old_snapshot.config.timeout,
+            initial.serve_config.header_read_timeout
+        );
+        assert!(Arc::ptr_eq(&old_snapshot.generation.unwrap().0, &initial));
+        let later_snapshot = later.request_snapshot(runtime.request_config());
+        assert_eq!(later_snapshot.config.limits.max_body_bytes, 512);
+        assert_eq!(
+            later_snapshot.config.timeout,
+            application.serve_config.header_read_timeout
+        );
+        assert!(Arc::ptr_eq(
+            &later_snapshot.generation.unwrap().0,
+            &application
+        ));
 
         // Decode a real H3 HEADERS frame and prove the generation selected before
         // publication travels through dispatch, rather than reloading live state.
@@ -4253,12 +4736,15 @@ mod h3_codec_tests {
             "127.0.0.1:8443".parse().unwrap(),
             &bridge,
             false,
-            limits,
-            selected,
+            request_snapshot.config.limits,
+            request_snapshot.generation,
             None,
         )
         .await;
         assert_eq!(seen.load(Ordering::SeqCst), application.generation);
+        reclaim_buffered_requests(&mut early);
+        assert!(early.request_snapshots.is_empty());
+        assert!(early.request_deadlines.is_empty());
         drop(early);
         drop(later);
         assert_eq!(runtime.active_conns.load(Ordering::SeqCst), 0);
@@ -4649,7 +5135,7 @@ mod h3_codec_tests {
         let mut st = H3State::default();
         st.requests.extend([first, second]);
         assert!(append_request_bytes(&mut st, first, &[0x00, 4, 1, 2, 3, 4], limits).is_ok());
-        let (dispatched, _lease) = take_request_for_dispatch(&mut st, first);
+        let (dispatched, _lease, _snapshot) = take_request_for_dispatch(&mut st, first);
         assert_eq!(dispatched.len(), 6);
         assert_eq!(
             st.total_req_bytes.get(),
@@ -4738,7 +5224,7 @@ mod h3_codec_tests {
         st.requests.insert(id);
         let wire = [0x01, 2, 0, 0, 0x00, 4, 1, 2, 3, 4];
         append_request_bytes(&mut st, id, &wire, H3RequestLimits::new(16, 16)).unwrap();
-        let (bytes, lease) = take_request_for_dispatch(&mut st, id);
+        let (bytes, lease, _snapshot) = take_request_for_dispatch(&mut st, id);
         let allocation = bytes.as_ptr();
         assert_eq!(
             budget.in_flight(),
@@ -4986,10 +5472,18 @@ mod h3_codec_tests {
         let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0); // first client bidi stream
         st.requests.insert(id);
         st.req_buf.insert(id, b"partial body".to_vec());
+        st.request_snapshots.insert(
+            id,
+            H3RequestSnapshot::unscoped(H3RequestConfig::new(H3RequestLimits::new(16, 16), None)),
+        );
         // A second, still-open stream must be untouched.
         let other = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
         st.requests.insert(other);
         st.req_buf.insert(other, b"keep".to_vec());
+        st.request_snapshots.insert(
+            other,
+            H3RequestSnapshot::unscoped(H3RequestConfig::new(H3RequestLimits::new(16, 16), None)),
+        );
         st.total_req_bytes
             .set(b"partial body".len() + b"keep".len());
 
@@ -4997,12 +5491,14 @@ mod h3_codec_tests {
         assert_eq!(drained.as_ref(), b"partial body");
         assert!(!st.requests.contains(&id), "slot must be removed");
         assert!(!st.req_buf.contains_key(&id), "buffer must be removed");
+        assert!(!st.request_snapshots.contains_key(&id));
         // The unrelated open stream is retained.
         assert!(st.requests.contains(&other));
         assert_eq!(
             st.req_buf.get(&other).map(|b| b.as_slice()),
             Some(&b"keep"[..])
         );
+        assert!(st.request_snapshots.contains_key(&other));
         assert_eq!(st.total_req_bytes.get(), b"keep".len());
 
         // Reclaiming an unknown stream is a harmless no-op returning empty.
@@ -5013,6 +5509,174 @@ mod h3_codec_tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn unfinished_request_deadline_is_absolute_and_reclaims_all_state() {
+        let accepted = Instant::now();
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let mut st = H3State::default();
+        st.track_request_stream(
+            id,
+            accepted,
+            H3RequestSnapshot::unscoped(H3RequestConfig::new(
+                H3RequestLimits::new(16, 16),
+                Some(Duration::from_secs(10)),
+            )),
+        );
+        let deadline = accepted + Duration::from_secs(10);
+        assert_eq!(st.next_request_deadline(), Some(deadline));
+        assert_eq!(
+            st.request_snapshots[&id].deadline.map(|key| key.when),
+            Some(deadline)
+        );
+
+        append_request_bytes(
+            &mut st,
+            id,
+            &[0x00, 4, 1, 2, 3, 4],
+            H3RequestLimits::new(16, 16),
+        )
+        .unwrap();
+        // Receiving progress does not slide the acceptance-time deadline.
+        assert_eq!(
+            st.request_snapshots[&id].deadline.map(|key| key.when),
+            Some(deadline)
+        );
+        assert!(reclaim_expired_requests(&mut st, deadline - Duration::from_nanos(1)).is_empty());
+
+        assert_eq!(reclaim_expired_requests(&mut st, deadline), vec![id]);
+        assert!(!st.requests.contains(&id));
+        assert!(!st.req_buf.contains_key(&id));
+        assert!(!st.req_frames.contains_key(&id));
+        assert!(!st.body_leases.contains_key(&id));
+        assert!(!st.request_snapshots.contains_key(&id));
+        assert!(st.request_deadlines.is_empty());
+        assert_eq!(st.next_request_deadline(), None);
+        assert_eq!(st.total_req_bytes.get(), 0);
+    }
+
+    #[test]
+    fn request_deadline_minimum_advances_and_disabled_timeout_stays_unarmed() {
+        let now = Instant::now();
+        let first = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let second = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let disabled = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 2);
+        let mut st = H3State::default();
+        let snapshot = |timeout| {
+            H3RequestSnapshot::unscoped(H3RequestConfig::new(H3RequestLimits::new(16, 16), timeout))
+        };
+        st.track_request_stream(first, now, snapshot(Some(Duration::from_secs(5))));
+        st.track_request_stream(second, now, snapshot(Some(Duration::from_secs(9))));
+        st.track_request_stream(disabled, now, snapshot(None));
+        assert_eq!(
+            st.next_request_deadline(),
+            Some(now + Duration::from_secs(5))
+        );
+        assert_eq!(st.request_snapshots[&disabled].deadline, None);
+
+        let _ = take_request_for_dispatch(&mut st, first);
+        assert_eq!(
+            st.next_request_deadline(),
+            Some(now + Duration::from_secs(9))
+        );
+        let _ = take_request_for_dispatch(&mut st, second);
+        assert_eq!(st.next_request_deadline(), None);
+        assert!(st.requests.contains(&disabled));
+        assert!(st.request_snapshots.contains_key(&disabled));
+
+        reclaim_buffered_requests(&mut st);
+        assert!(st.requests.is_empty());
+        assert!(st.request_deadlines.is_empty());
+        assert!(st.request_snapshots.is_empty());
+        assert_eq!(st.next_request_deadline(), None);
+    }
+
+    #[test]
+    fn equal_request_deadlines_retire_from_the_ordered_set_incrementally() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(5);
+        let mut st = H3State::default();
+        let mut ids = Vec::with_capacity(256);
+        for index in 0..256 {
+            let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, index);
+            ids.push(id);
+            st.track_request_stream(
+                id,
+                now,
+                H3RequestSnapshot::unscoped(H3RequestConfig::new(
+                    H3RequestLimits::new(16, 16),
+                    Some(Duration::from_secs(5)),
+                )),
+            );
+        }
+        assert_eq!(st.request_deadlines.len(), ids.len());
+
+        for (position, id) in ids.into_iter().enumerate() {
+            let _ = take_request_for_dispatch(&mut st, id);
+            let expected = (position != 255).then_some(deadline);
+            assert_eq!(st.next_request_deadline(), expected);
+        }
+        assert!(st.request_deadlines.is_empty());
+        assert!(st.request_snapshots.is_empty());
+    }
+
+    #[test]
+    fn cooperative_drains_are_bounded_and_deadline_index_is_incremental() {
+        assert!(
+            MAX_RECV_DRAIN_BATCHES > 1,
+            "a drain must retain syscall batching"
+        );
+        assert!(
+            (2..=MAX_INFLIGHT_PER_CORE).contains(&MAX_COMPLETION_DRAIN_BATCH),
+            "completion batching must retain throughput without monopolizing the endpoint loop"
+        );
+        assert!(recv_drain_should_continue(1, GRO_BATCH));
+        assert!(recv_drain_should_continue(
+            MAX_RECV_DRAIN_BATCHES - 1,
+            GRO_BATCH
+        ));
+        assert!(!recv_drain_should_continue(
+            MAX_RECV_DRAIN_BATCHES,
+            GRO_BATCH
+        ));
+        assert!(!recv_drain_should_continue(1, GRO_BATCH - 1));
+
+        let now = Instant::now();
+        let packet_affected = ConnectionHandle(10);
+        let deadline_due = ConnectionHandle(11);
+        let deadline_future = ConnectionHandle(12);
+        let mut deadlines = RequestDeadlineIndex::default();
+        deadlines.sync(deadline_due, Some(now));
+        deadlines.sync(deadline_future, Some(now + Duration::from_secs(1)));
+        deadlines.sync(deadline_due, Some(now));
+        assert_eq!(deadlines.ordered.len(), 2, "same deadline is a no-op");
+        assert_eq!(deadlines.next(), Some(now));
+
+        let mut affected = std::collections::HashSet::from([packet_affected]);
+        deadlines.extend_due(&mut affected, now);
+
+        assert!(affected.contains(&packet_affected));
+        assert!(affected.contains(&deadline_due));
+        assert!(!affected.contains(&deadline_future));
+        assert_eq!(deadlines.next(), Some(now + Duration::from_secs(1)));
+        assert!(!deadlines.by_connection.contains_key(&deadline_due));
+
+        // A deadline popped by the receive drain at the pump round cap is
+        // reinserted from the connection's unchanged cached minimum before
+        // pump returns; the outer loop can therefore select it again.
+        deadlines.sync(deadline_due, Some(now));
+        assert_eq!(deadlines.next(), Some(now));
+        let mut requeued = std::collections::HashSet::new();
+        deadlines.extend_due(&mut requeued, now);
+        assert_eq!(requeued, std::collections::HashSet::from([deadline_due]));
+
+        deadlines.sync(deadline_future, Some(now + Duration::from_secs(2)));
+        assert_eq!(deadlines.ordered.len(), 1, "reschedule replaces its node");
+        assert_eq!(deadlines.next(), Some(now + Duration::from_secs(2)));
+        deadlines.remove(deadline_future);
+        assert!(deadlines.ordered.is_empty());
+        assert!(deadlines.by_connection.is_empty());
     }
 
     // Full H3 request stream: HEADERS frame + DATA frame -> (field section, body).

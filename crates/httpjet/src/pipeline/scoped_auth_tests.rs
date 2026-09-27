@@ -113,6 +113,33 @@ async fn child_require_inherits_metadata_but_replaces_parent_valid_user() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_target_requires_its_own_basic_auth() {
+    const CUSTOM: &[u8] = b"authenticated custom 404";
+    let root = fixture(
+        "errordoc_target_auth",
+        "ErrorDocument 404 /private/404.html",
+    );
+    std::fs::create_dir(root.join("private")).unwrap();
+    std::fs::write(
+        root.join("private/.htaccess"),
+        "AuthType Basic\nAuthName PrivateError\nAuthUserFile users\n<If \"%{REQUEST_URI} =~ m#^/private/#\">\nRequire user Admin\n</If>\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("private/404.html"), CUSTOM).unwrap();
+    let state = build_state_htaccess(root);
+
+    super::assert_builtin_404_without(run(&state, request("/missing", None)).await, CUSTOM);
+    super::assert_builtin_404_without(
+        run(&state, request("/missing", Some(VISITOR))).await,
+        CUSTOM,
+    );
+
+    let allowed = run(&state, request("/missing", Some(ADMIN))).await;
+    assert_eq!(allowed.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(body_bytes(allowed.into_body()).as_ref(), CUSTOM);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn metadata_only_matching_sibling_does_not_clear_auth() {
     let root = fixture(
         "auth_metadata_sibling",

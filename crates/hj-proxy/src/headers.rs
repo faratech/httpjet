@@ -189,7 +189,10 @@ pub(crate) fn sanitize_response_headers(headers: &mut HeaderMap, keep_upgrade: b
     // it. Only the LSAPI origin drives the cache.
     headers.remove("x-litespeed-purge");
     headers.remove("x-litespeed-cache-control");
+    headers.remove("x-litespeed-tag");
     headers.remove("x-litespeed-vary");
+    headers.remove("x-wf-capsule");
+    headers.remove("x-wf-capsule-tags");
 }
 
 #[cfg(test)]
@@ -301,6 +304,34 @@ mod tests {
         assert_eq!(h.get(HOST).unwrap(), "example.com");
         assert_eq!(h.get("x-forwarded-host").unwrap(), "example.com");
         assert_eq!(h.get("x-forwarded-proto").unwrap(), "http");
+    }
+
+    #[test]
+    fn response_strips_untrusted_lscache_control_headers() {
+        let mut headers = HeaderMap::new();
+        for name in [
+            "x-litespeed-purge",
+            "x-litespeed-cache-control",
+            "x-litespeed-tag",
+            "x-litespeed-vary",
+            "x-wf-capsule",
+            "x-wf-capsule-tags",
+        ] {
+            headers.insert(name, HeaderValue::from_static("untrusted"));
+        }
+
+        sanitize_response_headers(&mut headers, false);
+
+        for name in [
+            "x-litespeed-purge",
+            "x-litespeed-cache-control",
+            "x-litespeed-tag",
+            "x-litespeed-vary",
+            "x-wf-capsule",
+            "x-wf-capsule-tags",
+        ] {
+            assert!(!headers.contains_key(name), "{name} survived sanitization");
+        }
     }
 
     #[test]

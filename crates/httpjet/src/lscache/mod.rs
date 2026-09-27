@@ -141,6 +141,16 @@ pub(crate) enum PrivateRoute {
     Private { owner: u64, owner2: String },
 }
 
+fn entry_scope_matches_route(entry: &CachedResponse, route: &PrivateRoute) -> bool {
+    match route {
+        PrivateRoute::Private { owner, .. } => {
+            entry.scope == (PageScope::Private { owner_hash: *owner })
+        }
+        PrivateRoute::Public => matches!(entry.scope, PageScope::Public),
+        PrivateRoute::Bypass => false,
+    }
+}
+
 fn private_route(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -362,6 +372,10 @@ fn strip_control_headers(headers: &mut HeaderMap) {
 /// identity guard on lookup (the key is by canonical vhost name — see `cache_lookup`).
 #[derive(Clone, Copy)]
 pub struct CacheCtx<'a> {
+    /// Whether this request is allowed to participate in the page cache at all.
+    /// This single route gate applies to both lookup and store so a request that
+    /// is excluded before dispatch cannot accidentally populate an empty key.
+    pub enabled: bool,
     pub method: &'a Method,
     pub host: &'a str,
     pub cookie: Option<&'a str>,
@@ -498,6 +512,9 @@ fn lookup(
     gates: Option<&SharedCacheGates>,
     mode: LookupMode,
 ) -> CacheOutcome {
+    if !cc.enabled {
+        return CacheOutcome::Bypass;
+    }
     #[cfg(feature = "otel")]
     let _trace_stage = crate::otel::stage(crate::otel::StageKind::CacheLookup);
     // (#5) The raw request host is no longer a key input (it now keys by the canonical
@@ -598,13 +615,13 @@ fn lookup(
         LookupMode::Full => store.get_entry_hashed(key_hash, &key, identity, now),
         LookupMode::FastPath => store.get_entry_hashed_uncounted(key_hash, &key, identity, now),
     };
-    let entry = match probed {
+    let mut entry = match probed {
         hj_pagecache::EntryState::Fresh(e) => e,
         // Dispatch serves the stale body and spawns the refresh; don't build it twice.
         hj_pagecache::EntryState::Stale(_) if mode == LookupMode::FastPath => {
             return CacheOutcome::Miss(key_hash);
         }
-        hj_pagecache::EntryState::Stale(e) => {
+        hj_pagecache::EntryState::Stale(mut e) => {
             // (dedup) A dict-compressed body is undecodable under a changed/absent dict → miss.
             if e.dict_gen != 0 && matching_dict(state, e.dict_gen).is_none() {
                 return CacheOutcome::Miss(key_hash);
@@ -614,25 +631,32 @@ fn lookup(
             if entry_is_self_redirect(&e, ctx.is_tls, host, req_path, req_query) {
                 return CacheOutcome::Miss(key_hash);
             }
+            if !entry_scope_matches_route(&e, &route) {
+                return CacheOutcome::Miss(key_hash);
+            }
             // Serve the stale body immediately; the caller spawns ONE background refresh
             // keyed by `key_hash`. Do NOT 304 here even on a conditional GET: a 304 would
             // tell CF "still fresh" and re-pin the stale copy — serve the body + a short/
             // no-store egress so CF re-asks and picks up the refreshed entry.
             let accept_encoding = AcceptEncoding::parse(egress_ae(state, ctx));
-            let Some(mut resp) = hit::build_hit_response(
-                &e,
+            let Some(mut resp) = build_hit_response_with_successor_retry(
+                state,
+                store,
+                &key,
+                identity,
+                &mut e,
                 now,
                 accept_encoding,
                 method == Method::HEAD,
-                matching_dict(state, e.dict_gen),
-                Some(store),
-                || store.body_bytes(&e),
-                || stored_file_body(store, &e),
+                |candidate| {
+                    (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
+                        && !entry_is_self_redirect(candidate, ctx.is_tls, host, req_path, req_query)
+                        && entry_scope_matches_route(candidate, &route)
+                },
             ) else {
                 // (fail-closed) The stale entry couldn't be rendered (dict-decode failure / empty
-                // body / a dead body file) — drop it and degrade to a miss so the backend
-                // re-renders instead of serving a blank or retrying a dead file.
-                store.invalidate_key(&key);
+                // body / a dead body file) — degrade to a miss so the backend re-renders instead
+                // of serving a blank. The helper removed it only if this exact version stayed live.
                 return CacheOutcome::Miss(key_hash);
             };
             note_variant_serve(state, &resp);
@@ -659,7 +683,9 @@ fn lookup(
     if entry_is_self_redirect(&entry, ctx.is_tls, host, req_path, req_query) {
         return CacheOutcome::Miss(key_hash);
     }
-    maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
+    if !entry_scope_matches_route(&entry, &route) {
+        return CacheOutcome::Miss(key_hash);
+    }
     // Conditional revalidation: when CF's edge copy goes stale-but-revalidatable it sends
     // a conditional GET (If-None-Match) to the origin. If it matches our stored validator,
     // answer 304 (validators only) instead of re-shipping the full 50–200 KB HTML body
@@ -682,6 +708,7 @@ fn lookup(
                 );
                 strip_shared_cdn_cache_directives(resp.headers_mut());
             }
+            maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
             record_fast_path_hit(state, store, mode, key_hash);
             return CacheOutcome::Hit(resp);
         }
@@ -712,15 +739,20 @@ fn lookup(
             capsule_shell,
         );
     }
-    match hit::build_hit_response(
-        &entry,
+    match build_hit_response_with_successor_retry(
+        state,
+        store,
+        &key,
+        identity,
+        &mut entry,
         now,
         accept_encoding,
         method == Method::HEAD,
-        matching_dict(state, entry.dict_gen),
-        Some(store),
-        || store.body_bytes(&entry),
-        || stored_file_body(store, &entry),
+        |candidate| {
+            (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
+                && !entry_is_self_redirect(candidate, ctx.is_tls, host, req_path, req_query)
+                && entry_scope_matches_route(candidate, &route)
+        },
     ) {
         Some(mut resp) => {
             note_variant_serve(state, &resp);
@@ -745,16 +777,16 @@ fn lookup(
                 );
                 strip_shared_cdn_cache_directives(resp.headers_mut());
             }
+            // Pin/open the selected stored body before a background recompress can
+            // replace and unlink its pathname. The response keeps that inode alive.
+            maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
             record_fast_path_hit(state, store, mode, key_hash);
             CacheOutcome::Hit(resp)
         }
         // (fail-closed) A fresh entry that can't be rendered (dict-decode failure / empty body /
         // a dead body file) is dropped and degrades to a miss so the backend re-renders — never
         // serve a blank 200, never keep retrying a dead file.
-        None => {
-            store.invalidate_key(&key);
-            CacheOutcome::Miss(key_hash)
-        }
+        None => CacheOutcome::Miss(key_hash),
     }
 }
 
@@ -797,6 +829,81 @@ fn stored_file_body(store: &hj_pagecache::PageStore, entry: &CachedResponse) -> 
         range: Some((f.body_start, f.body_start + f.body_len as u64 - 1)),
         cached: None,
     })
+}
+
+/// Build one hit response, retrying once when a concurrent in-place enrichment
+/// replaced the exact serve snapshot between lookup and body resolution. File
+/// recompression preserves `stored_at` and identity but publishes a new immutable
+/// file, so the old pathname may already be unlinked. Conditional invalidation
+/// prevents that stale request from deleting the successor; the uncounted retry
+/// then serves the successor without turning a valid cache hit into a backend miss.
+/// Callers validate the lookup snapshot before entering; `valid` applies only to
+/// a successor fetched after the first body-resolution attempt fails.
+fn build_hit_response_with_successor_retry(
+    state: &ServerState,
+    store: &hj_pagecache::PageStore,
+    key: &hj_pagecache::PageCacheKey,
+    identity: &str,
+    entry: &mut Arc<CachedResponse>,
+    now: Instant,
+    accept_encoding: AcceptEncoding,
+    is_head: bool,
+    valid: impl Fn(&CachedResponse) -> bool,
+) -> Option<Response> {
+    // The caller already validated its lookup snapshot. Borrow it directly: an
+    // Arc bump and a second dict/redirect/scope pass on every hit buy nothing.
+    let candidate = entry.as_ref();
+    if let Some(response) = hit::build_hit_response(
+        candidate,
+        now,
+        accept_encoding,
+        is_head,
+        matching_dict(state, candidate.dict_gen),
+        Some(store),
+        || store.body_bytes(candidate),
+        || stored_file_body(store, candidate),
+    ) {
+        return Some(response);
+    }
+
+    // Remove a genuinely broken current version, but never a replacement
+    // published after this request obtained its snapshot.
+    if store.invalidate_entry_if_current(key, entry) {
+        return None;
+    }
+    let successor = match store.get_entry_uncounted(key, identity, now) {
+        hj_pagecache::EntryState::Fresh(next)
+        | hj_pagecache::EntryState::Stale(next)
+        | hj_pagecache::EntryState::ErrorOnly(next) => next,
+        hj_pagecache::EntryState::Miss => return None,
+    };
+    // A recompress/variant enrichment preserves the logical version. Do not
+    // silently switch this request to an unrelated re-render of the same key.
+    if Arc::ptr_eq(entry, &successor)
+        || successor.stored_at != entry.stored_at
+        || !valid(&successor)
+    {
+        return None;
+    }
+    *entry = successor;
+
+    let candidate = entry.as_ref();
+    let response = hit::build_hit_response(
+        candidate,
+        now,
+        accept_encoding,
+        is_head,
+        matching_dict(state, candidate.dict_gen),
+        Some(store),
+        || store.body_bytes(candidate),
+        || stored_file_body(store, candidate),
+    );
+    if response.is_none() {
+        // The successor itself failed to resolve. Retire it only if this exact
+        // snapshot is still current; another enrichment remains untouched.
+        store.invalidate_entry_if_current(key, entry);
+    }
+    response
 }
 
 fn variant_eligibility_len(entry: &CachedResponse) -> usize {
@@ -1961,7 +2068,7 @@ fn capsule_public_fallback_lookup(
 
     let key = configuration_key(state, capsule_public_fallback_key(ctx, cc, store));
     let key_hash = hash_key(&key);
-    let (entry, stale) = match store.get_entry_uncounted(&key, cc.identity, now) {
+    let (mut entry, stale) = match store.get_entry_uncounted(&key, cc.identity, now) {
         hj_pagecache::EntryState::Fresh(e) => (e, false),
         hj_pagecache::EntryState::Stale(e) => (e, true),
         hj_pagecache::EntryState::ErrorOnly(_) | hj_pagecache::EntryState::Miss => {
@@ -1973,13 +2080,10 @@ fn capsule_public_fallback_lookup(
     if !capsule_entry_shell_capable(&entry)
         || (entry.dict_gen != 0 && matching_dict(state, entry.dict_gen).is_none())
         || entry_is_self_redirect(&entry, ctx.is_tls, cc.host, cc.req_path, cc.req_query)
+        || !matches!(entry.scope, PageScope::Public)
     {
         record_capsule_miss(state, "public_fallback_miss");
         return CacheOutcome::Miss(dedicated_key_hash);
-    }
-
-    if !stale {
-        maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
     }
 
     if let (Some(inm), Some(etag)) = (if_none_match, hit::entry_etag(&entry)) {
@@ -2002,6 +2106,9 @@ fn capsule_public_fallback_lookup(
                 apply_stale_cf_egress(resp.headers_mut());
             }
             apply_capsule_member_egress(resp.headers_mut());
+            if !stale {
+                maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
+            }
             // The public-fallback path is reachable only by a member candidate
             // (capsule_public_fallback_allowed gates on capsule_member_candidate).
             record_capsule_hit(
@@ -2047,15 +2154,27 @@ fn capsule_public_fallback_lookup(
         );
     }
 
-    match hit::build_hit_response(
-        &entry,
+    match build_hit_response_with_successor_retry(
+        state,
+        store,
+        &key,
+        cc.identity,
+        &mut entry,
         now,
         accept_encoding,
         cc.method == Method::HEAD,
-        matching_dict(state, entry.dict_gen),
-        Some(store),
-        || store.body_bytes(&entry),
-        || stored_file_body(store, &entry),
+        |candidate| {
+            capsule_entry_shell_capable(candidate)
+                && (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
+                && !entry_is_self_redirect(
+                    candidate,
+                    ctx.is_tls,
+                    cc.host,
+                    cc.req_path,
+                    cc.req_query,
+                )
+                && matches!(candidate.scope, PageScope::Public)
+        },
     ) {
         Some(mut resp) => {
             note_variant_serve(state, &resp);
@@ -2076,6 +2195,10 @@ fn capsule_public_fallback_lookup(
                 apply_stale_cf_egress(resp.headers_mut());
             }
             apply_capsule_member_egress(resp.headers_mut());
+            if !stale {
+                // Build/pin the response before recompress may retire the identity file.
+                maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
+            }
             // Public-fallback path is member-only (see above).
             record_capsule_hit(
                 state,
@@ -2094,7 +2217,6 @@ fn capsule_public_fallback_lookup(
             }
         }
         None => {
-            store.invalidate_key(&key);
             record_capsule_miss(state, "public_fallback_miss");
             CacheOutcome::Miss(dedicated_key_hash)
         }
@@ -2136,6 +2258,9 @@ pub fn capsule_lookup(
     if_none_match: Option<&str>,
     gates: Option<&SharedCacheGates>,
 ) -> CacheOutcome {
+    if !cc.enabled {
+        return CacheOutcome::Bypass;
+    }
     let Some(store) = state.page_cache.as_ref() else {
         return CacheOutcome::Bypass;
     };
@@ -2151,9 +2276,9 @@ pub fn capsule_lookup(
     let key = configuration_key(state, capsule_key(ctx, cc, store));
     let key_hash = hash_key(&key);
     let now = Instant::now();
-    let entry = match store.get_entry_uncounted(&key, cc.identity, now) {
+    let mut entry = match store.get_entry_uncounted(&key, cc.identity, now) {
         hj_pagecache::EntryState::Fresh(e) => e,
-        hj_pagecache::EntryState::Stale(e) => {
+        hj_pagecache::EntryState::Stale(mut e) => {
             if e.dict_gen != 0 && matching_dict(state, e.dict_gen).is_none() {
                 record_capsule_miss(state, "dedicated_miss");
                 return capsule_public_fallback_lookup(
@@ -2193,17 +2318,28 @@ pub fn capsule_lookup(
                     if_none_match,
                 );
             }
-            let Some(mut resp) = hit::build_hit_response(
-                &e,
+            let Some(mut resp) = build_hit_response_with_successor_retry(
+                state,
+                store,
+                &key,
+                cc.identity,
+                &mut e,
                 now,
                 AcceptEncoding::parse(egress_ae(state, ctx)),
                 cc.method == Method::HEAD,
-                matching_dict(state, e.dict_gen),
-                Some(store),
-                || store.body_bytes(&e),
-                || stored_file_body(store, &e),
+                |candidate| {
+                    (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
+                        && !entry_is_self_redirect(
+                            candidate,
+                            ctx.is_tls,
+                            cc.host,
+                            cc.req_path,
+                            cc.req_query,
+                        )
+                        && (!capsule_member_candidate(cc.cookie, store)
+                            || matches!(candidate.scope, PageScope::Public))
+                },
             ) else {
-                store.invalidate_key(&key);
                 record_capsule_miss(state, "dedicated_miss");
                 return capsule_public_fallback_lookup(
                     state,
@@ -2255,7 +2391,6 @@ pub fn capsule_lookup(
         record_capsule_miss(state, "dedicated_miss");
         return capsule_public_fallback_lookup(state, ctx, cc, store, now, key_hash, if_none_match);
     }
-    maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
     if let (Some(inm), Some(etag)) = (if_none_match, hit::entry_etag(&entry)) {
         if hit::if_none_match_matches(inm, etag) {
             let mut resp = hit::not_modified(&entry, etag, now);
@@ -2266,6 +2401,7 @@ pub fn capsule_lookup(
             if member {
                 apply_capsule_member_egress(resp.headers_mut());
             }
+            maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
             record_capsule_hit(state, "dedicated", member, age_secs);
             return CacheOutcome::Hit(resp);
         }
@@ -2290,15 +2426,27 @@ pub fn capsule_lookup(
             capsule_shell,
         );
     }
-    match hit::build_hit_response(
-        &entry,
+    match build_hit_response_with_successor_retry(
+        state,
+        store,
+        &key,
+        cc.identity,
+        &mut entry,
         now,
         accept_encoding,
         cc.method == Method::HEAD,
-        matching_dict(state, entry.dict_gen),
-        Some(store),
-        || store.body_bytes(&entry),
-        || stored_file_body(store, &entry),
+        |candidate| {
+            (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
+                && !entry_is_self_redirect(
+                    candidate,
+                    ctx.is_tls,
+                    cc.host,
+                    cc.req_path,
+                    cc.req_query,
+                )
+                && (!capsule_member_candidate(cc.cookie, store)
+                    || matches!(candidate.scope, PageScope::Public))
+        },
     ) {
         Some(mut resp) => {
             note_variant_serve(state, &resp);
@@ -2309,11 +2457,12 @@ pub fn capsule_lookup(
             if member {
                 apply_capsule_member_egress(resp.headers_mut());
             }
+            // Build/pin the response before recompress may retire the identity file.
+            maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
             record_capsule_hit(state, "dedicated", member, age_secs);
             CacheOutcome::Hit(resp)
         }
         None => {
-            store.invalidate_key(&key);
             record_capsule_miss(state, "dedicated_miss");
             capsule_public_fallback_lookup(state, ctx, cc, store, now, key_hash, if_none_match)
         }
@@ -2365,7 +2514,7 @@ fn stale_if_error_fallback(
     }
     let key = configuration_key(state, build_cache_key(ctx, cc, store, route));
     let now = Instant::now();
-    let entry = match store.get_entry(&key, identity, now) {
+    let mut entry = match store.get_entry(&key, identity, now) {
         hj_pagecache::EntryState::Fresh(e)
         | hj_pagecache::EntryState::Stale(e)
         | hj_pagecache::EntryState::ErrorOnly(e) => e,
@@ -2377,15 +2526,19 @@ fn stale_if_error_fallback(
     if entry_is_self_redirect(&entry, ctx.is_tls, host, req_path, req_query) {
         return None;
     }
-    let mut resp = hit::build_hit_response(
-        &entry,
+    let mut resp = build_hit_response_with_successor_retry(
+        state,
+        store,
+        &key,
+        identity,
+        &mut entry,
         now,
         AcceptEncoding::parse(egress_ae(state, ctx)),
         method == Method::HEAD,
-        matching_dict(state, entry.dict_gen),
-        Some(store),
-        || store.body_bytes(&entry),
-        || stored_file_body(store, &entry),
+        |candidate| {
+            (candidate.dict_gen == 0 || matching_dict(state, candidate.dict_gen).is_some())
+                && !entry_is_self_redirect(candidate, ctx.is_tls, host, req_path, req_query)
+        },
     )?;
     note_variant_serve(state, &resp);
     // Short-public egress (with Age reset + CDN/Expires strip) so CF never pins the
@@ -2683,6 +2836,14 @@ pub async fn cache_store_leading(
                 store.purge_tags(&refs);
             }
         }
+    }
+
+    // Keep the request-side route decision authoritative on the store side too.
+    // Purges above remain response side-effects even when this response itself
+    // is outside the cache route; all other internal control headers stay local.
+    if !cc.enabled {
+        strip_control_headers(&mut parts.headers);
+        return Response::from_parts(parts, body);
     }
 
     // 2. Cacheability decision (response-level), plus the glue's vary/cookie
@@ -3613,6 +3774,7 @@ mod tests {
         let key_for =
             |chain: &Vec<Arc<hj_rewrite::Htaccess>>, origin: Option<&String>, identity: &str| {
                 let cc = CacheCtx {
+                    enabled: true,
                     method: &Method::GET,
                     host: "forum.example",
                     cookie: None,
@@ -4191,6 +4353,7 @@ mod tests {
                 let method = Method::GET;
                 let identity = format!("https\nforum.example\n{path}");
                 let cc = CacheCtx {
+                    enabled: true,
                     method: &method,
                     host: "forum.example",
                     cookie: None,
@@ -4279,6 +4442,7 @@ mod tests {
         let (state, ctx, store) = cache_test_ctx();
         let method = Method::GET;
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -4320,6 +4484,7 @@ mod tests {
             &state,
             &ctx,
             &CacheCtx {
+                enabled: true,
                 identity: "https\nforum.example\n/etag-private",
                 req_path: "/etag-private",
                 ..cc
@@ -4380,6 +4545,7 @@ mod tests {
         epoch: u64,
     ) -> CacheCtx<'a> {
         CacheCtx {
+            enabled: true,
             method,
             host: "forum.example",
             cookie: None,
@@ -4573,6 +4739,7 @@ mod tests {
         let (state, ctx, store) = cache_test_ctx();
         let method = Method::GET;
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -4633,6 +4800,7 @@ mod tests {
         let later = ServerState::reload(&next, next.server.clone()).unwrap();
         let method = Method::GET;
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -4802,6 +4970,7 @@ mod tests {
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie,
@@ -4971,6 +5140,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/threads/dict.1/";
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5003,7 +5173,7 @@ mod tests {
         let mut compressed = None;
         for _ in 0..200 {
             if let hj_pagecache::EntryState::Fresh(e) =
-                store.get_entry(&key, identity, std::time::Instant::now())
+                store.get_entry_uncounted(&key, identity, std::time::Instant::now())
                 && e.dict_gen != 0
             {
                 compressed = Some(e);
@@ -5041,6 +5211,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/proxy.php";
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5097,6 +5268,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/threads/378554/";
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5167,6 +5339,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/threads/dict-capsule.1/";
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5361,6 +5534,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/threads/example.1/";
         let guest_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5390,6 +5564,7 @@ mod tests {
 
         let member_cookie = "xf_user=1; xf_session=abc; xf_wf_capsule_member=1";
         let member_cc = CacheCtx {
+            enabled: true,
             cookie: Some(member_cookie),
             ..guest_cc
         };
@@ -5428,6 +5603,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/threads/zero.1/";
         let guest_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5481,6 +5657,7 @@ mod tests {
         let identity = "https\nforum.example\n/threads/fallback.1/";
         let member_cookie = "xf_user=1; xf_session=abc; xf_wf_capsule_member=1";
         let member_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: Some(member_cookie),
@@ -5554,6 +5731,7 @@ mod tests {
         let identity = "https\nforum.example\n/threads/stale-fallback.1/";
         let member_cookie = "xf_user=1; xf_session=abc; xf_wf_capsule_member=1";
         let member_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: Some(member_cookie),
@@ -5628,6 +5806,7 @@ mod tests {
         let identity = "https\nforum.example\n/threads/untagged.1/";
         let member_cookie = "xf_user=1; xf_session=abc; xf_wf_capsule_member=1";
         let member_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: Some(member_cookie),
@@ -5696,6 +5875,7 @@ mod tests {
         let identity = "https\nforum.example\n/threads/scope.1/";
         let member_cookie = "xf_user=1; xf_session=abc; xf_wf_capsule_member=1";
         let member_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: Some(member_cookie),
@@ -5759,6 +5939,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/threads/classcount.1/";
         let guest_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5796,6 +5977,7 @@ mod tests {
 
         // A member serve of the same dedicated shell.
         let member_cc = CacheCtx {
+            enabled: true,
             cookie: Some("xf_user=1; xf_session=abc; xf_wf_capsule_member=1"),
             ..guest_cc
         };
@@ -5828,6 +6010,7 @@ mod tests {
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let identity = "https\nforum.example\n/threads/example.1/";
         let guest_cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5856,6 +6039,7 @@ mod tests {
         let _ = cache_store(&state, &ctx, &guest_cc, resp).await;
 
         let member_cc = CacheCtx {
+            enabled: true,
             cookie: Some("xf_user=1; xf_session=abc; xf_wf_capsule_member=1"),
             ..guest_cc
         };
@@ -5871,6 +6055,7 @@ mod tests {
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();
         let cc = CacheCtx {
+            enabled: true,
             method: &method,
             host: "forum.example",
             cookie: None,
@@ -5911,6 +6096,7 @@ mod tests {
             "plain GET may use stale-if-error"
         );
         let ranged = CacheCtx {
+            enabled: true,
             has_range: true,
             ..cc
         };
@@ -6121,6 +6307,142 @@ mod tests {
         );
         assert_eq!(served, body, "the in-flight hit reads its selected version");
 
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn stale_file_snapshot_retries_the_recompressed_successor() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("httpjet_recompress_retry_{n}"));
+        let mut cfg = hj_pagecache::StoreConfig::default();
+        cfg.store_path = Some(root.clone());
+        cfg.max_mem_bytes = 8 * 1024 * 1024;
+        cfg.max_disk_bytes = 8 * 1024 * 1024;
+        cfg.max_obj_bytes = 1024 * 1024;
+        let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+        store.load_from_disk(|_| {});
+
+        let (base_state, _, _) = cache_test_ctx();
+        let dict = Arc::new(
+            hj_compress::PageDict::new(DICT_CORPUS.to_vec(), hj_compress::DEFAULT_DICT_LEVEL)
+                .expect("test dictionary"),
+        );
+        let state = ServerState::new(
+            base_state.server.clone(),
+            None,
+            None,
+            Some(store.clone()),
+            Arc::new(hj_compress::PageDictRegistry::new(
+                std::collections::HashMap::from([("forum.example".to_string(), dict.clone())]),
+                None,
+            )),
+            1,
+            crate::state::XfCapsuleConfig::disabled(),
+            None,
+            false,
+            None,
+            false,
+            crate::state::RewriteTuning::default(),
+        )
+        .unwrap();
+
+        let key = hj_pagecache::PageCacheKey::public(1, true, "example.com", "/retry", "");
+        let identity = "https\nexample.com\n/retry";
+        let body = Bytes::from(DICT_CORPUS.repeat(16));
+        let stored_at = Instant::now();
+        assert!(store.store(
+            key.clone(),
+            CachedResponse {
+                status: 200,
+                identity: identity.to_owned(),
+                headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                body: PageBody::InMem(body.clone()),
+                variants: Vec::new(),
+                variants_filled: false,
+                dict_gen: 0,
+                tags: Vec::new(),
+                vary_cookie_name: String::new(),
+                vary_value: String::new(),
+                scope: PageScope::Public,
+                stored_at,
+                ttl: Duration::from_secs(60),
+                swr: Duration::ZERO,
+                sie: Duration::ZERO,
+            }
+        ));
+
+        // A normal hit snapshot has already passed its caller's dict/redirect/scope
+        // checks. The helper must build it without invoking the successor validator.
+        let mut current = store.lookup(&key, identity, Instant::now()).unwrap();
+        let current_validations = std::cell::Cell::new(0usize);
+        let response = build_hit_response_with_successor_retry(
+            &state,
+            &store,
+            &key,
+            identity,
+            &mut current,
+            Instant::now(),
+            AcceptEncoding::parse(""),
+            false,
+            |candidate| {
+                current_validations.set(current_validations.get() + 1);
+                candidate.dict_gen == 0 || matching_dict(&state, candidate.dict_gen).is_some()
+            },
+        )
+        .expect("the validated current snapshot must build directly");
+        assert_eq!(current_validations.get(), 0);
+        drop(response);
+
+        let mut stale = store.lookup(&key, identity, Instant::now()).unwrap();
+        let retired_path = match &stale.body {
+            PageBody::File { path, .. } => path.clone(),
+            _ => panic!("file tier should offload the identity"),
+        };
+        let compressed = Bytes::from(dict.encode(&body).expect("dictionary compression"));
+        assert!(store.fill_recompress_disk(
+            &key,
+            identity,
+            stored_at,
+            compressed,
+            dict.generation(),
+        ));
+        assert!(!retired_path.exists(), "old snapshot path was retired");
+
+        let successor_validations = std::cell::Cell::new(0usize);
+        let response = build_hit_response_with_successor_retry(
+            &state,
+            &store,
+            &key,
+            identity,
+            &mut stale,
+            Instant::now(),
+            AcceptEncoding::parse(""),
+            false,
+            |candidate| {
+                successor_validations.set(successor_validations.get() + 1);
+                candidate.dict_gen == 0 || matching_dict(&state, candidate.dict_gen).is_some()
+            },
+        )
+        .expect("the successor must satisfy the stale snapshot hit");
+        assert_eq!(
+            successor_validations.get(),
+            1,
+            "only the fetched successor needs validation"
+        );
+        let (served, truncated) = crate::uring::bridge::buffer_body(response.into_body()).await;
+        assert!(!truncated);
+        assert_eq!(served, body);
+        assert_eq!(stale.dict_gen, dict.generation());
+        assert!(matches!(
+            store.get_entry_uncounted(&key, identity, Instant::now()),
+            hj_pagecache::EntryState::Fresh(_)
+        ));
+
+        drop(state);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
     }

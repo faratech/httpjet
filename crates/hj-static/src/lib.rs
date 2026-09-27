@@ -288,10 +288,12 @@ impl StaticFiles {
                     && e.allow_symlink == allow_symlink
                     && e.root == doc_root
                     && e.rel == rel
-                    && let Some(file) = e.file.reopen_matching(doc_root, allow_symlink)
+                    && let Some((file, resolved_path)) =
+                        e.file.reopen_matching(doc_root, allow_symlink)
                 {
                     let mut resolved = e.file.clone();
                     resolved.file = Some(file);
+                    resolved.resolved_path = resolved_path;
                     return Ok(Resolved::File(resolved));
                 }
             }
@@ -374,16 +376,29 @@ impl ResolvedFile {
     /// The identity check and selected descriptor are therefore one operation:
     /// an atomic pathname replacement can never pair the memo's validators with
     /// bytes from the replacement inode.
-    fn reopen_matching(&self, doc_root: &Path, allow_symlink: bool) -> Option<std::fs::File> {
+    fn reopen_matching(
+        &self,
+        doc_root: &Path,
+        allow_symlink: bool,
+    ) -> Option<(std::fs::File, PathBuf)> {
         let rel = self.path.strip_prefix(doc_root).ok()?.to_string_lossy();
         let root_fd = open_dir(doc_root).ok()?;
-        let (fd, meta) = open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
-        (meta.is_file()
-            && meta.len == self.len
-            && meta.inode == self.inode
-            && meta.dev == self.dev
-            && meta.mtime == self.mtime)
-            .then(|| std::fs::File::from(fd))
+        let (fd, meta, followed_symlink) =
+            open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
+        if !meta.is_file()
+            || meta.len != self.len
+            || meta.inode != self.inode
+            || meta.dev != self.dev
+            || meta.mtime != self.mtime
+        {
+            return None;
+        }
+        let resolved_path = if followed_symlink || self.resolved_path != self.path {
+            resolved_fd_path(&fd, &self.path).ok()?
+        } else {
+            self.path.clone()
+        };
+        Some((std::fs::File::from(fd), resolved_path))
     }
 
     /// Build the ETag string for a given LiteSpeed `fileETag` bitmask, byte-for-byte
@@ -469,6 +484,13 @@ pub struct DefaultCharsetOverride(pub String);
 #[derive(Clone, Debug)]
 pub struct ResolvedTargetPath(pub PathBuf);
 
+/// Lexical filesystem target selected by the static resolver before symlink
+/// resolution. This extension is present only when it differs from
+/// [`ResolvedTargetPath`], keeping the common static path allocation-free while
+/// preserving the declared filename for script-handler and `<Files>` policy.
+#[derive(Clone, Debug)]
+pub struct LexicalTargetPath(pub PathBuf);
+
 /// Request extension that overrides the document root the [`StaticFiles`] handler
 /// resolves against, for a static `<context>` whose `location` differs from the
 /// vhost docroot (LiteSpeed parity — e.g. a hybrid-docroot context). Set by the
@@ -481,12 +503,15 @@ pub struct DocRootOverride(pub std::path::PathBuf);
 #[derive(Clone)]
 pub struct IndexFilesOverride(pub Vec<String>);
 
-#[async_trait]
-impl Handler for StaticFiles {
-    async fn handle(
+impl StaticFiles {
+    /// Serve a request while leaving its head available to the caller after
+    /// dispatch.  The main pipeline uses this for post-dispatch authorization
+    /// and ErrorDocument policy without cloning the complete header map on
+    /// every successful static response.
+    pub async fn handle_borrowed(
         &self,
         ctx: &mut ReqCtx,
-        req: Request<hj_core::IncomingBody>,
+        req: &mut Request<hj_core::IncomingBody>,
     ) -> Result<Response<Body>, HandlerError> {
         // Only GET/HEAD are servable as static content. Anything else is the
         // pipeline's concern (e.g. POST to a script handler); we 405 here so a
@@ -597,9 +622,13 @@ impl Handler for StaticFiles {
                 }
             }
         }
-        // This must be captured after precompressed selection: every response
+        // These must be captured after precompressed selection: every response
         // extension and FileBody path has to identify the representation whose
-        // metadata and pinned descriptor are being returned.
+        // metadata and pinned descriptor are being returned. Retain the lexical
+        // target only when canonicalization changed it (normally a symlink), so
+        // ordinary static responses pay no additional PathBuf allocation.
+        let lexical_target =
+            (resolved.path != resolved.resolved_path).then(|| resolved.path.clone());
         let resolved_target = resolved.resolved_path.clone();
 
         // ETag from the server's fileETag bitmask (default 28 = Size|MTime|INode).
@@ -634,7 +663,7 @@ impl Handler for StaticFiles {
             *resp.status_mut() = StatusCode::PRECONDITION_FAILED;
             resp.headers_mut()
                 .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
-            return Ok(with_resolved_target(resp, resolved_target));
+            return Ok(with_file_targets(resp, resolved_target, lexical_target));
         }
 
         // If-None-Match takes precedence over If-Modified-Since. The wildcard tests
@@ -657,7 +686,12 @@ impl Handler for StaticFiles {
             // Accept-Encoding, and the compression transform intentionally
             // skips bodyless 304 responses, so stamp it here with the sibling's
             // validator metadata.
-            if content_encoding.is_some() {
+            if let Some(enc) = content_encoding {
+                // A 304 describes the selected representation. Preserve its
+                // encoding metadata just as the corresponding 200 does so
+                // downstream caches revalidate the right variant and policy
+                // layers can classify the resolved precompressed target.
+                h.insert(CONTENT_ENCODING, HeaderValue::from_static(enc.token()));
                 h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
             }
             if let Some(ref e) = meta.etag {
@@ -666,7 +700,7 @@ impl Handler for StaticFiles {
             h.insert(LAST_MODIFIED, meta.last_modified.clone());
             h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             h.insert(CONTENT_TYPE, content_type.clone());
-            return Ok(with_resolved_target(resp, resolved_target));
+            return Ok(with_file_targets(resp, resolved_target, lexical_target));
         }
 
         // ---- Range handling (RFC 7233) -----------------------------------
@@ -688,12 +722,6 @@ impl Handler for StaticFiles {
                 RangeOutcome::Single(start, end) => {
                     let body = if is_head {
                         Body::Empty
-                    } else if !allow_symlink {
-                        // The verified descriptor, not the pathname, remains the
-                        // authority. Read only the requested interval: buffering
-                        // the whole file for a one-byte range allowed trivial
-                        // request-driven memory/IO amplification.
-                        Body::Full(read_verified_range(&resolved, start, end)?)
                     } else {
                         Body::File(FileBody {
                             path: resolved_target.clone(),
@@ -719,7 +747,7 @@ impl Handler for StaticFiles {
                         CONTENT_RANGE,
                         &format!("bytes {}-{}/{}", start, end, resolved.len),
                     );
-                    return Ok(with_resolved_target(resp, resolved_target));
+                    return Ok(with_file_targets(resp, resolved_target, lexical_target));
                 }
                 RangeOutcome::Unsatisfiable => {
                     let mut resp = hj_core::text_response(
@@ -729,7 +757,7 @@ impl Handler for StaticFiles {
                     let h = resp.headers_mut();
                     insert_static(h, CONTENT_RANGE, &format!("bytes */{}", resolved.len));
                     h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-                    return Ok(with_resolved_target(resp, resolved_target));
+                    return Ok(with_file_targets(resp, resolved_target, lexical_target));
                 }
                 RangeOutcome::Multi(ranges) => {
                     let total: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();
@@ -765,7 +793,7 @@ impl Handler for StaticFiles {
                         }
                         h.insert(LAST_MODIFIED, meta.last_modified.clone());
                         insert_static(h, CONTENT_LENGTH, &wire.len().to_string());
-                        return Ok(with_resolved_target(resp, resolved_target));
+                        return Ok(with_file_targets(resp, resolved_target, lexical_target));
                     }
                     // Over the materialization cap (or a failed part read): ignore
                     // Range and serve the full entity below — always RFC-permitted.
@@ -776,15 +804,10 @@ impl Handler for StaticFiles {
         }
 
         // ---- Full 200 response -------------------------------------------
-        // (#10/#387) When symlinks are disallowed, full responses still use
-        // bytes read through the exact descriptor selected above, closing the
-        // resolve-to-serve pathname race. Range responses were handled earlier
-        // and never pay this whole-entity allocation.
-        let verified_cached: Option<bytes::Bytes> = if !allow_symlink && !is_head {
-            Some(read_verified_file(&resolved)?)
-        } else {
-            None
-        };
+        // (#504) The descriptor selected by the confined resolver remains attached to
+        // the body. Every transport consumes it before considering `path`, so
+        // followSymbolLink=off keeps its resolve-to-serve guarantee without a
+        // request-sized allocation for the whole file.
         let body = if is_head {
             Body::Empty
         } else {
@@ -793,7 +816,7 @@ impl Handler for StaticFiles {
                 file: resolved.file.take(),
                 len: resolved.len,
                 range: None,
-                cached: verified_cached,
+                cached: None,
             })
         };
         let mut resp = Response::new(body);
@@ -810,12 +833,35 @@ impl Handler for StaticFiles {
         if let Some(ref e) = meta.etag {
             h.insert(ETAG, e.clone());
         }
-        Ok(with_resolved_target(resp, resolved_target))
+        Ok(with_file_targets(resp, resolved_target, lexical_target))
+    }
+}
+
+#[async_trait]
+impl Handler for StaticFiles {
+    async fn handle(
+        &self,
+        ctx: &mut ReqCtx,
+        mut req: Request<hj_core::IncomingBody>,
+    ) -> Result<Response<Body>, HandlerError> {
+        self.handle_borrowed(ctx, &mut req).await
     }
 }
 
 fn with_resolved_target(mut resp: Response<Body>, path: PathBuf) -> Response<Body> {
     resp.extensions_mut().insert(ResolvedTargetPath(path));
+    resp
+}
+
+fn with_file_targets(
+    mut resp: Response<Body>,
+    resolved: PathBuf,
+    lexical: Option<PathBuf>,
+) -> Response<Body> {
+    resp.extensions_mut().insert(ResolvedTargetPath(resolved));
+    if let Some(path) = lexical {
+        resp.extensions_mut().insert(LexicalTargetPath(path));
+    }
     resp
 }
 
@@ -896,7 +942,7 @@ fn resolve_file(
     };
 
     // First, stat the target itself (whether file or directory).
-    let (fd, stat) = match open_beneath(&root_fd, rel_open, allow_symlink) {
+    let (fd, stat, followed_symlink) = match open_beneath(&root_fd, rel_open, allow_symlink) {
         Ok(pair) => pair,
         Err(e) => return Err(map_open_err(e)),
     };
@@ -912,11 +958,11 @@ fn resolve_file(
         // into the app and 404.
         if !wants_dir {
             let lexical = doc_root.join(rel);
-            let resolved = if want_resolved {
+            let resolved = if want_resolved || followed_symlink {
                 resolved_fd_path(&fd, &lexical).map_err(map_open_err)?
             } else {
-                // No deny rules => no canonical-path consumer; the lexical join is
-                // only a redirect-building hint here.
+                // No deny rules and no symlink traversal => no canonical-path
+                // consumer; the lexical join is only a redirect-building hint.
                 lexical
             };
             return Ok(Resolved::DirectorySlash(resolved));
@@ -936,15 +982,16 @@ fn resolve_file(
             } else {
                 format!("{}/{}", rel_str.trim_end_matches('/'), idx)
             };
-            if let Ok((cfd, cstat)) = open_beneath(&root_fd, &child_rel, allow_symlink) {
+            if let Ok((cfd, cstat, followed_symlink)) =
+                open_beneath(&root_fd, &child_rel, allow_symlink)
+            {
                 if cstat.is_file() {
                     let abs = doc_root.join(&child_rel);
-                    let resolved_path = if want_resolved {
+                    let resolved_path = if want_resolved || followed_symlink {
                         resolved_fd_path(&cfd, &abs).map_err(map_open_err)?
                     } else {
-                        // Deny check unreachable without rules; transports that must
-                        // re-open use FileBody.path (the lexical target), following
-                        // symlinks only on allow_symlink vhosts where that is allowed.
+                        // No deny rule or symlink traversal needs a canonical
+                        // policy target. Transports still consume the pinned fd.
                         abs.clone()
                     };
                     return Ok(Resolved::File(ResolvedFile {
@@ -969,10 +1016,11 @@ fn resolve_file(
     }
 
     let abs = doc_root.join(rel);
-    let resolved_path = if want_resolved {
+    let resolved_path = if want_resolved || followed_symlink {
         resolved_fd_path(&fd, &abs).map_err(map_open_err)?
     } else {
-        // See above: without accessDenyDir nothing consumes the canonical form.
+        // See above: without accessDenyDir or symlink traversal, no policy
+        // consumer needs the canonical form.
         abs.clone()
     };
     Ok(Resolved::File(ResolvedFile {
@@ -986,9 +1034,13 @@ fn resolve_file(
     }))
 }
 
-fn resolved_fd_path(fd: &OwnedFd, lexical: &Path) -> io::Result<PathBuf> {
+fn resolved_fd_path(fd: &OwnedFd, _lexical: &Path) -> io::Result<PathBuf> {
     let proc_path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
-    std::fs::read_link(proc_path).or_else(|_| std::fs::canonicalize(lexical))
+    // The response serves this pinned descriptor, so policy must classify that
+    // exact inode. Falling back to canonicalizing `lexical` would race a pathname
+    // replacement and could describe a different file. This Linux-only server
+    // fails closed if procfs cannot identify the opened target.
+    std::fs::read_link(proc_path)
 }
 
 /// Resolve a precompressed sibling with the same path and file-type guarantees
@@ -1007,11 +1059,11 @@ fn resolve_precompressed_sibling(
     let rel = sibling.strip_prefix(doc_root).ok()?;
     let rel = rel.to_string_lossy();
     let root_fd = open_dir(doc_root).ok()?;
-    let (fd, stat) = open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
+    let (fd, stat, followed_symlink) = open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
     if !stat.is_file() {
         return None;
     }
-    let resolved_path = if want_resolved {
+    let resolved_path = if want_resolved || followed_symlink {
         resolved_fd_path(&fd, &sibling).ok()?
     } else {
         sibling.clone()
@@ -1025,55 +1077,6 @@ fn resolve_precompressed_sibling(
         resolved_path,
         file: Some(std::fs::File::from(fd)),
     })
-}
-
-/// Read the full bytes of the exact descriptor selected by resolution.
-///
-/// (#10/#387) A `followSymbolLink off` response is buffered so transports never
-/// reopen a followable path. Consuming the descriptor already returned by
-/// `open_beneath` also guarantees its metadata and bytes name the same inode.
-fn read_verified_file(resolved: &ResolvedFile) -> Result<bytes::Bytes, HandlerError> {
-    // This path buffers the WHOLE file into RAM (the symlink-TOCTOU mitigation hands
-    // the bytes to the transport via `FileBody.cached` so it never re-opens the
-    // followable path). Cap it so a symlink-off vhost can't be made to fault an
-    // arbitrarily large file into memory per request. Generous — a static file this
-    // large on such a vhost is pathological; everything real fits.
-    const MAX_VERIFIED_INMEM: u64 = 512 * 1024 * 1024;
-    if resolved.len > MAX_VERIFIED_INMEM {
-        return Err(HandlerError::PayloadTooLarge);
-    }
-    let file = resolved.file.as_ref().ok_or(HandlerError::NotFound)?;
-    let len = usize::try_from(resolved.len).map_err(|_| HandlerError::PayloadTooLarge)?;
-    let mut buf = vec![0; len];
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(&mut buf, 0)
-        .map_err(|_| HandlerError::NotFound)?;
-    Ok(bytes::Bytes::from(buf))
-}
-
-/// Read one inclusive byte range from the descriptor selected by the confined
-/// resolver. The allocation is proportional to the response, not the backing
-/// entity, and `read_exact_at` keeps a shared descriptor's cursor untouched.
-fn read_verified_range(
-    resolved: &ResolvedFile,
-    start: u64,
-    end: u64,
-) -> Result<bytes::Bytes, HandlerError> {
-    const MAX_VERIFIED_INMEM: u64 = 512 * 1024 * 1024;
-    let len_u64 = end
-        .checked_sub(start)
-        .and_then(|n| n.checked_add(1))
-        .ok_or(HandlerError::PayloadTooLarge)?;
-    if len_u64 > MAX_VERIFIED_INMEM {
-        return Err(HandlerError::PayloadTooLarge);
-    }
-    let len = usize::try_from(len_u64).map_err(|_| HandlerError::PayloadTooLarge)?;
-    let file = resolved.file.as_ref().ok_or(HandlerError::NotFound)?;
-    let mut buf = vec![0; len];
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(&mut buf, start)
-        .map_err(|_| HandlerError::NotFound)?;
-    Ok(bytes::Bytes::from(buf))
 }
 
 /// Build the DirectorySlash 301: the request path with a trailing `/` appended,
@@ -1161,7 +1164,8 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
     rustix::fs::open(path, oflags, Mode::empty()).map_err(io::Error::from)
 }
 
-/// Open `rel` beneath `root_fd`, returning the opened fd and its metadata.
+/// Open `rel` beneath `root_fd`, returning the opened fd, its metadata, and
+/// whether the permitted-symlink fallback was used.
 ///
 /// Two safety regimes, mirroring LiteSpeed's `followSymbolicLink`:
 ///
@@ -1174,12 +1178,12 @@ fn open_dir(path: &Path) -> io::Result<OwnedFd> {
 ///     component, so an in-docroot intermediate symlink (`/link_to_etc/passwd`)
 ///     would traverse out of the tree; refusing to serve is the only safe
 ///     option when the filesystem cannot enforce `RESOLVE_NO_SYMLINKS`.
-///   - `allow_symlink == true`: symlinks may be followed wherever they point
-///     (LiteSpeed semantics). We do *not* use `RESOLVE_BENEATH` here, because
-///     it rejects every absolute symlink with `EXDEV` even when the target is
-///     inside the tree. The request path has already been lexically cleaned of
-///     `..`, so the only escape vector is an intentional in-tree symlink, which
-///     the operator opted into. A plain `openat` (following symlinks) is used.
+///   - `allow_symlink == true`: first try the same no-symlink `openat2` fast
+///     path. A symlink (`ELOOP`/`EXDEV`) falls back to plain `openat`, which may
+///     follow it wherever it points (LiteSpeed semantics), and reports that fact
+///     so the caller can retain the canonical fd path for policy. The request
+///     path has already been lexically cleaned of `..`; the remaining escape is
+///     an intentional in-tree symlink, which the operator opted into.
 /// (#244) A `.htaccess` `DirectoryIndex` entry reaches this module verbatim —
 /// it is operator/app-controlled config, NOT the lexically-cleaned request
 /// path. An entry like `../../../etc/passwd` formatted into `child_rel` would
@@ -1198,20 +1202,36 @@ fn open_beneath(
     root_fd: &OwnedFd,
     rel: &str,
     allow_symlink: bool,
-) -> io::Result<(OwnedFd, MetaInfo)> {
+) -> io::Result<(OwnedFd, MetaInfo, bool)> {
     // NONBLOCK: the path components here come from request URLs (or .htaccess
     // config), so an attacker able to plant files in the served tree (e.g. via a
     // PHP write bug) could otherwise park this executor thread FOREVER inside
     // open(2) by naming a FIFO — one stalled thread per request.
     let oflags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
 
-    let fd = if allow_symlink {
-        // Follow symlinks; lexical cleaning already removed any `..` escape.
-        rustix::fs::openat(root_fd, rel, oflags, Mode::empty())?
+    let (fd, followed_symlink) = if allow_symlink {
+        // Keep ordinary files at one open syscall while learning whether a
+        // symlink was traversed. Only the exceptional symlink case falls back
+        // to the operator-authorized openat path and pays canonical readlink
+        // work; this preserves both names for script classification without
+        // slowing normal static files.
+        let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
+        match rustix::fs::openat2(root_fd, rel, oflags, Mode::empty(), resolve) {
+            Ok(fd) => (fd, false),
+            Err(e) if e == rustix::io::Errno::LOOP || e == rustix::io::Errno::XDEV => (
+                rustix::fs::openat(root_fd, rel, oflags, Mode::empty())?,
+                true,
+            ),
+            Err(e) if e == rustix::io::Errno::NOSYS || e == rustix::io::Errno::OPNOTSUPP => (
+                rustix::fs::openat(root_fd, rel, oflags, Mode::empty())?,
+                true,
+            ),
+            Err(e) => return Err(io::Error::from(e)),
+        }
     } else {
         let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
         match rustix::fs::openat2(root_fd, rel, oflags, Mode::empty(), resolve) {
-            Ok(fd) => fd,
+            Ok(fd) => (fd, false),
             Err(e) if e == rustix::io::Errno::NOSYS || e == rustix::io::Errno::OPNOTSUPP => {
                 // openat2 unsupported by this kernel *or filesystem* (overlayfs /
                 // Docker, some FUSE/NFS — even on kernels >=5.6). We must NOT fall
@@ -1252,7 +1272,7 @@ fn open_beneath(
         mode_is_dir: meta.is_dir(),
         mode_is_file: meta.is_file(),
     };
-    Ok((OwnedFd::from(file), info))
+    Ok((OwnedFd::from(file), info, followed_symlink))
 }
 
 /// Map an open error to a handler error: NotFound for ENOENT, Forbidden for

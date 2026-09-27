@@ -304,11 +304,14 @@ fn write_failure_leaves_entry_in_ram_and_servable() {
     let td = tempfile::tempdir().unwrap();
     let store_root = td.path().join("jc");
     let s = PageStore::new(cfg(&store_root));
-    // ENOSPC stand-in that also fails for root (chmod doesn't — CAP_DAC_OVERRIDE):
-    // plant a regular FILE at every first-level fanout name so create_dir_all errors.
-    for c in "0123456789abcdef".chars() {
-        std::fs::write(store_root.join(c.to_string()), b"").unwrap();
-    }
+    // ENOSPC stand-in that also fails for root (chmod doesn't — CAP_DAC_OVERRIDE).
+    // DiskStore prepares the secure fanout below a pinned root at open, so
+    // remove those children and replace the operator-facing pathname with a
+    // regular file.
+    // The pinned root remains authoritative but has no leaf to open, forcing the
+    // same disk-write failure without weakening the production opener.
+    std::fs::remove_dir_all(&store_root).unwrap();
+    std::fs::write(&store_root, b"blocked").unwrap();
 
     store_and_persist(&s, "/e/", b"ram only", &[], Duration::from_secs(600));
     let got = s

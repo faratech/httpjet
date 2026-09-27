@@ -21,11 +21,14 @@
 //! meta block (the index is exact-Eq) and the filename is only a locator.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -36,7 +39,11 @@ use crate::key::PageCacheKey;
 use crate::store::{CachedResponse, FileId, PageScope};
 
 const MAGIC: [u8; 4] = *b"HJPC";
-const VERSION: u16 = 2;
+// Version 3 is a security-policy epoch as well as a wire-format version. Older
+// files may contain static script-source responses admitted before exact opened
+// target classification. Boot scan must reject and unlink them on the first
+// fixed-binary restart; new entries cannot cross that guard.
+const VERSION: u16 = 3;
 /// Boot-scan walker thread cap: tmpfs metadata reads parallelize well but the
 /// win flattens past a few cores, and prod boxes share cores with live serving.
 const SCAN_MAX_THREADS: usize = 8;
@@ -63,6 +70,13 @@ const MAX_META_LEN: u32 = 4 << 20;
 const MAX_BODY_LEN: u32 = 256 << 20;
 const STAMP_NAME: &str = ".purge_all_stamp";
 const TAG_STAMP_NAME: &str = ".tag_purge_stamps";
+const OPENAT2_UNKNOWN: u8 = 0;
+const OPENAT2_SUPPORTED: u8 = 1;
+const OPENAT2_UNSUPPORTED: u8 = 2;
+#[cfg(unix)]
+const PRIVATE_DIR_MODE: u32 = 0o700;
+#[cfg(unix)]
+const PRIVATE_FILE_MODE: u32 = 0o600;
 pub(crate) const TAG_PURGE_FLOOR_RECORD_BYTES: u64 = 19;
 pub(crate) const TAG_PURGE_STAMP_RECORD_BYTES: u64 = 36;
 
@@ -142,16 +156,23 @@ pub struct StoredBodyFile {
 }
 
 pub(crate) struct PreparedEntry {
-    tmp_path: PathBuf,
+    leaf: fs::File,
+    tmp_file: fs::File,
+    tmp_name: String,
     dir: PathBuf,
     hex: String,
+    final_ext: &'static str,
     first_seq: u64,
     logical_total: u64,
 }
 
 impl Drop for PreparedEntry {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.tmp_path);
+        let _ = rustix::fs::unlinkat(
+            &self.leaf,
+            self.tmp_name.as_str(),
+            rustix::fs::AtFlags::empty(),
+        );
     }
 }
 
@@ -164,7 +185,14 @@ pub struct ScanSummary {
 }
 
 pub struct DiskStore {
+    /// Operator-facing configured path. Filesystem authority is `root_fd`; no
+    /// cache operation re-resolves this pathname after startup.
     root: PathBuf,
+    root_fd: Arc<fs::File>,
+    /// Capability cache for the one-syscall rooted reader. A seccomp policy or
+    /// old filesystem that rejects openat2 pays the probe once, then stays on
+    /// the descriptor-walk fallback.
+    openat2_state: AtomicU8,
     /// Final files published by this process while its boot scan is pending. Publication
     /// and scan membership checks share this mutex, so the scanner can never mistake a
     /// just-linked live file for inherited state and reject/unlink it.
@@ -175,11 +203,210 @@ pub struct DiskStore {
     seq: AtomicU64,
 }
 
+fn rustix_io(error: rustix::io::Errno) -> io::Error {
+    io::Error::from_raw_os_error(error.raw_os_error())
+}
+
+fn openat2_unavailable(error: rustix::io::Errno) -> bool {
+    error == rustix::io::Errno::NOSYS
+        || error == rustix::io::Errno::OPNOTSUPP
+        || error == rustix::io::Errno::INVAL
+        || error == rustix::io::Errno::PERM
+}
+
+fn validate_owned_dir(file: &fs::File, display: &Path) -> io::Result<fs::Metadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_dir() || metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "page-cache directory {} is not an owner-controlled directory",
+                display.display()
+            ),
+        ));
+    }
+    Ok(metadata)
+}
+
+fn validate_owned_file(file: &fs::File, display: &Path, harden: bool) -> io::Result<fs::Metadata> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "page-cache file {} must be an owner-controlled regular file with one link",
+                display.display()
+            ),
+        ));
+    }
+    if harden && metadata.mode() & 0o7777 != PRIVATE_FILE_MODE {
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    }
+    Ok(metadata)
+}
+
+fn open_secure_root(root: &Path) -> io::Result<fs::File> {
+    match fs::symlink_metadata(root) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(PRIVATE_DIR_MODE).create(root)?;
+        }
+        Err(error) => return Err(error),
+    }
+    let fd = rustix::fs::openat(
+        rustix::fs::CWD,
+        root,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(rustix_io)?;
+    let file = fs::File::from(fd);
+    let metadata = validate_owned_dir(&file, root)?;
+    if metadata.mode() & 0o7777 != PRIVATE_DIR_MODE {
+        #[cfg(test)]
+        PRIVATE_DIR_CHMOD_CALLS.with(|calls| calls.set(calls.get() + 1));
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
+    }
+    Ok(file)
+}
+
+fn open_dir_at(parent: &fs::File, name: &str) -> io::Result<fs::File> {
+    #[cfg(test)]
+    OPEN_DIR_AT_CALLS.with(|calls| calls.set(calls.get() + 1));
+    rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(fs::File::from)
+    .map_err(rustix_io)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only request-path syscall counter. Thread-local storage keeps the
+    /// parallel test runner from making focused open-path assertions flaky.
+    static OPEN_DIR_AT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts final-component file opens on the calling request/test thread.
+    static OPEN_FILE_AT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts actual openat2 attempts on the calling request/test thread.
+    static OPENAT2_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Counts actual directory mode repairs, excluding already-private dirs.
+    static PRIVATE_DIR_CHMOD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A path-scoped test probe sees rewinds from boot-scan worker threads without
+/// counting unrelated parallel tests that parse a different temporary store.
+#[cfg(test)]
+static META_REWIND_PROBE_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+#[cfg(test)]
+static META_REWIND_PROBE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+static META_REWIND_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn prepare_dir_at(parent: &fs::File, name: &str, display: &Path) -> io::Result<fs::File> {
+    match rustix::fs::mkdirat(parent, name, rustix::fs::Mode::RWXU) {
+        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+        Err(error) => return Err(rustix_io(error)),
+    }
+    let file = open_dir_at(parent, name)?;
+    let metadata = validate_owned_dir(&file, display)?;
+    if metadata.mode() & 0o7777 != PRIVATE_DIR_MODE {
+        #[cfg(test)]
+        PRIVATE_DIR_CHMOD_CALLS.with(|calls| calls.set(calls.get() + 1));
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
+    }
+    Ok(file)
+}
+
+fn prepare_fanout(root: &Path, root_fd: &fs::File) -> io::Result<()> {
+    for h0 in 0..16 {
+        let c0 = format!("{h0:x}");
+        let p0 = root.join(&c0);
+        let d0 = prepare_dir_at(root_fd, &c0, &p0)?;
+        for h1 in 0..16 {
+            let c1 = format!("{h1:x}");
+            let p1 = p0.join(&c1);
+            let d1 = prepare_dir_at(&d0, &c1, &p1)?;
+            for h2 in 0..16 {
+                let c2 = format!("{h2:x}");
+                prepare_dir_at(&d1, &c2, &p1.join(&c2))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn create_private_file_at(parent: &fs::File, name: &str) -> io::Result<fs::File> {
+    rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::WRONLY
+            | rustix::fs::OFlags::CREATE
+            | rustix::fs::OFlags::EXCL
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    )
+    .map(fs::File::from)
+    .map_err(rustix_io)
+}
+
+fn open_owned_file_at_with_metadata(
+    parent: &fs::File,
+    name: &OsStr,
+    display: &Path,
+    harden: bool,
+) -> io::Result<(fs::File, fs::Metadata)> {
+    #[cfg(test)]
+    OPEN_FILE_AT_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let fd = rustix::fs::openat(
+        parent,
+        name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(rustix_io)?;
+    let file = fs::File::from(fd);
+    let metadata = validate_owned_file(&file, display, harden)?;
+    Ok((file, metadata))
+}
+
+fn read_dir_names(dir: &fs::File) -> io::Result<Vec<OsString>> {
+    let mut names = Vec::new();
+    let entries = rustix::fs::Dir::read_from(dir).map_err(rustix_io)?;
+    for entry in entries {
+        let entry = entry.map_err(rustix_io)?;
+        let bytes = entry.file_name().to_bytes();
+        if bytes != b"." && bytes != b".." {
+            names.push(OsString::from_vec(bytes.to_vec()));
+        }
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
 impl DiskStore {
     /// Open (creating if needed) the store root. Cheap — the leaf fanout is
-    /// created on demand by writes and the boot scan handles `.tmp` cleanup.
+    /// prepared once here and the boot scan handles `.tmp` cleanup. Every later
+    /// filesystem operation is rooted at the pinned directory descriptor.
     pub fn open(root: &Path) -> io::Result<DiskStore> {
-        fs::create_dir_all(root)?;
+        let root_fd = Arc::new(open_secure_root(root)?);
+        prepare_fanout(root, &root_fd)?;
         // Seed the per-version filename counter PAST any prior run's ids, so a store that races
         // the concurrent boot warm-scan window can't reuse — and `rename`-clobber — a persisted
         // file left by a previous process (the counter used to restart at 1 each boot and was
@@ -195,6 +422,8 @@ impl DiskStore {
             .max(1);
         Ok(DiskStore {
             root: root.to_path_buf(),
+            root_fd,
+            openat2_state: AtomicU8::new(OPENAT2_UNKNOWN),
             live_files: Mutex::new(HashSet::new()),
             boot_scan_pending: AtomicBool::new(true),
             seq: AtomicU64::new(seed),
@@ -203,6 +432,192 @@ impl DiskStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn display_dir(&self, hex: &str) -> PathBuf {
+        self.root.join(&hex[0..1]).join(&hex[1..2]).join(&hex[2..3])
+    }
+
+    /// Attempt one no-symlink open from the pinned root. `None` means this
+    /// kernel/filesystem cannot provide openat2; the caller then uses the
+    /// descriptor walk.
+    fn open_rooted_fast(
+        &self,
+        relative: &Path,
+        flags: rustix::fs::OFlags,
+    ) -> io::Result<Option<fs::File>> {
+        if self.openat2_state.load(Ordering::Relaxed) == OPENAT2_UNSUPPORTED {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        OPENAT2_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let resolve = rustix::fs::ResolveFlags::BENEATH | rustix::fs::ResolveFlags::NO_SYMLINKS;
+        match rustix::fs::openat2(
+            &self.root_fd,
+            relative,
+            flags,
+            rustix::fs::Mode::empty(),
+            resolve,
+        ) {
+            Ok(fd) => {
+                self.openat2_state
+                    .store(OPENAT2_SUPPORTED, Ordering::Relaxed);
+                Ok(Some(fs::File::from(fd)))
+            }
+            Err(error) if openat2_unavailable(error) => {
+                self.openat2_state
+                    .store(OPENAT2_UNSUPPORTED, Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(error) => Err(rustix_io(error)),
+        }
+    }
+
+    /// Open a validated three-component fanout directory below the pinned root.
+    /// Modern Linux resolves the complete parent in one syscall; the fallback
+    /// retains the same no-symlink boundary one component at a time.
+    fn open_leaf_relative(&self, relative: &Path) -> io::Result<fs::File> {
+        let mut components = relative.components();
+        let mut names = [""; 3];
+        for name in &mut names {
+            let Some(std::path::Component::Normal(value)) = components.next() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid page-cache leaf locator",
+                ));
+            };
+            let bytes = value.as_encoded_bytes();
+            if bytes.len() != 1 || !bytes[0].is_ascii_hexdigit() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid page-cache leaf locator",
+                ));
+            }
+            *name = value.to_str().expect("validated hex component is UTF-8");
+        }
+        if components.next().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid page-cache leaf locator",
+            ));
+        }
+
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC;
+        if let Some(leaf) = self.open_rooted_fast(relative, flags)? {
+            return Ok(leaf);
+        }
+        let d0 = open_dir_at(&self.root_fd, names[0])?;
+        let d1 = open_dir_at(&d0, names[1])?;
+        open_dir_at(&d1, names[2])
+    }
+
+    fn open_leaf(&self, hex: &str) -> io::Result<fs::File> {
+        let bytes = hex.as_bytes();
+        if bytes.len() < 3 || bytes[..3].iter().any(|byte| !byte.is_ascii_hexdigit()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid page-cache hash locator",
+            ));
+        }
+        let relative = [bytes[0], b'/', bytes[1], b'/', bytes[2]];
+        self.open_leaf_relative(Path::new(OsStr::from_bytes(&relative)))
+    }
+
+    fn prepare_container(
+        &self,
+        hex: String,
+        final_ext: &'static str,
+        logical_total: u64,
+        write: impl FnOnce(&mut fs::File) -> io::Result<()>,
+    ) -> io::Result<PreparedEntry> {
+        let leaf = self.open_leaf(&hex)?;
+        let dir = self.display_dir(&hex);
+        let first_seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!("{hex}-{first_seq}{final_ext}.tmp");
+        let tmp_file = create_private_file_at(&leaf, &tmp_name)?;
+        let mut prepared = PreparedEntry {
+            leaf,
+            tmp_file,
+            tmp_name,
+            dir,
+            hex,
+            final_ext,
+            first_seq,
+            logical_total,
+        };
+        write(&mut prepared.tmp_file)?;
+        Ok(prepared)
+    }
+
+    fn relative_locator<'a>(&self, path: &'a Path) -> io::Result<&'a Path> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "page-cache file is outside the pinned store root",
+            )
+        })?;
+        let mut components = relative.components();
+        for _ in 0..3 {
+            let Some(std::path::Component::Normal(value)) = components.next() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid page-cache file locator",
+                ));
+            };
+            let bytes = value.as_encoded_bytes();
+            if bytes.len() != 1 || !bytes[0].is_ascii_hexdigit() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid page-cache file locator",
+                ));
+            }
+        }
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid page-cache file locator",
+            ));
+        }
+        Ok(relative)
+    }
+
+    /// Open a cache locator from the pinned, owner-validated root. Linux uses
+    /// one `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`; the
+    /// portable fallback opens each owner-controlled fanout directory with
+    /// `O_NOFOLLOW`. Both paths validate the final file's type, owner and link
+    /// count after opening it.
+    fn open_path_with_metadata(
+        &self,
+        path: &Path,
+        harden: bool,
+    ) -> io::Result<(fs::File, fs::Metadata)> {
+        let relative = self.relative_locator(path)?;
+        let flags =
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+        if let Some(file) = self.open_rooted_fast(relative, flags)? {
+            let metadata = validate_owned_file(&file, path, harden)?;
+            return Ok((file, metadata));
+        }
+        let leaf_relative = relative.parent().expect("validated locator has a parent");
+        let name = relative
+            .file_name()
+            .expect("validated locator has a file name");
+        let leaf = self.open_leaf_relative(leaf_relative)?;
+        open_owned_file_at_with_metadata(&leaf, name, path, harden)
+    }
+
+    #[cfg(test)]
+    fn open_path(&self, path: &Path, harden: bool) -> io::Result<fs::File> {
+        self.open_path_with_metadata(path, harden)
+            .map(|(file, _)| file)
+    }
+
+    fn unlink_at(parent: &fs::File, name: &OsStr) -> io::Result<()> {
+        rustix::fs::unlinkat(parent, name, rustix::fs::AtFlags::empty()).map_err(rustix_io)
     }
 
     /// Persist one entry (metadata from `entry`/`key`, the stored-form body and
@@ -242,10 +657,6 @@ impl DiskStore {
 
         let hash = key_hash(key);
         let hex = format!("{hash:016x}");
-        let dir = self.root.join(&hex[0..1]).join(&hex[1..2]).join(&hex[2..3]);
-        fs::create_dir_all(&dir)?;
-        let first_seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = dir.join(format!("{hex}-{first_seq}.pc.tmp"));
 
         let mut header = [0u8; HEADER_LEN as usize];
         header[0..4].copy_from_slice(&MAGIC);
@@ -269,24 +680,12 @@ impl DiskStore {
         let tag = integrity_tag(&header[..64], &meta);
         header[64..80].copy_from_slice(&tag);
 
-        let write = (|| -> io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
+        let logical_total = HEADER_LEN + meta.len() as u64 + body.len() as u64;
+        self.prepare_container(hex, ".pc", logical_total, |f| {
             f.write_all(&header)?;
             f.write_all(&meta)?;
             f.write_all(body)?;
             Ok(())
-        })();
-        if let Err(e) = write {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        let logical_total = HEADER_LEN + meta.len() as u64 + body.len() as u64;
-        Ok(PreparedEntry {
-            tmp_path,
-            dir,
-            hex,
-            first_seq,
-            logical_total,
         })
     }
 
@@ -299,29 +698,31 @@ impl DiskStore {
         // open(), so a collision (hence a retry) is effectively never hit; the loop is a backstop.
         let mut seq = prepared.first_seq;
         loop {
-            let final_path = prepared.dir.join(format!("{}-{seq}.pc", prepared.hex));
+            let final_name = format!("{}-{seq}{}", prepared.hex, prepared.final_ext);
+            let final_path = prepared.dir.join(&final_name);
             let mut live_files = self.live_files.lock();
-            match fs::hard_link(&prepared.tmp_path, &final_path) {
+            match rustix::fs::linkat(
+                &prepared.leaf,
+                prepared.tmp_name.as_str(),
+                &prepared.leaf,
+                final_name.as_str(),
+                rustix::fs::AtFlags::empty(),
+            ) {
                 Ok(()) => {
-                    let disk_total = match allocated_file_bytes(&final_path, prepared.logical_total)
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = fs::remove_file(&final_path);
-                            return Err(e);
-                        }
-                    };
+                    let metadata = prepared.tmp_file.metadata()?;
+                    let disk_total =
+                        allocated_bytes_from_metadata(&metadata, prepared.logical_total);
                     if self.boot_scan_pending.load(Ordering::Acquire) {
                         live_files.insert(final_path.clone());
                     }
                     drop(live_files);
-                    let _ = fs::remove_file(&prepared.tmp_path);
+                    let _ = Self::unlink_at(&prepared.leaf, OsStr::new(&prepared.tmp_name));
                     return Ok((final_path, disk_total));
                 }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                Err(rustix::io::Errno::EXIST) => {
                     seq = self.seq.fetch_add(1, Ordering::Relaxed);
                 }
-                Err(e) => return Err(e),
+                Err(e) => return Err(rustix_io(e)),
             }
         }
     }
@@ -364,24 +765,9 @@ impl DiskStore {
         }
 
         let hex = format!("{key_hash:016x}");
-        let dir = self.root.join(&hex[0..1]).join(&hex[1..2]).join(&hex[2..3]);
-        fs::create_dir_all(&dir)?;
-        let first_seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = dir.join(format!("{hex}-{first_seq}.pc.tmp"));
-        if let Err(e) = (|| -> io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
+        self.prepare_container(hex, ".pc", bytes.len() as u64, |f| {
             f.write_all(bytes)?;
             Ok(())
-        })() {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        Ok(PreparedEntry {
-            tmp_path,
-            dir,
-            hex,
-            first_seq,
-            logical_total: bytes.len() as u64,
         })
     }
 
@@ -390,7 +776,18 @@ impl DiskStore {
         &self,
         prepared: &PreparedEntry,
     ) -> Result<ScannedEntry, ReadError> {
-        read_meta(&prepared.tmp_path)
+        let display = prepared.dir.join(&prepared.tmp_name);
+        let (mut file, _) = open_owned_file_at_with_metadata(
+            &prepared.leaf,
+            OsStr::new(&prepared.tmp_name),
+            &display,
+            false,
+        )?;
+        // Reproduce a non-zero shared open-file-description offset without
+        // making production temp files read/write solely for this test hook.
+        file.seek(SeekFrom::End(0))?;
+        let clone = file.try_clone()?;
+        read_meta_file(clone, &display)
     }
 
     /// Persist one static-file cache entry. Static records use the same immutable
@@ -425,10 +822,6 @@ impl DiskStore {
 
         let hash = static_key_hash(vhost_id, cache_path);
         let hex = format!("{hash:016x}");
-        let dir = self.root.join(&hex[0..1]).join(&hex[1..2]).join(&hex[2..3]);
-        fs::create_dir_all(&dir)?;
-        let first_seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = dir.join(format!("{hex}-{first_seq}.sc.tmp"));
 
         let mut header = [0u8; HEADER_LEN as usize];
         header[0..4].copy_from_slice(&MAGIC);
@@ -440,49 +833,14 @@ impl DiskStore {
         let tag = integrity_tag(&header[..64], &meta);
         header[64..80].copy_from_slice(&tag);
 
-        let write = (|| -> io::Result<()> {
-            let mut f = fs::File::create(&tmp_path)?;
+        let logical_total = HEADER_LEN + meta.len() as u64 + body.len() as u64;
+        let prepared = self.prepare_container(hex, ".sc", logical_total, |f| {
             f.write_all(&header)?;
             f.write_all(&meta)?;
             f.write_all(body)?;
             Ok(())
-        })();
-        if let Err(e) = write {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-
-        let logical_total = HEADER_LEN + meta.len() as u64 + body.len() as u64;
-        let mut seq = first_seq;
-        loop {
-            let final_path = dir.join(format!("{hex}-{seq}.sc"));
-            let mut live_files = self.live_files.lock();
-            match fs::hard_link(&tmp_path, &final_path) {
-                Ok(()) => {
-                    let disk_total = match allocated_file_bytes(&final_path, logical_total) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            let _ = fs::remove_file(&final_path);
-                            let _ = fs::remove_file(&tmp_path);
-                            return Err(e);
-                        }
-                    };
-                    if self.boot_scan_pending.load(Ordering::Acquire) {
-                        live_files.insert(final_path.clone());
-                    }
-                    drop(live_files);
-                    let _ = fs::remove_file(&tmp_path);
-                    return Ok((final_path, disk_total));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    seq = self.seq.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(e);
-                }
-            }
-        }
+        })?;
+        self.publish_entry(prepared)
     }
 
     /// Read the body bytes back. Re-validates the header (magic/version/length
@@ -495,9 +853,9 @@ impl DiskStore {
     /// pages themselves. Smaller bodies stay on the read(2) path (one syscall
     /// beats map+fault+TLB-shootdown at that size) but skip the zero-fill by
     /// appending into spare capacity.
-    pub fn read_body(path: &Path, expected_len: u32) -> Result<Bytes, ReadError> {
-        let mut f = fs::File::open(path)?;
-        let file_len = f.metadata()?.len();
+    pub fn read_body(&self, path: &Path, expected_len: u32) -> Result<Bytes, ReadError> {
+        let (mut f, metadata) = self.open_path_with_metadata(path, false)?;
+        let file_len = metadata.len();
         let mut header = [0u8; HEADER_LEN as usize];
         f.read_exact(&mut header)?;
         let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
@@ -530,9 +888,9 @@ impl DiskStore {
     /// without allocating or reading the body itself. The transport can stream
     /// this range directly from tmpfs, matching the same header validation used
     /// by [`read_body`].
-    pub fn body_file(path: &Path, expected_len: u32) -> Result<StoredBodyFile, ReadError> {
-        let mut f = fs::File::open(path)?;
-        let file_len = f.metadata()?.len();
+    pub fn body_file(&self, path: &Path, expected_len: u32) -> Result<StoredBodyFile, ReadError> {
+        let (mut f, metadata) = self.open_path_with_metadata(path, false)?;
+        let file_len = metadata.len();
         let mut header = [0u8; HEADER_LEN as usize];
         f.read_exact(&mut header)?;
         let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
@@ -557,14 +915,19 @@ impl DiskStore {
     /// index compares stored version stamps, never arrival order.
     pub fn scan(&self, keep: impl Fn(ScannedEntry) -> bool + Send + Sync) -> ScanSummary {
         let scan_start = SystemTime::now();
-        self.walk_parallel(|file, sum, max_seq| {
-            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        self.walk_parallel(|leaf, name_os, file, sum, max_seq| {
+            let name = name_os.to_str().unwrap_or("");
             if name.ends_with(".tmp") {
                 // Only reap crash debris (mtime before this scan began); a
                 // newer `.tmp` may be an in-flight `write_entry` whose hard_link
                 // hasn't landed yet — unlinking it would ENOENT that write.
-                if !modified_at_or_after(file, scan_start) {
-                    let _ = fs::remove_file(file);
+                let stale = open_owned_file_at_with_metadata(leaf, name_os, file, true)
+                    .ok()
+                    .map(|(_, metadata)| metadata)
+                    .and_then(|metadata| metadata.modified().ok())
+                    .is_none_or(|modified| modified < scan_start);
+                if stale {
+                    let _ = Self::unlink_at(leaf, name_os);
                     sum.tmp_removed += 1;
                 }
                 return;
@@ -578,17 +941,22 @@ impl DiskStore {
             if let Some(seq) = parse_seq(name) {
                 *max_seq = (*max_seq).max(seq.saturating_add(1));
             }
-            match read_meta(file) {
+            let opened = open_owned_file_at_with_metadata(leaf, name_os, file, true)
+                .map_err(ReadError::Io)
+                .and_then(|(opened, metadata)| {
+                    read_meta_file_with_metadata(opened, file, metadata)
+                });
+            match opened {
                 Ok(entry) => {
                     if keep(entry) {
                         sum.loaded += 1;
                     } else {
-                        let _ = fs::remove_file(file);
+                        let _ = Self::unlink_at(leaf, name_os);
                         sum.rejected += 1;
                     }
                 }
                 Err(_) => {
-                    let _ = fs::remove_file(file);
+                    let _ = Self::unlink_at(leaf, name_os);
                     sum.corrupt_removed += 1;
                 }
             }
@@ -600,12 +968,17 @@ impl DiskStore {
         keep: impl Fn(ScannedStaticEntry) -> bool + Send + Sync,
     ) -> ScanSummary {
         let scan_start = SystemTime::now();
-        self.walk_parallel(|file, sum, max_seq| {
-            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        self.walk_parallel(|leaf, name_os, file, sum, max_seq| {
+            let name = name_os.to_str().unwrap_or("");
             if name.ends_with(".sc.tmp") {
                 // See `scan`: spare in-flight writes, reap only crash debris.
-                if !modified_at_or_after(file, scan_start) {
-                    let _ = fs::remove_file(file);
+                let stale = open_owned_file_at_with_metadata(leaf, name_os, file, true)
+                    .ok()
+                    .map(|(_, metadata)| metadata)
+                    .and_then(|metadata| metadata.modified().ok())
+                    .is_none_or(|modified| modified < scan_start);
+                if stale {
+                    let _ = Self::unlink_at(leaf, name_os);
                     sum.tmp_removed += 1;
                 }
                 return;
@@ -619,17 +992,22 @@ impl DiskStore {
             if let Some(seq) = parse_seq_ext(name, ".sc") {
                 *max_seq = (*max_seq).max(seq.saturating_add(1));
             }
-            match read_static_meta(file) {
+            let opened = open_owned_file_at_with_metadata(leaf, name_os, file, true)
+                .map_err(ReadError::Io)
+                .and_then(|(opened, metadata)| {
+                    read_static_meta_file_with_metadata(opened, file, metadata)
+                });
+            match opened {
                 Ok(entry) => {
                     if keep(entry) {
                         sum.loaded += 1;
                     } else {
-                        let _ = fs::remove_file(file);
+                        let _ = Self::unlink_at(leaf, name_os);
                         sum.rejected += 1;
                     }
                 }
                 Err(_) => {
-                    let _ = fs::remove_file(file);
+                    let _ = Self::unlink_at(leaf, name_os);
                     sum.corrupt_removed += 1;
                 }
             }
@@ -642,19 +1020,29 @@ impl DiskStore {
     /// (merged at the end), so `per_file` needs no shared mutable state.
     fn walk_parallel(
         &self,
-        per_file: impl Fn(&Path, &mut ScanSummary, &mut u64) + Send + Sync,
+        per_file: impl Fn(&fs::File, &OsStr, &Path, &mut ScanSummary, &mut u64) + Send + Sync,
     ) -> ScanSummary {
-        let mut units: Vec<PathBuf> = Vec::new();
-        for d0 in read_dir_sorted(&self.root) {
-            if d0.is_dir() {
-                // (non-dirs at the root: the purge stamp — never a work unit)
-                units.extend(read_dir_sorted(&d0).into_iter().filter(|p| p.is_dir()));
-            }
-        }
-        let walk_unit = |unit: &Path, sum: &mut ScanSummary, max_seq: &mut u64| {
-            for d2 in read_dir_sorted(unit) {
-                for file in read_dir_sorted(&d2) {
-                    per_file(&file, sum, max_seq);
+        let units: Vec<(u8, u8)> = (0..16)
+            .flat_map(|h0| (0..16).map(move |h1| (h0, h1)))
+            .collect();
+        let walk_unit = |&(h0, h1): &(u8, u8), sum: &mut ScanSummary, max_seq: &mut u64| {
+            let c0 = format!("{h0:x}");
+            let c1 = format!("{h1:x}");
+            let Ok(d0) = open_dir_at(&self.root_fd, &c0) else {
+                return;
+            };
+            let Ok(d1) = open_dir_at(&d0, &c1) else {
+                return;
+            };
+            for h2 in 0..16 {
+                let c2 = format!("{h2:x}");
+                let Ok(leaf) = open_dir_at(&d1, &c2) else {
+                    continue;
+                };
+                let dir = self.root.join(&c0).join(&c1).join(&c2);
+                for name in read_dir_names(&leaf).unwrap_or_default() {
+                    let file = dir.join(&name);
+                    per_file(&leaf, &name, &file, sum, max_seq);
                 }
             }
         };
@@ -666,7 +1054,7 @@ impl DiskStore {
             .min(SCAN_MAX_THREADS)
             .min(units.len().max(1));
         if threads <= 1 {
-            for unit in &units {
+            for unit in units.iter() {
                 walk_unit(unit, &mut sum, &mut max_seq);
             }
         } else {
@@ -718,67 +1106,110 @@ impl DiskStore {
     pub fn remove_key_versions_through(&self, key: &PageCacheKey, max_version_seq: u64) {
         let hash = key_hash(key);
         let hex = format!("{hash:016x}");
-        let dir = self.root.join(&hex[0..1]).join(&hex[1..2]).join(&hex[2..3]);
+        let Ok(leaf) = self.open_leaf(&hex) else {
+            return;
+        };
+        let dir = self.display_dir(&hex);
         let prefix = format!("{hex}-");
-        for file in read_dir_sorted(&dir) {
-            let Some(name) = file.file_name().and_then(|n| n.to_str()) else {
+        // Dir::read_from opens an independent "." descriptor internally, so
+        // enumeration never changes the caller's directory offset.
+        for name_os in read_dir_names(&leaf).unwrap_or_default() {
+            let Some(name) = name_os.to_str() else {
                 continue;
             };
             if !name.starts_with(&prefix) {
                 continue;
             }
+            let file = dir.join(&name_os);
             if name.ends_with(".pc")
-                && read_meta(&file).is_ok_and(|e| &e.key == key && e.version_seq <= max_version_seq)
+                && open_owned_file_at_with_metadata(&leaf, &name_os, &file, false)
+                    .map_err(ReadError::Io)
+                    .and_then(|(opened, metadata)| {
+                        read_meta_file_with_metadata(opened, &file, metadata)
+                    })
+                    .is_ok_and(|e| &e.key == key && e.version_seq <= max_version_seq)
             {
-                Self::remove(&file);
+                let _ = Self::unlink_at(&leaf, &name_os);
             }
         }
+    }
+
+    fn write_root_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".{name}.{seq}.tmp");
+        let mut file = create_private_file_at(&self.root_fd, &tmp_name)?;
+        if let Err(error) = file.write_all(bytes) {
+            let _ = Self::unlink_at(&self.root_fd, OsStr::new(&tmp_name));
+            return Err(error);
+        }
+        drop(file);
+        let renamed =
+            rustix::fs::renameat(&self.root_fd, &tmp_name, &self.root_fd, name).map_err(rustix_io);
+        if renamed.is_err() {
+            let _ = Self::unlink_at(&self.root_fd, OsStr::new(&tmp_name));
+        }
+        renamed
+    }
+
+    fn open_root_file(&self, name: &str, append: bool, harden: bool) -> io::Result<fs::File> {
+        let mut flags = rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC;
+        flags |= if append {
+            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::APPEND | rustix::fs::OFlags::CREATE
+        } else {
+            rustix::fs::OFlags::RDONLY
+        };
+        let fd = rustix::fs::openat(
+            &self.root_fd,
+            name,
+            flags,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )
+        .map_err(rustix_io)?;
+        let file = fs::File::from(fd);
+        validate_owned_file(&file, &self.root.join(name), harden)?;
+        Ok(file)
     }
 
     /// Record a durable `purge_all` watermark: entries stored at-or-before this
     /// wall time must never be loaded by a later boot scan.
     pub fn write_purge_stamp(&self, wall_ms: u64) -> io::Result<()> {
-        let tmp = self.root.join(format!("{STAMP_NAME}.tmp"));
-        let fin = self.root.join(STAMP_NAME);
-        fs::write(&tmp, wall_ms.to_string())?;
-        fs::rename(&tmp, &fin)
+        self.write_root_atomic(STAMP_NAME, wall_ms.to_string().as_bytes())
     }
 
     pub fn read_purge_stamp(&self) -> Option<u64> {
-        let s = fs::read_to_string(self.root.join(STAMP_NAME)).ok()?;
+        let mut file = self.open_root_file(STAMP_NAME, false, true).ok()?;
+        let mut s = String::new();
+        file.read_to_string(&mut s).ok()?;
         s.trim().parse().ok()
     }
 
     /// Append one tag-purge watermark. Fixed-size fields make a torn record detectable; boot
     /// recovery converts any malformed/truncated journal into a conservative restart-time floor.
     pub fn append_tag_purge_stamp(&self, tag_hash: u64, wall_ms: u64) -> io::Result<()> {
-        use std::fs::OpenOptions;
-
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join(TAG_STAMP_NAME))?;
+        let mut file = self.open_root_file(TAG_STAMP_NAME, true, true)?;
         writeln!(file, "T {tag_hash:016x} {wall_ms:016x}")
     }
 
     /// Atomically compact the tag-purge journal. `floor_ms` safely subsumes every removed
     /// exact tag stamp: peer entries at-or-before it are rejected regardless of tag.
     pub fn write_tag_purge_state(&self, floor_ms: u64, stamps: &[(u64, u64)]) -> io::Result<()> {
-        let tmp = self.root.join(format!("{TAG_STAMP_NAME}.tmp"));
-        let fin = self.root.join(TAG_STAMP_NAME);
-        let mut file = fs::File::create(&tmp)?;
-        writeln!(file, "F {floor_ms:016x}")?;
+        let mut bytes = Vec::with_capacity(
+            TAG_PURGE_FLOOR_RECORD_BYTES as usize
+                + stamps.len() * TAG_PURGE_STAMP_RECORD_BYTES as usize,
+        );
+        writeln!(bytes, "F {floor_ms:016x}")?;
         for &(tag_hash, wall_ms) in stamps {
-            writeln!(file, "T {tag_hash:016x} {wall_ms:016x}")?;
+            writeln!(bytes, "T {tag_hash:016x} {wall_ms:016x}")?;
         }
-        drop(file);
-        fs::rename(tmp, fin)
+        self.write_root_atomic(TAG_STAMP_NAME, &bytes)
     }
 
     /// Recover the compact floor and latest wall stamp for each stable tag hash. Hash
     /// collisions can only cause a conservative peer-fill miss, never stale adoption.
     pub(crate) fn read_tag_purge_state(&self) -> TagPurgeState {
-        let Ok(file) = fs::File::open(self.root.join(TAG_STAMP_NAME)) else {
+        let Ok(file) = self.open_root_file(TAG_STAMP_NAME, false, true) else {
             return TagPurgeState::default();
         };
         let byte_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
@@ -850,20 +1281,78 @@ impl DiskStore {
 
     /// Unlink a published entry file; ENOENT is fine (purge and eviction may
     /// both reach the same file).
-    pub fn remove(path: &Path) {
-        if let Err(e) = fs::remove_file(path) {
+    pub fn remove(&self, path: &Path) {
+        let result = self.relative_locator(path).and_then(|relative| {
+            let leaf_relative = relative.parent().expect("validated locator has a parent");
+            let name = relative
+                .file_name()
+                .expect("validated locator has a file name");
+            let leaf = self.open_leaf_relative(leaf_relative)?;
+            Self::unlink_at(&leaf, name)
+        });
+        if let Err(e) = result {
             if e.kind() != io::ErrorKind::NotFound {
                 tracing::warn!(path = %path.display(), error = %e, "jetcache: unlink failed");
             }
         }
+    }
+
+    pub fn read_meta(&self, path: &Path) -> Result<ScannedEntry, ReadError> {
+        let (file, metadata) = self.open_path_with_metadata(path, false)?;
+        read_meta_file_with_metadata(file, path, metadata)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_container(&self, path: &Path) -> io::Result<Vec<u8>> {
+        let mut file = self.open_path(path, false)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 }
 
 /// Header-only load: parse + validate everything except the body bytes (the
 /// body stays cold in tmpfs — the whole point of the boot scan being cheap).
 pub fn read_meta(path: &Path) -> Result<ScannedEntry, ReadError> {
-    let mut f = fs::File::open(path)?;
+    let fd = rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(rustix_io)?;
+    let file = fs::File::from(fd);
+    let metadata = validate_owned_file(&file, path, false)?;
+    read_meta_file_with_metadata(file, path, metadata)
+}
+
+#[cfg(test)]
+fn read_meta_file(mut f: fs::File, path: &Path) -> Result<ScannedEntry, ReadError> {
     let md = f.metadata()?;
+    // Prepared-entry clones share the writer's open-file-description offset.
+    // Fresh scan/read descriptors use the helper below directly at offset zero.
+    #[cfg(test)]
+    if META_REWIND_PROBE_ROOT
+        .lock()
+        .as_ref()
+        .is_some_and(|root| path.starts_with(root))
+    {
+        META_REWIND_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    f.seek(SeekFrom::Start(0))?;
+    read_meta_file_with_metadata(f, path, md)
+}
+
+fn read_meta_file_with_metadata(
+    mut f: fs::File,
+    path: &Path,
+    md: fs::Metadata,
+) -> Result<ScannedEntry, ReadError> {
+    // Every direct caller has just opened this descriptor, so it is already at
+    // offset zero. Avoid one lseek per file in the boot scan.
     let file_len = md.len();
     let mut header = [0u8; HEADER_LEN as usize];
     f.read_exact(&mut header)?;
@@ -953,8 +1442,27 @@ pub fn read_meta(path: &Path) -> Result<ScannedEntry, ReadError> {
 }
 
 pub fn read_static_meta(path: &Path) -> Result<ScannedStaticEntry, ReadError> {
-    let mut f = fs::File::open(path)?;
-    let md = f.metadata()?;
+    let fd = rustix::fs::openat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(rustix_io)?;
+    let file = fs::File::from(fd);
+    let metadata = validate_owned_file(&file, path, false)?;
+    read_static_meta_file_with_metadata(file, path, metadata)
+}
+
+fn read_static_meta_file_with_metadata(
+    mut f: fs::File,
+    path: &Path,
+    md: fs::Metadata,
+) -> Result<ScannedStaticEntry, ReadError> {
+    // Static metadata is only parsed from freshly opened descriptors.
     let file_len = md.len();
     let mut header = [0u8; HEADER_LEN as usize];
     f.read_exact(&mut header)?;
@@ -1231,6 +1739,7 @@ fn parse_seq_ext(name: &str, suffix: &str) -> Option<u64> {
     name.strip_suffix(suffix)?.split_once('-')?.1.parse().ok()
 }
 
+#[cfg(test)]
 fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
@@ -1238,22 +1747,6 @@ fn read_dir_sorted(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     paths.sort_unstable();
     paths
-}
-
-/// True if `file`'s mtime is at or after `since`. The boot scan uses this to leave
-/// a `.tmp` that may be an in-flight write (created during/after the scan) in place,
-/// reaping only older crash debris. An unreadable mtime is treated as NOT in-flight
-/// (false) so genuinely orphaned files are still eventually cleaned.
-fn modified_at_or_after(file: &Path, since: SystemTime) -> bool {
-    fs::metadata(file)
-        .and_then(|m| m.modified())
-        .map(|m| m >= since)
-        .unwrap_or(false)
-}
-
-fn allocated_file_bytes(path: &Path, fallback: u64) -> io::Result<u32> {
-    let md = fs::metadata(path)?;
-    Ok(allocated_bytes_from_metadata(&md, fallback))
 }
 
 fn allocated_bytes_from_metadata(md: &fs::Metadata, fallback: u64) -> u32 {
@@ -1365,14 +1858,350 @@ mod tests {
         (td, ds)
     }
 
-    fn store_with_seq(root: &Path, _runtime_seq_floor: u64, next_seq: u64) -> DiskStore {
-        fs::create_dir_all(root).unwrap();
-        DiskStore {
-            root: root.to_path_buf(),
-            live_files: Mutex::new(HashSet::new()),
-            boot_scan_pending: AtomicBool::new(true),
-            seq: AtomicU64::new(next_seq),
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn store_uses_rooted_openat2_or_descriptor_fallback() {
+        let td = tempfile::tempdir().unwrap();
+        let ds = DiskStore::open(td.path()).unwrap();
+        let body = b"rooted fallback body";
+        let (path, _) = ds
+            .write_entry(
+                &key(),
+                &entry(PageScope::Public),
+                0,
+                body,
+                1_750_000_000_123,
+            )
+            .unwrap();
+
+        OPEN_DIR_AT_CALLS.with(|calls| calls.set(0));
+        OPEN_FILE_AT_CALLS.with(|calls| calls.set(0));
+        OPENAT2_CALLS.with(|calls| calls.set(0));
+        assert_eq!(&ds.read_body(&path, body.len() as u32).unwrap()[..], body);
+        let directory_opens = OPEN_DIR_AT_CALLS.with(std::cell::Cell::get);
+        let file_opens = OPEN_FILE_AT_CALLS.with(std::cell::Cell::get);
+        let rooted_opens = OPENAT2_CALLS.with(std::cell::Cell::get);
+        match ds.openat2_state.load(Ordering::Relaxed) {
+            OPENAT2_SUPPORTED => assert_eq!((rooted_opens, directory_opens, file_opens), (1, 0, 0)),
+            OPENAT2_UNSUPPORTED => {
+                assert_eq!((rooted_opens, directory_opens, file_opens), (0, 3, 1))
+            }
+            state => panic!("unexpected openat2 capability state {state}"),
         }
+        ds.remove(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_store_enforces_private_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("jetcache");
+        let ds = DiskStore::open(&root).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+
+        let mut private_key = key();
+        private_key.private_owner = 0x1234;
+        let private = entry(PageScope::Private { owner_hash: 0x1234 });
+        let (page_path, _) = ds
+            .write_entry(&private_key, &private, 0, b"private response", 1)
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&page_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        let mut directory = page_path.parent();
+        while let Some(path) = directory {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                0o700,
+                "insecure cache directory {}",
+                path.display()
+            );
+            if path == root {
+                break;
+            }
+            directory = path.parent();
+        }
+
+        let source = root.join("source.css");
+        fs::write(&source, b"body").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+        let (static_path, _) = ds
+            .write_static_entry(
+                1,
+                "/style.css",
+                &source,
+                FileId::stat(&source).unwrap(),
+                "text/css",
+                "etag",
+                "date",
+                b"body",
+            )
+            .unwrap();
+        assert_eq!(
+            fs::metadata(static_path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+
+        ds.write_purge_stamp(2).unwrap();
+        ds.append_tag_purge_stamp(3, 4).unwrap();
+        assert_eq!(
+            fs::metadata(root.join(STAMP_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(root.join(TAG_STAMP_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_store_hardens_legacy_existing_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("jetcache");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        PRIVATE_DIR_CHMOD_CALLS.with(|calls| calls.set(0));
+        let _store = DiskStore::open(&root).unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            PRIVATE_DIR_CHMOD_CALLS.with(std::cell::Cell::get),
+            1,
+            "only the insecure root should need a mode repair"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reopening_private_fanout_does_not_rechmod_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("jetcache");
+        drop(DiskStore::open(&root).unwrap());
+
+        PRIVATE_DIR_CHMOD_CALLS.with(|calls| calls.set(0));
+        let _reopened = DiskStore::open(&root).unwrap();
+        assert_eq!(
+            PRIVATE_DIR_CHMOD_CALLS.with(std::cell::Cell::get),
+            0,
+            "an already-private root and fanout must not issue fchmod"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn boot_scan_hardens_legacy_fanout_and_files_before_loading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (td, store) = store();
+        let (path, _) = store
+            .write_entry(&key(), &entry(PageScope::Public), 0, b"legacy", 1)
+            .unwrap();
+        for directory in path.ancestors().skip(1).take(3) {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(td.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        drop(store);
+
+        let restarted = DiskStore::open(td.path()).unwrap();
+        let summary = restarted.scan(|_| true);
+        assert_eq!(summary.loaded, 1);
+        assert_eq!(
+            fs::metadata(td.path()).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        for directory in path.ancestors().skip(1).take(3) {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn boot_scan_reads_fresh_descriptors_without_rewind_syscalls() {
+        let _probe_guard = META_REWIND_PROBE_LOCK.lock();
+        let td = tempfile::tempdir().unwrap();
+        {
+            let store = DiskStore::open(td.path()).unwrap();
+            store
+                .write_entry(
+                    &key(),
+                    &entry(PageScope::Public),
+                    0,
+                    b"persisted body",
+                    1_750_000_000_123,
+                )
+                .unwrap();
+        }
+
+        let restarted = DiskStore::open(td.path()).unwrap();
+        *META_REWIND_PROBE_ROOT.lock() = Some(td.path().to_path_buf());
+        META_REWIND_CALLS.store(0, Ordering::Relaxed);
+        let summary = restarted.scan(|_| true);
+        assert_eq!(summary.loaded, 1);
+        assert_eq!(
+            META_REWIND_CALLS.load(Ordering::Relaxed),
+            0,
+            "freshly opened scan files must already be positioned at offset zero"
+        );
+        *META_REWIND_PROBE_ROOT.lock() = None;
+    }
+
+    #[test]
+    fn page_and_static_scans_repeat_without_shared_directory_offsets() {
+        let td = tempfile::tempdir().unwrap();
+        {
+            let store = DiskStore::open(td.path()).unwrap();
+            store
+                .write_entry(
+                    &key(),
+                    &entry(PageScope::Public),
+                    0,
+                    b"persisted page",
+                    1_750_000_000_123,
+                )
+                .unwrap();
+            let source = td.path().join("source.css");
+            fs::write(&source, b"persisted static").unwrap();
+            store
+                .write_static_entry(
+                    1,
+                    "/style.css",
+                    &source,
+                    FileId::stat(&source).unwrap(),
+                    "text/css",
+                    "etag",
+                    "date",
+                    b"persisted static",
+                )
+                .unwrap();
+        }
+
+        let restarted = DiskStore::open(td.path()).unwrap();
+        for _ in 0..2 {
+            assert_eq!(restarted.scan(|_| true).loaded, 1);
+            assert_eq!(restarted.scan_static(|_| true).loaded, 1);
+        }
+    }
+
+    #[test]
+    fn prepared_entry_clone_is_rewound_before_metadata_parse() {
+        let _probe_guard = META_REWIND_PROBE_LOCK.lock();
+        let (td, store) = store();
+        let prepared = store
+            .prepare_entry(
+                &key(),
+                &entry(PageScope::Public),
+                0,
+                b"prepared body",
+                1_750_000_000_123,
+            )
+            .unwrap();
+
+        *META_REWIND_PROBE_ROOT.lock() = Some(td.path().to_path_buf());
+        META_REWIND_CALLS.store(0, Ordering::Relaxed);
+        let scanned = store.read_prepared_entry(&prepared).unwrap();
+        assert_eq!(scanned.body_len, b"prepared body".len() as u32);
+        assert_eq!(
+            META_REWIND_CALLS.load(Ordering::Relaxed),
+            1,
+            "a clone of the written temp file must rewind its shared offset"
+        );
+        *META_REWIND_PROBE_ROOT.lock() = None;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_files_never_follow_links() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("jetcache");
+        let victim = parent.path().join("victim");
+        fs::write(&victim, b"unchanged").unwrap();
+        let store = DiskStore::open(&root).unwrap();
+
+        symlink(&victim, root.join(STAMP_NAME)).unwrap();
+        store.write_purge_stamp(42).unwrap();
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+        assert_eq!(store.read_purge_stamp(), Some(42));
+
+        symlink(&victim, root.join(TAG_STAMP_NAME)).unwrap();
+        assert!(store.append_tag_purge_stamp(1, 2).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+        fs::remove_file(root.join(TAG_STAMP_NAME)).unwrap();
+
+        fs::hard_link(&victim, root.join(TAG_STAMP_NAME)).unwrap();
+        assert!(store.append_tag_purge_stamp(1, 2).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"unchanged");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fanout_symlink_is_rejected_and_root_replacement_cannot_redirect_io() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().unwrap();
+        let poisoned = parent.path().join("poisoned");
+        let outside = parent.path().join("outside");
+        fs::create_dir(&poisoned).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, poisoned.join("0")).unwrap();
+        assert!(DiskStore::open(&poisoned).is_err());
+
+        let root = parent.path().join("jetcache");
+        let moved = parent.path().join("jetcache-moved");
+        let store = DiskStore::open(&root).unwrap();
+        fs::rename(&root, &moved).unwrap();
+        fs::create_dir(&root).unwrap();
+        let (locator, _) = store
+            .write_entry(&key(), &entry(PageScope::Public), 0, b"rooted", 1)
+            .unwrap();
+        assert!(
+            !locator.exists(),
+            "replacement root receives no cache write"
+        );
+        assert_eq!(&store.read_body(&locator, 6).unwrap()[..], b"rooted");
+        let relative = locator.strip_prefix(&root).unwrap();
+        assert!(moved.join(relative).is_file());
+        store.finish_boot_scan();
+        assert_eq!(
+            store.scan(|_| true).loaded,
+            1,
+            "boot scan must enumerate the pinned root after pathname replacement"
+        );
+        store.remove(&locator);
+        assert!(!moved.join(relative).exists());
+    }
+
+    fn store_with_seq(root: &Path, _runtime_seq_floor: u64, next_seq: u64) -> DiskStore {
+        let store = DiskStore::open(root).unwrap();
+        store.seq.store(next_seq, Ordering::Relaxed);
+        store
     }
 
     #[test]
@@ -1426,7 +2255,7 @@ mod tests {
         assert_eq!(got.sie, Duration::from_secs(3600));
         assert_eq!(got.body_len as usize, body.len());
 
-        let bytes = DiskStore::read_body(&path, body.len() as u32).expect("read_body");
+        let bytes = ds.read_body(&path, body.len() as u32).expect("read_body");
         assert_eq!(&bytes[..], body);
     }
 
@@ -1446,10 +2275,10 @@ mod tests {
         let (path, _disk_total) = ds.write_entry(&k, &e, 0, &body, 1_750_000_000_123).unwrap();
 
         assert!(matches!(
-            DiskStore::read_body(&path, body.len() as u32 + 1),
+            ds.read_body(&path, body.len() as u32 + 1),
             Err(ReadError::Corrupt(_))
         ));
-        let bytes = DiskStore::read_body(&path, body.len() as u32).expect("read_body");
+        let bytes = ds.read_body(&path, body.len() as u32).expect("read_body");
         assert_eq!(&bytes[..], &body[..]);
 
         fs::remove_file(&path).unwrap();
@@ -1464,7 +2293,7 @@ mod tests {
         let body = b"plain identity page bytes";
         let (path, _disk_total) = ds.write_entry(&k, &e, 0, body, 1_750_000_000_123).unwrap();
 
-        let f = DiskStore::body_file(&path, body.len() as u32).expect("body_file");
+        let f = ds.body_file(&path, body.len() as u32).expect("body_file");
         assert_eq!(f.path, path);
         assert_eq!(f.body_len as usize, body.len());
         assert_eq!(f.file_len, fs::metadata(&f.path).unwrap().len());
@@ -1473,6 +2302,175 @@ mod tests {
         let start = f.body_start as usize;
         let end = start + f.body_len as usize;
         assert_eq!(&raw[start..end], body);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn body_file_uses_rooted_openat2_or_descriptor_fallback() {
+        let (_td, ds) = store();
+        let body = b"single open page bytes";
+        let (path, _) = ds
+            .write_entry(
+                &key(),
+                &entry(PageScope::Public),
+                0,
+                body,
+                1_750_000_000_123,
+            )
+            .unwrap();
+
+        OPEN_DIR_AT_CALLS.with(|calls| calls.set(0));
+        OPEN_FILE_AT_CALLS.with(|calls| calls.set(0));
+        OPENAT2_CALLS.with(|calls| calls.set(0));
+        let file = ds.body_file(&path, body.len() as u32).unwrap();
+        let directory_opens = OPEN_DIR_AT_CALLS.with(std::cell::Cell::get);
+        let file_opens = OPEN_FILE_AT_CALLS.with(std::cell::Cell::get);
+        let rooted_opens = OPENAT2_CALLS.with(std::cell::Cell::get);
+
+        assert_eq!(file.body_len as usize, body.len());
+        match ds.openat2_state.load(Ordering::Relaxed) {
+            OPENAT2_SUPPORTED => assert_eq!((rooted_opens, directory_opens, file_opens), (1, 0, 0)),
+            OPENAT2_UNSUPPORTED => {
+                assert_eq!((rooted_opens, directory_opens, file_opens), (0, 3, 1))
+            }
+            state => panic!("unexpected openat2 capability state {state}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn remove_opens_leaf_from_pinned_root() {
+        let (_td, ds) = store();
+        let (path, _) = ds
+            .write_entry(
+                &key(),
+                &entry(PageScope::Public),
+                0,
+                b"unlink through rooted parent",
+                1_750_000_000_123,
+            )
+            .unwrap();
+
+        OPEN_DIR_AT_CALLS.with(|calls| calls.set(0));
+        OPEN_FILE_AT_CALLS.with(|calls| calls.set(0));
+        OPENAT2_CALLS.with(|calls| calls.set(0));
+        ds.remove(&path);
+        let directory_opens = OPEN_DIR_AT_CALLS.with(std::cell::Cell::get);
+        let file_opens = OPEN_FILE_AT_CALLS.with(std::cell::Cell::get);
+        let rooted_opens = OPENAT2_CALLS.with(std::cell::Cell::get);
+
+        assert!(!path.exists());
+        assert_eq!(file_opens, 0, "unlink must not open the entry file");
+        match ds.openat2_state.load(Ordering::Relaxed) {
+            OPENAT2_SUPPORTED => assert_eq!((rooted_opens, directory_opens), (1, 0)),
+            OPENAT2_UNSUPPORTED => assert_eq!((rooted_opens, directory_opens), (0, 3)),
+            state => panic!("unexpected openat2 capability state {state}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rooted_operations_reject_replacement_fanout_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let (td, ds) = store();
+        let body = b"do not read through a replacement leaf";
+        let cache_key = key();
+        let (path, _) = ds
+            .write_entry(
+                &cache_key,
+                &entry(PageScope::Public),
+                0,
+                body,
+                1_750_000_000_123,
+            )
+            .unwrap();
+        let leaf = path.parent().unwrap().to_path_buf();
+        let original = td.path().join("original-leaf");
+        let replacement = td.path().join("replacement-leaf");
+        fs::rename(&leaf, &original).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let replacement_file = replacement.join(path.file_name().unwrap());
+        fs::write(&replacement_file, b"attacker-controlled replacement").unwrap();
+        symlink(&replacement, &leaf).unwrap();
+
+        assert!(matches!(
+            ds.read_body(&path, body.len() as u32),
+            Err(ReadError::Io(_))
+        ));
+        assert!(
+            ds.write_entry(
+                &cache_key,
+                &entry(PageScope::Public),
+                0,
+                b"do not write through a replacement leaf",
+                1_750_000_000_124,
+            )
+            .is_err()
+        );
+
+        ds.remove(&path);
+
+        assert!(
+            original.join(path.file_name().unwrap()).exists(),
+            "a rejected replacement must not unlink from the detached original leaf"
+        );
+        assert_eq!(
+            fs::read(&replacement_file).unwrap(),
+            b"attacker-controlled replacement",
+            "read, write and remove must not follow the replacement fanout symlink"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_fallback_rejects_replacement_fanout_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let td = tempfile::tempdir().unwrap();
+        let ds = DiskStore::open(td.path()).unwrap();
+        let body = b"fallback must not follow the replacement leaf";
+        let (read_path, _) = ds
+            .write_entry(
+                &key(),
+                &entry(PageScope::Public),
+                0,
+                body,
+                1_750_000_000_123,
+            )
+            .unwrap();
+        let (remove_path, _) = ds
+            .write_entry(
+                &key(),
+                &entry(PageScope::Public),
+                0,
+                b"fallback must not unlink outside",
+                1_750_000_000_124,
+            )
+            .unwrap();
+        let leaf = read_path.parent().unwrap().to_path_buf();
+        let original = td.path().join("fallback-original-leaf");
+        fs::rename(&leaf, &original).unwrap();
+        let replacement = td.path().join("fallback-replacement-leaf");
+        fs::create_dir(&replacement).unwrap();
+        symlink(&replacement, &leaf).unwrap();
+        let original_remove = original.join(remove_path.file_name().unwrap());
+
+        ds.openat2_state
+            .store(OPENAT2_UNSUPPORTED, Ordering::Relaxed);
+        OPEN_DIR_AT_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            ds.read_body(&read_path, body.len() as u32),
+            Err(ReadError::Io(_))
+        ));
+        ds.remove(&remove_path);
+
+        assert!(original_remove.exists());
+        assert_eq!(
+            OPEN_DIR_AT_CALLS.with(std::cell::Cell::get),
+            6,
+            "each fallback operation must reject the symlink on its third component open"
+        );
     }
 
     #[test]
@@ -1501,8 +2499,8 @@ mod tests {
         );
 
         // Both files exist with their own bytes — the published version was never clobbered.
-        assert_eq!(&DiskStore::read_body(&p1, 3).unwrap()[..], b"OLD");
-        assert_eq!(&DiskStore::read_body(&p2, 3).unwrap()[..], b"NEW");
+        assert_eq!(&ds.read_body(&p1, 3).unwrap()[..], b"OLD");
+        assert_eq!(&ds.read_body(&p2, 3).unwrap()[..], b"NEW");
     }
 
     #[test]
@@ -1517,7 +2515,7 @@ mod tests {
                 100,
             )
             .unwrap();
-        let tmp = prepared.tmp_path.clone();
+        let tmp = prepared.dir.join(&prepared.tmp_name);
         assert!(tmp.exists());
         assert_eq!(
             read_dir_sorted(tmp.parent().unwrap())
@@ -1584,10 +2582,7 @@ mod tests {
         bad.truncate(bad.len() - 3);
         fs::write(&path, &bad).unwrap();
         assert!(matches!(read_meta(&path), Err(ReadError::Corrupt(_))));
-        assert!(matches!(
-            DiskStore::read_body(&path, 6),
-            Err(ReadError::Corrupt(_))
-        ));
+        assert!(matches!(ds.read_body(&path, 6), Err(ReadError::Corrupt(_))));
 
         // appended garbage (size invariant, the other direction)
         let mut bad = pristine.clone();
@@ -1605,17 +2600,32 @@ mod tests {
 
         // body length disagreeing with the index's expectation
         fs::write(&path, &pristine).unwrap();
-        assert!(matches!(
-            DiskStore::read_body(&path, 7),
-            Err(ReadError::Corrupt(_))
-        ));
+        assert!(matches!(ds.read_body(&path, 7), Err(ReadError::Corrupt(_))));
 
         // missing file is Io, not Corrupt (fail-closed miss either way)
         fs::remove_file(&path).unwrap();
-        assert!(matches!(
-            DiskStore::read_body(&path, 6),
-            Err(ReadError::Io(_))
-        ));
+        assert!(matches!(ds.read_body(&path, 6), Err(ReadError::Io(_))));
+    }
+
+    #[test]
+    fn boot_scan_unlinks_prior_security_policy_epoch() {
+        let (td, ds) = store();
+        let (path, _) = ds
+            .write_entry(&key(), &entry(PageScope::Public), 0, b"legacy source", 5)
+            .unwrap();
+        let mut legacy = fs::read(&path).unwrap();
+        legacy[4..6].copy_from_slice(&(VERSION - 1).to_le_bytes());
+        fs::write(&path, legacy).unwrap();
+        drop(ds);
+
+        let restarted = DiskStore::open(td.path()).unwrap();
+        let summary = restarted.scan(|_| true);
+        assert_eq!(summary.loaded, 0);
+        assert_eq!(summary.corrupt_removed, 1);
+        assert!(
+            !path.exists(),
+            "a pre-policy-epoch response must not survive restart"
+        );
     }
 
     #[test]
@@ -1858,9 +2868,9 @@ mod tests {
         let (p, _) = ds
             .write_entry(&key(), &entry(PageScope::Public), 0, b"x", 1)
             .unwrap();
-        DiskStore::remove(&p);
+        ds.remove(&p);
         assert!(!p.exists());
-        DiskStore::remove(&p); // ENOENT swallowed
+        ds.remove(&p); // ENOENT swallowed
     }
 
     #[test]

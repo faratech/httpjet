@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     io::{self, Read, Write},
+    mem::MaybeUninit,
     ops::{Deref, DerefMut},
     rc::Rc,
 };
@@ -19,7 +20,7 @@ const TLS_WRITE_BUFFER_BURST: usize = 512 * 1024;
 const IDLE_BUFFER_POOL_CAP: usize = 32;
 
 thread_local! {
-    static IDLE_BUFFERS: RefCell<Vec<Box<[u8]>>> = const { RefCell::new(Vec::new()) };
+    static IDLE_BUFFERS: RefCell<Vec<Box<[MaybeUninit<u8>]>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// httpjet fork: a connection holds a write buffer only while it has ciphertext to send.
@@ -27,7 +28,7 @@ thread_local! {
 /// between requests) and each used to keep a 64 KiB buffer; a flushed buffer now returns
 /// to this thread's pool and the next write takes a warm one, so there is no allocation
 /// or page fault per response.
-fn take_idle_box() -> Box<[u8]> {
+fn take_idle_box() -> Box<[MaybeUninit<u8>]> {
     IDLE_BUFFERS
         .try_with(|pool| pool.borrow_mut().pop())
         .ok()
@@ -35,7 +36,7 @@ fn take_idle_box() -> Box<[u8]> {
         .unwrap_or_else(|| uninit_box(TLS_WRITE_BUFFER_IDLE))
 }
 
-fn put_idle_box(buf: Box<[u8]>) {
+fn put_idle_box(buf: Box<[MaybeUninit<u8>]>) {
     let _ = IDLE_BUFFERS.try_with(move |pool| {
         let mut pool = pool.borrow_mut();
         if pool.len() < IDLE_BUFFER_POOL_CAP {
@@ -187,9 +188,9 @@ mod transition_tests {
     use std::sync::Arc;
     use std::task::{Context, Poll, Waker};
 
-    use monoio::buf::IoBuf;
+    use monoio::buf::{IoBuf, IoBufMut};
 
-    use super::{Stream, WriteBuffer};
+    use super::{Buffer, Stream, WriteBuffer};
 
     fn ready<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
@@ -235,7 +236,13 @@ mod transition_tests {
 
     fn storage(buffer: &WriteBuffer) -> *const u8 {
         match buffer {
-            WriteBuffer::Safe(b) => b.buffer.as_ref().expect("not in flight").buf.as_ptr(),
+            WriteBuffer::Safe(b) => b
+                .buffer
+                .as_ref()
+                .expect("not in flight")
+                .buf
+                .as_ptr()
+                .cast(),
             #[cfg(feature = "unsafe_io")]
             WriteBuffer::Unsafe(_) => unreachable!(),
         }
@@ -292,6 +299,31 @@ mod transition_tests {
         a.shrink_to_idle();
         assert_eq!(capacity(&a), 0);
         assert!(super::IDLE_BUFFERS.with(|pool| pool.borrow().is_empty()));
+    }
+
+    #[test]
+    fn maybe_uninit_buffer_exposes_only_the_written_prefix_across_growth() {
+        let mut buffer = Buffer {
+            read: 0,
+            write: 0,
+            buf: super::uninit_box(4),
+        };
+        assert_eq!(buffer.bytes_init(), 0);
+        assert_eq!(buffer.copy_from(b"abc"), 3);
+        // Exercise the IoBufMut completion path independently of copy_from.
+        unsafe {
+            buffer.write_ptr().write(b'd');
+            buffer.set_init(1);
+        }
+        let initialized =
+            unsafe { std::slice::from_raw_parts(buffer.read_ptr(), buffer.bytes_init()) };
+        assert_eq!(initialized, b"abcd");
+
+        buffer.advance(2);
+        buffer.grow_to(16);
+        let initialized =
+            unsafe { std::slice::from_raw_parts(buffer.read_ptr(), buffer.bytes_init()) };
+        assert_eq!(initialized, b"cd");
     }
 
     #[test]
@@ -496,18 +528,20 @@ impl io::Write for SafeWriteBuffer {
 struct Buffer {
     read: usize,
     write: usize,
-    buf: Box<[u8]>,
+    // Storage remains MaybeUninit until individual bytes are written. Keeping the
+    // type honest avoids asserting that a fresh 64/512 KiB allocation is initialized
+    // while retaining the no-memset handshake fast path.
+    buf: Box<[MaybeUninit<u8>]>,
 }
 
-/// httpjet patch (#349): allocate the ciphertext buffer without the zero fill.
+/// httpjet patches (#349/#514): allocate ciphertext without a zero fill while
+/// retaining its uninitialized type until each byte is written.
 /// Every byte below `write` is explicitly written (`copy_from` / `IoBufMut`
 /// completion / `grow_to`'s prefix copy) before any read exposes it
 /// (`read_ptr`/`bytes_init` are bounded by `write`), so the 64 KiB-per-accept
 /// (512 KiB on burst growth) memset was pure cost on the handshake path.
-fn uninit_box(size: usize) -> Box<[u8]> {
-    // SAFETY: u8 has no invalid bit patterns and the Buffer invariant above
-    // guarantees no uninitialized byte is ever read.
-    unsafe { Box::new_uninit_slice(size).assume_init() }
+fn uninit_box(size: usize) -> Box<[MaybeUninit<u8>]> {
+    Box::<[u8]>::new_uninit_slice(size)
 }
 
 impl Buffer {
@@ -576,7 +610,17 @@ impl Buffer {
 
     fn copy_from(&mut self, src: &[u8]) -> usize {
         let to_copy = src.len().min(self.available());
-        self.buf[self.write..self.write + to_copy].copy_from_slice(&src[..to_copy]);
+        // SAFETY: the destination covers `to_copy` distinct elements inside the
+        // allocation's spare suffix, and the source slice contains that many bytes.
+        if to_copy != 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr(),
+                    self.buf.as_mut_ptr().cast::<u8>().add(self.write),
+                    to_copy,
+                );
+            }
+        }
         self.write += to_copy;
         to_copy
     }
@@ -586,7 +630,9 @@ impl Buffer {
 // `bytes_init` returns exactly that initialized length.
 unsafe impl IoBuf for Buffer {
     fn read_ptr(&self) -> *const u8 {
-        self.buf[self.read..].as_ptr()
+        // Only the prefix through `write` has been initialized; `bytes_init`
+        // bounds every consumer to that prefix.
+        self.buf[self.read..].as_ptr().cast()
     }
 
     fn bytes_init(&self) -> usize {
@@ -598,7 +644,9 @@ unsafe impl IoBuf for Buffer {
 // advances `write` by the number of bytes the I/O operation initialized.
 unsafe impl monoio::buf::IoBufMut for Buffer {
     fn write_ptr(&mut self) -> *mut u8 {
-        self.buf[self.write..].as_mut_ptr()
+        // The write operation owns the spare suffix until it returns and calls
+        // `set_init` with the number of bytes it initialized.
+        self.buf[self.write..].as_mut_ptr().cast()
     }
 
     fn bytes_total(&mut self) -> usize {
@@ -606,6 +654,7 @@ unsafe impl monoio::buf::IoBufMut for Buffer {
     }
 
     unsafe fn set_init(&mut self, pos: usize) {
+        assert!(pos <= self.available());
         self.write += pos;
     }
 }

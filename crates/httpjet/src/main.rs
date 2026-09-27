@@ -164,8 +164,9 @@ struct ServeArgs {
     /// Local testing / explicit rollback only: drop the mandatory Cloudflare
     /// client-cert requirement so TLS content can be tested locally without a
     /// Cloudflare-issued client cert.
-    /// Without this flag, clientVerify=2 is enforced (handshakes without a
-    /// valid client cert are rejected — the production fail-closed behavior).
+    /// Without this flag, clientVerify=2 validates every presented certificate
+    /// during TLS. A peer that presents none completes the handshake, then the
+    /// request pipeline rejects it before dispatch (except the loopback exemption).
     #[arg(long)]
     no_mtls: bool,
     /// (#296) Do not pin the per-core io_uring transport threads to their CPU
@@ -446,7 +447,7 @@ struct PageCacheArgs {
     /// `forum.example=conf/pagecache-forum.dict,moon.example=conf/pagecache-moon.dict`.
     #[arg(long = "page-cache-dict-vhost", default_value = "")]
     dict_vhost: String,
-    /// Comma-separated `vhost=level` pairs overriding the store-time zstd level (1-19, default
+    /// Comma-separated `vhost=level` pairs overriding the internal zstd level (1-19, default
     /// 12) of that vhost's dictionary. A vhost whose compressed bodies round to the same 4 KiB
     /// tmpfs pages at a cheaper level gains nothing from 12: moontimenow's pages cost 5x less at
     /// level 3 with no footprint change (measured 2026-09-22). A malformed pair aborts startup.
@@ -1289,14 +1290,6 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 vary_cookies = %args.page_cache.vary_cookies,
                 "origin page cache ENABLED (--page-cache)"
             );
-            if let Some(p) = &store_path {
-                tracing::info!(
-                    path = %p.display(),
-                    hot_mem_bytes = args.page_cache.hot_mem,
-                    disk_mem_bytes = args.page_cache.disk_mem,
-                    "PERSISTENT tmpfs file tier ENABLED (--page-cache-store-path)"
-                );
-            }
             if args.page_cache.private_enabled {
                 tracing::info!(
                     session_cookie = %args.page_cache.private_session_cookie,
@@ -1312,7 +1305,23 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                     "member shared-path PUBLIC routing ENABLED (--page-cache-shared-paths)"
                 );
             }
-            Some(Arc::new(hj_pagecache::PageStore::new(store_cfg)))
+            let page_store = Arc::new(hj_pagecache::PageStore::new(store_cfg));
+            if let Some(p) = &store_path {
+                if page_store.has_disk() {
+                    tracing::info!(
+                        path = %p.display(),
+                        hot_mem_bytes = args.page_cache.hot_mem,
+                        disk_mem_bytes = args.page_cache.disk_mem,
+                        "PERSISTENT tmpfs file tier ENABLED (--page-cache-store-path)"
+                    );
+                } else {
+                    tracing::error!(
+                        path = %p.display(),
+                        "PERSISTENT tmpfs file tier requested but unavailable; page cache is RAM-only"
+                    );
+                }
+            }
+            Some(page_store)
         } else {
             None
         };
@@ -1336,7 +1345,8 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         let php_slow = {
             let p = args.php_slow_log.trim();
             (!p.is_empty()).then(|| {
-                tracing::info!(path = %p, threshold_ms = args.php_slow_threshold_ms, "php slow-request log ENABLED");
+                let p = state::redirect_log_path(std::path::Path::new(p));
+                tracing::info!(path = %p.display(), threshold_ms = args.php_slow_threshold_ms, "php slow-request log ENABLED");
                 phpslow::PhpSlowLog::spawn(p, args.php_slow_threshold_ms)
             })
         };
@@ -1673,10 +1683,12 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
 
         // (telemetry) Periodic disk snapshot of the in-RAM aggregates (durability
         // across restarts + a self-contained time-series for the two-node A/B).
+        let telemetry_file =
+            state::redirect_log_path(std::path::Path::new(args.telemetry_file.trim()));
         if !args.telemetry_file.trim().is_empty() && args.telemetry_flush_secs > 0 {
             handles.push(tokio::spawn(telemetry::run_flush(
                 state.telemetry.clone(),
-                std::path::PathBuf::from(args.telemetry_file.trim()),
+                telemetry_file.clone(),
                 std::time::Duration::from_secs(args.telemetry_flush_secs),
                 state.shutdown.clone(),
             )));
@@ -1869,11 +1881,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             "connections drained; stopping"
         );
         if !args.telemetry_file.trim().is_empty() && args.telemetry_flush_secs > 0 {
-            telemetry::flush_once(
-                &state.telemetry,
-                std::path::Path::new(args.telemetry_file.trim()),
-            )
-            .await;
+            telemetry::flush_once(&state.telemetry, &telemetry_file).await;
         }
         for h in handles {
             h.abort();
@@ -2902,6 +2910,10 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
             }
             _ => {}
         }
+    }
+
+    if let Err(error) = state::validate_proxy_contexts(cfg) {
+        errors.push(error);
     }
 
     table.sort();

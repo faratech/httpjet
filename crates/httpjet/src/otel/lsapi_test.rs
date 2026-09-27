@@ -116,11 +116,13 @@ pub(super) async fn roundtrip() -> (hj_core::Response, String) {
         )
         .unwrap();
     // Apply the same public-input boundary as the common pipeline, then the
-    // actual terminal instrumentation used by run_handler.
+    // consuming LSAPI path. It returns the original request head for
+    // ErrorDocument policy without replacing the streaming body.
     extract_parent(req.headers_mut(), false);
-    let response = crate::pipeline::instrumented_handler(&handler, &mut ctx, req)
-        .await
-        .unwrap();
+    let (response, parts) =
+        crate::pipeline::instrumented_lsapi_retaining_head(&handler, &mut ctx, req).await;
+    let response = response.unwrap();
     assert_eq!(response.status(), 200);
+    assert!(!parts.headers.contains_key("traceparent"));
     (response, peer.await.unwrap())
 }

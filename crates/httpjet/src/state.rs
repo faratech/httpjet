@@ -315,8 +315,8 @@ pub struct ServerState {
     /// neither starves the other. Inert unless `page_cache` is `Some` and `page_cache_dicts` is
     /// non-empty.
     pub page_cache_dict_fill: Arc<crate::lscache::RefreshRegistry>,
-    /// Per-vhost dictionary recompression work/savings. Populated only by first-hit background
-    /// jobs, so the map is bounded by configured cache vhosts and stays off request hot paths.
+    /// Per-vhost dictionary recompression work/savings. Populated by store-time jobs and hit-path
+    /// retries, so the map is bounded by configured cache vhosts and stays off request hot paths.
     pub page_cache_dict_metrics: Arc<dashmap::DashMap<String, Arc<DictRecompressMetrics>>>,
     /// (W-TinyLFU) Store-admission frequency sketch: only keys that show reuse are admitted to
     /// the cache, so the long tail behind Cloudflare can't churn out the hot set or waste
@@ -587,6 +587,59 @@ struct ConfigDerived {
     mtls_required_vhosts: HashSet<String>,
 }
 
+/// Validate every enabled proxy context against the exact processor lookup the
+/// request pipeline uses: vhost-local first, then the last same-named global
+/// declaration. An unresolved or wrong-kind route must not survive into a
+/// generation where it could fall through to another terminal handler.
+pub(crate) fn validate_proxy_contexts(server: &ServerConfig) -> Result<(), String> {
+    for (vhost_name, declaration) in &server.vhosts {
+        let Some(vhost) = declaration.config.as_ref() else {
+            continue;
+        };
+        for context in vhost.contexts.iter().filter(|context| {
+            context.enabled && context.kind == hj_core::config::ContextKind::Proxy
+        }) {
+            let Some(handler) = context
+                .handler
+                .as_deref()
+                .filter(|handler| !handler.is_empty())
+            else {
+                return Err(format!(
+                    "vhost {vhost_name:?} proxy context {:?} has no handler",
+                    context.uri
+                ));
+            };
+            let processor = vhost
+                .extra_ext_processors
+                .iter()
+                .find(|processor| processor.name == handler)
+                .or_else(|| {
+                    server
+                        .ext_processors
+                        .iter()
+                        .rev()
+                        .find(|processor| processor.name == handler)
+                });
+            match processor {
+                Some(processor) if processor.kind == ExtKind::Proxy => {}
+                Some(processor) => {
+                    return Err(format!(
+                        "vhost {vhost_name:?} proxy context {:?} resolves handler {handler:?} to non-proxy processor kind {:?}",
+                        context.uri, processor.kind
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "vhost {vhost_name:?} proxy context {:?} references unknown handler {handler:?}",
+                        context.uri
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build the config-derived half from a parsed config. Used by both
 /// [`ServerState::new`] (boot) and [`ServerState::reload`] (SIGHUP) so the two
 /// can never drift.
@@ -594,6 +647,7 @@ fn build_config_derived(
     server: &Arc<ServerConfig>,
     cf_send_zstd: bool,
 ) -> Result<ConfigDerived, String> {
+    validate_proxy_contexts(server)?;
     let router = Arc::new(Router::build(server.clone()));
     let serve_config = ServeConfig::from_tuning(&server.tuning);
     let php_suffixes = server
@@ -1235,7 +1289,7 @@ impl ServerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hj_core::config::{ExtAddress, VHostConfig, VHostDecl};
+    use hj_core::config::{Context, ContextKind, ExtAddress, VHostConfig, VHostDecl};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -1272,6 +1326,24 @@ mod tests {
             client_key_file: None,
             instances: 1,
             run_on_startup: 0,
+        }
+    }
+
+    fn proxy_context(handler: Option<&str>, enabled: bool) -> Context {
+        Context {
+            kind: ContextKind::Proxy,
+            uri: "/api".into(),
+            location: None,
+            handler: handler.map(str::to_string),
+            enabled,
+            extra_headers: Vec::new(),
+            add_default_charset: false,
+            charset: None,
+            cache_policy: None,
+            max_body_override: None,
+            bandwidth_limit: 0,
+            timeout_override: None,
+            sub_filter: None,
         }
     }
 
@@ -1333,6 +1405,73 @@ mod tests {
             target.keep_alive.unwrap(),
             target.connect_timeout.unwrap(),
         )
+    }
+
+    #[test]
+    fn proxy_context_validation_requires_an_effective_proxy_processor() {
+        let root = temp_root("proxy-context-validation");
+        let mut server = (*config(
+            &root,
+            vec![processor("api", 8101)],
+            vec![("site", processor("local", 8102))],
+        ))
+        .clone();
+        let vhost = server
+            .vhosts
+            .get_mut("site")
+            .unwrap()
+            .config
+            .as_mut()
+            .unwrap();
+        Arc::make_mut(vhost).contexts = vec![
+            proxy_context(Some("api"), true),
+            proxy_context(Some("missing-but-disabled"), false),
+        ];
+        assert!(validate_proxy_contexts(&server).is_ok());
+
+        Arc::make_mut(
+            server
+                .vhosts
+                .get_mut("site")
+                .unwrap()
+                .config
+                .as_mut()
+                .unwrap(),
+        )
+        .contexts[0]
+            .handler = None;
+        assert!(validate_proxy_contexts(&server).is_err());
+
+        Arc::make_mut(
+            server
+                .vhosts
+                .get_mut("site")
+                .unwrap()
+                .config
+                .as_mut()
+                .unwrap(),
+        )
+        .contexts[0]
+            .handler = Some("typo".into());
+        assert!(validate_proxy_contexts(&server).is_err());
+
+        let vhost = Arc::make_mut(
+            server
+                .vhosts
+                .get_mut("site")
+                .unwrap()
+                .config
+                .as_mut()
+                .unwrap(),
+        );
+        vhost.contexts[0].handler = Some("api".into());
+        let mut shadow = processor("api", 8103);
+        shadow.kind = ExtKind::FastCgi;
+        vhost.extra_ext_processors.insert(0, shadow);
+        assert!(
+            validate_proxy_contexts(&server).is_err(),
+            "a same-named local non-proxy must not fall back to a global proxy"
+        );
     }
 
     #[tokio::test]

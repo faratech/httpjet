@@ -1,6 +1,6 @@
 use std::{
     io,
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::ManuallyDrop,
     os::unix::prelude::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
     path::Path,
 };
@@ -61,7 +61,9 @@ impl UnixListener {
     /// Creates a new `UnixListener` bound to the specified socket with default
     /// config.
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<UnixListener> {
-        Self::bind_with_config(path, &ListenerOpts::default())
+        // SO_REUSEPORT is unsupported for AF_UNIX on Linux. ListenerOpts defaults
+        // it on for TCP listeners, so specialize the convenience constructor.
+        Self::bind_with_config(path, &ListenerOpts::default().reuse_port(false))
     }
 
     /// Accept
@@ -165,17 +167,12 @@ impl std::fmt::Debug for UnixListener {
 impl IntoRawFd for UnixListener {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
-        let mut this = ManuallyDrop::new(self);
-        #[allow(invalid_value)]
-        #[allow(clippy::uninit_assumed_init)]
-        let (mut fd, mut sys_listener) = unsafe {
-            (
-                MaybeUninit::uninit().assume_init(),
-                MaybeUninit::uninit().assume_init(),
-            )
-        };
-        std::mem::swap(&mut this.fd, &mut fd);
-        std::mem::swap(&mut this.sys_listener, &mut sys_listener);
+        let this = ManuallyDrop::new(self);
+        // SAFETY: `this` will not run UnixListener::drop, and each valid field is
+        // moved out exactly once. The std listener intentionally relinquishes its
+        // duplicate ownership of the same descriptor before SharedFd is unwrapped.
+        let (fd, mut sys_listener) =
+            unsafe { (std::ptr::read(&this.fd), std::ptr::read(&this.sys_listener)) };
         let _ = sys_listener.take().unwrap().into_raw_fd();
 
         fd.try_unwrap()

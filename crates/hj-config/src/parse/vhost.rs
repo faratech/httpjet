@@ -336,32 +336,59 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         ctx,
     );
 
-    let script_handlers = raw
-        .script_handler_list
-        .map(|shl| {
-            shl.script_handler
-                .into_iter()
-                .filter_map(|sh| {
-                    let suffix = nonempty(sh.suffix)?.trim().to_ascii_lowercase();
-                    let kind = context_kind(&sh.kind);
-                    // A `static` override carries no ext-processor; handler-dispatching
-                    // kinds (lsapi/cgi/proxy/appserver/...) still require one.
-                    let handler = match nonempty(sh.handler) {
-                        Some(h) => h,
-                        None if matches!(kind, ContextKind::Static | ContextKind::Other) => {
-                            String::new()
-                        }
-                        None => return None,
-                    };
-                    Some(ScriptHandler {
-                        suffix,
-                        kind,
-                        handler,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut script_handlers = Vec::new();
+    if let Some(shl) = raw.script_handler_list {
+        for sh in shl.script_handler {
+            let Some(suffix) = nonempty(sh.suffix) else {
+                continue;
+            };
+            let suffix = suffix.trim().to_ascii_lowercase();
+            let raw_kind = sh.kind.as_deref().map(str::trim).unwrap_or("");
+            let kind = context_kind(&sh.kind);
+            // `context_kind` deliberately defaults an ordinary context with no
+            // type to static. A scriptHandler is different: silently treating a
+            // missing, misspelled, or unsupported executable type as static can
+            // publish the script's source. Only the route kinds implemented by
+            // suffix dispatch, plus an explicit static opt-out, are accepted.
+            if raw_kind.is_empty()
+                || !matches!(
+                    kind,
+                    ContextKind::Static | ContextKind::Lsapi | ContextKind::Cgi
+                )
+            {
+                return Err(ConfigError::InvalidValue {
+                    path: config_path.clone(),
+                    directive: "scriptHandler.type",
+                    value: raw_kind.to_string(),
+                    reason: format!(
+                        "suffix {suffix:?} requires an explicit static, lsapi, or cgi type"
+                    ),
+                });
+            }
+            // An explicit `static` override intentionally has no processor.
+            // Executable routes without a handler are configuration errors; do
+            // not discard them and let their suffix fall through to static.
+            let handler = match nonempty(sh.handler) {
+                Some(handler) => handler,
+                None if kind == ContextKind::Static => String::new(),
+                None => {
+                    return Err(ConfigError::InvalidValue {
+                        path: config_path.clone(),
+                        directive: "scriptHandler.handler",
+                        value: String::new(),
+                        reason: format!(
+                            "executable suffix {suffix:?} requires an ext-processor handler"
+                        ),
+                    });
+                }
+            };
+            script_handlers.push(ScriptHandler {
+                suffix,
+                kind,
+                handler,
+            });
+        }
+    }
 
     // `<htAccess>`: allowOverride bitmask + accessFileName. Absent block => off.
     // An EXPLICIT `0` is recorded separately (audit): it FORBIDS overrides, while a

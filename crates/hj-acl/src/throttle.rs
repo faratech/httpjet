@@ -91,8 +91,12 @@ impl ClientThrottle {
         if self.rate == 0 {
             return true;
         }
+        // The shard hash already canonicalizes IPv4-mapped IPv6 addresses;
+        // canonicalize the map key too so one client cannot obtain two windows
+        // through equivalent address representations.
+        let ip = ip.to_canonical();
         let now = Instant::now();
-        let shard = &self.shards[shard_of(ip)];
+        let shard = &self.shards[shard_of_canonical(ip)];
         let mut map = shard.lock();
         if map.len() >= MAX_IPS_PER_SHARD {
             map.retain(|_, w| now.duration_since(w.start) < self.window);
@@ -136,9 +140,12 @@ impl ClientThrottle {
     }
 }
 
-fn shard_of(ip: IpAddr) -> usize {
+/// Select a shard for an address already normalized by [`IpAddr::to_canonical`].
+/// Keeping normalization at the `allow` boundary makes the hash key and map key
+/// identical without repeating the IPv4-mapped-IPv6 check on every request.
+fn shard_of_canonical(ip: IpAddr) -> usize {
     let mut h = 0x9e37_79b9_7f4a_7c15u64;
-    match ip.to_canonical() {
+    match ip {
         IpAddr::V4(v4) => {
             for b in v4.octets() {
                 h = (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
@@ -199,6 +206,17 @@ mod tests {
         assert!(t.allow(v4));
         assert!(t.allow(v6));
         assert!(!t.allow(v4));
+    }
+
+    #[test]
+    fn v4_and_v4_mapped_v6_share_one_window() {
+        let t = throttle(1);
+        let v4 = Ipv4Addr::new(192, 0, 2, 7);
+        assert!(t.allow(IpAddr::V4(v4)));
+        assert!(
+            !t.allow(IpAddr::V6(v4.to_ipv6_mapped())),
+            "equivalent address representations must not receive separate buckets"
+        );
     }
 
     #[test]

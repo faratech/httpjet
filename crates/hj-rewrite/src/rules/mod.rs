@@ -83,6 +83,13 @@ pub struct RuleSet {
 static RULESET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl RuleSet {
+    /// Whether evaluating this set is guaranteed to return an unchanged URI and
+    /// no rewrite environment. `RewriteEngine off` suppresses parsed rules just
+    /// as completely as an empty rule list.
+    pub fn is_noop(&self) -> bool {
+        !self.engine_on || self.rules.is_empty()
+    }
+
     /// Unique nonzero parse-time id (0 only for a default-constructed empty set).
     pub fn id(&self) -> u64 {
         self.id

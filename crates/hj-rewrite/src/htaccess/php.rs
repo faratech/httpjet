@@ -76,6 +76,17 @@ pub fn php_directives(chain: &[Arc<Htaccess>], rel_path: &str, basename: &str) -
 /// match). Callers gate this on [`Htaccess::has_handler_override`](super::Htaccess)
 /// so it is never reached on the common no-override path.
 pub fn php_handler_forced(chain: &[Arc<Htaccess>], rel_path: &str, basename: &str) -> bool {
+    php_handler_forced_iter(chain.iter().map(AsRef::as_ref), rel_path, basename)
+}
+
+/// Iterator form used by callers that already retain directory metadata beside
+/// each parsed file. It avoids building a second `Vec<Arc<Htaccess>>` merely to
+/// ask the same handler-routing question.
+pub fn php_handler_forced_iter<'a>(
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+    rel_path: &str,
+    basename: &str,
+) -> bool {
     let ext = basename
         .rsplit_once('.')
         .map(|(_, e)| e.to_ascii_lowercase());

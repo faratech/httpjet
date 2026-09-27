@@ -425,6 +425,599 @@ async fn cgi_route_summary_reloads_and_missing_processor_fails_closed() {
     assert!(!restored.has_cgi_script_routes);
 }
 
+fn assert_builtin_404_without(resp: Response, forbidden: &[u8]) {
+    assert_eq!(resp.status(), http::StatusCode::NOT_FOUND);
+    let body = body_bytes(resp.into_body());
+    assert!(
+        !body
+            .as_ref()
+            .windows(forbidden.len())
+            .any(|window| window == forbidden),
+        "ErrorDocument target bytes must not be exposed"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("<title>404 Not Found</title>"),
+        "failed ErrorDocument substitution must preserve the built-in 404 body"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_script_source_is_not_served_when_php_is_unavailable_or_disabled() {
+    const SOURCE: &[u8] = b"<?php echo 'error document secret';";
+    for enabled in [true, false] {
+        let root = temp_root(if enabled {
+            "errordoc-no-php"
+        } else {
+            "errordoc-script-disabled"
+        });
+        std::fs::create_dir(root.join("errors")).unwrap();
+        std::fs::write(root.join("errors/404.php"), SOURCE).unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "ErrorDocument 404 /errors/404.php\n",
+        )
+        .unwrap();
+        let state = build_state_inner(
+            root,
+            Vec::new(),
+            Vec::new(),
+            true,
+            None,
+            None,
+            move |server| {
+                server.vhosts.get_mut(VHOST).unwrap().enable_script = enabled;
+            },
+        );
+
+        assert_builtin_404_without(run(&state, get(CANON_HOST, "/missing", None)).await, SOURCE);
+        let direct = run(&state, get(CANON_HOST, "/errors/404.php", None)).await;
+        assert_eq!(direct.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_ne!(body_bytes(direct.into_body()).as_ref(), SOURCE);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_scripts_preserve_static_directory_index_selection() {
+    const STATIC_INDEX: &[u8] = b"static index remains available";
+    let root = temp_root("disabled-script-static-index");
+    std::fs::write(root.join("index.html"), STATIC_INDEX).unwrap();
+    let state = build_state_inner(root, Vec::new(), Vec::new(), true, None, None, |server| {
+        let declaration = server.vhosts.get_mut(VHOST).unwrap();
+        declaration.enable_script = false;
+        Arc::make_mut(declaration.config.as_mut().unwrap()).index_files =
+            vec!["index.php".into(), "index.html".into()];
+    });
+
+    let response = run(&state, get(CANON_HOST, "/", None)).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(body_bytes(response.into_body()).as_ref(), STATIC_INDEX);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_scripts_allow_static_children_of_dotted_directories() {
+    const STATIC_FILE: &[u8] = b"ordinary static child";
+    let root = temp_root("disabled-script-dotted-directory");
+    std::fs::create_dir(root.join("assets.php")).unwrap();
+    std::fs::write(root.join("assets.php/logo.png"), STATIC_FILE).unwrap();
+    let state = build_state_inner(root, Vec::new(), Vec::new(), true, None, None, |server| {
+        server.vhosts.get_mut(VHOST).unwrap().enable_script = false;
+    });
+
+    let response = run(&state, get(CANON_HOST, "/assets.php/logo.png", None)).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(body_bytes(response.into_body()).as_ref(), STATIC_FILE);
+
+    let response = run(&state, get(CANON_HOST, "/assets.php", None)).await;
+    assert_eq!(response.status(), http::StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(response.headers()[http::header::LOCATION], "/assets.php/");
+
+    let response = run(&state, get(CANON_HOST, "/missing.php", None)).await;
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_script_directory_candidate_cannot_populate_page_cache() {
+    const STATIC_INDEX: &[u8] = b"cacheable static fallback";
+    let root = temp_root("disabled-script-page-cache");
+    std::fs::write(root.join("index.html"), STATIC_INDEX).unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "CacheLookup public on\n\
+         Header set X-LiteSpeed-Cache-Control \"public,max-age=60\"\n",
+    )
+    .unwrap();
+
+    let new_store = || {
+        let mut cfg = hj_pagecache::StoreConfig::default();
+        // Keep the count specific to origin-page entries; the unified static
+        // body cache is unrelated to the route gate exercised here.
+        cfg.max_static_obj_bytes = 0;
+        Arc::new(hj_pagecache::PageStore::new(cfg))
+    };
+
+    // Positive control: the same cacheable static fallback populates normally
+    // when script execution is allowed and the missing index.php is skipped.
+    let enabled_store = new_store();
+    let enabled_state = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(enabled_store.clone()),
+        None,
+        |server| {
+            Arc::make_mut(
+                server
+                    .vhosts
+                    .get_mut(VHOST)
+                    .unwrap()
+                    .config
+                    .as_mut()
+                    .unwrap(),
+            )
+            .index_files = vec!["index.php".into(), "index.html".into()];
+        },
+    );
+    let response = run(&enabled_state, get(CANON_HOST, "/", None)).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(body_bytes(response.into_body()).as_ref(), STATIC_INDEX);
+    assert_eq!(
+        enabled_store.entry_count(),
+        1,
+        "positive control must store"
+    );
+
+    let disabled_store = new_store();
+    let disabled_state = build_state_inner(
+        root,
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(disabled_store.clone()),
+        None,
+        |server| {
+            let declaration = server.vhosts.get_mut(VHOST).unwrap();
+            declaration.enable_script = false;
+            Arc::make_mut(declaration.config.as_mut().unwrap()).index_files =
+                vec!["index.php".into(), "index.html".into()];
+        },
+    );
+    let response = run(&disabled_state, get(CANON_HOST, "/", None)).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    assert_eq!(body_bytes(response.into_body()).as_ref(), STATIC_INDEX);
+    assert_eq!(
+        disabled_store.entry_count(),
+        0,
+        "the disabled route must not populate an origin-page entry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_scripts_reject_precompressed_directory_index_source() {
+    const SOURCE: &[u8] = b"<?php echo 'logical script source';";
+    const COMPRESSED_SOURCE: &[u8] = b"precompressed-script-source";
+    let root = temp_root("disabled-script-precompressed-index");
+    std::fs::write(root.join("index.php"), SOURCE).unwrap();
+    std::fs::write(root.join("index.php.br"), COMPRESSED_SOURCE).unwrap();
+    let state = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        None,
+        None,
+        |server| {
+            let declaration = server.vhosts.get_mut(VHOST).unwrap();
+            declaration.enable_script = false;
+            Arc::make_mut(declaration.config.as_mut().unwrap()).index_files =
+                vec!["index.php".into()];
+        },
+    );
+    let mut request = get(CANON_HOST, "/", None);
+    request.headers_mut().insert(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_static("br"),
+    );
+
+    let response = run(&state, request).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_bytes(response.into_body());
+    assert_ne!(body.as_ref(), SOURCE);
+    assert_ne!(body.as_ref(), COMPRESSED_SOURCE);
+
+    // The conditional static path used to omit Content-Encoding on its 304,
+    // which hid the logical `.php` suffix from the resolved-target backstop.
+    // `If-None-Match: *` exercises that path without first exposing a 200.
+    let mut conditional = get(CANON_HOST, "/", Some("*"));
+    conditional.headers_mut().insert(
+        http::header::ACCEPT_ENCODING,
+        http::HeaderValue::from_static("br"),
+    );
+    let response = run(&state, conditional).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(response.status(), http::StatusCode::NOT_MODIFIED);
+
+    // A direct representation request has no Content-Encoding metadata, but
+    // the `.br` wrapper must not hide the executable suffix.
+    let response = run(&state, get(CANON_HOST, "/index.php.br", None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(body_bytes(response.into_body()).as_ref(), COMPRESSED_SOURCE);
+
+    // Script routing being enabled does not make compressed PHP source an
+    // executable request; the static fallback must reject it just the same.
+    let enabled = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        None,
+        None,
+        |_| {},
+    );
+    let response = run(&enabled, get(CANON_HOST, "/index.php.br", None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(body_bytes(response.into_body()).as_ref(), COMPRESSED_SOURCE);
+
+    // A file-tier entry can survive a deploy. Seed the vulnerable URL exactly
+    // as an older binary could have stored it, then prove both the on-core and
+    // full lookup paths bypass the hit before exact static-target validation.
+    let mut cache_cfg = hj_pagecache::StoreConfig::default();
+    cache_cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cache_cfg));
+    let cached = build_state_full(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        Some(store.clone()),
+        None,
+    );
+    seed_public_entry(&cached, &store, "/index.php.br", COMPRESSED_SOURCE).await;
+    assert_eq!(store.entry_count(), 1, "precondition: stale entry stored");
+    assert!(
+        fast_serve_get(&cached, "/index.php.br").await.is_none(),
+        "on-core lookup replayed the persisted source entry"
+    );
+    let response = run(&cached, get(CANON_HOST, "/index.php.br", None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(
+        response
+            .headers()
+            .get("x-litespeed-cache")
+            .and_then(|value| value.to_str().ok()),
+        Some("hit")
+    );
+    assert_ne!(body_bytes(response.into_body()).as_ref(), COMPRESSED_SOURCE);
+
+    let mut dir_cache_cfg = hj_pagecache::StoreConfig::default();
+    dir_cache_cfg.standard_cc_vhosts.push(VHOST.into());
+    let dir_store = Arc::new(hj_pagecache::PageStore::new(dir_cache_cfg));
+    let cached_directory = build_state_inner(
+        root,
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(dir_store.clone()),
+        None,
+        |server| {
+            Arc::make_mut(
+                server
+                    .vhosts
+                    .get_mut(VHOST)
+                    .unwrap()
+                    .config
+                    .as_mut()
+                    .unwrap(),
+            )
+            .index_files = vec!["index.php.br".into()];
+        },
+    );
+    seed_public_entry(&cached_directory, &dir_store, "/", COMPRESSED_SOURCE).await;
+    assert_eq!(
+        dir_store.entry_count(),
+        1,
+        "precondition: stale directory entry stored"
+    );
+    assert!(
+        fast_serve_get(&cached_directory, "/").await.is_none(),
+        "on-core lookup replayed a wrapped DirectoryIndex entry"
+    );
+    let response = run(&cached_directory, get(CANON_HOST, "/", None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(
+        response
+            .headers()
+            .get("x-litespeed-cache")
+            .and_then(|value| value.to_str().ok()),
+        Some("hit")
+    );
+    assert_ne!(body_bytes(response.into_body()).as_ref(), COMPRESSED_SOURCE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_script_rewrite_proxy_strips_untrusted_cache_control_headers() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0_u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            assert_ne!(read, 0);
+            head.extend_from_slice(&buf[..read]);
+            assert!(head.len() < 8192);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Length: 2\r\n\
+                  X-LiteSpeed-Purge: *\r\n\
+                  X-LiteSpeed-Cache-Control: public,max-age=60\r\n\
+                  X-LiteSpeed-Tag: T1\r\n\
+                  X-WF-Capsule: max-age=60\r\n\
+                  X-WF-Capsule-Tags: T1\r\n\
+                  Connection: close\r\n\r\nOK",
+            )
+            .await
+            .unwrap();
+    });
+
+    let root = temp_root("disabled-script-rewrite-proxy-cache-control");
+    std::fs::write(
+        root.join(".htaccess"),
+        format!(
+            "RewriteEngine On\n\
+             RewriteRule ^/route\\.php$ http://{address}/upstream [P,L]\n\
+             Header set X-LiteSpeed-Purge \"*\"\n\
+             Header set X-LiteSpeed-Cache-Control \"public,max-age=60\"\n\
+             Header set X-LiteSpeed-Tag \"T-local\"\n\
+             Header set X-LiteSpeed-Vary \"cookie=xf_style_id\"\n"
+        ),
+    )
+    .unwrap();
+    let store = Arc::new(hj_pagecache::PageStore::new(
+        hj_pagecache::StoreConfig::default(),
+    ));
+    let state = build_state_inner(
+        root,
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(store.clone()),
+        None,
+        |server| {
+            server.vhosts.get_mut(VHOST).unwrap().enable_script = false;
+            server.ext_processors.push(hj_core::config::ExtProcessor {
+                name: "rewrite-upstream".into(),
+                kind: hj_core::config::ExtKind::Proxy,
+                address: hj_core::config::ExtAddress::Tcp(address),
+                extra_addresses: Vec::new(),
+                load_balance: Default::default(),
+                client_cert_file: None,
+                client_key_file: None,
+                max_conns: 2,
+                init_timeout: std::time::Duration::from_secs(1),
+                retry_timeout: std::time::Duration::ZERO,
+                pc_keep_alive_timeout: std::time::Duration::from_secs(1),
+                resp_buffer: false,
+                env: Vec::new(),
+                auto_start: 0,
+                path: None,
+                backlog: 0,
+                instances: 0,
+                run_on_startup: 0,
+            });
+        },
+    );
+    let before = store.purge_epoch();
+    let response = run(&state, get(CANON_HOST, "/route.php", None)).await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    for name in [
+        "x-litespeed-purge",
+        "x-litespeed-cache-control",
+        "x-litespeed-tag",
+        "x-litespeed-vary",
+        "x-wf-capsule",
+        "x-wf-capsule-tags",
+    ] {
+        assert!(
+            !response.headers().contains_key(name),
+            "internal cache header leaked: {name}"
+        );
+    }
+    assert!(
+        store.purge_epoch() > before,
+        "trusted local purge directive was ignored"
+    );
+    assert_eq!(store.entry_count(), 0, "disabled route must not be stored");
+    drop(response);
+    upstream.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_handler_overrides_are_classified_before_static_serving() {
+    const SOURCE: &[u8] = b"<?php echo 'handler-forced secret';";
+    for (tag, directive) in [
+        ("sethandler", "SetHandler application/x-httpd-php\n"),
+        ("addhandler", "AddHandler application/x-httpd-php .html\n"),
+        ("addtype", "AddType application/x-httpd-php .html\n"),
+    ] {
+        let root = temp_root(tag);
+        std::fs::create_dir(root.join("errors")).unwrap();
+        std::fs::write(root.join("errors/404.html"), SOURCE).unwrap();
+        std::fs::write(root.join("errors/.htaccess"), directive).unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "ErrorDocument 404 /errors/404.html\n",
+        )
+        .unwrap();
+        let state = build_state_htaccess(root);
+
+        assert_builtin_404_without(run(&state, get(CANON_HOST, "/missing", None)).await, SOURCE);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_declared_cgi_with_missing_processor_never_serves_source() {
+    const SOURCE: &[u8] = b"#!/bin/sh\necho 'cgi error document secret'\n";
+    let root = temp_root("errordoc-missing-fastcgi");
+    std::fs::create_dir(root.join("errors")).unwrap();
+    std::fs::write(root.join("errors/404.fcgi"), SOURCE).unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "ErrorDocument 404 /errors/404.fcgi\n",
+    )
+    .unwrap();
+    let initial = build_state_htaccess(root);
+    let mut with_route = (*initial.server).clone();
+    let vhost = with_route
+        .vhosts
+        .get_mut(VHOST)
+        .unwrap()
+        .config
+        .as_mut()
+        .unwrap();
+    Arc::make_mut(vhost).script_handlers.push(ScriptHandler {
+        suffix: "fcgi".into(),
+        kind: ContextKind::Cgi,
+        handler: "missing-fastcgi".into(),
+    });
+    let state = ServerState::reload(&initial, Arc::new(with_route)).unwrap();
+
+    assert_builtin_404_without(run(&state, get(CANON_HOST, "/missing", None)).await, SOURCE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_target_directory_deny_preserves_original_error() {
+    const PRIVATE: &[u8] = b"private error document";
+    let root = temp_root("errordoc-target-deny");
+    std::fs::create_dir(root.join("private")).unwrap();
+    std::fs::write(root.join("private/404.html"), PRIVATE).unwrap();
+    std::fs::write(root.join("private/.htaccess"), "Require all denied\n").unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "ErrorDocument 404 /private/404.html\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root);
+
+    assert_builtin_404_without(
+        run(&state, get(CANON_HOST, "/missing", None)).await,
+        PRIVATE,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_target_directory_rewrite_forbidden_preserves_original_error() {
+    const PRIVATE: &[u8] = b"rewrite-protected error document";
+    let root = temp_root("errordoc-target-rewrite-forbidden");
+    std::fs::create_dir(root.join("private")).unwrap();
+    std::fs::write(root.join("private/404.html"), PRIVATE).unwrap();
+    std::fs::write(
+        root.join("private/.htaccess"),
+        "RewriteEngine On\nRewriteRule ^404\\.html$ - [F]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "ErrorDocument 404 /private/404.html\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root);
+
+    assert_builtin_404_without(
+        run(&state, get(CANON_HOST, "/missing", None)).await,
+        PRIVATE,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_target_does_not_inherit_source_setenvif() {
+    const PRIVATE: &[u8] = b"env-protected error document";
+    let root = temp_root("errordoc-target-env-isolation");
+    std::fs::create_dir(root.join("private")).unwrap();
+    std::fs::write(root.join("private/404.html"), PRIVATE).unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "SetEnvIf Request_URI ^/missing$ SOURCE_PATH=1\n\
+         ErrorDocument 404 /private/404.html\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("private/.htaccess"),
+        "Order deny,allow\nDeny from all\nAllow from env=SOURCE_PATH\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root);
+
+    assert_builtin_404_without(
+        run(&state, get(CANON_HOST, "/missing", None)).await,
+        PRIVATE,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn errordocument_public_static_target_keeps_original_status() {
+    const CUSTOM: &[u8] = b"custom public 404";
+    let root = temp_root("errordoc-static-control");
+    std::fs::create_dir(root.join("errors")).unwrap();
+    std::fs::write(root.join("errors/404.html"), CUSTOM).unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "ErrorDocument 404 /errors/404.html\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root);
+
+    let response = run(&state, get(CANON_HOST, "/missing", None)).await;
+    assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+    assert_eq!(body_bytes(response.into_body()).as_ref(), CUSTOM);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_normalized_script_handler_fails_closed() {
+    let root = temp_root("unsupported-script-handler");
+    const SOURCE: &[u8] = b"<?php echo 'must never be served';";
+    std::fs::create_dir(root.join("errors")).unwrap();
+    std::fs::write(root.join("app.tmpl"), SOURCE).unwrap();
+    std::fs::write(root.join("errors/404.tmpl"), SOURCE).unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "ErrorDocument 404 /errors/404.tmpl\n",
+    )
+    .unwrap();
+
+    // Parser-built configurations reject this kind. Construct the normalized
+    // model directly to exercise the runtime defense independently.
+    let initial = build_state_htaccess(root);
+    let mut next = (*initial.server).clone();
+    let vhost = next.vhosts.get_mut(VHOST).unwrap().config.as_mut().unwrap();
+    Arc::make_mut(vhost).script_handlers.push(ScriptHandler {
+        suffix: "tmpl".into(),
+        kind: ContextKind::Other,
+        handler: "misspelled-type".into(),
+    });
+    let routed = ServerState::reload(&initial, Arc::new(next)).unwrap();
+
+    let response = run(&routed, get(CANON_HOST, "/app.tmpl", None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(body_bytes(response.into_body()).as_ref(), SOURCE);
+
+    let mut disabled = (*routed.server).clone();
+    disabled.vhosts.get_mut(VHOST).unwrap().enable_script = false;
+    let disabled = ServerState::reload(&routed, Arc::new(disabled)).unwrap();
+    let response = run(&disabled, get(CANON_HOST, "/app.tmpl", None)).await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(body_bytes(response.into_body()).as_ref(), SOURCE);
+
+    assert_builtin_404_without(
+        run(&disabled, get(CANON_HOST, "/missing", None)).await,
+        SOURCE,
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn waf_runs_before_static_cache_and_can_block_a_previously_allowed_path() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -669,6 +1262,171 @@ async fn static_context_resolved_location_in_access_deny_dir_is_forbidden() {
     assert_eq!(resp.status(), 403);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_context_alternate_root_never_serves_or_replays_script_source() {
+    use std::os::unix::fs::symlink;
+
+    const SOURCE: &[u8] = b"<?php echo 'alternate-root secret';";
+    let doc_root = temp_root("alternate-script-docroot");
+    let context_root = temp_root("alternate-script-context");
+    std::fs::write(
+        doc_root.join(".htaccess"),
+        "DirectoryIndex index.php\n\
+         <Files \"forced.html\">\n\
+         SetHandler application/x-httpd-php\n\
+         </Files>\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(context_root.join("assets")).unwrap();
+    std::fs::write(context_root.join("assets/secret.php"), SOURCE).unwrap();
+    std::fs::write(context_root.join("assets/public.txt"), b"public").unwrap();
+    std::fs::write(context_root.join("assets/payload.txt"), SOURCE).unwrap();
+    symlink("payload.txt", context_root.join("assets/linked.php")).unwrap();
+    symlink("payload.txt", context_root.join("assets/forced.html")).unwrap();
+    std::fs::create_dir_all(context_root.join("assets/dir")).unwrap();
+    std::fs::write(context_root.join("assets/dir/payload.txt"), SOURCE).unwrap();
+    symlink("payload.txt", context_root.join("assets/dir/index.php")).unwrap();
+    let context = Context {
+        cache_policy: None,
+        bandwidth_limit: 0,
+        max_body_override: None,
+        timeout_override: None,
+        sub_filter: None,
+        kind: ContextKind::Static,
+        uri: "/assets".into(),
+        location: Some(context_root),
+        handler: None,
+        enabled: true,
+        extra_headers: Vec::new(),
+        add_default_charset: false,
+        charset: None,
+    };
+    let mut cache_cfg = hj_pagecache::StoreConfig::default();
+    cache_cfg.standard_cc_vhosts.push(VHOST.into());
+    cache_cfg.max_static_obj_bytes = 0;
+    let store = Arc::new(hj_pagecache::PageStore::new(cache_cfg));
+    let state = build_state_full(
+        doc_root.clone(),
+        vec![context],
+        // A nonmatching rule forces canonical target collection and covers the
+        // exact policy shape that previously lost the declared symlink name.
+        vec![format!("{}/*", doc_root.join("unrelated-deny").display())],
+        Some(store.clone()),
+        None,
+    );
+
+    let public = run(&state, get(CANON_HOST, "/assets/public.txt", None)).await;
+    assert_eq!(public.status(), http::StatusCode::OK);
+    assert_eq!(body_bytes(public.into_body()), "public");
+
+    for path in [
+        "/assets/secret.php",
+        "/assets/linked.php",
+        "/assets/forced.html",
+        "/assets/dir/",
+    ] {
+        let entries_before = store.entry_count();
+        seed_public_entry(&state, &store, path, SOURCE).await;
+        assert_eq!(
+            store.entry_count(),
+            entries_before + 1,
+            "precondition: seeded cache entry missing for {path}"
+        );
+        assert!(
+            fast_serve_get(&state, path).await.is_none(),
+            "on-core lookup replayed alternate-root script source for {path}"
+        );
+        let response = run(&state, get(CANON_HOST, path, None)).await;
+        assert_eq!(
+            response.status(),
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "static fallback was not denied for {path}"
+        );
+        assert_ne!(
+            response
+                .headers()
+                .get("x-litespeed-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("hit"),
+            "stale script source was replayed for {path}"
+        );
+        assert_ne!(body_bytes(response.into_body()).as_ref(), SOURCE, "{path}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlink_alias_to_script_never_serves_any_static_response_shape() {
+    use std::os::unix::fs::symlink;
+
+    const SOURCE: &[u8] = b"<?php echo 'symlink secret';";
+    let root = temp_root("symlink-script-target");
+    std::fs::write(root.join("real.php"), SOURCE).unwrap();
+    symlink("real.php", root.join("alias.txt")).unwrap();
+    let state = build_state_with(root, Vec::new(), Vec::new());
+
+    assert!(
+        fast_serve_get(&state, "/alias.txt").await.is_none(),
+        "on-core static path served a symlinked script target"
+    );
+
+    let ordinary = run(&state, get(CANON_HOST, "/alias.txt", None)).await;
+    assert_eq!(ordinary.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_ne!(body_bytes(ordinary.into_body()).as_ref(), SOURCE);
+
+    let conditional = run(&state, get(CANON_HOST, "/alias.txt", Some("*"))).await;
+    assert_eq!(
+        conditional.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "the 304 branch bypassed script-target classification"
+    );
+
+    let ranged = http::Request::builder()
+        .method("GET")
+        .uri("/alias.txt")
+        .header(header::HOST, CANON_HOST)
+        .header(header::RANGE, "bytes=0-3")
+        .body(hj_core::empty_incoming())
+        .unwrap();
+    let ranged = run(&state, ranged).await;
+    assert_eq!(
+        ranged.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "the 206 branch bypassed script-target classification"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlink_resolve_memo_refreshes_canonical_policy_target() {
+    use std::os::unix::fs::symlink;
+
+    const SOURCE: &[u8] = b"<?php echo 'same-inode secret';";
+    let root = temp_root("symlink-script-memo");
+    let public = root.join("public.txt");
+    let script = root.join("secret.php");
+    let alias = root.join("alias.txt");
+    std::fs::write(&public, SOURCE).unwrap();
+    std::fs::hard_link(&public, &script).unwrap();
+    symlink("public.txt", &alias).unwrap();
+    let state = build_state_with(root, Vec::new(), Vec::new());
+
+    let first = run(&state, get(CANON_HOST, "/alias.txt", None)).await;
+    assert_eq!(first.status(), http::StatusCode::OK);
+    assert_eq!(body_bytes(first.into_body()).as_ref(), SOURCE);
+
+    std::fs::remove_file(&alias).unwrap();
+    symlink("secret.php", &alias).unwrap();
+    let second = run(&state, get(CANON_HOST, "/alias.txt", None)).await;
+    assert_eq!(
+        second.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "same-inode memo replay retained the old safe-looking target name"
+    );
+    assert_ne!(body_bytes(second.into_body()).as_ref(), SOURCE);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn static_context_default_charset_applies_without_other_overrides() {
     let doc_root = temp_root("context-charset");
@@ -841,6 +1599,7 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
         request_id: Default::default(),
     };
     let cc = crate::lscache::CacheCtx {
+        enabled: true,
         method: &method,
         host: CANON_HOST,
         cookie: None,
@@ -970,6 +1729,7 @@ async fn seed_public_entry(
         request_id: Default::default(),
     };
     let cc = crate::lscache::CacheCtx {
+        enabled: true,
         method: &method,
         host: CANON_HOST,
         cookie: None,
@@ -1373,6 +2133,7 @@ RewriteRule ^.*$ index.php [NC,L]
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[tokio::test]
     async fn stores_then_replays_byte_identically_under_the_forum_chain() {
         let (root, state) = setup("memo_basic", FORUM_HTACCESS);
         let ua = ("user-agent", "Mozilla/5.0 Chrome/120");
@@ -1663,6 +2424,50 @@ async fn geo_acl_denies_by_resolved_client_ip() {
         resp.status(),
         http::StatusCode::OK,
         "loopback (the peer) is not in any denied range"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_throttle_uses_resolved_forwarded_identity() {
+    let doc_root = temp_root("client-throttle-e2e");
+    std::fs::write(doc_root.join("page.html"), b"<html>ok</html>").unwrap();
+    let state = build_state_inner(doc_root, Vec::new(), Vec::new(), false, None, None, |cfg| {
+        cfg.tuning.per_ip_rate = 1;
+        cfg.tuning.per_ip_rate_window = std::time::Duration::from_secs(60);
+        cfg.use_ip_in_proxy_header = 2;
+        cfg.security.access_control = vec![hj_core::config::AccessRule {
+            spec: "127.0.0.0/8".into(),
+            trusted: true,
+            allow: true,
+        }];
+    });
+
+    let first = get_with(
+        CANON_HOST,
+        "/page.html",
+        &[("CF-Connecting-IP", "203.0.113.10")],
+    );
+    assert_eq!(run_tls(&state, first).await.status(), http::StatusCode::OK);
+
+    let repeated = get_with(
+        CANON_HOST,
+        "/page.html",
+        &[("CF-Connecting-IP", "203.0.113.10")],
+    );
+    assert_eq!(
+        run_tls(&state, repeated).await.status(),
+        http::StatusCode::TOO_MANY_REQUESTS
+    );
+
+    let independent = get_with(
+        CANON_HOST,
+        "/page.html",
+        &[("CF-Connecting-IP", "203.0.113.11")],
+    );
+    assert_eq!(
+        run_tls(&state, independent).await.status(),
+        http::StatusCode::OK,
+        "clients behind one trusted proxy must have independent rate windows"
     );
 }
 

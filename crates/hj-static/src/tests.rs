@@ -469,6 +469,16 @@ fn read_file_body(b: &Body) -> Vec<u8> {
     if let Some(bytes) = file.cached_ranged() {
         return bytes.to_vec();
     }
+    if let Some(selected) = file.file.as_ref() {
+        use std::os::unix::fs::FileExt;
+        let (offset, len) = match file.range {
+            Some((start, end)) => (start, (end - start + 1) as usize),
+            None => (0, file.len as usize),
+        };
+        let mut bytes = vec![0; len];
+        selected.read_exact_at(&mut bytes, offset).unwrap();
+        return bytes;
+    }
     let bytes = fs::read(&file.path).unwrap();
     match file.range {
         Some((start, end)) => bytes[start as usize..=end as usize].to_vec(),
@@ -521,8 +531,8 @@ async fn serves_existing_file_200() {
 
 #[tokio::test]
 async fn range_on_symlink_off_vhost_serves_only_the_slice() {
-    // With `followSymbolLink off` the handler reads the selected range from the
-    // pinned descriptor. It must not materialize the whole entity.
+    // With `followSymbolLink off` the handler streams the selected range from the
+    // pinned descriptor. It must not materialize either the range or whole entity.
     let root = temp_root("rangesymoff");
     let data: Vec<u8> = (0u32..1000).map(|i| (i % 251) as u8).collect();
     fs::write(root.join("blob.bin"), &data).unwrap();
@@ -542,10 +552,13 @@ async fn range_on_symlink_off_vhost_serves_only_the_slice() {
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(resp.headers()[CONTENT_LENGTH], "10");
     assert_eq!(resp.headers()[CONTENT_RANGE], "bytes 10-19/1000");
-    match resp.into_body() {
-        Body::Full(served) => assert_eq!(&served[..], &data[10..=19]),
-        _ => panic!("expected a bounded verified range body"),
-    }
+    let Body::File(file) = resp.body() else {
+        panic!("expected a pinned file range body")
+    };
+    assert!(file.file.is_some());
+    assert!(file.cached.is_none());
+    assert_eq!(file.range, Some((10, 19)));
+    assert_eq!(read_file_body(resp.body()), data[10..=19]);
     fs::remove_dir_all(&root).ok();
 }
 
@@ -575,10 +588,16 @@ async fn tiny_verified_range_does_not_buffer_oversized_sparse_entity() {
     let resp = serve(&mut ctx, request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(resp.headers()[CONTENT_LENGTH], "1");
-    let Body::Full(body) = resp.into_body() else {
-        panic!("verified range must be bounded in memory")
+    let Body::File(file) = resp.body() else {
+        panic!("verified range must retain its pinned descriptor")
     };
-    assert_eq!(&body[..], b"Z");
+    assert!(file.file.is_some());
+    assert!(file.cached.is_none());
+    assert_eq!(
+        file.range,
+        Some((513 * 1024 * 1024 - 1, 513 * 1024 * 1024 - 1))
+    );
+    assert_eq!(read_file_body(resp.body()), b"Z");
     fs::remove_dir_all(&root).ok();
 }
 
@@ -842,38 +861,6 @@ async fn resolve_cache_hit_retains_a_descriptor_for_the_memoized_inode() {
     fs::remove_dir_all(&root).ok();
 }
 
-#[test]
-fn verified_buffer_reads_the_resolved_descriptor_after_path_replacement() {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let root = temp_root("verified-fd-replace");
-    let path = root.join("a.txt");
-    fs::write(&path, b"old selected").unwrap();
-    let file = fs::File::open(&path).unwrap();
-    let meta = file.metadata().unwrap();
-    let resolved = ResolvedFile {
-        path: path.clone(),
-        len: meta.len(),
-        mtime: meta.modified().unwrap(),
-        inode: meta.ino(),
-        dev: meta.dev(),
-        resolved_path: fs::canonicalize(&path).unwrap(),
-        file: Some(file),
-    };
-
-    let replacement = root.join("replacement.txt");
-    fs::write(&replacement, b"new pathname").unwrap();
-    fs::rename(replacement, &path).unwrap();
-    assert_eq!(fs::read(&path).unwrap(), b"new pathname");
-    assert_eq!(
-        read_verified_file(&resolved).unwrap(),
-        bytes::Bytes::from_static(b"old selected"),
-        "buffering must stay on the inode whose metadata supplied the response validators"
-    );
-
-    fs::remove_dir_all(&root).ok();
-}
-
 #[tokio::test]
 async fn head_has_no_body() {
     let root = temp_root("head");
@@ -1043,11 +1030,10 @@ async fn directory_index_traversal_rejected() {
 }
 
 #[tokio::test]
-async fn no_symlink_vhost_serves_from_verified_bytes_not_path_reopen() {
-    // (#10) With followSymbolLink off, the response body must carry bytes read through a fresh
-    // symlink-safe open (FileBody.cached), so the transport never re-opens the followable path —
-    // closing the resolve->serve TOCTOU. With symlinks allowed (the prod setting), the body stays
-    // path-based (cached: None) so the zero-copy hot path is unchanged.
+async fn no_symlink_vhost_pins_selected_inode_without_buffering() {
+    // With followSymbolLink off, the response body carries the exact descriptor selected by the
+    // confined open. Replacing the pathname after resolution cannot change the served bytes, and
+    // the handler does not allocate a whole-file cache entry per request.
     let root = temp_root("nosym-cached");
     fs::write(root.join("hello.txt"), b"verified-bytes").unwrap();
 
@@ -1061,18 +1047,20 @@ async fn no_symlink_vhost_serves_from_verified_bytes_not_path_reopen() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    match resp.body() {
-        Body::File(f) => {
-            let c = f
-                .cached
-                .as_ref()
-                .expect("followSymbolLink off must serve verified cached bytes");
-            assert_eq!(&c[..], b"verified-bytes");
-        }
-        _ => panic!("expected Body::File"),
-    }
+    let Body::File(file) = resp.body() else {
+        panic!("expected Body::File")
+    };
+    assert!(file.file.is_some(), "selected inode must remain pinned");
+    assert!(
+        file.cached.is_none(),
+        "handler must not buffer the whole file"
+    );
+    fs::write(root.join("replacement.txt"), b"new-path-bytes").unwrap();
+    fs::rename(root.join("replacement.txt"), root.join("hello.txt")).unwrap();
+    assert_eq!(fs::read(root.join("hello.txt")).unwrap(), b"new-path-bytes");
+    assert_eq!(read_file_body(resp.body()), b"verified-bytes");
 
-    // allow_symbol_link = true (prod): path-based body, no cached bytes (hot path unchanged).
+    // Symlink-following mode also carries its selected descriptor and no duplicate body.
     let vhost2 = Arc::new(VHostConfig {
         doc_root: root.clone(),
         allow_symbol_link: true,
@@ -1083,10 +1071,10 @@ async fn no_symlink_vhost_serves_from_verified_bytes_not_path_reopen() {
         .await
         .unwrap();
     match resp2.body() {
-        Body::File(f) => assert!(
-            f.cached.is_none(),
-            "symlinks allowed -> path-based body, no cached"
-        ),
+        Body::File(f) => {
+            assert!(f.file.is_some());
+            assert!(f.cached.is_none());
+        }
         _ => panic!("expected Body::File"),
     }
 
@@ -1130,12 +1118,7 @@ async fn symlink_followed_when_allowed() {
         allow_symbol_link: true,
         ..Default::default()
     });
-    // One deny rule (never matched here) keeps the canonical fd path computation on —
-    // this test asserts the symlink-resolved target, which the (#285) skip elides when
-    // no accessDenyDir is configured.
-    let mut server = make_server();
-    server.security.access_deny_dir = vec!["/nonexistent-denied/*".into()];
-    let mut ctx = make_ctx(Arc::new(server), vhost);
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
     let resp = serve(&mut ctx, req(Method::GET, "/alias.txt"))
         .await
         .unwrap();
@@ -1149,6 +1132,11 @@ async fn symlink_followed_when_allowed() {
         target.0,
         fs::canonicalize(root.join("pub/real.txt")).unwrap()
     );
+    let lexical = resp
+        .extensions()
+        .get::<LexicalTargetPath>()
+        .expect("lexical symlink target extension");
+    assert_eq!(lexical.0, root.join("pub/alias.txt"));
     fs::remove_dir_all(&root).ok();
 }
 
@@ -1736,8 +1724,9 @@ fn open_beneath_refuses_fifo_without_blocking() {
     );
     let root_fd = open_dir(&root).unwrap();
 
-    // allow_symlink=true exercises the plain-openat arm (the one that used to
-    // block); no writer exists, so a blocking open would never return.
+    // allow_symlink=true permits the fallback arm, but the no-symlink openat2
+    // attempt still uses O_NONBLOCK; no writer exists, so a blocking open would
+    // never return.
     let res = open_beneath(&root_fd, "stall", true);
     assert!(res.is_err(), "a FIFO must be refused, not served");
     fs::remove_dir_all(&root).ok();

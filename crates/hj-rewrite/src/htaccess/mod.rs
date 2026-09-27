@@ -24,7 +24,9 @@ use crate::rules::RuleSet;
 
 pub use cache::{CacheDirectives, CacheKeyModifier, cache_directives, chain_cacheable_for_default};
 pub use mod_access::{AccessOrder, AccessSubject, HostAccess, HostEntry};
-pub use php::{ResolvedPhp, php_directives, php_handler_forced};
+#[allow(unused_imports)]
+// Public downstream API; this crate does not call the iterator itself.
+pub use php::{ResolvedPhp, php_directives, php_handler_forced, php_handler_forced_iter};
 pub use scope_index::ScopeIndex;
 
 pub(crate) use scope_index::{build_access_index, build_header_index};

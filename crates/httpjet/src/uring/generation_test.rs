@@ -991,7 +991,15 @@ async fn quic_owner_survives_trust_publication_and_requires_matching_policy() {
         bridge,
         false,
         h3::H3RuntimeConfig::new(
-            || (h3::H3RequestLimits::new(16_384, 1024), 8),
+            || {
+                (
+                    h3::H3RequestConfig::new(
+                        h3::H3RequestLimits::new(16_384, 1024),
+                        Some(std::time::Duration::from_secs(30)),
+                    ),
+                    8,
+                )
+            },
             initial.metrics.active_conns.clone(),
             initial.body_budget.clone(),
         )
@@ -1123,7 +1131,15 @@ async fn live_quic_reload_pins_established_and_updates_fresh_connections() {
         bridge,
         false,
         h3::H3RuntimeConfig::new(
-            || (h3::H3RequestLimits::new(16_384, 1024), 8),
+            || {
+                (
+                    h3::H3RequestConfig::new(
+                        h3::H3RequestLimits::new(16_384, 1024),
+                        Some(std::time::Duration::from_secs(30)),
+                    ),
+                    8,
+                )
+            },
             initial.metrics.active_conns.clone(),
             initial.body_budget.clone(),
         )

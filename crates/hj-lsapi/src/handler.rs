@@ -385,9 +385,18 @@ fn collapse_rel(rel: &str) -> PathBuf {
     out
 }
 
-#[async_trait]
-impl Handler for Lsapi {
-    async fn handle(&self, ctx: &mut ReqCtx, mut req: Request) -> Result<Response, HandlerError> {
+impl Lsapi {
+    /// Dispatch while returning the consumed request's head to the caller. The
+    /// server pipeline needs the original headers only if post-dispatch target
+    /// auth or ErrorDocument policy runs. Consuming the request lets the
+    /// Content-Length path move its body into the LSAPI pump without allocating
+    /// an empty boxed replacement, while still avoiding an unconditional
+    /// HeaderMap clone on every successful PHP request.
+    pub async fn handle_retaining_head(
+        &self,
+        ctx: &mut ReqCtx,
+        mut req: Request,
+    ) -> (Result<Response, HandlerError>, http::request::Parts) {
         let script = self.script_filename(ctx, &req);
 
         // Resolve a pipeline-supplied SCRIPT_NAME / PATH_INFO split + the php.ini
@@ -435,28 +444,26 @@ impl Handler for Lsapi {
             }
             None => {
                 let (b, lease) =
-                    collect_to_cap(req.body_mut(), self.max_body, &self.body_budget).await?;
+                    match collect_to_cap(req.body_mut(), self.max_body, &self.body_budget).await {
+                        Ok(collected) => collected,
+                        Err(error) => {
+                            let (parts, _) = req.into_parts();
+                            return (Err(error), parts);
+                        }
+                    };
                 _body_lease = Some(lease);
                 Some(b)
             }
         };
-        if let Some(b) = &buffered {
-            let value = http::HeaderValue::from_str(&b.len().to_string())
-                .map_err(|_| HandlerError::PayloadTooLarge)?;
-            req.headers_mut()
-                .insert(http::header::CONTENT_LENGTH, value);
-        }
+        let buffered_len = buffered.as_ref().map(|body| body.len().to_string());
 
         // Build the CGI env + raw wire headers (both borrow `req`). lsphp reads
         // $_SERVER HTTP_* / getallheaders() from the LSAPI header index over this
         // header block, NOT the CGI env table, so they are sent there too.
-        let env = builder.build(&req, ctx);
-        let mut headers = collect_wire_headers(&req);
-        // Synthesize Content-Length for the chunked path so lsphp's CGI env /
-        // header index agree (and a -2 re-read still finds a concrete value).
-        if let Some(b) = &buffered {
-            inject_content_length(&mut headers, b.len());
-        }
+        let env = builder.build_with_content_length(&req, ctx, buffered_len.as_deref());
+        // Synthesize Content-Length only in the LSAPI wire view.  The retained
+        // request head remains byte-for-byte faithful for later policy checks.
+        let headers = collect_wire_headers(&req, buffered_len.as_deref());
 
         // (#3 LSAPI u16 length truncation) Every CGI env pair and every wire-order
         // header is length-prefixed with a big-endian u16 in the BEGIN_REQUEST
@@ -473,7 +480,10 @@ impl Handler for Lsapi {
             || lsapi_fields_overflow_u16(&headers)
             || lsapi_special_env_overflow_u16(&special_env)
         {
-            return Err(HandlerError::RequestHeaderFieldsTooLarge);
+            drop(env);
+            drop(headers);
+            let (parts, _) = req.into_parts();
+            return (Err(HandlerError::RequestHeaderFieldsTooLarge), parts);
         }
 
         // EARLY 413: if the client DECLARED a Content-Length over the cap, reject
@@ -481,11 +491,17 @@ impl Handler for Lsapi {
         // already enforced the cap incrementally inside collect_to_cap above.
         if let Some(len) = declared_len {
             if len > self.max_body {
-                return Err(HandlerError::PayloadTooLarge);
+                drop(env);
+                drop(headers);
+                let (parts, _) = req.into_parts();
+                return (Err(HandlerError::PayloadTooLarge), parts);
             }
             // We also refuse anything that cannot fit lsphp's i32 m_reqBodyLen.
             if len > i32::MAX as u64 {
-                return Err(HandlerError::PayloadTooLarge);
+                drop(env);
+                drop(headers);
+                let (parts, _) = req.into_parts();
+                return (Err(HandlerError::PayloadTooLarge), parts);
             }
         }
 
@@ -503,6 +519,7 @@ impl Handler for Lsapi {
         build_begin_request_framed_into(&mut begin, &env, &special_env, &headers, body_len);
         drop(env);
         drop(headers);
+        let (parts, body) = req.into_parts();
 
         // `begin` is owned here and only borrowed (`&[u8]`) by the dispatch/retry
         // path, so it can be recycled to the per-thread freelist once dispatch
@@ -517,6 +534,7 @@ impl Handler for Lsapi {
         let mut inflight: Option<InFlightGuard> = None;
         let result = match buffered {
             Some(buffered) => {
+                drop(body);
                 self.dispatch_buffered_retrying(
                     idempotent,
                     is_head,
@@ -527,7 +545,6 @@ impl Handler for Lsapi {
                 .await
             }
             None => {
-                let (_parts, body) = req.into_parts();
                 self.dispatch_streaming_retrying(
                     idempotent,
                     is_head,
@@ -541,7 +558,14 @@ impl Handler for Lsapi {
         };
         return_begin_buf(begin);
         drop(inflight);
-        result
+        (result, parts)
+    }
+}
+
+#[async_trait]
+impl Handler for Lsapi {
+    async fn handle(&self, ctx: &mut ReqCtx, req: Request) -> Result<Response, HandlerError> {
+        self.handle_retaining_head(ctx, req).await.0
     }
 }
 
@@ -1848,18 +1872,6 @@ fn lsapi_special_env_overflow_u16(fields: &[(SpecialEnvType, String, String)]) -
 /// Insert or overwrite a `Content-Length` header in the wire-order header list so
 /// the synthesized concrete length is visible to lsphp's header index (and a `-2`
 /// re-read would still find it). Case-insensitive on the existing name.
-fn inject_content_length<'r>(headers: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>, len: usize) {
-    let value = len.to_string();
-    if let Some(slot) = headers
-        .iter_mut()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-    {
-        slot.1 = Cow::Owned(value);
-    } else {
-        headers.push((Cow::Borrowed("content-length"), Cow::Owned(value)));
-    }
-}
-
 /// Collect the request headers in wire order for lsphp's LSAPI header index
 /// (the source of `getallheaders()` / `$_SERVER` HTTP_* on the SAPI side).
 ///
@@ -1869,17 +1881,28 @@ fn inject_content_length<'r>(headers: &mut Vec<(Cow<'r, str>, Cow<'r, str>)>, le
 /// env table; both LSAPI feeds must be filtered.
 ///
 /// Non-UTF-8 header values (obs-text per RFC 7230) are accepted via lossy conversion.
-fn collect_wire_headers(req: &Request) -> Vec<(Cow<'_, str>, Cow<'_, str>)> {
-    req.headers()
+fn collect_wire_headers<'r>(
+    req: &'r Request,
+    content_length: Option<&'r str>,
+) -> Vec<(Cow<'r, str>, Cow<'r, str>)> {
+    let mut headers: Vec<_> = req
+        .headers()
         .iter()
-        .filter(|(name, _)| !name.as_str().eq_ignore_ascii_case("proxy"))
+        .filter(|(name, _)| {
+            !name.as_str().eq_ignore_ascii_case("proxy")
+                && !(content_length.is_some() && *name == http::header::CONTENT_LENGTH)
+        })
         .map(|(name, value)| {
             let v = value.to_str().map(Cow::Borrowed).unwrap_or_else(|_| {
                 Cow::Owned(String::from_utf8_lossy(value.as_bytes()).into_owned())
             });
             (Cow::Borrowed(name.as_str()), v)
         })
-        .collect()
+        .collect();
+    if let Some(length) = content_length {
+        headers.push((Cow::Borrowed("content-length"), Cow::Borrowed(length)));
+    }
+    headers
 }
 
 fn log_stderr(body: &[u8]) {
@@ -2193,7 +2216,7 @@ mod wire_header_tests {
             .header("User-Agent", "curl/8")
             .body(empty_incoming_body())
             .unwrap();
-        let headers = collect_wire_headers(&req);
+        let headers = collect_wire_headers(&req, None);
         assert!(
             !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("proxy")),
             "Proxy header must be stripped from the LSAPI wire header index"
@@ -2205,6 +2228,23 @@ mod wire_header_tests {
                 .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
         );
         assert!(headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")));
+    }
+
+    #[test]
+    fn concrete_body_length_does_not_mutate_the_request_head() {
+        let req = http::Request::builder()
+            .uri("/index.php")
+            .header("Content-Length", "malformed")
+            .body(empty_incoming_body())
+            .unwrap();
+        let headers = collect_wire_headers(&req, Some("3"));
+        let lengths: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.as_ref())
+            .collect();
+        assert_eq!(lengths, ["3"]);
+        assert_eq!(req.headers()[http::header::CONTENT_LENGTH], "malformed");
     }
 }
 

@@ -11,12 +11,34 @@ pub(super) async fn enforce_chain(
     request_path: &str,
     authenticated: &mut Vec<AuthRealm>,
 ) -> Result<(), Response> {
-    if !chain.iter().any(|ht| ht.has_auth()) {
+    enforce_chain_iter(
+        ctx,
+        headers,
+        chain.iter().map(AsRef::as_ref),
+        path,
+        request_path,
+        authenticated,
+    )
+    .await
+}
+
+pub(super) async fn enforce_chain_iter<'a, I>(
+    ctx: &mut ReqCtx,
+    headers: &http::HeaderMap,
+    chain: I,
+    path: &str,
+    request_path: &str,
+    authenticated: &mut Vec<AuthRealm>,
+) -> Result<(), Response>
+where
+    I: Clone + Iterator<Item = &'a Htaccess>,
+{
+    if !chain.clone().any(Htaccess::has_auth) {
         return Ok(());
     }
     let filesystem_path = ctx.vhost.doc_root.join(path.trim_start_matches('/'));
     let realm = match hj_rewrite::resolve_auth_for_request(
-        chain.iter().map(AsRef::as_ref),
+        chain,
         path,
         request_path,
         Some(filesystem_path.to_string_lossy().as_ref()),
@@ -157,12 +179,12 @@ pub(super) fn target_has_auth(
         return false;
     }
     let indexes = effective_index_files(state, ctx, chain);
-    let candidates =
-        if let Some((script, _, _)) = split_script_path(state, ctx, path, indexes, chain) {
-            vec![(path.to_owned(), script)]
-        } else {
-            static_candidates(state, ctx, path, chain)
-        };
+    let script = split_script_path(state, ctx, path, indexes, chain);
+    let candidates = if let Some((script, _, _)) = script {
+        vec![(path.to_owned(), script)]
+    } else {
+        static_candidates(state, ctx, path, chain)
+    };
     candidates.into_iter().any(|(_, lexical)| {
         let Ok(target) = opened_target_path(&lexical) else {
             return false;

@@ -205,17 +205,27 @@ where
     }
 }
 
-/// The longest-matching enabled proxy context for `path`, returning its handler.
-pub(super) fn matching_proxy_context(ctx: &ReqCtx, path: &str) -> Option<String> {
+/// The longest-matching enabled proxy context for `path`. The match remains
+/// visible when its handler is absent so callers can fail closed instead of
+/// confusing an invalid match with no proxy context.
+fn matching_proxy_context_in<'a>(
+    contexts: &'a [hj_core::config::Context],
+    path: &str,
+) -> Option<&'a hj_core::config::Context> {
     use hj_core::config::ContextKind;
-    ctx.vhost
-        .contexts
+    contexts
         .iter()
         .filter(|c| {
             c.kind == ContextKind::Proxy && c.enabled && super::context_uri_matches(path, &c.uri)
         })
         .max_by_key(|c| c.uri.len())
-        .and_then(|c| c.handler.clone())
+}
+
+pub(super) fn matching_proxy_context<'a>(
+    ctx: &'a ReqCtx,
+    path: &str,
+) -> Option<&'a hj_core::config::Context> {
+    matching_proxy_context_in(&ctx.vhost.contexts, path)
 }
 
 /// Resolve a proxy-context handler name to a [`ProxyTarget`]. (#3) Vhost-local
@@ -233,13 +243,14 @@ pub(super) fn resolve_proxy_target(
         .iter()
         .find(|e| e.name == handler)
     {
-        return Some(
-            ProxyTarget::from_ext_processor(ep).in_scope(format!("vhost:{}", ctx.vhost_name)),
-        );
+        return (ep.kind == hj_core::config::ExtKind::Proxy).then(|| {
+            ProxyTarget::from_ext_processor(ep).in_scope(format!("vhost:{}", ctx.vhost_name))
+        });
     }
     state
         .ext_by_name
         .get(handler)
+        .filter(|processor| processor.kind == hj_core::config::ExtKind::Proxy)
         .map(ProxyTarget::from_ext_processor)
 }
 
@@ -247,6 +258,37 @@ pub(super) fn resolve_proxy_target(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn context(uri: &str, handler: Option<&str>, enabled: bool) -> hj_core::config::Context {
+        hj_core::config::Context {
+            kind: hj_core::config::ContextKind::Proxy,
+            uri: uri.into(),
+            location: None,
+            handler: handler.map(str::to_string),
+            enabled,
+            extra_headers: Vec::new(),
+            add_default_charset: false,
+            charset: None,
+            cache_policy: None,
+            max_body_override: None,
+            bandwidth_limit: 0,
+            timeout_override: None,
+            sub_filter: None,
+        }
+    }
+
+    #[test]
+    fn longest_proxy_match_is_preserved_when_its_handler_is_missing() {
+        let contexts = vec![
+            context("/", Some("fallback"), true),
+            context("/api", None, true),
+            context("/api/private", Some("disabled"), false),
+        ];
+        let matched = matching_proxy_context_in(&contexts, "/api/private/report")
+            .expect("the enabled /api context must remain the effective match");
+        assert_eq!(matched.uri, "/api");
+        assert!(matched.handler.is_none());
+    }
 
     #[tokio::test]
     async fn uring_upgrade_relay_moves_bytes_both_directions() {

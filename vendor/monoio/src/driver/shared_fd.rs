@@ -325,24 +325,22 @@ impl SharedFd {
     /// Try unwrap Rc, then deregister if registered and return rawfd.
     /// Note: this action will consume self and return rawfd without closing it.
     pub(crate) fn try_unwrap(self) -> Result<RawFd, Self> {
-        use std::mem::{ManuallyDrop, MaybeUninit};
+        use std::mem::ManuallyDrop;
 
         let fd = self.inner.fd;
         match Rc::try_unwrap(self.inner) {
             Ok(inner) => {
-                // Only drop Inner's state, skip its drop impl.
-                let mut inner_skip_drop = ManuallyDrop::new(inner);
-                #[allow(invalid_value)]
-                #[allow(clippy::uninit_assumed_init)]
-                let mut state = unsafe { MaybeUninit::uninit().assume_init() };
-                std::mem::swap(&mut inner_skip_drop.state, &mut state);
-
-                #[cfg(feature = "legacy")]
-                let state = unsafe { &*state.get() };
+                // httpjet #515: move the valid state out exactly once, but suppress Inner::drop:
+                // ownership of `fd` is being returned to the caller, so Inner must
+                // neither submit a close nor close it through the legacy driver.
+                let inner_skip_drop = ManuallyDrop::new(inner);
+                // SAFETY: Rc::try_unwrap gave us unique ownership; ManuallyDrop keeps
+                // Inner from later dropping this field, and `state` is dropped below.
+                let state = unsafe { std::ptr::read(inner_skip_drop.state.get()) };
 
                 #[cfg(feature = "legacy")]
                 #[allow(irrefutable_let_patterns)]
-                if let State::Legacy(idx) = state {
+                if let State::Legacy(idx) = &state {
                     if CURRENT.is_set() {
                         CURRENT.with(|inner| {
                             match inner {
@@ -365,6 +363,7 @@ impl SharedFd {
                         })
                     }
                 }
+                drop(state);
                 Ok(fd)
             }
             Err(inner) => Err(Self { inner }),

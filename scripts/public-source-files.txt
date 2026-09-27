@@ -22,7 +22,9 @@ scripts/export-public-source.sh
 scripts/fuzz-bounded.sh
 scripts/fuzz-seeds.py
 scripts/h3_generation_client.py
+scripts/h3bench.py
 scripts/h3get.py
+scripts/h3load.py
 scripts/oci-smoke.sh
 scripts/ocsp-runtime-test.py
 scripts/otel_h3_client.py

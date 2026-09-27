@@ -171,7 +171,7 @@ mod classify_tests {
     use super::*;
     use socket2::{Domain, Protocol as S2Protocol};
 
-    fn tcp(port: u16) -> Socket {
+    fn tcp() -> Socket {
         let s = Socket::new(Domain::IPV4, Type::STREAM, Some(S2Protocol::TCP)).unwrap();
         s.bind(
             &"127.0.0.1:0"
@@ -215,9 +215,9 @@ mod classify_tests {
 
     #[tokio::test]
     async fn tcp_and_udp_fds_classify_by_port_and_type() {
-        let http = tcp(0);
+        let http = tcp();
         let http_port = port_of(&http);
-        let https = tcp(0);
+        let https = tcp();
         let https_port = port_of(&https);
 
         match classify_activated(http, http_port, https_port, None).unwrap() {

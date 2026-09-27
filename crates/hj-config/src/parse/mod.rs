@@ -935,6 +935,48 @@ mod tests {
     }
 
     #[test]
+    fn script_handler_rejects_missing_unknown_and_unsupported_types() {
+        for raw_type in ["", "<type>lsapii</type>", "<type>proxy</type>"] {
+            let text = format!(
+                "<virtualHostConfig><scriptHandlerList><scriptHandler><suffix>php</suffix>{raw_type}<handler>php8</handler></scriptHandler></scriptHandlerList></virtualHostConfig>"
+            );
+            let err = parse_vhost_config(&text, &crate::parse::SubstCtx::default())
+                .expect_err("an unsafe script-handler type must fail config parsing");
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidValue {
+                        directive: "scriptHandler.type",
+                        ..
+                    }
+                ),
+                "unexpected error for {raw_type:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_handler_requires_executable_handler_but_keeps_static_opt_out() {
+        let executable = "<virtualHostConfig><scriptHandlerList><scriptHandler><suffix>php</suffix><type>lsapi</type></scriptHandler></scriptHandlerList></virtualHostConfig>";
+        let err = parse_vhost_config(executable, &crate::parse::SubstCtx::default())
+            .expect_err("an executable script route without a handler must fail");
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                directive: "scriptHandler.handler",
+                ..
+            }
+        ));
+
+        let explicit_static = "<virtualHostConfig><scriptHandlerList><scriptHandler><suffix>html</suffix><type>static</type></scriptHandler></scriptHandlerList></virtualHostConfig>";
+        let parsed = parse_vhost_config(explicit_static, &crate::parse::SubstCtx::default())
+            .expect("an explicit static suffix override remains valid");
+        assert_eq!(parsed.script_handlers.len(), 1);
+        assert_eq!(parsed.script_handlers[0].kind, ContextKind::Static);
+        assert!(parsed.script_handlers[0].handler.is_empty());
+    }
+
+    #[test]
     fn cacheable_status_parse() {
         assert_eq!(parse_cacheable_status("200,301"), vec![200, 301]);
         assert_eq!(parse_cacheable_status("301, 200, 200"), vec![200, 301]);

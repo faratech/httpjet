@@ -831,9 +831,12 @@ pub(crate) fn spawn_uring_h3(
             move || {
                 let state = config_holder.load();
                 (
-                    h3::H3RequestLimits::new(
-                        state.serve_config.max_req_header_size,
-                        state.serve_config.max_req_body_size,
+                    h3::H3RequestConfig::new(
+                        h3::H3RequestLimits::new(
+                            state.serve_config.max_req_header_size,
+                            state.serve_config.max_req_body_size,
+                        ),
+                        state.serve_config.header_read_timeout,
                     ),
                     state.server.tuning.max_connections,
                 )

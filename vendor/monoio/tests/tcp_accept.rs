@@ -3,6 +3,31 @@ use std::net::{IpAddr, SocketAddr};
 use monoio::net::{TcpListener, TcpStream};
 
 #[cfg(unix)]
+#[monoio::test_all]
+async fn stream_into_raw_fd_round_trips_without_closing() {
+    use monoio::io::{AsyncReadRentExt, AsyncWriteRentExt};
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = local_sync::oneshot::channel();
+    monoio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        assert!(tx.send(socket).is_ok());
+    });
+    let client = TcpStream::connect(addr).await.unwrap();
+    let mut server = rx.await.unwrap();
+
+    let fd = client.into_raw_fd();
+    let std_client = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    let mut client = TcpStream::from_std(std_client).unwrap();
+    assert_eq!(client.write_all(b"still open").await.0.unwrap(), 10);
+    let (read, bytes) = server.read_exact(Box::new([0u8; 10])).await;
+    assert_eq!(read.unwrap(), 10);
+    assert_eq!(&bytes[..], b"still open");
+}
+
+#[cfg(unix)]
 fn assert_close_on_exec(stream: &TcpStream) {
     use std::os::fd::AsRawFd;
 

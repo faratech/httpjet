@@ -1024,7 +1024,15 @@ mod tests {
             bridge,
             false,
             h3::H3RuntimeConfig::new(
-                || (h3::H3RequestLimits::new(16_384, 1024), 2),
+                || {
+                    (
+                        h3::H3RequestConfig::new(
+                            h3::H3RequestLimits::new(16_384, 1024),
+                            Some(std::time::Duration::from_secs(30)),
+                        ),
+                        2,
+                    )
+                },
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Arc::new(hj_core::budget::BodyBufferBudget::new(4096)),
             ),
@@ -1062,7 +1070,15 @@ mod tests {
             bridge,
             false,
             h3::H3RuntimeConfig::new(
-                || (h3::H3RequestLimits::new(16_384, 1024), 2),
+                || {
+                    (
+                        h3::H3RequestConfig::new(
+                            h3::H3RequestLimits::new(16_384, 1024),
+                            Some(std::time::Duration::from_secs(30)),
+                        ),
+                        2,
+                    )
+                },
                 Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 Arc::new(hj_core::budget::BodyBufferBudget::new(4096)),
             ),

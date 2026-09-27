@@ -1154,6 +1154,87 @@ fn req_body_len_from_begin(body: &[u8]) -> i32 {
     i32::from_le_bytes([body[4], body[5], body[6], body[7]])
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetainedHeadMarker(&'static str);
+
+async fn retained_head_roundtrip(tag: &str, declare_content_length: bool) {
+    let path = tmp_sock(tag);
+    let listener = UnixListener::bind(&path).unwrap();
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (ptype, begin) = read_packet(&mut stream).await.unwrap();
+        assert_eq!(ptype, PacketType::BeginRequest as u8);
+        let body_len = req_body_len_from_begin(&begin);
+        assert_eq!(body_len, 3, "lsphp must receive a concrete body length");
+        let mut body = vec![0; body_len as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, b"abc");
+
+        let mut out = BytesMut::new();
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(204, &[]),
+        );
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        stream.write_all(&out).await.unwrap();
+        stream.flush().await.unwrap();
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(2)));
+    let handler = Lsapi::new(pool).read_timeout(Duration::from_secs(2));
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri("/upload.php")
+        .header("Host", "test")
+        .header("X-Retained", "original")
+        .body(full_incoming(b"abc"))
+        .unwrap();
+    if declare_content_length {
+        request.headers_mut().insert(
+            http::header::CONTENT_LENGTH,
+            http::HeaderValue::from_static("3"),
+        );
+    }
+    request
+        .extensions_mut()
+        .insert(RetainedHeadMarker("original"));
+
+    let (result, parts) = handler
+        .handle_retaining_head(&mut ctx("/web/test"), request)
+        .await;
+    assert_eq!(result.expect("dispatch succeeds").status(), 204);
+    assert_eq!(parts.method, http::Method::POST);
+    assert_eq!(parts.uri.path(), "/upload.php");
+    assert_eq!(parts.headers.get("x-retained").unwrap(), "original");
+    assert_eq!(
+        parts.extensions.get::<RetainedHeadMarker>(),
+        Some(&RetainedHeadMarker("original"))
+    );
+    assert_eq!(
+        parts.headers.contains_key(http::header::CONTENT_LENGTH),
+        declare_content_length,
+        "buffering may synthesize Content-Length on the LSAPI wire but must not mutate the retained head"
+    );
+
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+/// The known-length path moves the original body into the socket pump while
+/// returning the untouched request head for post-dispatch policy.
+#[tokio::test]
+async fn streaming_dispatch_returns_original_request_head() {
+    retained_head_roundtrip("retain-stream-head", true).await;
+}
+
+/// The unknown-length path buffers to learn LSAPI's concrete length but still
+/// returns the original head rather than the synthesized wire view.
+#[tokio::test]
+async fn buffered_dispatch_returns_original_request_head() {
+    retained_head_roundtrip("retain-buffered-head", false).await;
+}
+
 /// FNV-1a 64-bit, used to fingerprint the received body so the assertions don't
 /// depend on echoing megabytes back.
 fn fnv1a(bytes: &[u8]) -> u64 {

@@ -427,12 +427,52 @@ pub(super) fn run_rewrite(
     path: &str,
     query: &str,
 ) -> RwResult {
+    let raw_request_target = req
+        .uri()
+        .path_and_query()
+        .map(|target| target.as_str())
+        .unwrap_or_else(|| req.uri().path());
+    run_rewrite_with_headers(
+        state,
+        ctx,
+        req.method().as_str(),
+        req.headers(),
+        raw_request_target,
+        chain,
+        path,
+        query,
+    )
+}
+
+/// Header-borrowing rewrite entry point for internal requests. ErrorDocument
+/// policy has a synthetic method/URI but must inspect the outer request headers;
+/// accepting those pieces directly avoids cloning the entire HeaderMap merely
+/// to feed the engine's already-lazy header lookup.
+pub(super) fn run_rewrite_with_headers(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    method: &str,
+    headers: &http::HeaderMap,
+    raw_request_target: &str,
+    chain: &[(PathBuf, Arc<Htaccess>)],
+    path: &str,
+    query: &str,
+) -> RwResult {
     #[cfg(feature = "otel")]
     let _trace_stage = crate::otel::stage(crate::otel::StageKind::Rewrite);
     if !state.rewrite_outcomes.enabled() {
         // `--rewrite-outcome-ttl-ms 0`: the cache is off entirely — no key build,
         // no counters (disabled is not "uncacheable").
-        return run_rewrite_inner(state, ctx, req, chain, path, query);
+        return run_rewrite_inner(
+            state,
+            ctx,
+            method,
+            headers,
+            raw_request_target,
+            chain,
+            path,
+            query,
+        );
     }
     let inline = state.inline_rules.get(&ctx.vhost_name);
     let cacheable = inline.is_none_or(|rs| rs.path_cacheable)
@@ -456,7 +496,16 @@ pub(super) fn run_rewrite(
             .metrics
             .rewrite_outcome_uncacheable
             .fetch_add(1, Ordering::Relaxed);
-        return run_rewrite_inner(state, ctx, req, chain, path, query);
+        return run_rewrite_inner(
+            state,
+            ctx,
+            method,
+            headers,
+            raw_request_target,
+            chain,
+            path,
+            query,
+        );
     }
     // Fold in the values of the KEYABLE dynamic vars the chain reads (User-Agent,
     // Origin) so a header-gated chain (e.g. a bot-detection or CORS-preflight
@@ -477,7 +526,7 @@ pub(super) fn run_rewrite(
         // Same extraction the engine's lazy header_lookup performs (get_all +
         // first decodable value), so key and evaluation always agree; the engine
         // expands an absent UA to "", so absent and empty may share a fragment.
-        let ua = keyed_header(req, http::header::USER_AGENT.as_str());
+        let ua = keyed_header(headers, http::header::USER_AGENT.as_str());
         let ua = ua.as_deref().unwrap_or("");
         let classified = state.rewrite_ua_classify
             && inline.is_none_or(|rs| {
@@ -515,7 +564,7 @@ pub(super) fn run_rewrite(
         // Absent MUST key distinctly from empty ("o-" vs "o="): the engine
         // expands both to "", but keeping them distinct costs one entry and
         // stays correct if that expansion ever changes.
-        match keyed_header(req, "origin") {
+        match keyed_header(headers, "origin") {
             None => key_vars.push_str("\no-"),
             Some(v) => {
                 key_vars.push_str("\no=");
@@ -525,7 +574,7 @@ pub(super) fn run_rewrite(
     }
     if uses(CacheKeyVar::Accept) {
         // Same absent-vs-empty discipline as Origin.
-        match keyed_header(req, "accept") {
+        match keyed_header(headers, "accept") {
             None => key_vars.push_str("\na-"),
             Some(v) => {
                 key_vars.push_str("\na=");
@@ -535,9 +584,8 @@ pub(super) fn run_rewrite(
     }
     // (#313) Borrow every key part for the size guard and the hash-first probe;
     // the owned OutcomeKey is built only on the miss path that inserts.
-    let host = rewrite_host(ctx, req);
+    let host = rewrite_host(ctx, headers);
     let https = ctx.is_tls;
-    let method = req.method().as_str();
     let vhost = ctx.vhost_name.as_str();
     let host_s: &str = &host;
     // Every key component except the vhost is client-controlled (path, query,
@@ -552,7 +600,16 @@ pub(super) fn run_rewrite(
             .metrics
             .rewrite_outcome_uncacheable
             .fetch_add(1, Ordering::Relaxed);
-        return run_rewrite_inner(state, ctx, req, chain, path, query);
+        return run_rewrite_inner(
+            state,
+            ctx,
+            method,
+            headers,
+            raw_request_target,
+            chain,
+            path,
+            query,
+        );
     }
     let hash =
         RewriteOutcomeCache::parts_hash(vhost, https, method, host_s, path, query, &key_vars);
@@ -575,7 +632,16 @@ pub(super) fn run_rewrite(
         .metrics
         .rewrite_outcome_misses
         .fetch_add(1, Ordering::Relaxed);
-    let result = run_rewrite_inner(state, ctx, req, chain, path, query);
+    let result = run_rewrite_inner(
+        state,
+        ctx,
+        method,
+        headers,
+        raw_request_target,
+        chain,
+        path,
+        query,
+    );
     let key = OutcomeKey {
         vhost: vhost.to_string(),
         https,
@@ -597,8 +663,8 @@ pub(super) fn run_rewrite(
 /// MUST see exactly what evaluation sees, or two requests the engine
 /// distinguishes could share a key (e.g. a duplicate header whose first value is
 /// non-ASCII).
-fn keyed_header(req: &Request, name: &str) -> Option<String> {
-    req.headers()
+fn keyed_header(headers: &http::HeaderMap, name: &str) -> Option<String> {
+    headers
         .get_all(name)
         .iter()
         .next()
@@ -610,8 +676,8 @@ fn keyed_header(req: &Request, name: &str) -> Option<String> {
 /// IPv6-aware [`hj_core::host_without_port`] (a naive `split(':')` mangles a bracketed
 /// `[::1]:443` to `[`); this also matches how the router resolves the vhost, so the
 /// rewrite host is consistent with routing. The fallback vhost name borrows.
-fn rewrite_host<'a>(ctx: &'a ReqCtx, req: &'a Request) -> Cow<'a, str> {
-    req.headers()
+fn rewrite_host<'a>(ctx: &'a ReqCtx, headers: &'a http::HeaderMap) -> Cow<'a, str> {
+    headers
         .get(http::header::HOST)
         .and_then(|h| h.to_str().ok())
         .map(|h| Cow::Owned(hj_core::host_without_port(h)))
@@ -622,7 +688,9 @@ fn rewrite_host<'a>(ctx: &'a ReqCtx, req: &'a Request) -> Cow<'a, str> {
 fn run_rewrite_inner(
     state: &ServerState,
     ctx: &ReqCtx,
-    req: &Request,
+    method: &str,
+    headers: &http::HeaderMap,
+    raw_request_target: &str,
     chain: &[(PathBuf, Arc<Htaccess>)],
     path: &str,
     query: &str,
@@ -650,7 +718,7 @@ fn run_rewrite_inner(
     // different values). (Was `.next_back()` = last value.) A non-ASCII value is decoded
     // lossily (the view lsphp gets), never skipped (#360).
     let header_lookup = |name: &str| -> Option<String> {
-        req.headers()
+        headers
             .get_all(name)
             .iter()
             .next()
@@ -666,8 +734,8 @@ fn run_rewrite_inner(
     // A1: build the request representation ONCE — it is identical for every
     // ruleset (first-match-wins; only `per_directory_prefix` is adjusted below).
     let mut input = RewriteInput::new(path, docroot)
-        .method(req.method().as_str())
-        .host(rewrite_host(ctx, req))
+        .method(method)
+        .host(rewrite_host(ctx, headers))
         .https(ctx.is_tls)
         .query(query)
         .remote_addr(remote_addr)
@@ -699,12 +767,7 @@ fn run_rewrite_inner(
     // `req.uri()` still carries the raw percent-encoded bytes — attach them only
     // when some ruleset actually reads the variable (zero cost otherwise).
     if rulesets.iter().any(|(rs, _)| rs.uses_the_request) {
-        let raw = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str().to_string())
-            .unwrap_or_else(|| req.uri().path().to_string());
-        input.raw_request_target = Some(raw);
+        input.raw_request_target = Some(raw_request_target.to_owned());
     }
 
     let mut merged_env: Vec<(String, String)> = Vec::new();
@@ -1071,17 +1134,17 @@ mod tests {
         };
         // Bracketed IPv6 (+ optional port) must keep the address, not collapse to "[".
         assert_eq!(
-            rewrite_host(&ctx, &mk(Some("[2606:4700::1111]:443"))),
+            rewrite_host(&ctx, mk(Some("[2606:4700::1111]:443")).headers()),
             "2606:4700::1111"
         );
-        assert_eq!(rewrite_host(&ctx, &mk(Some("[::1]"))), "::1");
+        assert_eq!(rewrite_host(&ctx, mk(Some("[::1]")).headers()), "::1");
         // Ordinary host:port still strips the port (and normalizes case, like the router).
         assert_eq!(
-            rewrite_host(&ctx, &mk(Some("Example.COM:8080"))),
+            rewrite_host(&ctx, mk(Some("Example.COM:8080")).headers()),
             "example.com"
         );
         // No Host header → fall back to the vhost name.
-        assert_eq!(rewrite_host(&ctx, &mk(None)), "fallback.example");
+        assert_eq!(rewrite_host(&ctx, mk(None).headers()), "fallback.example");
     }
 
     #[test]

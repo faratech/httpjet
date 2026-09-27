@@ -23,6 +23,7 @@ hmac = { workspace = true }
 # `hj-pagecache`, so there is no cycle.
 hj-cache = { workspace = true }
 parking_lot = { workspace = true }
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

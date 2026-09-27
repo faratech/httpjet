@@ -102,6 +102,22 @@ impl<'a> CgiEnvBuilder<'a> {
     where
         'a: 'r,
     {
+        self.build_with_content_length(req, ctx, None)
+    }
+
+    /// Build the CGI environment with an optional concrete body length.  LSAPI
+    /// must provide a length for a chunked request after buffering it, but the
+    /// override stays out of the caller's request headers so post-dispatch
+    /// authorization and ErrorDocument policy still see the exact inbound head.
+    pub fn build_with_content_length<'r>(
+        self,
+        req: &'r Request,
+        ctx: &'r ReqCtx,
+        content_length: Option<&'r str>,
+    ) -> Vec<(Cow<'r, str>, Cow<'r, str>)>
+    where
+        'a: 'r,
+    {
         let mut env: Vec<(Cow<'r, str>, Cow<'r, str>)> =
             Vec::with_capacity(24 + req.headers().len());
 
@@ -248,11 +264,11 @@ impl<'a> CgiEnvBuilder<'a> {
         {
             env.push((Cow::Borrowed("CONTENT_TYPE"), Cow::Borrowed(ct)));
         }
-        if let Some(cl) = req
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-        {
+        if let Some(cl) = content_length.or_else(|| {
+            req.headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+        }) {
             env.push((Cow::Borrowed("CONTENT_LENGTH"), Cow::Borrowed(cl)));
         }
 
@@ -271,6 +287,12 @@ impl<'a> CgiEnvBuilder<'a> {
             // for outbound calls — letting an attacker redirect them. It is never
             // a legitimate request header on the LSAPI path, so drop it.
             if nm.eq_ignore_ascii_case("proxy") {
+                continue;
+            }
+            // A buffered chunked request has a synthesized concrete length.
+            // Ignore every inbound Content-Length value (including malformed or
+            // repeated values) and add the authoritative override below.
+            if content_length.is_some() && name == http::header::CONTENT_LENGTH {
                 continue;
             }
             // An underscore in a header name collides with the `-`->`_` HTTP_* mapping
@@ -327,6 +349,9 @@ impl<'a> CgiEnvBuilder<'a> {
             };
             have_host |= is_host;
             env.push((Cow::Owned(http_var_name(nm)), value));
+        }
+        if let Some(cl) = content_length {
+            env.push((Cow::Borrowed("HTTP_CONTENT_LENGTH"), Cow::Borrowed(cl)));
         }
 
         // HTTP/2 and HTTP/3 clients send the `:authority` pseudo-header instead of a
@@ -1041,6 +1066,26 @@ mod tests {
         assert_eq!(m["SERVER_NAME"], "search.forum.example");
         assert_eq!(m["SERVER_PORT"], "8443");
         assert_eq!(m["PHP_VALUE"], "auto_prepend_file=/x/p.php");
+    }
+
+    #[test]
+    fn concrete_body_length_is_a_wire_view_only() {
+        let req = http::Request::builder()
+            .uri("/index.php")
+            .header("Host", "tenant.example")
+            .header("Content-Length", "malformed")
+            .body(empty_incoming())
+            .unwrap();
+        let c = ctx(false);
+        let env = CgiEnvBuilder::new(Path::new("/srv/www/tenant/index.php"))
+            .build_with_content_length(&req, &c, Some("3"));
+        let m: std::collections::HashMap<String, String> = env
+            .into_iter()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(m["CONTENT_LENGTH"], "3");
+        assert_eq!(m["HTTP_CONTENT_LENGTH"], "3");
+        assert_eq!(req.headers()[http::header::CONTENT_LENGTH], "malformed");
     }
 
     #[test]

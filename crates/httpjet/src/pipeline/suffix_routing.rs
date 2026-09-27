@@ -35,8 +35,10 @@ use super::rewrite_glue::clean_rel;
 /// [`hj_rewrite::php_handler_forced`]. This is **additive** — it only ever turns a
 /// non-PHP file into a PHP route, never the reverse.
 ///
-/// Returns `None` when LSAPI/PHP is disabled, scripting is off for the vhost, or
-/// the request does not resolve to a PHP script (static files fall through).
+/// Returns `None` when the request does not resolve to a declared script or when
+/// execution is disabled. Disabled vhosts use the lexical/cache gate plus the
+/// static resolver's actual-target backstop instead of duplicating filesystem
+/// probes here. Runtime backend availability remains irrelevant to classification.
 pub(super) fn split_script_path(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -44,62 +46,390 @@ pub(super) fn split_script_path(
     index_files: &[String],
     chain: &[Arc<Htaccess>],
 ) -> Option<(PathBuf, String, String)> {
-    // NOTE: do NOT short-circuit on `state.lsapi.is_none()`. A path that resolves
-    // to a script handler must be IDENTIFIED as such even when the lsphp pool is
-    // unavailable, so the suffix-routing block can return 503 instead of letting
-    // the file fall through to the static handler and leak its SOURCE CODE.
-    let enable_script = state
+    split_declared_script_path(state, ctx, path, index_files, chain)
+}
+
+/// Whether this vhost permits script execution. Kept separate from declaration
+/// classification so security-sensitive callers can recognize script source even
+/// while execution is disabled or its runtime backend is unavailable.
+pub(super) fn vhost_scripts_enabled(state: &ServerState, ctx: &ReqCtx) -> bool {
+    state
         .server
         .vhosts
         .get(&ctx.vhost_name)
         .map(|d| d.enable_script)
-        .unwrap_or(true);
-    if !enable_script {
-        return None;
+        .unwrap_or(true)
+}
+
+fn extension_is_executable(
+    php_suffixes: &std::collections::HashSet<String>,
+    extension: &str,
+) -> bool {
+    php_suffixes.contains(extension)
+        || (extension.bytes().any(|byte| byte.is_ascii_uppercase())
+            && php_suffixes.contains(&extension.to_ascii_lowercase()))
+}
+
+pub(super) fn directory_like(path: &str) -> bool {
+    path.ends_with('/')
+        || path
+            .split('/')
+            .all(|segment| segment.is_empty() || segment == ".")
+}
+
+/// Cheap lexical gate before candidate construction or stat-cache probes. A
+/// PATH_INFO request retains the executable extension in an earlier segment.
+fn has_executable_segment(path: &str, php_suffixes: &std::collections::HashSet<String>) -> bool {
+    path.split('/').any(|segment| {
+        matches!(
+            segment.rsplit_once('.'),
+            Some((_, extension))
+                if !extension.is_empty() && extension_is_executable(php_suffixes, extension)
+        )
+    })
+}
+
+/// Last-wins executable-suffix lookup that borrows configuration directly. This
+/// is used only while script execution is disabled, where constructing the full
+/// effective suffix set would be wasted: every possible script route fails
+/// closed before a backend or filesystem target is consulted.
+fn configured_extension_is_executable(state: &ServerState, ctx: &ReqCtx, extension: &str) -> bool {
+    if let Some(handler) = ctx
+        .vhost
+        .script_handlers
+        .iter()
+        .rev()
+        .find(|handler| handler.suffix.eq_ignore_ascii_case(extension))
+    {
+        return handler.kind != hj_core::config::ContextKind::Static;
+    }
+    state.php_suffixes.contains(extension)
+        || (extension.bytes().any(|byte| byte.is_ascii_uppercase())
+            && state
+                .php_suffixes
+                .iter()
+                .any(|suffix| suffix.eq_ignore_ascii_case(extension)))
+}
+
+/// Whether configuration could map this URL to a script, without building a
+/// suffix set, candidate PathBuf, or probing the filesystem. Disabled vhosts use
+/// this to bypass page-cache/static fast paths. A directory is only *potential*:
+/// the static resolver chooses the first existing index, and the actual-target
+/// backstop below decides whether that selected file is executable.
+pub(super) fn path_may_resolve_to_script(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    index_files: &[String],
+    chain: &[Arc<Htaccess>],
+) -> bool {
+    let force_active = chain.iter().any(|ht| ht.has_handler_override);
+    let force_php = |url: &str| {
+        let basename = url.rsplit('/').next().unwrap_or("");
+        hj_rewrite::php_handler_forced(chain, url, basename)
+    };
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = if bytes[i] == b'/' { i + 1 } else { i };
+        let rel_end = match path[start..].find('/') {
+            Some(offset) => start + offset,
+            None => path.len(),
+        };
+        i = rel_end;
+        let prefix = &path[..rel_end];
+        let basename = prefix.rsplit('/').next().unwrap_or("");
+        let declared = basename.rsplit_once('.').is_some_and(|(_, extension)| {
+            !extension.is_empty() && configured_extension_is_executable(state, ctx, extension)
+        }) || (force_active && force_php(prefix));
+        if declared {
+            return true;
+        }
+        if rel_end >= path.len() {
+            break;
+        }
+    }
+    if !directory_like(path) {
+        return false;
+    }
+    index_files.iter().any(|index| {
+        if !hj_static::safe_index_name(index) {
+            return false;
+        }
+        Path::new(index)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| configured_extension_is_executable(state, ctx, extension))
+            || (force_active && force_php(&format!("{path}{index}")))
+    })
+}
+
+/// Whether the request path ends in one or more known precompressed wrappers
+/// around a configuration-declared script (for example `index.php.br`). This is
+/// lexical by design: cache lookups run before static resolution, so a possible
+/// wrapped script must bypass a persisted hit and reach the exact-target guard.
+pub(super) fn path_may_resolve_to_precompressed_script(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    index_files: &[String],
+    chain: &[Arc<Htaccess>],
+) -> bool {
+    let force_active = chain.iter().any(|ht| ht.has_handler_override);
+    let candidate = |representation_basename: &str, prefix: &str| {
+        let Some(basename) = logical_precompressed_basename(representation_basename) else {
+            return false;
+        };
+        if Path::new(basename)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| configured_extension_is_executable(state, ctx, extension))
+        {
+            return true;
+        }
+        force_active
+            && hj_rewrite::php_handler_forced(chain, &format!("{prefix}{basename}"), basename)
+    };
+
+    let representation_basename = path.rsplit('/').next().unwrap_or("");
+    let prefix = path.strip_suffix(representation_basename).unwrap_or(path);
+    if candidate(representation_basename, prefix) {
+        return true;
     }
 
-    // (#9a) Effective PHP suffix set: the global `phpConfig` suffixes plus this
-    // vhost's `<scriptHandlerList>` LSAPI suffixes (per-vhost wins by being a
-    // superset; suffixes mapped to a non-LSAPI handler are ignored here).
-    let php_suffixes = effective_php_suffixes(state, ctx);
-    // Explicit CGI script-handler suffixes participate in the same filesystem
-    // resolution and authorization path. Dispatch later selects FastCGI only
-    // when the named processor is explicitly type=fcgi; unsupported CGI still
-    // resolves as executable and fails 503 rather than serving source bytes.
-    let php_suffixes = if !state.has_cgi_script_routes {
-        php_suffixes
-    } else {
-        let cgi_suffixes: Vec<String> = ctx
-            .vhost
-            .script_handlers
-            .iter()
-            .filter(|handler| handler.kind == hj_core::config::ContextKind::Cgi)
-            .map(|handler| handler.suffix.to_ascii_lowercase())
-            .collect();
-        if cgi_suffixes
-            .iter()
-            .all(|suffix| php_suffixes.contains(suffix))
+    if !directory_like(path) {
+        return false;
+    }
+    index_files
+        .iter()
+        .any(|index| hj_static::safe_index_name(index) && candidate(index, path))
+}
+
+/// Strip one or more storage-representation suffixes, returning `None` when
+/// the basename is not wrapped. Repeated wrappers remain fail-closed.
+fn logical_precompressed_basename(mut basename: &str) -> Option<&str> {
+    let original_len = basename.len();
+    loop {
+        let bytes = basename.as_bytes();
+        if bytes.len() < 3
+            || (!bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".br")
+                && !bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".gz"))
         {
-            php_suffixes
-        } else {
-            let mut combined = php_suffixes.into_owned();
-            combined.extend(cgi_suffixes);
-            std::borrow::Cow::Owned(combined)
+            break;
         }
+        basename = &basename[..basename.len() - 3];
+    }
+    (basename.len() != original_len).then_some(basename)
+}
+
+/// Linux renders an unlinked-but-open proc-fd target as
+/// `<original path> (deleted)`. Static responses serve the pinned descriptor, so
+/// strip every such marker before suffix classification; otherwise an unlink
+/// race can turn `secret.php` into the apparently safe extension
+/// `php (deleted)` while the script bytes remain readable.
+fn proc_fd_basename(mut basename: &str) -> &str {
+    while let Some(stripped) = basename.strip_suffix(" (deleted)") {
+        basename = stripped;
+    }
+    basename
+}
+
+/// Precisely resolve an existing script prefix for a disabled vhost without
+/// constructing the full effective-suffix set.
+///
+/// The cheap lexical gate calls this only for script-shaped paths after proxy
+/// precedence. Filesystem type still decides routing: `/assets.php/logo.png`
+/// may name an ordinary directory plus a static child, `/assets.php` keeps its
+/// DirectorySlash redirect, and a missing `/app.php` remains a normal 404.
+/// DirectoryIndex is deliberately left to the static resolver so it can choose
+/// the first existing index and the pinned-target guard can classify that exact
+/// file before any bytes are served.
+pub(super) fn disabled_path_resolves_to_script(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    chain: &[Arc<Htaccess>],
+) -> bool {
+    let force_active = chain.iter().any(|ht| ht.has_handler_override);
+    let bytes = path.as_bytes();
+    let mut i = 0;
+    let mut best = None;
+    while i < bytes.len() {
+        let start = if bytes[i] == b'/' { i + 1 } else { i };
+        let rel_end = match path[start..].find('/') {
+            Some(offset) => start + offset,
+            None => path.len(),
+        };
+        i = rel_end;
+        let prefix = &path[..rel_end];
+        let basename = prefix.rsplit('/').next().unwrap_or("");
+        let declared = basename.rsplit_once('.').is_some_and(|(_, extension)| {
+            !extension.is_empty() && configured_extension_is_executable(state, ctx, extension)
+        }) || (force_active
+            && hj_rewrite::php_handler_forced(chain, prefix, basename));
+        if declared
+            && let Some(rel) = clean_rel(prefix)
+            && !rel.as_os_str().is_empty()
+        {
+            let candidate = ctx.vhost.doc_root.join(rel);
+            if state
+                .stat_cache
+                .tests(&candidate)
+                .is_some_and(|tests| tests.is_file)
+            {
+                best = Some(candidate);
+            }
+        }
+        if rel_end >= path.len() {
+            break;
+        }
+    }
+    let Some(script) = best else { return false };
+    if ctx.vhost.allow_symbol_link {
+        return true;
+    }
+    let Some(doc_root) = std::fs::canonicalize(&ctx.vhost.doc_root).ok() else {
+        return false;
     };
+    std::fs::canonicalize(script)
+        .ok()
+        .is_some_and(|script| script.starts_with(doc_root))
+}
+
+/// Classify the actual file selected by the static resolver. This is the
+/// DirectoryIndex-safe disabled-vhost backstop and the direct precompressed
+/// representation guard for enabled vhosts. It reuses the resolver's pinned
+/// target and performs no filesystem work of its own.
+pub(super) fn target_is_declared_script<'a>(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    request_path: &str,
+    selected_target: &Path,
+    resolved_target: &Path,
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+) -> bool {
+    let executable_basename = |target: &Path| -> bool {
+        let Some(representation) = target.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let representation = proc_fd_basename(representation);
+        let logical = logical_precompressed_basename(representation).unwrap_or(representation);
+        Path::new(logical)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| configured_extension_is_executable(state, ctx, extension))
+    };
+
+    // The lexical selected target preserves the declared filename across a
+    // permitted symlink (`index.php -> payload.txt`). The canonical fd target
+    // remains a second fail-closed check for the inverse shape
+    // (`public.txt -> payload.php`). Known precompressed wrappers never change
+    // whether either target is a declared script.
+    if executable_basename(selected_target)
+        || (resolved_target != selected_target && executable_basename(resolved_target))
+    {
+        return true;
+    }
+
+    // Handler overrides are URL/name scoped. Evaluate them against the lexical
+    // file selected for this request, never the canonical symlink destination.
+    let Some(representation_basename) = selected_target.file_name().and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+    let logical_basename = logical_precompressed_basename(representation_basename);
+    let wrapped = logical_basename.is_some();
+    let basename = logical_basename.unwrap_or(representation_basename);
+    let scoped_path = if request_path.ends_with('/') {
+        std::borrow::Cow::Owned(format!("{request_path}{basename}"))
+    } else if wrapped {
+        std::borrow::Cow::Owned(
+            request_path
+                .strip_suffix(representation_basename)
+                .map(|prefix| format!("{prefix}{basename}"))
+                .unwrap_or_else(|| request_path.to_owned()),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(request_path)
+    };
+    hj_rewrite::php_handler_forced_iter(chain, &scoped_path, basename)
+}
+
+/// Resolve every path that configuration declares executable while execution is
+/// enabled, independent of runtime backend availability. Disabled vhosts defer
+/// DirectoryIndex choice to the static resolver and reject its logical target
+/// before bytes can be served.
+pub(super) fn split_declared_script_path(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    index_files: &[String],
+    chain: &[Arc<Htaccess>],
+) -> Option<(PathBuf, String, String)> {
+    split_declared_script_path_iter(
+        state,
+        ctx,
+        path,
+        index_files,
+        chain.iter().map(AsRef::as_ref),
+    )
+}
+
+/// Directory-bearing chain form for ErrorDocument policy. Keeping the parsed
+/// entries borrowed avoids cloning every `Arc<Htaccess>` into a parallel vector.
+pub(super) fn split_declared_script_path_with_dirs(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    index_files: &[String],
+    chain: &[(PathBuf, Arc<Htaccess>)],
+) -> Option<(PathBuf, String, String)> {
+    split_declared_script_path_iter(
+        state,
+        ctx,
+        path,
+        index_files,
+        chain.iter().map(|(_, ht)| ht.as_ref()),
+    )
+}
+
+fn split_declared_script_path_iter<'a, I>(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    index_files: &[String],
+    chain: I,
+) -> Option<(PathBuf, String, String)>
+where
+    I: Clone + Iterator<Item = &'a Htaccess>,
+{
+    // NOTE: do NOT short-circuit on `state.lsapi.is_none()`. A path that resolves
+    // to a script handler must be IDENTIFIED as such even when the lsphp pool is
+    // unavailable, so the caller can fail closed instead of letting the file fall
+    // through to the static handler and leak its SOURCE CODE.
+    if !vhost_scripts_enabled(state, ctx) {
+        return None;
+    }
     // Hot-path gate: only chains that actually carry a `SetHandler`/`AddHandler`/
     // `AddType` directive pay the per-prefix scope-match cost. Bool-field scan over
     // the (short) chain — no alloc/regex/syscall — so the common no-override case is
     // byte-identical to before (the `force_php` closure is never invoked).
-    let force_active = chain.iter().any(|h| h.has_handler_override);
+    let force_active = chain.clone().any(|h| h.has_handler_override);
+    let force_php = |url: &str| {
+        let base = url.rsplit('/').next().unwrap_or("");
+        hj_rewrite::php_handler_forced_iter(chain.clone(), url, base)
+    };
+    // (#9a/#505) Effective executable-suffix set: global `phpConfig` suffixes
+    // plus per-vhost script handlers. Only an explicit `static` mapping removes
+    // a suffix; unsupported normalized kinds remain classified as scripts so
+    // dispatch can fail closed instead of serving source.
+    let php_suffixes = effective_php_suffixes(state, ctx);
     if php_suffixes.is_empty() && !force_active {
         return None;
     }
-    let force_php = |url: &str| {
-        let base = url.rsplit('/').next().unwrap_or("");
-        hj_rewrite::php_handler_forced(chain, url, base)
-    };
-
+    if !force_active && !directory_like(path) && !has_executable_segment(path, &php_suffixes) {
+        return None;
+    }
     let resolved = resolve_script(
         &ctx.vhost.doc_root,
         path,
@@ -146,13 +476,7 @@ fn resolve_script(
     force_active: bool,
     force_php: &dyn Fn(&str) -> bool,
 ) -> Option<(PathBuf, String, String)> {
-    let ext_is_php = |ext: &str| -> bool {
-        // Suffixes are stored lowercase and real extensions almost always are — try the
-        // extension as-is first; only allocate a lowercased copy if it actually has uppercase.
-        php_suffixes.contains(ext)
-            || (ext.bytes().any(|b| b.is_ascii_uppercase())
-                && php_suffixes.contains(&ext.to_ascii_lowercase()))
-    };
+    let ext_is_php = |ext: &str| extension_is_executable(php_suffixes, ext);
     let is_php = |abs: &Path| -> bool {
         abs.extension()
             .and_then(|e| e.to_str())
@@ -220,8 +544,7 @@ fn resolve_script(
     // Decide "directory-like" from the URL string first — ends in '/', or normalizes to empty
     // (only empty/`.` segments, equivalent to the old `rel.as_os_str().is_empty()`) — so a plain
     // file request returns without building a PathBuf or stat'ing an index file.
-    let dir_like = path.ends_with('/') || path.split('/').all(|s| s.is_empty() || s == ".");
-    if !dir_like {
+    if !directory_like(path) {
         return None;
     }
     let rel = clean_rel(path)?;
@@ -288,6 +611,19 @@ mod tests {
     /// byte-identical to its extension-only behavior.
     fn no_force(_: &str) -> bool {
         false
+    }
+
+    #[test]
+    fn proc_fd_deleted_markers_do_not_hide_script_or_wrapper_suffixes() {
+        assert_eq!(proc_fd_basename("secret.php (deleted)"), "secret.php");
+        assert_eq!(
+            proc_fd_basename("secret.php.br (deleted) (deleted)"),
+            "secret.php.br"
+        );
+        assert_eq!(
+            logical_precompressed_basename(proc_fd_basename("secret.php.br (deleted) (deleted)")),
+            Some("secret.php")
+        );
     }
 
     #[test]

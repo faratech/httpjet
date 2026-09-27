@@ -6,6 +6,26 @@ use monoio::{
 };
 
 #[monoio::test_all]
+async fn listener_into_raw_fd_keeps_descriptor_open() -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+
+    let dir = tempfile::Builder::new()
+        .prefix("monoio-uds-listener-raw-fd")
+        .tempdir()
+        .unwrap();
+    let sock_path = dir.path().join("listener.sock");
+    let listener = UnixListener::bind(&sock_path)?;
+    let fd = listener.into_raw_fd();
+    let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
+    assert!(unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_GETFD) } >= 0);
+    assert_eq!(
+        listener.local_addr()?.as_pathname(),
+        Some(sock_path.as_path())
+    );
+    Ok(())
+}
+
+#[monoio::test_all]
 async fn accept_read_write() -> std::io::Result<()> {
     let dir = tempfile::Builder::new()
         .prefix("monoio-uds-tests")

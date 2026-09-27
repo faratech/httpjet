@@ -69,11 +69,15 @@ impl ResourceRoots {
                     self.check(path, false)?;
                 }
             }
-            // A unix-socket ext-processor address is an explicit filesystem
-            // reference like any other: without this, a submitted config could
-            // relay requests to a socket outside the authorized roots.
-            if let ExtAddress::Uds(path) = &processor.address {
-                self.check_socket(path)?;
+            // Every unix-socket ext-processor address is an explicit filesystem
+            // reference like any other. Proxy failover may select any secondary,
+            // so authorizing only the primary would leave an ambient-socket path.
+            for address in
+                std::iter::once(&processor.address).chain(processor.extra_addresses.iter())
+            {
+                if let ExtAddress::Uds(path) = address {
+                    self.check_socket(path)?;
+                }
             }
         }
         Ok(())
@@ -521,6 +525,17 @@ mod tests {
         assert!(roots.validate(&uds_cfg).is_ok());
         *uds_cfg.ext_processors.last_mut().unwrap() = socket_evil;
         assert_eq!(roots.validate(&uds_cfg), Err(InvalidResource));
+        let mut failover_ok = socket_ok;
+        failover_ok.extra_addresses = vec![ExtAddress::Uds(root.join("allowed/failover.sock"))];
+        *uds_cfg.ext_processors.last_mut().unwrap() = failover_ok.clone();
+        assert!(roots.validate(&uds_cfg).is_ok());
+        failover_ok.extra_addresses = vec![ExtAddress::Uds(root.join("outside/failover.sock"))];
+        *uds_cfg.ext_processors.last_mut().unwrap() = failover_ok;
+        assert_eq!(
+            roots.validate(&uds_cfg),
+            Err(InvalidResource),
+            "a proxy secondary UDS must be authorized like its primary"
+        );
         let mut cfg = config();
         let decl = cfg.vhosts.get_mut("site").unwrap();
         decl.vh_root = root.join("allowed/site");
