@@ -174,6 +174,7 @@ impl PoolIdle for Proxy {
                 Duration::from_millis(150),
                 Duration::from_secs(5),
             )
+            .unwrap()
             .idle_count()
     }
 }

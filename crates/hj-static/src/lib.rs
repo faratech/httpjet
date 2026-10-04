@@ -763,23 +763,19 @@ impl StaticFiles {
                     let total: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();
                     let content_type_str =
                         content_type.to_str().unwrap_or("application/octet-stream");
+                    let boundary = multipart_boundary();
                     if total <= MAX_MULTIPART_PART_BYTES
-                        && let Some(parts) = read_multipart_parts(
-                            &ranges,
-                            None,
-                            resolved.file.as_ref(),
-                            &resolved_target,
-                        )
-                    {
-                        let boundary = multipart_boundary();
-                        let wire = build_multipart_body(
+                        && let Some((body, wire_len)) = materialize_multipart(
                             &boundary,
                             content_type_str,
                             resolved.len,
                             &ranges,
-                            &parts,
-                        );
-                        let mut resp = Response::new(Body::Full(wire.clone()));
+                            resolved.file.as_ref(),
+                            is_head,
+                        )
+                        .await
+                    {
+                        let mut resp = Response::new(body);
                         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
                         let h = resp.headers_mut();
                         insert_static(
@@ -792,7 +788,7 @@ impl StaticFiles {
                             h.insert(ETAG, e.clone());
                         }
                         h.insert(LAST_MODIFIED, meta.last_modified.clone());
-                        insert_static(h, CONTENT_LENGTH, &wire.len().to_string());
+                        insert_static(h, CONTENT_LENGTH, &wire_len.to_string());
                         return Ok(with_file_targets(resp, resolved_target, lexical_target));
                     }
                     // Over the materialization cap (or a failed part read): ignore
@@ -1409,31 +1405,72 @@ fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
     }
 }
 
-/// Build a `multipart/byteranges` entity: leading CRLF on every part (the form
-/// nginx/Apache emit, which every byte-range client parses) and a closing
-/// `--boundary--`. Returns the framed body and the exact wire length.
-fn build_multipart_body(
+// All retained multipart payload bytes, including clones in transport queues,
+// share this budget. Admission precedes allocation and blocking file reads.
+const MULTIPART_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+static MULTIPART_BUDGET: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(MULTIPART_MEMORY_BUDGET))
+    });
+struct MultipartAllocation {
+    data: Vec<u8>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl AsRef<[u8]> for MultipartAllocation {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+async fn materialize_multipart(
     boundary: &str,
     content_type: &str,
     len: u64,
     ranges: &[(u64, u64)],
-    part_bytes: &[bytes::Bytes],
-) -> bytes::Bytes {
-    let mut out = bytes::BytesMut::new();
-    for ((start, end), data) in ranges.iter().zip(part_bytes) {
-        out.extend_from_slice(b"\r\n--");
-        out.extend_from_slice(boundary.as_bytes());
-        out.extend_from_slice(b"\r\nContent-Type: ");
-        out.extend_from_slice(content_type.as_bytes());
-        out.extend_from_slice(
-            format!("\r\nContent-Range: bytes {}-{}/{}\r\n\r\n", start, end, len).as_bytes(),
-        );
-        out.extend_from_slice(data);
+    pinned: Option<&std::fs::File>,
+    is_head: bool,
+) -> Option<(Body, usize)> {
+    let headers: Vec<_> = ranges.iter().map(|(start, end)| format!(
+        "\r\n--{boundary}\r\nContent-Type: {content_type}\r\nContent-Range: bytes {start}-{end}/{len}\r\n\r\n"
+    )).collect();
+    let closing = format!("\r\n--{boundary}--\r\n");
+    let wire_len =
+        ranges
+            .iter()
+            .zip(&headers)
+            .try_fold(closing.len(), |n, ((start, end), header)| {
+                n.checked_add(header.len())?
+                    .checked_add(usize::try_from(end - start + 1).ok()?)
+            })?;
+    if is_head {
+        return Some((Body::Empty, wire_len));
     }
-    out.extend_from_slice(b"\r\n--");
-    out.extend_from_slice(boundary.as_bytes());
-    out.extend_from_slice(b"--\r\n");
-    out.freeze()
+    let permit = MULTIPART_BUDGET
+        .clone()
+        .try_acquire_many_owned(u32::try_from(wire_len).ok()?)
+        .ok()?;
+    // A missing pinned descriptor declines materialization; do not reopen a
+    // validated pathname. The existing full-file response remains streamed.
+    let file = pinned?.try_clone().ok()?;
+    let ranges = ranges.to_vec();
+    let body = tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::FileExt;
+        let mut data = Vec::with_capacity(wire_len);
+        for ((start, end), header) in ranges.iter().zip(&headers) {
+            data.extend_from_slice(header.as_bytes());
+            let begin = data.len();
+            data.resize(begin + (*end - *start + 1) as usize, 0);
+            file.read_exact_at(&mut data[begin..], *start).ok()?;
+        }
+        data.extend_from_slice(closing.as_bytes());
+        Some(bytes::Bytes::from_owner(MultipartAllocation {
+            data,
+            _permit: permit,
+        }))
+    })
+    .await
+    .ok()??;
+    Some((Body::Full(body), wire_len))
 }
 
 /// A per-response multipart boundary: entropy comes from the clock plus this
@@ -1446,43 +1483,6 @@ fn multipart_boundary() -> String {
         .unwrap_or(0);
     let addr = &nanos as *const _ as usize;
     format!("{nanos:016x}{addr:08x}")
-}
-
-/// Read the requested slices out of the entity: from the symlink-verified cached
-/// bytes when present, else `read_at` off the pinned fd (a fresh open of the
-/// resolved path as the fallback — `read_at` never disturbs a shared cursor).
-/// `None` = a read failed or the entity shrank → the caller serves the full 200.
-fn read_multipart_parts(
-    ranges: &[(u64, u64)],
-    cached: Option<&bytes::Bytes>,
-    pinned: Option<&std::fs::File>,
-    path: &std::path::Path,
-) -> Option<Vec<bytes::Bytes>> {
-    use std::os::unix::fs::FileExt;
-    let mut parts = Vec::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        let n = (*end - *start + 1) as usize;
-        let mut buf = vec![0u8; n];
-        if let Some(c) = cached {
-            let s = *start as usize;
-            if s + n > c.len() {
-                return None; // entity shrank since the stat — fail safe to a 200
-            }
-            buf.copy_from_slice(&c[s..s + n]);
-        } else {
-            let owned;
-            let file = match pinned {
-                Some(f) => f,
-                None => {
-                    owned = std::fs::File::open(path).ok()?;
-                    &owned
-                }
-            };
-            file.read_exact_at(&mut buf, *start).ok()?;
-        }
-        parts.push(bytes::Bytes::from(buf));
-    }
-    Some(parts)
 }
 
 /// Parse a `Range` header value against a known entity length (single-range

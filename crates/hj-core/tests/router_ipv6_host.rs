@@ -56,6 +56,7 @@ fn build_router() -> Router {
         address: "0.0.0.0:443".into(),
         secure: true,
         proxy_protocol: false,
+        proxy_protocol_peers: vec![],
         uds_path: None,
         vhost_map: vec![
             VhostMap {
@@ -118,6 +119,7 @@ fn hostname_with_port_still_routes_correctly() {
         address: "0.0.0.0:80".into(),
         secure: false,
         proxy_protocol: false,
+        proxy_protocol_peers: vec![],
         uds_path: None,
         vhost_map: vec![
             VhostMap {

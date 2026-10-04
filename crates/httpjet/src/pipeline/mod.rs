@@ -194,7 +194,10 @@ pub(crate) async fn fast_serve(
     // The on-core memo/static/page-cache path cannot perform asynchronous WAF
     // inspection. When a sidecar is configured, force every request through the
     // bridged full pipeline where inspection precedes every cache/backend path.
-    if state.waf.is_some() || state.extensions.has_pre_handlers() {
+    if state.waf.is_some()
+        || state.extensions.has_pre_handlers()
+        || req.headers().contains_key(http::header::RANGE)
+    {
         return None;
     }
     #[cfg(feature = "acme")]
@@ -372,22 +375,25 @@ pub(crate) async fn fast_serve(
     let htaccess_enabled = ctx
         .vhost
         .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess);
-    let chain_with_dirs: Vec<(std::path::PathBuf, std::sync::Arc<Htaccess>)> = if htaccess_enabled {
-        state.rewrite_cache.load_chain_with_dirs(
+    let (chain_with_dirs, mut policy_deadline) = if htaccess_enabled {
+        state.rewrite_cache.load_chain_with_dirs_and_deadline(
             &ctx.vhost.doc_root,
             &orig_path,
             ctx.vhost.access_file_name_or_default(),
         )
     } else {
-        Vec::new()
+        (Vec::new(), req_start + std::time::Duration::from_secs(1))
     };
     let chain: Vec<std::sync::Arc<Htaccess>> =
         chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
     // (Tier 1.3) An auth-protected tree never serves on-core: dispatch() enforces
     // the 401 challenge / credential verification before anything else.
-    if chain.iter().any(|h| h.has_auth())
-        || scoped_auth::target_has_auth(state, &ctx, &orig_path, &chain)
-    {
+    let (target_auth, target_deadline) =
+        scoped_auth::target_has_auth(state, &ctx, &orig_path, &chain);
+    if let Some(deadline) = target_deadline {
+        policy_deadline = policy_deadline.min(deadline);
+    }
+    if chain.iter().any(|h| h.has_auth()) || target_auth {
         return None;
     }
     // (#349) Memo store eligibility — the response must be a pure function of
@@ -691,7 +697,7 @@ pub(crate) async fn fast_serve(
     if resp.status() == StatusCode::OK && !resp.headers().contains_key(http::header::SET_COOKIE) {
         if memo_store_ok {
             if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs) {
-                fast_memo::store(
+                fast_memo::store_until(
                     &fast_memo::MemoKey {
                         generation: state.generation,
                         listener,
@@ -711,6 +717,7 @@ pub(crate) async fn fast_serve(
                     vary,
                     &resp,
                     req_start,
+                    policy_deadline,
                 );
                 state
                     .metrics
@@ -2308,21 +2315,42 @@ fn rewrite_proxy_target_refused(target: &ProxyTarget) -> Option<String> {
 /// included because `/etc/hosts` pins (e.g. vhosts → 127.0.0.1 in R&D) are a
 /// literal-screen bypass. Unresolvable = refused; the dial would fail anyway.
 fn banned_resolved_authority(addrs: &[std::net::SocketAddr]) -> Option<String> {
+    if addrs.is_empty() {
+        return Some("resolved to no addresses".into());
+    }
     addrs
         .iter()
-        .filter(|a| {
-            let ip = a.ip().to_canonical();
-            match ip {
-                std::net::IpAddr::V4(v4) => {
-                    v4.is_loopback() || v4.is_unspecified() || v4.is_link_local()
-                }
-                std::net::IpAddr::V6(v6) => {
-                    v6.is_loopback() || v6.is_unspecified() || v6.is_unicast_link_local()
-                }
-            }
-        })
-        .map(|a| format!("{} resolves into the local trust plane ({a})", a.ip()))
-        .next()
+        .find(|a| !public_proxy_ip(a.ip().to_canonical()))
+        .map(|a| format!("{} is not a public-unicast destination", a.ip()))
+}
+
+// Same conservative special-use exclusions as the OCSP outbound recipient
+// policy; exact operator-declared backends are handled separately below.
+fn public_proxy_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => public_v4(ip),
+        std::net::IpAddr::V6(ip) => public_v6(ip),
+    }
+}
+fn public_v4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || a >= 224
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)) || (b == 88 && c == 99)))
+        || (a == 198 && ((18..=19).contains(&b) || (b == 51 && c == 100)))
+        || (a == 203 && b == 0 && c == 113))
+}
+fn public_v6(ip: std::net::Ipv6Addr) -> bool {
+    let s = ip.segments();
+    (0x2000..=0x3fff).contains(&s[0])
+        && s[0] != 0x2002
+        && !(s[0] == 0x2001 && (s[1] <= 0x1ff || s[1] == 0xdb8))
+        && !(s[0] == 0x3fff && s[1] <= 0xfff)
 }
 
 /// Resolve a `[P]` authority (bounded), returning the addresses or a refusal.
@@ -2364,12 +2392,18 @@ fn operator_target_addr(
     use hj_core::config::ExtAddress;
 
     let by_literal = |sa: std::net::SocketAddr| addrs.contains(&sa).then_some(sa);
-    let by_host_port = |hp: &str| match hp.parse::<std::net::SocketAddr>() {
-        Ok(sa) => by_literal(sa),
-        Err(_) => target_authority
-            .eq_ignore_ascii_case(hp)
-            .then(|| addrs.first().copied())
-            .flatten(),
+    let by_host_port = |hp: &str| {
+        let parsed = ProxyTarget::parse_url(hp).ok();
+        let authority = parsed
+            .as_ref()
+            .map_or(hp, |target| target.authority.as_str());
+        match authority.parse::<std::net::SocketAddr>() {
+            Ok(sa) => by_literal(sa),
+            Err(_) => target_authority
+                .eq_ignore_ascii_case(authority)
+                .then(|| addrs.first().copied())
+                .flatten(),
+        }
     };
     let by_address = |address: &ExtAddress| match address {
         ExtAddress::Tcp(sa) => by_literal(*sa),
@@ -2442,9 +2476,9 @@ mod proxy_screen_tests {
         assert!(banned_resolved_authority(&[addr("::1", 80)]).is_some());
         assert!(banned_resolved_authority(&[addr("::ffff:127.0.0.1", 80)]).is_some());
         assert!(banned_resolved_authority(&[addr("fe80::1", 80)]).is_some());
-        assert!(banned_resolved_authority(&[addr("203.0.113.9", 80)]).is_none());
-        assert!(banned_resolved_authority(&[addr("10.1.2.3", 8080)]).is_none());
-        assert!(banned_resolved_authority(&[]).is_none());
+        assert!(banned_resolved_authority(&[addr("8.8.8.8", 80)]).is_none());
+        assert!(banned_resolved_authority(&[addr("10.1.2.3", 8080)]).is_some());
+        assert!(banned_resolved_authority(&[]).is_some());
     }
 
     #[tokio::test]
@@ -2478,6 +2512,28 @@ mod proxy_screen_tests {
             instances: 0,
             run_on_startup: 0,
         }
+    }
+
+    #[test]
+    fn special_use_and_mixed_answers_are_refused() {
+        for ip in [
+            "172.16.0.1",
+            "192.168.1.1",
+            "100.64.0.1",
+            "198.18.0.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "fc00::1",
+            "2001:db8::1",
+            "2002:0a00:0001::1",
+            "ff02::1",
+            "::ffff:10.1.2.3",
+        ] {
+            assert!(banned_resolved_authority(&[addr(ip, 80)]).is_some(), "{ip}");
+            assert!(banned_resolved_authority(&[addr("8.8.8.8", 80), addr(ip, 80)]).is_some());
+        }
+        assert!(banned_resolved_authority(&[addr("2606:4700:4700::1111", 443)]).is_none());
     }
 
     #[test]
@@ -2564,6 +2620,54 @@ mod proxy_screen_tests {
         assert_eq!(
             operator_target_addr(&map, &[], &[], "127.0.0.1:8001", &[addr("127.0.0.1", 8001)]),
             Some(addr("127.0.0.1", 8001))
+        );
+    }
+
+    #[test]
+    fn scheme_qualified_configured_backends_keep_private_network_support() {
+        use hj_core::config::{ExtAddress, WebSocketMap};
+        for scheme in ["http", "https", "h2", "h2s"] {
+            let mut backend = ext(
+                "api",
+                ExtAddress::HostPort(format!("{scheme}://10.0.0.5:8080")),
+            );
+            backend.extra_addresses = vec![ExtAddress::HostPort(format!(
+                "{scheme}://backend.internal:8081"
+            ))];
+            assert_eq!(
+                operator_target_addr(
+                    &Default::default(),
+                    &[backend.clone()],
+                    &[],
+                    "10.0.0.5:8080",
+                    &[addr("10.0.0.5", 8080)]
+                ),
+                Some(addr("10.0.0.5", 8080))
+            );
+            assert_eq!(
+                operator_target_addr(
+                    &Default::default(),
+                    &[backend],
+                    &[],
+                    "backend.internal:8081",
+                    &[addr("10.0.0.6", 8081)]
+                ),
+                Some(addr("10.0.0.6", 8081))
+            );
+        }
+        let ws = [WebSocketMap {
+            uri: "/ws".into(),
+            address: "ws://10.0.0.7:8082".into(),
+        }];
+        assert_eq!(
+            operator_target_addr(
+                &Default::default(),
+                &[],
+                &ws,
+                "10.0.0.7:8082",
+                &[addr("10.0.0.7", 8082)]
+            ),
+            Some(addr("10.0.0.7", 8082))
         );
     }
 

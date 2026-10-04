@@ -75,6 +75,7 @@ struct JailedKey {
     gid: u32,
     /// The chroot target as raw bytes (or empty when no chroot).
     chroot: Vec<u8>,
+    chroot_inode: Option<(u64, u64)>,
     /// Namespace isolation flags (Phase 5a). Pools that unshare different
     /// namespaces must NOT dedupe, so these participate in the key. `Copy` +
     /// `Hash` via [`NamespaceFlags`]. Empty for the un-jailed / no-namespace
@@ -115,6 +116,14 @@ impl PoolKey {
                 uid,
                 gid,
                 chroot,
+                chroot_inode: jail
+                    .chroot_fd
+                    .as_ref()
+                    .and_then(|f| f.metadata().ok())
+                    .map(|m| {
+                        use std::os::unix::fs::MetadataExt;
+                        (m.dev(), m.ino())
+                    }),
                 // Phase 5a: different namespace isolation => different pool.
                 namespaces: jail.namespaces,
             }),
@@ -138,6 +147,7 @@ impl PoolKey {
                 use std::hash::{Hash, Hasher};
                 j.command.hash(&mut hasher);
                 j.chroot.hash(&mut hasher);
+                j.chroot_inode.hash(&mut hasher);
                 j.namespaces.hash(&mut hasher);
                 let h = hasher.finish();
                 format!("u{}g{}-{:016x}", j.uid, j.gid, h)

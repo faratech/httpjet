@@ -136,6 +136,7 @@ mod tests {
             tls: None,
             uds_path: None,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
         }
     }
     fn policy() -> TcpLaunchPolicy {

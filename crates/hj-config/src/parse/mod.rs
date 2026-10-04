@@ -159,6 +159,16 @@ fn parse_server_text(server_root: &Path, path: &Path, text: &str) -> Result<Serv
         .php_config
         .map(|p| convert_php(p, &ctx, security.cgi_cpu_limit_secs));
     let listeners = convert_listeners(raw.listener_list, &ctx);
+    for listener in &listeners {
+        listener
+            .validate_proxy_protocol()
+            .map_err(|reason| ConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                directive: "proxyProtocolPeers",
+                value: listener.name.clone(),
+                reason,
+            })?;
+    }
     let (vhosts, vhost_order) = convert_vhost_decls(raw.vhost_list, &ctx);
 
     Ok(ServerConfig {
@@ -615,6 +625,7 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
                 tls,
                 uds_path,
                 proxy_protocol: truthy(&l.proxy_protocol),
+                proxy_protocol_peers: l.proxy_protocol_peers.as_deref().map(split_list).unwrap_or_default(),
             })
         })
         .collect()
@@ -682,6 +693,7 @@ mod tests {
                     name: Some("plain-pp".into()),
                     address: Some("127.0.0.1:8080".into()),
                     proxy_protocol: Some("1".into()),
+                    proxy_protocol_peers: Some("192.0.2.10, 198.51.100.0/24".into()),
                     ..Default::default()
                 },
                 RawListener {

@@ -441,11 +441,56 @@ pub struct Listener {
     pub uds_path: Option<std::path::PathBuf>,
     /// (Tier 2) PROXY protocol v2/v1 on THIS listener: every connection to it must
     /// send a PROXY header before any other data; the header's source address
-    /// overrides the TCP peer for client-IP resolution and ACLs. Listener opt-in IS
-    /// the trust decision — only enable on listeners whose direct peers are the
-    /// trusted LB/proxy. (OLS models this server-level as a peer allow-list; the
-    /// per-listener form is httpjet-native.)
+    /// supplies client identity for client-IP resolution and ACLs only after the
+    /// real TCP sender passes proxy_protocol_peers. The per-listener trust policy
+    /// is httpjet-native; firewall restriction remains useful defense in depth.
     pub proxy_protocol: bool,
+    /// Exact direct TCP sender IPs/CIDRs permitted to assert PROXY identity.
+    pub proxy_protocol_peers: Vec<String>,
+}
+
+impl Listener {
+    pub fn validate_proxy_protocol(&self) -> Result<(), String> {
+        if self.proxy_protocol && (self.proxy_protocol_peers.is_empty() || self.uds_path.is_some())
+        {
+            return Err(
+                "PROXY protocol requires a TCP listener and explicit proxyProtocolPeers".into(),
+            );
+        }
+        if self
+            .proxy_protocol_peers
+            .iter()
+            .any(|peer| proxy_sender_net(peer).is_none())
+        {
+            return Err("invalid proxyProtocolPeers address or CIDR".into());
+        }
+        Ok(())
+    }
+    pub fn proxy_sender_allowed(&self, peer: std::net::IpAddr) -> bool {
+        self.proxy_protocol
+            && self
+                .proxy_protocol_peers
+                .iter()
+                .filter_map(|s| proxy_sender_net(s))
+                .any(|net| net.contains(&peer.to_canonical()))
+    }
+}
+fn proxy_sender_net(text: &str) -> Option<ipnet::IpNet> {
+    let net = text.parse::<ipnet::IpNet>().ok().or_else(|| {
+        text.parse::<std::net::IpAddr>()
+            .ok()
+            .map(ipnet::IpNet::from)
+    })?;
+    if let ipnet::IpNet::V6(net6) = net {
+        if let Some(ip) = net6.addr().to_ipv4_mapped() {
+            return net6
+                .prefix_len()
+                .checked_sub(96)
+                .and_then(|prefix| ipnet::Ipv4Net::new(ip, prefix).ok())
+                .map(ipnet::IpNet::V4);
+        }
+    }
+    Some(net)
 }
 
 #[derive(Debug, Clone)]
@@ -771,5 +816,31 @@ impl MimeMap {
         self.by_suffix
             .get(&suffix.to_ascii_lowercase())
             .map(|s| s.as_str())
+    }
+}
+
+#[cfg(test)]
+mod proxy_sender_tests {
+    use super::*;
+    #[test]
+    fn proxy_senders_require_explicit_valid_authority() {
+        let mut listener = Listener {
+            name: "p".into(),
+            address: "*:80".into(),
+            secure: false,
+            vhost_map: vec![],
+            tls: None,
+            uds_path: None,
+            proxy_protocol: true,
+            proxy_protocol_peers: vec![],
+        };
+        assert!(listener.validate_proxy_protocol().is_err());
+        listener.proxy_protocol_peers = vec!["192.0.2.1".into(), "198.51.100.0/24".into()];
+        assert!(listener.validate_proxy_protocol().is_ok());
+        assert!(listener.proxy_sender_allowed("::ffff:192.0.2.1".parse().unwrap()));
+        assert!(listener.proxy_sender_allowed("198.51.100.12".parse().unwrap()));
+        assert!(!listener.proxy_sender_allowed("203.0.113.1".parse().unwrap()));
+        listener.proxy_protocol_peers.push("bad/99".into());
+        assert!(listener.validate_proxy_protocol().is_err());
     }
 }

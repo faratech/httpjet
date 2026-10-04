@@ -660,21 +660,15 @@ fn build_optional_client_verifier(
 struct DepthLimitedClientVerifier {
     inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     max_intermediates: usize,
-    /// (#301) Positive-verdict memo for validated client-cert chains. The mTLS
-    /// listener disables session resumption (#300), so every connection runs a
-    /// full webpki chain build + signature verification (RSA-4096 for the
-    /// Cloudflare origin-pull CA) for what is in practice ONE long-lived client
-    /// certificate. A chain that verified is remembered by its exact DER bytes
-    /// (byte-compare, no hashing — no collision surface) for [`CHAIN_MEMO_TTL`],
-    /// bounding how long an expiring certificate can keep riding a cached
-    /// verdict. Rejections are never cached (and only CA-signed chains can
-    /// enter, so an attacker cannot grow or thrash the memo). Config reloads
-    /// rebuild the verifier, so the memo can never outlive a CA change.
+    /// Reuse a verified chain only for the identical verifier UnixTime. A new
+    /// handshake time must recheck certificate and revocation validity. Exact
+    /// DER keys and per-policy verifier instances retain the trust boundary.
     chain_memo: parking_lot::Mutex<Vec<ChainMemo>>,
 }
 
 struct ChainMemo {
     key: Vec<u8>,
+    verified_at: u64,
     valid_until: std::time::Instant,
 }
 
@@ -684,8 +678,7 @@ impl std::fmt::Debug for ChainMemo {
     }
 }
 
-/// How long a validated chain's verdict may be reused before webpki re-runs in
-/// full. Also the upper bound on how late a certificate expiry is noticed.
+/// Retention bound; verdict reuse also requires an identical verifier time.
 const CHAIN_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Distinct concurrently-remembered chains (prod sees one, plus a rotation
 /// overlap); oldest entry is dropped beyond this.
@@ -755,7 +748,10 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
         {
             let mut memo = self.chain_memo.lock();
             memo.retain(|m| m.valid_until > mono_now);
-            if memo.iter().any(|m| m.key == key) {
+            if memo
+                .iter()
+                .any(|m| m.key == key && m.verified_at == now.as_secs())
+            {
                 return Ok(rustls::server::danger::ClientCertVerified::assertion());
             }
         }
@@ -763,11 +759,13 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
             .inner
             .verify_client_cert(end_entity, intermediates, now)?;
         let mut memo = self.chain_memo.lock();
+        memo.retain(|m| m.key != key);
         if memo.len() >= CHAIN_MEMO_CAP {
             memo.remove(0);
         }
         memo.push(ChainMemo {
             key,
+            verified_at: now.as_secs(),
             valid_until: mono_now + CHAIN_MEMO_TTL,
         });
         Ok(verified)
@@ -922,36 +920,12 @@ fn build_server_config_inner(
     config.alpn_protocols = alpn;
     config.max_early_data_size = 0; // 0-RTT stays off: replay risk for non-idempotent requests.
 
-    // TLS session resumption. rustls defaults to NO session storage, so every new
-    // connection does a full TLS 1.3 handshake (key exchange + cert). Cloudflare cycles
-    // its origin connections continuously (idle reaps, the HTTP/1.1 max-requests cap,
-    // edge-POP rotation), so an in-memory resumable-session cache turns those steady-state
-    // reconnects into abbreviated (resumed) handshakes — a broad TTFB win that touches
-    // every reconnecting client, cached or dynamic. Stateful store, shared across the
-    // SO_REUSEPORT worker tasks in this process (one `ServerConfig` Arc). It is per
-    // process: a restart (deploy) starts cold and cannot resume the post-restart burst —
-    // this lifts steady-state churn, not the cold-start reconnect.
-    //
-    // (security, 2026-08-30) ENABLED on client-cert-verifying listeners too. The 2026-06
-    // posture disabled it because rustls reinstates the stored client-cert chain as
-    // `peer_certificates` on a resumed handshake, which the app-layer mTLS gate
-    // (`has_client_cert`) would read as "presented". The reinstated chain is, however,
-    // exactly the chain the verifier ACCEPTED when that ticket's session was created —
-    // the chain⇄ticket binding is by construction — and the resumption capability is
-    // bounded three ways:
-    //   * the session secret is server-side state and `take()` removes it, so TLS 1.3
-    //     tickets are single-use: a replayed identity falls back to a FULL handshake and
-    //     a fresh certificate presentation (no downgrade for the legitimate peer);
-    //   * the ticket identity travels only inside encrypted records between CF and the
-    //     origin — stealing it already implies breaking the record layer;
-    //   * 0-RTT stays off (`max_early_data_size = 0`), so no replayed early data.
-    // The application gates keep working unchanged: a session created WITHOUT a client
-    // cert reinstates NO chain on resume and is refused exactly like a fresh uncertified
-    // connection, while a resumed CERTIFIED session carries the previously verified chain,
-    // which also keeps `mtls_ok` (client-IP honoring) working across resumes.
-    // `httpjet_tls_handshakes_{full,resumed}_total` observe the split in production.
-    config.session_storage = new_session_storage();
-    config.send_tls13_tickets = session_tickets();
+    // An abbreviated handshake restores an old client identity without running
+    // the verifier at the current time. Client-auth listeners require full
+    // handshakes; public listeners retain stateful resumption and no 0-RTT.
+    let tickets = listener_session_tickets(tls.client_verify);
+    config.session_storage = listener_session_storage(tls.client_verify);
+    config.send_tls13_tickets = tickets;
 
     Ok((
         Arc::new(config),
@@ -983,6 +957,24 @@ pub fn configure_session_tickets(tickets: usize) {
 
 fn session_tickets() -> usize {
     SESSION_TICKETS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn listener_session_tickets(client_verify: u8) -> usize {
+    if client_verify == 0 {
+        session_tickets()
+    } else {
+        0
+    }
+}
+
+fn listener_session_storage(
+    client_verify: u8,
+) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
+    if client_verify == 0 {
+        new_session_storage()
+    } else {
+        Arc::new(rustls::server::NoServerSessionStorage {})
+    }
 }
 
 fn new_session_storage() -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
@@ -1066,6 +1058,7 @@ pub struct KtlsConfigTemplate {
     resolver: Arc<ReloadableResolver>,
     alpn: Vec<Vec<u8>>,
     session_storage: Arc<dyn rustls::server::StoresServerSessions + Send + Sync>,
+    tickets: usize,
     #[cfg(feature = "ocsp")]
     ocsp_no_resumption: bool,
 }
@@ -1089,7 +1082,7 @@ impl KtlsConfigTemplate {
         config.alpn_protocols = self.alpn.clone();
         config.max_early_data_size = 0;
         config.session_storage = self.session_storage.clone();
-        config.send_tls13_tickets = session_tickets();
+        config.send_tls13_tickets = self.tickets;
         config.key_log = key_log;
         #[cfg(feature = "ocsp")]
         if self.ocsp_no_resumption {
@@ -1138,18 +1131,14 @@ pub fn build_ktls_template_with_bootstrap(
     }));
     let managed = Arc::new(ArcSwap::from_pointee(SniCertMap::new()));
     let resolver = Arc::new(ReloadableResolver(cert_swap.clone(), managed.clone()));
-    // (security, 2026-08-30) Mirror the TCP builder: the stateful session cache is
-    // enabled on client-cert-verifying listeners as well — see the rationale at
-    // `build_server_config_inner` (chain⇄ticket binding, single-use tickets, 0-RTT off).
-    // kTLS's ticket/sequence accounting (see `server_config_with_key_log`) already
-    // handles post-handshake NewSessionTicket records via its KeyUpdate path.
-    let session_storage = new_session_storage();
+    let session_storage = listener_session_storage(tls.client_verify);
     let template = KtlsConfigTemplate {
         provider,
         verifier,
         resolver,
         alpn: ALPN_PROTOCOLS.iter().map(|p| p.to_vec()).collect(),
         session_storage,
+        tickets: listener_session_tickets(tls.client_verify),
         #[cfg(feature = "ocsp")]
         ocsp_no_resumption: false,
     };
@@ -1231,7 +1220,9 @@ impl PreparedListenerTls {
         let quic = quic.then(|| {
             let mut config = tcp.clone();
             config.alpn_protocols = vec![b"h3".to_vec()];
-            config.session_storage = new_session_storage();
+            if config.session_storage.can_cache() {
+                config.session_storage = new_session_storage();
+            }
             Arc::new(config)
         });
         Ok(Self {
@@ -1643,6 +1634,7 @@ mod tests {
                 domains: vec!["a.example.com".into(), "alias.example.com".into()],
             }],
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             tls: None,
         };
@@ -1699,6 +1691,7 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             vhost_map: vec![
                 VhostMap {
@@ -1765,6 +1758,7 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             vhost_map: vec![VhostMap {
                 vhost: "publisher.example".into(),
@@ -1837,6 +1831,7 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             vhost_map: vec![VhostMap {
                 vhost: "publisher.example".into(),
@@ -1917,6 +1912,7 @@ mod tests {
             secure: true,
             vhost_map: vec![],
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             tls: Some(ListenerTls {
                 key_file: d_key.clone(),
@@ -2021,6 +2017,7 @@ mod tests {
             secure: true,
             vhost_map: vec![],
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             tls: Some(ListenerTls {
                 key_file: write_tmp(&dir, "key.pem", &certificate.key_pem),
@@ -2100,6 +2097,7 @@ mod tests {
             secure: true,
             vhost_map: vec![],
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key_path,
@@ -2220,6 +2218,7 @@ mod tests {
             secure: true,
             vhost_map: vec![],
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key,
@@ -2258,6 +2257,7 @@ mod tests {
             secure: true,
             vhost_map: vec![],
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key,
@@ -2292,6 +2292,7 @@ mod tests {
             secure: true,
             vhost_map: vec![],
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             tls: Some(ListenerTls {
                 key_file: key,
@@ -2353,6 +2354,7 @@ mod tests {
             address: "*:443".into(),
             secure: true,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             vhost_map: vec![],
             tls: Some(ListenerTls {
@@ -2459,6 +2461,7 @@ mod tests {
             address: "*:443".into(),
             secure: true,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             vhost_map: vec![],
             tls: Some(ListenerTls {
@@ -2531,6 +2534,7 @@ mod tests {
             address: "*:8443".into(),
             secure: true,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             vhost_map: vec![VhostMap {
                 vhost: "vh1".into(),
@@ -2663,11 +2667,12 @@ mod resumption_tests {
     }
 
     /// (#301) The depth-limited verifier memoizes POSITIVE chain verdicts by
-    /// exact DER bytes: the second handshake with the same chain skips webpki
-    /// entirely, while a rejected chain is re-verified every time (negatives
+    /// exact DER bytes and verifier time: the second check in the same second
+    /// skips webpki, while a rejected chain is re-verified every time (negatives
     /// never enter the memo).
     #[test]
     fn client_chain_memo_dedups_positive_verifications() {
+        ensure_provider();
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
@@ -2761,6 +2766,26 @@ mod resumption_tests {
             "second identical chain must be served from the memo"
         );
 
+        let later = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            now.as_secs() + 1,
+        ));
+        assert!(verifier.verify_client_cert(&leaf, &[], later).is_ok());
+        assert_eq!(
+            counting.calls.load(Ordering::Relaxed),
+            2,
+            "a different handshake time requires fresh verification"
+        );
+        let expired =
+            rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+                (x509_parser::parse_x509_certificate(leaf.as_ref())
+                    .unwrap()
+                    .1
+                    .validity()
+                    .not_after
+                    .timestamp()
+                    + 1) as u64,
+            ));
+        assert!(verifier.verify_client_cert(&leaf, &[], expired).is_err());
         let bad_key = KeyPair::generate().expect("bad key");
         let bad_params = CertificateParams::new(vec!["bad.test".to_string()]).expect("bad params");
         let bad_cert = bad_params.self_signed(&bad_key).expect("bad cert");
@@ -2775,15 +2800,18 @@ mod resumption_tests {
         );
     }
 
-    // ---- (security, 2026-08-30) resumption on the client-verify listener ----
-    // The stateful session cache is installed on clientVerify=2 listeners; these
-    // tests pin the exact property the app-layer mTLS gate depends on: a RESUMED
-    // certified handshake reinstates the previously VERIFIED chain, while a resumed
-    // uncertified session reinstates nothing (and is refused like a fresh
-    // uncertified connection).
+    #[test]
+    fn client_auth_resumption_policy_is_disabled_in_all_modes() {
+        assert!(listener_session_storage(0).can_cache());
+        for mode in [1, 2, 3] {
+            assert!(!listener_session_storage(mode).can_cache());
+            assert_eq!(listener_session_tickets(mode), 0);
+        }
+    }
+
+    // Client-auth listeners always revalidate the presented chain on reconnect.
 
     use rustls::{ClientConfig, ClientConnection, ServerConnection};
-    use std::sync::atomic::Ordering as _;
 
     struct ResumptionFixture {
         server_cfg: Arc<RustlsServerConfig>,
@@ -2815,6 +2843,7 @@ mod resumption_tests {
             address: "*:443".into(),
             secure: true,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
             uds_path: None,
             vhost_map: vec![],
             tls: Some(ListenerTls {
@@ -2895,7 +2924,7 @@ mod resumption_tests {
     }
 
     #[test]
-    fn clientverify2_resumes_with_the_reinstated_client_chain() {
+    fn clientverify2_requires_fresh_full_handshakes() {
         let fx = resumption_fixture(true);
         let name = fx.name.clone();
 
@@ -2912,26 +2941,23 @@ mod resumption_tests {
             "full handshake verified the presented chain"
         );
 
-        // Connection 2: the client offers its ticket → RESUMED. The server
-        // reinstates the previously VERIFIED chain — exactly what the app-layer
-        // mTLS gate reads, so resumed certified connections keep passing it (and
-        // keep `mtls_ok` client-IP honoring working).
+        // Reconnect must be a full handshake with current verifier time.
         let mut client2 = ClientConnection::new(fx.client_cfg.clone(), name).unwrap();
         let mut srv2 = ServerConnection::new(fx.server_cfg.clone()).unwrap();
         settle(&mut client2, &mut srv2);
         assert_eq!(
             srv2.handshake_kind(),
-            Some(rustls::HandshakeKind::Resumed),
-            "second connection must resume from the issued ticket"
+            Some(rustls::HandshakeKind::Full),
+            "client-authenticated listeners must not resume"
         );
         assert!(
             srv2.peer_certificates().is_some_and(|c| !c.is_empty()),
-            "resumed certified session reinstates the verified chain"
+            "the fresh handshake verifies the presented chain"
         );
     }
 
     #[test]
-    fn clientverify2_resume_of_uncertified_session_reinstates_no_chain() {
+    fn clientverify2_uncertified_reconnect_has_no_chain() {
         let fx = resumption_fixture(false);
         let name = fx.name.clone();
 
@@ -2944,16 +2970,14 @@ mod resumption_tests {
         ));
         assert!(srv.peer_certificates().is_none());
 
-        // The uncertified session is ALSO resumable (rustls stores it) — but it
-        // reinstates NO chain, so the app-layer gate refuses this connection exactly
-        // like a fresh uncertified one. Fail-closed in both handshake kinds.
+        // Optional client authentication still exposes no identity for an uncertified peer.
         let mut client2 = ClientConnection::new(fx.client_cfg.clone(), name).unwrap();
         let mut srv2 = ServerConnection::new(fx.server_cfg.clone()).unwrap();
         settle(&mut client2, &mut srv2);
-        assert_eq!(srv2.handshake_kind(), Some(rustls::HandshakeKind::Resumed));
+        assert_eq!(srv2.handshake_kind(), Some(rustls::HandshakeKind::Full));
         assert!(
             srv2.peer_certificates().is_none(),
-            "resumed uncertified session must NOT fabricate a client chain"
+            "uncertified reconnect must not fabricate a client chain"
         );
     }
 }

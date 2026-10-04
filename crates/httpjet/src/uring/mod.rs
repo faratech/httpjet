@@ -1024,6 +1024,16 @@ async fn handle_tls_bridged(
     // (Tier 2) PROXY protocol: read the header from the raw stream and override the
     // peer address before the TLS handshake. Fail-closed: no header = close.
     if binding.proxy_protocol {
+        if !state
+            .server
+            .listeners
+            .iter()
+            .find(|l| l.name == core.listener_name.as_ref())
+            .is_some_and(|l| l.proxy_sender_allowed(peer.ip()))
+        {
+            tracing::debug!(%peer, "proxy_protocol: unauthorized transport peer; closing");
+            return;
+        }
         match proxy_protocol::reader::read_and_strip(
             &mut stream,
             state.serve_config.header_read_timeout,
@@ -1297,6 +1307,16 @@ async fn handle_conn_bridged<S>(
     // (Tier 2) PROXY protocol on a PLAINTEXT listener: strip the header (fail-closed)
     // and override the peer BEFORE the H1/h2c discriminator reads the first bytes.
     if binding.proxy_protocol {
+        if !state
+            .server
+            .listeners
+            .iter()
+            .find(|l| l.name == core.listener_name.as_ref())
+            .is_some_and(|l| l.proxy_sender_allowed(peer.ip()))
+        {
+            tracing::debug!(%peer, "proxy_protocol: unauthorized transport peer; closing");
+            return;
+        }
         match proxy_protocol::reader::read_and_strip(&mut stream, header_read_timeout).await {
             Ok(Some(h)) => {
                 if let Some(src) = h.src {
@@ -3486,6 +3506,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             }),
             uds_path: None,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
         };
         let mut server = hj_core::config::ServerConfig::default();
         server.server_root = root.to_path_buf();
@@ -5230,6 +5251,7 @@ mod uds_tests {
                 }],
                 uds_path: None,
                 proxy_protocol: false,
+                proxy_protocol_peers: vec![],
                 tls: None,
             }],
             vhosts: {

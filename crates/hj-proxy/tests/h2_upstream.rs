@@ -162,7 +162,8 @@ async fn h2_upstream_serves_requests_with_normalized_version() {
         .expect("h2 forward");
         let upstream = proxy
             .pool()
-            .get_or_create(&target, 100, keep_alive, connect_timeout);
+            .get_or_create(&target, 100, keep_alive, connect_timeout)
+            .unwrap();
         assert_eq!(
             upstream.idle_count(),
             1,

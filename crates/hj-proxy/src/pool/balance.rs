@@ -148,7 +148,7 @@ impl UpstreamPool {
     ) -> Result<(Arc<Upstream>, Option<RequestReservation>), hj_core::HandlerError> {
         // No group allocation or scheduler on the unchanged default path.
         if target.name.is_none() || target.load_balance == LoadBalanceConfig::default() {
-            return Ok((self.get_or_create(target, max, keep, connect), None));
+            return Ok((self.get_or_create(target, max, keep, connect)?, None));
         }
         self.group(target, max, keep, connect)
             .select()
@@ -173,7 +173,9 @@ impl UpstreamPool {
                     .enumerate()
                     .map(|(i, mut p)| {
                         p.failover.clear();
-                        let upstream = self.get_or_create(&p, max, keep, connect);
+                        let upstream = self
+                            .get_or_create(&p, max, keep, connect)
+                            .expect("operator-named upstream allocation");
                         Arc::new(Peer {
                             health: Mutex::new(super::health::HealthState::new(
                                 target.load_balance.health_check.is_none(),
@@ -272,12 +274,10 @@ mod tests {
                     if indirect {
                         std::hint::black_box(select(&p, &t));
                     } else {
-                        std::hint::black_box(p.get_or_create(
-                            &t,
-                            10,
-                            Duration::from_secs(5),
-                            Duration::from_secs(1),
-                        ));
+                        std::hint::black_box(
+                            p.get_or_create(&t, 10, Duration::from_secs(5), Duration::from_secs(1))
+                                .unwrap(),
+                        );
                     }
                 }
                 let elapsed = start.elapsed().as_nanos();

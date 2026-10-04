@@ -424,6 +424,7 @@ impl Upstream {
     /// Dial, feeding the breaker so a run of connect failures opens it (and a success
     /// closes it).
     async fn dial_tracked(&self) -> Result<AnySender, ProxyError> {
+        let _permit = dial_permit()?;
         match self.dial().await {
             Ok(sender) => {
                 self.note_dial_success();
@@ -587,6 +588,8 @@ impl Upstream {
 /// rewrite targets.
 #[derive(Default)]
 pub struct UpstreamPool {
+    dynamic: Arc<Mutex<HashMap<PoolKey, DynamicPool>>>,
+    identity_epoch: u64,
     health_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     published_groups: Arc<Mutex<Option<Vec<Arc<balance::Group>>>>>,
     groups: Mutex<HashMap<balance::GroupKey, Arc<balance::Group>>>,
@@ -599,6 +602,29 @@ pub struct UpstreamPool {
     failovers: AtomicU64,
 }
 
+const MAX_DYNAMIC_POOLS: usize = 256;
+const DYNAMIC_POOL_TTL: Duration = Duration::from_secs(60);
+static NEXT_IDENTITY_EPOCH: AtomicU64 = AtomicU64::new(1);
+static GLOBAL_DIALS: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_DIAL_BUDGET: Arc<Semaphore>;
+}
+pub(crate) fn dial_permit() -> Result<tokio::sync::OwnedSemaphorePermit, ProxyError> {
+    let budget = GLOBAL_DIALS.clone();
+    #[cfg(test)]
+    let budget = TEST_DIAL_BUDGET.try_with(Arc::clone).unwrap_or(budget);
+    budget
+        .try_acquire_owned()
+        .map_err(|_| ProxyError::Other("global proxy dial budget exhausted".into()))
+}
+
+struct DynamicPool {
+    upstream: Arc<Upstream>,
+    last_used: Instant,
+}
+
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -608,6 +634,7 @@ fn now_epoch_ms() -> u64 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PoolKey {
+    identity_epoch: u64,
     scope: Option<String>,
     name: Option<String>,
     scheme: String,
@@ -628,6 +655,7 @@ impl PoolKey {
         connect_timeout: Duration,
     ) -> Self {
         PoolKey {
+            identity_epoch: 0,
             scope: target.scope.clone(),
             name: target.name.clone(),
             scheme: target.scheme.to_ascii_lowercase(),
@@ -653,6 +681,8 @@ impl PoolKey {
 impl UpstreamPool {
     pub fn new() -> Self {
         UpstreamPool {
+            dynamic: Arc::new(Mutex::new(HashMap::new())),
+            identity_epoch: NEXT_IDENTITY_EPOCH.fetch_add(1, Ordering::Relaxed),
             health_tasks: Mutex::new(Vec::new()),
             published_groups: Arc::new(Mutex::new(None)),
             groups: Mutex::new(HashMap::new()),
@@ -675,7 +705,10 @@ impl UpstreamPool {
         max_conns: u32,
         keep_alive: Duration,
         connect_timeout: Duration,
-    ) -> Arc<Upstream> {
+    ) -> Result<Arc<Upstream>, hj_core::HandlerError> {
+        if target.name.is_none() {
+            return self.dynamic_pool(target, max_conns, keep_alive, connect_timeout);
+        }
         let peers = target.peers();
         let now_ms = now_epoch_ms();
         for (idx, peer) in peers.iter().enumerate() {
@@ -710,17 +743,87 @@ impl UpstreamPool {
             if idx > 0 {
                 self.failovers.fetch_add(1, Ordering::Relaxed);
             }
-            return upstream;
+            return Ok(upstream);
         }
         // Every peer marked bad: serve from the primary (its breaker half-open
         // window decides fast-fail vs trial dial) rather than refusing outright.
         let primary = &peers[0];
         let key = PoolKey::new(primary, max_conns, keep_alive, connect_timeout);
         let mut pools = self.pools.lock();
-        pools
+        Ok(pools
             .entry(key)
             .or_insert_with(|| Upstream::new(primary, max_conns, keep_alive, connect_timeout))
-            .clone()
+            .clone())
+    }
+
+    fn dynamic_pool(
+        &self,
+        target: &ProxyTarget,
+        max: u32,
+        keep: Duration,
+        connect: Duration,
+    ) -> Result<Arc<Upstream>, hj_core::HandlerError> {
+        let now = Instant::now();
+        let mut registry = self.dynamic.lock();
+        // Busy pools cannot be evicted: recreating their semaphore would bypass
+        // the per-upstream limit. Failure/backoff state lives in the same entry.
+        registry.retain(|_, pool| {
+            now.duration_since(pool.last_used) < DYNAMIC_POOL_TTL
+                || Arc::strong_count(&pool.upstream) > 1
+        });
+        let peers = target.peers();
+        let now_ms = now_epoch_ms();
+        let key_for = |peer: &ProxyTarget| {
+            let mut key = PoolKey::new(peer, max, keep, connect);
+            if key.has_configured_tls_identity() {
+                key.identity_epoch = self.identity_epoch;
+            }
+            key
+        };
+        let (index, selected) = peers
+            .iter()
+            .enumerate()
+            .find(|(_, peer)| {
+                let key = key_for(peer);
+                registry.get(&key).is_none_or(|p| {
+                    p.upstream
+                        .bad_until
+                        .lock()
+                        .as_ref()
+                        .is_none_or(|b| b.load(Ordering::Relaxed) <= now_ms)
+                })
+            })
+            .unwrap_or((0, &peers[0]));
+        if index > 0 {
+            self.failovers.fetch_add(1, Ordering::Relaxed);
+        }
+        let key = key_for(selected);
+        if let Some(pool) = registry.get_mut(&key) {
+            pool.last_used = now;
+            return Ok(pool.upstream.clone());
+        }
+        if registry.len() >= MAX_DYNAMIC_POOLS {
+            let oldest = registry
+                .iter()
+                .filter(|(_, p)| Arc::strong_count(&p.upstream) == 1)
+                .min_by_key(|(_, p)| p.last_used)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = oldest {
+                registry.remove(&key);
+            } else {
+                return Err(hj_core::HandlerError::ServiceUnavailable);
+            }
+        }
+        let upstream = Upstream::new(selected, max, keep, connect);
+        upstream.set_bad_until_handle(Arc::new(AtomicU64::new(0)));
+        registry.insert(
+            key,
+            DynamicPool {
+                upstream: upstream.clone(),
+                last_used: now,
+            },
+        );
+        Ok(upstream)
     }
 
     /// Requests served by a failover peer (Tier 1.2, for metrics).
@@ -730,11 +833,11 @@ impl UpstreamPool {
 
     /// Number of distinct upstream pools (for tests/metrics).
     pub fn len(&self) -> usize {
-        self.pools.lock().len()
+        self.pools.lock().len() + self.dynamic.lock().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.lock().is_empty()
+        self.pools.lock().is_empty() && self.dynamic.lock().is_empty()
     }
 
     pub(crate) fn retained_generation(
@@ -790,6 +893,8 @@ impl UpstreamPool {
             .map(|(key, upstream)| (key.clone(), upstream.clone()))
             .collect();
         UpstreamPool {
+            dynamic: self.dynamic.clone(),
+            identity_epoch: NEXT_IDENTITY_EPOCH.fetch_add(1, Ordering::Relaxed),
             pools: Mutex::new(retained),
             health_tasks: Mutex::new(Vec::new()),
             published_groups: self.published_groups.clone(),
@@ -806,6 +911,40 @@ mod tests {
     use crate::Proxy;
 
     #[test]
+    fn dynamic_registry_is_bounded_and_busy_pools_are_not_replaced() {
+        let pool = UpstreamPool::new();
+        let mut held = Vec::new();
+        for port in 1..=MAX_DYNAMIC_POOLS {
+            let target = ProxyTarget::parse_url(&format!("http://192.0.2.1:{port}")).unwrap();
+            held.push(
+                pool.get_or_create(&target, 1, Duration::from_secs(1), Duration::from_secs(1))
+                    .unwrap(),
+            );
+        }
+        let extra = ProxyTarget::parse_url("http://192.0.2.2:1").unwrap();
+        assert!(
+            pool.get_or_create(&extra, 1, Duration::from_secs(1), Duration::from_secs(1))
+                .is_err()
+        );
+        assert_eq!(pool.len(), MAX_DYNAMIC_POOLS);
+        assert!(pool.bad_until.lock().is_empty());
+        drop(held);
+        assert!(
+            pool.get_or_create(&extra, 1, Duration::from_secs(1), Duration::from_secs(1))
+                .is_ok()
+        );
+        assert_eq!(pool.len(), MAX_DYNAMIC_POOLS);
+        for value in pool.dynamic.lock().values_mut() {
+            value.last_used -= DYNAMIC_POOL_TTL;
+        }
+        assert!(
+            pool.get_or_create(&extra, 1, Duration::from_secs(1), Duration::from_secs(1))
+                .is_ok()
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
     fn equally_named_vhost_processors_have_distinct_pools() {
         let mut a = ProxyTarget::parse_url("http://127.0.0.1:29001")
             .unwrap()
@@ -813,8 +952,12 @@ mod tests {
         a.name = Some("backend".into());
         let b = a.clone().in_scope("vhost:b");
         let pool = UpstreamPool::new();
-        let ua = pool.get_or_create(&a, 10, Duration::from_secs(5), Duration::from_secs(1));
-        let ub = pool.get_or_create(&b, 10, Duration::from_secs(5), Duration::from_secs(1));
+        let ua = pool
+            .get_or_create(&a, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        let ub = pool
+            .get_or_create(&b, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
         assert!(!Arc::ptr_eq(&ua, &ub));
     }
 
@@ -852,8 +995,9 @@ mod tests {
         let target = ProxyTarget::from_ext_processor(&ep);
         let pool = UpstreamPool::new();
 
-        let primary =
-            pool.get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1));
+        let primary = pool
+            .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
         assert_eq!(primary.authority, "127.0.0.1:29001");
 
         // Trip the primary's breaker (CB_THRESHOLD consecutive dial failures) —
@@ -862,7 +1006,9 @@ mod tests {
             primary.note_dial_failure();
         }
 
-        let next = pool.get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1));
+        let next = pool
+            .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
         assert_eq!(
             next.authority, "127.0.0.1:29002",
             "over-rate primary must be skipped in favor of the failover peer"
@@ -871,8 +1017,9 @@ mod tests {
 
         // The primary recovers after the failover mark expires.
         std::thread::sleep(crate::pool::CB_HALF_OPEN_AFTER + Duration::from_millis(50));
-        let recovered =
-            pool.get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1));
+        let recovered = pool
+            .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
         assert_eq!(recovered.authority, "127.0.0.1:29001");
     }
 
@@ -881,14 +1028,50 @@ mod tests {
         let pool = UpstreamPool::new();
         let t1 = ProxyTarget::parse_url("http://127.0.0.1:8002/a").unwrap();
         let t2 = ProxyTarget::parse_url("http://127.0.0.1:8002/b").unwrap();
-        let u1 = pool.get_or_create(&t1, 10, Duration::from_secs(60), Duration::from_secs(5));
-        let u2 = pool.get_or_create(&t2, 10, Duration::from_secs(60), Duration::from_secs(5));
+        let u1 = pool
+            .get_or_create(&t1, 10, Duration::from_secs(60), Duration::from_secs(5))
+            .unwrap();
+        let u2 = pool
+            .get_or_create(&t2, 10, Duration::from_secs(60), Duration::from_secs(5))
+            .unwrap();
         assert!(Arc::ptr_eq(&u1, &u2), "same authority => same pool");
         assert_eq!(pool.len(), 1);
 
         let t3 = ProxyTarget::parse_url("http://127.0.0.1:8003/a").unwrap();
-        let _u3 = pool.get_or_create(&t3, 10, Duration::from_secs(60), Duration::from_secs(5));
+        let _u3 = pool
+            .get_or_create(&t3, 10, Duration::from_secs(60), Duration::from_secs(5))
+            .unwrap();
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn unnamed_credential_pools_refresh_without_losing_the_shared_bound() {
+        ensure_crypto_provider();
+        let pool = UpstreamPool::new();
+        let plain = ProxyTarget::parse_url("http://127.0.0.1:8002/").unwrap();
+        let mut authenticated = ProxyTarget::parse_url("https://127.0.0.1:8003/").unwrap();
+        authenticated.client_cert_file = Some("/missing/test-client-cert.pem".into());
+        authenticated.client_key_file = Some("/missing/test-client-key.pem".into());
+        let get = |p: &UpstreamPool, t: &ProxyTarget| {
+            p.get_or_create(t, 1, Duration::from_secs(5), Duration::from_secs(1))
+                .unwrap()
+        };
+        let old_plain = get(&pool, &plain);
+        let old_authenticated = get(&pool, &authenticated);
+        let next = pool.retained_generation([], 1, Duration::from_secs(5), Duration::from_secs(1));
+        assert!(Arc::ptr_eq(&old_plain, &get(&next, &plain)));
+        assert!(!Arc::ptr_eq(
+            &old_authenticated,
+            &get(&next, &authenticated)
+        ));
+        assert!(
+            Arc::ptr_eq(&old_authenticated, &get(&pool, &authenticated)),
+            "old in-flight generation must keep its original credential state"
+        );
+        assert!(
+            Arc::ptr_eq(&pool.dynamic, &next.dynamic),
+            "all generations count toward one cardinality bound"
+        );
     }
 
     #[test]
@@ -899,18 +1082,25 @@ mod tests {
         let mut b = ProxyTarget::parse_url("http://127.0.0.1:8003/").unwrap();
         b.name = Some("api".into());
 
-        let ua = pool.get_or_create(&a, 10, Duration::from_secs(60), Duration::from_secs(5));
-        let ub = pool.get_or_create(&b, 10, Duration::from_secs(60), Duration::from_secs(5));
+        let ua = pool
+            .get_or_create(&a, 10, Duration::from_secs(60), Duration::from_secs(5))
+            .unwrap();
+        let ub = pool
+            .get_or_create(&b, 10, Duration::from_secs(60), Duration::from_secs(5))
+            .unwrap();
         assert!(!Arc::ptr_eq(&ua, &ub));
         assert_eq!(ua.authority, "127.0.0.1:8002");
         assert_eq!(ub.authority, "127.0.0.1:8003");
 
-        let changed_limits =
-            pool.get_or_create(&a, 20, Duration::from_secs(30), Duration::from_secs(7));
+        let changed_limits = pool
+            .get_or_create(&a, 20, Duration::from_secs(30), Duration::from_secs(7))
+            .unwrap();
         assert!(!Arc::ptr_eq(&ua, &changed_limits));
         assert_eq!(pool.len(), 3);
 
-        let unchanged = pool.get_or_create(&a, 10, Duration::from_secs(60), Duration::from_secs(5));
+        let unchanged = pool
+            .get_or_create(&a, 10, Duration::from_secs(60), Duration::from_secs(5))
+            .unwrap();
         assert!(Arc::ptr_eq(&ua, &unchanged));
         assert_eq!(pool.len(), 3);
     }
@@ -927,13 +1117,17 @@ mod tests {
         let a = named_target("http://127.0.0.1:8002/");
         let b = named_target("http://127.0.0.1:8003/");
         let mut generation = UpstreamPool::new();
-        generation.get_or_create(&a, limits.0, limits.1, limits.2);
+        generation
+            .get_or_create(&a, limits.0, limits.1, limits.2)
+            .unwrap();
 
         for target in [&b, &a, &b, &a, &b] {
             generation =
                 generation.retained_generation([target.clone()], limits.0, limits.1, limits.2);
             assert_eq!(generation.len(), 0, "obsolete named pool must be dropped");
-            generation.get_or_create(target, limits.0, limits.1, limits.2);
+            generation
+                .get_or_create(target, limits.0, limits.1, limits.2)
+                .unwrap();
             assert_eq!(generation.len(), 1, "one active definition, one pool");
         }
     }
@@ -944,25 +1138,31 @@ mod tests {
         let a = named_target("http://127.0.0.1:8002/");
         let b = named_target("http://127.0.0.1:8003/");
         let old = UpstreamPool::new();
-        let ua = old.get_or_create(&a, limits.0, limits.1, limits.2);
-        let ub = old.get_or_create(&b, limits.0, limits.1, limits.2);
+        let ua = old.get_or_create(&a, limits.0, limits.1, limits.2).unwrap();
+        let ub = old.get_or_create(&b, limits.0, limits.1, limits.2).unwrap();
 
         let both = old.retained_generation([a.clone(), b.clone()], limits.0, limits.1, limits.2);
         assert_eq!(both.len(), 2);
         assert!(Arc::ptr_eq(
             &ua,
-            &both.get_or_create(&a, limits.0, limits.1, limits.2)
+            &both
+                .get_or_create(&a, limits.0, limits.1, limits.2)
+                .unwrap()
         ));
         assert!(Arc::ptr_eq(
             &ub,
-            &both.get_or_create(&b, limits.0, limits.1, limits.2)
+            &both
+                .get_or_create(&b, limits.0, limits.1, limits.2)
+                .unwrap()
         ));
 
         let only_b = both.retained_generation([b.clone()], limits.0, limits.1, limits.2);
         assert_eq!(only_b.len(), 1);
         assert!(Arc::ptr_eq(
             &ub,
-            &only_b.get_or_create(&b, limits.0, limits.1, limits.2)
+            &only_b
+                .get_or_create(&b, limits.0, limits.1, limits.2)
+                .unwrap()
         ));
     }
 
@@ -971,12 +1171,16 @@ mod tests {
         let limits = (10, Duration::from_secs(60), Duration::from_secs(5));
         let target = ProxyTarget::parse_url("http://127.0.0.1:9000/").unwrap();
         let old = UpstreamPool::new();
-        let upstream = old.get_or_create(&target, limits.0, limits.1, limits.2);
+        let upstream = old
+            .get_or_create(&target, limits.0, limits.1, limits.2)
+            .unwrap();
         let next = old.retained_generation([], limits.0, limits.1, limits.2);
         assert_eq!(next.len(), 1);
         assert!(Arc::ptr_eq(
             &upstream,
-            &next.get_or_create(&target, limits.0, limits.1, limits.2)
+            &next
+                .get_or_create(&target, limits.0, limits.1, limits.2)
+                .unwrap()
         ));
     }
 
@@ -1184,12 +1388,15 @@ mod tests {
     }
 
     fn target_upstream(proxy: &Proxy, target: &ProxyTarget) -> Arc<Upstream> {
-        proxy.pool().get_or_create(
-            target,
-            target.max_conns.unwrap(),
-            target.keep_alive.unwrap(),
-            target.connect_timeout.unwrap(),
-        )
+        proxy
+            .pool()
+            .get_or_create(
+                target,
+                target.max_conns.unwrap(),
+                target.keep_alive.unwrap(),
+                target.connect_timeout.unwrap(),
+            )
+            .unwrap()
     }
 
     #[test]

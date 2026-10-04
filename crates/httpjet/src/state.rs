@@ -711,6 +711,9 @@ fn build_config_derived(
         }
     }
 
+    for listener in &server.listeners {
+        listener.validate_proxy_protocol()?;
+    }
     let acl = Arc::new(AccessControl::from_security(&server.security)?);
     let client_throttle = hj_acl::ClientThrottle::from_tuning(&server.tuning);
     let compress = Arc::new(Compress::from_tuning(&server.tuning).with_cf_send_zstd(cf_send_zstd));
@@ -1399,12 +1402,16 @@ mod tests {
     }
 
     fn pooled(state: &ServerState, target: &ProxyTarget) -> Arc<hj_proxy::Upstream> {
-        state.proxy.pool().get_or_create(
-            target,
-            target.max_conns.unwrap(),
-            target.keep_alive.unwrap(),
-            target.connect_timeout.unwrap(),
-        )
+        state
+            .proxy
+            .pool()
+            .get_or_create(
+                target,
+                target.max_conns.unwrap(),
+                target.keep_alive.unwrap(),
+                target.connect_timeout.unwrap(),
+            )
+            .unwrap()
     }
 
     #[test]

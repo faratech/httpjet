@@ -487,6 +487,7 @@ impl Proxy {
         let connect_timeout = target
             .connect_timeout
             .unwrap_or(self.default_connect_timeout);
+        let dial_admission = pool::dial_permit().map_err(|_| HandlerError::ServiceUnavailable)?;
         let stream =
             match tokio::time::timeout(connect_timeout, TcpStream::connect(&hostport)).await {
                 Ok(Ok(stream)) => {
@@ -502,6 +503,7 @@ impl Proxy {
                     return Err(HandlerError::GatewayTimeout);
                 }
             };
+        drop(dial_admission);
         let _ = stream.set_nodelay(true);
         set_tcp_keepalive(&stream);
 
@@ -1583,6 +1585,40 @@ mod tests {
             Err(e) => panic!("expected BadGateway, got {e}"),
             Ok(_) => panic!("wss upstream should fail closed before dialing"),
         }
+    }
+
+    #[tokio::test]
+    async fn http_and_websocket_share_dial_admission() {
+        // Isolate the admission fixture from other tests, then exercise both
+        // real dispatch paths without opening any socket while saturated.
+        pool::TEST_DIAL_BUDGET.scope(Arc::new(tokio::sync::Semaphore::new(1)), async {
+        let permit = pool::dial_permit().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = ProxyTarget::parse_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let c = ctx("192.0.2.1", false);
+        let make_request = || {
+            let body: hj_core::IncomingBody = Empty::<Bytes>::new()
+                .map_err(|e| Box::new(e) as BoxError).boxed();
+            http::Request::builder().uri("/socket").header(HOST, "client.example")
+                .header(http::header::CONNECTION, "Upgrade")
+                .header(http::header::UPGRADE, "websocket").body(body).unwrap()
+        };
+        let proxy = Proxy::new();
+        assert!(proxy.forward(&c, make_request(), &target, None).await.is_err());
+        assert!(matches!(proxy.proxy_websocket(&c, make_request(), &target).await,
+            Err(HandlerError::ServiceUnavailable)));
+        assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err(),
+            "saturated admission must not open a socket");
+        drop(permit);
+        // A normal WebSocket request resumes dialing when capacity is returned.
+        let request = proxy.proxy_websocket(&c, make_request(), &target);
+        tokio::pin!(request);
+        tokio::select! {
+            accepted = listener.accept() => { assert!(accepted.is_ok()); }
+            result = &mut request => { panic!("request ended before connecting: {}", result.err().unwrap()); }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("ordinary dial was blocked"),
+        }
+        }).await;
     }
 
     #[tokio::test]

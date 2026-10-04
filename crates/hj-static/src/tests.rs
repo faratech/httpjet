@@ -237,12 +237,21 @@ fn multi_range_count_cap_falls_back_to_ignore() {
     assert_eq!(multi(parse_ranges(spec(8).as_bytes(), 1000)).len(), 8);
 }
 
-#[test]
-fn multipart_body_framing_is_byte_exact() {
-    let data = bytes::Bytes::from_static(b"0123456789");
+#[tokio::test]
+async fn multipart_body_framing_is_byte_exact() {
+    let root = temp_root("multipart-framing");
+    fs::write(root.join("file"), b"0123456789").unwrap();
+    let file = fs::File::open(root.join("file")).unwrap();
     let ranges = [(0u64, 3u64), (6u64, 9u64)];
-    let parts = vec![data.slice(0..4), data.slice(6..10)];
-    let body = build_multipart_body("BOUND", "text/plain", 10, &ranges, &parts);
+    let (Body::Full(body), length) =
+        materialize_multipart("BOUND", "text/plain", 10, &ranges, Some(&file), false)
+            .await
+            .unwrap()
+    else {
+        panic!("expected full body");
+    };
+    assert_eq!(body.len(), length);
+    fs::remove_dir_all(root).unwrap();
     assert_eq!(
         &body[..],
         b"\r\n--BOUND\r\nContent-Type: text/plain\r\nContent-Range: bytes 0-3/10\r\n\r\n0123\
@@ -2048,4 +2057,30 @@ async fn range_multi_all_unsatisfiable_is_416() {
     assert_eq!(resp.headers()[CONTENT_RANGE], "bytes */10");
 
     fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn multipart_memory_lease_survives_bytes_clones_and_head_needs_no_read() {
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+    let permit = semaphore.clone().try_acquire_many_owned(8).unwrap();
+    let bytes = bytes::Bytes::from_owner(MultipartAllocation {
+        data: vec![0; 8],
+        _permit: permit,
+    });
+    let clone = bytes.clone();
+    drop(bytes);
+    assert_eq!(semaphore.available_permits(), 8);
+    drop(clone);
+    assert_eq!(semaphore.available_permits(), 16);
+    let (body, length) =
+        materialize_multipart("test", "text/plain", 8, &[(0, 1), (4, 5)], None, true)
+            .await
+            .unwrap();
+    assert!(matches!(body, Body::Empty));
+    assert!(length > 4);
+    assert!(
+        materialize_multipart("test", "text/plain", 8, &[(0, 1), (4, 5)], None, false)
+            .await
+            .is_none()
+    );
 }

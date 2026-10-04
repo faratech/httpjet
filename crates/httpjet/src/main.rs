@@ -345,9 +345,8 @@ struct ServeArgs {
     /// arena retention trips the safety-net reclaim.
     #[arg(long, default_value_t = 768)]
     mimalloc_trim_threshold_mib: u64,
-    /// (profiling) Optional shared token guarding the /debug/pprof/profile endpoint
-    /// (only built with `--features profiling`; loopback-only regardless). Empty
-    /// = no token (loopback is the only guard).
+    /// Bearer secret required for profiling and sensitive metrics diagnostics.
+    /// Empty disables those routes; ordinary metrics scraping stays available.
     #[arg(long, default_value = "")]
     profile_token: String,
     /// (rewrite) TTL in milliseconds for the rewrite-outcome cache (memoized
@@ -1625,8 +1624,8 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 Ok(addr) if !metrics::metrics_bind_allowed(&addr) => {
                     tracing::error!(
                         %addr,
-                        "refusing non-loopback --metrics-addr: the metrics endpoint is an \
-                         UNAUTHENTICATED control+diagnostic surface (cache-URL enumeration, \
+                        "refusing non-loopback --metrics-addr: the metrics endpoint is a \
+                         local diagnostics surface (authenticated cache-URL enumeration, \
                          process stats, /__alloc-count?reset, profiling /debug/pprof/profile) and is \
                          documented loopback-only — not binding it (use 127.0.0.1 or ::1)"
                     );
@@ -2465,6 +2464,7 @@ fn pp_bind_is_public(address: &str) -> bool {
 
 fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
     let cfg = hj_config::load(root)?;
+    hj_acl::AccessControl::from_security(&cfg.security).map_err(anyhow::Error::msg)?;
     println!("httpjet config check — root: {}", cfg.server_root.display());
     println!("  server name : {}", cfg.server_name);
     println!("  run as      : {}:{}", cfg.user, cfg.group);
@@ -2556,7 +2556,7 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
         // listener is safe only when its direct peers are the trusted LB.
         if l.proxy_protocol && pp_bind_is_public(&l.address) {
             println!(
-                "  lint WARN : proxyProtocol on listener '{}' binds a wildcard/public address ({}); any direct peer can forge its client address — enable only behind a trusted LB (loopback/unspecified claimed sources are refused outright, so the local mTLS exemption and the loopback purge/ready endpoints stay out of reach)",
+                "  lint WARN : proxyProtocol on listener '{}' binds a wildcard/public address ({}); only proxyProtocolPeers may assert client identity; restrict direct reachability to those trusted load balancers",
                 l.name, l.address
             );
         }

@@ -122,12 +122,7 @@ impl AccessControl {
     /// Build an [`AccessControl`] from a [`Security`] block
     /// (`access_control` + `access_deny_dir`).
     ///
-    /// Rule specs are parsed leniently: an unparseable CIDR is skipped with a
-    /// warning rather than failing construction, mirroring LiteSpeed's
-    /// tolerance of malformed config lines. A malformed `accessDenyDir` glob
-    /// is the one fail-closed exception (#365): a skipped deny silently
-    /// exposes exactly the tree the operator asked to protect, so it is a
-    /// hard error — same philosophy as `--page-cache-shared-paths`.
+    /// Invalid access-control addresses and deny globs reject the configuration.
     pub fn from_security(security: &Security) -> Result<Self, String> {
         let mut rules: Vec<Rule> = Vec::with_capacity(security.access_control.len());
         let mut trusted_nets: Vec<IpNet> = Vec::new();
@@ -160,7 +155,10 @@ impl AccessControl {
                     });
                 }
                 None => {
-                    tracing::warn!(spec = %ar.spec, "hj-acl: ignoring unparseable access-control spec");
+                    return Err(format!(
+                        "invalid access-control address or CIDR: {}",
+                        ar.spec
+                    ));
                 }
             }
         }
@@ -1193,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_spec_is_skipped() {
+    fn malformed_spec_rejects_configuration() {
         let sec = Security {
             follow_symlink: false,
             access_deny_dir: vec![],
@@ -1212,10 +1210,10 @@ mod tests {
             cgi_cpu_limit_secs: None,
             ..Default::default()
         };
-        let acl = AccessControl::from_security(&sec).unwrap();
-        // Bad rule ignored; ALL allow stands; bad rule didn't register as trusted.
-        assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
-        assert!(!acl.is_trusted(ip("8.8.8.8")));
+        assert!(AccessControl::from_security(&sec).is_err());
+        let mut allow = sec;
+        allow.access_control[1].allow = true;
+        assert!(AccessControl::from_security(&allow).is_err());
     }
 
     #[test]

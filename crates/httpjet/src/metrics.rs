@@ -1,11 +1,7 @@
-//! (OPS1) Minimal loopback-only metrics endpoint.
-//!
-//! Serves a Prometheus text snapshot of the page-cache hit/miss counters (the
-//! single most important operational number once `--page-cache` is live), plus a
-//! request counter and an active-connections gauge. Deliberately tiny: a raw
-//! HTTP/1.1 responder bound to loopback and gated behind `--metrics-addr`, so it
-//! adds nothing to the request hot path and exposes no control surface. Every
-//! request (any method/path) returns the same snapshot.
+//! Loopback metrics and authenticated operational diagnostics.
+//! GET / and /metrics remain ordinary Prometheus scrapes. Sensitive routes
+//! require a nonempty bearer secret; mutation and profiling use POST. Complete
+//! bounded request heads, exact Host, and absent Origin are checked first.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -20,14 +16,7 @@ use crate::state::{Metrics, ServerState};
 
 const CACHE_ENTRIES_MIN_INTERVAL_MS: u64 = 1_000;
 
-/// The metrics endpoint exposes an UNAUTHENTICATED control+diagnostic surface — cache-URL
-/// enumeration (`/cache-entries`), process/mimalloc stats, a state-mutating `/__alloc-count?reset`,
-/// and (profiling builds) a up-to-60s `/debug/pprof/profile` CPU profiler. The module is documented
-/// loopback-only, but nothing previously constrained `--metrics-addr`, so a misconfigured
-/// `0.0.0.0:9090` exposed all of it to the network. Enforce the guarantee: only a loopback bind
-/// address is allowed (a `127.0.0.0/8` / `::1` socket is unreachable off-box). The caller refuses
-/// to bind anything else. (The sibling peer-purge endpoint re-checks the raw source IP for the
-/// same reason; here the bind constraint is sufficient because the socket itself is unreachable.)
+/// Local diagnostics and scraping are restricted to loopback binds.
 pub(crate) fn metrics_bind_allowed(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
@@ -76,6 +65,85 @@ fn parse_kib_field(field: &str) -> u64 {
 /// Prometheus snapshot it serves an on-demand raw pprof CPU profile at
 /// `/debug/pprof/profile` when built with `--features profiling` (telemetry
 /// points at the slow phase; this drills to the line).
+fn classify_metrics<'a>(
+    bytes: &'a [u8],
+    local: SocketAddr,
+    token: Option<&str>,
+) -> Result<&'a str, u16> {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut request = httparse::Request::new(&mut headers);
+    if !matches!(request.parse(bytes), Ok(httparse::Status::Complete(n)) if n == bytes.len())
+        || request.version != Some(1)
+        || !local.ip().is_loopback()
+    {
+        return Err(400);
+    }
+    let single = |name: &str| -> Result<Option<&[u8]>, u16> {
+        let mut values = request
+            .headers
+            .iter()
+            .filter(|h| h.name.eq_ignore_ascii_case(name));
+        let value = values.next().map(|h| h.value);
+        if values.next().is_some() {
+            Err(400)
+        } else {
+            Ok(value)
+        }
+    };
+    let host = single("host")?
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .ok_or(400u16)?;
+    if host != format!("localhost:{}", local.port())
+        && host.parse::<SocketAddr>().ok() != Some(local)
+    {
+        return Err(400);
+    }
+    if request.headers.iter().any(|h| {
+        [
+            "origin",
+            "transfer-encoding",
+            "content-encoding",
+            "expect",
+            "upgrade",
+            "trailer",
+        ]
+        .iter()
+        .any(|n| h.name.eq_ignore_ascii_case(n))
+    }) {
+        return Err(400);
+    }
+    if single("content-length")?.is_some_and(|v| v != b"0") {
+        return Err(400);
+    }
+    let authorization = single("authorization")?;
+    let target = request.path.ok_or(400u16)?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let (method, sensitive) = match path {
+        "/" | "/metrics" if query.is_empty() => ("GET", false),
+        "/cache-entries" | "/__mimalloc-stats" if query.is_empty() => ("GET", true),
+        "/__alloc-count" if query.is_empty() => ("GET", true),
+        "/__alloc-count" if query == "reset" => ("POST", true),
+        "/debug/pprof/profile" if cfg!(feature = "profiling") => ("POST", true),
+        _ => return Err(404),
+    };
+    if request.method != Some(method) {
+        return Err(405);
+    }
+    if sensitive {
+        let expected = token.filter(|t| !t.is_empty()).ok_or(403u16)?;
+        let supplied = authorization
+            .and_then(|h| h.strip_prefix(b"Bearer "))
+            .ok_or(403u16)?;
+        let digest = Sha256::digest(supplied);
+        if !bool::from(digest.ct_eq(&Sha256::digest(expected.as_bytes()))) {
+            return Err(403);
+        }
+    }
+    Ok(target)
+}
+
 pub async fn serve_metrics(
     listener: TcpListener,
     state: Arc<ServerState>,
@@ -98,19 +166,47 @@ pub async fn serve_metrics(
             // routes (CPU profiler, alloc-count reset) on it directly so they stay
             // loopback-only even if the bind constraint is ever loosened to allow remote read-only.
             let peer_loopback = peer.ip().is_loopback();
-            // Read the request head (bounded so a slow/garbage client can't pin the
-            // task). The path is only inspected for the pprof route; every
-            // other request returns the metrics snapshot.
-            let mut buf = [0u8; 1024];
-            let n = match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await
+            let local = match stream.local_addr() {
+                Ok(local) => local,
+                Err(_) => return,
+            };
+            let mut buf = [0u8; 8192];
+            let read = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut n = 0;
+                loop {
+                    if n == buf.len() {
+                        return Err(431u16);
+                    }
+                    let count = stream.read(&mut buf[n..]).await.map_err(|_| 400u16)?;
+                    if count == 0 {
+                        return Err(400);
+                    }
+                    n += count;
+                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        return Ok(n);
+                    }
+                }
+            })
+            .await
+            .unwrap_or(Err(408));
+            let target = match read
+                .and_then(|n| classify_metrics(&buf[..n], local, token.as_deref()))
             {
-                Ok(Ok(n)) => n,
-                _ => 0,
+                Ok(target) if peer_loopback => target,
+                result => {
+                    let status = result.err().unwrap_or(403);
+                    let head = format!(
+                        "HTTP/1.1 {status} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                    return;
+                }
             };
 
             #[cfg(feature = "profiling")]
             if peer_loopback {
-                if let Some((head, body)) = profile::try_handle(&buf[..n], token.as_deref()).await {
+                if let Some((head, body)) = profile::try_handle(target).await {
                     let _ = stream.write_all(head.as_bytes()).await;
                     let _ = stream.write_all(&body).await;
                     let _ = stream.shutdown().await;
@@ -124,7 +220,7 @@ pub async fn serve_metrics(
 
             // Loopback-only cache-contents listing: enumerate what's ACTUALLY cached (URL classes
             // + largest entries) so "what's junk?" is answerable directly, not inferred.
-            if request_target(&buf[..n]).is_some_and(|t| t.starts_with("/cache-entries")) {
+            if target == "/cache-entries" {
                 if !try_enter_cache_entries_render(&state) {
                     let body = "cache-entries render throttled\n";
                     let head = format!(
@@ -150,9 +246,9 @@ pub async fn serve_metrics(
             // Alloc-count (h2 alloc-campaign harness). Returns the global allocation-call
             // counter; `?reset` zeroes it first. 0 unless built `--features allocount`.
             // Measure allocs/request = (read after a fixed h2load run) - (reset before) / N.
-            if request_target(&buf[..n]).is_some_and(|t| t.starts_with("/__alloc-count")) {
+            if target.split('?').next() == Some("/__alloc-count") {
                 // `?reset` mutates state — loopback peers only (defense-in-depth; read is harmless).
-                if peer_loopback && request_target(&buf[..n]).is_some_and(|t| t.contains("reset")) {
+                if peer_loopback && target == "/__alloc-count?reset" {
                     crate::allocount::ALLOC_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
                 let body = format!(
@@ -172,7 +268,7 @@ pub async fn serve_metrics(
             // Loopback-only mimalloc diagnostics: process RSS/swap + mimalloc's own
             // stats dump, so the swap-retention picture (reserved vs committed vs
             // in-use → retention or a real leak) is answerable on the live binary.
-            if request_target(&buf[..n]).is_some_and(|t| t.starts_with("/__mimalloc-stats")) {
+            if target == "/__mimalloc-stats" {
                 let body = render_mimalloc_stats();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -197,7 +293,7 @@ pub async fn serve_metrics(
 }
 
 /// On-demand CPU profile endpoint (`--features profiling`). Loopback-only + an
-/// optional shared token; samples the WHOLE process (all worker threads) for a
+/// required bearer secret; samples the WHOLE process (all worker threads) for a
 /// bounded window and returns raw pprof protobuf bytes. Rendering is deliberately
 /// left to external tools such as `go tool pprof`. The pprof guard lives entirely
 /// inside a `spawn_blocking` closure so it never crosses an `.await` (it is not
@@ -209,20 +305,13 @@ mod profile {
     /// Returns `Some((http_head, body))` if the request targets
     /// `/debug/pprof/profile`,
     /// else `None` (let the caller serve the metrics snapshot).
-    pub async fn try_handle(req: &[u8], token: Option<&str>) -> Option<(String, Vec<u8>)> {
-        let target = request_target(req)?;
+    pub async fn try_handle(target: &str) -> Option<(String, Vec<u8>)> {
         let rest = target.strip_prefix("/debug/pprof/profile")?;
         // Only the bare path (optionally with a query) — not /debug/pprof/profileX.
         if !(rest.is_empty() || rest.starts_with('?')) {
             return None;
         }
         let q = rest.strip_prefix('?').unwrap_or("");
-        if let Some(expected) = token {
-            if param(q, "token").as_deref() != Some(expected) {
-                let body = b"forbidden: bad or missing ?token\n".to_vec();
-                return Some((head(403, "text/plain", body.len()), body));
-            }
-        }
         let secs = param(q, "seconds")
             .and_then(|s| s.parse().ok())
             .unwrap_or(10u64)
@@ -277,14 +366,6 @@ mod profile {
         )
     }
 
-    /// Extract the request target (second token of the request line).
-    fn request_target(req: &[u8]) -> Option<String> {
-        let line = req.split(|&b| b == b'\n').next()?;
-        let s = std::str::from_utf8(line).ok()?;
-        Some(s.split_whitespace().nth(1)?.to_string())
-    }
-
-    /// First `key=value` in a `&`-separated query string.
     fn param(query: &str, key: &str) -> Option<String> {
         query
             .split('&')
@@ -295,24 +376,13 @@ mod profile {
 
     #[cfg(test)]
     mod tests {
-        use super::try_handle;
-
         #[tokio::test]
-        async fn pprof_route_is_exact_and_token_gated() {
+        async fn pprof_route_is_exact() {
             assert!(
-                try_handle(b"GET /debug/pprof/profile-extra HTTP/1.1\r\n\r\n", None)
+                super::try_handle("/debug/pprof/profile-extra")
                     .await
                     .is_none()
             );
-
-            let (head, body) = try_handle(
-                b"GET /debug/pprof/profile?token=wrong HTTP/1.1\r\n\r\n",
-                Some("secret"),
-            )
-            .await
-            .expect("pprof route");
-            assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"));
-            assert_eq!(body, b"forbidden: bad or missing ?token\n");
         }
     }
 }
@@ -893,13 +963,6 @@ fn append_runtime_diagnostics(out: &mut String, d: RuntimeDiagnostics) {
         "Access-log lines shed because the non-blocking writer queue was full or gone.",
         d.access_log_dropped,
     );
-}
-
-/// Extract the request target (2nd token of the request line) from a raw HTTP head.
-fn request_target(req: &[u8]) -> Option<String> {
-    let line = req.split(|&b| b == b'\n').next()?;
-    let s = std::str::from_utf8(line).ok()?;
-    Some(s.split_whitespace().nth(1)?.to_string())
 }
 
 /// Render the live page-cache contents (loopback debug): per-URL-class histogram + the largest
@@ -1523,7 +1586,7 @@ mod tests {
 
     #[test]
     fn metrics_bind_only_allows_loopback() {
-        // Regression (#88): the metrics endpoint MUST be loopback-only (unauthenticated control
+        // Regression (#88): the metrics endpoint MUST be loopback-only (local control
         // surface). Loopback v4/v6 are allowed; a wildcard or LAN/public address is refused.
         for ok in ["127.0.0.1:9090", "127.0.0.5:9090", "[::1]:9090"] {
             assert!(
@@ -1797,6 +1860,67 @@ mod tests {
         assert!(
             body.contains("httpjet_log_access_dropped_lines_total 4\n"),
             "{body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_policy_tests {
+    use super::*;
+    fn classify(
+        method: &str,
+        target: &str,
+        headers: &str,
+        token: Option<&str>,
+    ) -> Result<String, u16> {
+        let request =
+            format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:9090\r\n{headers}\r\n");
+        classify_metrics(request.as_bytes(), "127.0.0.1:9090".parse().unwrap(), token)
+            .map(str::to_owned)
+    }
+    #[test]
+    fn ordinary_scrapes_remain_available_and_sensitive_routes_require_intent() {
+        assert!(classify("GET", "/metrics", "", None).is_ok());
+        assert!(classify("GET", "/", "", None).is_ok());
+        assert_eq!(classify("GET", "/cache-entries", "", None), Err(403));
+        assert_eq!(classify("GET", "/cache-entries-extra", "", None), Err(404));
+        assert_eq!(
+            classify("GET", "/debug/pprof/profile", "", Some("secret")),
+            Err(if cfg!(feature = "profiling") {
+                405
+            } else {
+                404
+            })
+        );
+        assert_eq!(
+            classify("GET", "/__alloc-count?reset", "", Some("secret")),
+            Err(405)
+        );
+        assert!(
+            classify(
+                "POST",
+                "/__alloc-count?reset",
+                "Authorization: Bearer secret\r\n",
+                Some("secret")
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            classify("GET", "/metrics", "Origin: null\r\n", None),
+            Err(400)
+        );
+        assert_eq!(
+            classify("GET", "/metrics", "Host: foreign.test\r\n", None),
+            Err(400)
+        );
+        assert_eq!(
+            classify(
+                "GET",
+                "/cache-entries",
+                "Authorization: Bearer secret\r\nAuthorization: Bearer secret\r\n",
+                Some("secret")
+            ),
+            Err(400)
         );
     }
 }

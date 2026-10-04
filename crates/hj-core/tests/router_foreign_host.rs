@@ -59,6 +59,7 @@ fn build_router() -> Router {
         address: "0.0.0.0:443".into(),
         secure: true,
         proxy_protocol: false,
+        proxy_protocol_peers: vec![],
         uds_path: None,
         vhost_map: vec![
             VhostMap {
@@ -222,6 +223,7 @@ fn mapped_vhost_with_unloaded_config_is_known_but_unloaded() {
         address: "0.0.0.0:443".into(),
         secure: true,
         proxy_protocol: false,
+        proxy_protocol_peers: vec![],
         uds_path: None,
         vhost_map: vec![
             VhostMap {

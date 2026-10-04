@@ -132,7 +132,16 @@ impl Htaccess {
             // Top-level (or in-block) directives we recognize.
             match dlow.as_str() {
                 "header" => {
-                    if let Some(mut op) = parse_header(rest) {
+                    if let Some(mut op) = parse_header(rest, lineno)? {
+                        if cur_scopes
+                            .iter()
+                            .any(|scope| scope.kind == ScopeKind::If && scope.uri_expr.is_none())
+                        {
+                            return Err(RewriteError::Malformed {
+                                line: lineno,
+                                msg: "unsupported Header enclosing If expression".into(),
+                            });
+                        }
                         op.scopes = cur_scopes.clone();
                         h.headers.push(op);
                     }
@@ -1035,11 +1044,14 @@ fn fnmatch_to_regex(glob: &str) -> String {
 // Directive parsers
 // ===========================================================================
 
-fn parse_header(rest: &str) -> Option<HeaderDirective> {
+fn parse_header(rest: &str, line: usize) -> Result<Option<HeaderDirective>, RewriteError> {
     // [always|onsuccess] action name [value] [env=...]
-    let mut toks = tokenize(rest);
+    let mut toks = header_tokens(rest).ok_or_else(|| RewriteError::Malformed {
+        line,
+        msg: "unbalanced Header quotes".into(),
+    })?;
     if toks.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut always = false;
     if toks[0].eq_ignore_ascii_case("always") {
@@ -1049,7 +1061,7 @@ fn parse_header(rest: &str) -> Option<HeaderDirective> {
         toks.remove(0);
     }
     if toks.is_empty() {
-        return None;
+        return Ok(None);
     }
     let action = match toks.remove(0).to_ascii_lowercase().as_str() {
         "set" => HeaderAction::Set,
@@ -1058,10 +1070,10 @@ fn parse_header(rest: &str) -> Option<HeaderDirective> {
         "merge" => HeaderAction::Merge,
         "unset" => HeaderAction::Unset,
         "echo" => HeaderAction::Echo,
-        _ => return None,
+        _ => return Ok(None),
     };
     if toks.is_empty() {
-        return None;
+        return Ok(None);
     }
     let name = toks.remove(0);
 
@@ -1069,10 +1081,17 @@ fn parse_header(rest: &str) -> Option<HeaderDirective> {
     let mut value = String::new();
     let mut env = None;
     let mut expr = Vec::new();
+    let mut has_expr = false;
     let mut i = 0;
     while i < toks.len() {
         let tok = &toks[i];
         if let Some(g) = tok.strip_prefix("env=") {
+            if env.is_some() || g.is_empty() || g == "!" {
+                return Err(RewriteError::Malformed {
+                    line,
+                    msg: "malformed or duplicate Header environment guard".into(),
+                });
+            }
             let (negate, var) = match g.strip_prefix('!') {
                 Some(v) => (true, v.to_string()),
                 None => (false, g.to_string()),
@@ -1080,7 +1099,14 @@ fn parse_header(rest: &str) -> Option<HeaderDirective> {
             env = Some(EnvGuard { var, negate });
             i += 1;
         } else if tok.starts_with("expr=") {
-            let mut raw = tok.trim_start_matches("expr=").to_string();
+            if has_expr {
+                return Err(RewriteError::Malformed {
+                    line,
+                    msg: "duplicate Header expression".into(),
+                });
+            }
+            has_expr = true;
+            let mut raw = tok.strip_prefix("expr=").unwrap().to_string();
             i += 1;
             while i < toks.len() && !toks[i].starts_with("env=") {
                 if !raw.is_empty() {
@@ -1089,18 +1115,32 @@ fn parse_header(rest: &str) -> Option<HeaderDirective> {
                 raw.push_str(&toks[i]);
                 i += 1;
             }
-            expr = raw
-                .split("&&")
-                .filter_map(|part| parse_if_uri_cond(part.trim()))
-                .collect();
+            expr = split_if_top_level(&raw, b"&&")
+                .and_then(|parts| {
+                    parts
+                        .into_iter()
+                        .map(|part| parse_if_uri_cond(part.trim()))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .filter(|conditions| !conditions.is_empty())
+                .ok_or_else(|| RewriteError::Malformed {
+                    line,
+                    msg: "unsupported or malformed Header expression".into(),
+                })?;
         } else if value.is_empty() {
             value = tok.clone();
             i += 1;
         } else {
+            if tok != "early" {
+                return Err(RewriteError::Malformed {
+                    line,
+                    msg: "unsupported Header trailing argument".into(),
+                });
+            }
             i += 1;
         }
     }
-    Some(HeaderDirective {
+    Ok(Some(HeaderDirective {
         action,
         name,
         value,
@@ -1108,7 +1148,53 @@ fn parse_header(rest: &str) -> Option<HeaderDirective> {
         expr,
         always,
         scopes: vec![],
-    })
+    }))
+}
+
+/// Accept either Apache quote delimiter, preserving inner quotes and regex
+/// escapes. Incomplete quotes must never conceal a guard.
+fn header_tokens(text: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut value = String::new();
+    let mut quote = None;
+    let mut present = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if quote.is_some() => {
+                if chars.peek().copied() == quote {
+                    value.push(chars.next()?);
+                } else {
+                    value.push(ch);
+                }
+                present = true;
+            }
+            '"' | '\'' if quote == Some(ch) => {
+                quote = None;
+            }
+            '"' | '\'' if quote.is_none() => {
+                quote = Some(ch);
+                present = true;
+            }
+            ch if ch.is_whitespace() && quote.is_none() => {
+                if present {
+                    tokens.push(std::mem::take(&mut value));
+                    present = false;
+                }
+            }
+            ch => {
+                value.push(ch);
+                present = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if present {
+        tokens.push(value);
+    }
+    Some(tokens)
 }
 
 /// Memo classification of one `SetEnvIf`: the attribute must be a key-covered
@@ -1310,7 +1396,9 @@ fn tokenize(s: &str) -> Vec<String> {
 
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with("'") && s.ends_with("'")))
+    {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()

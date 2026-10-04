@@ -540,7 +540,7 @@ mod tests {
             !resp.headers().contains_key("x-colon"),
             "Apache's optional trailing colon is currently rejected as an invalid field name"
         );
-        assert_eq!(resp.headers().get("x-expr-value").unwrap(), "");
+        assert!(!resp.headers().contains_key("x-expr-value"));
         assert_eq!(resp.headers().get("x-early").unwrap(), "late-only");
     }
 }

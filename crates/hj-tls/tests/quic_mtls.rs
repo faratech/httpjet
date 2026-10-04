@@ -149,6 +149,7 @@ fn quic_clientverify2_handshake_completes_without_client_cert() {
         secure: true,
         vhost_map: vec![],
         proxy_protocol: false,
+        proxy_protocol_peers: vec![],
         uds_path: None,
         tls: Some(ListenerTls {
             key_file: key,
@@ -190,6 +191,7 @@ fn tcp_clientverify2_handshake_completes_without_client_cert() {
         secure: true,
         vhost_map: vec![],
         proxy_protocol: false,
+        proxy_protocol_peers: vec![],
         uds_path: None,
         tls: Some(ListenerTls {
             key_file: key,

@@ -200,7 +200,7 @@ struct MemoEntry {
     status: http::StatusCode,
     headers: http::HeaderMap,
     body: Bytes,
-    stored: Instant,
+    expires: Instant,
 }
 
 #[derive(Default)]
@@ -260,7 +260,7 @@ pub(super) fn probe(
         let empty = {
             let bucket = map.get_mut(&h)?;
             bucket.retain(|e| {
-                let live = now.duration_since(e.stored) <= TTL;
+                let live = now < e.expires;
                 if !live {
                     *bytes -= e.body.len();
                     *count -= 1;
@@ -284,7 +284,23 @@ pub(super) fn probe(
     })
 }
 
+#[cfg(test)]
 pub(super) fn store(k: &MemoKey, vary: Vec<VaryItem>, resp: &Response, now: Instant) {
+    store_until(k, vary, resp, now, now + TTL);
+}
+
+pub(super) fn store_until(
+    k: &MemoKey,
+    vary: Vec<VaryItem>,
+    resp: &Response,
+    now: Instant,
+    policy_deadline: Instant,
+) {
+    let expires = (now + TTL).min(policy_deadline);
+    if expires <= Instant::now() {
+        return;
+    }
+
     let Body::Full(body) = resp.body() else {
         return;
     };
@@ -313,7 +329,7 @@ pub(super) fn store(k: &MemoKey, vary: Vec<VaryItem>, resp: &Response, now: Inst
         status: resp.status(),
         headers: resp.headers().clone(),
         body: body.clone(),
-        stored: now,
+        expires,
     };
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
@@ -383,6 +399,20 @@ mod tests {
 
     fn ua_cache() -> UaClassifyCache {
         UaClassifyCache::new()
+    }
+
+    #[test]
+    fn memo_cannot_outlive_consulted_policy_deadline() {
+        let now = Instant::now();
+        let deadline = now + std::time::Duration::from_millis(20);
+        let key = key("/policy-deadline", b"");
+        let request = req(&[]);
+        let cache = ua_cache();
+        store_until(&key, Vec::new(), &resp(b"public"), now, deadline);
+        assert!(probe(&key, &request, &cache, now).is_some());
+        assert!(probe(&key, &request, &cache, deadline).is_none());
+        store_until(&key, Vec::new(), &resp(b"expired"), now, now);
+        assert!(probe(&key, &request, &cache, now).is_none());
     }
 
     #[test]

@@ -237,6 +237,7 @@ fn build_state_inner(
         address: "127.0.0.1:0".into(),
         secure: false,
         proxy_protocol: false,
+        proxy_protocol_peers: vec![],
         uds_path: None,
         vhost_map: vec![VhostMap {
             vhost: VHOST.into(),
@@ -513,6 +514,49 @@ async fn disabled_scripts_allow_static_children_of_dotted_directories() {
 
     let response = run(&state, get(CANON_HOST, "/missing.php", None)).await;
     assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsupported_header_guard_cannot_populate_public_page_cache() {
+    for (expression, supported) in [
+        ("%{HTTP_COOKIE} == ''", false),
+        ("%{REQUEST_URI} =~ m#^/# && %{REQUEST_STATUS} == 200", false),
+        ("%{REQUEST_URI} =~ m#^/public#", true),
+    ] {
+        let root = temp_root("header-cache-guard");
+        std::fs::write(root.join("public.txt"), b"ordinary public response").unwrap();
+        std::fs::write(root.join(".htaccess"), format!(
+            "CacheLookup public on\nHeader set X-LiteSpeed-Cache-Control public,max-age=60 \"expr={expression}\"\n"
+        )).unwrap();
+        let mut config = hj_pagecache::StoreConfig::default();
+        config.max_static_obj_bytes = 0;
+        let store = Arc::new(hj_pagecache::PageStore::new(config));
+        let state = build_state_inner(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            Some(store.clone()),
+            None,
+            |_| {},
+        );
+        for _ in 0..3 {
+            let response = run(&state, get(CANON_HOST, "/public.txt", None)).await;
+            assert_eq!(
+                response.status(),
+                if supported {
+                    http::StatusCode::OK
+                } else {
+                    http::StatusCode::FORBIDDEN
+                }
+            );
+            if !supported {
+                assert!(!response.headers().contains_key("x-litespeed-cache-control"));
+            }
+        }
+        assert_eq!(store.stats().entries, u64::from(supported));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

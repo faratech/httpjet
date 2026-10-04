@@ -3,6 +3,69 @@
 use super::*;
 use hj_rewrite::AuthRealm;
 
+// Bound work before spawn_blocking. The owned permit stays in the closure even
+// if the requesting future is cancelled, so queued/running verification counts.
+const AUTH_CONCURRENCY: usize = 4;
+static AUTH_WORK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(AUTH_CONCURRENCY)));
+static AUTH_QUEUE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(16)));
+async fn auth_permit() -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+    auth_permit_from(&AUTH_WORK, &AUTH_QUEUE).await
+}
+async fn auth_permit_from(
+    work: &Arc<tokio::sync::Semaphore>,
+    queue: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+    let _queue = queue.clone().try_acquire_owned().map_err(|_| auth_busy())?;
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        work.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| auth_busy())?
+    .map_err(|_| auth_busy())
+}
+static AUTH_RATE: std::sync::LazyLock<std::sync::Mutex<AuthRate>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(AuthRate::default()));
+
+#[derive(Default)]
+struct AuthRate {
+    clients: std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>,
+}
+impl AuthRate {
+    fn blocked(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
+        let ip = ip.to_canonical();
+        self.clients
+            .retain(|_, (start, _)| now.duration_since(*start) < std::time::Duration::from_secs(1));
+        self.clients
+            .get(&ip)
+            .map_or(self.clients.len() >= 1024, |(_, count)| *count >= 32)
+    }
+    fn allow(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
+        let ip = ip.to_canonical();
+        self.clients
+            .retain(|_, (start, _)| now.duration_since(*start) < std::time::Duration::from_secs(1));
+        if !self.clients.contains_key(&ip) && self.clients.len() >= 1024 {
+            return false;
+        }
+        let (_, count) = self.clients.entry(ip).or_insert((now, 0));
+        if *count >= 32 {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+}
+fn auth_busy() -> Response {
+    let mut response = error_page(StatusCode::SERVICE_UNAVAILABLE);
+    response.headers_mut().insert(
+        http::header::RETRY_AFTER,
+        http::HeaderValue::from_static("1"),
+    );
+    response
+}
+
 pub(super) async fn enforce_chain(
     ctx: &mut ReqCtx,
     headers: &http::HeaderMap,
@@ -63,8 +126,17 @@ where
             } else {
                 ctx.vhost.doc_root.join(&realm.user_file)
             };
+            let permit = auth_permit().await?;
+            if AUTH_RATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .blocked(ctx.client_ip, std::time::Instant::now())
+            {
+                return Err(auth_busy());
+            }
             let checked_user = user.clone();
             let valid = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 hj_rewrite::auth::verify_credentials(&file, &checked_user, &password)
             })
             .await
@@ -74,6 +146,10 @@ where
                 authenticated.push(realm);
                 return Ok(());
             }
+            AUTH_RATE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .allow(ctx.client_ip, std::time::Instant::now());
         }
     }
     let mut response = error_page(StatusCode::UNAUTHORIZED);
@@ -170,13 +246,13 @@ pub(super) fn target_has_auth(
     ctx: &ReqCtx,
     path: &str,
     chain: &[Arc<Htaccess>],
-) -> bool {
+) -> (bool, Option<std::time::Instant>) {
     if !ctx
         .vhost
         .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess)
         || !aliases_possible(ctx, path)
     {
-        return false;
+        return (false, None);
     }
     let indexes = effective_index_files(state, ctx, chain);
     let script = split_script_path(state, ctx, path, indexes, chain);
@@ -185,26 +261,27 @@ pub(super) fn target_has_auth(
     } else {
         static_candidates(state, ctx, path, chain)
     };
-    candidates.into_iter().any(|(_, lexical)| {
+    let mut deadline: Option<std::time::Instant> = None;
+    for (_, lexical) in candidates {
         let Ok(target) = opened_target_path(&lexical) else {
-            return false;
+            continue;
         };
         let Ok(rel) = target.strip_prefix(&ctx.vhost.doc_root) else {
-            return false;
+            continue;
         };
         let resource = format!("/{}", rel.to_string_lossy());
-        let chain: Vec<_> = state
-            .rewrite_cache
-            .load_chain_with_dirs(
-                &ctx.vhost.doc_root,
-                &resource,
-                ctx.vhost.access_file_name_or_default(),
-            )
-            .into_iter()
-            .map(|(_, ht)| ht)
-            .collect();
-        chain.iter().any(|ht| ht.has_auth()) || access_denied(&chain, &resource, "GET", ctx)
-    })
+        let (entries, checked_until) = state.rewrite_cache.load_chain_with_dirs_and_deadline(
+            &ctx.vhost.doc_root,
+            &resource,
+            ctx.vhost.access_file_name_or_default(),
+        );
+        deadline = Some(deadline.map_or(checked_until, |old| old.min(checked_until)));
+        let chain: Vec<_> = entries.into_iter().map(|(_, ht)| ht).collect();
+        if chain.iter().any(|ht| ht.has_auth()) || access_denied(&chain, &resource, "GET", ctx) {
+            return (true, deadline);
+        }
+    }
+    (false, deadline)
 }
 
 /// Prefer the opened inode over a lexical target hint for the final backstop.
@@ -274,4 +351,67 @@ pub(super) async fn enforce_mapped_resources(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn auth_rate_is_bounded_and_canonical() {
+        let mut rate = AuthRate::default();
+        let now = std::time::Instant::now();
+        for _ in 0..32 {
+            assert!(rate.allow("192.0.2.1".parse().unwrap(), now));
+        }
+        assert!(!rate.allow("::ffff:192.0.2.1".parse().unwrap(), now));
+        assert!(rate.allow(
+            "192.0.2.1".parse().unwrap(),
+            now + std::time::Duration::from_secs(1)
+        ));
+        for n in 1..=1024u32 {
+            let _ = rate.allow(
+                std::net::IpAddr::V4(n.into()),
+                now + std::time::Duration::from_secs(1),
+            );
+        }
+        assert!(rate.clients.len() <= 1024);
+        assert!(!rate.allow(
+            "198.51.100.1".parse().unwrap(),
+            now + std::time::Duration::from_secs(1)
+        ));
+    }
+    #[tokio::test]
+    async fn cancelled_verification_retains_its_work_reservation() {
+        let work = Arc::new(tokio::sync::Semaphore::new(1));
+        let queue = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = auth_permit_from(&work, &queue)
+            .await
+            .unwrap_or_else(|_| panic!("free work slot"));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let request = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
+                drop(permit);
+                let _ = finished_tx.send(());
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+        request.abort();
+        let busy = auth_permit_from(&work, &queue).await.unwrap_err();
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()[http::header::RETRY_AFTER], "1");
+        let queued = queue.clone().try_acquire_owned().unwrap();
+        assert_eq!(
+            auth_permit_from(&work, &queue).await.unwrap_err().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        drop(queued);
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap();
+        assert!(auth_permit_from(&work, &queue).await.is_ok());
+    }
 }

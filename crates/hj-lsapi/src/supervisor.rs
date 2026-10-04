@@ -33,6 +33,40 @@ use crate::jail::{Credentials, JailConfig, resolve_credentials};
 use crate::limits::ResourceLimits;
 use crate::proto::{MAX_PACKET_LEN, PACKET_HEADER_LEN, PacketType, build_begin_request_framed};
 
+fn set_no_new_privileges() -> io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_file_capabilities(file: &std::fs::File) -> io::Result<()> {
+    let size = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"security.capability".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size >= 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "lsphp executable has file capabilities",
+        ));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENODATA) | Some(libc::ENOTSUP)
+    ) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 /// Infallible epoch publication invoked for every inherited-listener promotion
 /// after the old prefork master receives SIGUSR1 and before its grace wait.
 pub type PromotionHook = Arc<dyn Fn(u64, &str) + Send + Sync + 'static>;
@@ -591,7 +625,9 @@ impl LsphpSupervisor {
         // workers whose EFFECTIVE uid is root (saved-set-uid stays root). That is a
         // privilege regain, not a pdeathsig inconvenience: refuse the spawn.
         use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(&self.cfg.command)?;
+        let executable = std::fs::File::open(&self.cfg.command)?;
+        let meta = executable.metadata()?;
+        reject_file_capabilities(&executable)?;
         let mode = meta.mode();
         if (mode & 0o4000) != 0 || (mode & 0o2000) != 0 {
             return Err(io::Error::new(
@@ -707,7 +743,14 @@ impl LsphpSupervisor {
 
         // Capture chroot/chdir as Copy/CString values (parent-resolved). The
         // child does NO path allocation — these are pre-encoded CStrings.
-        let chroot: Option<CString> = self.cfg.jail.chroot.clone();
+        let chroot_pin = self.cfg.jail.chroot_fd.clone();
+        if self.cfg.jail.chroot.is_some() && chroot_pin.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chroot requires a validated pinned directory",
+            ));
+        }
+        let chroot = chroot_pin.as_ref().map(|f| f.as_raw_fd());
         let chdir: Option<CString> = self.cfg.jail.chdir.clone();
 
         let raw_listen_fd = listen_fd.as_raw_fd();
@@ -803,8 +846,12 @@ impl LsphpSupervisor {
                     // --- Step 6: chroot + chdir, BETWEEN setgid and setuid (so
                     // chroot still has the privilege it needs; chdir into the new
                     // root immediately after).
-                    if let Some(root) = &chroot {
-                        rustix::process::chroot(root.as_c_str())
+                    if let Some(root) = chroot {
+                        // Use the parent-validated inode, never its pathname.
+                        if libc::fchdir(root) != 0 {
+                            return Err(io::Error::last_os_error());
+                        }
+                        rustix::process::chroot(c".")
                             .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
                         // After chroot we ALWAYS chdir (the resolved chdir is
                         // "/" — the new root).
@@ -826,11 +873,16 @@ impl LsphpSupervisor {
                 // --- Step 8: RLIMIT_AS / RLIMIT_CPU AFTER the drop (not
                 // uid-relative; matches OLS, which sets RLIMIT_AS post uid/chroot).
                 limits.apply_post_setuid()?;
+                // Kernel enforcement covers exec-time pathname replacement too.
+                // Complete all privileged setup first; normal PHP file access is
+                // unchanged, while set-id/capability gains at exec are prohibited.
+                set_no_new_privileges()?;
                 Ok(())
             });
         }
 
         let child = cmd.spawn()?;
+        drop(chroot_pin);
         let mut candidate = ReadyChild::new(&self.inner, child, marker);
         // Drop our copy of the listen fd; the child has its dup on fd 0.
         drop(listen_fd);
@@ -2622,6 +2674,54 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    #[test]
+    fn child_exec_cannot_gain_new_privileges() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("/bin/cat");
+        command.arg("/proc/self/status");
+        unsafe {
+            command.pre_exec(set_no_new_privileges);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line == "NoNewPrivs:\t1")
+        );
+        assert!(reject_file_capabilities(&std::fs::File::open("/bin/cat").unwrap()).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires CAP_SETFCAP on a temporary inert file"]
+    fn executable_capability_metadata_is_rejected() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path =
+            std::env::temp_dir().join(format!("hj-capability-metadata-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        // Unlink the non-executable fixture immediately; it is never executed.
+        std::fs::remove_file(path).unwrap();
+        let capability = [0x02000000u32, 1, 0, 0, 0].map(u32::to_le);
+        let result = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                c"security.capability".as_ptr(),
+                capability.as_ptr().cast(),
+                std::mem::size_of_val(&capability),
+                0,
+            )
+        };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        assert!(reject_file_capabilities(&file).is_err());
+    }
 
     fn write_fake_lsapi_master(tag: &str, fail_after_first: bool) -> (PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!(

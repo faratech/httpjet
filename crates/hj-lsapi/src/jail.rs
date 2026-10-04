@@ -47,6 +47,8 @@ pub struct JailConfig {
     pub namespaces: NamespaceFlags,
     /// `chroot(2)` target, pre-encoded as a `CString`. `None` = no chroot.
     pub chroot: Option<CString>,
+    /// Validated jail inode retained across spawns and pathname replacement.
+    pub chroot_fd: Option<std::sync::Arc<std::fs::File>>,
     /// Directory to `chdir(2)` into. After a chroot this is always `"/"` (the
     /// new root); without a chroot it may be unset. Pre-encoded as a `CString`.
     pub chdir: Option<CString>,
@@ -262,14 +264,18 @@ impl JailConfig {
             ChrootMode::Path(p) => Some(p.clone()),
         };
 
-        let (chroot, chdir) = match chroot_path {
+        let (chroot, chroot_fd, chdir) = match chroot_path {
             Some(path) => {
-                validate_chroot_target(&path, cred.uid)?;
+                let pinned = validate_chroot_target(&path, cred.uid)?;
                 // Invariant 4: after chroot we always chdir into the new root.
                 let c = path_to_cstring(&path)?;
-                (Some(c), Some(cstring_root()))
+                (
+                    Some(c),
+                    Some(std::sync::Arc::new(pinned)),
+                    Some(cstring_root()),
+                )
             }
-            None => (None, None),
+            None => (None, None, None),
         };
 
         // --- Effective namespace policy: per-vhost override else server. ---
@@ -283,6 +289,7 @@ impl JailConfig {
             credentials: Some(cred),
             namespaces,
             chroot,
+            chroot_fd,
             chdir,
             // rlimits are layered in by the supervisor from its own config; the
             // jail itself carries none by default. Phase 3's limits live on
@@ -296,42 +303,64 @@ impl JailConfig {
 
 /// Validate a chroot target in the parent: must exist, be a directory, be
 /// root-owned, and not be writable by the worker uid. Fail-closed.
-fn validate_chroot_target(path: &Path, _worker_uid: u32) -> io::Result<()> {
-    let md = std::fs::metadata(path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "suexec: chroot target {} does not exist/stat failed: {e}",
-                path.display()
-            ),
+fn validate_chroot_target(path: &Path, _worker_uid: u32) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/")?;
+    let components: Vec<_> = path.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => *name,
+            _ => return Err(invalid("suexec: parent traversal in chroot pathname")),
+        };
+        let md = dir.metadata()?;
+        // Root-owned sticky directories (e.g. /tmp) protect root-owned child
+        // entries from replacement. Other writable ancestors are untrusted.
+        if md.uid() != 0 || (md.mode() & 0o022 != 0 && md.mode() & 0o1000 == 0) {
+            return Err(invalid("suexec: untrusted chroot ancestor"));
+        }
+        let fd = rustix::fs::openat(
+            &dir,
+            name,
+            rustix::fs::OFlags::PATH
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
         )
-    })?;
-    if !md.is_dir() {
-        return Err(invalid(&format!(
-            "suexec: chroot target {} is not a directory",
-            path.display()
-        )));
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("suexec: chroot component is not a directory or cannot be opened: {e}"),
+            )
+        })?;
+        dir = std::fs::File::from(fd);
+        let md = dir.metadata()?;
+        if md.uid() != 0
+            || (md.mode() & 0o022 != 0
+                && (index + 1 == components.len() || md.mode() & 0o1000 == 0))
+        {
+            return Err(invalid(
+                "suexec: chroot target or ancestor must be root-owned and protected from replacement",
+            ));
+        }
     }
-    // Must be owned by root (uid 0). A non-root-owned chroot root would let the
-    // owner replace it / pivot the jail.
-    if md.uid() != 0 {
-        return Err(invalid(&format!(
-            "suexec: chroot target {} must be owned by root (is uid {})",
-            path.display(),
-            md.uid()
-        )));
+    let md = dir.metadata()?;
+    if md.uid() != 0 || md.mode() & 0o022 != 0 {
+        return Err(invalid(
+            "suexec: chroot target must be root-owned and non-writable",
+        ));
     }
-    // Must NOT be writable by the worker. Owner is root (checked above), so the
-    // worker can only gain write via the group or other bits — reject either.
-    // (0o022 = group-write | other-write.)
-    if md.mode() & 0o022 != 0 {
-        return Err(invalid(&format!(
-            "suexec: chroot target {} is group/other-writable (mode {:o}); worker could escape jail",
-            path.display(),
-            md.mode() & 0o7777
-        )));
-    }
-    Ok(())
+    Ok(dir)
 }
 
 /// Encode a path as a NUL-terminated `CString` (parent-side, so the child needs
@@ -873,6 +902,29 @@ mod tests {
         let err = validate_chroot_target(&p, 1000).unwrap_err();
         assert!(err.to_string().contains("not a directory"), "got: {err}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn chroot_pin_rejects_links_and_survives_path_replacement() {
+        if rustix::process::getuid().as_raw() != 0 {
+            return;
+        }
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("hj-jail-pin-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("jail")).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(root.join("jail"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let pinned = validate_chroot_target(&root.join("jail"), 1000).unwrap();
+        let inode = pinned.metadata().unwrap().ino();
+        symlink(root.join("jail"), root.join("link")).unwrap();
+        assert!(validate_chroot_target(&root.join("link"), 1000).is_err());
+        assert!(validate_chroot_target(&root.join("link/sub"), 1000).is_err());
+        std::fs::rename(root.join("jail"), root.join("old")).unwrap();
+        std::fs::create_dir(root.join("jail")).unwrap();
+        assert_eq!(pinned.metadata().unwrap().ino(), inode);
+        assert_ne!(std::fs::metadata(root.join("jail")).unwrap().ino(), inode);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

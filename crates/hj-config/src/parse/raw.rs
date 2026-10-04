@@ -395,6 +395,8 @@ pub(super) struct RawListener {
     pub(super) ca_cert_file: Option<String>,
     #[serde(rename = "proxyProtocol", default)]
     pub(super) proxy_protocol: Option<String>,
+    #[serde(rename = "proxyProtocolPeers", default)]
+    pub(super) proxy_protocol_peers: Option<String>,
     #[serde(rename = "crlFile", default)]
     pub(super) crl_file: Option<String>,
     #[serde(rename = "enableStapling", default)]

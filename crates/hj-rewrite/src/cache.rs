@@ -146,6 +146,19 @@ impl HtaccessCache {
         request_path: &str,
         access_file_name: &str,
     ) -> Vec<(PathBuf, Arc<Htaccess>)> {
+        self.load_chain_with_dirs_and_deadline(docroot, request_path, access_file_name)
+            .0
+    }
+
+    /// Chain plus the earliest freshness deadline of every consulted entry,
+    /// including absent access files and missing directories.
+    pub fn load_chain_with_dirs_and_deadline(
+        &self,
+        docroot: &Path,
+        request_path: &str,
+        access_file_name: &str,
+    ) -> (Vec<(PathBuf, Arc<Htaccess>)>, Instant) {
+        let mut deadline = Instant::now() + self.revalidate_ttl;
         let mut chain = Vec::new();
 
         // The directories to check, in order: docroot, docroot/seg1, ... up to the directory
@@ -164,7 +177,10 @@ impl HtaccessCache {
             seg_count.saturating_sub(1)
         };
         if dir_count >= MAX_CHAIN_DEPTH {
-            return vec![(docroot.to_path_buf(), deny_all_sentinel())];
+            return (
+                vec![(docroot.to_path_buf(), deny_all_sentinel())],
+                Instant::now(),
+            );
         }
 
         // A directory that does not exist ends the walk: nothing beneath it can hold an
@@ -177,7 +193,8 @@ impl HtaccessCache {
             if let Some(seg) = seg {
                 cur.push(seg);
             }
-            let (parsed, dir_missing) = self.load(&cur, access_file_name);
+            let (parsed, dir_missing, checked_until) = self.load(&cur, access_file_name);
+            deadline = deadline.min(checked_until);
             if let Some(h) = parsed {
                 chain.push((cur.clone(), h));
             }
@@ -185,7 +202,7 @@ impl HtaccessCache {
                 break;
             }
         }
-        chain
+        (chain, deadline)
     }
 
     /// Load a single directory's `.htaccess`, reparsing on mtime change.
@@ -206,7 +223,7 @@ impl HtaccessCache {
 
     /// [`get_or_load_named`](Self::get_or_load_named) plus whether `dir` itself is
     /// missing (the chain walk stops there).
-    fn load(&self, dir: &Path, access_file_name: &str) -> (Option<Arc<Htaccess>>, bool) {
+    fn load(&self, dir: &Path, access_file_name: &str) -> (Option<Arc<Htaccess>>, bool, Instant) {
         let file = dir.join(access_file_name);
 
         // Fast path: within the revalidation window, trust the cache — no stat.
@@ -214,7 +231,11 @@ impl HtaccessCache {
         // insert below to avoid a same-shard deadlock.)
         if let Some(entry) = self.inner.get(&file) {
             if !self.revalidate_ttl.is_zero() && entry.checked_at.elapsed() < self.revalidate_ttl {
-                return (entry.parsed.clone(), entry.dir_missing);
+                return (
+                    entry.parsed.clone(),
+                    entry.dir_missing,
+                    entry.checked_at + self.revalidate_ttl,
+                );
             }
         }
 
@@ -229,7 +250,11 @@ impl HtaccessCache {
                     && (!entry.dir_missing || !is_dir(dir))
                 {
                     entry.checked_at = Instant::now();
-                    return (entry.parsed.clone(), entry.dir_missing);
+                    return (
+                        entry.parsed.clone(),
+                        entry.dir_missing,
+                        entry.checked_at + self.revalidate_ttl,
+                    );
                 }
             }
         }
@@ -271,6 +296,7 @@ impl HtaccessCache {
         // map). Past the cap an absent/new directory still resolves correctly — it
         // just isn't cached, so it re-stats on each request rather than poisoning
         // the bound. Keeps the existing `DashMap` API (no eviction machinery).
+        let checked_at = Instant::now();
         if self.count.load(Ordering::Relaxed) < MAX_HTACCESS_ENTRIES
             || self.inner.contains_key(&file)
         {
@@ -279,7 +305,7 @@ impl HtaccessCache {
                 Entry {
                     parsed: parsed.clone(),
                     mtime: cur_mtime,
-                    checked_at: Instant::now(),
+                    checked_at,
                     read_failed,
                     dir_missing,
                 },
@@ -288,7 +314,7 @@ impl HtaccessCache {
                 self.count.fetch_add(1, Ordering::Relaxed);
             }
         }
-        (parsed, dir_missing)
+        (parsed, dir_missing, checked_at + self.revalidate_ttl)
     }
 
     /// Number of cached directory entries (for diagnostics/tests).
@@ -317,5 +343,39 @@ impl HtaccessCache {
     #[cfg(test)]
     pub(crate) fn cap_count(&self) -> usize {
         self.count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[test]
+    fn absence_and_nested_entries_keep_original_freshness_deadlines() {
+        let root = std::env::temp_dir().join(format!("hj-policy-deadline-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let cache = HtaccessCache::new();
+        cache.get_or_load(&root);
+        let checked_at = Instant::now() - Duration::from_millis(800);
+        cache
+            .inner
+            .get_mut(&root.join(".htaccess"))
+            .unwrap()
+            .checked_at = checked_at;
+        let (chain, deadline) =
+            cache.load_chain_with_dirs_and_deadline(&root, "/child/file", ".htaccess");
+        assert!(chain.is_empty());
+        assert_eq!(deadline, checked_at + REVALIDATE_TTL);
+        std::fs::write(root.join(".htaccess"), "Require all denied").unwrap();
+        cache
+            .inner
+            .get_mut(&root.join(".htaccess"))
+            .unwrap()
+            .checked_at -= REVALIDATE_TTL;
+        let (chain, _) = cache.load_chain_with_dirs_and_deadline(&root, "/child/file", ".htaccess");
+        assert!(
+            chain[0].1.access_decision("/child/file", "GET")
+                == crate::directives::AccessDecision::Denied
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

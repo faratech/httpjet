@@ -81,10 +81,6 @@ fn parsed_semantic_gaps_remain_explicit() {
         "Header echo is parsed but intentionally emits no operation"
     );
     assert!(success.contains(&HeaderOp::Set {
-        name: "X-Expr-Value".into(),
-        value: String::new(),
-    }));
-    assert!(success.contains(&HeaderOp::Set {
         name: "X-Early".into(),
         value: "late-only".into(),
     }));
@@ -92,13 +88,52 @@ fn parsed_semantic_gaps_remain_explicit() {
         name: "X-Colon:".into(),
         value: "value".into(),
     }));
+}
 
-    let error = ht.response_headers("/index.html", 500, &[]);
+#[test]
+fn unsupported_header_guards_reject_the_access_file() {
+    for guard in [
+        "%{HTTP_COOKIE} == ''",
+        "%{REQUEST_STATUS} == 200",
+        "",
+        "%{REQUEST_URI} =~ m#^/# && %{HTTP_COOKIE} == ''",
+        "%{REQUEST_URI} =~ m#^/# || %{HTTP_COOKIE} == ''",
+        "(%{HTTP_COOKIE} == '')",
+    ] {
+        let text = format!("Header set X-LiteSpeed-Cache-Control public \"expr={guard}\"\n");
+        assert!(Htaccess::parse(&text).is_err(), "{guard}");
+    }
+}
+
+#[test]
+fn supported_header_guards_preserve_conjunctions_and_regex_operators() {
+    let ht = Htaccess::parse(r##"Header set Cache-Control public "expr=%{REQUEST_URI} =~ m#^/public/# && %{REQUEST_URI} !~ m#private#""##).unwrap();
+    assert_eq!(ht.response_headers("/public/file", 200, &[]).len(), 1);
+    assert!(ht.response_headers("/public/private", 200, &[]).is_empty());
+    assert!(ht.response_headers("/other", 200, &[]).is_empty());
+}
+
+#[test]
+fn unsupported_enclosing_expression_cannot_mutate_headers() {
     assert!(
-        error.contains(&HeaderOp::Set {
-            name: "X-Expr-Guard".into(),
-            value: "guarded".into(),
-        }),
-        "an unsupported expression currently collapses to no guard"
+        Htaccess::parse("<If \"%{HTTP_COOKIE} == ''\">\nHeader set Cache-Control public\n</If>\n")
+            .is_err()
     );
+    assert!(Htaccess::parse("Header set Cache-Control public env=A env=B").is_err());
+}
+
+#[test]
+fn either_quote_style_and_malformed_guards_fail_closed() {
+    for text in [
+        "Header set X-Review guarded 'expr=%{REQUEST_STATUS} == 200'",
+        "Header set X-Review guarded \"expr=%{REQUEST_STATUS} == 200",
+        "Header set X-Review guarded 'expr=%{REQUEST_URI} =~ m#^/# && %{HTTP_COOKIE} == 1'",
+        "Header set X-Review guarded Expr=%{REQUEST_STATUS}",
+    ] {
+        assert!(Htaccess::parse(text).is_err(), "{text}");
+    }
+    let ht = Htaccess::parse("Header set X-Review guarded 'expr=%{REQUEST_URI} =~ m#^/public/#'")
+        .unwrap();
+    assert_eq!(ht.response_headers("/public/file", 200, &[]).len(), 1);
+    assert!(ht.response_headers("/other", 200, &[]).is_empty());
 }

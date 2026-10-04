@@ -218,6 +218,19 @@ pub(crate) fn classify_replacement(
     }
     let mut tls_vhost_change = false;
     for name in old.vhosts.keys().chain(new.vhosts.keys()) {
+        let policy = |c: &ServerConfig| {
+            let decl = c.vhosts.get(name);
+            let config = decl.and_then(|v| v.config.as_deref());
+            (
+                decl.and_then(|v| v.allow_symbol_link),
+                decl.is_some_and(|v| v.restrained),
+                config.and_then(|v| v.allow_symbol_link_override),
+                config.map_or(c.security.follow_symlink, |v| v.allow_symbol_link),
+            )
+        };
+        if policy(old) != policy(new) {
+            return Err(RestartRequired);
+        }
         let before = old.vhosts.get(name).and_then(|v| v.config.as_deref());
         let after = new.vhosts.get(name).and_then(|v| v.config.as_deref());
         tls_vhost_change |= !same(
@@ -293,6 +306,7 @@ mod tests {
             tls: None,
             uds_path: None,
             proxy_protocol: false,
+            proxy_protocol_peers: vec![],
         });
         cfg.vhosts.insert(
             "site".into(),
@@ -327,6 +341,16 @@ mod tests {
             // trusted, what XFF-honoring means, or the symlink containment.
             |c| c.use_ip_in_proxy_header = 1,
             |c| c.security.follow_symlink = true,
+            |c| c.vhosts.get_mut("site").unwrap().allow_symbol_link = Some(true),
+            |c| c.vhosts.get_mut("site").unwrap().restrained = true,
+            |c| {
+                Arc::make_mut(c.vhosts.get_mut("site").unwrap().config.as_mut().unwrap())
+                    .allow_symbol_link = true
+            },
+            |c| {
+                Arc::make_mut(c.vhosts.get_mut("site").unwrap().config.as_mut().unwrap())
+                    .allow_symbol_link_override = Some(true)
+            },
             |c| {
                 c.security.access_control.push(hj_core::config::AccessRule {
                     spec: "ALL".into(),
