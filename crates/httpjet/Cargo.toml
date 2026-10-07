@@ -140,3 +140,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 flate2 = { workspace = true }
+
+[lints]
+workspace = true

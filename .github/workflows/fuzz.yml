@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        target: [h1_chunked_decode, h1_request_framing, hpack_decode, hpack_roundtrip, lsapi_resp_header]
+        target: [h1_chunked_decode, h1_request_framing, hpack_decode, hpack_roundtrip, lsapi_resp_header, qpack_decode, proxy_protocol_parse, lscache_control]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:

@@ -6,6 +6,21 @@ use hj_rewrite::AuthRealm;
 // Bound work before spawn_blocking. The owned permit stays in the closure even
 // if the requesting future is cancelled, so queued/running verification counts.
 const AUTH_CONCURRENCY: usize = 4;
+/// Roots beyond the docroot where an `AuthUserFile` may live (`--auth-user-file-roots`),
+/// set once at startup.
+static EXTRA_AUTH_USER_FILE_ROOTS: std::sync::OnceLock<Vec<std::path::PathBuf>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn set_auth_user_file_roots(roots: Vec<std::path::PathBuf>) {
+    let _ = EXTRA_AUTH_USER_FILE_ROOTS.set(roots);
+}
+
+fn auth_user_file_roots() -> Vec<std::path::PathBuf> {
+    EXTRA_AUTH_USER_FILE_ROOTS
+        .get()
+        .cloned()
+        .unwrap_or_default()
+}
 static AUTH_WORK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(AUTH_CONCURRENCY)));
 static AUTH_QUEUE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
@@ -121,11 +136,9 @@ where
         .and_then(|(_, value)| hj_rewrite::auth::decode_basic_credentials(value));
     if let Some((user, password)) = credentials {
         if realm.user_satisfies(&user) {
-            let file = if realm.user_file.is_absolute() {
-                realm.user_file.clone()
-            } else {
-                ctx.vhost.doc_root.join(&realm.user_file)
-            };
+            let user_file = realm.user_file.clone();
+            let doc_root = ctx.vhost.doc_root.clone();
+            let roots = auth_user_file_roots();
             let permit = auth_permit().await?;
             if AUTH_RATE
                 .lock()
@@ -135,12 +148,20 @@ where
                 return Err(auth_busy());
             }
             let checked_user = user.clone();
-            let valid = tokio::task::spawn_blocking(move || {
+            let verdict = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                hj_rewrite::auth::verify_credentials(&file, &checked_user, &password)
+                let file = hj_rewrite::auth::open_user_file(&user_file, &doc_root, &roots)?;
+                hj_rewrite::auth::verify_credentials(&user_file, file, &checked_user, &password)
             })
             .await
-            .unwrap_or(false);
+            .unwrap_or(Ok(false));
+            let valid = match verdict {
+                Ok(valid) => valid,
+                Err(error) => {
+                    tracing::error!(request_id = %ctx.request_id, %error, "Basic auth refused");
+                    return Err(error_page(StatusCode::INTERNAL_SERVER_ERROR));
+                }
+            };
             if valid {
                 ctx.set_env(hj_lsapi::cgi::AUTH_USER_ENV, user);
                 authenticated.push(realm);

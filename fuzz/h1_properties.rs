@@ -76,6 +76,16 @@ pub fn h1_request_framing(data: &[u8]) {
     assert!(equivalent(one_read, split_read));
     if let codec::RequestHeadProgress::Complete(head_len) = one_read {
         assert!(head_len <= max_head);
+        let head = &wire[..head_len];
+        // The served path refuses a head with a bare LF; when it does not, every LF in
+        // the head is part of a CRLF, which is what the strict chunked decoder expects.
+        if !codec::head_has_bare_lf(head) {
+            assert!(
+                head.iter()
+                    .enumerate()
+                    .all(|(i, &b)| b != b'\n' || (i > 0 && head[i - 1] == b'\r'))
+            );
+        }
     }
 
     // Derive pseudo-headers: first byte = TE flags, remaining bytes split on NUL

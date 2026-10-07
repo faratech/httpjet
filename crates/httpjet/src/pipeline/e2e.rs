@@ -1592,6 +1592,7 @@ async fn fast_serve_get(state: &Arc<ServerState>, path: &str) -> Option<Response
         40000,
         false,
         false,
+        false,
         Proto::Http1,
         None,
         &req,
@@ -1633,6 +1634,7 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
         is_tls: false,
         protocol: Proto::Http1,
         trusted_proxy: false,
+        forwarding_trusted: false,
         env: Vec::new(),
         local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
         peer_port: 40000,
@@ -1736,6 +1738,7 @@ async fn fast_serve_req(state: &Arc<ServerState>, req: &Request) -> Option<Respo
         40000,
         false,
         false,
+        false,
         Proto::Http1,
         None,
         req,
@@ -1763,6 +1766,7 @@ async fn seed_public_entry(
         is_tls: false,
         protocol: Proto::Http1,
         trusted_proxy: false,
+        forwarding_trusted: false,
         env: Vec::new(),
         local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
         peer_port: 40000,
@@ -2020,6 +2024,41 @@ async fn reserved_paths_are_intercepted_before_the_fast_path() {
     let _ = std::fs::remove_dir_all(doc_root);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purge_endpoint_rejects_non_post_on_both_entry_paths() {
+    use crate::peer_purge::{PURGE_PATH, READY_PATH};
+    let doc_root = temp_root("purge-method");
+    let state = build_state_full(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        Some(crate::peer_purge::PurgeForwarder::new()),
+    );
+    let on_core = fast_serve_get(&state, PURGE_PATH)
+        .await
+        .expect("reserved path intercepted on-core");
+    assert_eq!(on_core.status(), 405);
+    assert_eq!(on_core.headers().get(header::ALLOW).unwrap(), "POST");
+    let full = run(&state, get(CANON_HOST, PURGE_PATH, None)).await;
+    assert_eq!(full.status(), 405);
+
+    let post = |path: &str| {
+        http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, CANON_HOST)
+            .header("x-litespeed-purge", "*")
+            .body(hj_core::empty_incoming())
+            .unwrap()
+    };
+    assert_eq!(run(&state, post(PURGE_PATH)).await.status(), 204);
+    let ready = run(&state, post(READY_PATH)).await;
+    assert_eq!(ready.status(), 405);
+    assert_eq!(ready.headers().get(header::ALLOW).unwrap(), "GET, HEAD");
+    let _ = std::fs::remove_dir_all(doc_root);
+}
+
 // ─── (#349) fast_memo under a `.htaccess`-heavy chain: the vary-set contract ───
 // The production forum docroot file reads Origin (SetEnvIf → ACAO echo), the
 // User-Agent (crawler class → X-Robots-Tag), Cookie (SetEnvIfNoCase) and
@@ -2120,6 +2159,7 @@ RewriteRule ^.*$ index.php [NC,L]
             is_tls: false,
             protocol: Proto::Http1,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: Vec::new(),
             local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
             peer_port: 40000,
@@ -2764,6 +2804,7 @@ fn ctx_for_transform() -> hj_core::ReqCtx {
         peer_unix: false,
         protocol: Proto::Http1,
         trusted_proxy: false,
+        forwarding_trusted: false,
         env: Vec::new(),
         local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
         peer_port: 40000,

@@ -4,9 +4,9 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 target=${1:?supply a fuzz target}
 case "$target" in
-  h1_chunked_decode|h1_request_framing)
+  h1_chunked_decode|h1_request_framing|proxy_protocol_parse)
     python3 -B scripts/fuzz-seeds.py "$target" ;;
-  hpack_decode|hpack_roundtrip|lsapi_resp_header) ;;
+  hpack_decode|hpack_roundtrip|lsapi_resp_header|qpack_decode|lscache_control) ;;
   *) echo "unknown fuzz target" >&2; exit 2 ;;
 esac
 seconds=${FUZZ_SECONDS:-300}

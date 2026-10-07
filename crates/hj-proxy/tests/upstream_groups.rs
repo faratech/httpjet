@@ -38,6 +38,7 @@ fn ctx() -> ReqCtx {
         peer_unix: false,
         protocol: Proto::Http1,
         trusted_proxy: false,
+        forwarding_trusted: false,
         env: Vec::new(),
         local_addr: "127.0.0.1:80".parse().unwrap(),
         peer_port: 40000,

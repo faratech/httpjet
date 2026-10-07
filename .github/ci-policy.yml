@@ -3,3 +3,4 @@ workflows:
   .github/workflows/ci.yml: fast
   .github/workflows/fuzz.yml: deep
   .github/workflows/interoperability.yml: deep
+  .github/workflows/deps-advisory.yml: fast

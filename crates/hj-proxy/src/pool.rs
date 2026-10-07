@@ -79,13 +79,11 @@ fn client_tls_config_with_cert(
 ) -> Result<Arc<rustls::ClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(std::fs::File::open(
-        cert_path,
-    )?))
-    .collect::<Result<Vec<_>, _>>()?;
-    let key =
-        rustls_pemfile::private_key(&mut std::io::BufReader::new(std::fs::File::open(key_path)?))?
-            .ok_or("no private key found")?;
+    use rustls::pki_types::pem::PemObject as _;
+    let certs: Vec<_> =
+        rustls::pki_types::CertificateDer::pem_reader_iter(std::fs::File::open(cert_path)?)
+            .collect::<Result<Vec<_>, _>>()?;
+    let key = rustls::pki_types::PrivateKeyDer::from_pem_reader(std::fs::File::open(key_path)?)?;
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)?;

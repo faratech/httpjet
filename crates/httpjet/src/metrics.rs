@@ -144,12 +144,30 @@ fn classify_metrics<'a>(
     Ok(target)
 }
 
+/// Concurrent metrics connections; further accepts wait in the listen backlog.
+const METRICS_MAX_CONNS: usize = 64;
+
 pub async fn serve_metrics(
     listener: TcpListener,
     state: Arc<ServerState>,
     profile_token: Option<String>,
 ) {
+    serve_metrics_with_limit(listener, state, profile_token, METRICS_MAX_CONNS).await
+}
+
+async fn serve_metrics_with_limit(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    profile_token: Option<String>,
+    limit: usize,
+) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(limit));
     loop {
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the metrics semaphore is never closed");
         let (mut stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
@@ -161,6 +179,7 @@ pub async fn serve_metrics(
         let state = state.clone();
         let token = profile_token.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             // Defense-in-depth: the listener is bind-constrained to loopback (metrics_bind_allowed),
             // so this is always true in practice — but gate the state-mutating / expensive control
             // routes (CPU profiler, alloc-count reset) on it directly so they stay
@@ -486,6 +505,14 @@ fn render(state: &ServerState) -> String {
             "httpjet_pagecache_refresh_inflight {}\n",
             state.page_cache_refresh.inflight_count()
         ));
+        body.push_str(
+            "# HELP httpjet_pagecache_integrity_active 1 when persisted cache containers carry HMAC integrity tags; 0 = untagged (fail-open).\n\
+             # TYPE httpjet_pagecache_integrity_active gauge\n",
+        );
+        body.push_str(&format!(
+            "httpjet_pagecache_integrity_active {}\n",
+            u8::from(hj_pagecache::diskstore::integrity_key_active())
+        ));
     }
     append_runtime_diagnostics(
         &mut body,
@@ -654,6 +681,18 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
          httpjet_tls_handshakes_hello_retry_total {}\n",
         crate::uring::trusted_proxy_idle_secs(),
         metrics.tls_handshakes_hello_retry.load(Ordering::Relaxed),
+    ));
+    let h3 = crate::uring::h3::admission_counts();
+    out.push_str(&format!(
+        "# HELP httpjet_h3_retry_sent_total QUIC Retry packets sent to unvalidated addresses under handshake pressure.\n\
+         # TYPE httpjet_h3_retry_sent_total counter\n\
+         httpjet_h3_retry_sent_total {}\n\
+         # HELP httpjet_h3_refused_total HTTP/3 connections refused or closed by admission control.\n\
+         # TYPE httpjet_h3_refused_total counter\n\
+         httpjet_h3_refused_total{{reason=\"connection_budget\"}} {}\n\
+         httpjet_h3_refused_total{{reason=\"handshake_cap\"}} {}\n\
+         httpjet_h3_refused_total{{reason=\"handshake_timeout\"}} {}\n",
+        h3.retries_sent, h3.refused_budget, h3.refused_handshakes, h3.handshake_timeouts,
     ));
 }
 
@@ -1470,6 +1509,12 @@ fn render_metrics(
             s.disk_evictions.to_string(),
         );
         metric(
+            "httpjet_pagecache_evictions_total",
+            "counter",
+            "Entries torn down through the eviction funnel (RAM budget, disk budget, expiry, purge).",
+            s.evictions.to_string(),
+        );
+        metric(
             "httpjet_pagecache_swept_expired_total",
             "counter",
             "Past-deadline ghost entries reclaimed by the proactive expiry sweep.",
@@ -1867,6 +1912,47 @@ mod tests {
 #[cfg(test)]
 mod request_policy_tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_listener_caps_concurrent_connections() {
+        use tokio::io::AsyncWriteExt;
+        let doc_root = std::env::temp_dir().join(format!("hj-metrics-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&doc_root).unwrap();
+        let state = crate::pipeline::e2e::build_state_full(
+            doc_root.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_metrics_with_limit(listener, state, None, 1));
+
+        let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut scrape = tokio::net::TcpStream::connect(addr).await.unwrap();
+        scrape
+            .write_all(format!("GET /metrics HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut first = [0u8; 12];
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(300), scrape.read_exact(&mut first)).await;
+        assert!(
+            blocked.is_err(),
+            "the single slot is held by the idle connection"
+        );
+
+        drop(idle);
+        tokio::time::timeout(Duration::from_secs(5), scrape.read_exact(&mut first))
+            .await
+            .expect("the scrape is served once the slot frees")
+            .unwrap();
+        assert_eq!(&first, b"HTTP/1.1 200");
+        let _ = std::fs::remove_dir_all(doc_root);
+    }
+
     fn classify(
         method: &str,
         target: &str,

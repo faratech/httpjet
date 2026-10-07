@@ -61,3 +61,24 @@ path = "fuzz_targets/h1_request_framing.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "qpack_decode"
+path = "fuzz_targets/qpack_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_protocol_parse"
+path = "fuzz_targets/proxy_protocol_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lscache_control"
+path = "fuzz_targets/lscache_control.rs"
+test = false
+doc = false
+bench = false

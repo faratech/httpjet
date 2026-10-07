@@ -18,6 +18,23 @@ use hj_core::{ReqCtx, Request};
 /// `script_name`/`path_info` default sensibly from the request URI; callers that
 /// have already split PATH_INFO can override via [`CgiEnvBuilder`].
 ///
+/// Whether a client request header may reach a PHP/CGI backend. This is the one
+/// rule for both LSAPI feeds (the CGI env table and the wire header block, which
+/// lsphp also maps to `HTTP_*`) and for FastCGI params.
+///
+/// - httpoxy (CVE-2016-5385): a client `Proxy` header would become HTTP_PROXY,
+///   which CGI-mode PHP libraries consult for outbound calls.
+/// - An underscore collides with the `-`->`_` HTTP_* mapping: `X_Forwarded_For`
+///   and the real `X-Forwarded-For` both become `HTTP_X_FORWARDED_FOR`, letting a
+///   client spoof a value an app may trust (nginx `underscores_in_headers off`).
+/// - Forwarding-authority headers (`CF-Connecting-IP`, `X-Forwarded-*`, ...) are
+///   assertions only a trusted proxy may make; `REMOTE_ADDR` remains the truth.
+pub fn header_forwardable(name: &str, forwarding_trusted: bool) -> bool {
+    !name.eq_ignore_ascii_case("proxy")
+        && !name.contains('_')
+        && (forwarding_trusted || !hj_core::is_forwarding_authority_header(name))
+}
+
 /// `remote_addr` is taken from `ctx.client_ip` (the proxy-resolved client IP).
 pub fn build_cgi_env<'r>(
     req: &'r Request,
@@ -282,27 +299,13 @@ impl<'a> CgiEnvBuilder<'a> {
         let mut have_host = false;
         for name in req.headers().keys() {
             let nm = name.as_str();
-            // httpoxy (CVE-2016-5385): a client `Proxy` header would otherwise
-            // become HTTP_PROXY in $_SERVER, which CGI-mode PHP libraries consult
-            // for outbound calls — letting an attacker redirect them. It is never
-            // a legitimate request header on the LSAPI path, so drop it.
-            if nm.eq_ignore_ascii_case("proxy") {
+            if !header_forwardable(nm, ctx.forwarding_trusted) {
                 continue;
             }
             // A buffered chunked request has a synthesized concrete length.
             // Ignore every inbound Content-Length value (including malformed or
             // repeated values) and add the authoritative override below.
             if content_length.is_some() && name == http::header::CONTENT_LENGTH {
-                continue;
-            }
-            // An underscore in a header name collides with the `-`->`_` HTTP_* mapping
-            // (`http_var_name` leaves `_` unchanged), so `X_Forwarded_For` and the real
-            // `X-Forwarded-For` both become `HTTP_X_FORWARDED_FOR` — two entries with the
-            // same key, and PHP's $_SERVER takes the last, letting a client spoof an
-            // HTTP_* value an app may trust. Drop underscore-named headers, matching
-            // nginx's default `underscores_in_headers off`. (Standard request headers
-            // never contain `_`, so this only sheds the ambiguous/forged ones.)
-            if nm.contains('_') {
                 continue;
             }
             // Accept both UTF-8 and raw bytes (obs-text per RFC 7230). Borrow the
@@ -692,6 +695,7 @@ mod tests {
             is_tls,
             protocol: Proto::Http2,
             trusted_proxy: true,
+            forwarding_trusted: true,
             env: vec![],
             local_addr: "192.0.2.1:8080".parse().unwrap(),
             peer_port: 54321,
@@ -873,6 +877,89 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn forwarding_request() -> Request {
+        http::Request::builder()
+            .uri("/index.php")
+            .header("Host", "forum.example")
+            .header("User-Agent", "curl/8")
+            .header("CF-Connecting-IP", "198.51.100.9")
+            .header("X-Forwarded-For", "198.51.100.9")
+            .header("X-Forwarded-Proto", "https")
+            .header("X-Forwarded-Host", "evil.example")
+            .header("X-Forwarded-Port", "443")
+            .header("X-Real-IP", "198.51.100.9")
+            .header("True-Client-IP", "198.51.100.9")
+            .header("Forwarded", "for=198.51.100.9")
+            .body(empty_incoming())
+            .unwrap()
+    }
+
+    const FORWARDING_VARS: &[&str] = &[
+        "HTTP_CF_CONNECTING_IP",
+        "HTTP_X_FORWARDED_FOR",
+        "HTTP_X_FORWARDED_PROTO",
+        "HTTP_X_FORWARDED_HOST",
+        "HTTP_X_FORWARDED_PORT",
+        "HTTP_X_REAL_IP",
+        "HTTP_TRUE_CLIENT_IP",
+        "HTTP_FORWARDED",
+    ];
+
+    #[test]
+    fn untrusted_peer_forwarding_headers_never_reach_the_cgi_env() {
+        let req = forwarding_request();
+        let mut c = ctx(true);
+        c.forwarding_trusted = false;
+        let env = build_cgi_env(&req, &c, Path::new("/web/public_html/index.php"));
+        for var in FORWARDING_VARS {
+            assert!(
+                !env.iter().any(|(k, _)| k.as_ref() == *var),
+                "{var} must not reach PHP from an untrusted peer"
+            );
+        }
+        assert!(env.iter().any(|(k, _)| k.as_ref() == "HTTP_USER_AGENT"));
+        let remote = env.iter().find(|(k, _)| k.as_ref() == "REMOTE_ADDR");
+        assert_eq!(
+            remote.map(|(_, v)| v.as_ref()),
+            Some(c.client_ip.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn trusted_peer_forwarding_headers_reach_the_cgi_env() {
+        let req = forwarding_request();
+        let c = ctx(true);
+        assert!(c.forwarding_trusted);
+        let env = build_cgi_env(&req, &c, Path::new("/web/public_html/index.php"));
+        for var in FORWARDING_VARS {
+            assert!(
+                env.iter().any(|(k, _)| k.as_ref() == *var),
+                "{var} from a trusted proxy reaches PHP"
+            );
+        }
+    }
+
+    #[test]
+    fn header_forwardable_is_one_rule_for_both_lsapi_feeds() {
+        for (name, trusted, expected) in [
+            ("proxy", true, false),
+            ("Proxy", false, false),
+            ("X_Real_Ip", true, false),
+            ("x_forwarded_for", true, false),
+            ("cf-connecting-ip", true, true),
+            ("CF-Connecting-IP", false, false),
+            ("forwarded", false, false),
+            ("user-agent", false, true),
+            ("cookie", false, true),
+        ] {
+            assert_eq!(
+                header_forwardable(name, trusted),
+                expected,
+                "{name} trusted={trusted}"
+            );
+        }
     }
 
     #[test]

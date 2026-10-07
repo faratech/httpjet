@@ -117,21 +117,7 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// proxy and resolved `ReqCtx::client_ip`; downstream applications must see
 /// only that canonical result, never an attacker-chosen alias.
 fn strip_forwarding_authority(headers: &mut HeaderMap) {
-    const NAMES: &[&str] = &[
-        "forwarded",
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-proto",
-        "x-forwarded-port",
-        "x-real-ip",
-        "x-original-forwarded-for",
-        "cf-connecting-ip",
-        "true-client-ip",
-        "client-ip",
-        "fastly-client-ip",
-        "x-cluster-client-ip",
-    ];
-    for name in NAMES {
+    for name in hj_core::FORWARDING_AUTHORITY_HEADERS {
         headers.remove(*name);
     }
 }
@@ -235,6 +221,7 @@ mod tests {
             is_tls,
             protocol: Proto::Http1,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: vec![],
             local_addr: "127.0.0.1:8080".parse().unwrap(),
             peer_port: 0,
@@ -283,6 +270,23 @@ mod tests {
             assert!(!h.contains_key(name), "{name} survived canonicalization");
         }
         assert_eq!(h.get("x-forwarded-for").unwrap(), "198.51.100.9");
+    }
+
+    #[test]
+    fn every_shared_forwarding_authority_name_is_canonicalized() {
+        let mut h = HeaderMap::new();
+        for name in hj_core::FORWARDING_AUTHORITY_HEADERS {
+            h.insert(*name, HeaderValue::from_static("attacker-chosen"));
+        }
+        let ctx = dummy_ctx("198.51.100.9".parse().unwrap(), true);
+        rewrite_request_headers(&mut h, &ctx, false);
+        for name in hj_core::FORWARDING_AUTHORITY_HEADERS {
+            assert_ne!(
+                h.get(*name).map(|v| v.as_bytes()),
+                Some(&b"attacker-chosen"[..]),
+                "{name} survived canonicalization"
+            );
+        }
     }
 
     #[test]

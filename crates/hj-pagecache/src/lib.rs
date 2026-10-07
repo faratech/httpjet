@@ -35,14 +35,14 @@ pub use admission::AdmissionFilter;
 pub use classify::{Disposition, classify_response};
 pub use diskstore::key_hash;
 pub use key::{
-    PageCacheKey, QsStrip, compute_vary_value, normalize_query, public_with_vary,
-    vary_value_from_request,
+    PageCacheKey, QsStrip, compute_vary_value, compute_vary_value_with_defaults, normalize_query,
+    public_with_vary, vary_value_from_request,
 };
 pub use proto::{
     LsCacheControl, Purge, StdCacheControl, parse_lscache_control, parse_purge,
     parse_std_cache_control, parse_tags, parse_vary,
 };
-pub use shared_paths::{SharedPathMatcher, parse_shared_paths};
+pub use shared_paths::{SharedPathMatcher, parse_shared_paths, path_has_segment_prefix};
 pub use store::{
     CacheListing, CacheStats, CachedResponse, EntryInfo, EntryState, FileId, Freshness, PageBody,
     PageScope, PageStore, StaticNode, StoreConfig,

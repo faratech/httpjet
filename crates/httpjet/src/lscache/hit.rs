@@ -429,8 +429,8 @@ fn fill_encodings(
 /// Levels for the once-per-entry variant fill: a variant is compressed ONCE off
 /// the client path and served for the entry's whole TTL, so spend more CPU per
 /// byte than the on-the-fly defaults (the same compress-once principle as the
-/// level-19 dict storage, bounded well below it so a fill burst can't
-/// monopolize the capped fill pool).
+/// dictionary storage, which runs at the configured dict level — default 12,
+/// production 6/3 — bounded so a fill burst can't monopolize the capped fill pool).
 const FILL_LEVELS: Levels = Levels {
     gzip: 9,
     zstd: 9,

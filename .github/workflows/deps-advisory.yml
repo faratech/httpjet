@@ -1,0 +1,55 @@
+name: Dependency advisories
+
+on:
+  schedule:
+    - cron: '41 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: deps-advisory
+  cancel-in-progress: false
+
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Rust 1.99
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup default 1.99.0
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Check advisories and transport-critical releases
+        id: scan
+        run: |
+          set +e
+          REPORT=report.md bash scripts/deps-advisory.sh
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Record findings in one tracking issue
+        if: steps.scan.outputs.status == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create deps-advisory --color B60205 --force >/dev/null
+          number="$(gh issue list --label deps-advisory --state open --json number --jq '.[0].number')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body-file report.md
+          else
+            gh issue create --title "deps: advisories or transport-critical releases pending" \
+              --label deps-advisory --body-file report.md
+          fi
+
+      - name: Fail on findings or tool errors
+        if: steps.scan.outputs.status != '0'
+        run: exit 1

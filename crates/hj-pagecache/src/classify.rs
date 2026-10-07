@@ -149,8 +149,15 @@ pub fn classify_response(
         std.stale_while_revalidate = std.stale_while_revalidate.or(one.stale_while_revalidate);
         std.stale_if_error = std.stale_if_error.or(one.stale_if_error);
     }
-    decl_stale = decl_stale.max(std.stale_while_revalidate.unwrap_or(0));
-    decl_sie = decl_sie.max(std.stale_if_error.unwrap_or(0));
+    // The standard header's stale windows apply only when the app did NOT opt in through
+    // `X-LiteSpeed-Cache-Control`: an LSCache app addresses the ORIGIN cache with that header and
+    // the standard `stale-if-error` to its CDN. Merging both kept every XenForo page on tmpfs for
+    // ttl + 24 h (the app's Cloudflare `stale-if-error=86400`) — 255k entries for a 2% hit ratio
+    // on 2026-10-04. With an LSCache opt-in the configured defaults apply instead.
+    if ls_public_ttl.is_none() {
+        decl_stale = decl_stale.max(std.stale_while_revalidate.unwrap_or(0));
+        decl_sie = decl_sie.max(std.stale_if_error.unwrap_or(0));
+    }
 
     // Standard HTTP backstop: an explicit no-store/no-cache/private on ANY standard
     // `Cache-Control` vetoes caching even if `X-LiteSpeed-Cache-Control` said public.
@@ -694,8 +701,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_windows_threaded_from_standard_cc_on_litespeed_app() {
-        // Forum style: X-LiteSpeed public(ttl) + standard CC carries swr/sie.
+    fn standard_cc_stale_windows_ignored_on_litespeed_app() {
+        // Forum style: X-LiteSpeed public(ttl) + a standard CC whose swr/sie address the CDN.
+        // Since 2026-10-04 the LSCache opt-in is authoritative: the configured defaults apply
+        // (here 0/0 — StoreConfig::default() caps the windows at 0).
         let h = hdrs(&[
             ("x-litespeed-cache-control", "public, max-age=300"),
             (
@@ -707,8 +716,8 @@ mod tests {
             classify_response(&Method::GET, 200, &h, false, &cfg(), false),
             Disposition::StorePublic {
                 ttl_secs: 300,
-                stale_secs: 600,
-                stale_if_error_secs: 3600
+                stale_secs: 0,
+                stale_if_error_secs: 0
             }
         );
     }
@@ -718,13 +727,11 @@ mod tests {
         let mut c = cfg();
         c.max_stale_secs = 600;
         c.max_stale_if_error_secs = 1800;
-        let h = hdrs(&[
-            ("x-litespeed-cache-control", "public, max-age=300"),
-            (
-                "cache-control",
-                "stale-while-revalidate=86400, stale-if-error=86400",
-            ),
-        ]);
+        // The LSCache header's own windows are capped by the configured maxima.
+        let h = hdrs(&[(
+            "x-litespeed-cache-control",
+            "public, max-age=300, stale-while-revalidate=86400, stale-if-error=86400",
+        )]);
         assert_eq!(
             classify_response(&Method::GET, 200, &h, false, &c, false),
             Disposition::StorePublic {
@@ -852,6 +859,80 @@ mod tests {
         assert_eq!(
             classify_response(&Method::GET, 200, &malformed, false, &cfg(), true),
             Disposition::Bypass("cache-control")
+        );
+    }
+
+    #[test]
+    fn lscache_opt_in_ignores_the_standard_headers_stale_windows() {
+        let mut c = cfg();
+        c.default_sie_secs = 30;
+        c.default_stale_secs = 0;
+        c.max_stale_secs = 86400;
+        c.max_stale_if_error_secs = 86400;
+        // An LSCache app: the standard Cache-Control addresses the CDN, not this cache.
+        let both = hdrs(&[
+            ("x-litespeed-cache-control", "public,max-age=43200"),
+            (
+                "cache-control",
+                "public, max-age=7200, s-maxage=43200, stale-while-revalidate=14400, stale-if-error=86400",
+            ),
+        ]);
+        // `s-maxage` implies proxy-revalidate (proto.rs), which suppresses the DEFAULT windows,
+        // so this entry gets none: retention = ttl. (Before 2026-10-04 the standard header's
+        // stale-if-error=86400 was adopted here and every such entry stayed ttl + 24 h.)
+        assert_eq!(
+            classify_response(&Method::GET, 200, &both, false, &c, false),
+            Disposition::StorePublic {
+                ttl_secs: 43200,
+                stale_secs: 0,
+                stale_if_error_secs: 0
+            },
+            "with an X-LiteSpeed opt-in the standard header's stale windows are ignored"
+        );
+        // The app declares its origin windows IN the LSCache header (what CacheOptimizer now emits).
+        let ls_declared = hdrs(&[
+            (
+                "x-litespeed-cache-control",
+                "public,max-age=43200,stale-while-revalidate=3600,stale-if-error=3600",
+            ),
+            (
+                "cache-control",
+                "public, max-age=7200, s-maxage=43200, stale-while-revalidate=14400, stale-if-error=86400",
+            ),
+        ]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &ls_declared, false, &c, false),
+            Disposition::StorePublic {
+                ttl_secs: 43200,
+                stale_secs: 3600,
+                stale_if_error_secs: 3600
+            }
+        );
+        // The LSCache header's own windows still apply.
+        let ls_windows = hdrs(&[
+            (
+                "x-litespeed-cache-control",
+                "public,max-age=600,stale-while-revalidate=120,stale-if-error=3600",
+            ),
+            ("cache-control", "public, max-age=60, stale-if-error=86400"),
+        ]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &ls_windows, false, &c, false),
+            Disposition::StorePublic {
+                ttl_secs: 600,
+                stale_secs: 120,
+                stale_if_error_secs: 3600
+            }
+        );
+        // A standards-only app keeps the old behaviour.
+        let std_only = hdrs(&[("cache-control", "public, max-age=600, stale-if-error=86400")]);
+        assert_eq!(
+            classify_response(&Method::GET, 200, &std_only, false, &c, true),
+            Disposition::StorePublic {
+                ttl_secs: 600,
+                stale_secs: 0,
+                stale_if_error_secs: 86400
+            }
         );
     }
 }

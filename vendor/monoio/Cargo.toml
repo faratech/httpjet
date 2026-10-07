@@ -135,8 +135,8 @@ optional = true
 version = "0.12"
 optional = true
 
-[dependencies.fxhash]
-version = "0.2"
+[dependencies.rustc-hash]
+version = "2"
 
 [dependencies.lazy_static]
 version = "1"
@@ -149,7 +149,7 @@ version = "0.2"
 version = "2.7"
 
 [dependencies.mio]
-version = "0.8"
+version = "1"
 features = [
     "net",
     "os-poll",
@@ -169,7 +169,7 @@ optional = true
 version = "0.2"
 
 [dependencies.socket2]
-version = "0.5"
+version = "0.6"
 features = ["all"]
 
 [dependencies.threadpool]

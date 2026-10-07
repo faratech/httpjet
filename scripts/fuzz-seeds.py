@@ -4,12 +4,12 @@ import hashlib
 from pathlib import Path
 import sys
 
-TARGETS = {"h1_chunked_decode", "h1_request_framing"}
+TARGETS = {"h1_chunked_decode", "h1_request_framing", "proxy_protocol_parse"}
 
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in TARGETS:
-        raise SystemExit("usage: fuzz-seeds.py h1_chunked_decode|h1_request_framing")
+        raise SystemExit("usage: fuzz-seeds.py " + "|".join(sorted(TARGETS)))
     target = sys.argv[1]
     root = Path(__file__).resolve().parent.parent / "fuzz"
     corpus = root / "corpus" / target

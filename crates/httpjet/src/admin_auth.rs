@@ -1,12 +1,7 @@
 //! Credential loading for the opt-in local configuration writer.
 //! Never log file contents or retain a plaintext token in the authentication state.
 use sha2::{Digest, Sha256};
-use std::{
-    fs::OpenOptions,
-    io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::Path,
-};
+use std::{io::Read, os::unix::fs::MetadataExt, path::Path};
 use subtle::ConstantTimeEq;
 
 pub(crate) struct AuthToken([u8; 32]);
@@ -44,19 +39,9 @@ impl AuthToken {
     /// O_NOFOLLOW rejects a final-component symlink; metadata is checked on the
     /// opened descriptor, not through a racy path-based preflight check.
     pub(crate) fn load(path: &Path) -> Result<Self, InvalidToken> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|_| InvalidToken)?;
-        let metadata = file.metadata().map_err(|_| InvalidToken)?;
-        // SAFETY: geteuid has no preconditions and does not mutate process identity.
-        let euid = unsafe { libc::geteuid() };
-        if !metadata.is_file()
-            || !matches!(metadata.mode() & 0o7777, 0o400 | 0o600)
-            || (metadata.uid() != 0 && metadata.uid() != euid)
-            || metadata.nlink() != 1
-            || !matches!(metadata.len(), 64 | 65)
+        let (file, metadata) =
+            crate::secret_file::open_private_regular_file(path).map_err(|_| InvalidToken)?;
+        if !matches!(metadata.mode() & 0o7777, 0o400 | 0o600) || !matches!(metadata.len(), 64 | 65)
         {
             return Err(InvalidToken);
         }

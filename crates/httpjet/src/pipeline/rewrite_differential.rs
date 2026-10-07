@@ -305,6 +305,7 @@ fn make_ctx(server: &Arc<ServerConfig>, vhost: &Arc<VHostConfig>) -> ReqCtx {
         is_tls: true,
         protocol: Proto::Http2,
         trusted_proxy: false,
+        forwarding_trusted: false,
         env: Vec::with_capacity(8),
         local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
         peer_port: 40000,

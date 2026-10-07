@@ -156,6 +156,18 @@ pub fn compute_vary_value<S: AsRef<str>>(
     cookie_header: Option<&str>,
     vary_cookies: &[S],
 ) -> String {
+    compute_vary_value_with_defaults(cookie_header, vary_cookies, &[])
+}
+
+/// [`compute_vary_value`] with per-cookie DEFAULT values: a configured vary cookie whose value
+/// equals its default is treated as absent, so `xf_style_id=50` (the default style, which the
+/// app's own cache key also normalizes to "no cookie") keys the same entry as no cookie at all.
+/// `--page-cache-vary-default name=value,...` (2026-10-04).
+pub fn compute_vary_value_with_defaults<S: AsRef<str>>(
+    cookie_header: Option<&str>,
+    vary_cookies: &[S],
+    defaults: &[(String, String)],
+) -> String {
     let vary_cookies: Vec<&str> = vary_cookies.iter().map(|s| s.as_ref()).collect();
     let vary_cookies: &[&str] = &vary_cookies;
     let Some(cookies) = cookie_header else {
@@ -174,7 +186,12 @@ pub fn compute_vary_value<S: AsRef<str>>(
             (name.trim() == *configured_name).then_some(value.trim())
         });
         if let Some(value) = value {
-            found.push((configured_name, bounded_vary_value(value)));
+            let is_default = defaults
+                .iter()
+                .any(|(n, v)| n == *configured_name && v == value);
+            if !is_default {
+                found.push((configured_name, bounded_vary_value(value)));
+            }
         }
     }
     if found.is_empty() {
@@ -533,5 +550,26 @@ mod tests {
         let https = public_with_vary(0, true, "forum.example", "/threads/1234", "", "");
         let http = public_with_vary(0, false, "forum.example", "/threads/1234", "", "");
         assert_ne!(https, http, "HTTP and HTTPS must not share a cache entry");
+    }
+
+    #[test]
+    fn default_valued_vary_cookie_keys_like_no_cookie() {
+        let names = vec!["xf_style_id".to_string()];
+        let defaults = vec![("xf_style_id".to_string(), "50".to_string())];
+        assert_eq!(
+            compute_vary_value_with_defaults(Some("xf_style_id=50; xf_csrf=a"), &names, &defaults),
+            "",
+            "the default style cookie must not split the entry"
+        );
+        assert_eq!(
+            compute_vary_value_with_defaults(Some("xf_style_id=17"), &names, &defaults),
+            compute_vary_value(Some("xf_style_id=17"), &names),
+            "a non-default value still varies"
+        );
+        assert_eq!(
+            compute_vary_value_with_defaults(Some("xf_style_id=50"), &names, &[]),
+            compute_vary_value(Some("xf_style_id=50"), &names),
+            "no defaults configured: unchanged"
+        );
     }
 }

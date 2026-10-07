@@ -396,6 +396,7 @@ mod tests {
             peer_unix: false,
             protocol: hj_core::Proto::Http2,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: vec![],
             local_addr: "127.0.0.1:443".parse().unwrap(),
             peer_port: 12345,

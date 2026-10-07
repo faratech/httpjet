@@ -463,7 +463,7 @@ impl Lsapi {
         let env = builder.build_with_content_length(&req, ctx, buffered_len.as_deref());
         // Synthesize Content-Length only in the LSAPI wire view.  The retained
         // request head remains byte-for-byte faithful for later policy checks.
-        let headers = collect_wire_headers(&req, buffered_len.as_deref());
+        let headers = collect_wire_headers(&req, buffered_len.as_deref(), ctx.forwarding_trusted);
 
         // (#3 LSAPI u16 length truncation) Every CGI env pair and every wire-order
         // header is length-prefixed with a big-endian u16 in the BEGIN_REQUEST
@@ -1875,21 +1875,20 @@ fn lsapi_special_env_overflow_u16(fields: &[(SpecialEnvType, String, String)]) -
 /// Collect the request headers in wire order for lsphp's LSAPI header index
 /// (the source of `getallheaders()` / `$_SERVER` HTTP_* on the SAPI side).
 ///
-/// httpoxy (CVE-2016-5385): the client `Proxy` header is dropped here — it would
-/// otherwise surface as HTTP_PROXY and let an attacker hijack CGI-mode PHP's
-/// outbound calls. This mirrors the same drop in [`CgiEnvBuilder::build`] for the
-/// env table; both LSAPI feeds must be filtered.
+/// lsphp maps every header-block name to `HTTP_*` too, so the block is filtered by
+/// the same [`crate::cgi::header_forwardable`] rule as the env table.
 ///
 /// Non-UTF-8 header values (obs-text per RFC 7230) are accepted via lossy conversion.
 fn collect_wire_headers<'r>(
     req: &'r Request,
     content_length: Option<&'r str>,
+    forwarding_trusted: bool,
 ) -> Vec<(Cow<'r, str>, Cow<'r, str>)> {
     let mut headers: Vec<_> = req
         .headers()
         .iter()
         .filter(|(name, _)| {
-            !name.as_str().eq_ignore_ascii_case("proxy")
+            crate::cgi::header_forwardable(name.as_str(), forwarding_trusted)
                 && !(content_length.is_some() && *name == http::header::CONTENT_LENGTH)
         })
         .map(|(name, value)| {
@@ -2216,7 +2215,7 @@ mod wire_header_tests {
             .header("User-Agent", "curl/8")
             .body(empty_incoming_body())
             .unwrap();
-        let headers = collect_wire_headers(&req, None);
+        let headers = collect_wire_headers(&req, None, true);
         assert!(
             !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("proxy")),
             "Proxy header must be stripped from the LSAPI wire header index"
@@ -2231,13 +2230,37 @@ mod wire_header_tests {
     }
 
     #[test]
+    fn collect_wire_headers_drops_underscore_names_and_untrusted_forwarding() {
+        let req = http::Request::builder()
+            .uri("/index.php")
+            .header("Host", "forum.example")
+            .header("User-Agent", "curl/8")
+            .header("X_Real_Ip", "127.0.0.1")
+            .header("X_Forwarded_For", "127.0.0.1")
+            .header("CF-Connecting-IP", "198.51.100.9")
+            .body(empty_incoming_body())
+            .unwrap();
+        let has = |headers: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
+                   name: &str| {
+            headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+        };
+        for trusted in [false, true] {
+            let headers = collect_wire_headers(&req, None, trusted);
+            assert!(!has(&headers, "x_real_ip"), "trusted={trusted}");
+            assert!(!has(&headers, "x_forwarded_for"), "trusted={trusted}");
+            assert!(has(&headers, "user-agent"));
+            assert_eq!(has(&headers, "cf-connecting-ip"), trusted);
+        }
+    }
+
+    #[test]
     fn concrete_body_length_does_not_mutate_the_request_head() {
         let req = http::Request::builder()
             .uri("/index.php")
             .header("Content-Length", "malformed")
             .body(empty_incoming_body())
             .unwrap();
-        let headers = collect_wire_headers(&req, Some("3"));
+        let headers = collect_wire_headers(&req, Some("3"), true);
         let lengths: Vec<_> = headers
             .iter()
             .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))

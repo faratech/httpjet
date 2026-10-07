@@ -6,6 +6,7 @@ use rustls::{
     pki_types::{ServerName, UnixTime},
     sign::CertifiedKey,
 };
+use rustls_pki_types::pem::PemObject as _;
 use std::{collections::BTreeSet, sync::Arc};
 use x509_parser::{extensions::GeneralName, prelude::FromDer};
 
@@ -38,7 +39,7 @@ impl CertificateValidator {
             if pem.len() > 64 * 1024 {
                 return Err(ManagerError::State);
             }
-            for cert in rustls_pemfile::certs(&mut &pem[..]) {
+            for cert in rustls_pki_types::CertificateDer::pem_slice_iter(&pem[..]) {
                 roots
                     .add(cert.map_err(|_| ManagerError::State)?)
                     .map_err(|_| ManagerError::State)?;
@@ -62,9 +63,10 @@ impl CertificateValidator {
         if issued.certificate_pem.len() > 64 * 1024 || issued.private_key_pem.len() > 8192 {
             return Err(ManagerError::Crypto);
         }
-        let chain = rustls_pemfile::certs(&mut issued.certificate_pem.as_bytes())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| ManagerError::Crypto)?;
+        let chain =
+            rustls_pki_types::CertificateDer::pem_slice_iter(issued.certificate_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ManagerError::Crypto)?;
         if chain.is_empty() || chain.len() > 8 {
             return Err(ManagerError::Crypto);
         }
@@ -109,9 +111,9 @@ impl CertificateValidator {
                 .verify_server_cert(&chain[0], &chain[1..], &name, &[], now)
                 .map_err(|_| ManagerError::Crypto)?;
         }
-        let private_key = rustls_pemfile::private_key(&mut issued.private_key_pem.as_bytes())
-            .map_err(|_| ManagerError::Crypto)?
-            .ok_or(ManagerError::Crypto)?;
+        let private_key =
+            rustls_pki_types::PrivateKeyDer::from_pem_slice(issued.private_key_pem.as_bytes())
+                .map_err(|_| ManagerError::Crypto)?;
         let key = CertifiedKey::from_der(chain, private_key, &self.provider)
             .map_err(|_| ManagerError::Crypto)?;
         key.keys_match().map_err(|_| ManagerError::Crypto)?;

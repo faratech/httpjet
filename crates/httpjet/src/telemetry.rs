@@ -149,6 +149,11 @@ pub struct VhostMetrics {
     status_3xx: AtomicU64,
     status_4xx: AtomicU64,
     status_5xx: AtomicU64,
+    /// Per-vhost split of the funnel's `cache_hits` / `cache_misses` (2026-10-04): the
+    /// globals mix every vhost and content type, so a cache validation could not say what
+    /// share of ONE site's page views httpjet served.
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
     duration: AtomicHistogram,
 }
 
@@ -574,18 +579,26 @@ impl Telemetry {
 
     /// Record a cache HIT. `loopback` (the RAW peer IP is loopback) additionally bumps the
     /// loopback subset, so `real = total − loopback` excludes synthetic ab/h2load + ops traffic.
-    pub fn record_cache_hit(&self, loopback: bool) {
+    /// `vhost` (the resolved request host) also bumps that vhost's series; an unmapped name
+    /// lands in `__other__`.
+    pub fn record_cache_hit(&self, loopback: bool, vhost: &str) {
         let s = self.shard();
         s.cache_hits.fetch_add(1, Relaxed);
+        s.per_vhost[self.vhost_idx(vhost)]
+            .cache_hits
+            .fetch_add(1, Relaxed);
         if loopback {
             s.cache_hits_loopback.fetch_add(1, Relaxed);
         }
     }
 
-    /// Record a cache MISS (+ loopback subset). See [`Self::record_cache_hit`].
-    pub fn record_cache_miss(&self, loopback: bool) {
+    /// Record a cache MISS (+ loopback subset, + vhost series). See [`Self::record_cache_hit`].
+    pub fn record_cache_miss(&self, loopback: bool, vhost: &str) {
         let s = self.shard();
         s.cache_misses.fetch_add(1, Relaxed);
+        s.per_vhost[self.vhost_idx(vhost)]
+            .cache_misses
+            .fetch_add(1, Relaxed);
         if loopback {
             s.cache_misses_loopback.fetch_add(1, Relaxed);
         }
@@ -663,6 +676,17 @@ impl Telemetry {
         acc
     }
 
+    /// Aggregate the `i`-th vhost bucket's `[cache_hits, cache_misses]` across shards.
+    fn aggregate_vhost_cache(&self, i: usize) -> [u64; 2] {
+        let mut acc = [0u64; 2];
+        for s in &self.shards {
+            let v = &s.0.per_vhost[i];
+            acc[0] += v.cache_hits.load(Relaxed);
+            acc[1] += v.cache_misses.load(Relaxed);
+        }
+        acc
+    }
+
     /// Aggregate the `i`-th vhost bucket's latency histogram across shards.
     fn aggregate_vhost_histogram(&self, i: usize) -> HistogramSnapshot {
         let mut agg = HistogramSnapshot::default();
@@ -705,6 +729,32 @@ impl Telemetry {
                     "httpjet_responses_by_vhost{{vhost=\"{name}\",class=\"{class}\"}} {val}\n"
                 ));
             }
+        }
+        let cache: Vec<(usize, [u64; 2])> = active
+            .iter()
+            .map(|&i| (i, self.aggregate_vhost_cache(i)))
+            .collect();
+        out.push_str(
+            "# HELP httpjet_cache_hits_by_vhost Page-cache hits per vhost (the funnel's cache_hits split by vhost).\n\
+             # TYPE httpjet_cache_hits_by_vhost counter\n",
+        );
+        for (i, c) in &cache {
+            let name = label_escape(&self.vhost_names[*i]);
+            out.push_str(&format!(
+                "httpjet_cache_hits_by_vhost{{vhost=\"{name}\"}} {}\n",
+                c[0]
+            ));
+        }
+        out.push_str(
+            "# HELP httpjet_cache_misses_by_vhost Page-cache misses per vhost (the funnel's cache_misses split by vhost).\n\
+             # TYPE httpjet_cache_misses_by_vhost counter\n",
+        );
+        for (i, c) in &cache {
+            let name = label_escape(&self.vhost_names[*i]);
+            out.push_str(&format!(
+                "httpjet_cache_misses_by_vhost{{vhost=\"{name}\"}} {}\n",
+                c[1]
+            ));
         }
         out.push_str(
             "# HELP httpjet_request_duration_by_vhost_seconds Per-vhost handle() wall time.\n\
@@ -1065,15 +1115,15 @@ mod tests {
         // 10 hits total, 4 of them loopback; 6 misses total, 1 loopback.
         // real = 6 hits / (6 hits + 5 misses) = 0.5455.
         for _ in 0..6 {
-            t.record_cache_hit(false);
+            t.record_cache_hit(false, "");
         }
         for _ in 0..4 {
-            t.record_cache_hit(true);
+            t.record_cache_hit(true, "");
         }
         for _ in 0..5 {
-            t.record_cache_miss(false);
+            t.record_cache_miss(false, "");
         }
-        t.record_cache_miss(true);
+        t.record_cache_miss(true, "");
         t.record_cache_admission(true);
         for _ in 0..3 {
             t.record_cache_admission(false);
@@ -1096,10 +1146,41 @@ mod tests {
         assert!(out.contains("httpjet_cache_admit_ratio 0.2500\n"), "{out}");
     }
 
+    #[test]
+    fn per_vhost_cache_counters_render() {
+        let t = Telemetry::new(["a.example".to_string(), "b.example".to_string()]);
+        t.record_cache_hit(false, "a.example");
+        t.record_cache_hit(true, "a.example");
+        t.record_cache_miss(false, "b.example");
+        t.record_cache_hit(false, "unknown.example");
+        let mut out = String::new();
+        t.render_into(&mut out);
+        assert!(
+            out.contains("httpjet_cache_hits_by_vhost{vhost=\"a.example\"} 2\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("httpjet_cache_misses_by_vhost{vhost=\"a.example\"} 0\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("httpjet_cache_misses_by_vhost{vhost=\"b.example\"} 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("httpjet_cache_hits_by_vhost{vhost=\"__other__\"} 1\n"),
+            "{out}"
+        );
+        // The per-vhost split never changes the global funnel counters.
+        let v = t.counter_values();
+        assert_eq!(counter(&v, "cache_hits"), 3);
+        assert_eq!(counter(&v, "cache_misses"), 1);
+    }
+
     #[tokio::test]
     async fn flush_once_writes_snapshot_file() {
         let t = Telemetry::default();
-        t.record_cache_hit(false);
+        t.record_cache_hit(false, "");
         let path = std::env::temp_dir().join(format!(
             "httpjet_telemetry_flush_{}.tsv",
             std::time::SystemTime::now()

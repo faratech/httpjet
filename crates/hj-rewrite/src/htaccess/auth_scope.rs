@@ -163,6 +163,14 @@ impl Htaccess {
         self.auth.as_ref().is_some_and(|p| p.sensitive)
     }
 
+    /// Every `AuthUserFile` value in this file, for configuration lint.
+    pub fn auth_user_files(&self) -> impl Iterator<Item = &std::path::Path> {
+        self.auth
+            .iter()
+            .flat_map(|policy| policy.groups.iter())
+            .filter_map(|group| group.user_file.as_deref())
+    }
+
     /// Conservative configuration-only lint. Only directory-wide metadata is
     /// guaranteed to apply to a scoped group; matching sibling metadata is not
     /// assumed when lint cannot establish a concrete request path.

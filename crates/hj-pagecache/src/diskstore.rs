@@ -1649,41 +1649,39 @@ fn validate_header(header: &[u8], hlen: u64, file_len: u64) -> Result<(u32, u32)
 /// verification is skipped, preserving the old behavior for ephemeral test stores.
 static INTEGRITY_KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
 
-/// Create-or-load the 32-byte jetcache integrity key at `path` (created 0600 from
-/// /dev/urandom). Best-effort: on failure the store runs WITHOUT integrity tags
-/// (zeros) and this returns Err for the caller to log.
-pub fn init_integrity_key(path: &std::path::Path) -> std::io::Result<()> {
-    use std::io::Read;
+/// Install the 32-byte jetcache integrity key from an already-validated reader.
+/// Until a key is installed, containers carry zero tags and verification accepts
+/// anything; `integrity_key_active` reports which mode the store runs in.
+pub fn install_integrity_key(mut reader: impl std::io::Read) -> std::io::Result<()> {
     let mut key = [0u8; 32];
-    match std::fs::File::open(path) {
-        Ok(mut f) => f.read_exact(&mut key)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut ur = std::fs::File::open("/dev/urandom")?;
-            ur.read_exact(&mut key)?;
-            // Create with a tight mode regardless of umask; the dir may not exist yet.
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            // O_CREAT|O_EXCL with the final mode (no umask window); O_EXCL also
-            // refuses an existing path INCLUDING a planted symlink, so the write
-            // cannot be redirected. A racing creator is an error, not a clobber.
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut f = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(path)?;
-                f.write_all(&key)?;
-                let _ = f.sync_all();
-            }
-            #[cfg(not(unix))]
-            std::fs::write(path, key)?;
-        }
-        Err(e) => return Err(e),
+    reader.read_exact(&mut key)?;
+    let _ = INTEGRITY_KEY.set(key);
+    Ok(())
+}
+
+pub fn integrity_key_active() -> bool {
+    INTEGRITY_KEY.get().is_some()
+}
+
+/// Create a new 32-byte key at `path` (0600 from /dev/urandom) and install it.
+pub fn create_integrity_key(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut key = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
     }
+    // O_CREAT|O_EXCL with the final mode (no umask window); O_EXCL also refuses an
+    // existing path INCLUDING a planted symlink, so the write cannot be redirected.
+    // A racing creator is an error, not a clobber.
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(&key)?;
+    let _ = f.sync_all();
     let _ = INTEGRITY_KEY.set(key);
     Ok(())
 }

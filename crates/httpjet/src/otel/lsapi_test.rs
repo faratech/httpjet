@@ -94,6 +94,7 @@ pub(super) async fn roundtrip() -> (hj_core::Response, String) {
         is_tls: false,
         protocol: hj_core::Proto::Http1,
         trusted_proxy: false,
+        forwarding_trusted: false,
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 12345,

@@ -38,7 +38,7 @@ pub fn load(server_root: impl AsRef<Path>) -> Result<ServerConfig> {
     load_vhost_files(&mut cfg)?;
     // mime.properties (best-effort; absence is not fatal)
     let mime_path = server_root.join("conf/mime.properties");
-    if let Ok(text) = std::fs::read_to_string(&mime_path) {
+    if let Ok(text) = read_config_file(&mime_path, MAX_CONFIG_FILE_BYTES) {
         cfg.mime = parse_mime(&text);
     }
     Ok(cfg)
@@ -125,12 +125,38 @@ fn bundle_document(text: &str, root: &str) -> std::result::Result<(), crate::Bun
     }
 }
 
+/// Upper bound for any single configuration file read from disk. Real LiteSpeed
+/// configs are tens of KiB; this keeps a runaway or hostile file from being
+/// buffered whole by a reload.
+pub(crate) const MAX_CONFIG_FILE_BYTES: u64 = 16 << 20;
+
+pub(crate) fn read_config_file(path: &Path, max: u64) -> Result<String> {
+    use std::io::Read;
+    let io = |source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let too_large = |len| ConfigError::TooLarge {
+        path: path.to_path_buf(),
+        len,
+        max,
+    };
+    let file = std::fs::File::open(path).map_err(io)?;
+    let len = file.metadata().map_err(io)?.len();
+    if len > max {
+        return Err(too_large(len));
+    }
+    let mut text = String::new();
+    file.take(max + 1).read_to_string(&mut text).map_err(io)?;
+    if text.len() as u64 > max {
+        return Err(too_large(text.len() as u64));
+    }
+    Ok(text)
+}
+
 /// Parse just the server file (no vhost-file loading); useful for tests.
 pub(crate) fn load_server_file(server_root: &Path, path: &Path) -> Result<ServerConfig> {
-    let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let text = read_config_file(path, MAX_CONFIG_FILE_BYTES)?;
     parse_server_text(server_root, path, &text)
 }
 
@@ -1481,5 +1507,29 @@ mod tests {
         let pairs = parse_expires_by_type("image/*=A604800, text/css=M86400");
         assert_eq!(pairs[0], ("image/*".into(), "A604800".into()));
         assert_eq!(pairs[1], ("text/css".into(), "M86400".into()));
+    }
+}
+
+#[cfg(test)]
+mod read_limit_tests {
+    use super::*;
+
+    #[test]
+    fn oversized_config_file_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("hj-config-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.xml");
+        std::fs::write(&path, vec![b'x'; 65]).unwrap();
+        assert!(matches!(
+            read_config_file(&path, 64),
+            Err(ConfigError::TooLarge {
+                len: 65,
+                max: 64,
+                ..
+            })
+        ));
+        std::fs::write(&path, vec![b'x'; 64]).unwrap();
+        assert_eq!(read_config_file(&path, 64).unwrap().len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

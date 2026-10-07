@@ -96,10 +96,7 @@ pub(super) fn convert_vhost_decls(
 /// Load every vhost's per-vhost XML file into its `VHostDecl::config`.
 pub(super) fn load_vhost_files(cfg: &mut ServerConfig) -> Result<()> {
     load_vhost_sources(cfg, false, |_, path| {
-        std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+        super::read_config_file(path, super::MAX_CONFIG_FILE_BYTES)
     })
 }
 

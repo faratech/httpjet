@@ -931,7 +931,7 @@ impl HotTier {
 
     fn try_replace_weight(&self, old_weight: u64, new_weight: u64) -> bool {
         self.used_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.saturating_sub(old_weight)
                     .checked_add(new_weight)
                     .filter(|next| *next <= self.max_bytes)
@@ -945,7 +945,7 @@ impl HotTier {
         }
         let _ = self
             .used_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(weight))
             });
     }
@@ -1096,6 +1096,10 @@ pub struct StoreConfig {
     /// supported (any varied response is bypassed). These are shared,
     /// non-sensitive prefs (e.g. style/language), never session tokens.
     pub vary_cookies: Vec<String>,
+    /// Per-cookie default values: a vary cookie carrying its default is keyed like no cookie
+    /// (`--page-cache-vary-default`). The app's own cache key normalizes the default style the
+    /// same way, so without this the default-style members never matched a guest-stored shell.
+    pub vary_defaults: Vec<(String, String)>,
     /// Cookie names that, if a *public* response tries to `Set-Cookie`, forbid
     /// caching (defense-in-depth against an app marking a session-bearing page
     /// public). Other `Set-Cookie`s (csrf/analytics) are cached-but-stripped.
@@ -1163,6 +1167,7 @@ impl Default for StoreConfig {
             opt_in_303_prefixes: Vec::new(),
             cache_post: false,
             vary_cookies: Vec::new(),
+            vary_defaults: Vec::new(),
             private_cookies: Vec::new(),
             standard_cc_vhosts: Vec::new(),
             stream_fill_vhosts: Vec::new(),
@@ -1226,6 +1231,9 @@ pub struct CacheStats {
     pub disk_max_bytes: u64,
     /// `File` entries evicted by the disk LRU because tmpfs hit its cap.
     pub disk_evictions: u64,
+    /// Every entry torn down through the eviction funnel (RAM budget, disk budget, expiry,
+    /// purge): the count the RAM-budget LRU was missing from the exported metrics.
+    pub evictions: u64,
     /// Entries reclaimed by the proactive expiry sweep on the maintenance tick.
     pub swept_expired: u64,
     /// Counted lookups that met an entry past its full retention window (a TTL re-render
@@ -1433,7 +1441,7 @@ struct StoreEvict {
     /// Total teardowns through the funnel. Diagnostic-only — not surfaced in [`CacheStats`]
     /// today (it was the old `PageStore.evictions`), kept so the teardown path stays cheap to
     /// instrument if a counter is ever wanted.
-    evictions: AtomicU64,
+    evictions: Arc<AtomicU64>,
 }
 
 /// Bucket index for [`StoreEvict::disk_evict_ages`].
@@ -1597,6 +1605,8 @@ pub struct PageStore {
     store_purge_rejections: AtomicU64,
     /// `Arc`-shared with [`StoreEvict`] (bumped on a disk-budget eviction).
     disk_evictions: Arc<AtomicU64>,
+    /// `Arc`-shared with [`StoreEvict`]: every teardown through the funnel.
+    evictions: Arc<AtomicU64>,
     /// `Arc`-shared with [`StoreEvict`]: age-at-eviction buckets (<1h, 1-6h, 6-24h, >=24h).
     disk_evict_ages: Arc<[AtomicU64; 4]>,
     swept_expired: AtomicU64,
@@ -1716,6 +1726,7 @@ impl PageStore {
         }
         let disk_evictions = Arc::new(AtomicU64::new(0));
         let disk_evict_ages: Arc<[AtomicU64; 4]> = Arc::new(Default::default());
+        let evictions = Arc::new(AtomicU64::new(0));
 
         // The primitive divides each configured TOTAL by SHARDS internally, reproducing the page
         // store's old `(max_mem_bytes / SHARDS).max(1)` per-shard budgets exactly.
@@ -1730,7 +1741,7 @@ impl PageStore {
                 tag_index: tag_index.clone(),
                 disk_evictions: disk_evictions.clone(),
                 disk_evict_ages: disk_evict_ages.clone(),
-                evictions: AtomicU64::new(0),
+                evictions: evictions.clone(),
             },
         );
 
@@ -1770,6 +1781,7 @@ impl PageStore {
             store_commit_calls: CachePaddedAtomic(AtomicU64::new(0)),
             store_purge_rejections: AtomicU64::new(0),
             disk_evictions,
+            evictions,
             disk_evict_ages,
             swept_expired: AtomicU64::new(0),
             expired_misses: AtomicU64::new(0),
@@ -3463,6 +3475,7 @@ impl PageStore {
             disk_bytes,
             disk_max_bytes: self.disk.as_ref().map_or(0, |_| self.disk_max_bytes),
             disk_evictions: self.disk_evictions.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
             swept_expired: self.swept_expired.load(Ordering::Relaxed),
             expired_misses: self.expired_misses.load(Ordering::Relaxed),
             disk_evict_ages: [

@@ -67,13 +67,13 @@ pub mod ocsp;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
 use arc_swap::ArcSwap;
 use hj_config::model::{Listener, ListenerTls, ServerConfig, VhSsl};
+use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{
     ClientHello, ResolvesServerCert, ServerSessionMemoryCache, WebPkiClientVerifier,
@@ -450,8 +450,7 @@ pub(crate) fn load_cert_chain(
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file =
         File::open(path).with_context(|| format!("opening certificate file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_reader_iter(file)
         .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("parsing PEM certificates in {}", path.display()))?;
     Ok(certs)
@@ -464,10 +463,16 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 pub(crate) fn load_private_key(key_file: &Path) -> Result<Arc<dyn SigningKey>> {
     let file = File::open(key_file)
         .with_context(|| format!("opening private key file {}", key_file.display()))?;
-    let mut reader = BufReader::new(file);
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("parsing PEM private key in {}", key_file.display()))?
-        .ok_or_else(|| anyhow!("no private key found in {}", key_file.display()))?;
+    let key = match PrivateKeyDer::from_pem_reader(file) {
+        Ok(key) => key,
+        Err(rustls::pki_types::pem::Error::NoItemsFound) => {
+            return Err(anyhow!("no private key found in {}", key_file.display()));
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("parsing PEM private key in {}", key_file.display()));
+        }
+    };
 
     let provider = provider()?;
     provider
@@ -625,12 +630,10 @@ fn build_optional_client_verifier(
     // client-cert verification. Boot-loaded like the CA (rotating a CRL = restart or
     // a future reload path).
     if let Some(crl_path) = crl_file {
-        let mut pem = std::io::BufReader::new(
-            std::fs::File::open(crl_path)
-                .with_context(|| format!("reading CRL {}", crl_path.display()))?,
-        );
+        let pem = std::fs::File::open(crl_path)
+            .with_context(|| format!("reading CRL {}", crl_path.display()))?;
         let crls: Vec<rustls::pki_types::CertificateRevocationListDer<'static>> =
-            rustls_pemfile::crls(&mut pem)
+            rustls::pki_types::CertificateRevocationListDer::pem_reader_iter(pem)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .with_context(|| format!("parsing CRL {}", crl_path.display()))?;
         anyhow::ensure!(
@@ -2372,10 +2375,7 @@ mod tests {
 
         // Client trusts the server leaf and offers no client certificate.
         let mut roots = RootCertStore::empty();
-        let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap();
+        let leaf_der = CertificateDer::from_pem_slice(leaf.cert_pem.as_bytes()).unwrap();
         roots.add(leaf_der).unwrap();
         let client_cfg = ClientConfig::builder()
             .with_root_certificates(roots)
@@ -2862,10 +2862,7 @@ mod resumption_tests {
         // The client trusts the server's self-signed leaf and — when the fixture is
         // built with a cert — presents the CA-signed client chain.
         let mut roots = RootCertStore::empty();
-        let leaf_der = rustls_pemfile::certs(&mut leaf.cert_pem.as_bytes())
-            .next()
-            .unwrap()
-            .unwrap();
+        let leaf_der = CertificateDer::from_pem_slice(leaf.cert_pem.as_bytes()).unwrap();
         roots.add(leaf_der).unwrap();
         let builder = ClientConfig::builder().with_root_certificates(roots);
         let client_cfg = if with_client_cert {

@@ -1129,6 +1129,7 @@ mod tests {
             is_tls,
             protocol: Proto::Http1,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: vec![],
             local_addr: "127.0.0.1:8080".parse().unwrap(),
             peer_port: 0,

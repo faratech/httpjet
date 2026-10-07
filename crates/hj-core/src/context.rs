@@ -47,9 +47,14 @@ pub struct ReqCtx {
     /// cert, `SSL_*` env, Alt-Svc) test [`Self::tls`]`.is_some()`, not this flag.
     pub is_tls: bool,
     pub protocol: Proto,
-    /// True if `peer_ip` is a trusted reverse proxy (e.g. a Cloudflare range)
-    /// and (on TLS) presented a valid client cert.
+    /// True if `peer_ip` is inside a `T`-flagged trusted network (e.g. a
+    /// Cloudflare range). IP-only: it makes no client-certificate claim.
     pub trusted_proxy: bool,
+    /// True if the client-asserted forwarding headers (`CF-Connecting-IP`,
+    /// `X-Forwarded-*`, `Forwarded`, ...) may reach backends: the peer is
+    /// `trusted_proxy` and, when its listener requires client certificates,
+    /// it presented one.
+    pub forwarding_trusted: bool,
     /// Environment variables set by rewrite `[E=...]` flags, consumed by later
     /// conditions and `Header ... env=` directives.
     pub env: Vec<(String, String)>,

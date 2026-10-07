@@ -35,7 +35,11 @@ async fn filesystem_absolute_directory_patterns_protect_direct_and_aliased_resou
 fn fixture(tag: &str, config: &str) -> PathBuf {
     let root = temp_root(tag);
     std::fs::write(root.join(".htaccess"), config).unwrap();
-    std::fs::write(root.join("users"), "Admin:password\nVisitor:password\n").unwrap();
+    std::fs::write(
+        root.join("users"),
+        "Admin:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\nVisitor:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n",
+    )
+    .unwrap();
     root
 }
 
@@ -369,4 +373,31 @@ async fn static_context_location_resolves_its_own_auth_chain() {
         401
     );
     assert_eq!(status(&state, "/assets/secret.txt", Some(ADMIN)).await, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_user_file_outside_docroot_is_a_500_not_an_oracle() {
+    let outside = temp_root("auth_outside_file");
+    std::fs::write(
+        outside.join("secret"),
+        "Admin:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n",
+    )
+    .unwrap();
+    for user_file in [
+        outside.join("secret").display().to_string(),
+        "../secret".to_string(),
+    ] {
+        let root = fixture(
+            "auth_outside",
+            &format!("AuthType Basic\nAuthUserFile {user_file}\nRequire valid-user\n"),
+        );
+        std::fs::write(root.join("x.txt"), b"protected").unwrap();
+        let state = build_state_htaccess(root);
+        assert_eq!(status(&state, "/x.txt", None).await, 401, "{user_file}");
+        assert_eq!(
+            status(&state, "/x.txt", Some(ADMIN)).await,
+            500,
+            "{user_file}: a matching line must never authenticate"
+        );
+    }
 }

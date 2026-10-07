@@ -290,6 +290,7 @@ mod tests {
             is_tls: false,
             protocol: hj_core::Proto::Http1,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: Vec::new(),
             local_addr: "127.0.0.1:80".parse().unwrap(),
             peer_port: 40000,

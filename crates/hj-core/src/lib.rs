@@ -23,8 +23,8 @@ pub use http_util::{
     response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date, strip_hop_by_hop_response,
 };
 pub use net::{
-    host_without_port, is_trusted_internal_peer, valid_http_authority, valid_uri_authority,
-    valid_uri_scheme,
+    FORWARDING_AUTHORITY_HEADERS, host_without_port, is_forwarding_authority_header,
+    is_trusted_internal_peer, valid_http_authority, valid_uri_authority, valid_uri_scheme,
 };
 pub use reqid::ReqId;
 pub use router::{ResolvedVhost, Router};

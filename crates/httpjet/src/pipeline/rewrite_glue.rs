@@ -44,6 +44,9 @@ pub(super) enum RwResult {
     },
     Forbidden,
     Gone,
+    /// An internal rewrite produced a path with a malformed escape, an embedded NUL or
+    /// invalid UTF-8 once decoded; refused like an undecodable request target.
+    InvalidTarget,
     /// `query` mirrors the rewrite engine's effective query: `Some(q)` for a query the
     /// rewritten URI carries (newly set, or the original retained when the substitution had
     /// no `?query`), and `None` when the rewrite leaves NO query at all — `[QSD]`, or a
@@ -826,11 +829,14 @@ fn run_rewrite_inner(
             } => {
                 let mut all = std::mem::take(&mut merged_env);
                 all.append(&mut env);
+                let Some(path) = canonical_rewritten_path(&new_uri) else {
+                    return RwResult::InvalidTarget;
+                };
                 // Pass the engine's `Option` query through unchanged: `None` (incl. `[QSD]`)
                 // means "no query", which the dispatch loop turns into an empty string —
                 // NOT the original query (that bug made `[QSD]` a no-op).
                 return RwResult::Rewritten {
-                    path: new_uri,
+                    path,
                     query: new_query,
                     env: all,
                 };
@@ -875,6 +881,16 @@ pub(super) fn decode_request_path(raw: &str) -> Option<Cow<'_, str>> {
     hj_core::percent_decode_cow(raw)
 }
 
+/// The canonical form of an internal rewrite target. The engine's substitution is
+/// URI-escaped, and Apache adopts an internal rewrite through an internal redirect that
+/// percent-decodes and dot-normalizes the path again before the per-directory walk,
+/// access checks and file mapping. Decoding exactly once here gives every downstream
+/// consumer (destination chain, access checks, script split, static handler) the same
+/// path. A decoded `%2F` is a separator, the same policy as the request's first decode.
+pub(super) fn canonical_rewritten_path(new_uri: &str) -> Option<String> {
+    decode_request_path(new_uri).map(|decoded| normalized_request_path(&decoded))
+}
+
 /// Percent-encode a decoded path so a single decode by a terminal handler
 /// recovers it byte-for-byte. Only `/` (the path separator) and the RFC 3986
 /// unreserved set pass through literally; everything else — notably `%`, `?`,
@@ -884,7 +900,27 @@ pub(super) fn percent_encode_path(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
     for &b in path.as_bytes() {
         match b {
-            b'/' | b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+            b'/'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@' => {
                 out.push(b as char);
             }
             other => {
@@ -903,49 +939,6 @@ pub(super) fn percent_encode_path(path: &str) -> String {
         }
     }
     out
-}
-
-/// Whether a rewritten target still needs [`percent_encode_path`] before it can
-/// ride in `req.uri()`. The engine's substitution output is ALREADY escaped
-/// (`escape_subst`) — and `%<digit>` in a substitution is a backreference, so
-/// re-encoding it would double-encode (`%20` -> `%2520`, a file that does not
-/// exist). Only a raw `[NE]` (noescape) target carries URI-forbidden bytes.
-pub(super) fn needs_encoding(path: &str) -> bool {
-    let b = path.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'/'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~'
-            | b'!'
-            | b'$'
-            | b'&'
-            | b'\''
-            | b'('
-            | b')'
-            | b'*'
-            | b'+'
-            | b','
-            | b';'
-            | b'='
-            | b':'
-            | b'@' => i += 1,
-            b'%' if i + 2 < b.len()
-                && b[i + 1].is_ascii_hexdigit()
-                && b[i + 2].is_ascii_hexdigit() =>
-            {
-                i += 3;
-            }
-            _ => return true,
-        }
-    }
-    false
 }
 
 /// The directory portion of a normalized URL path: everything up to and INCLUDING the last `/`.
@@ -1116,6 +1109,7 @@ mod tests {
             is_tls: true,
             protocol: Proto::Http1,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: Vec::new(),
             local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
             peer_port: 12345,
@@ -1411,6 +1405,27 @@ mod tests {
     }
 
     #[test]
+    fn rewritten_targets_decode_once_and_normalize() {
+        for (target, canonical) in [
+            ("/3d/%2e%2e/robots.txt", Some("/robots.txt")),
+            ("/files/a%20b.txt", Some("/files/a b.txt")),
+            ("/files/100%25.txt", Some("/files/100%.txt")),
+            ("/files/a%2Fb/../c", Some("/files/a/c")),
+            ("/community/", Some("/community/")),
+            ("/index.php", Some("/index.php")),
+            ("/a%00b", None),
+            ("/bad%zz", None),
+            ("/%FF", None),
+        ] {
+            assert_eq!(
+                canonical_rewritten_path(target).as_deref(),
+                canonical,
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
     fn percent_encode_path_roundtrips_through_decode() {
         // A decoded path containing a literal `%`/`?`/`#`/space re-encodes so a
         // single handler decode recovers it exactly (no double-decode, #1).
@@ -1420,6 +1435,7 @@ mod tests {
             "/lit%25eral",
             "/q?x#frag",
             "/.git/cfg",
+            "/a+b;c=d,e(f)@g!h'i*j$k&l:m",
         ] {
             let enc = percent_encode_path(p);
             assert_eq!(

@@ -81,6 +81,7 @@ fn ctx(doc_root: &str) -> ReqCtx {
         is_tls: false,
         protocol: Proto::Http1,
         trusted_proxy: false,
+        forwarding_trusted: false,
         env: vec![],
         local_addr: "127.0.0.1:8080".parse().unwrap(),
         peer_port: 0,
@@ -1730,4 +1731,190 @@ async fn declared_content_length_completes_body_before_resp_end() {
     end_tx.send(()).unwrap();
     server_task.await.unwrap();
     let _ = std::fs::remove_file(&path);
+}
+
+fn raw_header_block(body: &[u8], env_end: usize) -> &[u8] {
+    let unknown = read_i32_le(body, 24) as usize;
+    let header_len = read_i32_le(body, 0) as usize;
+    let pad = (8 - ((PACKET_HEADER_LEN + env_end) % 8)) % 8;
+    let raw_at = env_end + pad + HEADER_INDEX_LEN + unknown * 16;
+    &body[raw_at..raw_at + header_len]
+}
+
+async fn begin_request_for(trusted: bool) -> (BTreeMap<String, String>, String) {
+    let path = tmp_sock(if trusted {
+        "fwd-trusted"
+    } else {
+        "fwd-untrusted"
+    });
+    let listener = UnixListener::bind(&path).unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let (ptype, body) = read_packet(&mut s).await.unwrap();
+        assert_eq!(ptype, PacketType::BeginRequest as u8);
+        let mut out = BytesMut::new();
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[]),
+        );
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        s.write_all(&out).await.unwrap();
+        s.flush().await.unwrap();
+        let _ = tx.send(body);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(2)));
+    let handler = Lsapi::new(pool).read_timeout(Duration::from_secs(2));
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/index.php")
+        .header("Host", "test")
+        .header("User-Agent", "curl/8")
+        .header("X_Real_Ip", "127.0.0.1")
+        .header("CF-Connecting-IP", "198.51.100.9")
+        .body(empty_incoming())
+        .unwrap();
+    let mut c = ctx("/web/test");
+    c.trusted_proxy = trusted;
+    c.forwarding_trusted = trusted;
+    handler.handle(&mut c, req).await.expect("handle ok");
+    let body = rx.await.unwrap();
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+    let (env, env_end) = parse_begin_env(&body);
+    let raw = String::from_utf8_lossy(raw_header_block(&body, env_end)).to_ascii_lowercase();
+    (env, raw)
+}
+
+#[tokio::test]
+async fn wire_header_block_omits_underscore_and_untrusted_forwarding_names() {
+    let (env, raw) = begin_request_for(false).await;
+    assert!(raw.contains("user-agent: curl/8"), "{raw}");
+    assert!(
+        !raw.contains("x_real_ip"),
+        "underscore names never reach lsphp: {raw}"
+    );
+    assert!(
+        !raw.contains("cf-connecting-ip"),
+        "untrusted forwarding header: {raw}"
+    );
+    assert!(!env.contains_key("HTTP_CF_CONNECTING_IP"));
+    assert!(!env.contains_key("HTTP_X_REAL_IP"));
+
+    let (env, raw) = begin_request_for(true).await;
+    assert!(raw.contains("cf-connecting-ip: 198.51.100.9"), "{raw}");
+    assert!(!raw.contains("x_real_ip"), "{raw}");
+    assert_eq!(
+        env.get("HTTP_CF_CONNECTING_IP").map(String::as_str),
+        Some("198.51.100.9")
+    );
+}
+
+/// LIVE: what the real lsphp exposes in `$_SERVER` for forwarding headers.
+///   cargo test -p hj-lsapi --test dispatch -- --ignored live_forwarding_headers
+#[tokio::test]
+#[ignore = "spawns the real lsphp; run manually on an R&D box"]
+async fn live_forwarding_headers_follow_peer_trust() {
+    use hj_lsapi::{LsphpSupervisor, SupervisorConfig};
+
+    let lsphp = PathBuf::from("/usr/local/lsws/lsphp8/bin/lsphp");
+    if !lsphp.exists() {
+        eprintln!("lsphp not found at {lsphp:?}; skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hj-lsapi-fwd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("env.php"),
+        b"<?php foreach (['HTTP_CF_CONNECTING_IP','HTTP_X_REAL_IP','HTTP_X_FORWARDED_FOR','REMOTE_ADDR','HTTP_USER_AGENT'] as $k) { echo $k, '=', $_SERVER[$k] ?? '-', \"\\n\"; }\n",
+    )
+    .unwrap();
+    let sock = std::env::temp_dir().join(format!("php8-httpjet-fwd-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+    let php = hj_core::config::PhpConfig {
+        handler_id: "lsphp".into(),
+        command: lsphp.clone(),
+        suffixes: vec!["php".into()],
+        env: vec![("PHP_LSAPI_CHILDREN".into(), "1".into())],
+        max_conns: 4,
+        init_timeout: Duration::from_secs(10),
+        retry_timeout: Duration::from_secs(0),
+        pc_keep_alive_timeout: Duration::from_secs(0),
+        backlog: 1024,
+        run_on_startup: 1,
+        mem_soft_limit: None,
+        mem_hard_limit: None,
+        detached_mode: false,
+        max_process_time: None,
+        cpu_limit_secs: None,
+        proc_soft_limit: None,
+        proc_hard_limit: None,
+        max_idle_time: None,
+        min_restart_interval: Duration::from_secs(10),
+        max_restart_backoff: Duration::from_secs(30),
+    };
+    let sup = LsphpSupervisor::new(SupervisorConfig::from_php_config(&php, &sock, "", ""));
+    sup.start().await.expect("lsphp should start");
+    let pool = Arc::new(LsapiPool::new(&sock, 4, Duration::from_secs(10)));
+    let handler = Lsapi::new(pool)
+        .script_root(&dir)
+        .read_timeout(Duration::from_secs(10));
+
+    let render = async |trusted: bool| -> String {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/env.php")
+            .header("Host", "localhost")
+            .header("User-Agent", "curl/8")
+            .header("CF-Connecting-IP", "198.51.100.9")
+            .header("X_Real_Ip", "127.0.0.1")
+            .header("X_Forwarded_For", "127.0.0.2")
+            .body(empty_incoming())
+            .unwrap();
+        let mut c = ctx(dir.to_str().unwrap());
+        c.trusted_proxy = trusted;
+        c.forwarding_trusted = trusted;
+        let resp = handler.handle(&mut c, req).await.expect("dispatch");
+        let (_p, body) = resp.into_parts();
+        let bytes = match body {
+            hj_core::Body::Stream(s) => s.collect().await.unwrap().to_bytes(),
+            hj_core::Body::Full(b) => b,
+            _ => panic!("unexpected body"),
+        };
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let untrusted = render(false).await;
+    let trusted = render(true).await;
+    sup.drain().await.unwrap();
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("untrusted:\n{untrusted}\ntrusted:\n{trusted}");
+
+    assert!(
+        untrusted.contains("HTTP_CF_CONNECTING_IP=-\n"),
+        "{untrusted}"
+    );
+    assert!(untrusted.contains("HTTP_X_REAL_IP=-\n"), "{untrusted}");
+    assert!(
+        untrusted.contains("HTTP_X_FORWARDED_FOR=-\n"),
+        "{untrusted}"
+    );
+    assert!(
+        untrusted.contains("HTTP_USER_AGENT=curl/8\n"),
+        "{untrusted}"
+    );
+    assert!(
+        trusted.contains("HTTP_CF_CONNECTING_IP=198.51.100.9\n"),
+        "{trusted}"
+    );
+    assert!(
+        trusted.contains("HTTP_X_REAL_IP=-\n"),
+        "underscore spoof: {trusted}"
+    );
+    assert!(
+        trusted.contains("HTTP_X_FORWARDED_FOR=-\n"),
+        "underscore spoof: {trusted}"
+    );
 }

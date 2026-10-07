@@ -259,3 +259,43 @@ mod tests {
         }
     }
 }
+
+/// Request headers that assert a client identity or scheme on behalf of a
+/// proxy. Only a trusted proxy may supply them to a backend.
+pub const FORWARDING_AUTHORITY_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+    "x-original-forwarded-for",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "client-ip",
+    "fastly-client-ip",
+    "x-cluster-client-ip",
+];
+
+pub fn is_forwarding_authority_header(name: &str) -> bool {
+    FORWARDING_AUTHORITY_HEADERS
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod forwarding_authority_tests {
+    use super::*;
+
+    #[test]
+    fn forwarding_authority_names_are_lowercase_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for name in FORWARDING_AUTHORITY_HEADERS {
+            assert_eq!(*name, name.to_ascii_lowercase());
+            assert!(seen.insert(*name), "duplicate {name}");
+            assert!(http::HeaderName::from_static(name).as_str() == *name);
+        }
+        assert!(is_forwarding_authority_header("CF-Connecting-IP"));
+        assert!(!is_forwarding_authority_header("user-agent"));
+    }
+}

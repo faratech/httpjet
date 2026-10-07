@@ -135,3 +135,80 @@ async fn inline_memo_keeps_every_header_dependency_after_user_agent() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewritten_target_is_canonicalized_before_destination_chain_and_access_checks() {
+    let root = temp_root("rewrite-canonical");
+    std::fs::create_dir_all(root.join("files")).unwrap();
+    std::fs::create_dir_all(root.join("secret")).unwrap();
+    std::fs::write(root.join("files/ok.txt"), "ok\n").unwrap();
+    std::fs::write(root.join("files/100%.txt"), "percent\n").unwrap();
+    std::fs::write(root.join("secret/flag.txt"), "flag\n").unwrap();
+    std::fs::write(root.join("secret/.htaccess"), "Require all denied\n").unwrap();
+    std::fs::create_dir_all(root.join("scoped")).unwrap();
+    std::fs::write(root.join("scoped/page.txt"), "scoped\n").unwrap();
+    std::fs::write(
+        root.join("scoped/.htaccess"),
+        "Header set X-Scope destination\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "RewriteEngine On\nRewriteRule ^pub/(.*)$ /files/$1 [L]\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root.clone());
+
+    let status = |resp: &Response| resp.status().as_u16();
+    let ok = run(&state, get(CANON_HOST, "/pub/ok.txt", None)).await;
+    assert_eq!(status(&ok), 200);
+    assert_eq!(&body_bytes(ok.into_body())[..], b"ok\n");
+    let direct = run(&state, get(CANON_HOST, "/secret/flag.txt", None)).await;
+    assert_eq!(
+        status(&direct),
+        403,
+        "control: the secret dir denies directly"
+    );
+
+    let traversal = get(CANON_HOST, "/pub/%252e%252e/secret/flag.txt", None);
+    assert!(
+        fast_serve_req(&state, &traversal).await.is_none(),
+        "the on-core path must bridge a rewrite into another directory"
+    );
+    let traversal = run(&state, traversal).await;
+    assert_eq!(
+        status(&traversal),
+        403,
+        "the destination directory's access file must judge the path that is served"
+    );
+
+    let scoped = run(
+        &state,
+        get(CANON_HOST, "/pub/%252e%252e/scoped/page.txt", None),
+    )
+    .await;
+    assert_eq!(status(&scoped), 200);
+    assert_eq!(
+        scoped
+            .headers()
+            .get("x-scope")
+            .and_then(|v| v.to_str().ok()),
+        Some("destination"),
+        "the served file's own directory scope (headers, limits, contexts) must apply"
+    );
+
+    let above_root = run(
+        &state,
+        get(CANON_HOST, "/pub/%252e%252e/%252e%252e/x", None),
+    )
+    .await;
+    assert_eq!(status(&above_root), 404);
+
+    let literal_percent = run(&state, get(CANON_HOST, "/pub/100%2525.txt", None)).await;
+    assert_eq!(status(&literal_percent), 200);
+    assert_eq!(&body_bytes(literal_percent.into_body())[..], b"percent\n");
+
+    let nul = run(&state, get(CANON_HOST, "/pub/a%2500b", None)).await;
+    assert_eq!(status(&nul), 400);
+    let _ = std::fs::remove_dir_all(&root);
+}

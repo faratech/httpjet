@@ -8,7 +8,7 @@
 //!
 //! Line format (tab-separated, no header — fixed columns, like an access log):
 //!
-//! `ts  kind  lb  user  method  status  ttfb_us  acquire_us  dispatch_us  bytes  retry  host  uri  reqid`
+//! `ts  kind  lb  user  method  status  ttfb_us  acquire_us  dispatch_us  bytes  retry  host  uri  reqid  xfcache`
 //!
 //! * `ts` — unix epoch milliseconds
 //! * `kind` — `slow` (TTFB over threshold) or `samp` (population sample)
@@ -21,6 +21,10 @@
 //!   falls back to `dispatch_us` when the backend died pre-byte
 //! * `bytes` — declared Content-Length (`0` when streaming/undeclared)
 //! * `uri` — path+query, capped at 200 bytes
+//! * `xfcache` — the PHP response's `X-XF-Cache-Status` (`PREBHIT` = pre-bootstrap
+//!   Redis DB1 serve, `PREBHIT-MEMBER` = member shell, `HIT` = XF post-bootstrap
+//!   page cache), `-` when absent (a full render, or a non-page response). Appended
+//!   2026-10-04 as the LAST column so fixed-index readers of the first 14 keep working.
 //!
 //! Writing rides the existing `hj_log::AccessLogger` writer task: non-blocking
 //! on the request path, size-rolled, gzip-archived, day-pruned, supervised.
@@ -129,6 +133,7 @@ impl PhpSlowLog {
         bytes: u64,
         loopback: bool,
         retry_kind: &str,
+        xf_cache: Option<&str>,
     ) {
         let sampled = self
             .tick
@@ -148,7 +153,7 @@ impl PhpSlowLog {
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let line = format!(
-            "{ts_ms}\t{kind}\t{lb}\t{user}\t{method}\t{status}\t{ttfb_us}\t{acquire_us}\t{dispatch_us}\t{bytes}\t{retry}\t{host}\t{uri}\t{reqid}",
+            "{ts_ms}\t{kind}\t{lb}\t{user}\t{method}\t{status}\t{ttfb_us}\t{acquire_us}\t{dispatch_us}\t{bytes}\t{retry}\t{host}\t{uri}\t{reqid}\t{xfcache}",
             kind = if slow { "slow" } else { "samp" },
             lb = loopback as u8,
             user = if pre.auth { "auth" } else { "guest" },
@@ -157,6 +162,7 @@ impl PhpSlowLog {
             host = clean(&pre.host),
             uri = clean(&pre.uri),
             reqid = clean(&pre.request_id),
+            xfcache = clean(xf_cache.unwrap_or("-")),
         );
         self.logger.log_line(line);
     }

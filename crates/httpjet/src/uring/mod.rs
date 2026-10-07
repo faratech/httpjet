@@ -18,6 +18,8 @@ pub(crate) mod h3;
 pub(crate) mod ktls;
 pub(crate) mod ktls_policy;
 pub(crate) mod proxy_protocol;
+mod proxy_protocol_wire;
+mod qpack;
 pub(crate) mod request_body;
 mod unix_path;
 pub(crate) mod worker_group;
@@ -36,7 +38,8 @@ use crate::state::ServerState;
 use bridge::{Bridge, BridgeCtx};
 use codec::{
     BodyFraming, ChunkStep, ChunkedDecoder, MAX_REQUEST_HEADERS, RequestHeadProgress,
-    chunked_accounted_bytes, classify_framing, request_head_progress, te_is_chunked,
+    chunked_accounted_bytes, classify_framing, head_has_bare_lf, request_head_progress,
+    te_is_chunked,
 };
 use hj_core::Proto;
 use std::sync::Arc;
@@ -188,6 +191,7 @@ impl CoreHandler {
             ctx.local,
             ctx.peer.port(),
             ctx.is_tls,
+            ctx.mtls_required,
             ctx.peer_unix,
             ctx.proto,
             ctx.tls.clone(),
@@ -1112,10 +1116,8 @@ async fn handle_tls_bridged(
     let tls_params = hj_tls::tls_params_from_conn(tls.session());
     // Application-layer mTLS (clientVerify=2): refuse a non-internal peer that
     // presented no valid client cert — mirrors server.rs::mtls_refused exactly.
-    // On a RESUMED handshake `peer_certificates` is the chain rustls reinstated
-    // from the session store (the chain verified when that ticket was issued),
-    // so certified CF connections keep passing this gate — and uncertified
-    // resumed sessions reinstate nothing and are refused, same as fresh.
+    // Client-auth listeners never resume sessions (hj-tls listener_session_storage),
+    // so `peer_certificates` is always this handshake's own verifier verdict.
     if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
         tracing::debug!(%peer, "uring tls: mTLS required, no client cert from non-internal peer; refusing");
         return;
@@ -1594,6 +1596,11 @@ async fn handle_h1_bridged<S>(
                 let mut headers = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
                 let mut req = httparse::Request::new(&mut headers);
                 match request_head_progress(req.parse(&acc), acc.len(), max_head) {
+                    RequestHeadProgress::Complete(head_len)
+                        if head_has_bare_lf(&acc[..head_len]) =>
+                    {
+                        ParsedReq::Bad
+                    }
                     RequestHeadProgress::Complete(head_len) => materialize_head(&req, head_len),
                     RequestHeadProgress::Partial => ParsedReq::Partial,
                     RequestHeadProgress::TooLarge => ParsedReq::HeadersTooLarge,
@@ -1631,6 +1638,10 @@ async fn handle_h1_bridged<S>(
                 }
                 ParsedReq::HeadersTooLarge => {
                     write_status_close(&mut stream, 431, "Request Header Fields Too Large").await;
+                    return;
+                }
+                ParsedReq::MethodNotAllowed => {
+                    write_status_close(&mut stream, 405, "Method Not Allowed").await;
                     return;
                 }
                 ParsedReq::Partial => {
@@ -1896,11 +1907,6 @@ async fn handle_h1_bridged<S>(
             relay_h1_upgrade(stream, std::mem::take(&mut acc), upgrade, &shutdown).await;
             return;
         }
-        // (Tier 2) Explicit CONNECT rejection: no tunneling.
-        if method == http::Method::CONNECT {
-            write_status_close(&mut stream, 405, "Method Not Allowed").await;
-            return;
-        }
         let is_head = method == http::Method::HEAD;
         // (Tier 2) 103 Early Hints over HTTP/1.1 — parity with the h2 emitter: the
         // backend's preload/preconnect Link headers go out as an interim response
@@ -1952,6 +1958,8 @@ enum ParsedReq {
     },
     Partial,
     Bad,
+    /// CONNECT: refused before dispatch (no tunneling).
+    MethodNotAllowed,
     /// Configured byte cap or `MAX_REQUEST_HEADERS` field slots exceeded — answer 431.
     HeadersTooLarge,
 }
@@ -1971,10 +1979,22 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
         Ok(m) => m,
         Err(_) => return ParsedReq::Bad,
     };
-    let uri = match req.path.unwrap_or("/").parse::<http::Uri>() {
-        Ok(u) => u,
-        Err(_) => return ParsedReq::Bad,
+    if method == http::Method::CONNECT {
+        return ParsedReq::MethodNotAllowed;
+    }
+    let raw_target = req.path.unwrap_or("/");
+    // http::Uri silently drops a fragment; h2/h3 reject one, so H1 must too.
+    if raw_target.contains('#') {
+        return ParsedReq::Bad;
+    }
+    let Some((uri, target_authority)) = raw_target
+        .parse::<http::Uri>()
+        .ok()
+        .and_then(|uri| request_target(&method, raw_target, uri))
+    else {
+        return ParsedReq::Bad;
     };
+    let mut host_value: Option<&[u8]> = None;
     let mut hdr_map = http::HeaderMap::with_capacity(req.headers.len());
     let mut cl_values: Vec<&[u8]> = Vec::new();
     let mut chunked = false;
@@ -2004,6 +2024,7 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
             continue;
         } else if h.name.eq_ignore_ascii_case("host") {
             host_count += 1;
+            host_value.get_or_insert(h.value);
         } else if h.name.eq_ignore_ascii_case("connection") {
             // RFC 7230 §6.1: Connection is a comma-separated token list
             // (e.g. `close, Upgrade`). Match each token, not the whole
@@ -2039,6 +2060,27 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
     // duplicate CL values. (A malformed/duplicate CL silently coerced to a length
     // would frame the body short and leak the trailing bytes as the next request.)
     // Decided by `codec::classify_framing` so the served path and the fuzzers agree.
+    if let Some(authority) = &target_authority {
+        // RFC 9112 §3.2.2: an absolute-form target's authority replaces any Host, so
+        // routing, cache keys and backends all see the one authority.
+        match http::HeaderValue::from_str(authority) {
+            Ok(value) => {
+                hdr_map.insert(http::header::HOST, value);
+            }
+            Err(_) => return ParsedReq::Bad,
+        }
+    } else {
+        match host_value {
+            Some(value) => {
+                if !std::str::from_utf8(value).is_ok_and(hj_core::valid_http_authority) {
+                    return ParsedReq::Bad;
+                }
+            }
+            // RFC 9112 §3.2: an HTTP/1.1 request without Host is malformed.
+            None if req.version == Some(1) => return ParsedReq::Bad,
+            None => {}
+        }
+    }
     let framing = if host_count > 1 {
         // RFC 9112 §3.2: a request with multiple Host lines is malformed
         // (MUST reject or replace). Routing, foreign-host protection and
@@ -2057,6 +2099,40 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
         keep_alive: !conn_close,
         expect_continue,
     }
+}
+
+/// RFC 9112 §3.2 request-target forms for an origin server. Returns the origin-form URI
+/// and, for absolute-form, the authority that replaces Host. Authority-form (CONNECT
+/// only) and asterisk-form outside OPTIONS are refused.
+fn request_target(
+    method: &http::Method,
+    raw: &str,
+    uri: http::Uri,
+) -> Option<(http::Uri, Option<String>)> {
+    if raw == "*" {
+        return (method == http::Method::OPTIONS).then_some((uri, None));
+    }
+    if raw.starts_with('/') {
+        return (uri.scheme().is_none() && uri.authority().is_none()).then_some((uri, None));
+    }
+    let scheme = uri.scheme_str()?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = uri.authority()?.as_str().to_owned();
+    if !hj_core::valid_http_authority(&authority) {
+        return None;
+    }
+    let path = if uri.path().is_empty() {
+        "/"
+    } else {
+        uri.path()
+    };
+    let origin = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_owned(),
+    };
+    Some((origin.parse().ok()?, Some(authority)))
 }
 
 // The pure request-framing primitives (`BodyFraming`, `classify_framing`,
@@ -4924,6 +5000,58 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             _ => panic!("expected Done"),
         }
 
+        // RFC 9112 §3.2 target forms and Host.
+        let target = |wire: &[u8]| match parse(wire) {
+            ParsedReq::Done { uri, headers, .. } => Some((
+                uri.to_string(),
+                headers
+                    .get(http::header::HOST)
+                    .map(|h| h.to_str().unwrap().to_owned()),
+            )),
+            _ => None,
+        };
+        assert_eq!(
+            target(b"GET http://a.test/x?y=1 HTTP/1.1\r\nHost: b.test\r\n\r\n"),
+            Some(("/x?y=1".into(), Some("a.test".into()))),
+            "absolute-form: origin-form URI, authority replaces Host"
+        );
+        assert_eq!(
+            target(b"GET http://a.test HTTP/1.1\r\n\r\n"),
+            Some(("/".into(), Some("a.test".into()))),
+            "absolute-form supplies the missing Host"
+        );
+        assert_eq!(
+            target(b"OPTIONS * HTTP/1.1\r\nHost: a.test\r\n\r\n"),
+            Some(("*".into(), Some("a.test".into())))
+        );
+        assert_eq!(
+            target(b"GET / HTTP/1.0\r\n\r\n"),
+            Some(("/".into(), None)),
+            "HTTP/1.0 may omit Host"
+        );
+        for bad in [
+            &b"GET * HTTP/1.1\r\nHost: a.test\r\n\r\n"[..],
+            b"GET a.test:443 HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            b"GET ftp://a.test/x HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            b"GET http://u@a.test/x HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            b"GET /x#frag HTTP/1.1\r\nHost: a.test\r\n\r\n",
+            b"GET / HTTP/1.1\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: \r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: u@a.test\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: [::1\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a\xffb\r\n\r\n",
+        ] {
+            assert!(
+                matches!(parse(bad), ParsedReq::Bad),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert!(matches!(
+            parse(b"CONNECT a.test:443 HTTP/1.1\r\nHost: a.test:443\r\n\r\n"),
+            ParsedReq::MethodNotAllowed
+        ));
+
         // #233 class: an httparse-accepted target that http::Uri rejects → Bad (400+close),
         // NOT a Done that would panic downstream.
         assert!(matches!(
@@ -5352,6 +5480,37 @@ mod uds_tests {
         let _ = client.read_to_string(&mut buf);
         assert!(buf.starts_with("HTTP/1.1 200 OK"), "got {buf:.80}");
         assert!(buf.contains("uds ok"), "body served over UDS: {buf:.120}");
+
+        let h1 = |raw: &[u8]| {
+            let mut client = std::os::unix::net::UnixStream::connect(&sock_path).unwrap();
+            client.write_all(raw).unwrap();
+            let _ = client.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut buf = String::new();
+            let _ = client.read_to_string(&mut buf);
+            buf
+        };
+        let bare_lf = h1(b"GET /index.html HTTP/1.1\nHost: uds.test\nConnection: close\n\n");
+        assert!(
+            bare_lf.starts_with("HTTP/1.1 400"),
+            "bare LF: {bare_lf:.80}"
+        );
+        let connect = h1(b"CONNECT uds.test:443 HTTP/1.1\r\nHost: uds.test:443\r\n\r\n");
+        assert!(
+            connect.starts_with("HTTP/1.1 405"),
+            "CONNECT: {connect:.80}"
+        );
+        let hostless = h1(b"GET /index.html HTTP/1.1\r\nConnection: close\r\n\r\n");
+        assert!(
+            hostless.starts_with("HTTP/1.1 400"),
+            "no Host: {hostless:.80}"
+        );
+        let absolute = h1(
+            b"GET http://uds.test/index.html HTTP/1.1\r\nHost: other.test\r\nConnection: close\r\n\r\n",
+        );
+        assert!(
+            absolute.starts_with("HTTP/1.1 200 OK"),
+            "absolute-form: {absolute:.80}"
+        );
 
         // h2c prior knowledge must reach the same pipeline (a SETTINGS-only
         // preface gets an h2 SETTINGS reply, not an H1 error).

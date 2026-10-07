@@ -1,7 +1,8 @@
 # Fuzzing
 
 The out-of-workspace `cargo-fuzz` suite covers HPACK, LSAPI response headers,
-and HTTP/1 framing/chunked decoding.
+HTTP/1 framing/chunked decoding, HTTP/3 QPACK field sections, PROXY protocol
+v1/v2 headers, and the page-cache control headers the application emits.
 
 ```bash
 cargo +nightly install cargo-fuzz
@@ -9,7 +10,10 @@ cargo +nightly fuzz run <target> -- -max_total_time=300
 ```
 
 Targets: `hpack_decode`, `hpack_roundtrip`, `lsapi_resp_header`,
-`h1_chunked_decode`, and `h1_request_framing`.
+`h1_chunked_decode`, `h1_request_framing`, `qpack_decode`, `proxy_protocol_parse`,
+and `lscache_control`. QPACK and PROXY protocol parsing live in std-only modules
+(`uring/qpack.rs`, `uring/proxy_protocol_wire.rs`) so the targets include the exact
+server source; `proxy_protocol_parse` has reviewed seeds carrying the v2 signature.
 
 Minimize a crash with:
 

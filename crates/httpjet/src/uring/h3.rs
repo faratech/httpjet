@@ -43,6 +43,148 @@ const MAX_RECV_DRAIN_BATCHES: usize = 8;
 /// included in this total.
 const MAX_COMPLETION_DRAIN_BATCH: usize = 64;
 const MAX_PEER_UNI_STREAMS: usize = 16;
+/// Advertised MAX_STREAMS for client request streams, and the admission bound the
+/// accept loop enforces itself so a transport bug that over-reports peer streams
+/// cannot turn into an unbounded loop or allocation.
+const MAX_CONCURRENT_BIDI_STREAMS: u32 = 256;
+/// Once this many connections on a core are still handshaking, an Initial from an
+/// unvalidated address draws a stateless Retry. A spoofed source never returns the
+/// token, so it costs one datagram and no connection state.
+const H3_RETRY_THRESHOLD_PER_CORE: u64 = 64;
+/// Hard per-core bound on concurrent QUIC handshakes, validated or not.
+const H3_HANDSHAKING_CAP_PER_CORE: u32 = 256;
+/// An amplification-limited handshake arms no quinn timer, so without this bound a
+/// spoofed Initial would hold its handshake slot for the whole idle timeout.
+const H3_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+static H3_RETRIES_SENT: AtomicU64 = AtomicU64::new(0);
+static H3_REFUSED_BUDGET: AtomicU64 = AtomicU64::new(0);
+static H3_REFUSED_HANDSHAKES: AtomicU64 = AtomicU64::new(0);
+static H3_HANDSHAKE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide HTTP/3 admission counters for the metrics endpoint.
+pub(crate) struct H3AdmissionCounts {
+    pub retries_sent: u64,
+    pub refused_budget: u64,
+    pub refused_handshakes: u64,
+    pub handshake_timeouts: u64,
+}
+
+pub(crate) fn admission_counts() -> H3AdmissionCounts {
+    use std::sync::atomic::Ordering::Relaxed;
+    H3AdmissionCounts {
+        retries_sent: H3_RETRIES_SENT.load(Relaxed),
+        refused_budget: H3_REFUSED_BUDGET.load(Relaxed),
+        refused_handshakes: H3_REFUSED_HANDSHAKES.load(Relaxed),
+        handshake_timeouts: H3_HANDSHAKE_TIMEOUTS.load(Relaxed),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncomingDecision {
+    Accept,
+    Retry,
+    Refuse,
+}
+
+/// Admission for a new QUIC connection on one core. `handshaking` counts this
+/// core's connections that have not completed the handshake.
+fn incoming_decision(
+    accepting: bool,
+    budget_available: bool,
+    address_validated: bool,
+    may_retry: bool,
+    handshaking: u64,
+) -> IncomingDecision {
+    if !accepting || !budget_available || handshaking >= u64::from(H3_HANDSHAKING_CAP_PER_CORE) {
+        return IncomingDecision::Refuse;
+    }
+    if !address_validated && handshaking >= H3_RETRY_THRESHOLD_PER_CORE {
+        return if may_retry {
+            IncomingDecision::Retry
+        } else {
+            IncomingDecision::Refuse
+        };
+    }
+    IncomingDecision::Accept
+}
+
+enum Admission {
+    Accepted(
+        ConnectionHandle,
+        quinn_proto::Connection,
+        super::ConnectionPermit,
+    ),
+    /// A Retry, refusal or accept-error response is staged in `scratch`.
+    Transmit(quinn_proto::Transmit),
+    Dropped,
+}
+
+/// Decide and apply admission for one new connection. Accepting takes only a
+/// per-core handshake slot; the shared connection budget is charged at
+/// `Connected`, so unvalidated Initials can never hold the budget TCP draws from.
+fn admit_incoming(
+    endpoint: &mut Endpoint,
+    incoming: quinn_proto::Incoming,
+    now: Instant,
+    scratch: &mut Vec<u8>,
+    accepting: bool,
+    runtime: &H3RuntimeConfig,
+    handshakes: &Arc<AtomicU64>,
+) -> Admission {
+    use std::sync::atomic::Ordering::Relaxed;
+    let decision = incoming_decision(
+        accepting,
+        connection_budget_available(&runtime.active_conns, runtime.max_connections()),
+        incoming.remote_address_validated(),
+        incoming.may_retry(),
+        handshakes.load(Relaxed),
+    );
+    let slot = (decision == IncomingDecision::Accept)
+        .then(|| {
+            super::ConnectionPermit::try_acquire(handshakes.clone(), H3_HANDSHAKING_CAP_PER_CORE)
+        })
+        .flatten();
+    let Some(slot) = slot else {
+        if decision == IncomingDecision::Retry {
+            match endpoint.retry(incoming, scratch) {
+                Ok(transmit) => {
+                    H3_RETRIES_SENT.fetch_add(1, Relaxed);
+                    return Admission::Transmit(transmit);
+                }
+                Err(error) => {
+                    H3_REFUSED_HANDSHAKES.fetch_add(1, Relaxed);
+                    return Admission::Transmit(endpoint.refuse(error.into_incoming(), scratch));
+                }
+            }
+        }
+        if accepting {
+            H3_REFUSED_HANDSHAKES.fetch_add(1, Relaxed);
+        }
+        return Admission::Transmit(endpoint.refuse(incoming, scratch));
+    };
+    match endpoint.accept(incoming, now, scratch, None) {
+        Ok((handle, conn)) => Admission::Accepted(handle, conn, slot),
+        Err(error) => {
+            tracing::debug!(error = ?error.cause, "uring h3: accept rejected");
+            error
+                .response
+                .map_or(Admission::Dropped, Admission::Transmit)
+        }
+    }
+}
+
+fn connection_budget_available(active: &AtomicU64, cap: u32) -> bool {
+    cap == 0 || active.load(std::sync::atomic::Ordering::Relaxed) < u64::from(cap)
+}
+
+/// A handshaking connection's claim on the process-wide connection budget, which
+/// is shared with the TCP accept loops. It is converted into a held permit only
+/// when the handshake completes.
+struct PendingConnectionBudget {
+    active: Arc<AtomicU64>,
+    cap: u32,
+}
 
 const H3_STREAM_CREATION_ERROR: u32 = 0x0103;
 const H3_CLOSED_CRITICAL_STREAM: u32 = 0x0104;
@@ -287,12 +429,18 @@ impl H3RuntimeConfig {
 
     fn accepted_state_with_policy(
         &self,
-        permit: super::ConnectionPermit,
+        handshake_slot: super::ConnectionPermit,
+        accepted_at: Instant,
         epoch: u64,
         policy: &QuicServerPolicy,
     ) -> H3State {
         H3State {
-            _connection_permit: Some(permit),
+            pending_budget: Some(PendingConnectionBudget {
+                active: self.active_conns.clone(),
+                cap: self.max_connections(),
+            }),
+            handshake_slot: Some(handshake_slot),
+            accepted_at: Some(accepted_at),
             serving_view: policy
                 .serving_view
                 .as_ref()
@@ -406,7 +554,7 @@ fn server_config(rustls_cfg: Arc<rustls::ServerConfig>) -> io::Result<ServerConf
     // stream + connection RECEIVE WINDOWS so the peer can't buffer unbounded request data at
     // the QUIC layer. The app-level req_buf cap (below) bounds the post-read accumulation.
     let mut transport = quinn_proto::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(256u32.into());
+    transport.max_concurrent_bidi_streams(MAX_CONCURRENT_BIDI_STREAMS.into());
     transport.max_concurrent_uni_streams((MAX_PEER_UNI_STREAMS as u32).into());
     let idle = std::time::Duration::from_secs(60)
         .try_into()
@@ -495,6 +643,11 @@ fn per_core_h3(core: usize, std_sock: std::net::UdpSocket, rustls_cfg: Arc<rustl
 #[derive(Default)]
 struct H3State {
     _connection_permit: Option<super::ConnectionPermit>,
+    pending_budget: Option<PendingConnectionBudget>,
+    /// Released when the handshake completes or the connection is rejected; the
+    /// per-core count of these is the Retry/refuse pressure signal.
+    handshake_slot: Option<super::ConnectionPermit>,
+    accepted_at: Option<Instant>,
     serving_view: Option<crate::serving_generation::ServingView>,
     connected: bool,
     control_setup: bool,
@@ -623,6 +776,21 @@ impl H3State {
 
     fn next_request_deadline(&self) -> Option<Instant> {
         self.request_deadlines.first().map(|key| key.when)
+    }
+
+    fn handshake_deadline(&self) -> Option<Instant> {
+        match self.accepted_at {
+            Some(at) if !self.connected && !self.rejected => Some(at + H3_HANDSHAKE_TIMEOUT),
+            _ => None,
+        }
+    }
+
+    /// The earliest instant the driver must revisit this connection on its own.
+    fn next_deadline(&self) -> Option<Instant> {
+        match (self.handshake_deadline(), self.next_request_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     fn first_expired_request(&self, now: Instant) -> Option<StreamId> {
@@ -1992,17 +2160,38 @@ fn service_conn(
                         conn.remote_address(),
                     )
                 });
-                if eligible {
-                    st.client_leaf = leaf;
-                    st.connected = true;
-                    tracing::info!("uring h3: QUIC handshake complete (Connected)");
-                } else {
+                let budget = match st.pending_budget.take() {
+                    Some(pending) => {
+                        super::ConnectionPermit::try_acquire(pending.active, pending.cap)
+                            .map(Some)
+                            .ok_or(())
+                    }
+                    None => Ok(None),
+                };
+                if !eligible {
                     st.rejected = true;
                     if let Some(conn) = conns.get_mut(&hd) {
                         conn.close(
                             now,
                             quinn_proto::VarInt::from_u32(0x010b),
                             bytes::Bytes::from_static(b"client certificate required"),
+                        );
+                    }
+                } else if let Ok(permit) = budget {
+                    if permit.is_some() {
+                        st._connection_permit = permit;
+                    }
+                    st.client_leaf = leaf;
+                    st.connected = true;
+                    tracing::info!("uring h3: QUIC handshake complete (Connected)");
+                } else {
+                    H3_REFUSED_BUDGET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    st.rejected = true;
+                    if let Some(conn) = conns.get_mut(&hd) {
+                        conn.close(
+                            now,
+                            quinn_proto::VarInt::from_u32(H3_EXCESSIVE_LOAD),
+                            bytes::Bytes::from_static(b"connection budget exhausted"),
                         );
                     }
                 }
@@ -2019,7 +2208,25 @@ fn service_conn(
         cancel_all_dispatched_requests(st);
         reclaim_buffered_requests(st);
         st.rejected = true;
+        st.handshake_slot = None;
         return;
+    }
+    if st
+        .handshake_deadline()
+        .is_some_and(|deadline| deadline <= now)
+    {
+        H3_HANDSHAKE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        st.rejected = true;
+        if let Some(conn) = conns.get_mut(&hd) {
+            conn.close(
+                now,
+                quinn_proto::VarInt::from_u32(H3_EXCESSIVE_LOAD),
+                Bytes::from_static(b"handshake timeout"),
+            );
+        }
+    }
+    if st.connected || st.rejected {
+        st.handshake_slot = None;
     }
     for id in readable {
         if !st.request_cancellations.contains_key(&id) {
@@ -2116,7 +2323,19 @@ fn service_conn(
     // request stream.
     let mut accepted_at = None;
     let mut request_snapshot = None;
+    let mut accepted_this_drive = 0u32;
     while let Some(id) = conns.get_mut(&hd).and_then(|c| c.streams().accept(Dir::Bi)) {
+        if let Err(error) = admit_request_stream(st, &mut accepted_this_drive) {
+            st.rejected = true;
+            if let Some(c) = conns.get_mut(&hd) {
+                c.close(
+                    now,
+                    quinn_proto::VarInt::from_u32(error.code),
+                    Bytes::from_static(error.reason),
+                );
+            }
+            break;
+        }
         if accepting_requests {
             st.next_request_stream_index = st.next_request_stream_index.max(id.index() + 1);
             let accepted_at = *accepted_at.get_or_insert_with(Instant::now);
@@ -2137,6 +2356,26 @@ fn service_conn(
             let _ = c.send_stream(id).reset(code);
         }
     }
+}
+
+/// Bound request-stream admission independently of the QUIC layer. A conformant
+/// peer can never have more than the advertised MAX_STREAMS open, so one drive can
+/// accept at most that many. The live-request bound keeps a 2x margin because a
+/// stream leaves `requests` only when this driver observes its completion.
+fn admit_request_stream(
+    st: &H3State,
+    accepted_this_drive: &mut u32,
+) -> Result<(), H3ConnectionError> {
+    *accepted_this_drive += 1;
+    if *accepted_this_drive > MAX_CONCURRENT_BIDI_STREAMS
+        || st.requests.len() >= 2 * MAX_CONCURRENT_BIDI_STREAMS as usize
+    {
+        return Err(H3ConnectionError::new(
+            H3_EXCESSIVE_LOAD,
+            b"request streams exceed the advertised limit",
+        ));
+    }
+    Ok(())
 }
 
 fn send_h3_goaway(conn: &mut quinn_proto::Connection, st: &mut H3State) {
@@ -2810,6 +3049,7 @@ async fn recv_drain(
     h3: &mut HashMap<ConnectionHandle, H3State>,
     request_deadlines: &mut RequestDeadlineIndex,
     epoch_ctr: &mut u64,
+    handshakes: &Arc<AtomicU64>,
     runtime: &H3RuntimeConfig,
     policy: &QuicServerPolicy,
     accepting_connections: bool,
@@ -2919,51 +3159,35 @@ async fn recv_drain(
                         }
                         DatagramEvent::NewConnection(incoming) => {
                             scratch.clear();
-                            let permit = (accepting_connections
+                            let accepting = accepting_connections
                                 && policy
                                     .serving_view
                                     .as_ref()
-                                    .is_none_or(|view| view.is_current_trust_epoch()))
-                            .then(|| {
-                                super::ConnectionPermit::try_acquire(
-                                    runtime.active_conns.clone(),
-                                    runtime.max_connections(),
-                                )
-                            });
-                            let Some(Some(permit)) = permit else {
-                                let transmit = endpoint.refuse(incoming, scratch);
-                                send_endpoint_datagram(
-                                    udp,
-                                    tx_scratch,
-                                    &scratch[..transmit.size],
-                                    transmit.destination,
-                                )
-                                .await;
-                                continue;
-                            };
-                            match endpoint.accept(incoming, now, scratch, None) {
-                                Ok((handle, conn)) => {
+                                    .is_none_or(|view| view.is_current_trust_epoch());
+                            match admit_incoming(
+                                endpoint, incoming, now, scratch, accepting, runtime, handshakes,
+                            ) {
+                                Admission::Accepted(handle, conn, slot) => {
                                     *epoch_ctr += 1;
                                     conns.insert(handle, conn);
                                     h3.insert(
                                         handle,
-                                        runtime
-                                            .accepted_state_with_policy(permit, *epoch_ctr, policy),
+                                        runtime.accepted_state_with_policy(
+                                            slot, now, *epoch_ctr, policy,
+                                        ),
                                     );
                                     affected.insert(handle);
                                 }
-                                Err(e) => {
-                                    if let Some(t) = e.response {
-                                        send_endpoint_datagram(
-                                            udp,
-                                            tx_scratch,
-                                            &scratch[..t.size],
-                                            t.destination,
-                                        )
-                                        .await;
-                                    }
-                                    tracing::debug!(error = ?e.cause, "uring h3: accept rejected");
+                                Admission::Transmit(transmit) => {
+                                    send_endpoint_datagram(
+                                        udp,
+                                        tx_scratch,
+                                        &scratch[..transmit.size],
+                                        transmit.destination,
+                                    )
+                                    .await;
                                 }
+                                Admission::Dropped => {}
                             }
                         }
                         DatagramEvent::ConnectionEvent(handle, cev) => {
@@ -3004,6 +3228,7 @@ async fn pump(
     h3: &mut HashMap<ConnectionHandle, H3State>,
     request_deadlines: &mut RequestDeadlineIndex,
     epoch_ctr: &mut u64,
+    handshakes: &Arc<AtomicU64>,
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     bridge: &Bridge,
     local: SocketAddr,
@@ -3042,7 +3267,7 @@ async fn pump(
                 tx_scratch,
             )
             .await;
-            request_deadlines.sync(hd, h3.get(&hd).and_then(H3State::next_request_deadline));
+            request_deadlines.sync(hd, h3.get(&hd).and_then(H3State::next_deadline));
             if more_to_send {
                 next.insert(hd); // hit the per-flush datagram cap → more to send
             }
@@ -3061,6 +3286,7 @@ async fn pump(
             h3,
             request_deadlines,
             epoch_ctr,
+            handshakes,
             runtime,
             policy,
             accepting,
@@ -3078,7 +3304,7 @@ async fn pump(
     // minimum so the endpoint's outer pre-select check drives it immediately.
     // Handles retained only for transmit work keep the pre-existing wakeup path.
     for hd in &to_drive {
-        request_deadlines.sync(*hd, h3.get(hd).and_then(H3State::next_request_deadline));
+        request_deadlines.sync(*hd, h3.get(hd).and_then(H3State::next_deadline));
     }
     let mut drained_handles = Vec::new();
     conns.retain(|hd, c| {
@@ -3152,6 +3378,7 @@ async fn endpoint_loop_concurrent(
     let (comp_tx, comp_rx) = flume::bounded::<Completion>(MAX_INFLIGHT_PER_CORE * 2);
     let inflight = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let mut epoch_ctr: u64 = 0;
+    let handshakes = Arc::new(AtomicU64::new(0));
     // quinn-udp socket state for GSO send (probes UDP_SEGMENT support once per core).
     let udp_state = {
         let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
@@ -3225,6 +3452,7 @@ async fn endpoint_loop_concurrent(
                 &mut h3,
                 &mut request_deadlines,
                 &mut epoch_ctr,
+                &handshakes,
                 &inflight,
                 &bridge,
                 local,
@@ -3261,7 +3489,7 @@ async fn endpoint_loop_concurrent(
                 let now = Instant::now();
                 drain_deadline = Some(now + super::URING_DRAIN_GRACE);
                 let handles = conns.keys().copied().collect();
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
             }
             // (1) Finished request(s): write each response into its stream, then pump the
             // sends (the response streams out cooperatively, interleaved with ACK processing).
@@ -3284,14 +3512,14 @@ async fn endpoint_loop_concurrent(
                     to_drive.insert(hd);
                     completed += 1;
                 }
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
             }
             // (2) Socket readable: GRO-drain queued datagrams, then pump (drive affected conns
             // + interleave further ACK processing). `readable()` is a poll op (cancel-safe).
             _ = udp.readable(false) => {
                 let now = Instant::now();
-                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &runtime, &policy, !draining, now).await;
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
+                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
             }
             // (3) A QUIC timer (handshake retransmit / idle / pacing) or absolute
             // request-stream deadline fired — pump every connection now due.
@@ -3302,7 +3530,7 @@ async fn endpoint_loop_concurrent(
                     .filter_map(|(hd, c)| c.poll_timeout().filter(|t| *t <= now).map(|_| *hd))
                     .collect();
                 request_deadlines.extend_due(&mut due, now);
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
+                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
             }
         }
     }
@@ -3314,123 +3542,12 @@ async fn endpoint_loop_concurrent(
 // use), and encode the real response. This is the production H3 implementation; the
 // tokio/quinn transport adapter no longer exists.
 
+#[cfg(test)]
+use super::qpack::qpack_decode;
+use super::qpack::{QPACK_STATIC, qpack_decode_limited};
 use crate::uring::bridge::{Bridge, BridgeCtx};
 use hj_core::Proto;
 use tokio_util::sync::CancellationToken;
-
-/// RFC 9204 Appendix A QPACK static table (index 0..=98). The dynamic table is unused
-/// (we advertise SETTINGS_QPACK_MAX_TABLE_CAPACITY=0), so this + literals + Huffman fully
-/// decode any conformant request header block.
-static QPACK_STATIC: &[(&str, &str)] = &[
-    (":authority", ""),
-    (":path", "/"),
-    ("age", "0"),
-    ("content-disposition", ""),
-    ("content-length", "0"),
-    ("cookie", ""),
-    ("date", ""),
-    ("etag", ""),
-    ("if-modified-since", ""),
-    ("if-none-match", ""),
-    ("last-modified", ""),
-    ("link", ""),
-    ("location", ""),
-    ("referer", ""),
-    ("set-cookie", ""),
-    (":method", "CONNECT"),
-    (":method", "DELETE"),
-    (":method", "GET"),
-    (":method", "HEAD"),
-    (":method", "OPTIONS"),
-    (":method", "POST"),
-    (":method", "PUT"),
-    (":scheme", "http"),
-    (":scheme", "https"),
-    (":status", "103"),
-    (":status", "200"),
-    (":status", "304"),
-    (":status", "404"),
-    (":status", "503"),
-    ("accept", "*/*"),
-    ("accept", "application/dns-message"),
-    ("accept-encoding", "gzip, deflate, br"),
-    ("accept-ranges", "bytes"),
-    ("access-control-allow-headers", "cache-control"),
-    ("access-control-allow-headers", "content-type"),
-    ("access-control-allow-origin", "*"),
-    ("cache-control", "max-age=0"),
-    ("cache-control", "max-age=2592000"),
-    ("cache-control", "max-age=604800"),
-    ("cache-control", "no-cache"),
-    ("cache-control", "no-store"),
-    ("cache-control", "public, max-age=31536000"),
-    ("content-encoding", "br"),
-    ("content-encoding", "gzip"),
-    ("content-type", "application/dns-message"),
-    ("content-type", "application/javascript"),
-    ("content-type", "application/json"),
-    ("content-type", "application/x-www-form-urlencoded"),
-    ("content-type", "image/gif"),
-    ("content-type", "image/jpeg"),
-    ("content-type", "image/png"),
-    ("content-type", "text/css"),
-    ("content-type", "text/html; charset=utf-8"),
-    ("content-type", "text/plain"),
-    ("content-type", "text/plain;charset=utf-8"),
-    ("range", "bytes=0-"),
-    ("strict-transport-security", "max-age=31536000"),
-    (
-        "strict-transport-security",
-        "max-age=31536000; includesubdomains",
-    ),
-    (
-        "strict-transport-security",
-        "max-age=31536000; includesubdomains; preload",
-    ),
-    ("vary", "accept-encoding"),
-    ("vary", "origin"),
-    ("x-content-type-options", "nosniff"),
-    ("x-xss-protection", "1; mode=block"),
-    (":status", "100"),
-    (":status", "204"),
-    (":status", "206"),
-    (":status", "302"),
-    (":status", "400"),
-    (":status", "403"),
-    (":status", "421"),
-    (":status", "425"),
-    (":status", "500"),
-    ("accept-language", ""),
-    ("access-control-allow-credentials", "FALSE"),
-    ("access-control-allow-credentials", "TRUE"),
-    ("access-control-allow-headers", "*"),
-    ("access-control-allow-methods", "get"),
-    ("access-control-allow-methods", "get, post, options"),
-    ("access-control-allow-methods", "options"),
-    ("access-control-expose-headers", "content-length"),
-    ("access-control-request-headers", "content-type"),
-    ("access-control-request-method", "get"),
-    ("access-control-request-method", "post"),
-    ("alt-svc", "clear"),
-    ("authorization", ""),
-    (
-        "content-security-policy",
-        "script-src 'none'; object-src 'none'; base-uri 'none'",
-    ),
-    ("early-data", "1"),
-    ("expect-ct", ""),
-    ("forwarded", ""),
-    ("if-range", ""),
-    ("origin", ""),
-    ("purpose", "prefetch"),
-    ("server", ""),
-    ("timing-allow-origin", "*"),
-    ("upgrade-insecure-requests", "1"),
-    ("user-agent", ""),
-    ("x-forwarded-for", ""),
-    ("x-frame-options", "deny"),
-    ("x-frame-options", "sameorigin"),
-];
 
 /// Read a QUIC/HTTP-3 variable-length integer (RFC 9000 §16) at `*pos`.
 fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
@@ -3443,122 +3560,6 @@ fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
         v = (v << 8) | b as u64;
     }
     Some(v)
-}
-
-/// Read a QPACK prefixed integer (RFC 7541 §5.1) starting at the type byte `buf[*pos]`,
-/// using the low `prefix_bits` bits; consumes the first byte + any continuation bytes.
-fn qpack_read_int(buf: &[u8], pos: &mut usize, prefix_bits: u32) -> Option<u64> {
-    let first = *buf.get(*pos)?;
-    *pos += 1;
-    let max = (1u64 << prefix_bits) - 1;
-    let mut val = (first as u64) & max;
-    if val < max {
-        return Some(val);
-    }
-    let mut m = 0u32;
-    loop {
-        let b = *buf.get(*pos)?;
-        *pos += 1;
-        val = val.checked_add(((b & 0x7f) as u64) << m)?;
-        if b & 0x80 == 0 {
-            break;
-        }
-        m += 7;
-        if m > 62 {
-            return None;
-        }
-    }
-    Some(val)
-}
-
-/// Read a QPACK string literal: an `H` (Huffman) bit at bit position `prefix_bits`, a
-/// `prefix_bits`-prefixed length, then the bytes (Huffman-decoded when H=1).
-fn qpack_read_str_limited(
-    buf: &[u8],
-    pos: &mut usize,
-    prefix_bits: u32,
-    max_output: usize,
-) -> Option<Vec<u8>> {
-    let huff = (*buf.get(*pos)? >> prefix_bits) & 1 == 1;
-    let len = qpack_read_int(buf, pos, prefix_bits)? as usize;
-    let raw = buf.get(*pos..(*pos).checked_add(len)?)?;
-    *pos += len;
-    if huff {
-        hj_h2::hpack::huffman::decode_limited(raw, max_output)
-    } else {
-        (raw.len() <= max_output).then(|| raw.to_vec())
-    }
-}
-
-/// Decode a QPACK encoded field section (RFC 9204 §4.5) into (name, value) pairs. Supports
-/// the static table + literals + Huffman; rejects any dynamic/post-base reference (unused).
-#[cfg(test)]
-fn qpack_decode(buf: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    qpack_decode_limited(buf, usize::MAX).map(|(headers, _)| headers)
-}
-
-fn qpack_decode_limited(
-    buf: &[u8],
-    max_field_section_size: usize,
-) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, usize)> {
-    let mut pos = 0usize;
-    qpack_read_int(buf, &mut pos, 8)?; // Required Insert Count (0)
-    qpack_read_int(buf, &mut pos, 7)?; // Delta Base (sign bit + 7-bit prefix; 0)
-    let mut out = Vec::new();
-    let mut decoded_size = 0usize;
-    while pos < buf.len() {
-        let first = buf[pos];
-        if first & 0x80 != 0 {
-            // Indexed Field Line; T (bit6): 1=static.
-            let is_static = (first >> 6) & 1 == 1;
-            let idx = qpack_read_int(buf, &mut pos, 6)? as usize;
-            if !is_static {
-                return None;
-            }
-            let (n, v) = QPACK_STATIC.get(idx)?;
-            decoded_size = decoded_size
-                .checked_add(n.len())?
-                .checked_add(v.len())?
-                .checked_add(32)?;
-            if decoded_size > max_field_section_size {
-                return None;
-            }
-            out.push((n.as_bytes().to_vec(), v.as_bytes().to_vec()));
-        } else if first & 0x40 != 0 {
-            // Literal Field Line with Name Reference; T (bit4): 1=static.
-            let is_static = (first >> 4) & 1 == 1;
-            let idx = qpack_read_int(buf, &mut pos, 4)? as usize;
-            if !is_static {
-                return None;
-            }
-            let name_bytes = QPACK_STATIC.get(idx)?.0.as_bytes();
-            let base = decoded_size
-                .checked_add(name_bytes.len())?
-                .checked_add(32)?;
-            if base > max_field_section_size {
-                return None;
-            }
-            let value = qpack_read_str_limited(buf, &mut pos, 7, max_field_section_size - base)?;
-            decoded_size = base.checked_add(value.len())?;
-            let name = name_bytes.to_vec();
-            out.push((name, value));
-        } else if first & 0x20 != 0 {
-            // Literal Field Line with Literal Name (001 N H + 3-bit name length).
-            let base = decoded_size.checked_add(32)?;
-            if base > max_field_section_size {
-                return None;
-            }
-            let name = qpack_read_str_limited(buf, &mut pos, 3, max_field_section_size - base)?;
-            let with_name = base.checked_add(name.len())?;
-            let value =
-                qpack_read_str_limited(buf, &mut pos, 7, max_field_section_size - with_name)?;
-            decoded_size = with_name.checked_add(value.len())?;
-            out.push((name, value));
-        } else {
-            return None; // post-base / dynamic — unsupported (table capacity 0)
-        }
-    }
-    Some((out, decoded_size))
 }
 
 struct ParsedH3Request {
@@ -5994,6 +5995,466 @@ mod h3_codec_tests {
             qpack_decode(&streamed.field),
             qpack_decode(&buffered.field),
             "header sections must match"
+        );
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const SERVER: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 4433);
+
+    fn spoofed(i: u16) -> SocketAddr {
+        SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, (i % 250) as u8 + 1)),
+            10_000 + i,
+        )
+    }
+
+    struct Harness {
+        server: Endpoint,
+        server_config: Arc<ServerConfig>,
+        client: Endpoint,
+        client_config: quinn_proto::ClientConfig,
+        runtime: H3RuntimeConfig,
+        active: Arc<AtomicU64>,
+        handshakes: Arc<AtomicU64>,
+        scratch: Vec<u8>,
+    }
+
+    impl Harness {
+        fn new(max_connections: u32) -> Self {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            let certified =
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            let cert = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+            let key =
+                rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+                    .unwrap();
+            let mut server_tls = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key)
+                .unwrap();
+            server_tls.alpn_protocols = vec![b"h3".to_vec()];
+            server_tls.max_early_data_size = 0;
+            let server_config = Arc::new(server_config(Arc::new(server_tls)).unwrap());
+            let server = Endpoint::new(
+                Arc::new(EndpointConfig::default()),
+                Some(server_config.clone()),
+                true,
+                None,
+            );
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(cert).unwrap();
+            let mut client_tls = rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            client_tls.alpn_protocols = vec![b"h3".to_vec()];
+            let client_config = quinn_proto::ClientConfig::new(Arc::new(
+                quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls))
+                    .unwrap(),
+            ));
+            let client = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+            let active = Arc::new(AtomicU64::new(0));
+            let runtime = H3RuntimeConfig::new(
+                move || {
+                    (
+                        H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None),
+                        max_connections,
+                    )
+                },
+                active.clone(),
+                Arc::new(hj_core::budget::BodyBufferBudget::new(1 << 20)),
+            );
+            Self {
+                server,
+                server_config,
+                client,
+                client_config,
+                runtime,
+                active,
+                handshakes: Arc::new(AtomicU64::new(0)),
+                scratch: Vec::new(),
+            }
+        }
+
+        fn policy(&self) -> QuicServerPolicy {
+            QuicServerPolicy {
+                config: self.server_config.clone(),
+                serving_view: None,
+                require_client_cert: false,
+            }
+        }
+
+        fn connect(&mut self, now: Instant) -> (ConnectionHandle, quinn_proto::Connection) {
+            self.client
+                .connect(now, self.client_config.clone(), SERVER, "localhost")
+                .unwrap()
+        }
+
+        fn first_datagram(conn: &mut quinn_proto::Connection, now: Instant) -> Vec<u8> {
+            let mut buf = Vec::new();
+            let transmit = conn
+                .poll_transmit(now, 1, &mut buf)
+                .expect("client Initial");
+            buf.truncate(transmit.size);
+            buf
+        }
+
+        fn incoming(
+            &mut self,
+            from: SocketAddr,
+            datagram: &[u8],
+            now: Instant,
+        ) -> quinn_proto::Incoming {
+            self.scratch.clear();
+            match self.server.handle(
+                now,
+                from,
+                None,
+                None,
+                BytesMut::from(datagram),
+                &mut self.scratch,
+            ) {
+                Some(DatagramEvent::NewConnection(incoming)) => incoming,
+                _ => panic!("expected a new connection"),
+            }
+        }
+
+        fn admit(&mut self, incoming: quinn_proto::Incoming, now: Instant) -> Admission {
+            self.scratch.clear();
+            admit_incoming(
+                &mut self.server,
+                incoming,
+                now,
+                &mut self.scratch,
+                true,
+                &self.runtime,
+                &self.handshakes,
+            )
+        }
+
+        /// Exchange datagrams until the server reports the handshake outcome.
+        fn drive_handshake(
+            &mut self,
+            conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+            h3: &mut HashMap<ConnectionHandle, H3State>,
+            hd: ConnectionHandle,
+            client_handle: ConnectionHandle,
+            client: &mut quinn_proto::Connection,
+            client_addr: SocketAddr,
+            now: Instant,
+        ) {
+            let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+            let mut buf = Vec::new();
+            let mut scratch = Vec::new();
+            for _ in 0..64 {
+                service_conn(&mut self.server, conns, h3, hd, now, true, config);
+                if h3[&hd].connected || h3[&hd].rejected {
+                    return;
+                }
+                loop {
+                    buf.clear();
+                    let Some(transmit) =
+                        conns.get_mut(&hd).unwrap().poll_transmit(now, 1, &mut buf)
+                    else {
+                        break;
+                    };
+                    scratch.clear();
+                    if let Some(DatagramEvent::ConnectionEvent(_, event)) = self.client.handle(
+                        now,
+                        SERVER,
+                        None,
+                        None,
+                        BytesMut::from(&buf[..transmit.size]),
+                        &mut scratch,
+                    ) {
+                        client.handle_event(event);
+                    }
+                }
+                while let Some(event) = client.poll_endpoint_events() {
+                    if let Some(event) = self.client.handle_event(client_handle, event) {
+                        client.handle_event(event);
+                    }
+                }
+                while client.poll().is_some() {}
+                loop {
+                    buf.clear();
+                    let Some(transmit) = client.poll_transmit(now, 1, &mut buf) else {
+                        break;
+                    };
+                    scratch.clear();
+                    if let Some(DatagramEvent::ConnectionEvent(handle, event)) = self.server.handle(
+                        now,
+                        client_addr,
+                        None,
+                        None,
+                        BytesMut::from(&buf[..transmit.size]),
+                        &mut scratch,
+                    ) {
+                        conns.get_mut(&handle).unwrap().handle_event(event);
+                    }
+                }
+            }
+            panic!("handshake did not finish");
+        }
+    }
+
+    #[test]
+    fn incoming_decision_admits_retries_and_refuses_by_pressure() {
+        use IncomingDecision::*;
+        let threshold = H3_RETRY_THRESHOLD_PER_CORE;
+        let cap = u64::from(H3_HANDSHAKING_CAP_PER_CORE);
+        let cases = [
+            (true, true, false, true, 0, Accept),
+            (true, true, false, true, threshold - 1, Accept),
+            (true, true, false, true, threshold, Retry),
+            (true, true, false, false, threshold, Refuse),
+            (true, true, true, false, threshold, Accept),
+            (true, true, true, false, cap - 1, Accept),
+            (true, true, true, false, cap, Refuse),
+            (true, false, true, false, 0, Refuse),
+            (false, true, true, false, 0, Refuse),
+        ];
+        for (accepting, budget, validated, may_retry, handshaking, expected) in cases {
+            assert_eq!(
+                incoming_decision(accepting, budget, validated, may_retry, handshaking),
+                expected,
+                "accepting={accepting} budget={budget} validated={validated} handshaking={handshaking}"
+            );
+        }
+    }
+
+    #[test]
+    fn unvalidated_initial_gets_retry_when_handshaking_cap_exceeded() {
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let mut held = Vec::new();
+        for i in 0..H3_RETRY_THRESHOLD_PER_CORE as u16 {
+            let (_, mut conn) = h.connect(now);
+            let initial = Harness::first_datagram(&mut conn, now);
+            let incoming = h.incoming(spoofed(i), &initial, now);
+            match h.admit(incoming, now) {
+                Admission::Accepted(handle, conn, slot) => held.push((handle, conn, slot)),
+                _ => panic!("below the threshold every Initial is accepted"),
+            }
+        }
+        assert_eq!(h.handshakes.load(Relaxed), H3_RETRY_THRESHOLD_PER_CORE);
+        assert_eq!(
+            h.active.load(Relaxed),
+            0,
+            "handshakes never charge the shared budget"
+        );
+
+        let retried_from = spoofed(999);
+        let (client_handle, mut client) = h.connect(now);
+        let initial = Harness::first_datagram(&mut client, now);
+        let incoming = h.incoming(retried_from, &initial, now);
+        let Admission::Transmit(transmit) = h.admit(incoming, now) else {
+            panic!("an unvalidated Initial over the threshold must not be accepted");
+        };
+        let retry = h.scratch[..transmit.size].to_vec();
+        assert_eq!(retry[0] & 0xf0, 0xf0, "a QUIC v1 Retry long header");
+        assert_eq!(h.handshakes.load(Relaxed), H3_RETRY_THRESHOLD_PER_CORE);
+
+        let mut scratch = Vec::new();
+        match h.client.handle(
+            now,
+            SERVER,
+            None,
+            None,
+            BytesMut::from(&retry[..]),
+            &mut scratch,
+        ) {
+            Some(DatagramEvent::ConnectionEvent(handle, event)) => {
+                assert_eq!(handle, client_handle);
+                client.handle_event(event);
+            }
+            _ => panic!("the client must route the Retry to its connection"),
+        }
+        let token_initial = Harness::first_datagram(&mut client, now);
+        let incoming = h.incoming(retried_from, &token_initial, now);
+        assert!(incoming.remote_address_validated());
+        let accepted = h.admit(incoming, now);
+        assert!(
+            matches!(accepted, Admission::Accepted(..)),
+            "a token-bearing Initial is accepted under pressure"
+        );
+        drop(held);
+        assert_eq!(h.handshakes.load(Relaxed), 1);
+        drop(accepted);
+        assert_eq!(h.handshakes.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn h3_cannot_exhaust_tcp_connection_budget() {
+        let cap = 8;
+        let mut h = Harness::new(cap);
+        let now = Instant::now();
+        let policy = h.policy();
+        let mut conns = HashMap::new();
+        let mut h3 = HashMap::new();
+        let mut clients = Vec::new();
+        for i in 0..20u16 {
+            let (client_handle, mut client) = h.connect(now);
+            let initial = Harness::first_datagram(&mut client, now);
+            let incoming = h.incoming(spoofed(i), &initial, now);
+            let Admission::Accepted(handle, conn, slot) = h.admit(incoming, now) else {
+                panic!("half-open connections below the threshold are accepted");
+            };
+            conns.insert(handle, conn);
+            h3.insert(
+                handle,
+                h.runtime
+                    .accepted_state_with_policy(slot, now, u64::from(i), &policy),
+            );
+            clients.push((handle, client_handle, client, spoofed(i)));
+        }
+        assert_eq!(h.active.load(Relaxed), 0);
+        assert!(
+            crate::uring::ConnectionPermit::try_acquire(h.active.clone(), cap).is_some(),
+            "TCP accepts still get the shared budget while 20 H3 handshakes are pending"
+        );
+
+        let (hd, client_handle, mut client, addr) = clients.remove(0);
+        h.drive_handshake(
+            &mut conns,
+            &mut h3,
+            hd,
+            client_handle,
+            &mut client,
+            addr,
+            now,
+        );
+        assert!(h3[&hd].connected);
+        assert_eq!(
+            h.active.load(Relaxed),
+            1,
+            "the budget is charged at Connected"
+        );
+        assert_eq!(
+            h.handshakes.load(Relaxed),
+            19,
+            "the handshake slot is released"
+        );
+
+        let tcp: Vec<_> = (0..cap - 1)
+            .map(|_| crate::uring::ConnectionPermit::try_acquire(h.active.clone(), cap).unwrap())
+            .collect();
+        let (hd, client_handle, mut client, addr) = clients.remove(0);
+        h.drive_handshake(
+            &mut conns,
+            &mut h3,
+            hd,
+            client_handle,
+            &mut client,
+            addr,
+            now,
+        );
+        assert!(h3[&hd].rejected && !h3[&hd].connected);
+        assert_eq!(
+            h.active.load(Relaxed),
+            u64::from(cap),
+            "a full budget is never exceeded"
+        );
+        drop(tcp);
+    }
+
+    #[test]
+    fn half_open_h3_connection_is_closed_after_handshake_timeout() {
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let policy = h.policy();
+        let (_, mut client) = h.connect(now);
+        let initial = Harness::first_datagram(&mut client, now);
+        let incoming = h.incoming(spoofed(1), &initial, now);
+        let Admission::Accepted(hd, conn, slot) = h.admit(incoming, now) else {
+            panic!("accepted");
+        };
+        let mut conns = HashMap::from([(hd, conn)]);
+        let mut h3 = HashMap::from([(
+            hd,
+            h.runtime.accepted_state_with_policy(slot, now, 1, &policy),
+        )]);
+        assert_eq!(h3[&hd].next_deadline(), Some(now + H3_HANDSHAKE_TIMEOUT));
+
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        let before = H3_HANDSHAKE_TIMEOUTS.load(Relaxed);
+        service_conn(
+            &mut h.server,
+            &mut conns,
+            &mut h3,
+            hd,
+            now + Duration::from_secs(9),
+            true,
+            config,
+        );
+        assert!(!h3[&hd].rejected);
+        assert_eq!(h.handshakes.load(Relaxed), 1);
+        service_conn(
+            &mut h.server,
+            &mut conns,
+            &mut h3,
+            hd,
+            now + H3_HANDSHAKE_TIMEOUT,
+            true,
+            config,
+        );
+        assert!(h3[&hd].rejected);
+        assert_eq!(
+            h.handshakes.load(Relaxed),
+            0,
+            "the handshake slot is released"
+        );
+        assert_eq!(h3[&hd].next_deadline(), None);
+        assert!(H3_HANDSHAKE_TIMEOUTS.load(Relaxed) > before);
+    }
+
+    #[test]
+    fn handshake_deadline_never_outlives_the_handshake() {
+        let t0 = Instant::now();
+        let mut st = H3State {
+            accepted_at: Some(t0),
+            ..Default::default()
+        };
+        assert_eq!(st.next_deadline(), Some(t0 + H3_HANDSHAKE_TIMEOUT));
+        st.connected = true;
+        assert_eq!(st.next_deadline(), None);
+        assert_eq!(H3State::default().next_deadline(), None);
+    }
+
+    #[test]
+    fn request_stream_admission_caps_one_drive_at_the_advertised_limit() {
+        let st = H3State::default();
+        let mut accepted = 0;
+        for _ in 0..MAX_CONCURRENT_BIDI_STREAMS {
+            assert!(admit_request_stream(&st, &mut accepted).is_ok());
+        }
+        let error = admit_request_stream(&st, &mut accepted).unwrap_err();
+        assert_eq!(error.code, H3_EXCESSIVE_LOAD);
+    }
+
+    #[test]
+    fn request_stream_admission_caps_live_requests() {
+        let mut st = H3State::default();
+        for index in 0..u64::from(2 * MAX_CONCURRENT_BIDI_STREAMS - 1) {
+            st.requests
+                .insert(StreamId::new(quinn_proto::Side::Client, Dir::Bi, index));
+        }
+        let mut accepted = 0;
+        assert!(admit_request_stream(&st, &mut accepted).is_ok());
+        st.requests.insert(StreamId::new(
+            quinn_proto::Side::Client,
+            Dir::Bi,
+            u64::from(2 * MAX_CONCURRENT_BIDI_STREAMS),
+        ));
+        let mut accepted = 0;
+        assert_eq!(
+            admit_request_stream(&st, &mut accepted).unwrap_err().code,
+            H3_EXCESSIVE_LOAD
         );
     }
 }

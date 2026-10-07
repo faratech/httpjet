@@ -80,10 +80,10 @@ fn handshake_without_client_cert(
     use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConnection};
 
     let mut roots = RootCertStore::empty();
-    let leaf_der = rustls_pemfile::certs(&mut leaf_pem.as_bytes())
-        .next()
-        .unwrap()
-        .unwrap();
+    let leaf_der = {
+        use rustls::pki_types::pem::PemObject as _;
+        rustls::pki_types::CertificateDer::from_pem_slice(leaf_pem.as_bytes()).unwrap()
+    };
     roots.add(leaf_der).unwrap();
     let client_cfg = ClientConfig::builder()
         .with_root_certificates(roots)

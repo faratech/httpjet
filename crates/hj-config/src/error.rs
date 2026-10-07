@@ -8,6 +8,8 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("config file {path} is {len} bytes, over the {max}-byte limit")]
+    TooLarge { path: PathBuf, len: u64, max: u64 },
     #[error("failed to parse XML in {path}: {msg}")]
     Xml { path: PathBuf, msg: String },
     #[error("invalid <{directive}> value {value:?} in {path}: {reason}")]

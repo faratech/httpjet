@@ -9,11 +9,10 @@
 //!   (uncompressed) body when eligible, and **strips** the internal
 //!   `X-LiteSpeed-*` control headers so they never reach the client / Cloudflare.
 //!
-//! Phase 1 caches **public GET** responses only. The store deliberately holds
-//! the *uncompressed* canonical body — compression happens per-serve in the
-//! `handle()` transform chain (which skips bodies that already carry a
-//! `Content-Encoding`), so a cache hit negotiates `gzip`/`br`/`zstd` exactly
-//! like a miss and there is no per-codec variant explosion.
+//! Public GET responses (plus opted-in 404/410/303 and the per-session private tier). The body is
+//! canonicalized to identity at store time, then shrunk in place by the background dictionary
+//! recompress (`spawn_dict_recompress`); a hit serves a precompressed variant when one has been
+//! filled (`hit.rs`), else decodes and compresses per serve.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -34,8 +33,8 @@ use hj_compress::{ACCEPT_ENCODING_ENV, AcceptEncoding, Encoding, decode_bytes};
 use hj_core::{Body, FileBody, ReqCtx, Request, Response};
 use hj_pagecache::{
     CachedResponse, Disposition, PageBody, PageScope, Purge, QsStrip, classify_response,
-    compute_vary_value, normalize_query, parse_purge, parse_std_cache_control, parse_tags,
-    parse_vary, public_with_vary,
+    compute_vary_value_with_defaults, normalize_query, parse_purge, parse_std_cache_control,
+    parse_tags, parse_vary, public_with_vary,
 };
 use hj_rewrite::{CacheKeyModifier, Htaccess, chain_cacheable_for_default};
 
@@ -163,7 +162,16 @@ fn private_route(
     if !cfg.private_enabled {
         return PrivateRoute::Public;
     }
-    if cookie_value(cookie, &cfg.private_user_cookie).is_none() {
+    // (2026-10-04) EITHER logged-in marker makes this a logged-in request. XenForo sets
+    // `xf_user` only for "stay logged in"; a session-only login carries just `xf_session`,
+    // and that visitor is a member too. Keying on `xf_user` alone routed those requests
+    // PUBLIC and served them the cached GUEST page with `public, max-age=604800` (verified
+    // with a minted member session, 22:30 UTC). pagecache.php already treats either cookie
+    // as non-guest; this makes httpjet agree. Guests that happen to carry `xf_session`
+    // (post-logout, after a POST) now render through PHP, where XF's own page cache serves
+    // them — a short detour, never a wrong page.
+    let session = cookie_value(cookie, &cfg.private_session_cookie).filter(|s| !s.is_empty());
+    if cookie_value(cookie, &cfg.private_user_cookie).is_none() && session.is_none() {
         return PrivateRoute::Public;
     }
     // (shared-paths) Logged-in, but the request targets an allowlisted visitor-invariant
@@ -187,12 +195,12 @@ fn private_route(
     if !vhost_private || context_denies_cache(ctx, cc.req_path, true) {
         return PrivateRoute::Bypass;
     }
-    match cookie_value(cookie, &cfg.private_session_cookie) {
-        Some(sess) if !sess.is_empty() => PrivateRoute::Private {
+    match session {
+        Some(sess) => PrivateRoute::Private {
             owner: fnv64(sess.as_bytes(), OWNER_BASIS_A),
             owner2: format!("s={:016x}", fnv64(sess.as_bytes(), OWNER_BASIS_B)),
         },
-        _ => PrivateRoute::Bypass,
+        None => PrivateRoute::Bypass,
     }
 }
 
@@ -425,7 +433,7 @@ pub struct CacheCtx<'a> {
 /// (still-stale) stored entry — it returns `Miss` so the render path runs.
 /// The Accept-Encoding the COMPRESSION layers (page-cache variant store/serve + the
 /// on-serve Compress transform) should negotiate against for this response — NOT what
-/// lsphp/XenForo sees (that stays the real `HTTP_ACCEPT_ENCODING`). With `--cf-send-zstd`
+/// lsphp/XenForo sees (cgi.rs always hands PHP `HTTP_ACCEPT_ENCODING=identity`). With `--cf-send-zstd`
 /// on, a trusted-proxy (Cloudflare) peer is forced to `zstd` regardless of its forwarded
 /// AE, keeping the stored variant + served encoding in lockstep with the transform. CF
 /// decodes the zstd and re-encodes per browser at its edge; untrusted (direct) clients
@@ -1236,7 +1244,7 @@ fn spawn_finalize(
 const DICT_SATURATION_WARN_INTERVAL_SECS: u64 = 60;
 
 fn rate_limit_dict_saturation_warning(last: &std::sync::atomic::AtomicU64, now: u64) -> bool {
-    last.fetch_update(
+    last.try_update(
         std::sync::atomic::Ordering::AcqRel,
         std::sync::atomic::Ordering::Relaxed,
         |previous| {
@@ -1299,9 +1307,10 @@ fn stored_content_type(headers: &[(HeaderName, HeaderValue)]) -> &str {
 /// cache may never serve is the cheaper side of that trade: the pool is bounded and the encode is
 /// ~100x cheaper than the PHP render that produced the body.
 ///
-/// The encode stays on the background pool rather than running inline before the store: at level 15
-/// it costs tens of ms on a real page, which would land directly on the TTFB of every cacheable
-/// miss. The entry is therefore stored as identity and shrunk moments later, in place.
+/// The encode stays on the background pool rather than running inline before the store: at the
+/// configured dictionary level (default 12; production windowsforum=6, moontimenow=3) it costs
+/// milliseconds to tens of ms on a real page, which would land directly on the TTFB of every
+/// cacheable miss. The entry is therefore stored as identity and shrunk moments later, in place.
 fn spawn_store_finalize(
     state: &Arc<ServerState>,
     vhost_name: &str,
@@ -1514,7 +1523,10 @@ fn capsule_key(
 fn public_vary_value(cc: &CacheCtx<'_>, store: &hj_pagecache::PageStore) -> String {
     match cc.vary_value {
         Some(v) => v.to_string(),
-        None => compute_vary_value(cc.cookie, &store.config().vary_cookies),
+        None => {
+            let cfg = store.config();
+            compute_vary_value_with_defaults(cc.cookie, &cfg.vary_cookies, &cfg.vary_defaults)
+        }
     }
 }
 
@@ -1554,7 +1566,7 @@ fn capsule_public_vary_value(cookie: Option<&str>, store: &hj_pagecache::PageSto
                 && *name != "xf_api_key"
         })
         .collect();
-    compute_vary_value(cookie, &vary_cookies)
+    compute_vary_value_with_defaults(cookie, &vary_cookies, &cfg.vary_defaults)
 }
 
 fn capsule_vhost_allowed(state: &ServerState, ctx: &ReqCtx) -> bool {
@@ -1683,6 +1695,10 @@ fn capsule_canary_allows(
     h.finish() % 100 < pct as u64
 }
 
+/// Broader than `private_route` on purpose: an empty session cookie still counts here, so
+/// the capsule guards (never store a shell from, or serve a non-public entry to, a possible
+/// member) err on the member side. `private_route` may route that same request public
+/// because it only ever serves the guest page there.
 fn capsule_member_candidate(cookie: Option<&str>, store: &hj_pagecache::PageStore) -> bool {
     cookie_value(cookie, &store.config().private_user_cookie).is_some()
         || cookie_value(cookie, &store.config().private_session_cookie).is_some()
@@ -2273,9 +2289,19 @@ pub fn capsule_lookup(
         return CacheOutcome::Bypass;
     }
 
+    // (2026-10-04) Guests never probe the dedicated key: their page is the PUBLIC entry that
+    // `cache_lookup` serves next, so the extra probe (39k "dedicated misses" per 2.5 h) bought
+    // nothing. Members fall straight through to the shell-capable public entry unless dedicated
+    // stores are enabled (`--xf-capsule-dedicated-store`).
+    if !capsule_member_candidate(cc.cookie, store) {
+        return CacheOutcome::Bypass;
+    }
     let key = configuration_key(state, capsule_key(ctx, cc, store));
     let key_hash = hash_key(&key);
     let now = Instant::now();
+    if !state.xf_capsule.dedicated_store {
+        return capsule_public_fallback_lookup(state, ctx, cc, store, now, key_hash, if_none_match);
+    }
     let mut entry = match store.get_entry_uncounted(&key, cc.identity, now) {
         hj_pagecache::EntryState::Fresh(e) => e,
         hj_pagecache::EntryState::Stale(mut e) => {
@@ -2901,7 +2927,11 @@ pub async fn cache_store_leading(
         && !is_self_redirect(status, &parts.headers, ctx.is_tls, host, req_path, req_query)
         // An opted-in 303 is stored only under an allowlisted prefix: redirects elsewhere
         // (thread `latest`, attachments) rely on CDN purges the origin can't mirror.
-        && (status != 303 || cfg.opt_in_303_prefixes.iter().any(|p| req_path.starts_with(p.as_str())))
+        && (status != 303
+            || cfg
+                .opt_in_303_prefixes
+                .iter()
+                .any(|p| hj_pagecache::path_has_segment_prefix(req_path, p)))
         // A standard HTTP `Vary` response header lists request dimensions the content
         // depends on. We key on cookies + the negotiated encoding variant, so the only
         // token we can honor is `Accept-Encoding`; any other (`Accept-Language`,
@@ -3127,10 +3157,10 @@ pub async fn cache_store_leading(
 
     // (#A/#B) CANONICALIZE TO IDENTITY before caching. The store, PC1 variants, and
     // per-serve compression all assume an identity body; the cache key is NOT
-    // encoding-aware, so storing an already-compressed backend response (PHP/XF
-    // `Content-Encoding: gzip` for gzip clients like Cloudflare) would replay a gzip
-    // body to EVERY client — binary junk to non-gzip clients, and PC1 would
-    // re-compress it (gzip-of-gzip). Decode a known single codec back to identity
+    // encoding-aware, so storing an already-compressed backend response (a backend that
+    // ignores the identity Accept-Encoding cgi.rs hands it and sends `Content-Encoding`
+    // anyway) would replay that body to EVERY client — binary junk to clients that did not
+    // ask for it, and PC1 would re-compress it (gzip-of-gzip). Decode a known single codec back to identity
     // and drop the header; if it can't be canonicalized (unknown / multi-value
     // encoding, or a decode error) DON'T cache it — fall through to the miss return
     // below, which serves the backend's response verbatim (valid for THIS client).
@@ -3204,7 +3234,7 @@ pub async fn cache_store_leading(
             .find(|(name, _)| name == ETAG)
             .map(|(_, value)| value.clone());
         let mut finalize_targets = Vec::with_capacity(2);
-        if let Some(control) = capsule_control {
+        if let (Some(control), true) = (capsule_control, state.xf_capsule.dedicated_store) {
             // (#99) The dedicated capsule entry is stored WITHOUT the W-TinyLFU `admitted` gate
             // that governs the public mirror below — intentionally. The admission sketch frequency
             // is recorded only in `cache_lookup` (the public key), driven by GUEST traffic; capsule
@@ -3880,6 +3910,7 @@ mod tests {
             is_tls: true,
             protocol: hj_core::Proto::Http2,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: Vec::new(),
             local_addr: "127.0.0.1:443".parse().unwrap(),
             peer_port: 12345,
@@ -4946,6 +4977,7 @@ mod tests {
             is_tls: true,
             protocol: hj_core::Proto::Http2,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: Vec::new(),
             local_addr: "127.0.0.1:443".parse().unwrap(),
             peer_port: 12345,
@@ -5022,6 +5054,68 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             2
         );
+    }
+
+    /// (2026-10-04) A session-only login (`xf_session` without the `xf_user` remember cookie)
+    /// is a member too. Routing it PUBLIC served the cached GUEST page with `public,
+    /// max-age=604800` to a logged-in visitor; now either logged-in marker leaves the public
+    /// tier. Guests (no marker, or an empty session value) still route public, and the
+    /// visitor-invariant shared paths stay public for everyone.
+    #[tokio::test]
+    async fn session_only_cookie_never_routes_public() {
+        let (state, ctx, store) = shared_paths_ctx(SHARED_SPEC, 100);
+        let session_only = Some("xf_csrf=abc; xf_session=sessOnlyAAAA");
+        assert!(
+            !matches!(
+                shared_paths_route(
+                    &state,
+                    &ctx,
+                    &store,
+                    session_only,
+                    "/threads/x.1/",
+                    "",
+                    true
+                ),
+                PrivateRoute::Public
+            ),
+            "a session-only login must never read or store the public tier"
+        );
+        assert!(matches!(
+            shared_paths_route(
+                &state,
+                &ctx,
+                &store,
+                Some("xf_csrf=abc"),
+                "/threads/x.1/",
+                "",
+                true
+            ),
+            PrivateRoute::Public
+        ));
+        assert!(matches!(
+            shared_paths_route(
+                &state,
+                &ctx,
+                &store,
+                Some("xf_session="),
+                "/threads/x.1/",
+                "",
+                true
+            ),
+            PrivateRoute::Public
+        ));
+        assert!(matches!(
+            shared_paths_route(
+                &state,
+                &ctx,
+                &store,
+                session_only,
+                "/wf-unfurl/image/abc.webp",
+                "",
+                true
+            ),
+            PrivateRoute::Public
+        ));
     }
 
     #[tokio::test]
@@ -5333,6 +5427,7 @@ mod tests {
             canary_percent: 100,
             allow_members: true,
             member_canary_percent: 100,
+            dedicated_store: true,
         };
         let (state, ctx, store) = cache_test_ctx_with_dict_and_capsule(capsule);
         let method = Method::GET;
@@ -5506,6 +5601,7 @@ mod tests {
             is_tls: true,
             protocol: hj_core::Proto::Http2,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: Vec::new(),
             local_addr: "127.0.0.1:443".parse().unwrap(),
             peer_port: 12345,
@@ -5529,6 +5625,7 @@ mod tests {
             canary_percent: 100,
             allow_members: true,
             member_canary_percent: 100,
+            dedicated_store: false,
         });
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();
@@ -5560,6 +5657,15 @@ mod tests {
             .header(HDR_XF_CAPSULE_TAGS, "public, T1")
             .body(Body::Full(Bytes::from_static(b"<html>capsule</html>")))
             .unwrap();
+        // (2026-10-04) Members are served from the PUBLIC entry (dedicated capsule stores are
+        // off), and the public store is admission-gated: record the sighting the guest
+        // `cache_lookup` would have recorded before the render.
+        state.page_cache_admission.record(hash_key(&build_cache_key(
+            &ctx,
+            &guest_cc,
+            &store,
+            &PrivateRoute::Public,
+        )));
         let _ = cache_store(&state, &ctx, &guest_cc, resp).await;
 
         let member_cookie = "xf_user=1; xf_session=abc; xf_wf_capsule_member=1";
@@ -5572,7 +5678,11 @@ mod tests {
             CacheOutcome::Hit(hit) => hit,
             _ => panic!("expected capsule hit for member cookie"),
         };
-        assert_eq!(hit.headers().get(HDR_XF_CAPSULE_STATUS).unwrap(), "hit");
+        // (2026-10-04) Served from the shell-capable PUBLIC entry (dedicated stores off).
+        assert_eq!(
+            hit.headers().get(HDR_XF_CAPSULE_STATUS).unwrap(),
+            "hit,public-fallback"
+        );
         assert_eq!(
             hit.headers().get(http::header::CACHE_CONTROL).unwrap(),
             "private, no-store"
@@ -5598,6 +5708,7 @@ mod tests {
             canary_percent: 0,
             allow_members: true,
             member_canary_percent: 100,
+            dedicated_store: false,
         });
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();
@@ -5651,6 +5762,7 @@ mod tests {
             canary_percent: 100,
             allow_members: true,
             member_canary_percent: 100,
+            dedicated_store: false,
         });
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();
@@ -5725,6 +5837,7 @@ mod tests {
             canary_percent: 100,
             allow_members: true,
             member_canary_percent: 100,
+            dedicated_store: false,
         });
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();
@@ -5800,6 +5913,7 @@ mod tests {
             canary_percent: 100,
             allow_members: true,
             member_canary_percent: 100,
+            dedicated_store: false,
         });
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();
@@ -5861,6 +5975,7 @@ mod tests {
             canary_percent: 100,
             allow_members: true,
             member_canary_percent: 100,
+            dedicated_store: false,
         }
     }
 
@@ -5965,14 +6080,25 @@ mod tests {
             .header(HDR_XF_CAPSULE_TAGS, "public, T1")
             .body(Body::Full(Bytes::from_static(b"<html>capsule</html>")))
             .unwrap();
+        // (2026-10-04) Members are served from the PUBLIC entry (dedicated capsule stores are
+        // off), and the public store is admission-gated: record the sighting the guest
+        // `cache_lookup` would have recorded before the render.
+        state.page_cache_admission.record(hash_key(&build_cache_key(
+            &ctx,
+            &guest_cc,
+            &store,
+            &PrivateRoute::Public,
+        )));
         let _ = cache_store(&state, &ctx, &guest_cc, resp).await;
 
-        // A guest serve from the dedicated capsule entry (guest passes the lookup gate too).
+        // (2026-10-04) Guests never probe the capsule tier: their page is the public entry
+        // `cache_lookup` serves next, so capsule_lookup is a Bypass and the guest class is
+        // never counted here.
         assert!(matches!(
             capsule_lookup(&state, &ctx, &guest_cc, None, None),
-            CacheOutcome::Hit(_)
+            CacheOutcome::Bypass
         ));
-        assert_eq!(state.metrics.xf_capsule_hits_guest.load(Relaxed), 1);
+        assert_eq!(state.metrics.xf_capsule_hits_guest.load(Relaxed), 0);
         assert_eq!(state.metrics.xf_capsule_hits_member.load(Relaxed), 0);
 
         // A member serve of the same dedicated shell.
@@ -5985,12 +6111,12 @@ mod tests {
             capsule_lookup(&state, &ctx, &member_cc, None, None),
             CacheOutcome::Hit(_)
         ));
-        assert_eq!(state.metrics.xf_capsule_hits_guest.load(Relaxed), 1);
+        assert_eq!(state.metrics.xf_capsule_hits_guest.load(Relaxed), 0);
         assert_eq!(state.metrics.xf_capsule_hits_member.load(Relaxed), 1);
-        // Two hits => two shell-age observations.
+        // One member hit => one shell-age observation.
         assert_eq!(
             state.metrics.xf_capsule_shell_age_secs_count.load(Relaxed),
-            2
+            1
         );
     }
 
@@ -6005,6 +6131,7 @@ mod tests {
             canary_percent: 100,
             allow_members: false,
             member_canary_percent: 0,
+            dedicated_store: false,
         });
         let method = Method::GET;
         let chain: Vec<Arc<Htaccess>> = Vec::new();

@@ -138,6 +138,8 @@ pub struct XfCapsuleConfig {
     pub canary_percent: u8,
     pub allow_members: bool,
     pub member_canary_percent: u8,
+    /// Store dedicated (admission-exempt) capsule entries in addition to the public mirror.
+    pub dedicated_store: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +159,7 @@ impl XfCapsuleConfig {
             canary_percent: 0,
             allow_members: false,
             member_canary_percent: 0,
+            dedicated_store: false,
         }
     }
 }

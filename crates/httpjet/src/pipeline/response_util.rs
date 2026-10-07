@@ -402,6 +402,7 @@ fn isolated_error_document_context(ctx: &ReqCtx) -> ReqCtx {
         is_tls: ctx.is_tls,
         protocol: ctx.protocol,
         trusted_proxy: ctx.trusted_proxy,
+        forwarding_trusted: ctx.forwarding_trusted,
         env: Vec::new(),
         local_addr: ctx.local_addr,
         peer_port: ctx.peer_port,

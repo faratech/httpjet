@@ -66,8 +66,11 @@ impl Control {
         let Ok(permit) = self.candidates.clone().try_acquire_owned() else {
             return failure(503, "busy");
         };
-        let Ok(transaction) =
-            tokio::time::timeout(Duration::from_secs(5), self.coordinator.begin()).await
+        let Ok(transaction) = tokio::time::timeout(
+            crate::config_transaction::BEGIN_TIMEOUT,
+            self.coordinator.begin(),
+        )
+        .await
         else {
             return failure(503, "busy");
         };

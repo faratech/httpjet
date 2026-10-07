@@ -44,11 +44,17 @@ impl SharedPathMatcher {
             // route added later must never be member-shared by accident (the
             // allowlist widens the private tier's cardinal rule; it has to be
             // exact about what it widens).
-            SharedPathMatcher::Prefix { path: p } => match path.strip_prefix(p.as_str()) {
-                Some(rest) => p.ends_with('/') || rest.is_empty() || rest.starts_with('/'),
-                None => false,
-            },
+            SharedPathMatcher::Prefix { path: p } => path_has_segment_prefix(path, p),
         }
+    }
+}
+
+/// `path` starts with `prefix` at a path-segment boundary: `/a` matches `/a` and
+/// `/a/…` but not `/ab`; a prefix ending in `/` matches anything below it.
+pub fn path_has_segment_prefix(path: &str, prefix: &str) -> bool {
+    match path.strip_prefix(prefix) {
+        Some(rest) => prefix.ends_with('/') || rest.is_empty() || rest.starts_with('/'),
+        None => false,
     }
 }
 
@@ -140,6 +146,16 @@ pub fn parse_shared_paths(spec: &str) -> Result<Vec<SharedPathMatcher>, String> 
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn segment_prefix_rejects_sibling_routes() {
+        assert!(path_has_segment_prefix("/whats-new", "/whats-new"));
+        assert!(path_has_segment_prefix("/whats-new/posts/", "/whats-new"));
+        assert!(path_has_segment_prefix("/whats-new/posts/", "/whats-new/"));
+        assert!(!path_has_segment_prefix("/whats-newish/", "/whats-new"));
+        assert!(!path_has_segment_prefix("/whats", "/whats-new"));
+    }
+
     use super::*;
 
     #[test]

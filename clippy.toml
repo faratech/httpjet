@@ -1,0 +1,6 @@
+# Test code may unwrap/expect/index/panic freely; the ratchet in
+# scripts/clippy-panic-ratchet.sh tracks only non-test code.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true

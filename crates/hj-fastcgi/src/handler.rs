@@ -572,6 +572,7 @@ mod tests {
             is_tls: false,
             protocol: Proto::Http1,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: vec![],
             local_addr: "127.0.0.1:8080".parse().unwrap(),
             peer_port: 50123,
@@ -602,6 +603,30 @@ mod tests {
             *input = &input[4..];
             value as usize
         }
+    }
+
+    #[test]
+    fn fastcgi_params_omit_untrusted_forwarding_headers() {
+        let request = http::Request::builder()
+            .uri("/app/tail")
+            .header("Host", "example.test")
+            .header("CF-Connecting-IP", "198.51.100.9")
+            .header("X_Real_Ip", "127.0.0.1")
+            .header("User-Agent", "curl/8")
+            .body(hj_core::empty_incoming())
+            .unwrap();
+        let mut ctx = context();
+        ctx.forwarding_trusted = false;
+        let env: BTreeMap<String, String> =
+            CgiEnvBuilder::new(std::path::Path::new("/srv/apps/index.fcgi"))
+                .build(&request, &ctx)
+                .into_iter()
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect();
+        assert!(!env.contains_key("HTTP_CF_CONNECTING_IP"));
+        assert!(!env.contains_key("HTTP_X_REAL_IP"));
+        assert_eq!(env["HTTP_USER_AGENT"], "curl/8");
+        assert!(env.contains_key("REMOTE_ADDR"));
     }
 
     fn decode_params(bytes: &[u8]) -> BTreeMap<String, String> {

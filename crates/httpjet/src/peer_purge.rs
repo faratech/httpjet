@@ -14,7 +14,11 @@
 //! request arriving via Cloudflare has peer = the CF edge's PUBLIC IP, fails
 //! the gate, and falls through to normal handling (a plain 404) — the
 //! endpoints are invisible to anything off-box. There is no shared secret:
-//! loopback IS the trust boundary.
+//! loopback IS the trust boundary. A unix-socket listener (`--http-uds`) reports
+//! every peer as loopback, so there the socket file's mode is the boundary.
+//!
+//! Methods: the purge endpoint accepts only POST and the readiness probe only
+//! GET/HEAD; a trusted source using another method gets 405 with `Allow`.
 //!
 //! History: this module used to also fan purges out to the active-active peer
 //! node (`--cache-peer`) and pull cross-node cache fills. The peer node was
@@ -77,6 +81,9 @@ impl PurgeForwarder {
             if !source_trusted(peer_ip) {
                 return None; // untrusted source → normal handling (404), endpoint stays invisible
             }
+            if !ready_method_allowed(req.method()) {
+                return Some(method_not_allowed("GET, HEAD"));
+            }
             let (warm, loaded) = state
                 .page_cache
                 .as_ref()
@@ -88,8 +95,9 @@ impl PurgeForwarder {
             .headers()
             .get(PURGE_HEADER)
             .and_then(|v| v.to_str().ok());
-        match classify(path, peer_ip, directive) {
+        match classify(req.method(), path, peer_ip, directive) {
             Verdict::Passthrough => None,
+            Verdict::MethodNotAllowed => Some(method_not_allowed("POST")),
             Verdict::BadRequest => Some(ack(StatusCode::BAD_REQUEST)),
             Verdict::Apply(purge) => {
                 if let Some(store) = state.page_cache.as_ref() {
@@ -117,6 +125,8 @@ impl PurgeForwarder {
 enum Verdict {
     /// Not a (valid-source) purge: fall through to normal request handling.
     Passthrough,
+    /// A trusted source used a method other than POST.
+    MethodNotAllowed,
     /// Valid source (loopback), but no usable purge directive.
     BadRequest,
     /// Valid source + valid directive.
@@ -132,17 +142,37 @@ fn source_trusted(peer_ip: IpAddr) -> bool {
     peer_ip.to_canonical().is_loopback()
 }
 
-fn classify(path: &str, peer_ip: IpAddr, directive: Option<&str>) -> Verdict {
+fn classify(
+    method: &http::Method,
+    path: &str,
+    peer_ip: IpAddr,
+    directive: Option<&str>,
+) -> Verdict {
     if path != PURGE_PATH {
         return Verdict::Passthrough;
     }
     if !source_trusted(peer_ip) {
         return Verdict::Passthrough;
     }
+    if method != http::Method::POST {
+        return Verdict::MethodNotAllowed;
+    }
     match directive {
         Some(d) if !d.trim().is_empty() => Verdict::Apply(parse_purge(d)),
         _ => Verdict::BadRequest,
     }
+}
+
+fn ready_method_allowed(method: &http::Method) -> bool {
+    method == http::Method::GET || method == http::Method::HEAD
+}
+
+fn method_not_allowed(allow: &'static str) -> Response {
+    http::Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(http::header::ALLOW, allow)
+        .body(Body::Empty)
+        .unwrap()
 }
 
 fn ack(status: StatusCode) -> Response {
@@ -179,10 +209,54 @@ mod tests {
     const PUBLIC: &str = "203.0.113.9"; // a public source (e.g. a CF edge / attacker)
 
     #[test]
+    fn purge_requires_post_from_loopback() {
+        for method in [http::Method::GET, http::Method::HEAD, http::Method::PUT] {
+            assert_eq!(
+                classify(&method, PURGE_PATH, "127.0.0.1".parse().unwrap(), Some("*")),
+                Verdict::MethodNotAllowed,
+                "{method}"
+            );
+        }
+        assert_eq!(
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "127.0.0.1".parse().unwrap(),
+                Some("*")
+            ),
+            Verdict::Apply(Purge::All)
+        );
+    }
+
+    #[test]
+    fn untrusted_source_is_passthrough_for_every_method() {
+        for method in [http::Method::GET, http::Method::POST, http::Method::DELETE] {
+            assert_eq!(
+                classify(&method, PURGE_PATH, PUBLIC.parse().unwrap(), Some("*")),
+                Verdict::Passthrough,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn ready_probe_allows_only_get_and_head() {
+        assert!(ready_method_allowed(&http::Method::GET));
+        assert!(ready_method_allowed(&http::Method::HEAD));
+        assert!(!ready_method_allowed(&http::Method::POST));
+        assert!(!ready_method_allowed(&http::Method::DELETE));
+    }
+
+    #[test]
     fn classify_allows_loopback() {
         for lo in ["127.0.0.1", "::1"] {
             assert_eq!(
-                classify(PURGE_PATH, lo.parse().unwrap(), Some("*")),
+                classify(
+                    &http::Method::POST,
+                    PURGE_PATH,
+                    lo.parse().unwrap(),
+                    Some("*")
+                ),
                 Verdict::Apply(Purge::All),
                 "loopback {lo} should purge"
             );
@@ -192,7 +266,12 @@ mod tests {
     #[test]
     fn classify_applies_tags_from_loopback() {
         assert_eq!(
-            classify(PURGE_PATH, "127.0.0.1".parse().unwrap(), Some("tag=t1,t2")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "127.0.0.1".parse().unwrap(),
+                Some("tag=t1,t2")
+            ),
             Verdict::Apply(Purge::Tags(vec!["t1".into(), "t2".into()]))
         );
     }
@@ -201,7 +280,12 @@ mod tests {
     fn classify_rejects_private_lan_source() {
         // Loopback-only: a private host on the LAN/VPC must NOT be able to purge.
         assert_eq!(
-            classify(PURGE_PATH, OTHER_LAN.parse().unwrap(), Some("*")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                OTHER_LAN.parse().unwrap(),
+                Some("*")
+            ),
             Verdict::Passthrough
         );
     }
@@ -211,7 +295,12 @@ mod tests {
         // A request via Cloudflare (peer = CF edge PUBLIC IP) or any direct attacker must
         // look like a normal 404, never revealing the endpoint.
         assert_eq!(
-            classify(PURGE_PATH, PUBLIC.parse().unwrap(), Some("*")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                PUBLIC.parse().unwrap(),
+                Some("*")
+            ),
             Verdict::Passthrough
         );
     }
@@ -220,12 +309,22 @@ mod tests {
     fn classify_matches_ipv4_mapped_loopback_but_not_mapped_public() {
         // A dual-stack listener may report the v4 peer as ::ffff:127.0.0.1 — still loopback.
         assert_eq!(
-            classify(PURGE_PATH, "::ffff:127.0.0.1".parse().unwrap(), Some("*")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "::ffff:127.0.0.1".parse().unwrap(),
+                Some("*")
+            ),
             Verdict::Apply(Purge::All)
         );
         // ...but a mapped PUBLIC v4 is still rejected.
         assert_eq!(
-            classify(PURGE_PATH, "::ffff:203.0.113.9".parse().unwrap(), Some("*")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "::ffff:203.0.113.9".parse().unwrap(),
+                Some("*")
+            ),
             Verdict::Passthrough
         );
     }
@@ -245,7 +344,12 @@ mod tests {
     #[test]
     fn classify_passes_through_non_purge_path() {
         assert_eq!(
-            classify("/whats-new/", "127.0.0.1".parse().unwrap(), Some("*")),
+            classify(
+                &http::Method::POST,
+                "/whats-new/",
+                "127.0.0.1".parse().unwrap(),
+                Some("*")
+            ),
             Verdict::Passthrough
         );
     }
@@ -253,11 +357,21 @@ mod tests {
     #[test]
     fn classify_bad_request_when_no_directive() {
         assert_eq!(
-            classify(PURGE_PATH, "127.0.0.1".parse().unwrap(), None),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "127.0.0.1".parse().unwrap(),
+                None
+            ),
             Verdict::BadRequest
         );
         assert_eq!(
-            classify(PURGE_PATH, "127.0.0.1".parse().unwrap(), Some("  ")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "127.0.0.1".parse().unwrap(),
+                Some("  ")
+            ),
             Verdict::BadRequest
         );
     }
@@ -269,12 +383,22 @@ mod tests {
         // made the documented loopback purge fall through to the backend.
         let _pf = PurgeForwarder::new();
         assert_eq!(
-            classify(PURGE_PATH, "127.0.0.1".parse().unwrap(), Some("*")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "127.0.0.1".parse().unwrap(),
+                Some("*")
+            ),
             Verdict::Apply(Purge::All),
             "loopback purge must work with no peers configured"
         );
         assert_eq!(
-            classify(PURGE_PATH, OTHER_LAN.parse().unwrap(), Some("*")),
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                OTHER_LAN.parse().unwrap(),
+                Some("*")
+            ),
             Verdict::Passthrough,
             "non-loopback stays rejected"
         );

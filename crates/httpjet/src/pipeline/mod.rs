@@ -45,6 +45,7 @@ mod response_util;
 mod rewrite_differential;
 mod rewrite_glue;
 mod scoped_auth;
+pub(crate) use scoped_auth::set_auth_user_file_roots;
 mod suffix_routing;
 
 pub(crate) use rewrite_glue::{DEFAULT_REWRITE_OUTCOME_TTL, RewriteOutcomeCache, UaClassifyCache};
@@ -59,8 +60,8 @@ use response_util::{
     matching_static_context, redirect, status_response,
 };
 use rewrite_glue::{
-    RwResult, build_uri, decode_request_path, needs_encoding, normalized_request_path,
-    percent_encode_path, resolved_rel_path, run_rewrite, url_parent_dir,
+    RwResult, build_uri, decode_request_path, normalized_request_path, percent_encode_path,
+    resolved_rel_path, run_rewrite, url_parent_dir,
 };
 use suffix_routing::split_script_path;
 
@@ -185,6 +186,7 @@ pub(crate) async fn fast_serve(
     local_addr: std::net::SocketAddr,
     peer_port: u16,
     is_tls: bool,
+    mtls_required: bool,
     peer_unix: bool,
     proto: Proto,
     tls: Option<hj_core::TlsParams>,
@@ -206,7 +208,7 @@ pub(crate) async fn fast_serve(
         // transition. The full funnel checks the raw URI before normalization.
         return None;
     }
-    // Reserved cache endpoints (`/__hj_cache_purge|_get|_ready`) are intercepted
+    // Reserved cache endpoints (`/__hj_cache_purge|_ready`) are intercepted
     // before vhost routing on BOTH entry points: `handle()` checks them below the
     // bridge, but this on-core fast path runs FIRST — without the same gate here,
     // any GET/HEAD probe could be answered by vhost content instead of the
@@ -271,6 +273,7 @@ pub(crate) async fn fast_serve(
         is_tls: effective_https,
         peer_unix,
         protocol: proto,
+        forwarding_trusted: forwarding_trusted(trusted_proxy, mtls_required, tls.as_ref()),
         trusted_proxy,
         env: Vec::with_capacity(8),
         local_addr,
@@ -327,14 +330,7 @@ pub(crate) async fn fast_serve(
                 .metrics
                 .fast_memo_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mtls_ok = if state.mtls_required_vhosts.contains(&ctx.vhost_name) {
-                ctx.tls
-                    .as_ref()
-                    .map(|t| t.client_cert.is_some())
-                    .unwrap_or(false)
-            } else {
-                is_tls
-            };
+            let mtls_ok = mtls_ok(mtls_required, is_tls, ctx.tls.as_ref());
             ctx.client_ip = state.acl.resolve_client_ip(
                 peer_ip,
                 req.headers(),
@@ -418,14 +414,7 @@ pub(crate) async fn fast_serve(
     // path judges the SAME identity the tokio `handle()` path does — not the raw socket
     // peer (the Cloudflare edge IP). Mirrors `record_fast_serve` / `handle()`; honors
     // the mtls-ok-vs-real-IP invariant (no client cert required under a non-mTLS vhost).
-    let mtls_ok = if state.mtls_required_vhosts.contains(&ctx.vhost_name) {
-        ctx.tls
-            .as_ref()
-            .map(|t| t.client_cert.is_some())
-            .unwrap_or(false)
-    } else {
-        is_tls
-    };
+    let mtls_ok = mtls_ok(mtls_required, is_tls, ctx.tls.as_ref());
     ctx.client_ip = state.acl.resolve_client_ip(
         peer_ip,
         req.headers(),
@@ -480,7 +469,8 @@ pub(crate) async fn fast_serve(
         | RwResult::Redirect { .. }
         | RwResult::Status { .. }
         | RwResult::Forbidden
-        | RwResult::Gone => {
+        | RwResult::Gone
+        | RwResult::InvalidTarget => {
             return None;
         }
     };
@@ -568,7 +558,9 @@ pub(crate) async fn fast_serve(
             lscache::cache_lookup_fast_path(state, &ctx, &cc, inm)
         {
             apply_response_transforms(state, &ctx, &mut resp).await;
-            state.telemetry.record_cache_hit(peer_ip.is_loopback());
+            state
+                .telemetry
+                .record_cache_hit(peer_ip.is_loopback(), &ctx.vhost_name);
             if !state.client_throttle.allow(ctx.client_ip) {
                 return None; // over the per-IP rate: dispatch() renders the 429
             }
@@ -1482,13 +1474,8 @@ async fn handle_inner(
     // network boundary, so any completed TLS connection counts (the pre-#16 behavior).
     // Requiring a cert UNCONDITIONALLY made mtls_ok false for 100% of --no-mtls traffic, silently
     // disabling CF-Connecting-IP real-IP resolution (every visitor resolved to the CF edge IP).
-    let mtls_ok = if mtls_required {
-        tls.as_ref()
-            .map(|t| t.client_cert.is_some())
-            .unwrap_or(false)
-    } else {
-        is_tls
-    };
+    let mtls_ok = mtls_ok(mtls_required, is_tls, tls.as_ref());
+    let forwarding_trusted = forwarding_trusted(trusted_proxy, mtls_required, tls.as_ref());
     let client_ip = state.acl.resolve_client_ip(
         peer_ip,
         req.headers(),
@@ -1516,6 +1503,7 @@ async fn handle_inner(
         peer_unix,
         protocol: proto,
         trusted_proxy,
+        forwarding_trusted,
         // Pre-size past the first growth doublings: the PHP path pushes ~8-24 entries
         // (HTTPS seed + SetEnvIf + SCRIPT_NAME/QUERY_STRING/REDIRECT_URL + [E=] sets).
         env: Vec::with_capacity(8),
@@ -3011,6 +2999,18 @@ async fn dispatch(
             tracing::error!(request_id = %ctx.request_id, reason, "rewrite evaluation failed closed");
             return error_page(StatusCode::INTERNAL_SERVER_ERROR);
         }
+        RwResult::InvalidTarget => {
+            tracing::debug!(request_id = %ctx.request_id, "rewritten target does not decode");
+            return error_doc_or_page(
+                state,
+                ctx,
+                req.headers(),
+                &chain,
+                &orig_path,
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        }
         RwResult::Proxy { target_url, env } => {
             // Merge the rewrite chain's env (incl. preceding `[E=]` rulesets) into ctx.env so
             // env-gated `Header ... env=` directives fire on the proxied response, and so
@@ -3365,7 +3365,11 @@ async fn dispatch(
             .page_cache
             .as_ref()
             .map(|pc| {
-                hj_pagecache::compute_vary_value(cache_cookie.as_deref(), &pc.config().vary_cookies)
+                hj_pagecache::compute_vary_value_with_defaults(
+                    cache_cookie.as_deref(),
+                    &pc.config().vary_cookies,
+                    &pc.config().vary_defaults,
+                )
             })
             .unwrap_or_default()
     } else {
@@ -3413,7 +3417,9 @@ async fn dispatch(
             if let lscache::CacheOutcome::Hit(hit) =
                 lscache::cache_lookup(state, ctx, &cc, inm, false, None)
             {
-                state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
+                state
+                    .telemetry
+                    .record_cache_hit(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
                 return hit;
             }
         }
@@ -3506,19 +3512,21 @@ async fn dispatch(
         if !is_refresh {
             match lscache::capsule_lookup(state, ctx, &cc, inm, shared_gates.as_ref()) {
                 lscache::CacheOutcome::Hit(hit) => {
-                    state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
+                    state
+                        .telemetry
+                        .record_cache_hit(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
                     return hit;
                 }
                 lscache::CacheOutcome::StaleHit(stale, key_hash) => {
                     let lb = ctx.peer_ip.is_loopback();
-                    state.telemetry.record_cache_hit(lb);
+                    state.telemetry.record_cache_hit(lb, &ctx.vhost_name);
                     state.telemetry.record_cache_stale_serve(lb);
                     spawn_revalidate(state, host_foreign, ctx, &req, key_hash);
                     return stale;
                 }
                 lscache::CacheOutcome::CapsuleStaleHit(stale, key_hash) => {
                     let lb = ctx.peer_ip.is_loopback();
-                    state.telemetry.record_cache_hit(lb);
+                    state.telemetry.record_cache_hit(lb, &ctx.vhost_name);
                     state.telemetry.record_cache_stale_serve(lb);
                     spawn_capsule_revalidate(state, host_foreign, ctx, &req, key_hash);
                     return stale;
@@ -3537,7 +3545,9 @@ async fn dispatch(
         }
         match cache_outcome {
             lscache::CacheOutcome::Hit(hit) => {
-                state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
+                state
+                    .telemetry
+                    .record_cache_hit(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
                 return hit;
             }
             lscache::CacheOutcome::StaleHit(stale, key_hash) => {
@@ -3546,14 +3556,14 @@ async fn dispatch(
                 // hit (it avoided the backend). A refresh request never reaches here (its
                 // initial lookup is force-missed), so this only fires for real traffic.
                 let lb = ctx.peer_ip.is_loopback();
-                state.telemetry.record_cache_hit(lb);
+                state.telemetry.record_cache_hit(lb, &ctx.vhost_name);
                 state.telemetry.record_cache_stale_serve(lb);
                 spawn_revalidate(state, host_foreign, ctx, &req, key_hash);
                 return stale;
             }
             lscache::CacheOutcome::CapsuleStaleHit(stale, key_hash) => {
                 let lb = ctx.peer_ip.is_loopback();
-                state.telemetry.record_cache_hit(lb);
+                state.telemetry.record_cache_hit(lb, &ctx.vhost_name);
                 state.telemetry.record_cache_stale_serve(lb);
                 spawn_capsule_revalidate(state, host_foreign, ctx, &req, key_hash);
                 return stale;
@@ -3567,7 +3577,9 @@ async fn dispatch(
                 match state.page_cache_inflight.enter(key_hash) {
                     lscache::Enter::Leader(guard) => {
                         // Genuine miss: this request renders (and maybe stores).
-                        state.telemetry.record_cache_miss(ctx.peer_ip.is_loopback());
+                        state
+                            .telemetry
+                            .record_cache_miss(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
                         _sf_leader = Some(guard);
                     }
                     lscache::Enter::Follower(follower) => {
@@ -3575,24 +3587,34 @@ async fn dispatch(
                         // otherwise wait (bounded) for it to wake us, then serve from cache.
                         // (force_miss=false here: a follower WANTS the leader's fresh entry.)
                         //
+                        // (2026-10-04) Follower probes are UNCOUNTED (fast-path mode): the
+                        // leader's lookup already recorded this request's sighting in the
+                        // admission sketch and its miss in the counters; counting the followers'
+                        // re-probes inflated both (one burst = N "accesses" of one page).
                         if let lscache::CacheOutcome::Hit(hit) =
-                            lscache::cache_lookup(state, ctx, &cc, inm, false, None)
+                            lscache::cache_lookup_fast_path(state, ctx, &cc, inm)
                         {
                             // Follower served the leader's freshly-stored entry: a HIT, not a miss.
-                            state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
+                            state
+                                .telemetry
+                                .record_cache_hit(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
                             return hit;
                         }
                         let _ = tokio::time::timeout(SINGLEFLIGHT_WAIT, follower.wait()).await;
                         if let lscache::CacheOutcome::Hit(hit) =
-                            lscache::cache_lookup(state, ctx, &cc, inm, false, None)
+                            lscache::cache_lookup_fast_path(state, ctx, &cc, inm)
                         {
                             // Follower served the leader's freshly-stored entry: a HIT, not a miss.
-                            state.telemetry.record_cache_hit(ctx.peer_ip.is_loopback());
+                            state
+                                .telemetry
+                                .record_cache_hit(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
                             return hit;
                         }
                         // Leader stored nothing cacheable (or hung past the wait): fall through
                         // and render ourselves. We stay a non-leader (no guard) — a real miss.
-                        state.telemetry.record_cache_miss(ctx.peer_ip.is_loopback());
+                        state
+                            .telemetry
+                            .record_cache_miss(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
                     }
                 }
             }
@@ -3956,6 +3978,14 @@ async fn dispatch(
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
+                // Which origin layer answered: XF sets X-XF-Cache-Status on the two
+                // DB1 paths (pre-bootstrap PREBHIT / post-bootstrap HIT); a full
+                // render carries none. httpjet strips X-LiteSpeed-* downstream but
+                // passes this header through, so it is also what the edge sees.
+                let xf_cache = resp
+                    .headers()
+                    .get("x-xf-cache-status")
+                    .and_then(|v| v.to_str().ok());
                 sl.record(
                     pre,
                     lsapi_timing,
@@ -3964,6 +3994,7 @@ async fn dispatch(
                     bytes,
                     ctx.peer_ip.is_loopback(),
                     retry_kind,
+                    xf_cache,
                 );
             }
             mark_php_backend_failure(&mut resp);
@@ -4028,21 +4059,13 @@ async fn dispatch(
             .insert(hj_static::IndexFilesOverride(index_files.to_vec()));
     }
 
-    // Static: if a rewrite changed the path, serve the rewritten file. The
-    // terminal handlers percent-DECODE `req.uri()`, while `cur_path` is already
-    // decoded (the rewrite engine operates on the decoded path), so re-encode it
-    // before injecting — otherwise a path containing a literal `%` (or `?`/`#`)
-    // would be double-decoded by the handler. A single decode then recovers the
-    // exact `cur_path` the access check and rewrite engine already saw (#1).
+    // Static: if a rewrite changed the path, serve the rewritten file. `cur_path` is
+    // canonical (decoded once and normalized by `run_rewrite`) and the terminal
+    // handlers percent-DECODE `req.uri()`, so it is always re-encoded: one handler
+    // decode then recovers exactly the path every access check above judged.
     if rewritten && cur_path.as_ref() != orig_path.as_str() {
-        let encoded;
-        let target = if needs_encoding(cur_path.as_ref()) {
-            encoded = percent_encode_path(cur_path.as_ref());
-            encoded.as_str()
-        } else {
-            cur_path.as_ref()
-        };
-        match build_uri(target, &cur_query) {
+        let target = percent_encode_path(cur_path.as_ref());
+        match build_uri(&target, &cur_query) {
             Some(uri) => *req.uri_mut() = uri,
             // Fail closed: an unparsable rewritten target must not silently
             // keep the PRE-rewrite URI in `req` — the static handler would
@@ -4134,6 +4157,25 @@ async fn dispatch(
     )
     .await;
     lscache::cache_store(state, ctx, &cc, resp).await
+}
+
+fn mtls_ok(mtls_required: bool, is_tls: bool, tls: Option<&hj_core::TlsParams>) -> bool {
+    if mtls_required {
+        tls.is_some_and(|t| t.client_cert.is_some())
+    } else {
+        is_tls
+    }
+}
+
+/// Peer addresses are TCP-authenticated, so a trusted network may assert client identity
+/// on plaintext as well; a listener that requires client certificates additionally needs
+/// one presented, so a cert-less internal peer exempted at accept never qualifies.
+fn forwarding_trusted(
+    trusted_proxy: bool,
+    mtls_required: bool,
+    tls: Option<&hj_core::TlsParams>,
+) -> bool {
+    trusted_proxy && (!mtls_required || tls.is_some_and(|t| t.client_cert.is_some()))
 }
 
 fn resolved_static_target_denied(acl: &hj_acl::AccessControl, resp: &Response) -> bool {
@@ -6701,6 +6743,7 @@ mod tests {
             is_tls: true,
             protocol: Proto::Http1,
             trusted_proxy: false,
+            forwarding_trusted: false,
             env: Vec::new(),
             local_addr: SocketAddr::from(([127, 0, 0, 1], 443)),
             peer_port: 12345,
@@ -6750,15 +6793,8 @@ mod tests {
         // - When it does NOT (--no-mtls / clientVerify=0, the prod topology, `mtls_required=false`):
         //   trust the network boundary — any completed TLS connection counts (pre-#16 behavior).
         // The unconditional cert requirement broke 100% of --no-mtls real-IP resolution.
-        // Mirror the exact expression handle() uses.
         let mtls_ok = |mtls_required: bool, is_tls: bool, tls: &Option<hj_core::TlsParams>| {
-            if mtls_required {
-                tls.as_ref()
-                    .map(|t| t.client_cert.is_some())
-                    .unwrap_or(false)
-            } else {
-                is_tls
-            }
+            super::mtls_ok(mtls_required, is_tls, tls.as_ref())
         };
         let tls_no_cert = Some(hj_core::TlsParams::new(
             "TLSv1.3",
@@ -6789,6 +6825,20 @@ mod tests {
         assert!(mtls_ok(false, true, &None)); // TLS, no cert, no client-auth: ok (the fix)
         assert!(mtls_ok(false, true, &tls_no_cert)); // ditto
         assert!(!mtls_ok(false, false, &None)); // plaintext :80: not ok
+
+        // Forwarding headers reach backends from a trusted network; on a client-auth
+        // listener only with a presented cert. Plaintext from a trusted net keeps them
+        // (the TCP peer address is not spoofable), unlike real-IP resolution above.
+        let fwd = |trusted: bool, required: bool, tls: &Option<hj_core::TlsParams>| {
+            super::forwarding_trusted(trusted, required, tls.as_ref())
+        };
+        assert!(!fwd(false, false, &None));
+        assert!(!fwd(false, true, &tls_cert));
+        assert!(fwd(true, false, &None));
+        assert!(fwd(true, false, &tls_no_cert));
+        assert!(!fwd(true, true, &tls_no_cert));
+        assert!(!fwd(true, true, &None));
+        assert!(fwd(true, true, &tls_cert));
     }
 
     #[test]

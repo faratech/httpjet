@@ -29,6 +29,7 @@ mod peer_purge;
 mod phpslow;
 mod pipeline;
 mod resource_generation;
+mod secret_file;
 mod server;
 mod serving_generation;
 mod statcache;
@@ -56,7 +57,7 @@ use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -347,8 +348,17 @@ struct ServeArgs {
     mimalloc_trim_threshold_mib: u64,
     /// Bearer secret required for profiling and sensitive metrics diagnostics.
     /// Empty disables those routes; ordinary metrics scraping stays available.
-    #[arg(long, default_value = "")]
+    /// Visible in /proc/*/cmdline; prefer --profile-token-file.
+    #[arg(long, default_value = "", conflicts_with = "profile_token_file")]
     profile_token: String,
+    /// Extra directories (comma-separated) where a `.htaccess` AuthUserFile may live,
+    /// besides the vhost docroot.
+    #[arg(long, default_value = "")]
+    auth_user_file_roots: String,
+    /// File holding the --profile-token secret (single-link regular file owned by
+    /// root or the serving user, no group/other permissions).
+    #[arg(long)]
+    profile_token_file: Option<PathBuf>,
     /// (rewrite) TTL in milliseconds for the rewrite-outcome cache (memoized
     /// rewrite decisions for `path_cacheable` chains, keyed by vhost/scheme/
     /// method/host/path/query + any keyable header vars). 0 disables the cache
@@ -425,6 +435,10 @@ struct PageCacheArgs {
         default_value = "/usr/local/httpjet/conf/.jetcache.key"
     )]
     integrity_key: PathBuf,
+    /// Refuse to start the file tier when the integrity key cannot be installed,
+    /// instead of running with untagged containers.
+    #[arg(long = "page-cache-integrity-required", default_value_t = false)]
+    integrity_required: bool,
     /// Byte cap of the in-RAM hot tier in front of the file store (zero-syscall
     /// zero-copy serves for the hottest bodies). Only meaningful with
     /// --page-cache-store-path. Default 192 MiB.
@@ -484,6 +498,10 @@ struct PageCacheArgs {
         default_value = "xf_style_variation,xf_style_id,xf_language_id"
     )]
     vary_cookies: String,
+    /// Comma-separated `name=value` pairs: a vary cookie carrying this value is keyed like no
+    /// cookie (the app treats the default the same way). E.g. `xf_style_id=50`.
+    #[arg(long = "page-cache-vary-default", default_value = "")]
+    vary_defaults: String,
     /// Comma-separated cookie names that forbid public caching if a public
     /// response tries to Set-Cookie them (session guard). Default: XenForo.
     #[arg(
@@ -594,12 +612,54 @@ struct XfCapsuleArgs {
     /// Deterministic percentage of eligible member-cookie requests that may receive capsules.
     #[arg(long = "xf-capsule-member-canary-percent", default_value_t = 0)]
     member_canary_percent: u8,
+    /// Also store every capsule-capable page under a DEDICATED (admission-exempt) key. Off by
+    /// default since 2026-10-04: members are served from the shell-capable PUBLIC entry, which
+    /// keeps one copy per page and lets the admission gate govern every store.
+    #[arg(long = "xf-capsule-dedicated-store", default_value_t = false)]
+    dedicated_store: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum XfCapsuleSafeGetCliMode {
     Prefixes,
     AllGetClassified,
+}
+
+fn read_profile_token_file(path: &std::path::Path) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use std::io::Read;
+    let (file, _) = secret_file::open_private_regular_file(path)
+        .with_context(|| format!("--profile-token-file {}", path.display()))?;
+    let mut token = String::new();
+    file.take(4096)
+        .read_to_string(&mut token)
+        .with_context(|| format!("--profile-token-file {}", path.display()))?;
+    let token = token.trim();
+    anyhow::ensure!(
+        !token.is_empty(),
+        "--profile-token-file {} is empty",
+        path.display()
+    );
+    Ok(token.to_string())
+}
+
+fn install_page_cache_integrity_key(path: &std::path::Path) -> std::io::Result<()> {
+    match secret_file::open_private_regular_file(path) {
+        Ok((file, _)) => hj_pagecache::diskstore::install_integrity_key(file),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            hj_pagecache::diskstore::create_integrity_key(path)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn integrity_boot_decision(error: &std::io::Error, required: bool) -> anyhow::Result<()> {
+    if required {
+        anyhow::bail!(
+            "--page-cache-integrity-required: the jetcache integrity key is unusable: {error}"
+        );
+    }
+    Ok(())
 }
 
 fn normalize_capsule_prefix(prefix: String) -> Option<String> {
@@ -645,6 +705,7 @@ fn xf_capsule_config(args: &XfCapsuleArgs, page_cache_enabled: bool) -> state::X
         canary_percent: args.canary_percent.min(100),
         allow_members: args.allow_members,
         member_canary_percent: args.member_canary_percent.min(100),
+        dedicated_store: args.dedicated_store,
     }
 }
 
@@ -813,6 +874,27 @@ fn parse_dict_levels(spec: &str) -> Result<HashMap<String, i32>, String> {
         levels.insert(vhost, level);
     }
     Ok(levels)
+}
+
+/// Parse `--page-cache-vary-default` as `cookie=value` pairs. A malformed pair is a startup
+/// error: silently dropping it would fold a non-default variant into the default entry.
+fn parse_vary_defaults(spec: &str) -> Result<Vec<(String, String)>, String> {
+    if spec.split(',').any(|entry| entry.trim().is_empty()) && !spec.trim().is_empty() {
+        return Err(format!("{spec:?}: empty entry"));
+    }
+    split_csv(spec)
+        .into_iter()
+        .map(|entry| {
+            let (name, value) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("{entry:?}: expected cookie=value"))?;
+            let (name, value) = (name.trim(), value.trim());
+            if name.is_empty() || value.is_empty() {
+                return Err(format!("{entry:?}: expected cookie=value"));
+            }
+            Ok((name.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// Parse `--page-cache-opt-in-status`: only 303, 404 and 410 may be admitted this way.
@@ -1066,9 +1148,23 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     let lsphp_external = args.lsphp_external.clone();
     let metrics_addr = args.metrics_addr.trim().to_string();
     let admin_addr = args.admin_addr;
-    let profile_token = {
-        let t = args.profile_token.trim();
-        (!t.is_empty()).then(|| t.to_string())
+    pipeline::set_auth_user_file_roots(
+        split_csv(&args.auth_user_file_roots)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+    );
+    let profile_token = match &args.profile_token_file {
+        Some(path) => Some(read_profile_token_file(path)?),
+        None => {
+            let t = args.profile_token.trim();
+            if !t.is_empty() {
+                tracing::warn!(
+                    "--profile-token is visible in /proc/*/cmdline; use --profile-token-file"
+                );
+            }
+            (!t.is_empty()).then(|| t.to_string())
+        }
     };
 
     rt.block_on(async move {
@@ -1190,6 +1286,8 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("--page-cache-dict-level: {e}"))?;
         let opt_in_status = parse_opt_in_status(&args.page_cache.opt_in_status)
             .map_err(|e| anyhow::anyhow!("--page-cache-opt-in-status: {e}"))?;
+        let vary_defaults = parse_vary_defaults(&args.page_cache.vary_defaults)
+            .map_err(|e| anyhow::anyhow!("--page-cache-vary-default: {e}"))?;
         let opt_in_303_prefixes = split_csv(&args.page_cache.opt_in_303_prefixes);
         if let Some(bad) = opt_in_303_prefixes.iter().find(|p| !p.starts_with('/')) {
             anyhow::bail!("--page-cache-303-prefixes: {bad:?} must start with '/'");
@@ -1239,16 +1337,15 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             let store_path = resolve_page_cache_store_path(&args.page_cache.store_path);
             // (security #260) Integrity key for persisted HJPC containers: a same-uid
             // writer (compromised lsphp) can no longer forge/relocate entries that the
-            // boot scan adopts. Best-effort — if /run/httpjet is unusable we log loudly
-            // and run untagged rather than refuse to serve.
+            // boot scan adopts. Without --page-cache-integrity-required a key failure
+            // logs loudly and runs untagged (httpjet_pagecache_integrity_active 0).
             if store_path.is_some() {
-                // Persistent, pre-provisioned (root:0400 nobody) so the tag survives
-                // reboots; uid nobody must read it to tag writes. Same-uid lsphp can
-                // read it too — an accepted residual documented in issue #260 (the
-                // full fix is a dedicated PHP uid).
-                if let Err(e) = hj_pagecache::diskstore::init_integrity_key(
-                    &args.page_cache.integrity_key,
-                ) {
+                // Persistent, pre-provisioned (0400, owned by the serving user) so the
+                // tag survives reboots. Same-uid lsphp can read it too — an accepted
+                // residual documented in issue #260 and SECURITY.md.
+                if let Err(e) = install_page_cache_integrity_key(&args.page_cache.integrity_key)
+                {
+                    integrity_boot_decision(&e, args.page_cache.integrity_required)?;
                     tracing::warn!(error = %e, "jetcache integrity key unavailable; persisted containers run WITHOUT integrity tags");
                 }
             }
@@ -1270,6 +1367,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 opt_in_303_prefixes: opt_in_303_prefixes.clone(),
                 cache_post: cc.enable_post_cache,
                 vary_cookies: split_csv(&args.page_cache.vary_cookies),
+                vary_defaults: vary_defaults.clone(),
                 private_cookies: split_csv(&args.page_cache.private_cookies),
                 standard_cc_vhosts: split_csv(&args.page_cache.standard_vhosts),
                 stream_fill_vhosts: split_csv(&args.page_cache.stream_fill_vhosts),
@@ -1755,7 +1853,15 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                 cfg.tuning.per_ip_rate = rate;
                             }
                             let new_server = Arc::new(cfg);
-                            let transaction = transactions.begin().await;
+                            let Ok(transaction) = tokio::time::timeout(
+                                config_transaction::BEGIN_TIMEOUT,
+                                transactions.begin(),
+                            )
+                            .await
+                            else {
+                                tracing::warn!("SIGHUP: a configuration transaction is in progress; reload skipped — send SIGHUP again");
+                                continue;
+                            };
                             let revision = transaction.revision();
                             let cur = transaction.current.clone();
                             if let Some(reason) = hard_config_change(&cur.server, &new_server) {
@@ -1989,9 +2095,24 @@ fn bind_lsphp_control(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let listener = tokio::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok((listener, ControlSocketGuard(path.to_path_buf())))
+    // Bind inside a fresh 0700 directory, tighten the socket, then rename it into
+    // place, so the control socket is never reachable under the umask's mode. The
+    // process umask is not flipped: the pool spawns lsphp children concurrently.
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staging = parent.join(format!(".{name}.{}.bind", std::process::id()));
+    if std::fs::symlink_metadata(&staging).is_ok_and(|meta| meta.is_dir()) {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    std::fs::DirBuilder::new().mode(0o700).create(&staging)?;
+    let staged = staging.join("sock");
+    let bound = tokio::net::UnixListener::bind(&staged).and_then(|listener| {
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&staged, path)?;
+        Ok(listener)
+    });
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok((bound?, ControlSocketGuard(path.to_path_buf())))
 }
 
 fn systemd_notify(message: &str) -> std::io::Result<()> {
@@ -2400,7 +2521,7 @@ fn hard_config_change(
     new: &hj_core::config::ServerConfig,
 ) -> Option<&'static str> {
     if listener_sig(old) != listener_sig(new) {
-        return Some("listener address / TLS binding changed");
+        return Some("listener address / TLS / PROXY-protocol binding changed");
     }
     if php_pool_sig(old) != php_pool_sig(new) {
         return Some("lsphp pool config changed");
@@ -2414,8 +2535,14 @@ fn listener_sig(c: &hj_core::config::ServerConfig) -> String {
     let mut s = String::new();
     for l in &c.listeners {
         s.push_str(&format!(
-            "{}|{}|{}|{:?}\n",
-            l.name, l.address, l.secure, l.tls
+            "{}|{}|{}|{:?}|{}|{:?}|{:?}\n",
+            l.name,
+            l.address,
+            l.secure,
+            l.tls,
+            l.proxy_protocol,
+            l.proxy_protocol_peers,
+            l.uds_path
         ));
     }
     s
@@ -2552,6 +2679,12 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
                 l.name
             );
         }
+        if l.uds_path.is_some() {
+            println!(
+                "  lint WARN : listener '{}' is unix: — every peer appears as loopback, so the loopback-gated /__hj_cache_purge and /__hj_cache_ready endpoints and the mTLS loopback exemption are open to any process that can connect; the socket file's mode is the boundary",
+                l.name
+            );
+        }
         // (Tier 2) The PROXY header overrides the client address, so a pp-enabled
         // listener is safe only when its direct peers are the trusted LB.
         if l.proxy_protocol && pp_bind_is_public(&l.address) {
@@ -2685,6 +2818,18 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
                         "vhost {name}: {}:{lineno} authentication configuration may be incomplete or unsupported; unresolved matching resources fail closed (403)",
                         htaccess.display()
                     ));
+                    }
+                    for user_file in ht.auth_user_files() {
+                        if let Err(hj_rewrite::auth::AuthFileError::OutsideAllowedRoots {
+                            ..
+                        }) = hj_rewrite::auth::open_user_file(user_file, &config.doc_root, &[])
+                        {
+                            warnings.push(format!(
+                                "vhost {name}: {} AuthUserFile {} is outside the docroot; requests answer 500 unless --auth-user-file-roots allows it",
+                                htaccess.display(),
+                                user_file.display()
+                            ));
+                        }
                     }
                 }
                 Err(err) => warnings.push(format!(
@@ -2964,6 +3109,18 @@ mod tests {
     }
 
     #[test]
+    fn vary_default_pairs_reject_malformed_entries() {
+        assert_eq!(
+            parse_vary_defaults("xf_style_id=50").unwrap(),
+            vec![("xf_style_id".to_string(), "50".to_string())]
+        );
+        assert!(parse_vary_defaults("").unwrap().is_empty());
+        for bad in ["xf_style_id", "=50", "xf_style_id=", "a=1,,b=2"] {
+            assert!(parse_vary_defaults(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn dict_levels_parse_and_reject_typos() {
         let levels = parse_dict_levels(" MoonTimeNow.com=3 , windowsforum.com=12 ").unwrap();
         assert_eq!(levels.get("moontimenow.com"), Some(&3));
@@ -3220,6 +3377,123 @@ mod tests {
         assert_eq!(resolve_page_cache_store_path("none"), None);
         assert_eq!(resolve_page_cache_store_path("off"), None);
         assert_eq!(resolve_page_cache_store_path("ram"), None);
+    }
+
+    #[tokio::test]
+    async fn control_socket_is_never_world_accessible() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt as _};
+        let dir = std::env::temp_dir().join(format!("hj-control-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lsphp-control.sock");
+        let (listener, guard) = bind_lsphp_control(&path).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_socket());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec![std::ffi::OsString::from("lsphp-control.sock")]
+        );
+        let client = tokio::net::UnixStream::connect(&path);
+        let (accepted, connected) = tokio::join!(listener.accept(), client);
+        assert!(
+            accepted.is_ok() && connected.is_ok(),
+            "the renamed socket accepts"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn listener_signature_covers_proxy_protocol_and_uds() {
+        let listener = hj_core::config::Listener {
+            name: "edge".into(),
+            address: "0.0.0.0:80".into(),
+            secure: false,
+            vhost_map: Vec::new(),
+            tls: None,
+            uds_path: None,
+            proxy_protocol: false,
+            proxy_protocol_peers: Vec::new(),
+        };
+        let base = hj_core::config::ServerConfig {
+            listeners: vec![listener],
+            ..Default::default()
+        };
+        assert_eq!(hard_config_change(&base, &base.clone()), None);
+        let mut changed = base.clone();
+        changed.listeners[0].proxy_protocol = true;
+        assert!(hard_config_change(&base, &changed).is_some());
+        let mut changed = base.clone();
+        changed.listeners[0].proxy_protocol_peers = vec!["10.0.0.0/8".into()];
+        assert!(hard_config_change(&base, &changed).is_some());
+        let mut changed = base.clone();
+        changed.listeners[0].uds_path = Some("/run/httpjet/http.sock".into());
+        assert!(hard_config_change(&base, &changed).is_some());
+    }
+
+    #[test]
+    fn strict_lint_rejects_auth_user_file_outside_allowed_roots() {
+        let dir = std::env::temp_dir().join(format!("hj-auth-lint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let doc_root = dir.join("docroot");
+        std::fs::create_dir_all(&doc_root).unwrap();
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        std::fs::write(dir.join("outside"), "Admin:password\n").unwrap();
+        std::fs::write(dir.join("conf/users"), "Admin:password\n").unwrap();
+        let vhost_xml = dir.join("conf/vhost.xml");
+        std::fs::write(&vhost_xml, b"<vhost></vhost>").unwrap();
+        let lint = |user_file: &std::path::Path| {
+            std::fs::write(
+                doc_root.join(".htaccess"),
+                format!(
+                    "AuthType Basic\nAuthUserFile {}\nRequire valid-user\n",
+                    user_file.display()
+                ),
+            )
+            .unwrap();
+            let mut vhost = hj_config::VHostConfig::default();
+            vhost.doc_root = doc_root.clone();
+            vhost.rewrite.auto_load_htaccess = true;
+            let mut cfg = hj_config::ServerConfig {
+                server_root: dir.clone(),
+                ..Default::default()
+            };
+            cfg.vhosts.insert(
+                "t.example".into(),
+                hj_config::VHostDecl {
+                    name: "t.example".into(),
+                    vh_root: dir.clone(),
+                    config_file: vhost_xml.clone(),
+                    allow_symbol_link: None,
+                    restrained: false,
+                    enable_script: true,
+                    config: Some(Arc::new(vhost)),
+                },
+            );
+            lint_unsupported_features(&cfg, &dir)
+                .into_iter()
+                .any(|w| w.contains("AuthUserFile"))
+        };
+        assert!(lint(&dir.join("outside")), "outside the docroot");
+        assert!(
+            lint(&dir.join("conf/users")),
+            "$SERVER_ROOT/conf needs --auth-user-file-roots"
+        );
+        std::fs::write(doc_root.join("users"), "Admin:password\n").unwrap();
+        assert!(!lint(std::path::Path::new("users")), "inside the docroot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn integrity_required_flag_refuses_boot_without_key() {
+        let error = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "mode 0644");
+        assert!(super::integrity_boot_decision(&error, true).is_err());
+        assert!(super::integrity_boot_decision(&error, false).is_ok());
     }
 
     #[test]

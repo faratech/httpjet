@@ -261,8 +261,35 @@ impl ChunkedDecoder {
     }
 }
 
+/// A request head that ends a line with LF alone. httparse tolerates it, but the chunked
+/// decoder and the h2/h3 parsers do not; a head one parser frames differently from
+/// another is a desync seam against lenient upstreams, so such a head is refused.
+pub fn head_has_bare_lf(head: &[u8]) -> bool {
+    head.iter()
+        .enumerate()
+        .any(|(i, &b)| b == b'\n' && (i == 0 || head[i - 1] != b'\r'))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn head_with_bare_lf_is_rejected() {
+        assert!(!head_has_bare_lf(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(head_has_bare_lf(b"GET / HTTP/1.1\nHost: x\n\n"));
+        assert!(head_has_bare_lf(b"GET / HTTP/1.1\r\nHost: x\n\r\n"));
+        assert!(head_has_bare_lf(b"\nGET / HTTP/1.1\r\n\r\n"));
+        let mut headers = [httparse::EMPTY_HEADER; 4];
+        let mut req = httparse::Request::new(&mut headers);
+        assert!(
+            matches!(
+                req.parse(b"GET / HTTP/1.1\nHost: x\n\n"),
+                Ok(httparse::Status::Complete(_))
+            ),
+            "httparse alone accepts a bare-LF head, so the explicit check is needed"
+        );
+    }
+
     use super::*;
 
     #[test]

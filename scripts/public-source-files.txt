@@ -4,6 +4,7 @@
 .gitignore
 Cargo.lock
 Cargo.toml
+clippy.toml
 CONTRIBUTING.md
 DCO
 LICENSE
@@ -16,7 +17,10 @@ fuzz
 packaging
 scripts/acme-pebble-test.py
 scripts/check-dco.sh
+scripts/clippy-panic-ratchet.sh
+scripts/clippy-panic-baseline.txt
 scripts/check-dependency-licenses.py
+scripts/deps-advisory.sh
 scripts/ci-h2spec.py
 scripts/export-public-source.sh
 scripts/fuzz-bounded.sh

@@ -5,6 +5,9 @@ use arc_swap::ArcSwap;
 use std::{io::Read, sync::Arc};
 use tokio::sync::{Mutex, MutexGuard};
 
+/// How long a writer waits for the configuration transaction lock before giving up.
+pub(crate) const BEGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Default)]
 struct Publication {
     closed: bool,
