@@ -469,6 +469,18 @@ impl Proxy {
             selected_target.authority = selected.authority.clone();
             selected_target.transport = selected.transport().clone();
         }
+        // (#583) Default (non-load-balanced) targets return no reservation,
+        // but maxConns must still bound the long-lived relay: acquire a plain
+        // permit and carry it in the upgrade for the relay's lifetime.
+        let mut ws_permit = None;
+        if reservation.is_none() {
+            ws_permit = Some(
+                selected
+                    .acquire()
+                    .await
+                    .ok_or(HandlerError::ServiceUnavailable)?,
+            );
+        }
         let target = &selected_target;
         let hostport = match &target.transport {
             TargetTransport::Tcp(hp) => hp.clone(),
@@ -566,6 +578,7 @@ impl Proxy {
 
             return Ok(WebSocketUpgrade {
                 reservation,
+                permit: ws_permit,
                 response: resp,
                 upstream: UpstreamUpgraded::Hyper(upstream_io),
             });
@@ -580,6 +593,7 @@ impl Proxy {
         headers::sanitize_response_headers(resp.headers_mut(), false);
         Ok(WebSocketUpgrade {
             reservation: None,
+            permit: ws_permit,
             response: resp,
             upstream: UpstreamUpgraded::Rejected(status),
         })
@@ -649,6 +663,9 @@ impl Proxy {
 /// Result of [`Proxy::proxy_websocket`].
 pub struct WebSocketUpgrade {
     pub reservation: Option<RequestReservation>,
+    /// (#583) maxConns permit for default (non-load-balanced) targets, which
+    /// have no reservation to carry one. Held for the relay's lifetime.
+    pub permit: Option<tokio::sync::OwnedSemaphorePermit>,
     /// The response to return to the downstream client (status `101` on
     /// success, or the upstream's rejection response).
     pub response: Response,
@@ -1620,6 +1637,68 @@ mod tests {
             _ = tokio::time::sleep(Duration::from_secs(1)) => panic!("ordinary dial was blocked"),
         }
         }).await;
+    }
+
+    /// Regression (#583): a default (non-load-balanced) WebSocket target must
+    /// still enforce maxConns — the permit rides in the returned upgrade.
+    #[tokio::test]
+    async fn websocket_default_target_enforces_max_conns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Raw upstream: answer every handshake with a plain 200 (non-101).
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let mut used = 0;
+                    while !buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf[used..]).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => used += n,
+                        }
+                    }
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                });
+            }
+        });
+        let mut target = ProxyTarget::parse_url(&format!("http://{addr}/socket")).unwrap();
+        target.max_conns = Some(1);
+        target.connect_timeout = Some(Duration::from_millis(300));
+        let c = ctx("192.0.2.1", false);
+        let make_request = || {
+            let body: hj_core::IncomingBody = Empty::<Bytes>::new()
+                .map_err(|e| Box::new(e) as BoxError)
+                .boxed();
+            http::Request::builder()
+                .uri("/socket")
+                .header(HOST, "client.example")
+                .header(http::header::CONNECTION, "Upgrade")
+                .header(http::header::UPGRADE, "websocket")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                .header("sec-websocket-version", "13")
+                .body(body)
+                .unwrap()
+        };
+        let proxy = Proxy::new();
+        let first = proxy
+            .proxy_websocket(&c, make_request(), &target)
+            .await
+            .expect("first upgrade attempt completes");
+        assert!(first.permit.is_some(), "default target carries a permit");
+        // While the first permit is held, maxConns=1 refuses a second attempt.
+        let second = proxy.proxy_websocket(&c, make_request(), &target).await;
+        assert!(
+            matches!(second, Err(HandlerError::ServiceUnavailable)),
+            "second attempt must be refused at maxConns"
+        );
+        drop(first);
+        server.abort();
     }
 
     #[tokio::test]

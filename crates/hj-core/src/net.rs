@@ -278,9 +278,28 @@ pub const FORWARDING_AUTHORITY_HEADERS: &[&str] = &[
 ];
 
 pub fn is_forwarding_authority_header(name: &str) -> bool {
-    FORWARDING_AUTHORITY_HEADERS
+    if FORWARDING_AUTHORITY_HEADERS
         .iter()
         .any(|known| known.eq_ignore_ascii_case(name))
+    {
+        return true;
+    }
+    // Class-based catch for synonyms the enumeration misses (#585): any
+    // normalized (dash/underscore-folded) name that asserts a client identity
+    // or scheme on behalf of a proxy — the *-client-ip family (X-Client-IP,
+    // Proxy-Client-IP, WL-Proxy-Client-IP), the X-Forwarded-* family beyond
+    // the listed members (X-Forwarded-Protocol/-Scheme), and *-real-ip forms.
+    // Unrecognized members of the class fail closed; ordinary headers
+    // (user-agent, accept, x-requested-with) are outside the class.
+    let n = name.to_ascii_lowercase().replace('_', "-");
+    n == "forwarded"
+        || n.starts_with("forwarded-")
+        || n.starts_with("x-forwarded-")
+        || n == "client-ip"
+        || n.ends_with("-client-ip")
+        || n == "real-ip"
+        || n.ends_with("-real-ip")
+        || n == "x-client-ip"
 }
 
 #[cfg(test)]
@@ -297,5 +316,24 @@ mod forwarding_authority_tests {
         }
         assert!(is_forwarding_authority_header("CF-Connecting-IP"));
         assert!(!is_forwarding_authority_header("user-agent"));
+    }
+
+    /// Regression (#585): synonyms outside the enumerated list are still
+    /// forwarding-authority headers; ordinary headers are not.
+    #[test]
+    fn forwarding_authority_synonyms_fail_closed() {
+        for name in [
+            "X-Client-IP",
+            "X-Forwarded-Protocol",
+            "X-Forwarded-Scheme",
+            "Proxy-Client-IP",
+            "WL-Proxy-Client-IP",
+            "X_Forwarded_Protocol",
+        ] {
+            assert!(is_forwarding_authority_header(name), "{name}");
+        }
+        for name in ["user-agent", "accept", "x-requested-with", "x-cache"] {
+            assert!(!is_forwarding_authority_header(name), "{name}");
+        }
     }
 }

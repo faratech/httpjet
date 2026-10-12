@@ -91,11 +91,11 @@ impl PurgeForwarder {
                 .unwrap_or((true, 0));
             return Some(ready_ack(warm, loaded));
         }
-        let directive = req
-            .headers()
-            .get(PURGE_HEADER)
-            .and_then(|v| v.to_str().ok());
-        match classify(req.method(), path, peer_ip, directive) {
+        // Honor every X-LiteSpeed-Purge line, not just the first (#589):
+        // HTTP list-headers combine with ',' and parse_purge splits on ',',
+        // matching the backend-response path's get_all handling.
+        let directive = combined_purge_directive(req.headers());
+        match classify(req.method(), path, peer_ip, directive.as_deref()) {
             Verdict::Passthrough => None,
             Verdict::MethodNotAllowed => Some(method_not_allowed("POST")),
             Verdict::BadRequest => Some(ack(StatusCode::BAD_REQUEST)),
@@ -161,6 +161,17 @@ fn classify(
         Some(d) if !d.trim().is_empty() => Verdict::Apply(parse_purge(d)),
         _ => Verdict::BadRequest,
     }
+}
+
+/// Combine all `X-LiteSpeed-Purge` header lines into one directive string
+/// (non-UTF8 lines are skipped, as on the backend-response path).
+fn combined_purge_directive(headers: &http::HeaderMap) -> Option<String> {
+    let parts: Vec<&str> = headers
+        .get_all(PURGE_HEADER)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(","))
 }
 
 fn ready_method_allowed(method: &http::Method) -> bool {
@@ -237,6 +248,25 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    /// Regression (#589): multiple purge header lines must all take effect.
+    #[test]
+    fn multiple_purge_header_lines_combine() {
+        let mut h = http::HeaderMap::new();
+        h.append(PURGE_HEADER, "tag=T1".parse().unwrap());
+        h.append(PURGE_HEADER, "tag=T2".parse().unwrap());
+        let combined = combined_purge_directive(&h).expect("directive");
+        assert_eq!(
+            classify(
+                &http::Method::POST,
+                PURGE_PATH,
+                "127.0.0.1".parse().unwrap(),
+                Some(&combined)
+            ),
+            Verdict::Apply(Purge::Tags(vec!["T1".into(), "T2".into()]))
+        );
+        assert!(combined_purge_directive(&http::HeaderMap::new()).is_none());
     }
 
     #[test]

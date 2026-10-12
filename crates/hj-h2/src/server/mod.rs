@@ -2481,6 +2481,102 @@ mod tests {
         );
     }
 
+    /// Regression (#581): a server RST_STREAM (here via a zero WINDOW_UPDATE)
+    /// must tear down the receiving stream — a later DATA...END_STREAM must
+    /// not complete and dispatch the already-reset request.
+    #[test]
+    fn server_rst_tears_down_receiving_stream() {
+        use super::recv::process_frame;
+        use crate::frame::{flags, kind};
+
+        let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
+        streams.insert(
+            1,
+            StreamState {
+                headers_done: true,
+                body: vec![0u8; 10],
+                recv_window: 65535,
+                ..Default::default()
+            },
+        );
+        let mut dec = Decoder::new(4096, 8192);
+        let mut enc = Encoder::new();
+        let mut out = OutQueue::default();
+        let mut peer = PeerSettings::default();
+        let mut recv = Recv {
+            last_client_stream: 1,
+            open_header_block: None,
+            discarding_header_block: false,
+            discard_header_block: Vec::new(),
+            discard_rst_code: error_code::STREAM_CLOSED,
+            reset_ids: FxHashSet::default(),
+            max_concurrent: 100,
+            conn_recv_window: 65535,
+            our_initial_window: 65535,
+            rst_unanswered: 0,
+            total_buffered: 10,
+            max_request_body: 1 << 20,
+            per_conn_request_body: 4 << 20,
+            body_budget: None,
+            no_progress_frames: 0,
+        };
+        let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
+        let mut cancelled: FxHashSet<u32> = FxHashSet::default();
+        let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
+        let service = |_req: Request| std::future::ready(Response::new(hj_core::Body::Empty));
+
+        // Zero-increment WINDOW_UPDATE on the body-pending stream -> RST.
+        let outcome = process_frame(
+            FrameHeader {
+                length: 4,
+                kind: kind::WINDOW_UPDATE,
+                flags: 0,
+                stream_id: 1,
+            },
+            &[0, 0, 0, 0],
+            &mut streams,
+            &mut dec,
+            &mut enc,
+            &mut out,
+            &mut peer,
+            &mut recv,
+            0,
+            true,
+            &service,
+            &mut inflight,
+            &mut cancelled,
+            &mut inflight_sids,
+        );
+        assert!(matches!(outcome, FrameOutcome::ResetStream(1)));
+        assert!(!streams.contains_key(&1), "receiving stream torn down");
+        assert_eq!(recv.total_buffered, 0, "buffered body un-accounted");
+
+        // A later DATA...END_STREAM on the reset stream must not dispatch.
+        let outcome = process_frame(
+            FrameHeader {
+                length: 3,
+                kind: kind::DATA,
+                flags: flags::END_STREAM,
+                stream_id: 1,
+            },
+            b"abc",
+            &mut streams,
+            &mut dec,
+            &mut enc,
+            &mut out,
+            &mut peer,
+            &mut recv,
+            0,
+            true,
+            &service,
+            &mut inflight,
+            &mut cancelled,
+            &mut inflight_sids,
+        );
+        assert!(matches!(outcome, FrameOutcome::ResetStream(1)));
+        assert_eq!(inflight.len(), 0, "reset request must never dispatch");
+    }
+
     #[test]
     fn data_frame_respects_server_wide_body_budget() {
         // (#236 residual) The per-stream and per-connection caps leave the SERVER-WIDE

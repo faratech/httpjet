@@ -143,6 +143,13 @@ where
     macro_rules! rst {
         ($sid:expr_2021, $code:expr_2021) => {{
             out.frames(|b| frame::write_rst_stream(b, $sid, $code));
+            // (#581) Tear down the RECEIVING side too: drop any half-received
+            // request and return its buffered-body accounting, or a later
+            // DATA...END_STREAM would still complete and dispatch a request
+            // we already reset. Idempotent for arms that removed it first.
+            if let Some(s) = streams.remove(&$sid) {
+                recv.buffer_sub(s.body.len());
+            }
             // (#357) Record the reset id (never consumed; skip at the cap — fail
             // closed into a connection error on a later reuse) so a subsequent
             // HEADERS on it is the tolerated §5.1 close race, not §5.1.1 reuse.

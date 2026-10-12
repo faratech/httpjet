@@ -542,6 +542,21 @@ impl Upstream {
     where
         IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // (#579) Bound the SETTINGS exchange like the health-check probe
+        // does: a silent upstream must not pin the global dial permit (held
+        // by dial_tracked across this call) or the upstream maxConns permit
+        // forever. Capped at MAX_QUEUE_WAIT for the same reason as
+        // checkout_fresh — prod connect_timeout can be 600 s.
+        let budget = self.connect_timeout.min(Self::MAX_QUEUE_WAIT);
+        tokio::time::timeout(budget, self.h2_handshake_inner(io))
+            .await
+            .map_err(|_| ProxyError::ConnectTimeout)?
+    }
+
+    async fn h2_handshake_inner<IO>(&self, io: IO) -> Result<AnySender, ProxyError>
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let io = hyper_util::rt::TokioIo::new(io);
         let (sender, conn): (hyper::client::conn::http2::SendRequest<OutBody>, _) =
             hyper::client::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -733,11 +748,16 @@ impl UpstreamPool {
                     .entry(key)
                     .or_insert_with(|| {
                         let up = Upstream::new(peer, max_conns, keep_alive, connect_timeout);
-                        up.set_bad_until_handle(handle);
+                        up.set_bad_until_handle(handle.clone());
                         up
                     })
                     .clone()
             };
+            // (#584) A retained upstream (config reload) still points at the
+            // PREVIOUS generation's bad_until handle, so its dial failures
+            // never reach this pool's failover check. Rebind on every
+            // selection; same-Arc when nothing changed.
+            upstream.set_bad_until_handle(handle);
             if idx > 0 {
                 self.failovers.fetch_add(1, Ordering::Relaxed);
             }
@@ -877,6 +897,18 @@ impl UpstreamPool {
                 )
             })
             .collect();
+        // (#584) Carry failover cooldowns for retained keys into the new
+        // generation; a fresh empty map would forget a dead primary.
+        let retained_bad: HashMap<PoolKey, Arc<AtomicU64>> = {
+            let pools_keys: std::collections::HashSet<PoolKey> =
+                self.pools.lock().keys().cloned().collect();
+            self.bad_until
+                .lock()
+                .iter()
+                .filter(|(k, _)| pools_keys.contains(*k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
         let pools = self.pools.lock();
         let retained = pools
             .iter()
@@ -897,7 +929,7 @@ impl UpstreamPool {
             health_tasks: Mutex::new(Vec::new()),
             published_groups: self.published_groups.clone(),
             groups: Mutex::new(groups),
-            bad_until: Mutex::new(HashMap::new()),
+            bad_until: Mutex::new(retained_bad),
             failovers: AtomicU64::new(0),
         }
     }
@@ -1019,6 +1051,71 @@ mod tests {
             .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
             .unwrap();
         assert_eq!(recovered.authority, "127.0.0.1:29001");
+    }
+
+    /// Regression (#584): failover must survive a config reload — the new
+    /// generation retains the upstreams AND their bad_until cooldowns, and a
+    /// failure recorded after the reload reaches the new pool's check.
+    #[test]
+    fn failover_survives_retained_generation() {
+        use hj_core::config::{ExtAddress, ExtKind, ExtProcessor};
+
+        let ep = ExtProcessor {
+            load_balance: Default::default(),
+            name: "lb".into(),
+            kind: ExtKind::Proxy,
+            address: ExtAddress::Tcp("127.0.0.1:29001".parse().unwrap()),
+            extra_addresses: vec![ExtAddress::Tcp("127.0.0.1:29002".parse().unwrap())],
+            max_conns: 10,
+            init_timeout: Duration::from_secs(1),
+            retry_timeout: Duration::from_secs(0),
+            pc_keep_alive_timeout: Duration::from_secs(5),
+            resp_buffer: false,
+            env: vec![],
+            auto_start: 0,
+            path: None,
+            backlog: 0,
+            client_cert_file: None,
+            client_key_file: None,
+            instances: 1,
+            run_on_startup: 0,
+        };
+        let target = ProxyTarget::from_ext_processor(&ep);
+        let pool = UpstreamPool::new();
+        let primary = pool
+            .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        for _ in 0..3 {
+            primary.note_dial_failure();
+        }
+        // Reload: retain the named target into a new generation.
+        let next = pool.retained_generation(
+            [target.clone()],
+            10,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+        );
+        let selected = next
+            .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            selected.authority, "127.0.0.1:29002",
+            "marked primary must stay skipped after reload"
+        );
+        // And a failure recorded AFTER the reload (on the retained primary
+        // Arc, rebound to the new generation's handle) fails over too.
+        primary.note_dial_success();
+        let primary2 = next
+            .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        assert!(Arc::ptr_eq(&primary, &primary2));
+        for _ in 0..3 {
+            primary2.note_dial_failure();
+        }
+        let selected2 = next
+            .get_or_create(&target, 10, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(selected2.authority, "127.0.0.1:29002");
     }
 
     #[test]
@@ -1180,6 +1277,26 @@ mod tests {
                 .get_or_create(&target, limits.0, limits.1, limits.2)
                 .unwrap()
         ));
+    }
+
+    /// Regression (#579): an h2 upstream whose transport stalls (never reads,
+    /// so the client preface write blocks) must fail the handshake within the
+    /// connect budget, not pin the dial permit forever. Note hyper's
+    /// handshake/ready resolve optimistically against a merely SETTINGS-silent
+    /// peer, so the stall has to be at the IO layer to reproduce the pin.
+    #[tokio::test]
+    async fn h2_handshake_times_out_on_stalled_peer() {
+        let t = ProxyTarget::parse_url("h2://127.0.0.1:8002/").unwrap();
+        let u = Upstream::new(&t, 4, Duration::from_secs(30), Duration::from_millis(200));
+        // 8-byte duplex, never read: the preface write fills it and pends.
+        let (client_io, _stalled_peer) = tokio::io::duplex(8);
+        let start = std::time::Instant::now();
+        let err = match u.h2_handshake(client_io).await {
+            Ok(_) => panic!("stalled peer must time out"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ProxyError::ConnectTimeout), "{err:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

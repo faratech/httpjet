@@ -1381,6 +1381,11 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 shared_public_paths: shared_public_paths.clone(),
                 shared_paths_canary_percent: args.page_cache.shared_paths_canary_percent.min(100),
             };
+            if cc.enable_post_cache {
+                tracing::warn!(
+                    "enablePostCache is on but POST page caching is not implemented; POST responses are never cached (#593)"
+                );
+            }
             tracing::info!(
                 mem_bytes = args.page_cache.mem,
                 default_ttl_secs = cc.default_ttl_secs,
@@ -2627,6 +2632,14 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
                 "  lint WARN : geoAllow/geoDeny/asnAllow/asnDeny configured without <geoipDBFile> — the geo ACL is INERT"
             );
         }
+    }
+
+    // (#593) POST page caching is not implemented in the cache glue; the
+    // knob must not be silently inert.
+    if cfg.cache.enable_post_cache {
+        println!(
+            "  lint WARN : enablePostCache is on but POST responses are never cached by httpjet — the setting is INERT"
+        );
     }
 
     // (Tier 2) The syslog access-log sink is env-configured; surface it so `check`

@@ -3817,6 +3817,11 @@ fn build_h3_request_head(
     if path.contains(&b'#') || !(path.starts_with(b"/") || path.as_slice() == b"*") {
         return None;
     }
+    // Network-path reference (//authority/...): http::Uri would parse the
+    // authority out of :path, diverging from the routed :authority (#587).
+    if path.starts_with(b"//") {
+        return None;
+    }
     if path.as_slice() == b"*" && method != http::Method::OPTIONS {
         return None;
     }
@@ -4431,6 +4436,21 @@ mod h3_codec_tests {
     fn qpack_decode_rejects_dynamic() {
         let buf = vec![0x00, 0x00, 0x80 | 5]; // Indexed, T=dynamic (bit6=0)
         assert!(qpack_decode(&buf).is_none());
+    }
+
+    /// Regression (#588): a nonzero Required Insert Count (or Delta Base)
+    /// names dynamic state we do not have; it must not decode as static lines.
+    #[test]
+    fn qpack_decode_rejects_nonzero_insert_count() {
+        // RIC=1, Delta=0, then a valid static indexed line (:method: GET = 17|0xc0).
+        let buf = vec![0x01, 0x00, 0xc0 | 17];
+        assert!(qpack_decode(&buf).is_none());
+        // RIC=0 but Delta Base magnitude 1.
+        let buf = vec![0x00, 0x01, 0xc0 | 17];
+        assert!(qpack_decode(&buf).is_none());
+        // The zero-prefix form still decodes.
+        let buf = vec![0x00, 0x00, 0xc0 | 17];
+        assert!(qpack_decode(&buf).is_some());
     }
 
     #[test]
@@ -5817,6 +5837,10 @@ mod h3_codec_tests {
         };
         assert!(
             request_from_raw_qpack(&request(b"GET", b"/safe#ignored", b"example.com")).is_none()
+        );
+        // (#587) Network-path :path must not smuggle its own authority.
+        assert!(
+            request_from_raw_qpack(&request(b"GET", b"//evil.example/x", b"example.com")).is_none()
         );
         assert!(request_from_raw_qpack(&request(b"GET", b"*", b"example.com")).is_none());
         for authority in [

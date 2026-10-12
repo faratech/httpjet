@@ -1184,6 +1184,22 @@ mod ols_parity {
         }
     }
 
+    /// Regression (#580): `[S=usize::MAX]` must saturate past the end of the
+    /// ruleset, never wrap back to the same rule (infinite loop in release,
+    /// overflow panic in debug).
+    #[test]
+    fn skip_max_saturates_and_terminates() {
+        let rs = RuleSet::parse(
+            "RewriteEngine On\nRewriteRule ^x$ - [S=18446744073709551615]\nRewriteRule ^x$ - [G]",
+        )
+        .unwrap();
+        // Terminates (skip past end -> pass ends unchanged) instead of looping.
+        assert!(matches!(
+            evaluate(&rs, &input("/x")),
+            RewriteOutcome::Unchanged { .. }
+        ));
+    }
+
     /// `[C]`/chain: when a chained rule FAILS to match, the rule(s) chained to
     /// it are skipped (OLS rewriteengine.cpp:1486-1496).
     #[test]

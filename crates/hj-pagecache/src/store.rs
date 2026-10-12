@@ -3283,20 +3283,30 @@ impl PageStore {
 
     /// Purge every entry carrying any of the given tags.
     pub fn purge_tags(&self, tags: &[&str]) {
+        // Hold `page_commit` across BOTH the teardown and the older-version
+        // sweep (#592): a store publishes its body file under this lock, so
+        // sweeping outside it let a just-published live file (prepared with a
+        // lower version_seq, published in the gap) be unlinked by seq alone.
+        let _page_commit = self.page_commit.lock();
         let sweeps = self.purge_tags_locked(tags);
-        // Deferred older-version unlinks: outside `page_commit` and the shard
-        // locks (see `purge_tagged_id`). The referenced body file itself was
-        // already unlinked by the synchronous teardown above; this clears the
-        // superseded versions left in the bucket.
         if let Some(disk) = &self.disk {
             for (key, max_version_seq) in sweeps {
-                disk.remove_key_versions_through(&key, max_version_seq);
+                // Never unlink the version the live index entry (a re-store
+                // that survived this purge) currently resolves to.
+                let live_version = self.inner.with_shard(&CacheKeyId::new(&key), |acc| {
+                    acc.get(&CacheKeyId::new(&key))
+                        .and_then(CacheEntry::as_page)
+                        .and_then(|node| {
+                            file_body_disk_version(self.disk.as_deref(), &node.body)
+                                .map(|(_, seq)| seq)
+                        })
+                });
+                disk.remove_key_versions_through_except(&key, max_version_seq, live_version);
             }
         }
     }
 
     fn purge_tags_locked(&self, tags: &[&str]) -> Vec<(PageCacheKey, u64)> {
-        let _page_commit = self.page_commit.lock();
         let mut sweeps: Vec<(PageCacheKey, u64)> = Vec::new();
         let wall_ms = wall_now_ms();
         let epoch = self.purge_seq.fetch_add(1, Ordering::AcqRel) + 1;

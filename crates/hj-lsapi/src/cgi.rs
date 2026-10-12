@@ -516,8 +516,15 @@ fn ctx_env_override_denied(name: &str) -> bool {
         "SERVER_ADMIN",
         "SERVER_PROTOCOL",
         "REQUEST_SCHEME",
+        "REQUEST_METHOD",
+        "REQUEST_URI",
+        "PATH_INFO",
+        "CONTENT_LENGTH",
+        "CONTENT_TYPE",
+        "GATEWAY_INTERFACE",
     ];
     DENIED.contains(&name)
+        || name.starts_with("REQUEST_TIME")
         || name.starts_with("LSAPI_")
         || name.starts_with("SSL_")
         || (name.starts_with("HJ_") && !FORWARDED_INTERNAL_ENV.contains(&name))
@@ -726,6 +733,12 @@ mod tests {
             ("SERVER_PROTOCOL".into(), "HTTP/9".into()),
             ("SSL_CLIENT_VERIFY".into(), "SUCCESS".into()),
             ("REMOTE_USER".into(), "admin".into()),
+            // (#586) Method/URI/PATH_INFO/content vars are server-computed too.
+            ("REQUEST_METHOD".into(), "POST".into()),
+            ("REQUEST_URI".into(), "/forged".into()),
+            ("PATH_INFO".into(), "/forged".into()),
+            ("CONTENT_TYPE".into(), "text/evil".into()),
+            ("REQUEST_TIME_FLOAT".into(), "1.0".into()),
             ("HJ_ANYTHING".into(), "x".into()),
             // Contracts that must keep working:
             ("SCRIPT_NAME".into(), "/index.php".into()),
@@ -748,6 +761,12 @@ mod tests {
         assert_eq!(m["SCRIPT_NAME"], "/index.php");
         assert_eq!(m["QUERY_STRING"], "front=controller");
         assert_eq!(m["REDIRECT_STATUS"], "403");
+        // (#586) Forged computed vars keep their server-computed values.
+        assert_eq!(m["REQUEST_METHOD"], "GET");
+        assert_ne!(m.get("REQUEST_URI").map(String::as_str), Some("/forged"));
+        assert_ne!(m.get("PATH_INFO").map(String::as_str), Some("/forged"));
+        assert_ne!(m.get("CONTENT_TYPE").map(String::as_str), Some("text/evil"));
+        assert_ne!(m.get("REQUEST_TIME_FLOAT").map(String::as_str), Some("1.0"));
     }
 
     #[test]

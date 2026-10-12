@@ -382,7 +382,9 @@ pub(super) fn run_pass(
                     return PassResult::Continue { end };
                 }
                 // `[S=n]`: skip the next n rules. OLS advances by skip+1.
-                idx += 1 + rule.flags.skip;
+                // Saturate: a huge skip (e.g. usize::MAX) must end the pass,
+                // never wrap back to the same rule.
+                idx = idx.saturating_add(1).saturating_add(rule.flags.skip);
             }
         }
     }

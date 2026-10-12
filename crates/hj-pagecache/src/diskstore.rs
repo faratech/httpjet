@@ -1104,6 +1104,18 @@ impl DiskStore {
     /// files are likewise owned by their writers; rejected writers clean them,
     /// while a crash leaves debris for the next boot scan.
     pub fn remove_key_versions_through(&self, key: &PageCacheKey, max_version_seq: u64) {
+        self.remove_key_versions_through_except(key, max_version_seq, None);
+    }
+
+    /// Like [`Self::remove_key_versions_through`], but never unlinks
+    /// `except_version_seq` — the version a live index entry currently
+    /// resolves to (#592).
+    pub fn remove_key_versions_through_except(
+        &self,
+        key: &PageCacheKey,
+        max_version_seq: u64,
+        except_version_seq: Option<u64>,
+    ) {
         let hash = key_hash(key);
         let hex = format!("{hash:016x}");
         let Ok(leaf) = self.open_leaf(&hex) else {
@@ -1127,7 +1139,11 @@ impl DiskStore {
                     .and_then(|(opened, metadata)| {
                         read_meta_file_with_metadata(opened, &file, metadata)
                     })
-                    .is_ok_and(|e| &e.key == key && e.version_seq <= max_version_seq)
+                    .is_ok_and(|e| {
+                        &e.key == key
+                            && e.version_seq <= max_version_seq
+                            && Some(e.version_seq) != except_version_seq
+                    })
             {
                 let _ = Self::unlink_at(&leaf, &name_os);
             }
@@ -2858,6 +2874,27 @@ mod tests {
             inflight.exists(),
             "purge never owns another writer's tmp file"
         );
+    }
+
+    /// Regression (#592): the sweep must never unlink the version a live
+    /// index entry currently resolves to, even when it is <= the sweep bound.
+    #[test]
+    fn purge_version_sweep_spares_live_excepted_version() {
+        let (_td, ds) = store();
+        let k = key();
+        ds.seq.store(10, Ordering::Relaxed);
+        let (old, _) = ds
+            .write_entry(&k, &entry(PageScope::Public), 0, b"old", 100)
+            .unwrap();
+        let (live, _) = ds
+            .write_entry(&k, &entry(PageScope::Public), 0, b"live", 200)
+            .unwrap();
+        let live_seq = read_meta(&live).unwrap().version_seq;
+
+        ds.remove_key_versions_through_except(&k, live_seq, Some(live_seq));
+
+        assert!(!old.exists(), "superseded version is removed");
+        assert!(live.exists(), "live excepted version must survive");
     }
 
     #[test]

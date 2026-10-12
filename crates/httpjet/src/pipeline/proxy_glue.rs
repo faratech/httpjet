@@ -122,9 +122,15 @@ async fn proxy_websocket_inner(
     };
     let resp = upgrade.response;
     let reservation = upgrade.reservation.take();
+    // (#583) Default-target maxConns permit; held for the relay's lifetime.
+    let permit = upgrade.permit.take();
 
     if let Some(handoff) = uring_upgrade {
-        let io = start_uring_upgrade_relay(hyper_util::rt::TokioIo::new(upstream_io), reservation);
+        let io = start_uring_upgrade_relay(
+            hyper_util::rt::TokioIo::new(upstream_io),
+            reservation,
+            permit,
+        );
         if handoff.handoff(io).await.is_err() {
             return error_page(StatusCode::BAD_GATEWAY);
         }
@@ -135,6 +141,7 @@ async fn proxy_websocket_inner(
     // future resolves with the client IO, which we bridge to the upstream.
     tokio::spawn(async move {
         let _reservation = reservation;
+        let _permit = permit;
         match client_on_upgrade
             .expect("hyper upgrade future present")
             .await
@@ -154,6 +161,7 @@ async fn proxy_websocket_inner(
 fn start_uring_upgrade_relay<U>(
     upstream: U,
     reservation: Option<hj_proxy::RequestReservation>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> UringUpgradeIo
 where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -164,6 +172,7 @@ where
     let (upstream_tx, from_upstream) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, ()>>(8);
     tokio::spawn(async move {
         let _reservation = reservation;
+        let _permit = permit;
         let (mut reader, mut writer) = tokio::io::split(upstream);
         let downstream_to_upstream = async {
             while let Some(bytes) = downstream_rx.recv().await {
@@ -293,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn uring_upgrade_relay_moves_bytes_both_directions() {
         let (client, mut upstream_peer) = tokio::io::duplex(1024);
-        let mut io = start_uring_upgrade_relay(client, None);
+        let mut io = start_uring_upgrade_relay(client, None, None);
 
         io.to_upstream
             .send(bytes::Bytes::from_static(b"client-frame"))

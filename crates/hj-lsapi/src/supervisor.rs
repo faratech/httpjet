@@ -33,6 +33,25 @@ use crate::jail::{Credentials, JailConfig, resolve_credentials};
 use crate::limits::ResourceLimits;
 use crate::proto::{MAX_PACKET_LEN, PACKET_HEADER_LEN, PacketType, build_begin_request_framed};
 
+/// A requested chroot must actually be applied: it needs the validated
+/// pinned directory AND a credential drop to chroot under. Without
+/// credentials the spawn path used to skip the chroot silently (#591).
+fn validate_chroot(chroot_requested: bool, pinned: bool, has_target: bool) -> io::Result<()> {
+    if chroot_requested && !pinned {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chroot requires a validated pinned directory",
+        ));
+    }
+    if chroot_requested && !has_target {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "chroot requires credentials (jail credentials or a resolvable user)",
+        ));
+    }
+    Ok(())
+}
+
 fn set_no_new_privileges() -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         Err(io::Error::last_os_error())
@@ -744,12 +763,11 @@ impl LsphpSupervisor {
         // Capture chroot/chdir as Copy/CString values (parent-resolved). The
         // child does NO path allocation — these are pre-encoded CStrings.
         let chroot_pin = self.cfg.jail.chroot_fd.clone();
-        if self.cfg.jail.chroot.is_some() && chroot_pin.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "chroot requires a validated pinned directory",
-            ));
-        }
+        validate_chroot(
+            self.cfg.jail.chroot.is_some(),
+            chroot_pin.is_some(),
+            target.is_some(),
+        )?;
         let chroot = chroot_pin.as_ref().map(|f| f.as_raw_fd());
         let chdir: Option<CString> = self.cfg.jail.chdir.clone();
 
@@ -1117,8 +1135,13 @@ impl LsphpSupervisor {
         // already hold logical ownership of this transition via Starting; reset
         // back to Starting after drain so the post-start logic is unambiguous).
         // Backoff only matters when we've already failed at least once.
+        // Cancellable (#590): shutdown must not wait out the backoff (cap
+        // 30 s) while this holds the lifecycle lock.
         if !backoff.is_zero() {
-            tokio::time::sleep(backoff).await;
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = self.cancel.cancelled() => return Ok(()),
+            }
         }
 
         let result = if self.can_hot_reload() {
@@ -2843,6 +2866,52 @@ while True:
         config.children = 1;
         config.start_timeout = Duration::from_secs(2);
         config
+    }
+
+    /// Regression (#591): a requested chroot without a pinned directory or
+    /// without credentials must be rejected, never silently skipped.
+    #[test]
+    fn chroot_requires_pinned_dir_and_credentials() {
+        assert!(validate_chroot(false, false, false).is_ok());
+        assert!(validate_chroot(true, true, true).is_ok());
+        assert!(validate_chroot(true, false, true).is_err());
+        assert!(validate_chroot(true, true, false).is_err());
+    }
+
+    /// Regression (#590): shutdown cancellation must cut the restart backoff
+    /// short instead of waiting it out under the lifecycle lock.
+    #[tokio::test]
+    async fn restart_backoff_is_cancellable() {
+        let (program, _counter) = write_fake_lsapi_master("backoff-cancel", false);
+        let socket = probe_socket("backoff-cancel");
+        let _ = std::fs::remove_file(&socket);
+        let mut config = fake_supervisor_config(program, &socket);
+        config.min_restart_interval = Duration::from_millis(100);
+        config.max_restart_backoff = Duration::from_secs(30);
+        let listener = StdUnixListener::bind(&socket).unwrap();
+        rustix::net::listen(&listener, 128).unwrap();
+        let supervisor = LsphpSupervisor::new(config).with_listen_fd(listener.into());
+        {
+            let mut g = supervisor.inner.lock();
+            g.restart_failures = 8; // backoff = 100ms * 2^8, capped at 30 s
+            g.last_restart = Instant::now() - Duration::from_secs(3600);
+        }
+        let cancel = supervisor.cancel_token();
+        let start = Instant::now();
+        let restart = tokio::spawn(async move { supervisor.restart_debounced().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), restart)
+            .await
+            .expect("restart must return promptly after cancel")
+            .expect("restart task panicked");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "backoff was not cancelled: {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_file(&socket);
     }
 
     #[test]

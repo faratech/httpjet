@@ -117,6 +117,25 @@ impl Sidecar {
         normalized_path: &str,
         include_body: bool,
     ) -> Result<Verdict, InspectError> {
+        // (#582) Collect and restore the body BEFORE the timed sidecar
+        // exchange. The old shape swapped the body out inside the timed
+        // block, so a timeout mid-collect dropped the partially-read body
+        // and fail-open dispatch forwarded an EMPTY body downstream.
+        let body_hex = if include_body {
+            let incoming = std::mem::replace(req.body_mut(), hj_core::empty_incoming());
+            let bytes = incoming
+                .collect()
+                .await
+                .map_err(|_| InspectError::Io)?
+                .to_bytes();
+            *req.body_mut() = Full::new(bytes.clone())
+                .map_err(|never| match never {})
+                .map_err(|error| Box::new(error) as BoxError)
+                .boxed();
+            Some(hex(&bytes))
+        } else {
+            None
+        };
         tokio::time::timeout(self.timeout, async {
             let _permit = self
                 .concurrency
@@ -134,21 +153,7 @@ impl Sidecar {
                 .acquire_many_owned(charge)
                 .await
                 .map_err(|_| InspectError::Capacity)?;
-            let body = if include_body {
-                let incoming = std::mem::replace(req.body_mut(), hj_core::empty_incoming());
-                let bytes = incoming
-                    .collect()
-                    .await
-                    .map_err(|_| InspectError::Io)?
-                    .to_bytes();
-                *req.body_mut() = Full::new(bytes.clone())
-                    .map_err(|never| match never {})
-                    .map_err(|error| Box::new(error) as BoxError)
-                    .boxed();
-                Some(hex(&bytes))
-            } else {
-                None
-            };
+            let body = body_hex;
             let headers: Vec<EncodedHeader<'_>> = req
                 .headers()
                 .iter()
@@ -418,6 +423,35 @@ mod tests {
                     .boxed(),
             )
             .unwrap()
+    }
+
+    /// Regression (#582): a sidecar timeout must leave the original request
+    /// body in `req` — fail-open dispatch forwards whatever body remains.
+    #[tokio::test]
+    async fn timeout_leaves_original_body_intact() {
+        // Sidecar that accepts but never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stall = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let sidecar = Sidecar::new(
+            addr,
+            "/inspect".into(),
+            Duration::from_millis(100),
+            1024,
+            2,
+            FailurePolicy::Open,
+        )
+        .unwrap();
+        let ctx = context();
+        let mut req = request(5);
+        let result = sidecar.inspect(&ctx, &mut req, "/inspect", true).await;
+        assert!(matches!(result, Err(InspectError::Timeout)), "{result:?}");
+        let bytes = req.body_mut().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 5, "original body must survive the timeout");
+        stall.abort();
     }
 
     #[test]

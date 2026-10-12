@@ -173,8 +173,18 @@ pub(crate) fn qpack_decode_limited(
     max_field_section_size: usize,
 ) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, usize)> {
     let mut pos = 0usize;
-    qpack_read_int(buf, &mut pos, 8)?; // Required Insert Count (0)
-    qpack_read_int(buf, &mut pos, 7)?; // Delta Base (sign bit + 7-bit prefix; 0)
+    // Required Insert Count must be 0: the dynamic table is never used
+    // (SETTINGS advertise capacity 0), so a nonzero count references state
+    // that cannot exist and must not decode as a static/literal section (#588).
+    if qpack_read_int(buf, &mut pos, 8)? != 0 {
+        return None;
+    }
+    // Delta Base likewise: with RIC=0 any nonzero magnitude (or a negative
+    // base, sign bit set with magnitude 0) names dynamic state we do not have.
+    let delta_sign_negative = buf.get(pos).map(|b| b >> 7) == Some(1);
+    if qpack_read_int(buf, &mut pos, 7)? != 0 || delta_sign_negative {
+        return None;
+    }
     let mut out = Vec::new();
     let mut decoded_size = 0usize;
     while pos < buf.len() {

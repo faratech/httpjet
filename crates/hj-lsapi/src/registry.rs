@@ -825,6 +825,10 @@ impl LsapiRegistry {
         // loop bounded.
         let mut idle_passes: u32 = 0;
         const MAX_IDLE_PASSES: u32 = 1024;
+        // (#590) Wall-clock bound as well as a pass count: 1024 cooperative
+        // yields can elapse in far less than a real supervisor start (25 ms
+        // readiness probes), abandoning a pool that then starts orphaned.
+        let drain_deadline = std::time::Instant::now() + Duration::from_secs(30);
 
         loop {
             // Snapshot the slots so we don't hold the map lock across awaits.
@@ -937,7 +941,7 @@ impl LsapiRegistry {
             // get_or_try_init advance, but bound the total idle waiting so a
             // permanently-failed (never-retried) start cannot wedge shutdown.
             idle_passes += 1;
-            if idle_passes >= MAX_IDLE_PASSES {
+            if idle_passes >= MAX_IDLE_PASSES && std::time::Instant::now() >= drain_deadline {
                 tracing::warn!(
                     "lsphp registry drain: a pool slot stayed mid-start after \
                      {MAX_IDLE_PASSES} passes; abandoning it (supervisor Drop is the backstop)"
@@ -950,7 +954,13 @@ impl LsapiRegistry {
                 });
                 break;
             }
-            tokio::task::yield_now().await;
+            // Pace the wait once past the pass cap so waiting out the
+            // wall-clock deadline does not spin the executor.
+            if idle_passes >= MAX_IDLE_PASSES {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
         }
         first_error.map_or(Ok(()), Err)
     }
