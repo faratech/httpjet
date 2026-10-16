@@ -72,12 +72,22 @@ pub const MAX_CHUNK_LINE: usize = 8 * 1024;
 pub fn te_is_chunked(value: &[u8]) -> bool {
     // ASCII OWS only (as in resolve_content_length): str::trim would strip obs-text
     // padding such as "\xc2\xa0chunked" that hyper/LiteSpeed never frame as chunked.
-    let start = value.iter().position(|&b| b != b' ' && b != b'\t');
-    let end = value.iter().rposition(|&b| b != b' ' && b != b'\t');
-    match (start, end) {
-        (Some(s), Some(e)) => value[s..=e].eq_ignore_ascii_case(b"chunked"),
-        _ => false,
-    }
+    let start = leading_ows(value);
+    let end = value.len() - trailing_ows(value);
+    value
+        .get(start..end)
+        .is_some_and(|v| v.eq_ignore_ascii_case(b"chunked"))
+}
+
+fn leading_ows(v: &[u8]) -> usize {
+    v.iter().take_while(|&&b| b == b' ' || b == b'\t').count()
+}
+
+fn trailing_ows(v: &[u8]) -> usize {
+    v.iter()
+        .rev()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count()
 }
 
 /// Strictly resolve the request Content-Length from its (possibly repeated) header
@@ -158,8 +168,9 @@ fn trailer_line_valid(line: &[u8]) -> bool {
     let Some(colon) = line.iter().position(|&b| b == b':') else {
         return false;
     };
-    colon > 0
-        && line[..colon]
+    let name = line.get(..colon).unwrap_or_default();
+    !name.is_empty()
+        && name
             .iter()
             .all(|&b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
         && framing_line_clean(line)
@@ -255,7 +266,7 @@ impl ChunkedDecoder {
                 if rel == 0 {
                     return ChunkStep::Done(self.pos + 2);
                 }
-                if !trailer_line_valid(&rest[..rel]) {
+                if !rest.get(..rel).is_some_and(trailer_line_valid) {
                     return ChunkStep::Bad;
                 }
                 self.pos += rel + 2;

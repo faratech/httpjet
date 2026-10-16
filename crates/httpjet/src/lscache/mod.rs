@@ -2785,26 +2785,25 @@ fn is_canonical_path_literal(b: u8) -> bool {
 }
 
 fn escaped_byte_at(raw: &[u8], i: usize) -> Option<u8> {
-    if raw[i] == b'%' && i + 2 < raw.len() {
-        Some((hex_val(raw[i + 1])? << 4) | hex_val(raw[i + 2])?)
-    } else {
-        None
+    match raw.get(i..i + 3)? {
+        [b'%', hi, lo] => Some((hex_val(*hi)? << 4) | hex_val(*lo)?),
+        _ => None,
     }
 }
 
 /// Entries are keyed and identified by the decoded, dot-normalized path, but the backend
 /// routes the RAW `REQUEST_URI`. Only the one raw spelling that canonically encodes that path
-/// (modulo escaped unreserved bytes and hex case) may read or populate an entry. Any other
+/// (modulo hex case) may read or populate an entry. Any other
 /// spelling — `/./`, `/x/../`, `//`, `%2F`, an escaped sub-delim — shares the key yet can
 /// render different content (XenForo 404s `/./`), which would poison the canonical URL.
 pub(crate) fn raw_path_is_cache_canonical(raw: &str, normalized: &str) -> bool {
     let raw = raw.as_bytes();
     let mut i = 0;
     for &b in normalized.as_bytes() {
-        if i >= raw.len() {
+        let Some(&r) = raw.get(i) else {
             return false;
-        }
-        if is_canonical_path_literal(b) && raw[i] == b {
+        };
+        if is_canonical_path_literal(b) && r == b {
             i += 1;
         // An unreserved byte must appear literally: XenForo strips the SCRIPT_NAME
         // prefix from the RAW REQUEST_URI before decoding, so `/index%2Ephp/x/`
