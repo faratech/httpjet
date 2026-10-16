@@ -117,6 +117,22 @@ pub fn resolve_auth_for_request<'a>(
     request_path: &str,
     filesystem_path: Option<&str>,
 ) -> Result<Option<AuthRealm>, InvalidAuth> {
+    resolve_auth_for_request_paths(
+        chain,
+        resource_path,
+        request_path,
+        filesystem_path.as_slice(),
+    )
+}
+
+/// Resolve one policy in configuration order across equivalent lexical and
+/// canonical filesystem names. Matching either name selects the same group.
+pub fn resolve_auth_for_request_paths<'a>(
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+    resource_path: &str,
+    request_path: &str,
+    filesystem_paths: &[&str],
+) -> Result<Option<AuthRealm>, InvalidAuth> {
     let basename = resource_path.rsplit('/').next().unwrap_or("");
     let mut effective = EffectiveAuth::default();
     for ht in chain {
@@ -127,8 +143,9 @@ pub fn resolve_auth_for_request<'a>(
                 let matches_at = |m: &AccessMatcher, on_error| {
                     if matches!(m, AccessMatcher::Path(_)) {
                         return m.matches(resource_path, basename, on_error)
-                            || filesystem_path
-                                .is_some_and(|path| m.matches(path, basename, on_error));
+                            || filesystem_paths
+                                .iter()
+                                .any(|path| m.matches(path, basename, on_error));
                     }
                     let path = match m {
                         AccessMatcher::IfUri { .. } | AccessMatcher::IfUriExpr(_) => request_path,

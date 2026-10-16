@@ -292,6 +292,48 @@ fn forbidden_flag_yields_403() {
 }
 
 #[test]
+fn literal_prefix_alternation_after_metachar() {
+    // #619: a metachar before the top-level `|` must also abandon the prefix.
+    for pat in ["^a\\.php$|b\\.php$", "^ab+c|def", "^ab[cd]|ef"] {
+        let rs = RuleSet::parse(&format!("RewriteEngine On\nRewriteRule {pat} - [F]")).unwrap();
+        let right = if pat.contains("b\\.php") {
+            "/b.php"
+        } else if pat.ends_with("|def") {
+            "/def"
+        } else {
+            "/ef"
+        };
+        assert!(
+            matches!(
+                evaluate(&rs, &input(right)),
+                RewriteOutcome::Forbidden { .. }
+            ),
+            "{right} must match right arm of {pat}"
+        );
+    }
+}
+
+#[test]
+fn env_long_spelling_preserves_name_and_value_case() {
+    // #621
+    let rs = RuleSet::parse("RewriteEngine On\nRewriteRule .* - [ENV=No-Cache:MixedCase]").unwrap();
+    let env = evaluate(&rs, &input("/x")).env().to_vec();
+    assert!(env.contains(&("No-Cache".to_string(), "MixedCase".to_string())));
+}
+
+#[test]
+fn proxy_qsa_appends_to_substitution_query() {
+    // #622
+    let rs = RuleSet::parse("RewriteEngine On\nRewriteRule ^x$ http://up/s?a=1 [P,QSA]").unwrap();
+    match evaluate(&rs, &input("/x").query("token=2")) {
+        RewriteOutcome::Proxy { target_url, .. } => {
+            assert_eq!(target_url, "http://up/s?a=1&token=2")
+        }
+        other => panic!("expected proxy, got {other:?}"),
+    }
+}
+
+#[test]
 fn proxy_flag_yields_proxy_outcome() {
     let rs = RuleSet::parse(
         "RewriteEngine On\nRewriteRule ^/tools\\.json$ http://127.0.0.1:8002/tools.json [P,L]",
@@ -609,6 +651,77 @@ fn file_test_precomputed() {
         RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/index.php"),
         other => panic!("expected rewrite to index.php, got {other:?}"),
     }
+}
+
+#[test]
+fn dangling_link_is_not_existing_and_directory_is_not_nonempty() {
+    // #686: `!-e` front controllers still route a dangling symlink.
+    let rs = RuleSet::parse(
+        "RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-e\nRewriteRule . index.php [L]",
+    )
+    .unwrap();
+    let dangling = input("/old-release").file_tests(FileTests {
+        is_link: true,
+        ..Default::default()
+    });
+    assert!(matches!(
+        evaluate(&rs, &dangling),
+        RewriteOutcome::Rewritten { .. }
+    ));
+    // #687: `-s` is a regular-file test.
+    let rs = RuleSet::parse(
+        "RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-s\nRewriteRule . index.php [L]",
+    )
+    .unwrap();
+    let dir = std::env::temp_dir();
+    let md = std::fs::metadata(&dir).unwrap();
+    let tests = FileTests::from_metadata(&md);
+    assert!(tests.exists && !tests.is_nonempty);
+    assert!(matches!(
+        evaluate(&rs, &input("/somedir").file_tests(tests)),
+        RewriteOutcome::Rewritten { .. }
+    ));
+}
+
+#[test]
+fn file_test_aliases_and_exec_follow_ols() {
+    let route = |op: &str, tests: FileTests| {
+        let rs = RuleSet::parse(&format!(
+            "RewriteEngine On\nRewriteCond %{{REQUEST_FILENAME}} {op}\nRewriteRule . index.php [L]"
+        ))
+        .unwrap();
+        matches!(
+            evaluate(&rs, &input("/x").file_tests(tests)),
+            RewriteOutcome::Rewritten { .. }
+        )
+    };
+    let link = FileTests {
+        is_link: true,
+        exists: true,
+        ..Default::default()
+    };
+    let file = FileTests {
+        is_file: true,
+        exists: true,
+        ..Default::default()
+    };
+    assert!(route("-L", link) && route("-h", link) && !route("-L", file));
+    assert!(route("-F", file) && !route("!-F", file));
+    // `-x` is an executable regular file, not "exists".
+    assert!(!route("-x", file));
+    assert!(route(
+        "-x",
+        FileTests {
+            is_exec: true,
+            ..file
+        }
+    ));
+    let dir = FileTests {
+        is_dir: true,
+        exists: true,
+        ..Default::default()
+    };
+    assert!(!route("-x", dir) && route("-e", dir));
 }
 
 #[test]
@@ -949,6 +1062,19 @@ mod semantics {
         }
     }
 
+    #[test]
+    fn server_context_rules_run_once() {
+        // #701: vhost-level rules are not re-run on a changed URI (OLS), so a
+        // prefixing rule does not compound.
+        let rs = RuleSet::parse("RewriteEngine On\nRewriteRule ^/(.*)$ /x/$1 [L]").unwrap();
+        let mut inp = input("/old");
+        inp.server_context = true;
+        match evaluate(&rs, &inp) {
+            RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/x/old"),
+            other => panic!("expected /x/old, got {other:?}"),
+        }
+    }
+
     /// `- [END]` with no URI change still flags `end` (so the pipeline stops all
     /// subsequent `.htaccess`/ruleset processing) via the `Unchanged` outcome.
     #[test]
@@ -1040,6 +1166,23 @@ mod semantics {
             evaluate(&rs, &inp2),
             RewriteOutcome::Unchanged { .. }
         ));
+    }
+
+    #[test]
+    fn path_redirect_never_emits_port_zero() {
+        // #688: a UDS listener's fabricated port 0 is never emitted.
+        let rs = RuleSet::parse("RewriteEngine On\nRewriteRule ^old$ /new [R=302,L]").unwrap();
+        for (port, want) in [
+            (0, "http://alias.example/new"),
+            (80, "http://alias.example/new"),
+            (8080, "http://alias.example:8080/new"),
+        ] {
+            let inp = input("/old").server_name("alias.example").server_port(port);
+            match evaluate(&rs, &inp) {
+                RewriteOutcome::Redirect { location, .. } => assert_eq!(location, want),
+                other => panic!("expected redirect, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2690,7 +2833,9 @@ mod ua_classify {
         let rs = parse("RewriteEngine On\nRewriteRule ^a$ /b [L]");
         assert!(!rs.ua_classify_eligible());
         assert_eq!(rs.ua_cond_count(), 0);
-        // Uncacheable set (cookie) -> ineligible regardless of its UA cond.
+        // Uncacheable set (cookie): the outcome cache cannot key it (no
+        // cache_key_vars), but the UA flow alone decides classifiability, which the
+        // page cache still needs (#603).
         let rs = parse(
             "RewriteEngine On\n\
              RewriteCond %{HTTP_USER_AGENT} bot\n\
@@ -2698,7 +2843,44 @@ mod ua_classify {
              RewriteRule ^ - [L]",
         );
         assert!(!rs.path_cacheable);
-        assert!(!rs.ua_classify_eligible());
+        assert!(rs.cache_key_vars.is_empty());
+        assert!(rs.reads_user_agent());
+        assert!(rs.ua_classify_eligible());
+    }
+
+    /// The page cache persists UA-class keys across restarts, so their identity must
+    /// not be the parse-order id (#603).
+    #[test]
+    fn ua_fingerprint_is_stable_and_tracks_only_the_ua_conds() {
+        let crawler = "RewriteEngine On\n\
+             RewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot)\n\
+             RewriteRule .* - [E=KNOWN_CRAWLER:1]";
+        let a = parse(crawler);
+        let b = parse(crawler);
+        assert_ne!(a.id(), b.id());
+        assert_ne!(a.ua_fingerprint(), 0);
+        assert_eq!(
+            a.ua_fingerprint(),
+            b.ua_fingerprint(),
+            "stable across parses"
+        );
+        let other_rules = parse(&format!("{crawler}\nRewriteRule ^old$ /new [R=301,L]"));
+        assert_eq!(a.ua_fingerprint(), other_rules.ua_fingerprint());
+        let other_pattern = parse(
+            "RewriteEngine On\n\
+             RewriteCond %{HTTP_USER_AGENT} (Googlebot|Yandex)\n\
+             RewriteRule .* - [E=KNOWN_CRAWLER:1]",
+        );
+        assert_ne!(a.ua_fingerprint(), other_pattern.ua_fingerprint());
+        let nocase = parse(
+            "RewriteEngine On\n\
+             RewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot) [NC]\n\
+             RewriteRule .* - [E=KNOWN_CRAWLER:1]",
+        );
+        assert_ne!(a.ua_fingerprint(), nocase.ua_fingerprint());
+        let no_ua = parse("RewriteEngine On\nRewriteRule ^a$ /b [L]");
+        assert!(!no_ua.reads_user_agent());
+        assert_eq!(no_ua.ua_fingerprint(), 0);
     }
 
     #[test]
@@ -2781,7 +2963,7 @@ mod memo_class {
     }
 
     #[test]
-    fn key_covered_set_env_if_attributes_need_no_vary() {
+    fn key_covered_set_env_if_attributes_report_host_for_canonical_page_cache() {
         let m = memo(
             "SetEnvIf Request_URI \"^/beta/?$\" WF_BETA=1\n\
              SetEnvIf Query_String \"(^|&)amp=1(&|$)\" AMP_PAGE\n\
@@ -2790,7 +2972,7 @@ mod memo_class {
              SetEnvIf Server_Name example SN",
         );
         assert!(m.eligible);
-        assert!(m.vary_headers.is_empty(), "{:?}", m.vary_headers);
+        assert_eq!(m.vary_headers, vec!["host"]);
     }
 
     #[test]
@@ -2839,6 +3021,53 @@ mod memo_class {
         // still a pure function of the path.
         assert!(m.eligible, "{:?}", m.blockers);
         assert!(m.vary_headers.is_empty());
+    }
+
+    #[test]
+    fn deeply_nested_if_expression_fails_closed() {
+        let mut expr = "%{REQUEST_URI} =~ m#^/a#".to_string();
+        for _ in 0..1000 {
+            expr = format!("%{{REQUEST_URI}} =~ m#^/a# || ({expr})");
+        }
+        let src = format!("<If \"{expr}\">\nRequire all denied\n</If>\n");
+        let h = crate::Htaccess::parse(&src).unwrap();
+        assert_eq!(
+            h.access_decision("/a", "GET"),
+            crate::AccessDecision::Denied
+        );
+        let grant = crate::Htaccess::parse(&src.replace("all denied", "all granted")).unwrap();
+        assert_ne!(
+            grant.access_decision("/a", "GET"),
+            crate::AccessDecision::Granted
+        );
+        let wrapped = format!(
+            "{}%{{REQUEST_URI}} =~ m#^/a#{}",
+            "(".repeat(1000),
+            ")".repeat(1000)
+        );
+        let h = crate::Htaccess::parse(&format!("<If \"{wrapped}\">\nRequire all denied\n</If>\n"))
+            .unwrap();
+        assert_eq!(
+            h.access_decision("/a", "GET"),
+            crate::AccessDecision::Denied
+        );
+    }
+
+    #[test]
+    fn header_reads_survive_non_cacheable_inputs_and_cover_all_rule_fields() {
+        let ht = crate::Htaccess::parse("SetEnvIf User_Agent bot REDIRECT_STATUS=200").unwrap();
+        assert!(!ht.memo.eligible);
+        assert!(ht.memo.vary_headers.iter().any(|name| name == "user-agent"));
+        let rules = crate::RuleSet::parse(concat!(
+            "RewriteCond %{REMOTE_ADDR} ^127\n",
+            "RewriteCond %{HTTP:X-Partner} yes\n",
+            "RewriteCond %{HTTP_REFERER} ^https\n",
+            "RewriteRule .* /%{HTTP:Accept-Language} [E=V:%{HTTP_COOKIE}]\n",
+        ))
+        .unwrap();
+        for name in ["x-partner", "referer", "accept-language", "cookie"] {
+            assert!(rules.header_reads.iter().any(|read| read == name), "{name}");
+        }
     }
 
     #[test]

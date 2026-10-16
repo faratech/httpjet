@@ -366,3 +366,30 @@ fn ram_cap_evicts_under_pressure_in_ram_only_mode() {
     );
     assert_eq!(st.entries, s.entry_count(), "entries counter == map len");
 }
+
+/// Teardown drops the hot tier's decoded-identity copy of a body as well as the body
+/// itself, so neither lingers in RAM until the hot tier's idle eviction.
+#[test]
+fn teardown_drops_the_hot_identity_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+    s.load_from_disk(|_| {});
+    s.store(
+        key(0),
+        entry(0, &[b'x'; 4096], &[], Duration::from_secs(600)),
+    );
+    let body_id = match s
+        .lookup(&key(0), &identity(0), Instant::now())
+        .map(|e| e.body.clone())
+    {
+        Some(PageBody::File { body_id, .. }) => body_id,
+        other => panic!("expected a file-backed body, got {other:?}"),
+    };
+    s.hot_identity_put(body_id, Bytes::from_static(b"decoded identity"));
+    assert!(s.hot_identity_get(body_id).is_some());
+    s.invalidate_key(&key(0));
+    assert!(
+        s.hot_identity_get(body_id).is_none(),
+        "the decoded identity of a torn-down body must not stay resident"
+    );
+}

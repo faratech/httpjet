@@ -20,6 +20,8 @@ impl Htaccess {
     /// directives are treated as no-ops (but `RewriteRule ... [E=...]` inside
     /// their blocks is still parsed into `rules`).
     pub fn parse(text: &str) -> Result<Htaccess, RewriteError> {
+        // Apache skips a leading UTF-8 BOM; kept, it would hide the first directive.
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         let mut h = Htaccess::default();
         // Memo eligibility starts TRUE and is withdrawn by the first blocking directive.
         h.memo.eligible = true;
@@ -34,6 +36,10 @@ impl Htaccess {
         // section's line, `None` = top level): its `Order`/`Allow`/`Deny` lines
         // accumulate into ONE `AccessRule` so they are judged together (#359).
         let mut legacy_slots: std::collections::HashMap<Option<usize>, usize> =
+            std::collections::HashMap::new();
+        // Per nesting depth: the conditions of the `<If>`/`<ElseIf>` chain that a
+        // following `<Else>`/`<ElseIf>` at that depth continues.
+        let mut if_chains: std::collections::HashMap<usize, Vec<Option<UriExpr>>> =
             std::collections::HashMap::new();
 
         for (lineno, raw) in logical_lines(text) {
@@ -52,7 +58,36 @@ impl Htaccess {
                     .rposition(|s| s.kind_name.eq_ignore_ascii_case(&tag))
                 {
                     malformed_sections |= idx + 1 != section_stack.len();
-                    section_stack.remove(idx);
+                    let closed = section_stack.remove(idx);
+                    let depth = section_stack.len();
+                    if_chains.retain(|d, _| *d <= depth);
+                    match closed.branch {
+                        Some(IfBranch::If(cond)) => {
+                            if_chains.insert(depth, vec![cond]);
+                        }
+                        Some(IfBranch::ElseIf(cond)) => {
+                            if let Some(chain) = if_chains.get_mut(&depth) {
+                                chain.push(cond);
+                            }
+                        }
+                        Some(IfBranch::Else) | None => {}
+                    }
+                    if let Some(kind) = closed.require_kind {
+                        let denied = kind.fold(&closed.require_children).ok_or_else(|| {
+                            RewriteError::Malformed {
+                                line: closed.lineno,
+                                msg: "authorization container without Require".into(),
+                            }
+                        })?;
+                        match section_stack
+                            .iter_mut()
+                            .rev()
+                            .find(|s| s.require_kind.is_some())
+                        {
+                            Some(parent) => parent.require_children.push(denied),
+                            None => record_access_rule(&mut h, &section_stack, denied),
+                        }
+                    }
                 } else {
                     malformed_sections = true;
                 }
@@ -63,11 +98,22 @@ impl Htaccess {
             if line.starts_with('<') {
                 malformed_sections |= !line.ends_with('>');
                 malformed_sections |= auth_tokens(line).is_none();
-                if let Some(pending) = PendingSection::open(line, lineno) {
-                    section_stack.push(pending);
+                let depth = section_stack.len();
+                let prior = if_chains.remove(&depth);
+                let pending = PendingSection::open(line, lineno, prior.as_deref())?;
+                if pending.method.is_some() {
+                    // The memo keys GET only; a method filter could tell HEAD apart.
+                    h.memo.block(lineno, "access_method_limit");
                 }
+                if matches!(pending.branch, Some(IfBranch::ElseIf(_))) {
+                    if let Some(prior) = prior {
+                        if_chains.insert(depth, prior);
+                    }
+                }
+                section_stack.push(pending);
                 continue;
             }
+            if_chains.remove(&section_stack.len());
 
             // Body lines. If we're inside an access section, capture its Require.
             let (directive, rest) = split_first(line);
@@ -87,6 +133,15 @@ impl Htaccess {
             // Auth directives are parsed as real directives, never discovered by
             // substrings in comments. Metadata and Require retain lexical scope.
             if record_auth(&mut h, &section_stack, &dlow, rest) {
+                // A user predicate is a member the container cannot evaluate (deny).
+                if let Some(container) = section_stack
+                    .iter_mut()
+                    .rev()
+                    .find(|s| s.require_kind.is_some())
+                    .filter(|_| dlow == "require")
+                {
+                    container.require_children.push(true);
+                }
                 continue;
             }
 
@@ -98,7 +153,14 @@ impl Htaccess {
             // user/user/group/...) is fail-closed to DENY unless it is explicitly
             // `(all) granted` (#2).
             if let Some(denied) = classify_access_directive(&dlow, rest) {
-                record_access_rule(&mut h, &section_stack, denied);
+                match section_stack
+                    .iter_mut()
+                    .rev()
+                    .find(|s| s.require_kind.is_some())
+                {
+                    Some(container) => container.require_children.push(denied),
+                    None => record_access_rule(&mut h, &section_stack, denied),
+                }
                 continue;
             }
             // Legacy mod_access: `Order`, `Allow from …`, `Deny from …` (every
@@ -107,6 +169,12 @@ impl Htaccess {
             // and env (#359). Hostname operands cannot be evaluated here and are
             // recorded fail-closed.
             if matches!(dlow.as_str(), "order" | "allow" | "deny") {
+                if section_stack.iter().any(|s| s.require_kind.is_some()) {
+                    return Err(RewriteError::Malformed {
+                        line: lineno,
+                        msg: "legacy access directive inside an authorization container".into(),
+                    });
+                }
                 record_legacy_access(
                     &mut h,
                     &section_stack,
@@ -254,12 +322,12 @@ impl Htaccess {
             }
         }
 
-        // An ambiguous auth scope must never become a different usable scope.
-        // The cache handles parse errors with its existing deny-all sentinel.
-        if h.has_auth() && (malformed_sections || !section_stack.is_empty()) {
+        // Unbalanced sections re-scope the rules after them (Apache answers 500),
+        // so the cache's deny-all sentinel stands in for the whole file.
+        if malformed_sections || !section_stack.is_empty() {
             return Err(RewriteError::Malformed {
                 line: 1,
-                msg: "unbalanced or malformed authentication section".into(),
+                msg: "unbalanced or malformed section".into(),
             });
         }
         drop(section_stack);
@@ -463,8 +531,13 @@ fn auth_tokens(text: &str) -> Option<Vec<String>> {
 fn classify_access_directive(dlow: &str, rest: &str) -> Option<bool> {
     match dlow {
         "require" => {
-            let r = rest.trim().to_ascii_lowercase();
-            if r == "all granted" || r == "granted" {
+            let toks = auth_tokens(rest).unwrap_or_default();
+            let granted = match toks.as_slice() {
+                [g] => g.eq_ignore_ascii_case("granted"),
+                [a, g] => a.eq_ignore_ascii_case("all") && g.eq_ignore_ascii_case("granted"),
+                _ => false,
+            };
+            if granted {
                 Some(false)
             } else {
                 // `all denied`, `denied`, AND every authorization predicate
@@ -574,6 +647,7 @@ fn access_matchers(stack: &[PendingSection], denied: bool) -> Option<Vec<AccessM
             Some(SectionKind::Directory) | Some(SectionKind::DirectoryMatch) => {
                 matchers.push(AccessMatcher::Path(sec.regex.clone()?));
             }
+            None if sec.method.is_some() => matchers.extend(sec.method.clone()),
             None => {
                 // `<If>` contributes a URI condition; other None blocks (IfModule
                 // etc.) carry an If-scope only when they are actually `<If>`.
@@ -620,10 +694,69 @@ struct PendingSection {
     /// The scope a directive (e.g. `Header`) inside this block inherits. Set for
     /// `<Files*>`/`<Directory*>` and for the common `<If "%{REQUEST_URI} ...">`.
     scope: Option<Scope>,
+    /// `<Limit>`/`<LimitExcept>`: the method matcher ANDed into enclosed access rules.
+    method: Option<AccessMatcher>,
+    /// `<RequireAll>`/`<RequireAny>`/`<RequireNone>`: enclosed `Require` verdicts
+    /// (true = deny) are combined here and recorded as one rule on close.
+    require_kind: Option<RequireKind>,
+    require_children: Vec<bool>,
+    branch: Option<IfBranch>,
+}
+
+/// A member of an `<If>`/`<ElseIf>`/`<Else>` chain, carrying its own condition
+/// (`None` = not modellable).
+enum IfBranch {
+    If(Option<UriExpr>),
+    ElseIf(Option<UriExpr>),
+    Else,
+}
+
+#[derive(Clone, Copy)]
+enum RequireKind {
+    All,
+    Any,
+    None,
+}
+
+impl RequireKind {
+    /// The container's deny verdict. Unevaluable predicates already count as deny,
+    /// and `<RequireNone>` can never grant on its own, so it always denies.
+    fn fold(self, children: &[bool]) -> Option<bool> {
+        if children.is_empty() {
+            return None;
+        }
+        Some(match self {
+            RequireKind::All => children.iter().any(|d| *d),
+            RequireKind::Any => children.iter().all(|d| *d),
+            RequireKind::None => true,
+        })
+    }
+}
+
+/// The `<Else>`/`<ElseIf>` condition: no earlier member of the chain matched
+/// (and, for `<ElseIf>`, its own condition holds).
+fn else_expr(prior: Option<&[Option<UriExpr>]>, own: Option<Option<UriExpr>>) -> Option<UriExpr> {
+    let prior = prior?.iter().cloned().collect::<Option<Vec<UriExpr>>>()?;
+    let none_before = UriExpr::Not(Box::new(match <[UriExpr; 1]>::try_from(prior) {
+        Ok([one]) => one,
+        Err(many) => UriExpr::Or(many),
+    }));
+    match own {
+        None => Some(none_before),
+        Some(own) => Some(UriExpr::And(vec![none_before, own?])),
+    }
 }
 
 impl PendingSection {
-    fn open(line: &str, lineno: usize) -> Option<PendingSection> {
+    /// An access section whose pattern does not compile is a parse error (#604):
+    /// the whole file then fails closed through the cache's deny-all sentinel, as
+    /// Apache answers 500 for the directory, instead of silently dropping the
+    /// `Require`/`Deny` (and `Header`) rules it encloses.
+    fn open(
+        line: &str,
+        lineno: usize,
+        prior_if_chain: Option<&[Option<UriExpr>]>,
+    ) -> Result<PendingSection, RewriteError> {
         // Strip leading '<' and trailing '>'.
         let inner = line.trim_start_matches('<').trim_end_matches('>');
         let (tag, args) = split_first(inner);
@@ -650,17 +783,21 @@ impl PendingSection {
             }
             let pat = unquote(a);
             let compiled = match kind {
-                Some(SectionKind::Files) if !is_regex_marker => {
-                    // `<Files "glob">` uses APACHE FNMATCH glob semantics, NOT
-                    // regex: `*.log` must match `x.log` but not `xlog`. Translate
-                    // the glob to an anchored regex so the uniform regex-matching
-                    // path handles it. A metacharacter-free name reduces to an
-                    // exact match.
-                    Regex::new(&fnmatch_to_regex(&pat)).ok()
-                }
-                _ => Regex::new(&pat).ok(),
-            };
-            (compiled, pat)
+                // `<Files "glob">` uses APACHE FNMATCH glob semantics, NOT regex:
+                // `*.log` must match `x.log` but not `xlog`. Translate the glob to
+                // an anchored regex so the uniform regex-matching path handles it.
+                // fnmatch never rejects a pattern, so a glob whose translation does
+                // not compile (e.g. a reversed range) matches its text literally.
+                Some(SectionKind::Files) if !is_regex_marker => Regex::new(&fnmatch_to_regex(&pat))
+                    .or_else(|_| Regex::new(&format!("^{}$", fancy_regex::escape(&pat)))),
+                _ => Regex::new(&pat),
+            }
+            .map_err(|e| RewriteError::BadRegex {
+                line: lineno,
+                pattern: pat.clone(),
+                source: Box::new(e),
+            })?;
+            (Some(compiled), pat)
         } else {
             (None, String::new())
         };
@@ -695,13 +832,59 @@ impl PendingSection {
             None => None,
         };
 
-        Some(PendingSection {
+        let mut method = None;
+        let mut require_kind = None;
+        let mut branch = None;
+        let mut scope = scope;
+        match tag_low.as_str() {
+            "limit" | "limitexcept" => {
+                let methods = tokenize(args);
+                if methods.is_empty() {
+                    return Err(RewriteError::Malformed {
+                        line: lineno,
+                        msg: format!("<{tag}> without methods"),
+                    });
+                }
+                method = Some(AccessMatcher::Method {
+                    methods,
+                    except: tag_low == "limitexcept",
+                });
+            }
+            "requireall" => require_kind = Some(RequireKind::All),
+            "requireany" => require_kind = Some(RequireKind::Any),
+            "requirenone" => require_kind = Some(RequireKind::None),
+            "if" => {
+                branch = Some(IfBranch::If(
+                    scope.as_ref().and_then(|s| s.uri_expr.clone()),
+                ))
+            }
+            "elseif" | "else" => {
+                let own = (tag_low == "elseif").then(|| parse_if_uri_expr(&unquote(args.trim())));
+                scope = Some(Scope {
+                    kind: ScopeKind::If,
+                    regex: None,
+                    negate: false,
+                    uri_expr: else_expr(prior_if_chain, own.clone()),
+                });
+                branch = Some(match own {
+                    Some(own) => IfBranch::ElseIf(own),
+                    None => IfBranch::Else,
+                });
+            }
+            _ => {}
+        }
+
+        Ok(PendingSection {
             kind,
             kind_name,
             regex,
             auth_matcher: auth_section_matcher(kind, &tag_low, args),
             lineno,
             scope,
+            method,
+            require_kind,
+            require_children: Vec::new(),
+            branch,
         })
     }
 }
@@ -772,13 +955,24 @@ fn parse_if_scope(args: &str) -> Option<Scope> {
     })
 }
 
+const MAX_IF_URI_EXPR_DEPTH: usize = 32;
+
 fn parse_if_uri_expr(expr: &str) -> Option<UriExpr> {
+    parse_if_uri_expr_at(expr, 0)
+}
+
+fn parse_if_uri_expr_at(expr: &str, depth: usize) -> Option<UriExpr> {
+    // Tenant-controlled .htaccess must not turn recursive descent (and the
+    // resulting tree's evaluation/drop) into a process stack-overflow abort.
+    if depth > MAX_IF_URI_EXPR_DEPTH {
+        return None;
+    }
     let expr = strip_if_outer_parens(expr.trim())?;
     let or_parts = split_if_top_level(expr, b"||")?;
     if or_parts.len() > 1 {
         return or_parts
             .into_iter()
-            .map(parse_if_uri_expr)
+            .map(|part| parse_if_uri_expr_at(part, depth + 1))
             .collect::<Option<Vec<_>>>()
             .map(UriExpr::Or);
     }
@@ -786,7 +980,7 @@ fn parse_if_uri_expr(expr: &str) -> Option<UriExpr> {
     if and_parts.len() > 1 {
         return and_parts
             .into_iter()
-            .map(parse_if_uri_expr)
+            .map(|part| parse_if_uri_expr_at(part, depth + 1))
             .collect::<Option<Vec<_>>>()
             .map(UriExpr::And);
     }
@@ -874,6 +1068,7 @@ fn split_if_top_level<'a>(expr: &'a str, operator: &[u8; 2]) -> Option<Vec<&'a s
 }
 
 fn strip_if_outer_parens(mut expr: &str) -> Option<&str> {
+    let mut outer_depth = 0;
     loop {
         expr = expr.trim();
         if !expr.starts_with('(') {
@@ -946,6 +1141,10 @@ fn strip_if_outer_parens(mut expr: &str) -> Option<&str> {
         if !stripped {
             return Some(expr);
         }
+        outer_depth += 1;
+        if outer_depth > MAX_IF_URI_EXPR_DEPTH {
+            return None;
+        }
     }
 }
 
@@ -964,47 +1163,63 @@ fn parse_if_uri_cond(expr: &str) -> Option<UriCond> {
         return None;
     };
     let rest = rest.trim_start();
-    // Apache `m#...#` (or `m/.../`, or a bare `re`) delimiter form.
-    let pattern = if let Some(body) = rest.strip_prefix('m') {
-        let body = body.trim_start();
-        let delim = body.chars().next()?;
-        let body = &body[delim.len_utf8()..];
-        let mut escaped = false;
-        let mut end = None;
-        for (i, ch) in body.char_indices() {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == delim {
-                end = Some(i);
-                break;
-            }
+    // ap_expr regexes are delimited: `/re/` or `m<delim>re<delim>`, optionally
+    // followed by the `i` flag. A bare token is not a regex literal.
+    let (delim, body) = match rest.strip_prefix('m') {
+        Some(body) => {
+            let body = body.trim_start();
+            let delim = body.chars().next()?;
+            (delim, &body[delim.len_utf8()..])
         }
-        let end = end?;
-        if !body[end + delim.len_utf8()..].trim().is_empty() {
-            return None;
-        }
-        &body[..end]
-    } else {
-        let mut tokens = rest.split_whitespace();
-        let pattern = tokens.next().unwrap_or(rest);
-        if tokens.next().is_some() {
-            return None;
-        }
-        pattern
+        None => ('/', rest.strip_prefix('/')?),
     };
-    let regex = Regex::new(pattern).ok()?;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == delim {
+            end = Some(i);
+            break;
+        }
+    }
+    let end = end?;
+    let nocase = match body[end + delim.len_utf8()..].trim() {
+        "" => false,
+        "i" => true,
+        _ => return None,
+    };
+    let pattern = &body[..end];
+    let pattern = if nocase {
+        std::borrow::Cow::Owned(format!("(?i){pattern}"))
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    };
+    let regex = Regex::new(&pattern).ok()?;
     Some(UriCond {
         regex: Some(regex),
         negate,
     })
 }
 
+/// Whether the class opened by a `[` (iterator positioned just after it) has a
+/// closing `]`: an optional leading `!`/`^` (negation), then at least one member (a `]` right
+/// after the opening is a member), then a `]`.
+fn glob_class_closes(mut rest: impl Iterator<Item = char> + Clone) -> bool {
+    let mut peek = rest.clone();
+    if matches!(peek.next(), Some('!' | '^')) {
+        rest.next();
+    }
+    rest.next().is_some() && rest.any(|cc| cc == ']')
+}
+
 /// Translate an Apache `fnmatch` glob to an anchored regex. `*` -> `.*`, `?` ->
 /// `.`, `[...]` classes are passed through (Apache and regex share the syntax),
 /// and every other metacharacter is escaped so it is matched literally — this
-/// is exactly what makes `*.log` match `x.log` but not `xlog`.
+/// is exactly what makes `*.log` match `x.log` but not `xlog`. Like fnmatch, a
+/// `[` with no closing `]` is a literal bracket, so a glob always compiles.
 fn fnmatch_to_regex(glob: &str) -> String {
     let mut re = String::with_capacity(glob.len() + 4);
     re.push('^');
@@ -1013,23 +1228,30 @@ fn fnmatch_to_regex(glob: &str) -> String {
         match c {
             '*' => re.push_str(".*"),
             '?' => re.push('.'),
-            '[' => {
-                // Copy a character class verbatim (translate a leading `!` to
-                // regex `^` negation). Find the closing ']'.
+            '[' if glob_class_closes(chars.clone()) => {
+                // Copy a character class (translate a leading `!` to regex `^`
+                // negation). A `]` right after the opening is a member, as in
+                // fnmatch; a literal `[` or `\\` inside is escaped for the regex.
                 re.push('[');
-                if matches!(chars.peek(), Some('!')) {
+                if matches!(chars.peek(), Some('!' | '^')) {
                     chars.next();
                     re.push('^');
                 }
+                let mut first = true;
                 for cc in chars.by_ref() {
-                    re.push(cc);
-                    if cc == ']' {
+                    if cc == ']' && !first {
+                        re.push(']');
                         break;
                     }
+                    if matches!(cc, '[' | ']' | '\\') {
+                        re.push('\\');
+                    }
+                    re.push(cc);
+                    first = false;
                 }
             }
             // Regex metacharacters that must be escaped to stay literal.
-            '.' | '+' | '(' | ')' | '{' | '}' | '^' | '$' | '|' | '\\' => {
+            '.' | '+' | '(' | ')' | '{' | '}' | '^' | '$' | '|' | '\\' | '[' | ']' => {
                 re.push('\\');
                 re.push(c);
             }
@@ -1207,16 +1429,18 @@ fn header_tokens(text: &str) -> Option<Vec<String>> {
 fn classify_set_env_if_for_memo(memo: &mut MemoClass, s: &SetEnvIf, lineno: usize) {
     if s.var.eq_ignore_ascii_case("REDIRECT_STATUS") {
         memo.block(lineno, "set_env_if_seeds_redirect_status");
-        return;
+        // Page-cache keying also consumes vary_headers, even when finished
+        // response memoization is blocked. Retain the attribute's header read.
     }
     let attr = s.attribute.as_str();
     let eq = |n: &str| attr.eq_ignore_ascii_case(n);
-    if eq("request_uri")
-        || eq("request_method")
-        || eq("query_string")
-        || eq("host")
-        || eq("server_name")
-    {
+    if eq("host") || eq("server_name") {
+        // Finished memo keys already carry Host; the page-cache key uses the
+        // canonical vhost and needs this read to distinguish request aliases.
+        memo.vary("host".into());
+        return;
+    }
+    if eq("request_uri") || eq("request_method") || eq("query_string") {
         return;
     }
     if eq("request_protocol") || eq("remote_addr") || eq("server_addr") {

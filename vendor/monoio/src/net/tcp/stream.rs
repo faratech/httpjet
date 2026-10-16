@@ -212,6 +212,15 @@ impl TcpStream {
         self.meta.set_tcp_keepalive(time, interval, retries)
     }
 
+    /// Set the `TCP_USER_TIMEOUT` option on this socket (Linux): how long sent data
+    /// may stay unacknowledged, zero-window probing included, before the kernel
+    /// aborts the connection.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn set_tcp_user_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.meta.set_tcp_user_timeout(timeout)
+    }
+
     /// Creates new `TcpStream` from a `std::net::TcpStream`.
     pub fn from_std(stream: std::net::TcpStream) -> io::Result<Self> {
         #[cfg(unix)]
@@ -628,6 +637,11 @@ impl StreamMeta {
             t = t.with_retries(retries)
         }
         self.socket.as_ref().unwrap().set_tcp_keepalive(&t)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_tcp_user_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.as_ref().unwrap().set_tcp_user_timeout(timeout)
     }
 
     #[cfg(feature = "zero-copy")]

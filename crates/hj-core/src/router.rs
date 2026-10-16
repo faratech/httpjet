@@ -137,6 +137,15 @@ impl Router {
         self.listeners.get(listener)?.default.as_deref()
     }
 
+    /// True when `host` is an exact `<vhostMap>` domain routed to `vhost` on any
+    /// listener: an explicitly configured alias, never a wildcard-routed foreign host.
+    pub fn host_maps_to_vhost(&self, host: &str, vhost: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        self.listeners
+            .values()
+            .any(|r| r.exact.get(&host).is_some_and(|v| v == vhost))
+    }
+
     /// True when `host` is an EXACT `<vhostMap>` domain on this listener — i.e. it was
     /// matched explicitly, NOT routed by the `*` wildcard fallback. Lets the page cache
     /// distinguish a configured hostname from a foreign Host that only reached a vhost via

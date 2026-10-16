@@ -86,6 +86,35 @@ fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 #[test]
+fn footprint_matches_the_stats_byte_totals() {
+    let td = tempfile::tempdir().unwrap();
+    let s = PageStore::new(cfg(td.path()));
+    assert_eq!(s.footprint(), hj_pagecache::CacheFootprint::default());
+    for i in 0..8 {
+        let path = format!("/threads/{i}");
+        store_and_persist(
+            &s,
+            &path,
+            &vec![b'x'; 4096 + i],
+            &["t"],
+            Duration::from_secs(600),
+        );
+        let _ = s.lookup(&key(&path), &identity(&path), Instant::now());
+    }
+    let fp = s.footprint();
+    let st = s.stats();
+    assert!(fp.disk_bytes > 0, "{fp:?}");
+    assert!(fp.index_ram_bytes > 0, "{fp:?}");
+    assert_eq!(fp.disk_bytes, st.disk_bytes);
+    assert_eq!(fp.hot_bytes, st.hot_bytes);
+    assert_eq!(fp.index_ram_bytes, st.memory_bytes - st.tag_index_bytes);
+
+    s.purge_tags(&["t"]);
+    let fp = s.footprint();
+    assert_eq!((fp.index_ram_bytes, fp.disk_bytes), (0, 0), "{fp:?}");
+}
+
+#[test]
 fn entries_survive_a_restart_with_freshness_continuity() {
     let td = tempfile::tempdir().unwrap();
     {

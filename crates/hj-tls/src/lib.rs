@@ -301,9 +301,15 @@ impl CertReloadHandle {
     /// atomically swap them into the live resolver. On any load error the CURRENT
     /// certs stay in place (a failed reload never breaks TLS); new handshakes use
     /// the new certs once this returns `Ok`.
+    ///
+    /// A vhost whose certificate cannot be loaded at reload time (unreadable after a
+    /// renewal, a half-written PEM, a key that does not match) keeps the certificate it
+    /// had before instead of silently falling back to the listener default, which would
+    /// be a name mismatch (Cloudflare 526) until the next reload (#606).
     pub fn reload(&self, server: &ServerConfig, listener: &Listener) -> Result<()> {
+        let previous = self.0.load_full();
         #[allow(unused_mut)]
-        let mut next = build_sni_with_default(server, listener)?;
+        let mut next = build_sni_with_default_retaining(server, listener, Some(&previous.sni))?;
         #[cfg(feature = "ocsp")]
         if let Some(stapling) = self.2.load_full() {
             next.stapling = Some(
@@ -326,11 +332,19 @@ impl CertReloadHandle {
 /// cert/key files). Shared by [`build_server_config_inner`] (boot) and
 /// [`CertReloadHandle::reload`] (SIGHUP) so the two can never diverge.
 fn build_sni_with_default(server: &ServerConfig, listener: &Listener) -> Result<SniWithDefault> {
+    build_sni_with_default_retaining(server, listener, None)
+}
+
+fn build_sni_with_default_retaining(
+    server: &ServerConfig,
+    listener: &Listener,
+    previous: Option<&SniCertMap>,
+) -> Result<SniWithDefault> {
     let tls = listener
         .tls
         .as_ref()
         .ok_or_else(|| anyhow!("listener {} has no TLS configuration", listener.name))?;
-    let sni = build_sni_resolver(server, listener)
+    let sni = build_sni_resolver_retaining(server, listener, previous)
         .with_context(|| format!("listener {}: building SNI resolver", listener.name))?;
     let default_ck = build_certified_key(
         &tls.cert_file,
@@ -494,8 +508,25 @@ pub(crate) fn build_certified_key(
     // only authenticated, fresh responses through generation-bound resolver slots.
     // XML enableStapling alone does not initiate network traffic; the binary
     // requires an explicit responder endpoint and an OCSP-enabled build.
-    Ok(CertifiedKey::new(chain, key))
+    let certified = CertifiedKey::new(chain, key);
+    // A mismatched pair would otherwise install and fail every handshake for its
+    // names. `Unknown` means the key cannot report its public half; allow it.
+    match certified.keys_match() {
+        Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {
+            Ok(certified)
+        }
+        Err(err) => Err(anyhow!(
+            "certificate {} does not match private key {}: {err}",
+            cert_file.display(),
+            key_file.display()
+        )),
+    }
 }
+
+/// Domains whose previously loaded certificate a SIGHUP reload kept because the
+/// vhost's certificate files could not be loaded (#606).
+pub static CERT_RELOAD_RETAINED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Resolve the intermediate-chain PEM to append after the leaf when `cert_chain`
 /// is enabled. Prefers an explicitly-configured chain file; otherwise, for the
@@ -558,6 +589,16 @@ fn listener_chain_file(tls: &ListenerTls) -> Option<PathBuf> {
 /// the mapping is authoritative even when the cert's SAN/CN does not cover that
 /// domain.
 pub(crate) fn build_sni_resolver(server: &ServerConfig, listener: &Listener) -> Result<SniCertMap> {
+    build_sni_resolver_retaining(server, listener, None)
+}
+
+/// [`build_sni_resolver`] for a reload: a vhost whose certificate fails to load
+/// keeps the certificate each of its domains had in `previous`.
+fn build_sni_resolver_retaining(
+    server: &ServerConfig,
+    listener: &Listener,
+    previous: Option<&SniCertMap>,
+) -> Result<SniCertMap> {
     let mut resolver = SniCertMap::new();
     let mut registered = 0usize;
 
@@ -586,12 +627,37 @@ pub(crate) fn build_sni_resolver(server: &ServerConfig, listener: &Listener) -> 
         ) {
             Ok(ck) => Arc::new(ck),
             Err(err) => {
-                tracing::error!(
-                    vhost = %map.vhost,
-                    cert = %vhssl.cert_file.display(),
-                    error = %err,
-                    "failed to load vhost TLS certificate; skipping (its domains fall back to the default cert)"
-                );
+                let mut retained = 0usize;
+                if let Some(previous) = previous {
+                    for domain in &map.domains {
+                        let domain = domain.trim();
+                        if let Some(keys) = previous.by_name.get(&domain.to_ascii_lowercase()) {
+                            for key in keys {
+                                resolver.add(domain, key.clone());
+                            }
+                            retained += 1;
+                        }
+                    }
+                }
+                if retained > 0 {
+                    CERT_RELOAD_RETAINED
+                        .fetch_add(retained as u64, std::sync::atomic::Ordering::Relaxed);
+                    registered += retained;
+                    tracing::error!(
+                        vhost = %map.vhost,
+                        cert = %vhssl.cert_file.display(),
+                        error = %err,
+                        domains = retained,
+                        "failed to reload vhost TLS certificate; retaining the previously loaded certificate"
+                    );
+                } else {
+                    tracing::error!(
+                        vhost = %map.vhost,
+                        cert = %vhssl.cert_file.display(),
+                        error = %err,
+                        "failed to load vhost TLS certificate; skipping (its domains fall back to the default cert)"
+                    );
+                }
                 continue;
             }
         };
@@ -1802,6 +1868,109 @@ mod tests {
     /// End-to-end through `build_server_config`: the wrapped resolver presents
     /// the name-uncovered vhost cert for its mapped SNI, and the listener
     /// default cert for any unmapped/missing SNI.
+    fn reload_fixture(dir: &Path, tag: &str) -> (ServerConfig, Listener, PathBuf) {
+        let dflt = gen_cert(&["default.example.com"]);
+        let d_cert = write_tmp(dir, &format!("{tag}-default-cert.pem"), &dflt.cert_pem);
+        let d_key = write_tmp(dir, &format!("{tag}-default-key.pem"), &dflt.key_pem);
+        let vh = gen_cert(&["publisher.example"]);
+        let vh_cert = write_tmp(dir, &format!("{tag}-vh-cert.pem"), &vh.cert_pem);
+        let vh_key = write_tmp(dir, &format!("{tag}-vh-key.pem"), &vh.key_pem);
+        let mut server = base_server();
+        server.vhosts.insert(
+            "publisher.example".into(),
+            make_vhost_decl(
+                "publisher.example",
+                Some(VhSsl {
+                    key_file: vh_key.clone(),
+                    cert_file: vh_cert,
+                    cert_chain: false,
+                    ca_cert_file: None,
+                }),
+            ),
+        );
+        let listener = Listener {
+            name: "TLS".into(),
+            address: "*:8443".into(),
+            secure: true,
+            proxy_protocol: false,
+            proxy_protocol_peers: vec![],
+            uds_path: None,
+            vhost_map: vec![VhostMap {
+                vhost: "publisher.example".into(),
+                domains: vec!["publisher.example".into(), "news.forum.example".into()],
+            }],
+            tls: Some(ListenerTls {
+                key_file: d_key,
+                cert_file: d_cert,
+                cert_chain: false,
+                ca_cert_file: None,
+                client_verify: 0,
+                verify_depth: 1,
+                enable_stapling: false,
+                crl_file: None,
+            }),
+        };
+        (server, listener, vh_key)
+    }
+
+    /// Regression (#606): a vhost whose certificate cannot be loaded at SIGHUP time
+    /// keeps its previous certificate instead of silently falling back to the listener
+    /// default (a name mismatch, i.e. Cloudflare 526, until the next reload).
+    #[test]
+    fn reload_retains_previous_vhost_cert_when_its_files_are_unreadable() {
+        ensure_provider();
+        let dir = tmpdir();
+        let (server, listener, vh_key) = reload_fixture(&dir, "reload-retain");
+        let (_config, handle) = build_server_config_reloadable(&server, &listener).unwrap();
+        let resolve = |name: &str| {
+            handle
+                .0
+                .load()
+                .sni
+                .resolve_name(Some(name), P256_SCHEMES)
+                .expect("mapped name resolves")
+        };
+        let before = resolve("news.forum.example");
+        let default_before = handle.0.load().default.clone().unwrap();
+        let retained_before = CERT_RELOAD_RETAINED.load(std::sync::atomic::Ordering::Relaxed);
+
+        std::fs::remove_file(&vh_key).unwrap();
+        handle
+            .reload(&server, &listener)
+            .expect("reload still succeeds");
+
+        for name in ["news.forum.example", "publisher.example"] {
+            let after = resolve(name);
+            assert!(
+                Arc::ptr_eq(&before, &after),
+                "{name} keeps its previous cert"
+            );
+            assert!(
+                !Arc::ptr_eq(&after, &default_before),
+                "{name} is not downgraded"
+            );
+        }
+        assert!(
+            CERT_RELOAD_RETAINED.load(std::sync::atomic::Ordering::Relaxed) >= retained_before + 2
+        );
+    }
+
+    #[test]
+    fn mismatched_key_pair_is_rejected() {
+        ensure_provider();
+        let dir = tmpdir();
+        let a = gen_cert(&["a.example"]);
+        let b = gen_cert(&["b.example"]);
+        let a_cert = write_tmp(&dir, "mismatch-a-cert.pem", &a.cert_pem);
+        let b_key = write_tmp(&dir, "mismatch-b-key.pem", &b.key_pem);
+        let err = build_certified_key(&a_cert, None, &b_key)
+            .err()
+            .expect("a certificate with someone else's key must not load");
+        assert!(err.to_string().contains("does not match"), "{err}");
+        let a_key = write_tmp(&dir, "mismatch-a-key.pem", &a.key_pem);
+        build_certified_key(&a_cert, None, &a_key).expect("a matching pair loads");
+    }
+
     #[test]
     fn full_config_resolver_serves_uncovered_sni_and_default_fallback() {
         ensure_provider();

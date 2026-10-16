@@ -997,7 +997,7 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "hj-acl"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "globset",
  "hj-core",
@@ -1010,7 +1010,7 @@ dependencies = [
 
 [[package]]
 name = "hj-acme"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "hj-cache"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "hj-config",
  "parking_lot",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "hj-compress"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "async-trait",
  "brotli",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "hj-config"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "ipnet",
  "quick-xml",
@@ -1071,7 +1071,7 @@ dependencies = [
 
 [[package]]
 name = "hj-core"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "hj-extension"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "async-trait",
  "hj-core",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "hj-fastcgi"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1111,14 +1111,14 @@ dependencies = [
 
 [[package]]
 name = "hj-geo"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "ipnet",
 ]
 
 [[package]]
 name = "hj-h2"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1136,14 +1136,14 @@ dependencies = [
 
 [[package]]
 name = "hj-http"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "hj-core",
 ]
 
 [[package]]
 name = "hj-log"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "flate2",
  "tokio",
@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "hj-lsapi"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "hj-ocsp"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "base64 0.23.1",
  "foreign-types",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "hj-pagecache"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "hj-proxy"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "bytes",
  "hj-core",
@@ -1227,7 +1227,7 @@ dependencies = [
 
 [[package]]
 name = "hj-rewrite"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "base64 0.23.1",
  "bcrypt",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "hj-static"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "hj-tls"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1332,7 +1332,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "httpjet"
-version = "0.0.5"
+version = "0.0.7"
 dependencies = [
  "anyhow",
  "arc-swap",

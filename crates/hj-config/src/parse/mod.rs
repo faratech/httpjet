@@ -229,8 +229,8 @@ fn convert_tuning(r: RawTuning) -> Tuning {
     let d = Tuning::default();
     Tuning {
         max_connections: u32_of(&r.max_connections, d.max_connections),
-        conn_timeout: secs_of(&r.conn_timeout, 60),
-        keep_alive_timeout: secs_of(&r.keep_alive_timeout, 5),
+        conn_timeout: secs_in_range(&r.conn_timeout, 60, 1..=10_000, "connTimeout"),
+        keep_alive_timeout: secs_in_range(&r.keep_alive_timeout, 5, 1..=10_000, "keepAliveTimeout"),
         max_keep_alive_req: u32_of(&r.max_keep_alive_req, d.max_keep_alive_req),
         max_req_url_len: bytes_of(&r.max_req_url_len, d.max_req_url_len as u64) as usize,
         max_req_header_size: bytes_of(&r.max_req_header_size, d.max_req_header_size as u64)
@@ -291,6 +291,10 @@ fn convert_expires(r: Option<RawExpires>) -> ExpiresConfig {
     };
     ExpiresConfig {
         enabled: truthy(&r.enable_expires),
+        enable_declared: r
+            .enable_expires
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty()),
         by_type: r
             .expires_by_type
             .as_deref()
@@ -633,7 +637,7 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(std::path::PathBuf::from),
+                        .map(|p| PathBuf::from(ctx.expand(p))),
                 })
             } else {
                 None
@@ -689,6 +693,28 @@ pub(crate) fn parse_mime(text: &str) -> MimeMap {
 mod tests {
     use super::*;
 
+    /// Regression (#605): connTimeout/keepAliveTimeout outside LiteSpeed's [1, 10000]
+    /// fall back to the defaults instead of becoming unbounded deadlines.
+    #[test]
+    fn connection_timeouts_out_of_range_use_the_defaults() {
+        let tuning = |conn: &str, keep: &str| {
+            convert_tuning(RawTuning {
+                conn_timeout: Some(conn.into()),
+                keep_alive_timeout: Some(keep.into()),
+                ..Default::default()
+            })
+        };
+        let t = tuning("0", "0");
+        assert_eq!(t.conn_timeout, Duration::from_secs(60));
+        assert_eq!(t.keep_alive_timeout, Duration::from_secs(5));
+        let t = tuning("20000", "10001");
+        assert_eq!(t.conn_timeout, Duration::from_secs(60));
+        assert_eq!(t.keep_alive_timeout, Duration::from_secs(5));
+        let t = tuning("30", "10000");
+        assert_eq!(t.conn_timeout, Duration::from_secs(30));
+        assert_eq!(t.keep_alive_timeout, Duration::from_secs(10_000));
+    }
+
     #[test]
     fn fastcgi_processor_has_a_distinct_opt_in_identity() {
         for kind in ["fcgi", "fastcgi"] {
@@ -706,6 +732,32 @@ mod tests {
                 ExtAddress::Uds(_)
             ));
         }
+    }
+
+    #[test]
+    fn listener_crl_file_is_var_expanded() {
+        use super::raw::{RawListener, RawListenerList};
+        let ctx = crate::subst::SubstCtx {
+            server_root: "/usr/local/lsws".into(),
+            ..Default::default()
+        };
+        let list = RawListenerList {
+            listener: vec![RawListener {
+                name: Some("tls".into()),
+                address: Some("127.0.0.1:8443".into()),
+                secure: Some("1".into()),
+                key_file: Some("$SERVER_ROOT/conf/k.pem".into()),
+                cert_file: Some("$SERVER_ROOT/conf/c.pem".into()),
+                crl_file: Some("$SERVER_ROOT/conf/ca.crl".into()),
+                ..Default::default()
+            }],
+        };
+        let listeners = convert_listeners(Some(list), &ctx);
+        let tls = listeners[0].tls.as_ref().unwrap();
+        assert_eq!(
+            tls.crl_file,
+            Some(PathBuf::from("/usr/local/lsws/conf/ca.crl"))
+        );
     }
 
     // ----- (Tier 2) per-listener proxyProtocol -----

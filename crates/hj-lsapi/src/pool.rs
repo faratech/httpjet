@@ -59,6 +59,7 @@ pub struct PoolStats {
     pub worker_attribution_failures: u64,
     pub eagain_retries: u64,
     pub eagain_terminal_exhaustions: u64,
+    pub unread_body_drops: u64,
 }
 
 #[derive(Default)]
@@ -74,6 +75,7 @@ struct PoolCounters {
     attribution_consecutive_failures: AtomicU64,
     eagain_retries: AtomicU64,
     eagain_terminal_exhaustions: AtomicU64,
+    unread_body_drops: AtomicU64,
 }
 
 impl PoolCounters {
@@ -87,6 +89,7 @@ impl PoolCounters {
             worker_attribution_failures: self.worker_attribution_failures.load(Ordering::Relaxed),
             eagain_retries: self.eagain_retries.load(Ordering::Relaxed),
             eagain_terminal_exhaustions: self.eagain_terminal_exhaustions.load(Ordering::Relaxed),
+            unread_body_drops: self.unread_body_drops.load(Ordering::Relaxed),
         }
     }
 }
@@ -99,10 +102,21 @@ const EXTERNAL_GENERATION_BYTES: u64 = (size_of::<AtomicU64>() * EXTERNAL_GENERA
 const EXTERNAL_GENERATION_STATE_OFFSET: usize = 0;
 const EXTERNAL_GENERATION_MARKER_OFFSET: usize = size_of::<AtomicU64>();
 
+/// Published by a stopping supervisor: no worker family is current, so every
+/// family announced before it is stale. [`generation_marker_fingerprint`] never
+/// yields it.
+const RETIRED_MARKER_FINGERPRINT: u64 = 1;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ExternalGenerationSnapshot {
     epoch: u64,
     marker_fingerprint: u64,
+}
+
+impl ExternalGenerationSnapshot {
+    fn is_retired(self) -> bool {
+        self.marker_fingerprint == RETIRED_MARKER_FINGERPRINT
+    }
 }
 
 /// The generation state is a trust anchor (epoch + promoted-family marker):
@@ -144,6 +158,10 @@ fn validate_generation_dir(path: &Path) -> io::Result<()> {
 /// an Acquire atomic load, with no per-request filesystem operation.
 pub struct ExternalGeneration {
     map: Mmap,
+    /// The last two worker families this reader saw published. While a stop's
+    /// retirement is current only they are stale: the successor supervisor's
+    /// workers answer queued dials before it publishes their family.
+    seen_families: [AtomicU64; 2],
 }
 
 impl ExternalGeneration {
@@ -159,7 +177,12 @@ impl ExternalGeneration {
                 .len(EXTERNAL_GENERATION_BYTES as usize)
                 .map(&file)?
         };
-        Ok(Self { map })
+        let generation = Self {
+            map,
+            seen_families: [AtomicU64::new(0), AtomicU64::new(0)],
+        };
+        generation.snapshot();
+        Ok(generation)
     }
 
     pub fn load(&self) -> u64 {
@@ -167,7 +190,30 @@ impl ExternalGeneration {
     }
 
     fn snapshot(&self) -> ExternalGenerationSnapshot {
-        read_generation_snapshot(&self.map)
+        let snapshot = read_generation_snapshot(&self.map);
+        let family = snapshot.marker_fingerprint;
+        if family > RETIRED_MARKER_FINGERPRINT {
+            let latest = self.seen_families[0].load(Ordering::Acquire);
+            if latest != family
+                && self.seen_families[0]
+                    .compare_exchange(latest, family, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                self.seen_families[1].store(latest, Ordering::Release);
+            }
+        }
+        snapshot
+    }
+
+    fn worker_is_stale(&self, worker_family: u64) -> bool {
+        let current = self.snapshot();
+        if current.is_retired() {
+            return self
+                .seen_families
+                .iter()
+                .any(|family| family.load(Ordering::Acquire) == worker_family);
+        }
+        current.marker_fingerprint != 0 && worker_family != current.marker_fingerprint
     }
 }
 
@@ -178,6 +224,9 @@ impl ExternalGeneration {
 /// mapped could make that reader fault.
 pub struct ExternalGenerationWriter {
     map: MmapMut,
+    /// Serializes publications and records a stop-time retirement, after which
+    /// a late promotion (a reload racing the stop) cannot re-announce a family.
+    retired: Mutex<bool>,
 }
 
 impl ExternalGenerationWriter {
@@ -204,7 +253,10 @@ impl ExternalGenerationWriter {
                 .len(EXTERNAL_GENERATION_BYTES as usize)
                 .map_mut(&file)?
         };
-        let writer = Self { map };
+        let writer = Self {
+            map,
+            retired: Mutex::new(false),
+        };
         let state = mapped_atomic(&writer.map, EXTERNAL_GENERATION_STATE_OFFSET);
         let observed = state.load(Ordering::Acquire);
         if observed & 1 != 0 {
@@ -227,6 +279,7 @@ impl ExternalGenerationWriter {
     /// the new family's workers against the stale fingerprint and retire them
     /// after every response. Promotions go through [`Self::advance_with_marker`].
     pub fn publish(&self, generation: u64) {
+        let _serialized = self.retired.lock();
         self.update(generation, None);
     }
 
@@ -236,6 +289,7 @@ impl ExternalGenerationWriter {
     /// Epoch-only, like [`Self::publish`]: never use this to announce a
     /// worker-family replacement — that is [`Self::advance_with_marker`].
     pub fn advance(&self, core_generation: u64) -> u64 {
+        let _serialized = self.retired.lock();
         let current = self.snapshot().epoch;
         let next = current.saturating_add(1).max(core_generation);
         self.update(next, None);
@@ -246,9 +300,30 @@ impl ExternalGenerationWriter {
     /// one seqlock snapshot. Readers can therefore distinguish an old worker
     /// from a candidate that accepted just before publication.
     pub fn advance_with_marker(&self, core_generation: u64, marker: &str) -> u64 {
+        let retired = self.retired.lock();
+        let fingerprint = if *retired {
+            RETIRED_MARKER_FINGERPRINT
+        } else {
+            generation_marker_fingerprint(marker)
+        };
         let current = self.snapshot().epoch;
         let next = current.saturating_add(1).max(core_generation);
-        self.update(next, Some(generation_marker_fingerprint(marker)));
+        self.update(next, Some(fingerprint));
+        next
+    }
+
+    /// Announce that this supervisor is stopping: advance the epoch with a
+    /// fingerprint no worker family carries. External web pools then drop their
+    /// idle sockets, refuse to re-pool any checked-out one, and SIGUSR1 each
+    /// attributed worker only after its response completes, so the drain ends
+    /// when in-flight requests do instead of waiting out pooled keep-alive
+    /// connections. The next supervisor's startup promotion advances past this
+    /// epoch with its real fingerprint. Returns the generation that was published.
+    pub fn retire_all(&self) -> u64 {
+        let mut retired = self.retired.lock();
+        *retired = true;
+        let next = self.snapshot().epoch.saturating_add(1);
+        self.update(next, Some(RETIRED_MARKER_FINGERPRINT));
         next
     }
 
@@ -326,7 +401,7 @@ fn generation_marker_fingerprint(marker: &str) -> u64 {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    hash.max(1)
+    hash.max(RETIRED_MARKER_FINGERPRINT + 1)
 }
 
 #[derive(Debug)]
@@ -406,9 +481,8 @@ impl WorkerRetirement {
         })
     }
 
-    fn retire_if_stale(&self, current: ExternalGenerationSnapshot, counters: &PoolCounters) {
-        if current.marker_fingerprint == 0 || self.marker_fingerprint == current.marker_fingerprint
-        {
+    fn retire_if_stale(&self, external: &ExternalGeneration, counters: &PoolCounters) {
+        if !external.worker_is_stale(self.marker_fingerprint) {
             return;
         }
         let rc = unsafe {
@@ -863,6 +937,8 @@ pub struct LsapiPool {
     /// When active, rapid connection failures trigger an open state that fast-fails
     /// new requests until recovery is detected. Attached via `with_circuit_breaker()`.
     breaker: Option<Arc<DialBreaker>>,
+    /// Peak checked-out connections since the last [`Self::take_inflight_max`].
+    inflight_max: AtomicU64,
 }
 
 /// Default idle TTL when the config carries no `pc_keep_alive_timeout`.
@@ -900,6 +976,7 @@ impl LsapiPool {
             counters: Arc::new(PoolCounters::default()),
             retry_timeout: Duration::ZERO,
             breaker: None,
+            inflight_max: AtomicU64::new(0),
         }
     }
 
@@ -978,6 +1055,27 @@ impl LsapiPool {
 
     pub fn stats(&self) -> PoolStats {
         self.counters.snapshot()
+    }
+
+    /// Connections checked out right now (held semaphore permits).
+    pub fn inflight(&self) -> u64 {
+        self.max_conns.saturating_sub(self.sem.available_permits()) as u64
+    }
+
+    /// Peak [`Self::inflight`] since the previous call, then restart the window. Connections
+    /// still checked out carry into the new window, so the result is never below the
+    /// current in-flight count.
+    pub fn take_inflight_max(&self) -> u64 {
+        self.inflight_max
+            .swap(0, Ordering::Relaxed)
+            .max(self.inflight())
+    }
+
+    fn note_inflight(&self) {
+        let now = self.inflight();
+        if now > self.inflight_max.load(Ordering::Relaxed) {
+            self.inflight_max.fetch_max(now, Ordering::Relaxed);
+        }
     }
 
     /// The pool's current generation.
@@ -1085,6 +1183,7 @@ impl LsapiPool {
                 Ok(Err(_)) => return Err(PoolError::Closed),
                 Err(_) => return Err(PoolError::Timeout(self.init_timeout)),
             };
+        self.note_inflight();
 
         // Snapshot the generation we acquire against; the conn we hand out is
         // stamped with this on re-pool, and refused if the generation advanced.
@@ -1395,7 +1494,9 @@ fn attempt_worker_attribution(
 
 /// Push a recovered socket back into the idle set IFF the pool generation has not
 /// advanced since it was acquired. A socket that spans a restart belongs to a
-/// dead worker, so we drop it instead of re-pooling.
+/// dead worker, so we drop it instead of re-pooling. While a stopping supervisor's
+/// retirement is current, a fresh dial still lands on a draining worker, so it
+/// is never re-pooled either: the worker serves that one response and retires.
 fn repool_if_current(
     idle: &Arc<Mutex<VecDeque<IdleEntry>>>,
     generation: &Arc<AtomicU64>,
@@ -1409,7 +1510,9 @@ fn repool_if_current(
     if worker.is_none() && external_generation.is_some() {
         worker = attempt_worker_attribution(&stream, worker_pid_hint, counters);
     }
-    if refresh_generation(idle, generation, external_generation, counters) == acquire_gen {
+    if refresh_generation(idle, generation, external_generation, counters) == acquire_gen
+        && !external_generation.is_some_and(|external| external.snapshot().is_retired())
+    {
         idle.lock().push_back(IdleEntry {
             stream,
             worker,
@@ -1422,7 +1525,7 @@ fn repool_if_current(
             .stale_checked_out_drops
             .fetch_add(1, Ordering::Relaxed);
         if let (Some(external), Some(worker)) = (external_generation, worker.as_ref()) {
-            worker.retire_if_stale(external.snapshot(), counters);
+            worker.retire_if_stale(external, counters);
         }
     }
     // else: generation advanced (worker restarted) -> drop the socket.
@@ -1506,6 +1609,7 @@ impl PooledConn {
                 worker: self.worker.take(),
                 worker_pid_hint: self.worker_pid_hint.take(),
                 poisoned: false,
+                expect_drained: false,
             }),
             idle: self.idle.clone(),
             generation: self.generation.clone(),
@@ -1545,6 +1649,7 @@ struct ReturnSlot {
     worker: Option<WorkerRetirement>,
     worker_pid_hint: Option<u32>,
     poisoned: bool,
+    expect_drained: bool,
 }
 
 /// Re-pools a split connection once both halves are returned cleanly.
@@ -1606,6 +1711,33 @@ impl ReturnGuard {
     pub fn poison(&self) {
         self.slot.lock().poisoned = true;
     }
+
+    /// A request body was written on this connection: re-pool it only if lsphp
+    /// dequeued every byte we sent.
+    ///
+    /// lsphp neither drains an unread request body at `LSAPI_Finish_r` nor
+    /// discards it before the next `readReq`; PHP's own deactivate-time drain is
+    /// skipped once a script opens `php://input`. A script that reads the body
+    /// partially would leave client bytes in the socket that lsphp parses as the
+    /// next BEGIN_REQUEST, so keep-alive framing must not depend on the app.
+    pub fn expect_body_drained(&self) {
+        self.slot.lock().expect_drained = true;
+    }
+}
+
+/// Bytes this end wrote that the peer has not dequeued yet, or `None` when the
+/// kernel cannot say (treated as "not drained").
+fn unix_unsent_bytes(stream: &UnixStream) -> Option<usize> {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: `stream` owns an open AF_UNIX stream socket for the duration of the
+    // call, and TIOCOUTQ (== SIOCOUTQ on Linux, `unix_outq_len`) writes exactly one
+    // `c_int` through the pointer, which refers to a live, aligned local.
+    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+    if rc == 0 {
+        usize::try_from(queued).ok()
+    } else {
+        None
+    }
 }
 
 impl Drop for ReturnGuard {
@@ -1620,15 +1752,26 @@ impl Drop for ReturnGuard {
                 slot.write.take(),
                 slot.worker.take(),
                 slot.worker_pid_hint.take(),
+                slot.expect_drained,
             )
         };
 
         // A missing half means that side did not finish cleanly; we then drop both.
-        if let (Some(read), Some(write), worker, worker_pid_hint) = halves {
+        if let (Some(read), Some(write), worker, worker_pid_hint, expect_drained) = halves {
             // Both directions completed cleanly: re-pool the recovered socket IFF
             // the generation has not advanced (worker not restarted). Halves not
             // from the same socket (reunite Err) should be impossible here.
             if let Ok(stream) = read.reunite(write) {
+                if expect_drained && unix_unsent_bytes(&stream) != Some(0) {
+                    self.counters
+                        .unread_body_drops
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        target: "hj_lsapi",
+                        "lsphp left part of the request body unread; closing the connection instead of re-pooling"
+                    );
+                    return;
+                }
                 repool_if_current(
                     &self.idle,
                     &self.generation,
@@ -1663,7 +1806,7 @@ fn discard_stale_entry(
         entry.worker = attempt_worker_attribution(&entry.stream, entry.worker_pid_hint, counters);
     }
     if let (Some(external), Some(worker)) = (external_generation, entry.worker.as_ref()) {
-        worker.retire_if_stale(external.snapshot(), counters);
+        worker.retire_if_stale(external, counters);
     }
     drop(entry);
 }
@@ -1884,6 +2027,152 @@ mod tests {
         let _ = std::fs::remove_file(generation_path);
     }
 
+    #[test]
+    fn retirement_epoch_is_monotonic_across_supervisor_restarts() {
+        let path = tmp_generation("retire");
+        let first = ExternalGenerationWriter::open_or_create(&path).unwrap();
+        let reader = ExternalGeneration::open(&path).unwrap();
+        assert_eq!(first.advance_with_marker(1, "family-a"), 1);
+        assert!(!reader.snapshot().is_retired());
+
+        assert_eq!(first.retire_all(), 2);
+        assert_eq!(
+            reader.snapshot(),
+            ExternalGenerationSnapshot {
+                epoch: 2,
+                marker_fingerprint: RETIRED_MARKER_FINGERPRINT,
+            }
+        );
+        assert_eq!(
+            first.advance_with_marker(1, "late-family"),
+            3,
+            "a promotion racing the stop still advances the epoch"
+        );
+        assert!(
+            reader.snapshot().is_retired(),
+            "a stopping supervisor must not re-announce a worker family"
+        );
+        drop(first);
+
+        let next = ExternalGenerationWriter::open_or_create(&path).unwrap();
+        assert_eq!(next.load(), 3);
+        assert_eq!(next.advance_with_marker(1, "family-b"), 4);
+        assert_eq!(
+            reader.snapshot(),
+            ExternalGenerationSnapshot {
+                epoch: 4,
+                marker_fingerprint: generation_marker_fingerprint("family-b"),
+            }
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 16);
+        ExternalGeneration::open(&path).expect("a retired state stays a valid mapping");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retirement_stales_only_families_seen_before_it() {
+        let path = tmp_generation("retired-families");
+        let writer = ExternalGenerationWriter::open_or_create(&path).unwrap();
+        writer.advance_with_marker(1, "family-a");
+        let reader = ExternalGeneration::open(&path).unwrap();
+        writer.advance_with_marker(1, "family-b");
+        let a = generation_marker_fingerprint("family-a");
+        let b = generation_marker_fingerprint("family-b");
+        let c = generation_marker_fingerprint("family-c");
+        assert!(reader.worker_is_stale(a));
+        assert!(!reader.worker_is_stale(b));
+
+        writer.retire_all();
+        assert!(reader.worker_is_stale(a), "a still-draining reload family");
+        assert!(reader.worker_is_stale(b), "the stopping family");
+        assert!(
+            !reader.worker_is_stale(c),
+            "the successor's workers answer before it publishes their family"
+        );
+        drop(writer);
+
+        let next = ExternalGenerationWriter::open_or_create(&path).unwrap();
+        next.advance_with_marker(1, "family-c");
+        assert!(reader.worker_is_stale(b));
+        assert!(!reader.worker_is_stale(c));
+
+        let late = ExternalGeneration::open(&path).unwrap();
+        next.retire_all();
+        assert!(late.worker_is_stale(c));
+        let unseen = ExternalGeneration::open(&path).unwrap();
+        assert!(
+            !unseen.worker_is_stale(c),
+            "a reader that never saw a family cannot tell it from a successor"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn marker_fingerprints_never_collide_with_retirement() {
+        for marker in ["", "a", "family-a", "httpjet-1-2-3"] {
+            let fingerprint = generation_marker_fingerprint(marker);
+            assert_ne!(fingerprint, 0);
+            assert_ne!(fingerprint, RETIRED_MARKER_FINGERPRINT);
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_refuses_to_repool_checked_out_and_fresh_connections() {
+        let socket_path = tmp_sock("retirement");
+        let generation_path = tmp_generation("retirement");
+        let writer = ExternalGenerationWriter::open_or_create(&generation_path).unwrap();
+        writer.advance_with_marker(1, "family-a");
+
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                held.push(stream);
+            }
+        });
+        let pool = LsapiPool::new(&socket_path, 4, Duration::from_secs(2))
+            .external_generation_file(&generation_path)
+            .unwrap();
+
+        let idle = pool.acquire().await.unwrap();
+        let checked_out = pool.acquire().await.unwrap();
+        drop(idle);
+        assert_eq!(pool.idle_count(), 1);
+
+        writer.retire_all();
+        assert_eq!(pool.generation(), 2);
+        assert_eq!(pool.idle_count(), 0, "retirement drops idle connections");
+        drop(checked_out);
+        assert_eq!(
+            pool.idle_count(),
+            0,
+            "a connection spanning retirement must not be re-pooled"
+        );
+        let fresh = pool.acquire().await.unwrap();
+        drop(fresh);
+        assert_eq!(
+            pool.idle_count(),
+            0,
+            "a connection dialed while retired must not be re-pooled"
+        );
+
+        drop(writer);
+        let next = ExternalGenerationWriter::open_or_create(&generation_path).unwrap();
+        next.advance_with_marker(1, "family-b");
+        let current = pool.acquire().await.unwrap();
+        drop(current);
+        assert_eq!(pool.generation(), 3);
+        assert_eq!(pool.idle_count(), 1, "the next family re-pools normally");
+        let stats = pool.stats();
+        assert_eq!(stats.stale_checked_out_drops, 2);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(generation_path);
+    }
+
     #[tokio::test]
     async fn attribution_backoff_caps_consecutive_capture_failures() {
         let socket_path = tmp_sock("attribution-backoff");
@@ -1928,6 +2217,41 @@ mod tests {
         let _ = server.await;
         let _ = std::fs::remove_file(socket_path);
         let _ = std::fs::remove_file(generation_path);
+    }
+
+    #[tokio::test]
+    async fn inflight_max_tick_swaps_and_carries_held_connections() {
+        let path = tmp_sock("inflight");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (s, _) = listener.accept().await.unwrap();
+                held.push(s);
+            }
+        });
+        let pool = LsapiPool::new(&path, 4, Duration::from_secs(2));
+        assert_eq!((pool.inflight(), pool.take_inflight_max()), (0, 0));
+
+        let a = pool.acquire().await.unwrap();
+        let b = pool.acquire().await.unwrap();
+        let c = pool.acquire().await.unwrap();
+        drop(b);
+        drop(c);
+        assert_eq!(pool.inflight(), 1);
+        assert_eq!(pool.take_inflight_max(), 3, "peak of the window");
+        assert_eq!(
+            pool.take_inflight_max(),
+            1,
+            "the swap resets the peak; a still-held connection carries over"
+        );
+        drop(a);
+        assert_eq!(pool.inflight(), 0);
+        assert_eq!(pool.take_inflight_max(), 0);
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

@@ -286,6 +286,9 @@ pub(super) struct EvalState {
     /// still valid. Cleared once a rule rewrites `uri`, after which rules are
     /// evaluated normally (the cheap, rare fallback).
     pub(super) prefilter_valid: bool,
+    /// The working URI is an absolute URL from a substitution without `[R]`;
+    /// `evaluate` promotes it to a 302 once the rule loop ends (#665).
+    pub(super) pending_absolute: bool,
     /// Count of `[N]`/`[next]` restarts so far. Lives here (not in `run_pass`) so
     /// the guard accumulates ACROSS passes: a `[N]` returns from `run_pass` to
     /// restart, so a per-call counter would reset to 0 every restart and never
@@ -578,14 +581,9 @@ fn apply_rule(
     if rule.flags.proxy {
         let target = subst_target.unwrap_or_else(|| state.uri.clone());
         let effective_query = if rule.flags.qsd { "" } else { &state.query };
-        let target = if effective_query.is_empty()
-            || target.contains('?')
-            || (target.ends_with('?') && !rule.flags.qsa)
-        {
-            target
-        } else {
-            format!("{target}?{effective_query}")
-        };
+        // #622: [QSA] must merge the original query even when the
+        // substitution carries its own `?query` (same merge as redirects).
+        let target = apply_query_to_location(&target, effective_query, rule.flags.qsa, input);
         return Some(RuleApply::Terminal(RewriteOutcome::Proxy {
             target_url: target,
             env: state.env_vec(),
@@ -608,7 +606,21 @@ fn apply_rule(
             }));
         }
 
-        let location = subst_target.clone().unwrap_or_else(|| state.uri.clone());
+        let location = match subst_target.as_deref() {
+            Some(target) => {
+                let (path, q) = split_subst(target);
+                let path = if is_absolute_uri(path) {
+                    path.to_string()
+                } else {
+                    resolve_subst_path(path, rs, input)
+                };
+                match q {
+                    Some(q) => format!("{path}?{q}"),
+                    None => path,
+                }
+            }
+            None => state.uri.clone(),
+        };
         // QSA on a redirect appends original query; QSD discards it.
         let effective_query = if rule.flags.qsd { "" } else { &state.query };
         let location = apply_query_to_location(&location, effective_query, rule.flags.qsa, input);
@@ -625,7 +637,15 @@ fn apply_rule(
     // Plain (internal) rewrite.
     if let Some(target) = subst_target {
         let (path, q) = split_subst(&target);
-        let new_uri = resolve_subst_path(path, rs, input);
+        // OLS promotes an absolute-URI result to a 302 only AFTER the rule loop, so
+        // later rules still apply ([F], [E=], ...); see `evaluate` (#665).
+        let absolute = is_absolute_uri(path);
+        let new_uri = if absolute {
+            path.to_string()
+        } else {
+            resolve_subst_path(path, rs, input)
+        };
+        state.pending_absolute = absolute;
         // `[QSD]` discards the current query before any merge.
         let base_query = if rule.flags.qsd { "" } else { &state.query };
         let new_query = compute_query(q, base_query, rule.flags.qsa);
@@ -756,7 +776,13 @@ fn eval_conditions(
     let mut i = 0;
     while i < conds.len() {
         let cond = &conds[i];
-        if eval_one_cond(cond, input, state, rule_caps) {
+        let passed = eval_one_cond(cond, input, state, rule_caps);
+        // An unevaluable cond must fail the rule (the caller turns it into a
+        // fail-closed outcome) before negation or an `[OR]` sibling can pass it.
+        if state.regex_failed {
+            return false;
+        }
+        if passed {
             // Passed: skip the rest of this OR group.
             while conds[i].or_next && i + 1 < conds.len() {
                 i += 1;
@@ -908,7 +934,10 @@ fn parse_leading_i64(s: &str) -> i64 {
     if i == start_digits {
         return 0;
     }
-    s[..i].parse().unwrap_or(0)
+    // strtoll saturates on overflow.
+    s[..i]
+        .parse()
+        .unwrap_or(if bytes[0] == b'-' { i64::MIN } else { i64::MAX })
 }
 
 /// Apply a `-f/-d/-l/-s/-x` test to `path`.
@@ -919,7 +948,8 @@ fn file_test(input: &RewriteInput, path: &str, kind: FileTestKind) -> bool {
             FileTestKind::Dir => t.is_dir,
             FileTestKind::Link => t.is_link,
             FileTestKind::Size => t.is_nonempty,
-            FileTestKind::Exists => t.is_file || t.is_dir || t.is_link,
+            FileTestKind::Exists => t.exists || t.is_file || t.is_dir,
+            FileTestKind::Exec => t.is_exec,
         },
         StatSource::Live(f) => match f(std::path::Path::new(path)) {
             Some(md) => {
@@ -930,6 +960,7 @@ fn file_test(input: &RewriteInput, path: &str, kind: FileTestKind) -> bool {
                     FileTestKind::Link => t.is_link,
                     FileTestKind::Size => t.is_nonempty,
                     FileTestKind::Exists => true,
+                    FileTestKind::Exec => t.is_exec,
                 }
             }
             None => false,
@@ -940,7 +971,8 @@ fn file_test(input: &RewriteInput, path: &str, kind: FileTestKind) -> bool {
                 FileTestKind::Dir => t.is_dir,
                 FileTestKind::Link => t.is_link,
                 FileTestKind::Size => t.is_nonempty,
-                FileTestKind::Exists => t.is_file || t.is_dir || t.is_link,
+                FileTestKind::Exists => t.exists || t.is_file || t.is_dir,
+                FileTestKind::Exec => t.is_exec,
             },
             None => false,
         },
@@ -979,6 +1011,25 @@ fn resolve_subst_path(path: &str, rs: &RuleSet, input: &RewriteInput) -> String 
     };
     let base = base.trim_end_matches('/');
     format!("{base}/{path}")
+}
+
+/// The scheme set OLS treats as an absolute substitution result.
+pub(super) fn is_absolute_uri(s: &str) -> bool {
+    const SCHEMES: [&str; 9] = [
+        "http://",
+        "https://",
+        "ftp://",
+        "gopher://",
+        "mailto:",
+        "news:",
+        "nntp://",
+        "ws://",
+        "wss://",
+    ];
+    SCHEMES.iter().any(|p| {
+        s.get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p))
+    })
 }
 
 fn has_scheme(s: &str) -> bool {
@@ -1139,8 +1190,9 @@ fn fully_qualify_redirect(location: &str, input: &RewriteInput) -> String {
         return location.to_string();
     }
     let scheme = if input.https { "https" } else { "http" };
-    // Authority: prefer the explicit SERVER_NAME, else the Host header. Include
-    // a non-default port only when SERVER_PORT was supplied and is non-default.
+    // Authority: SERVER_NAME (the caller passes the request Host for an explicitly
+    // mapped alias, #688), else the Host header. Include a non-default port only when
+    // SERVER_PORT was supplied, is non-default, and is real (a UDS listener reports 0).
     let host: &str = if !input.server_name.is_empty() {
         &input.server_name
     } else {
@@ -1157,7 +1209,7 @@ fn fully_qualify_redirect(location: &str, input: &RewriteInput) -> String {
         .is_some_and(|p| p.parse::<u16>().is_ok())
         && host.contains(':');
     match input.server_port {
-        Some(port) if !host_has_port && !is_default_port(port, input.https) => {
+        Some(port) if port != 0 && !host_has_port && !is_default_port(port, input.https) => {
             format!("{scheme}://{host}:{port}{location}")
         }
         _ => format!("{scheme}://{host}{location}"),

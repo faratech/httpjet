@@ -29,6 +29,33 @@ enum Stream {
     Unix(tokio::net::UnixStream),
 }
 
+impl Stream {
+    /// #629: an idle pooled socket whose peer already closed reads EOF (or
+    /// errors / has unexpected bytes); a live one reports WouldBlock.
+    fn is_healthy(&self) -> bool {
+        let mut probe = [0u8; 1];
+        let result = match self {
+            Self::Tcp(s) => s.try_read(&mut probe),
+            Self::Unix(s) => s.try_read(&mut probe),
+        };
+        matches!(result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    }
+}
+
+/// #627: releases the reserved `open` slot if the connect future is dropped
+/// (acquire timeout / caller cancellation) before a PooledConnection exists.
+struct SlotGuard {
+    inner: Arc<Inner>,
+    armed: bool,
+}
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.inner.release_open();
+        }
+    }
+}
+
 impl AsyncRead for Stream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -137,12 +164,17 @@ impl FastCgiPool {
                     state.idle.pop_front();
                     state.open -= 1;
                 }
-                if let Some(idle) = state.idle.pop_back() {
-                    return Ok(PooledConnection {
-                        inner: self.0.clone(),
-                        stream: Some(idle.stream),
-                        reusable: false,
-                    });
+                while let Some(idle) = state.idle.pop_back() {
+                    if idle.stream.is_healthy() {
+                        return Ok(PooledConnection {
+                            inner: self.0.clone(),
+                            stream: Some(idle.stream),
+                            reusable: false,
+                        });
+                    }
+                    // #629: peer closed while idle — discard and keep looking
+                    // (falls through to a fresh dial when no idle survives).
+                    state.open -= 1;
                 }
                 if state.open < self.0.max_open {
                     state.open += 1;
@@ -152,6 +184,10 @@ impl FastCgiPool {
                 }
             };
             if reserve {
+                let mut guard = SlotGuard {
+                    inner: self.0.clone(),
+                    armed: true,
+                };
                 let stream = match &self.0.endpoint {
                     Endpoint::Tcp(address) => tokio::net::TcpStream::connect(address)
                         .await
@@ -164,15 +200,15 @@ impl FastCgiPool {
                         .map(Stream::Unix),
                 };
                 return match stream {
-                    Ok(stream) => Ok(PooledConnection {
-                        inner: self.0.clone(),
-                        stream: Some(stream),
-                        reusable: false,
-                    }),
-                    Err(_) => {
-                        self.0.release_open();
-                        Err(PoolError::Connect)
+                    Ok(stream) => {
+                        guard.armed = false;
+                        Ok(PooledConnection {
+                            inner: self.0.clone(),
+                            stream: Some(stream),
+                            reusable: false,
+                        })
                     }
+                    Err(_) => Err(PoolError::Connect),
                 };
             }
             notified.await;
@@ -271,8 +307,12 @@ mod tests {
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = accepted.clone();
         let server = tokio::spawn(async move {
-            while let Ok((_stream, _)) = listener.accept().await {
+            // Hold accepted streams open: dropping each at loop end would make
+            // the pooled socket dead on reuse (#629 probe would redial).
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
             }
         });
         let pool = FastCgiPool::new(
@@ -295,6 +335,55 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn slot_guard_releases_reservation_on_drop() {
+        // #627: a cancelled mid-connect acquire drops the guard, freeing open.
+        let pool = FastCgiPool::new(
+            Endpoint::Tcp("127.0.0.1:1".parse().unwrap()),
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        pool.0.state.lock().unwrap().open = 1;
+        let guard = SlotGuard {
+            inner: pool.0.clone(),
+            armed: true,
+        };
+        drop(guard);
+        assert_eq!(pool.counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn dead_idle_connection_is_discarded_for_fresh_dial() {
+        // #629: server closes the first conn while it sits idle; the next
+        // acquire must not hand out the dead socket.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            drop(first);
+            let (_second, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let pool = FastCgiPool::new(
+            Endpoint::Tcp(address),
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut first = pool.acquire().await.unwrap();
+        first.mark_reusable();
+        drop(first);
+        // Let the server-side close reach the pooled socket.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = pool.acquire().await.unwrap();
+        assert_eq!(pool.counts(), (1, 0));
+        drop(second);
+        server.await.unwrap();
     }
 
     #[tokio::test]

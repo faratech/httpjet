@@ -13,7 +13,7 @@
 //! the last redundant per-request `statx` on the rewrite hot path.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -28,6 +28,10 @@ pub const DEFAULT_STAT_TTL: Duration = Duration::from_secs(1);
 /// just `statx` through, exactly as before).
 const DEFAULT_CAP: usize = 32_768;
 
+/// Paths longer than this are never memoized: real hot paths are short, and an
+/// attacker-chosen 8 KiB key would otherwise pin its bytes for the process life.
+const MAX_KEY_BYTES: usize = 1024;
+
 /// TTL-coalesced cache of `-f`/`-d`/`-l`/`-s` file tests, keyed by absolute path.
 pub struct StatCache {
     map: DashMap<PathBuf, (Instant, Option<FileTests>)>,
@@ -35,9 +39,12 @@ pub struct StatCache {
     cap: usize,
     /// Approximate entry count for the cap gate: `DashMap::len()` sweeps (and
     /// briefly locks) every shard, and once the map is full that sweep ran on
-    /// EVERY uncached request. Entries are never removed, so a saturating
-    /// counter bumped on new-key insert is exact up to insert races.
+    /// EVERY uncached request. Bumped on new-key insert and lowered by
+    /// `sweep_expired`, exact up to insert races.
     count: AtomicUsize,
+    created: Instant,
+    /// Milliseconds after `created` of the last expired-entry sweep (+1; 0 = never).
+    last_sweep_ms: AtomicU64,
 }
 
 impl StatCache {
@@ -49,6 +56,8 @@ impl StatCache {
             ttl,
             cap: DEFAULT_CAP,
             count: AtomicUsize::new(0),
+            created: Instant::now(),
+            last_sweep_ms: AtomicU64::new(0),
         }
     }
 
@@ -66,7 +75,10 @@ impl StatCache {
             present = true;
         } // read guard dropped here before we take the write lock below
         let tests = Self::stat(path);
-        if present || self.count.load(Ordering::Relaxed) < self.cap {
+        if present
+            || (path.as_os_str().len() <= MAX_KEY_BYTES
+                && (self.count.load(Ordering::Relaxed) < self.cap || self.sweep_expired()))
+        {
             if self
                 .map
                 .insert(path.to_path_buf(), (Instant::now(), tests))
@@ -78,10 +90,47 @@ impl StatCache {
         tests
     }
 
+    /// Once the map is full, drop entries past their TTL (they would be re-stat'd
+    /// on next use anyway), at most once per TTL. Returns whether room was made.
+    fn sweep_expired(&self) -> bool {
+        let now_ms = self.created.elapsed().as_millis() as u64 + 1;
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < self.ttl.as_millis() as u64 {
+            return false;
+        }
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        let mut removed = 0;
+        self.map.retain(|_, e| {
+            let keep = e.0.elapsed() < self.ttl;
+            removed += usize::from(!keep);
+            keep
+        });
+        let _ = self
+            .count
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(removed))
+            });
+        self.count.load(Ordering::Relaxed) < self.cap
+    }
+
+    /// `-f`/`-d`/`-s` follow a symlink; `-l` must see the link itself (lstat), or it
+    /// could never be true and a dangling link would read as absent.
     fn stat(path: &Path) -> Option<FileTests> {
-        std::fs::metadata(path)
-            .ok()
+        let lmd = std::fs::symlink_metadata(path).ok()?;
+        if !lmd.file_type().is_symlink() {
+            return Some(FileTests::from_metadata(&lmd));
+        }
+        let mut tests = std::fs::metadata(path)
             .map(|md| FileTests::from_metadata(&md))
+            .unwrap_or_default();
+        tests.is_link = true;
+        Some(tests)
     }
 }
 
@@ -107,6 +156,44 @@ mod tests {
         assert!(c.tests(&missing).is_none());
 
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn symlinks_report_is_link_and_follow_for_other_tests() {
+        let dir =
+            std::env::temp_dir().join(format!("httpjet_statcache_link_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target.txt"), b"hi").unwrap();
+        std::os::unix::fs::symlink(dir.join("target.txt"), dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).unwrap();
+
+        let c = StatCache::new(Duration::ZERO);
+        let t = c.tests(&dir.join("link")).expect("link exists");
+        assert!(t.is_link && t.is_file && t.is_nonempty);
+        let t = c
+            .tests(&dir.join("dangling"))
+            .expect("dangling link exists");
+        assert!(t.is_link && !t.is_file && !t.is_dir);
+        assert!(!c.tests(&dir.join("target.txt")).unwrap().is_link);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_map_reclaims_expired_entries_and_skips_long_keys() {
+        let mut c = StatCache::new(Duration::from_millis(20));
+        c.cap = 2;
+        c.tests(Path::new("/nonexistent-statcache-a"));
+        c.tests(Path::new("/nonexistent-statcache-b"));
+        assert_eq!(c.map.len(), 2);
+        std::thread::sleep(Duration::from_millis(40));
+        c.tests(Path::new("/nonexistent-statcache-c"));
+        assert!(c.map.contains_key(Path::new("/nonexistent-statcache-c")));
+        assert_eq!(c.map.len(), 1);
+
+        let long = PathBuf::from(format!("/{}", "x".repeat(2048)));
+        assert!(c.tests(&long).is_none());
+        assert!(!c.map.contains_key(&long));
     }
 
     #[test]

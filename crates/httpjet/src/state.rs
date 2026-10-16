@@ -878,23 +878,31 @@ fn build_transforms(
     ]
 }
 
-/// Per-vhost `<expires>` blocks (audit): parsed into `VHostConfig.expires` for years
-/// but never consulted — only the server-level `expiresByType` applied. A vhost with
-/// its OWN enabled block overrides the server rules entirely (LSWS semantics).
+/// Per-vhost `<expires>` blocks, resolved the way OLS does: `enableExpires`
+/// inherits the server value unless the vhost declares it, and the vhost's
+/// `expiresByType` entries override per type on top of the server's. A disabled
+/// vhost gets an explicit empty rule set so the server rules cannot apply.
 fn build_vhost_expires(server: &ServerConfig) -> HashMap<String, Arc<ExpiresRules>> {
     let mut out = HashMap::new();
     for (name, decl) in &server.vhosts {
         let Some(cfg) = &decl.config else { continue };
         let Some(ex) = &cfg.expires else { continue };
-        if !ex.enabled {
-            continue;
-        }
-        out.insert(
-            name.clone(),
-            Arc::new(ExpiresRules::from_pairs(
-                ex.by_type.iter().map(|(t, v)| (t.clone(), v.clone())),
-            )),
-        );
+        let enabled = if ex.enable_declared {
+            ex.enabled
+        } else {
+            server.expires.enabled
+        };
+        let rules = if enabled {
+            ExpiresRules::from_pairs(
+                ex.by_type
+                    .iter()
+                    .chain(server.expires.by_type.iter())
+                    .map(|(t, v)| (t.clone(), v.clone())),
+            )
+        } else {
+            ExpiresRules::from_pairs(std::iter::empty::<(String, String)>())
+        };
+        out.insert(name.clone(), Arc::new(rules));
     }
     out
 }
@@ -1298,6 +1306,49 @@ mod tests {
     use hj_core::config::{Context, ContextKind, ExtAddress, VHostConfig, VHostDecl};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    #[test]
+    fn vhost_expires_inherits_enable_and_overrides_per_type() {
+        let server = r#"<httpServerConfig><serverName>x</serverName>
+<expires><enableExpires>1</enableExpires><expiresByType>image/*=A604800, text/css=A3600</expiresByType></expires>
+<virtualHostList>
+<virtualHost><name>off</name><vhRoot>/tmp/off</vhRoot><configFile>/nonexistent/off.xml</configFile></virtualHost>
+<virtualHost><name>typed</name><vhRoot>/tmp/typed</vhRoot><configFile>/nonexistent/typed.xml</configFile></virtualHost>
+<virtualHost><name>plain</name><vhRoot>/tmp/plain</vhRoot><configFile>/nonexistent/plain.xml</configFile></virtualHost>
+</virtualHostList></httpServerConfig>"#;
+        let docs = std::collections::BTreeMap::from([
+            (
+                "off".to_string(),
+                "<virtualHostConfig><expires><enableExpires>0</enableExpires></expires></virtualHostConfig>"
+                    .to_string(),
+            ),
+            (
+                "typed".to_string(),
+                "<virtualHostConfig><expires><expiresByType>image/png=A60</expiresByType></expires></virtualHostConfig>"
+                    .to_string(),
+            ),
+            (
+                "plain".to_string(),
+                "<virtualHostConfig></virtualHostConfig>".to_string(),
+            ),
+        ]);
+        let cfg = hj_config::parse_bundle(Path::new("/tmp"), server, &docs, "").unwrap();
+        let map = build_vhost_expires(&cfg);
+
+        let off = map
+            .get("off")
+            .expect("disabled vhost must suppress server rules");
+        assert!(off.lookup("image/png").is_none());
+
+        let typed = map
+            .get("typed")
+            .expect("typed-only block inherits enabled=1");
+        assert_eq!(typed.lookup("image/png").unwrap().age_secs, 60);
+        assert_eq!(typed.lookup("image/jpeg").unwrap().age_secs, 604800);
+        assert_eq!(typed.lookup("text/css").unwrap().age_secs, 3600);
+
+        assert!(!map.contains_key("plain"));
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(

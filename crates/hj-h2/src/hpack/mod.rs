@@ -12,8 +12,9 @@
 //!
 //! String literals use Huffman (§5.2) whenever it is strictly smaller than the raw
 //! octets, on both encode and decode. Values are treated as raw octet strings
-//! end-to-end (HPACK strings are not text); only DECODED header fields are
-//! UTF-8-validated, because httpjet's request contract surfaces them as `str`.
+//! end-to-end (HPACK strings are not text): the decoder's dynamic table and
+//! [`Decoder::decode_octets`] are byte-based, so obs-text (0x80-0xFF) in a field never
+//! desyncs the table or fails the connection.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -31,8 +32,9 @@ pub enum Error {
     Truncated,
     /// An index referenced an entry outside the static+dynamic table.
     BadIndex,
-    /// A string literal was not valid UTF-8 / not valid Huffman (header values are
-    /// byte strings, but httpjet's contract uses `str`; non-UTF-8 is rejected here).
+    /// A string literal was not valid Huffman (EOS/padding errors). From the `str`-based
+    /// [`Decoder::decode`] wrapper only, also a field that was not UTF-8 — reported after
+    /// the whole block was consumed, so the dynamic table stays in sync.
     BadString,
     /// A dynamic table size update was illegal: either it exceeded the protocol limit
     /// (SETTINGS_HEADER_TABLE_SIZE, RFC 7541 §6.3) or it did not appear at the very start
@@ -42,8 +44,9 @@ pub enum Error {
     /// accounted per field as `name.len() + value.len() + 32` (RFC 7541 §4.1). This is the
     /// "HTTP/2 Bomb" guard: a block of near-empty indexed entries amplifies 1 wire byte into
     /// a full header field, so the wire-size cap never fires — this trips on the decoded size
-    /// instead. The decoder is connection-scoped/stateful, so aborting mid-block desyncs the
-    /// shared HPACK context → treat as connection-fatal (COMPRESSION_ERROR), like a bad decode.
+    /// instead. The block is still decoded to the end with emission suppressed past the cap,
+    /// so the connection-scoped dynamic table stays in sync and the caller can refuse just
+    /// the one stream (a decode error proper stays connection-fatal).
     HeaderListTooLarge,
 }
 
@@ -67,7 +70,7 @@ fn encode_string_bytes(out: &mut Vec<u8>, raw: &[u8]) {
     }
 }
 
-fn decode_string<'a>(buf: &'a [u8], pos: &mut usize) -> Result<Cow<'a, str>, Error> {
+fn decode_string<'a>(buf: &'a [u8], pos: &mut usize) -> Result<Cow<'a, [u8]>, Error> {
     let huff = buf.get(*pos).ok_or(Error::Truncated)? & 0x80 != 0;
     let len = integer::decode(buf, pos, 7).ok_or(Error::Truncated)? as usize;
     let end = pos.checked_add(len).ok_or(Error::Truncated)?;
@@ -75,12 +78,9 @@ fn decode_string<'a>(buf: &'a [u8], pos: &mut usize) -> Result<Cow<'a, str>, Err
     *pos = end;
     if huff {
         let decoded = huffman::decode(bytes).ok_or(Error::BadString)?;
-        let s = String::from_utf8(decoded).map_err(|_| Error::BadString)?;
-        Ok(Cow::Owned(s))
+        Ok(Cow::Owned(decoded))
     } else {
-        std::str::from_utf8(bytes)
-            .map(Cow::Borrowed)
-            .map_err(|_| Error::BadString)
+        Ok(Cow::Borrowed(bytes))
     }
 }
 
@@ -94,7 +94,7 @@ fn decode_string_into<'s>(
     buf: &'s [u8],
     pos: &mut usize,
     scratch: &'s mut Vec<u8>,
-) -> Result<&'s str, Error> {
+) -> Result<&'s [u8], Error> {
     let huff = buf.get(*pos).ok_or(Error::Truncated)? & 0x80 != 0;
     let len = integer::decode(buf, pos, 7).ok_or(Error::Truncated)? as usize;
     let end = pos.checked_add(len).ok_or(Error::Truncated)?;
@@ -102,9 +102,9 @@ fn decode_string_into<'s>(
     *pos = end;
     if huff {
         huffman::decode_into(scratch, bytes).ok_or(Error::BadString)?;
-        std::str::from_utf8(scratch).map_err(|_| Error::BadString)
+        Ok(scratch)
     } else {
-        std::str::from_utf8(bytes).map_err(|_| Error::BadString)
+        Ok(bytes)
     }
 }
 
@@ -205,18 +205,17 @@ impl Encoder {
     /// tracks that minimum; it is only relevant when we have a real pending change.
     pub(crate) fn set_peer_max_size(&mut self, peer_max: usize) {
         let target = peer_max.min(self.preferred_max);
-        if target != self.max_size {
-            // Track the lowest target seen — needed to produce the §4.2 intermediate signal.
-            self.pending_min_size = Some(
-                self.pending_min_size
-                    .map_or(target, |prev| prev.min(target)),
-            );
-            self.pending_size_update = Some(target);
-        } else {
-            // Net no-op: the target equals the currently active size, so no update is needed
-            // and any earlier intermediate-minimum is moot (no change will be emitted).
+        let min = self
+            .pending_min_size
+            .map_or(target, |prev| prev.min(target));
+        if target == self.max_size && min >= target {
             self.pending_size_update = None;
             self.pending_min_size = None;
+        } else {
+            // A return to the active size after a lower value still needs min-then-final, or
+            // the peer's decoder (which did evict to the minimum) desyncs from our table.
+            self.pending_min_size = Some(min);
+            self.pending_size_update = Some(target);
         }
     }
 
@@ -385,7 +384,7 @@ impl Encoder {
 
 /// HPACK decoder maintaining the dynamic table per RFC 7541 §2.3.2 / §4.
 pub struct Decoder {
-    dynamic: VecDeque<(String, String)>,
+    dynamic: VecDeque<(Box<[u8]>, Box<[u8]>)>,
     size: usize,
     /// Current dynamic-table size limit (mutated by §6.3 size updates).
     max_size: usize,
@@ -394,7 +393,8 @@ pub struct Decoder {
     hard_max: usize,
     /// SETTINGS_MAX_HEADER_LIST_SIZE we advertise (RFC 7540 §6.5.2): the maximum decoded
     /// header-list size, summed per field as `name.len() + value.len() + 32`. Bounds the
-    /// "HTTP/2 Bomb" amplification; a block exceeding it fails with `HeaderListTooLarge`.
+    /// "HTTP/2 Bomb" amplification; a block exceeding it is fully consumed (table kept in
+    /// sync), emits nothing past the cap, and then fails with `HeaderListTooLarge`.
     max_list_size: usize,
 }
 
@@ -415,17 +415,15 @@ impl Decoder {
     /// `self.dynamic`). Returning refs lets the decode loop emit indexed/named headers with
     /// ZERO per-header `String` allocation (the `emit` closure builds the HeaderName/Value),
     /// instead of materializing a throwaway owned tuple per header on every request decode.
-    fn entry_ref(&self, index: usize) -> Option<(&str, &str)> {
+    fn entry_ref(&self, index: usize) -> Option<(&[u8], &[u8])> {
         if let Some((n, v)) = static_table::get(index) {
-            return Some((n, v));
+            return Some((n.as_bytes(), v.as_bytes()));
         }
         let dyn_idx = index.checked_sub(static_table::TABLE.len() + 1)?;
-        self.dynamic
-            .get(dyn_idx)
-            .map(|(n, v)| (n.as_str(), v.as_str()))
+        self.dynamic.get(dyn_idx).map(|(n, v)| (&**n, &**v))
     }
 
-    fn insert(&mut self, name: String, value: String) {
+    fn insert(&mut self, name: Box<[u8]>, value: Box<[u8]>) {
         let entry_size = name.len() + value.len() + ENTRY_OVERHEAD;
         self.evict_to(self.max_size.saturating_sub(entry_size));
         if entry_size <= self.max_size {
@@ -455,11 +453,31 @@ impl Decoder {
         Ok(())
     }
 
-    /// Decode a complete header block, invoking `emit(name, value)` for each field in
-    /// order. Returns `Err` on malformed input.
+    /// [`Self::decode_octets`] for callers that want text: a field that is not UTF-8 is
+    /// skipped and the block then fails with [`Error::BadString`] (after it was consumed in
+    /// full, so the table is still in sync). A more severe decode error wins.
     pub fn decode<F>(&mut self, buf: &[u8], mut emit: F) -> Result<(), Error>
     where
         F: FnMut(&str, &str),
+    {
+        let mut non_utf8 = false;
+        self.decode_octets(buf, |n, v| {
+            match (std::str::from_utf8(n), std::str::from_utf8(v)) {
+                (Ok(n), Ok(v)) => emit(n, v),
+                _ => non_utf8 = true,
+            }
+        })?;
+        if non_utf8 {
+            return Err(Error::BadString);
+        }
+        Ok(())
+    }
+
+    /// Decode a complete header block, invoking `emit(name, value)` with each field's raw
+    /// octets in order. Returns `Err` on malformed input.
+    pub fn decode_octets<F>(&mut self, buf: &[u8], mut emit: F) -> Result<(), Error>
+    where
+        F: FnMut(&[u8], &[u8]),
     {
         let mut pos = 0;
         // §4.2: a dynamic table size update MUST occur at the beginning of a header block,
@@ -470,14 +488,19 @@ impl Decoder {
         // refuse the block once the running total exceeds the advertised MAX_HEADER_LIST_SIZE.
         // This bounds the "HTTP/2 Bomb" — a block of near-empty indexed entries that costs ~1
         // wire byte each but appends a full field — which the wire-size cap alone cannot catch.
+        // Past the cap, keep decoding (so incremental-indexing inserts still land and the
+        // dynamic table matches the peer's) but stop emitting; the error is reported once the
+        // whole block is consumed. The wire block itself is bounded by the caller.
         let list_limit = self.max_list_size;
-        let mut listed = 0usize;
-        let mut emit_checked = |n: &str, v: &str| -> Result<(), Error> {
-            listed = listed.saturating_add(n.len() + v.len() + ENTRY_OVERHEAD);
-            if listed > list_limit {
-                return Err(Error::HeaderListTooLarge);
+        let listed = std::cell::Cell::new(0usize);
+        let mut emit_checked = |n: &[u8], v: &[u8]| -> Result<(), Error> {
+            let total = listed
+                .get()
+                .saturating_add(n.len() + v.len() + ENTRY_OVERHEAD);
+            listed.set(total);
+            if total <= list_limit {
+                emit(n, v);
             }
-            emit(n, v);
             Ok(())
         };
         while pos < buf.len() {
@@ -497,7 +520,7 @@ impl Decoder {
                 // separate statement first releases the shared `self`/`buf` borrow the `Cow` held,
                 // so the insert can reborrow `&mut self`. (The non-indexing arm below never owns —
                 // that is the allocation the `Cow` return type saves.)
-                let (n, v) = (n.into_owned(), v.into_owned());
+                let (n, v) = (n.into_owned().into(), v.into_owned().into());
                 self.insert(n, v);
             } else if b & 0x20 != 0 {
                 // §6.3 Dynamic table size update (5-bit prefix).
@@ -517,15 +540,18 @@ impl Decoder {
                 DECODE_SCRATCH.with(|cell| -> Result<(), Error> {
                     let mut guard = cell.borrow_mut();
                     let (nb, vb) = &mut *guard;
-                    let name: &str = if name_idx == 0 {
+                    let name: &[u8] = if name_idx == 0 {
                         decode_string_into(buf, &mut pos, nb)?
                     } else {
                         self.entry_ref(name_idx).ok_or(Error::BadIndex)?.0
                     };
-                    let value: &str = decode_string_into(buf, &mut pos, vb)?;
+                    let value: &[u8] = decode_string_into(buf, &mut pos, vb)?;
                     emit_checked(name, value)
                 })?;
             }
+        }
+        if listed.get() > list_limit {
+            return Err(Error::HeaderListTooLarge);
         }
         Ok(())
     }
@@ -537,7 +563,7 @@ impl Decoder {
         buf: &'a [u8],
         pos: &mut usize,
         prefix_bits: u8,
-    ) -> Result<(Cow<'a, str>, Cow<'a, str>), Error> {
+    ) -> Result<(Cow<'a, [u8]>, Cow<'a, [u8]>), Error> {
         let name_idx = integer::decode(buf, pos, prefix_bits).ok_or(Error::Truncated)? as usize;
         // Borrow rather than own: an indexed name borrows the table, a non-Huffman literal
         // borrows the wire buffer (`decode_string` already returns a `Cow`). The caller owns
@@ -952,6 +978,42 @@ mod tests {
     }
 
     #[test]
+    fn over_cap_block_is_fully_consumed_and_keeps_the_table_in_sync() {
+        // Regression (#595): an over-cap list is a stream error, so the connection's
+        // dynamic table must end exactly as after a full decode. The insert of `x-dyn: v1`
+        // (literal with incremental indexing) comes AFTER the bomb has crossed the cap: a
+        // decoder that stopped at the cap would never make it, and a later block that
+        // references dynamic index 62 would then fail instead of resolving it.
+        let mut block: Vec<u8> = std::iter::repeat_n(0x80 | 32u8, 1024).collect();
+        block.extend_from_slice(&[0x40, 0x05]);
+        block.extend_from_slice(b"x-dyn");
+        block.push(0x02);
+        block.extend_from_slice(b"v1");
+        let follow_up = [0x80 | 62u8];
+
+        let mut capped = Decoder::new(4096, 1024);
+        let mut emitted = 0usize;
+        assert_eq!(
+            capped.decode(&block, |_, _| emitted += 1),
+            Err(Error::HeaderListTooLarge)
+        );
+        assert!(emitted < 1024, "emission stops at the cap");
+        let mut uncapped = Decoder::new(4096, 1 << 20);
+        uncapped.decode(&block, |_, _| {}).unwrap();
+
+        let mut a = Vec::new();
+        capped
+            .decode(&follow_up, |n, v| a.push((n.to_owned(), v.to_owned())))
+            .unwrap();
+        let mut b = Vec::new();
+        uncapped
+            .decode(&follow_up, |n, v| b.push((n.to_owned(), v.to_owned())))
+            .unwrap();
+        assert_eq!(a, vec![("x-dyn".to_owned(), "v1".to_owned())]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
     fn realistic_block_stays_under_list_cap() {
         // A normal small request (a handful of indexed fields) decodes without tripping.
         const COOKIE_INDEXED: u8 = 0x80 | 32;
@@ -1025,23 +1087,109 @@ mod tests {
 
     #[test]
     fn transient_table_size_change_before_block_is_coalesced() {
-        // Peer lowers then restores the table size before we emit any block. Since eviction is
-        // deferred to emit time, the net effect is no change → no size update, table intact.
+        // Raising then restoring with no lower value in between nets to no change.
         let mut enc = Encoder::new();
         let mut b1 = Vec::new();
-        enc.encode_header(&mut b1, "x-a", "1"); // index it
+        enc.encode_header(&mut b1, "x-a", "1");
+        enc.set_peer_max_size(8192);
+        enc.set_peer_max_size(4096);
+        let mut b2 = Vec::new();
+        enc.encode_header(&mut b2, "x-a", "1");
+        assert_eq!(
+            b2.len(),
+            1,
+            "a no-op change emits nothing and keeps the entry"
+        );
+    }
+
+    #[test]
+    fn lowered_then_restored_table_size_signals_min_then_final() {
+        // RFC 7541 §4.2: SETTINGS_HEADER_TABLE_SIZE 0 then 4096 between blocks must emit
+        // update(0) then update(4096) — the peer's decoder flushed its table at 0.
+        let mut enc = Encoder::new();
+        let mut b1 = Vec::new();
+        enc.encode_header(&mut b1, "x-a", "1");
         enc.set_peer_max_size(0);
         enc.set_peer_max_size(4096);
         let mut b2 = Vec::new();
         enc.encode_header(&mut b2, "x-a", "1");
-        assert_ne!(
-            b2[0], 0x20,
-            "a transient change that nets to no-op emits nothing"
-        );
+        assert_eq!(b2[0], 0x20, "update(0) leads the block");
+        assert_eq!(&b2[1..4], &[0x3f, 0xe1, 0x1f], "then update(4096)");
+        assert!(b2.len() > 4, "the flushed entry is re-sent as a literal");
+
+        let mut dec = Decoder::new(4096, 1 << 16);
+        dec.decode(&b1, |_, _| {}).unwrap();
+        let mut d2 = Vec::new();
+        dec.decode(&b2, |n, v| d2.push((n.to_string(), v.to_string())))
+            .unwrap();
+        assert_eq!(d2, vec![("x-a".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn obs_text_literals_decode_as_octets_and_keep_the_table_in_sync() {
+        // A Latin-1 0xE9 (not UTF-8) in an incrementally indexed value, a Huffman
+        // without-indexing value and a raw never-indexed value; then index 62 must
+        // resolve the stored entry byte-exactly, with size accounted in octets.
+        let mut buf = Vec::new();
+        buf.push(0x40);
+        super::encode_string(&mut buf, "user-agent");
+        super::encode_string_bytes(&mut buf, b"caf\xe9");
+        buf.push(0x00);
+        super::encode_string(&mut buf, "x-h");
+        super::encode_string_bytes(&mut buf, b"aaaaaaaaaaaaaaaa\xe9");
+        buf.push(0x10);
+        super::encode_string(&mut buf, "x-r");
+        super::encode_string_bytes(&mut buf, b"\xff");
+        let mut dec = Decoder::new(4096, 1 << 20);
+        let mut got: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        dec.decode_octets(&buf, |n, v| got.push((n.to_vec(), v.to_vec())))
+            .unwrap();
         assert_eq!(
-            b2.len(),
-            1,
-            "the dynamic entry survived (never actually evicted)"
+            got,
+            vec![
+                (b"user-agent".to_vec(), b"caf\xe9".to_vec()),
+                (b"x-h".to_vec(), b"aaaaaaaaaaaaaaaa\xe9".to_vec()),
+                (b"x-r".to_vec(), b"\xff".to_vec()),
+            ]
         );
+        assert_eq!(dec.size, 10 + 4 + ENTRY_OVERHEAD);
+        let mut follow = Vec::new();
+        integer::encode(&mut follow, 62, 7, 0x80);
+        let mut got = Vec::new();
+        dec.decode_octets(&follow, |n, v| got.push((n.to_vec(), v.to_vec())))
+            .unwrap();
+        assert_eq!(got, vec![(b"user-agent".to_vec(), b"caf\xe9".to_vec())]);
+    }
+
+    #[test]
+    fn str_decode_reports_non_utf8_after_consuming_the_block() {
+        let mut buf = Vec::new();
+        buf.push(0x40);
+        super::encode_string(&mut buf, "x-a");
+        super::encode_string_bytes(&mut buf, b"\xe9");
+        buf.push(0x40);
+        super::encode_string(&mut buf, "x-b");
+        super::encode_string(&mut buf, "ok");
+        let mut dec = Decoder::new(4096, 1 << 20);
+        let mut got = Vec::new();
+        assert_eq!(
+            dec.decode(&buf, |n, v| got.push((n.to_owned(), v.to_owned()))),
+            Err(Error::BadString)
+        );
+        assert_eq!(got, vec![("x-b".to_string(), "ok".to_string())]);
+        let mut follow = Vec::new();
+        integer::encode(&mut follow, 63, 7, 0x80);
+        let mut raw = Vec::new();
+        dec.decode_octets(&follow, |n, v| raw.push((n.to_vec(), v.to_vec())))
+            .unwrap();
+        assert_eq!(raw, vec![(b"x-a".to_vec(), b"\xe9".to_vec())]);
+    }
+
+    #[test]
+    fn invalid_huffman_is_still_a_decode_error() {
+        // 0xff 0xff 0xff 0xff is the 30-bit EOS symbol, which a literal must not contain.
+        let buf = [0x00, 0x01, b'x', 0x84, 0xff, 0xff, 0xff, 0xff];
+        let mut dec = Decoder::new(4096, 1 << 20);
+        assert_eq!(dec.decode_octets(&buf, |_, _| {}), Err(Error::BadString));
     }
 }

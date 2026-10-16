@@ -80,6 +80,11 @@ pub struct InflightLeader {
 }
 
 impl InflightRegistry {
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
     /// Become the leader for `key_hash`, or get the leader's notify to wait on as a follower.
     pub fn enter(self: &Arc<Self>, key_hash: u64) -> Enter {
         use dashmap::mapref::entry::Entry;

@@ -257,3 +257,13 @@ fn mapped_vhost_with_unloaded_config_is_known_but_unloaded() {
     // An unknown listener is never "known but unloaded".
     assert!(!r.host_known_but_unloaded("nope", Some("broken.example.com")));
 }
+
+#[test]
+fn host_maps_to_vhost_only_for_explicit_aliases() {
+    // #688: redirect authority may follow an explicit alias, never a wildcard-routed host.
+    let r = build_router();
+    assert!(r.host_maps_to_vhost("www.tenant.example", "tenant.example"));
+    assert!(r.host_maps_to_vhost("WWW.Tenant.Example", "tenant.example"));
+    assert!(!r.host_maps_to_vhost("www.tenant.example", "forum.example"));
+    assert!(!r.host_maps_to_vhost("www.publisher.example", "forum.example"));
+}

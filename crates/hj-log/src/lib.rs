@@ -350,8 +350,13 @@ pub fn render_access_line_into(
         line.push_str("{\"ts\":\"");
         line.push_str(&je(&fmt::clf_time(ts)));
         line.push_str("\",\"client_ip\":\"");
-        line.push_str(&je(&client_ip.to_string()));
-        line.push_str("\",\"method\":\"");
+        if peer_unix {
+            line.push_str("unix:");
+        } else {
+            line.push_str(&je(&client_ip.to_string()));
+        }
+        // Borrowed path has no authenticated user; AccessRecord renders null.
+        line.push_str("\",\"remote_user\":null,\"method\":\"");
         line.push_str(&je(method));
         line.push_str("\",\"uri\":\"");
         line.push_str(&je(path));
@@ -938,7 +943,7 @@ mod tests {
     #[test]
     fn borrowed_render_matches_record_render() {
         let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_766_000_000);
-        for format in [LogFormat::Common, LogFormat::Combined] {
+        for format in [LogFormat::Common, LogFormat::Combined, LogFormat::Json] {
             for (query, referer, ua, reqid) in [
                 (None, None, None, None),
                 (
@@ -994,5 +999,44 @@ mod tests {
                 );
             }
         }
+        // #633: JSON + peer_unix must also match AccessRecord (unix:, remote_user).
+        let record = AccessRecord {
+            client_ip: "127.0.0.1".parse().unwrap(),
+            ts,
+            method: std::borrow::Cow::Borrowed("GET"),
+            uri: "/uds".to_string(),
+            protocol: "HTTP/1.1",
+            status: 200,
+            bytes: 5,
+            referer: None,
+            user_agent: None,
+            host: None,
+            remote_user: None,
+            request_id: None,
+            peer_unix: true,
+        };
+        let mut expected = record.render(LogFormat::Json).into_bytes();
+        expected.push(b'\n');
+        let mut got = Vec::new();
+        render_access_line_into(
+            &mut got,
+            LogFormat::Json,
+            record.client_ip,
+            ts,
+            "GET",
+            "/uds",
+            None,
+            "HTTP/1.1",
+            200,
+            5,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            String::from_utf8_lossy(&expected)
+        );
     }
 }

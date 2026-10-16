@@ -124,6 +124,9 @@ impl Default for Tuning {
 #[derive(Debug, Clone, Default)]
 pub struct ExpiresConfig {
     pub enabled: bool,
+    /// `<enableExpires>` was present. A vhost block without it inherits the
+    /// server's enabled state (OLS `ExpiresCtrl::config`).
+    pub enable_declared: bool,
     /// (type-glob, header-value) pairs, e.g. ("image/*", "A604800").
     pub by_type: Vec<(String, String)>,
 }

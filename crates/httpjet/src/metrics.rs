@@ -29,12 +29,12 @@ fn unix_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct ProcMem {
-    vm_rss_bytes: u64,
-    rss_anon_bytes: u64,
+pub(crate) struct ProcMem {
+    pub(crate) vm_rss_bytes: u64,
+    pub(crate) rss_anon_bytes: u64,
 }
 
-fn proc_mem() -> Option<ProcMem> {
+pub(crate) fn proc_mem() -> Option<ProcMem> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
     Some(parse_proc_mem(&s)).filter(|m| m.vm_rss_bytes > 0 || m.rss_anon_bytes > 0)
 }
@@ -149,15 +149,15 @@ const METRICS_MAX_CONNS: usize = 64;
 
 pub async fn serve_metrics(
     listener: TcpListener,
-    state: Arc<ServerState>,
+    holder: Arc<arc_swap::ArcSwap<ServerState>>,
     profile_token: Option<String>,
 ) {
-    serve_metrics_with_limit(listener, state, profile_token, METRICS_MAX_CONNS).await
+    serve_metrics_with_limit(listener, holder, profile_token, METRICS_MAX_CONNS).await
 }
 
 async fn serve_metrics_with_limit(
     listener: TcpListener,
-    state: Arc<ServerState>,
+    holder: Arc<arc_swap::ArcSwap<ServerState>>,
     profile_token: Option<String>,
     limit: usize,
 ) {
@@ -176,7 +176,9 @@ async fn serve_metrics_with_limit(
                 continue;
             }
         };
-        let state = state.clone();
+        // The LIVE generation: a reload rebuilds per-generation objects (throttle,
+        // htaccess cache, proxy pool counters), and a boot snapshot would freeze them (#683).
+        let state = holder.load_full();
         let token = profile_token.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -553,6 +555,11 @@ fn append_lsapi_pool_metrics(out: &mut String, stats: Option<hj_lsapi::PoolStats
             stats.stale_checked_out_drops,
         ),
         (
+            "httpjet_lsapi_unread_body_drops_total",
+            "LSAPI connections closed instead of re-pooled because lsphp left request-body bytes unread.",
+            stats.unread_body_drops,
+        ),
+        (
             "httpjet_lsapi_stale_worker_retire_signals_total",
             "Response-complete old-generation lsphp workers retired through pinned pidfds.",
             stats.stale_worker_retire_signals,
@@ -662,6 +669,7 @@ fn append_dict_recompress_metrics(
 /// handshakes that paid a HelloRetryRequest round trip.
 fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) {
     let (h2_idle, h2_peer) = hj_h2::server::connection_close_counts();
+    let (send_blocked_conn, send_blocked_stream) = hj_h2::server::send_blocked_counts();
     let h1_idle = metrics.h1_idle_closes.load(Ordering::Relaxed);
     let h1_peer = metrics.h1_peer_closes.load(Ordering::Relaxed);
     out.push_str(&format!(
@@ -678,10 +686,33 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
          httpjet_trusted_proxy_idle_seconds {}\n\
          # HELP httpjet_tls_handshakes_hello_retry_total Full TLS handshakes that needed a HelloRetryRequest.\n\
          # TYPE httpjet_tls_handshakes_hello_retry_total counter\n\
-         httpjet_tls_handshakes_hello_retry_total {}\n",
+         httpjet_tls_handshakes_hello_retry_total {}\n\
+         # HELP httpjet_h2_send_stall_resets_total HTTP/2 responses reset because they made too little progress while waiting on withheld flow-control credit.\n\
+         # TYPE httpjet_h2_send_stall_resets_total counter\n\
+         httpjet_h2_send_stall_resets_total {}\n\
+         # HELP httpjet_h2_send_blocked_total HTTP/2 responses that entered a flow-control-blocked state with bytes pending, once per transition, by the window that ran out (conn = connection, stream = the stream's own).\n\
+         # TYPE httpjet_h2_send_blocked_total counter\n\
+         httpjet_h2_send_blocked_total{{kind=\"conn\"}} {}\n\
+         httpjet_h2_send_blocked_total{{kind=\"stream\"}} {}\n\
+         # HELP httpjet_tls_cert_reload_retained_total Domains that kept their previous certificate because a reload could not load the new one.\n\
+         # TYPE httpjet_tls_cert_reload_retained_total counter\n\
+         httpjet_tls_cert_reload_retained_total {}\n",
         crate::uring::trusted_proxy_idle_secs(),
         metrics.tls_handshakes_hello_retry.load(Ordering::Relaxed),
+        hj_h2::server::send_stall_resets(),
+        send_blocked_conn,
+        send_blocked_stream,
+        hj_tls::CERT_RELOAD_RETAINED.load(Ordering::Relaxed),
     ));
+    out.push_str(
+        "# HELP httpjet_h2_peer_settings_total HTTP/2 connections by the effective value of a peer SETTINGS parameter after its first SETTINGS frame (omitted = RFC default). bucket = inclusive power-of-two upper bound (<=N) or overflow (>N); non-cumulative.\n\
+         # TYPE httpjet_h2_peer_settings_total counter\n",
+    );
+    for (param, bucket, count) in hj_h2::server::peer_settings_counts() {
+        out.push_str(&format!(
+            "httpjet_h2_peer_settings_total{{param=\"{param}\",bucket=\"{bucket}\"}} {count}\n"
+        ));
+    }
     let h3 = crate::uring::h3::admission_counts();
     out.push_str(&format!(
         "# HELP httpjet_h3_retry_sent_total QUIC Retry packets sent to unvalidated addresses under handshake pressure.\n\
@@ -1745,6 +1776,7 @@ mod tests {
                 worker_attribution_failures: 7,
                 eagain_retries: 8,
                 eagain_terminal_exhaustions: 9,
+                unread_body_drops: 10,
             }),
         );
         for expected in [
@@ -1756,6 +1788,7 @@ mod tests {
             "httpjet_lsapi_worker_attribution_failures_total 7\n",
             "httpjet_lsapi_eagain_retries_total 8\n",
             "httpjet_lsapi_eagain_terminal_exhaustions_total 9\n",
+            "httpjet_lsapi_unread_body_drops_total 10\n",
         ] {
             assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
         }
@@ -1907,11 +1940,82 @@ mod tests {
             "{body}"
         );
     }
+
+    #[test]
+    fn connection_metrics_include_h2_flow_control_and_peer_settings() {
+        let mut body = String::new();
+        append_connection_metrics(&mut body, &Metrics::default());
+        for series in [
+            "# TYPE httpjet_h2_send_blocked_total counter\n",
+            "httpjet_h2_send_blocked_total{kind=\"conn\"} ",
+            "httpjet_h2_send_blocked_total{kind=\"stream\"} ",
+            "# TYPE httpjet_h2_peer_settings_total counter\n",
+            "httpjet_h2_peer_settings_total{param=\"initial_window_size\",bucket=\"<=65536\"} ",
+            "httpjet_h2_peer_settings_total{param=\"header_table_size\",bucket=\"<=0\"} ",
+            "httpjet_h2_peer_settings_total{param=\"header_table_size\",bucket=\">65536\"} ",
+            "httpjet_h2_peer_settings_total{param=\"max_frame_size\",bucket=\"<=16384\"} ",
+            "httpjet_tls_cert_reload_retained_total ",
+        ] {
+            assert!(body.contains(series), "missing {series}: {body}");
+        }
+        assert_eq!(
+            body.matches("# HELP httpjet_h2_peer_settings_total ")
+                .count(),
+            1
+        );
+    }
 }
 
 #[cfg(test)]
 mod request_policy_tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metrics_scrape_reads_the_live_generation() {
+        // #683: a reload swaps in a new ServerState; :9090 must not keep the boot one.
+        use tokio::io::AsyncWriteExt;
+        let doc_root = std::env::temp_dir().join(format!("hj-metrics-gen-{}", std::process::id()));
+        std::fs::create_dir_all(&doc_root).unwrap();
+        std::fs::write(doc_root.join(".htaccess"), "RewriteEngine On\n").unwrap();
+        let build = || {
+            crate::pipeline::e2e::build_state_full(
+                doc_root.clone(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        let holder = Arc::new(arc_swap::ArcSwap::from(build()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_metrics_with_limit(listener, holder.clone(), None, 4));
+        let next = build();
+        next.rewrite_cache
+            .get_or_load(&doc_root)
+            .expect("htaccess loads");
+        assert_eq!(next.rewrite_cache.len(), 1);
+        holder.store(next);
+
+        let mut scrape = tokio::net::TcpStream::connect(addr).await.unwrap();
+        scrape
+            .write_all(
+                format!("GET /metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut body = String::new();
+        tokio::time::timeout(Duration::from_secs(5), scrape.read_to_string(&mut body))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            body.contains("\nhttpjet_htaccess_cache_entries 1\n"),
+            "{body}"
+        );
+        let _ = std::fs::remove_dir_all(doc_root);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn metrics_listener_caps_concurrent_connections() {
@@ -1927,7 +2031,12 @@ mod request_policy_tests {
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_metrics_with_limit(listener, state, None, 1));
+        tokio::spawn(serve_metrics_with_limit(
+            listener,
+            Arc::new(arc_swap::ArcSwap::from(state)),
+            None,
+            1,
+        ));
 
         let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;

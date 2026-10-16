@@ -68,6 +68,7 @@ pub fn parse_cgi_head(
                 .and_then(|value| std::str::from_utf8(value).ok())
                 .and_then(|value| value.parse::<u16>().ok())
                 .and_then(|value| StatusCode::from_u16(value).ok())
+                .filter(|code| !code.is_informational())
                 .ok_or(ResponseError::Malformed)?;
             status = Some(code);
             continue;
@@ -158,6 +159,7 @@ mod tests {
             b" Bad: fold\r\n\r\n".as_slice(),
             b"Connection: close\r\n\r\n",
             b"Status: 200 OK\r\nStatus: 201 X\r\n\r\n",
+            b"Status: 103 Early Hints\r\n\r\n",
             b"Broken\r\n\r\n",
             b"X: bad\nY: ok\r\n\r\n",
         ] {

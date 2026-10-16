@@ -1634,55 +1634,300 @@ async fn malformed_host_fallback_is_reset_on_the_wire() {
     let _ = srv.await;
 }
 
-#[tokio::test]
-async fn header_bomb_is_goaway_not_amplified() {
-    // The "HTTP/2 Bomb": a HEADERS block of single-byte indexed references to static index
-    // 32 (`cookie: ""`). Each byte appends a full field, so the 64 KiB *wire* cap never
-    // fires — a naive decoder expands it to a huge HeaderMap. The decoded-list cap must
-    // abort the block with a connection-fatal COMPRESSION_ERROR (the HPACK decoder is
-    // connection-scoped/stateful, so the connection cannot safely continue), NOT a per-stream
-    // RST the attacker can retry on the same connection.
-    let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let config = Config {
-        header_list_size: 1024,
-        ..Config::default()
-    };
-    let srv = tokio::spawn(async move { serve(server, noop_service, config, None).await });
+/// Echo `x-dyn` back as `x-echo`; count every dispatched request.
+fn echo_counting_service(
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> impl Fn(Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> + Clone
+{
+    move |req: Request| {
+        let calls = calls.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let echoed = req.headers().get("x-dyn").cloned();
+            let mut resp = hj_core::text_response(http::StatusCode::OK, "");
+            if let Some(v) = echoed {
+                resp.headers_mut().insert("x-echo", v);
+            }
+            resp
+        })
+    }
+}
+
+async fn open_client(
+    config: Config,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+    let (mut client, server) = tokio::io::duplex(256 * 1024);
+    let service = echo_counting_service(calls);
+    let srv = tokio::spawn(async move {
+        let _ = serve(server, service, config, None).await;
+    });
     client.write_all(hj_h2::conn::PREFACE).await.unwrap();
     let mut f = Vec::new();
     frame::write_settings(&mut f, &[]);
     client.write_all(&f).await.unwrap();
-
-    // 1 KiB of 0xA0 = §6.1 indexed header field, static index 32 (`cookie`). Accounted at
-    // 6 + 0 + 32 = 38 B/entry, the 1 KiB cap trips after ~27 of the 1024 entries.
-    let block = vec![0xA0u8; 1024];
-    let mut req = Vec::new();
-    frame::write_frame(
-        &mut req,
-        frame::kind::HEADERS,
-        frame::flags::END_HEADERS | frame::flags::END_STREAM,
-        1,
-        &block,
-    );
-    client.write_all(&req).await.unwrap();
     client.flush().await.unwrap();
+    for _ in 0..3 {
+        let _ = read_frame(&mut client).await; // SETTINGS, WINDOW_UPDATE, SETTINGS ACK
+    }
+    (client, srv)
+}
 
-    let code = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+/// Read frames until an RST_STREAM for `sid` and return its error code; panic on GOAWAY
+/// or on response HEADERS for `sid`. Decodes every HEADERS block to keep `dec` in sync.
+async fn expect_reset<R: AsyncReadExt + Unpin>(r: &mut R, dec: &mut Decoder, sid: u32) -> u32 {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
-            let (hdr, payload) = read_frame(&mut client).await;
-            if hdr.kind == frame::kind::GOAWAY {
-                return u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            let (hdr, payload) = read_frame(r).await;
+            match hdr.kind {
+                frame::kind::GOAWAY => panic!("connection GOAWAYed instead of resetting {sid}"),
+                frame::kind::HEADERS => {
+                    assert_ne!(hdr.stream_id, sid, "response written on reset stream {sid}");
+                    dec.decode(&payload, |_, _| {}).unwrap();
+                }
+                frame::kind::RST_STREAM if hdr.stream_id == sid => {
+                    return u32::from_be_bytes(payload[..4].try_into().unwrap());
+                }
+                _ => {}
             }
-            assert_ne!(
-                hdr.kind,
-                frame::kind::RST_STREAM,
-                "the bomb must be connection-fatal, not a retryable stream reset"
-            );
         }
     })
     .await
-    .expect("server must GOAWAY the header bomb");
-    assert_eq!(code, frame::error_code::COMPRESSION_ERROR);
+    .unwrap_or_else(|_| panic!("timed out waiting for RST_STREAM on stream {sid}"))
+}
+
+#[tokio::test]
+async fn header_bomb_is_a_stream_reset_not_connection_fatal() {
+    // The "HTTP/2 Bomb": single-byte indexed references to static index 32 (`cookie: ""`)
+    // each append a full field, so the 64 KiB wire cap never fires; the decoded-list cap
+    // must. Regression (#595): that used to GOAWAY the whole connection, so one oversized
+    // request relayed by Cloudflare tore down a pooled origin connection carrying other
+    // users' streams. Now the block is still decoded to the end (keeping the HPACK table in
+    // sync — here it inserts `x-dyn: v1` before the bomb) and only its stream is refused.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = Config {
+        header_list_size: 1024,
+        ..Config::default()
+    };
+    let (mut client, srv) = open_client(config, calls.clone()).await;
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let end = frame::flags::END_HEADERS | frame::flags::END_STREAM;
+    // Pseudo-headers as static-table references and a non-indexing literal, so the
+    // only dynamic-table insert on the connection is the one after the bomb.
+    let mut get = vec![0x82, 0x84, 0x87, 0x01, 0x0b];
+    get.extend_from_slice(b"example.com");
+
+    // Stream 1: the bomb crosses the cap, THEN inserts `x-dyn: v1`. A decoder that
+    // stopped at the cap would never make that insert.
+    let mut block = get.clone();
+    block.extend(std::iter::repeat_n(0xA0u8, 1024));
+    block.extend_from_slice(&[0x40, 0x05]);
+    block.extend_from_slice(b"x-dyn");
+    block.push(0x02);
+    block.extend_from_slice(b"v1");
+    let mut buf = Vec::new();
+    frame::write_frame(&mut buf, frame::kind::HEADERS, end, 1, &block);
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    assert_eq!(
+        expect_reset(&mut client, &mut dec, 1).await,
+        frame::error_code::REFUSED_STREAM
+    );
+
+    // Stream 3 references dynamic index 62: it resolves to `x-dyn: v1` only if the
+    // server consumed the whole over-cap block.
+    let mut block = get.clone();
+    block.push(0x80 | 62);
+    let mut buf = Vec::new();
+    frame::write_frame(&mut buf, frame::kind::HEADERS, end, 3, &block);
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    let (status, echo) = read_response(&mut client, &mut dec, 3).await;
+    assert_eq!(
+        status.as_deref(),
+        Some("200"),
+        "connection must survive the bomb"
+    );
+    assert_eq!(echo.as_deref(), Some("v1"), "HPACK table must stay in sync");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "bomb never dispatched"
+    );
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn exhausted_body_budget_refuses_the_stream_not_the_connection() {
+    // Regression (#597): the request-body budget is server-wide, so exhaustion caused by
+    // OTHER connections must refuse this stream, not GOAWAY a pooled connection.
+    let budget = std::sync::Arc::new(hj_core::budget::BodyBufferBudget::new(1024));
+    let mut hog = hj_core::budget::BodyBufferLease::new(budget.clone());
+    assert!(hog.reserve(1024));
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = Config {
+        body_budget: Some(budget.clone()),
+        ..Config::default()
+    };
+    let (mut client, srv) = open_client(config, calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get_with(&mut enc, "/upload", &[("content-length", "1")]),
+    );
+    frame::write_frame(
+        &mut buf,
+        frame::kind::DATA,
+        frame::flags::END_STREAM,
+        1,
+        b"x",
+    );
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    assert_eq!(
+        expect_reset(&mut client, &mut dec, 1).await,
+        frame::error_code::REFUSED_STREAM
+    );
+
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        3,
+        &encode_get(&mut enc, "/after"),
+    );
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    let (status, _) = read_response(&mut client, &mut dec, 3).await;
+    assert_eq!(status.as_deref(), Some("200"));
+    assert_eq!(
+        budget.in_flight(),
+        1024,
+        "the refused stream holds no budget"
+    );
+    drop(hog);
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn pre_response_window_overflow_reset_tears_down_the_receiving_stream() {
+    // Regression (#598, residual of #581): a WINDOW_UPDATE that overflows the parked
+    // pre-response credit makes the server RST the stream from the connection loop (not
+    // through rst!). A later DATA...END_STREAM must not then dispatch the request and
+    // write a response on the stream the server already reset.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut client, srv) = open_client(Config::default(), calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get_with(&mut enc, "/one", &[("content-length", "5")]),
+    );
+    let mut wu = Vec::new();
+    wu.extend_from_slice(&0x7fff_ffffu32.to_be_bytes());
+    frame::write_frame(&mut buf, frame::kind::WINDOW_UPDATE, 0, 1, &wu);
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    assert_eq!(
+        expect_reset(&mut client, &mut dec, 1).await,
+        frame::error_code::FLOW_CONTROL_ERROR
+    );
+
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::DATA,
+        frame::flags::END_STREAM,
+        1,
+        b"hello",
+    );
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        3,
+        &encode_get(&mut enc, "/sync"),
+    );
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    // read_response panics on a GOAWAY; expect_reset above already asserted that no
+    // response HEADERS for stream 1 preceded the reset. Any HEADERS for 1 now would be
+    // decoded here before stream 3's and is caught by the call count.
+    let (status, _) = read_response(&mut client, &mut dec, 3).await;
+    assert_eq!(status.as_deref(), Some("200"));
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the reset stream 1 must never be dispatched"
+    );
+    drop(client);
+    let _ = srv.await;
+}
+
+/// Regression (#599), tokio loop: a response waiting on credit the reader withholds
+/// (while it keeps the connection alive with PINGs) is reset by the send-stall deadline.
+#[tokio::test]
+async fn send_stall_deadline_resets_a_credit_starved_response() {
+    let (mut client, server) = tokio::io::duplex(256 * 1024);
+    let config = Config {
+        conn_idle_timeout: Some(std::time::Duration::from_secs(10)),
+        send_stall_timeout: Some(std::time::Duration::from_millis(300)),
+        ..Config::default()
+    };
+    let service =
+        |_req: Request| async { Response::new(Body::Full(Bytes::from(vec![b'x'; 64 * 1024]))) };
+    let srv = tokio::spawn(async move { serve(server, service, config, None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut f = Vec::new();
+    frame::write_settings(&mut f, &[(frame::settings::INITIAL_WINDOW_SIZE, 0)]);
+    let mut enc = Encoder::new();
+    frame::write_frame(
+        &mut f,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        1,
+        &encode_get(&mut enc, "/big"),
+    );
+    client.write_all(&f).await.unwrap();
+    client.flush().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let code = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            tokio::select! {
+                (hdr, payload) = read_frame(&mut client) => {
+                    assert_ne!(hdr.kind, frame::kind::DATA, "no credit, no DATA");
+                    assert_ne!(hdr.kind, frame::kind::GOAWAY, "only the response is reset");
+                    if hdr.kind == frame::kind::RST_STREAM && hdr.stream_id == 1 {
+                        return u32::from_be_bytes(payload[..4].try_into().unwrap());
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    let mut ping = Vec::new();
+                    frame::write_frame(&mut ping, frame::kind::PING, 0, 0, &[0u8; 8]);
+                    client.write_all(&ping).await.unwrap();
+                }
+            }
+        }
+    })
+    .await
+    .expect("the starved response must be reset");
+    assert_eq!(code, frame::error_code::CANCEL);
+    assert!(started.elapsed() < std::time::Duration::from_millis(1500));
     drop(client);
     let _ = srv.await;
 }
@@ -3493,4 +3738,99 @@ async fn bare_continuation_without_open_header_block_is_a_connection_error() {
 
     drop(client);
     let _ = srv.await;
+}
+
+#[tokio::test]
+async fn header_table_size_lowered_then_restored_signals_min_size_update() {
+    // RFC 7541 §4.2: SETTINGS_HEADER_TABLE_SIZE 0 then 4096 in one interval — our decoder
+    // flushed its table at 0, so the next response block must lead with update(0).
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut f = Vec::new();
+    frame::write_settings(&mut f, &[]);
+    let mut enc = Encoder::new();
+    let b = encode_get(&mut enc, "/");
+    frame::write_frame(
+        &mut f,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        1,
+        &b,
+    );
+    client.write_all(&f).await.unwrap();
+    loop {
+        let (hdr, _) = read_frame(&mut client).await;
+        if hdr.stream_id == 1 && hdr.flags & frame::flags::END_STREAM != 0 {
+            break;
+        }
+    }
+    let mut f = Vec::new();
+    frame::write_settings(
+        &mut f,
+        &[
+            (frame::settings::HEADER_TABLE_SIZE, 0),
+            (frame::settings::HEADER_TABLE_SIZE, 4096),
+        ],
+    );
+    let b = encode_get(&mut enc, "/");
+    frame::write_frame(
+        &mut f,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        3,
+        &b,
+    );
+    client.write_all(&f).await.unwrap();
+    let block = loop {
+        let (hdr, p) = read_frame(&mut client).await;
+        if hdr.kind == frame::kind::HEADERS && hdr.stream_id == 3 {
+            break p;
+        }
+    };
+    drop(client);
+    let _ = srv.await;
+    assert_eq!(block[0], 0x20, "update(0) must lead the block");
+    assert_eq!(block[1] & 0xe0, 0x20, "then the final size update");
+}
+
+#[tokio::test]
+async fn continue_interim_leads_with_pending_table_size_update() {
+    // #681: the 100-continue block may be the first block after a peer lowered
+    // SETTINGS_HEADER_TABLE_SIZE, so it must carry the required size update.
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let srv =
+        tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut f = Vec::new();
+    frame::write_settings(&mut f, &[(frame::settings::HEADER_TABLE_SIZE, 0)]);
+    let mut enc = Encoder::new();
+    let mut b = Vec::new();
+    for (n, v) in [
+        (":method", "POST"),
+        (":scheme", "https"),
+        (":path", "/upload"),
+        (":authority", "example.test"),
+        ("expect", "100-continue"),
+    ] {
+        enc.encode_header(&mut b, n, v);
+    }
+    frame::write_frame(
+        &mut f,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &b,
+    );
+    client.write_all(&f).await.unwrap();
+    let block = loop {
+        let (hdr, p) = read_frame(&mut client).await;
+        if hdr.kind == frame::kind::HEADERS && hdr.stream_id == 1 {
+            break p;
+        }
+    };
+    drop(client);
+    let _ = srv.await;
+    assert_eq!(block[0], 0x20, "update(0) must lead the 100-continue block");
 }

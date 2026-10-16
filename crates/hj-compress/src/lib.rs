@@ -474,7 +474,9 @@ fn add_vary_accept_encoding(resp: &mut Response) {
 /// preserving ETag *strength* (so `If-Range` resume still works). Only an ETag in
 /// the exact `...;;;"` shape we generate is touched; foreign strong ETags are
 /// dropped because the compressed representation cannot share their validator.
-fn tag_etag_variant(resp: &mut Response, enc: Encoding) {
+/// Re-label `resp`'s ETag for an `enc`-encoded body (`"…;;;"` → `"…;<enc>"`; a foreign
+/// strong ETag is dropped). Also applied to precompressed page-cache hits.
+pub fn tag_etag_variant(resp: &mut Response, enc: Encoding) {
     let marker: &[u8] = match enc {
         Encoding::Gzip => b"gz",
         Encoding::Brotli => b"br",

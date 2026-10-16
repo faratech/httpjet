@@ -27,6 +27,9 @@ pub(crate) const MAX_ITERATIONS: usize = 10;
 pub struct RuleSet {
     /// `RewriteEngine on/off`. When off, [`evaluate`] is a no-op.
     pub(crate) engine_on: bool,
+    /// Whether a `RewriteEngine` line appeared. Without one, a per-directory
+    /// ruleset inherits the enclosing context's engine state (OLS/Apache merge).
+    pub(crate) engine_set: bool,
     /// `RewriteBase` value, if any (used to resolve relative substitutions).
     pub(crate) base: Option<String>,
     /// The rules in source order.
@@ -50,6 +53,12 @@ pub struct RuleSet {
     /// values to the [outcome-cache key] so a UA-reading chain is cacheable without
     /// collapsing distinct UAs onto one entry.
     pub cache_key_vars: Vec<CacheKeyVar>,
+    /// Every request-header name read through `%{HTTP:...}` or a bare header
+    /// variable (`HTTP_COOKIE`, `HTTP_REFERER`, ...), normalized lowercase.
+    /// Unlike `cache_key_vars`, this is retained even when another input makes
+    /// the ruleset non-path-cacheable: downstream page caching still needs to
+    /// distinguish responses by these header values.
+    pub header_reads: Vec<String>,
     /// `%{ENV:NAME}` names this ruleset reads that classification treated as
     /// CONSTANT-EMPTY at rewrite-eval time (currently only `REDIRECT_STATUS`):
     /// httpjet itself never seeds them into the request env before/during rewrite
@@ -71,6 +80,13 @@ pub struct RuleSet {
     /// instead of the raw UA string, collapsing real-world UA diversity onto a
     /// handful of cache entries.
     ua_classify_eligible: bool,
+    /// Any rule or cond reads `%{HTTP_USER_AGENT}`, whether or not the set is
+    /// path-cacheable (the page cache must know even when the outcome cache cannot).
+    reads_user_agent: bool,
+    /// Stable (across restarts and rebuilds) identity of the UA conds behind
+    /// [`Self::ua_cond_signature`]: FNV-1a over each UA cond's regex source and
+    /// `[NC]` flag, in order. 0 unless [`Self::ua_classify_eligible`].
+    ua_fingerprint: u64,
     /// Precomputed at parse time: any cond/rule reads `%{THE_REQUEST}`. The
     /// pipeline then attaches the VERBATIM pre-decode request target to the
     /// RewriteInput so the variable resolves from raw bytes (Apache documents
@@ -87,7 +103,12 @@ impl RuleSet {
     /// no rewrite environment. `RewriteEngine off` suppresses parsed rules just
     /// as completely as an empty rule list.
     pub fn is_noop(&self) -> bool {
-        !self.engine_on || self.rules.is_empty()
+        self.engine_state() == Some(false) || self.rules.is_empty()
+    }
+
+    /// The explicit `RewriteEngine` state, or `None` to inherit the parent's.
+    pub fn engine_state(&self) -> Option<bool> {
+        self.engine_set.then_some(self.engine_on)
     }
 
     /// Unique nonzero parse-time id (0 only for a default-constructed empty set).
@@ -103,6 +124,17 @@ impl RuleSet {
     /// instead of the raw User-Agent string (see [`Self::ua_cond_signature`]).
     pub fn ua_classify_eligible(&self) -> bool {
         self.ua_classify_eligible
+    }
+
+    /// Whether any rule or cond reads the User-Agent (independent of cacheability).
+    pub fn reads_user_agent(&self) -> bool {
+        self.reads_user_agent
+    }
+
+    /// Restart-stable identity of this ruleset's UA conds, for keys that outlive the
+    /// process (the persistent page cache). [`Self::id`] is process-local.
+    pub fn ua_fingerprint(&self) -> u64 {
+        self.ua_fingerprint
     }
 
     /// Number of UA-reading conds covered by the signature (bitmap width).
@@ -225,6 +257,26 @@ pub(crate) fn extract_literal_prefix(pattern_src: &str, negate: bool, nocase: bo
     // is the correct slashed prefix — there is no need to exclude them (doing so left the
     // inline `^/…` proxy rules paying a full regex capture on every request).
     let bytes = pattern_src.as_bytes();
+    // #619: a top-level `|` ANYWHERE after the anchor invalidates the prefix,
+    // even if a metacharacter (`$`,`.`,`[`,`+`) ends the literal run before
+    // the scan below reaches it (e.g. `^a\.php$|b\.php$`).
+    {
+        let mut depth = 0usize;
+        let mut in_class = false;
+        let mut j = 1;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'\\' => j += 1,
+                b'[' if !in_class => in_class = true,
+                b']' if in_class => in_class = false,
+                b'(' if !in_class => depth += 1,
+                b')' if !in_class => depth = depth.saturating_sub(1),
+                b'|' if !in_class && depth == 0 => return Box::from(&b""[..]),
+                _ => {}
+            }
+            j += 1;
+        }
+    }
     let mut out = Vec::new();
     let mut i = 1; // skip the leading '^'
     while i < bytes.len() {
@@ -233,7 +285,7 @@ pub(crate) fn extract_literal_prefix(pattern_src: &str, negate: bool, nocase: bo
             // `?`/`*`/`{` make that byte OPTIONAL (`^api/?`; `{0,n}`), so it is NOT part of
             // the required prefix — drop it and stop, else we'd wrongly reject e.g. `/api`.
             b'?' | b'*' | b'{' => {
-                out.pop();
+                while out.pop().is_some_and(|b| b & 0xC0 == 0x80) {}
                 break;
             }
             // `\X`: an escaped *literal* (X non-alphanumeric, e.g. `\.` `\/` `\-`) is a
@@ -333,6 +385,8 @@ pub(crate) enum FileTestKind {
     Link,
     Size,
     Exists,
+    /// `-x`: an executable regular file (OLS COND_OP_EXEC).
+    Exec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -711,8 +765,84 @@ impl CompiledRegex {
 /// loop: rules run top-to-bottom; a matched `[L]`/`[F]`/`[P]`/`[R]` stops the
 /// pass; if any non-terminal rule rewrote the URI, the whole list is re-run
 /// (up to [`MAX_ITERATIONS`]).
+/// True when an absolute `location` names the request's own URL (same scheme,
+/// Host and path+query).
+fn absolute_target_is_current(location: &str, input: &RewriteInput) -> bool {
+    let scheme = if input.https { "https://" } else { "http://" };
+    let Some(rest) = location
+        .get(..scheme.len())
+        .filter(|p| p.eq_ignore_ascii_case(scheme))
+        .map(|_| &location[scheme.len()..])
+    else {
+        return false;
+    };
+    let (authority, path_query) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let default_port = if input.https { 443 } else { 80 };
+    // `host[:port]` or `[v6][:port]`; `input.host` is port- and bracket-stripped.
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+        let Some((h, after)) = v6.split_once(']') else {
+            return false;
+        };
+        let port = match after.strip_prefix(':') {
+            Some(p) => match p.parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => return false,
+            },
+            None if after.is_empty() => default_port,
+            None => return false,
+        };
+        (h, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => match p.parse::<u16>() {
+                Ok(p) => (h, p),
+                Err(_) => return false,
+            },
+            None => (authority, default_port),
+        }
+    };
+    let current_port = input.host_port.unwrap_or(default_port);
+    if !host.eq_ignore_ascii_case(&input.host) || port != current_port {
+        return false;
+    }
+    let (path, query) = match path_query.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path_query, ""),
+    };
+    let path = if path.is_empty() { "/" } else { path };
+    // The location is escaped; the input URI is decoded (OLS compares unescaped).
+    query == input.query.as_ref() && percent_decoded(path) == input.uri.as_bytes()
+}
+
+fn percent_decoded(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+        if b[i] == b'%'
+            && let (Some(Some(h)), Some(Some(l))) =
+                (b.get(i + 1).map(|&c| hex(c)), b.get(i + 2).map(|&c| hex(c)))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
 pub fn evaluate(rs: &RuleSet, input: &RewriteInput) -> RewriteOutcome {
-    if !rs.engine_on {
+    evaluate_with_engine(rs, input, rs.engine_on)
+}
+
+/// [`evaluate`] with the effective engine state resolved by the caller (a
+/// per-directory set without `RewriteEngine` inherits it; see
+/// [`RuleSet::engine_state`]).
+pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool) -> RewriteOutcome {
+    if !engine_on {
         return RewriteOutcome::Unchanged {
             env: Vec::new(),
             end: false,
@@ -733,6 +863,7 @@ pub fn evaluate(rs: &RuleSet, input: &RewriteInput) -> RewriteOutcome {
         env_order: Vec::new(),
         last_cond_caps: std::array::from_fn(|_| None),
         prefilter_valid: true,
+        pending_absolute: false,
         next_loops: 0,
         regex_failed: false,
     };
@@ -776,7 +907,11 @@ pub fn evaluate(rs: &RuleSet, input: &RewriteInput) -> RewriteOutcome {
                     ended = true;
                     break;
                 }
-                if state.uri == uri_before {
+                // An absolute URL is final; restarting would match rules against it.
+                // Only a per-directory ruleset re-runs on a changed URI (Apache/OLS
+                // re-enter .htaccess processing after an internal redirect); vhost-level
+                // rules run once, restarting only for [N] (OLS processVHostRewrite, #701).
+                if state.uri == uri_before || state.pending_absolute || input.server_context {
                     // No URI change this pass and no terminal rule fired: done.
                     break;
                 }
@@ -789,6 +924,25 @@ pub fn evaluate(rs: &RuleSet, input: &RewriteInput) -> RewriteOutcome {
         }
     }
 
+    if state.pending_absolute && eval::is_absolute_uri(&state.uri) {
+        let mut location = std::mem::take(&mut state.uri);
+        if !state.query.is_empty() {
+            location.push('?');
+            location.push_str(&state.query);
+        }
+        // OLS detectLoopRedirect: a target naming the current URL would loop forever.
+        if absolute_target_is_current(&location, input) {
+            return RewriteOutcome::Unchanged {
+                env: state.env_vec(),
+                end: ended,
+            };
+        }
+        return RewriteOutcome::Redirect {
+            code: 302,
+            location,
+            env: state.env_vec(),
+        };
+    }
     if state.uri != *input.uri || state.query != *input.query {
         // `new_query` reports the *effective* query the rewritten URI carries:
         // `Some(q)` for a non-empty query (whether newly set or carried over via

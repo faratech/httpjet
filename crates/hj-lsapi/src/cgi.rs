@@ -217,11 +217,9 @@ impl<'a> CgiEnvBuilder<'a> {
         push!("SERVER_SOFTWARE", self.server_software.clone());
         push!("SERVER_ADDR", ctx.local_addr.ip().to_string());
 
-        // Port: from the Host header if present, else the listener's bound port.
-        let server_port = host_header(req)
-            .and_then(|h| port_of(&h))
-            .unwrap_or_else(|| ctx.local_addr.port());
-        push!("SERVER_PORT", server_port.to_string());
+        // The listener's port, never the client's Host header: SERVER_PORT is
+        // server-asserted (LSWS REF_SERVER_PORT; XenForo isSecure() trusts 443).
+        push!("SERVER_PORT", ctx.local_addr.port().to_string());
 
         // Request arrival time. REQUEST_TIME is whole seconds; the _FLOAT variant
         // carries microsecond precision (e.g. "1700000000.123456").
@@ -338,10 +336,17 @@ impl<'a> CgiEnvBuilder<'a> {
             let value: Cow<'r, str> = match values.next() {
                 None => first,
                 Some(second_hv) => {
+                    // Cookie crumbs join with `; ` (RFC 9113 §8.2.3), the form every
+                    // cookie parser splits on (#671).
+                    let sep = if nm.eq_ignore_ascii_case("cookie") {
+                        "; "
+                    } else {
+                        ", "
+                    };
                     let mut joined = String::with_capacity(first.len() + 8);
                     joined.push_str(&first);
                     for hv in std::iter::once(second_hv).chain(values) {
-                        joined.push_str(", ");
+                        joined.push_str(sep);
                         match hv.to_str() {
                             Ok(v) => joined.push_str(v),
                             Err(_) => joined.push_str(&String::from_utf8_lossy(hv.as_bytes())),
@@ -831,7 +836,7 @@ mod tests {
         assert_eq!(m["SERVER_SOFTWARE"], "LiteSpeed");
         assert_eq!(m["GATEWAY_INTERFACE"], "CGI/1.1");
         assert_eq!(m["HTTPS"], "on");
-        assert_eq!(m["SERVER_PORT"], "443");
+        assert_eq!(m["SERVER_PORT"], "8080");
         assert_eq!(m["REDIRECT_STATUS"], "200");
         assert_eq!(m["REQUEST_TIME"], "1700000000");
         assert_eq!(m["REQUEST_TIME_FLOAT"], "1700000000.123456");
@@ -844,7 +849,7 @@ mod tests {
         assert_eq!(m["CONTENT_TYPE"], "application/x-www-form-urlencoded");
         assert_eq!(m["CONTENT_LENGTH"], "9");
         // HTTP_HOST drops the scheme-default :443 (matches SERVER_NAME + XF boardUrl);
-        // SERVER_PORT still reports 443 (XF isSecure() relies on it — see line above).
+        // SERVER_PORT is the listener's port, not the Host header's.
         assert_eq!(m["HTTP_HOST"], "forum.example");
         assert_eq!(m["HTTP_USER_AGENT"], "curl/8");
         assert_eq!(m["HTTP_X_FORWARDED_FOR"], "203.0.113.7");
@@ -1138,7 +1143,6 @@ mod tests {
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
         assert!(!m.contains_key("HTTPS"));
-        // No port in Host -> fall back to the listener's bound port.
         assert_eq!(m["SERVER_PORT"], "8080");
         assert_eq!(m["REQUEST_SCHEME"], "http");
         // No TLS context -> no SSL_* and no AUTH_TYPE without an Authorization header.
@@ -1170,8 +1174,44 @@ mod tests {
         assert_eq!(m["PATH_INFO"], "/Foo");
         assert_eq!(m["PATH_TRANSLATED"], "/web/public_html/Foo");
         assert_eq!(m["SERVER_NAME"], "search.forum.example");
-        assert_eq!(m["SERVER_PORT"], "8443");
+        assert_eq!(m["SERVER_PORT"], "8080");
         assert_eq!(m["PHP_VALUE"], "auto_prepend_file=/x/p.php");
+    }
+
+    /// Regression (#602): a plaintext client cannot claim SERVER_PORT=443 (and
+    /// with it XenForo's isSecure()) by putting `:443` in its Host header.
+    #[test]
+    fn server_port_comes_from_the_listener_not_host() {
+        let req = http::Request::builder()
+            .uri("/index.php")
+            .header("Host", "tenant.example:443")
+            .body(empty_incoming())
+            .unwrap();
+        let mut c = ctx(false);
+        c.local_addr = "192.0.2.1:80".parse().unwrap();
+        let m: std::collections::HashMap<String, String> =
+            build_cgi_env(&req, &c, Path::new("/srv/www/tenant/index.php"))
+                .into_iter()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+        assert_eq!(m["SERVER_PORT"], "80");
+        assert_eq!(m["REQUEST_SCHEME"], "http");
+        assert!(!m.contains_key("HTTPS"));
+        assert_eq!(m["SERVER_NAME"], "tenant.example");
+
+        let req = http::Request::builder()
+            .uri("/index.php")
+            .header("Host", "tenant.example:8443")
+            .body(empty_incoming())
+            .unwrap();
+        let mut c = ctx(true);
+        c.local_addr = "192.0.2.1:443".parse().unwrap();
+        let m: std::collections::HashMap<String, String> =
+            build_cgi_env(&req, &c, Path::new("/srv/www/tenant/index.php"))
+                .into_iter()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+        assert_eq!(m["SERVER_PORT"], "443");
     }
 
     #[test]

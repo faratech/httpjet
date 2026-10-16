@@ -461,7 +461,10 @@ pub(super) async fn error_doc_or_page(
 
 /// A bare status response (no body) for a non-3xx `[R=NNN]` outcome (#8/A).
 pub(super) fn status_response(code: u16) -> Response {
-    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::OK);
+    let status = StatusCode::from_u16(code)
+        .ok()
+        .filter(|s| !s.is_informational())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut resp = Response::new(Body::Empty);
     *resp.status_mut() = status;
     resp
@@ -568,6 +571,15 @@ mod tests {
             "/errors/404.html",
             Path::new("/srv/shared/404.html")
         ));
+    }
+
+    #[test]
+    fn status_response_never_emits_an_informational_final() {
+        assert_eq!(
+            status_response(103).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(status_response(410).status(), StatusCode::GONE);
     }
 
     #[test]

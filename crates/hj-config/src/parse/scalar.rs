@@ -114,6 +114,33 @@ pub(super) fn secs_of(s: &Option<String>, default: u64) -> Duration {
     Duration::from_secs(s.as_deref().and_then(parse_secs).unwrap_or(default))
 }
 
+/// LSWS `getLongValue(node, tag, min, max, default)`: a value outside `range` falls
+/// back to `default` instead of being taken verbatim. A connection timeout of 0 would
+/// otherwise become an UNBOUNDED handshake/header/body/idle deadline (#605).
+pub(super) fn secs_in_range(
+    s: &Option<String>,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+    tag: &str,
+) -> Duration {
+    let secs = match s.as_deref().and_then(parse_secs) {
+        Some(v) if range.contains(&v) => v,
+        Some(v) => {
+            tracing::warn!(
+                tag,
+                value = v,
+                default,
+                "tuning value outside [{}, {}]; using the default",
+                range.start(),
+                range.end()
+            );
+            default
+        }
+        None => default,
+    };
+    Duration::from_secs(secs)
+}
+
 pub(super) fn bytes_of(s: &Option<String>, default: u64) -> u64 {
     s.as_deref().and_then(parse_bytes).unwrap_or(default)
 }

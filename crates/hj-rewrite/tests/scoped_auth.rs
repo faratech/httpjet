@@ -137,7 +137,6 @@ fn incomplete_unsupported_and_malformed_auth_fail_closed() {
         "AuthType Basic\nAuthUserFile \"users\nRequire valid-user",
         "AuthType Basic\nAuthUserFile users\n<RequireAny>\nRequire valid-user\n</RequireAny>",
         "AuthType Basic\nAuthUserFile users\n<If \"%{HTTP_HOST} == 'x'\">\nRequire valid-user\n</If>",
-        "AuthType Basic\nAuthUserFile users\n<FilesMatch \"[\">\nRequire valid-user\n</FilesMatch>",
     ] {
         let ht = Htaccess::parse(config).unwrap();
         assert!(resolve_auth([&ht], "/x.txt").is_err(), "{config}");
@@ -146,6 +145,8 @@ fn incomplete_unsupported_and_malformed_auth_fail_closed() {
         "AuthType Basic\n<Files x.txt>\nRequire valid-user",
         "AuthType Basic\n<Files x.txt>\nRequire valid-user\n</If>",
         "AuthType Basic\n<Files x.txt\nRequire valid-user\n</Files>",
+        // (#604) An uncompilable section regex fails the whole file closed.
+        "AuthType Basic\nAuthUserFile users\n<FilesMatch \"[\">\nRequire valid-user\n</FilesMatch>",
     ] {
         assert!(Htaccess::parse(config).is_err(), "{config}");
     }

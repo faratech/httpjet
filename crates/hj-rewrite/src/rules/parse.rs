@@ -44,6 +44,11 @@ fn cond_or_foldable(c: &Cond) -> bool {
 /// exactly what the alternation tests. Only whole, uniform groups are folded
 /// (same `test_string`, same `nocase`, all foldable); anything else is kept
 /// verbatim. The merged cond inherits the group's trailing `or_next` (`false`).
+fn cond_refs_zero(c: &Cond) -> bool {
+    c.test_string.contains("%0")
+        || matches!(&c.pattern, CondPattern::Lexical(_, rhs) | CondPattern::Numeric(_, rhs) if rhs.contains("%0"))
+}
+
 fn combine_or_conds(conds: Vec<Cond>) -> Vec<Cond> {
     let n = conds.len();
     let mut slots: Vec<Option<Cond>> = conds.into_iter().map(Some).collect();
@@ -238,6 +243,56 @@ fn rule_cache_class(
     ok
 }
 
+fn collect_header_reads_from_string(s: &str, reads: &mut Vec<String>) {
+    let mut rest = s;
+    while let Some(p) = rest.find("%{") {
+        let after = &rest[p + 2..];
+        let Some(end) = after.find('}') else {
+            return;
+        };
+        let var = &after[..end];
+        let name = if let Some(header) = var.strip_prefix("HTTP:") {
+            (!header.is_empty()).then(|| header.to_ascii_lowercase())
+        } else if var.eq_ignore_ascii_case("HTTP_USER_AGENT") {
+            Some("user-agent".to_string())
+        } else if var.eq_ignore_ascii_case("HTTP_COOKIE") {
+            Some("cookie".to_string())
+        } else if var.eq_ignore_ascii_case("HTTP_REFERER") {
+            Some("referer".to_string())
+        } else if var.eq_ignore_ascii_case("HTTP_ACCEPT") {
+            Some("accept".to_string())
+        } else if var.eq_ignore_ascii_case("HTTP_HOST") {
+            Some("host".to_string())
+        } else {
+            None
+        };
+        if let Some(name) = name
+            && !reads.contains(&name)
+        {
+            reads.push(name);
+        }
+        rest = &after[end + 1..];
+    }
+}
+
+fn rules_header_reads(rules: &[Rule]) -> Vec<String> {
+    let mut reads = Vec::new();
+    for rule in rules {
+        collect_header_reads_from_string(&rule.subst, &mut reads);
+        for (k, v) in &rule.flags.env_sets {
+            collect_header_reads_from_string(k, &mut reads);
+            collect_header_reads_from_string(v, &mut reads);
+        }
+        for cond in &rule.conds {
+            collect_header_reads_from_string(&cond.test_string, &mut reads);
+            if let CondPattern::Lexical(_, rhs) | CondPattern::Numeric(_, rhs) = &cond.pattern {
+                collect_header_reads_from_string(rhs, &mut reads);
+            }
+        }
+    }
+    reads
+}
+
 /// True if `s` contains a `%N` cond-backreference (a `%` immediately followed by
 /// a digit, NOT a `%{` var open). Mirror of [`uses_dollar_backref`].
 fn uses_percent_backref(s: &str) -> bool {
@@ -271,8 +326,47 @@ fn is_exact_ua_var(s: &str) -> bool {
         && keyable_var(&s[2..s.len() - 1]) == Some(CacheKeyVar::UserAgent)
 }
 
-/// Decide UA-classification eligibility for a parsed, `path_cacheable` set that
-/// reads the User-Agent, and collect its UA-cond positions. Sound iff the
+/// Whether any substitution, `[E=]` set, cond test string or comparison RHS reads
+/// the User-Agent.
+fn rules_read_ua(rules: &[Rule]) -> bool {
+    rules.iter().any(|rule| {
+        string_refs_ua(&rule.subst)
+            || rule
+                .flags
+                .env_sets
+                .iter()
+                .any(|(k, v)| string_refs_ua(k) || string_refs_ua(v))
+            || rule.conds.iter().any(|c| {
+                string_refs_ua(&c.test_string)
+                    || matches!(&c.pattern,
+                        CondPattern::Lexical(_, rhs) | CondPattern::Numeric(_, rhs)
+                            if string_refs_ua(rhs))
+            })
+    })
+}
+
+/// FNV-1a over each UA cond's regex source and `[NC]` flag, in order: an identity
+/// for the classification bitmap that survives restarts, unlike the parse-order id.
+fn ua_fingerprint(rules: &[Rule], ua_conds: &[(usize, usize)]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for &(ri, ci) in ua_conds {
+        let cond = &rules[ri].conds[ci];
+        if let CondPattern::Regex(_, source) = &cond.pattern {
+            feed(source.as_bytes());
+        }
+        feed(&[0, u8::from(cond.nocase), 0xff]);
+    }
+    h
+}
+
+/// Decide UA-classification eligibility for a parsed set that reads the
+/// User-Agent, and collect its UA-cond positions. Sound iff the
 /// outcome's ONLY dependence on the UA value is the boolean match result of each
 /// UA cond — then keying on the match bitmap is exact. Conservative requirements:
 ///   * every UA read sits in a cond TEST STRING that is exactly the UA var
@@ -339,6 +433,7 @@ impl RuleSet {
     /// [`crate::Htaccess`] for the directive-aware parser). Line continuations
     /// (`\` at EOL) are joined.
     pub fn parse(rules: &str) -> Result<RuleSet, RewriteError> {
+        let rules = rules.strip_prefix('\u{FEFF}').unwrap_or(rules);
         let mut set = RuleSet::default();
         let mut pending_conds: Vec<Cond> = Vec::new();
 
@@ -354,6 +449,7 @@ impl RuleSet {
                         rest.trim().to_ascii_lowercase().as_str(),
                         "on" | "1" | "true" | "yes"
                     );
+                    set.engine_set = true;
                 }
                 "rewritebase" => {
                     let b = rest.trim();
@@ -368,7 +464,11 @@ impl RuleSet {
                     let mut rule = parse_rule(rest, std::mem::take(&mut pending_conds), line)?;
                     // Fold same-variable OR-condition runs into one alternation
                     // regex (e.g. a 28-line User-Agent crawler block -> 1 match).
-                    rule.conds = combine_or_conds(std::mem::take(&mut rule.conds));
+                    // `%0` is the FIRST passing cond's match, which an alternation
+                    // (leftmost match) cannot reproduce.
+                    if !rest.contains("%0") && !rule.conds.iter().any(cond_refs_zero) {
+                        rule.conds = combine_or_conds(std::mem::take(&mut rule.conds));
+                    }
                     set.rules.push(rule);
                 }
                 _ => {
@@ -425,14 +525,23 @@ impl RuleSet {
         if set.path_cacheable {
             set.cache_key_vars = keys;
             set.assumed_empty_env = assumed_env;
-            if set.cache_key_vars.contains(&CacheKeyVar::UserAgent) {
-                let (eligible, ua_conds) = compute_ua_classify(&set.rules);
-                set.ua_classify_eligible = eligible;
-                set.ua_conds = ua_conds;
-            }
         } else {
             set.cache_key_vars = Vec::new();
             set.assumed_empty_env = Vec::new();
+        }
+        // UA classification depends only on how the UA flows through the rules, not
+        // on whether OTHER inputs make the set path-cacheable; the page cache keys on
+        // it either way (#603). Outcome-cache/memo consumers still gate on
+        // `cache_key_vars`, so their behavior is unchanged.
+        set.header_reads = rules_header_reads(&set.rules);
+        set.reads_user_agent = rules_read_ua(&set.rules);
+        if set.reads_user_agent {
+            let (eligible, ua_conds) = compute_ua_classify(&set.rules);
+            set.ua_classify_eligible = eligible;
+            set.ua_conds = ua_conds;
+            if eligible {
+                set.ua_fingerprint = ua_fingerprint(&set.rules, &set.ua_conds);
+            }
         }
         // (audit) Does anything read %{THE_REQUEST}? The pipeline only then pays to
         // attach the verbatim pre-decode target to the rewrite input.
@@ -638,13 +747,16 @@ fn classify_cond_pattern(
     nocase: bool,
     line: usize,
 ) -> Result<CondPattern, RewriteError> {
-    // File tests: -f -d -l -s -x (single token).
+    // File tests (single token). `-F` is `-f` via a subrequest and `-L`/`-h` are
+    // `-l` aliases (OLS rewriterule.cpp maps them the same way); unrecognized,
+    // they were silently compiled as regexes that never match.
     match raw {
-        "-f" => return Ok(CondPattern::FileTest(FileTestKind::File)),
+        "-f" | "-F" => return Ok(CondPattern::FileTest(FileTestKind::File)),
         "-d" => return Ok(CondPattern::FileTest(FileTestKind::Dir)),
-        "-l" => return Ok(CondPattern::FileTest(FileTestKind::Link)),
+        "-l" | "-L" | "-h" => return Ok(CondPattern::FileTest(FileTestKind::Link)),
         "-s" => return Ok(CondPattern::FileTest(FileTestKind::Size)),
-        "-x" | "-e" => return Ok(CondPattern::FileTest(FileTestKind::Exists)),
+        "-x" => return Ok(CondPattern::FileTest(FileTestKind::Exec)),
+        "-e" => return Ok(CondPattern::FileTest(FileTestKind::Exists)),
         _ => {}
     }
     // Numeric comparisons: `-eq`/`-ne`/`-gt`/`-lt`/`-ge`/`-le` followed by the
@@ -803,11 +915,15 @@ fn parse_rule_flags(field: &str) -> RuleFlags {
             // OLS uses strtol; a non-numeric value is a parse error there, but
             // we degrade to 0 (no skip) rather than failing the whole set.
             flags.skip = n.trim().parse().unwrap_or(0);
-        } else if let Some(spec) = tok
-            .strip_prefix("E=")
-            .or_else(|| tok.strip_prefix("e="))
-            .or_else(|| upper.strip_prefix("ENV="))
-        {
+        } else if let Some(spec) = (if upper.starts_with("ENV=") {
+            // #621: strip from the ORIGINAL token, not upper, so the var
+            // name and value keep their case.
+            tok.get(4..)
+        } else if upper.starts_with("E=") {
+            tok.get(2..)
+        } else {
+            None
+        }) {
             // (audit) Apache accepts any case for the env-set spelling ([E=], [e=],
             // [ENV=]); matching only the exact mixed-case forms silently DROPPED a
             // valid lowercase flag — the rule matched and stopped but never set the
@@ -826,7 +942,12 @@ fn parse_redirect_code(code: &str) -> u16 {
         "" | "temp" | "302" | "found" => 302,
         "permanent" | "301" => 301,
         "seeother" | "303" => 303,
-        other => other.parse().unwrap_or(302),
+        // A 1xx (or out-of-range) code can never be a final response (#696).
+        other => other
+            .parse()
+            .ok()
+            .filter(|c| (200..600).contains(c))
+            .unwrap_or(302),
     }
 }
 

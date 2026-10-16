@@ -112,6 +112,9 @@ impl ExpiresRule {
         while i + 1 < rest.len() + 1 {
             let num = rest.get(i)?;
             let n: i64 = num.parse().ok()?;
+            if n < 0 {
+                return None;
+            }
             let unit = rest.get(i + 1)?;
             let factor = unit_to_seconds(unit)?;
             // Checked arithmetic: an absurdly large value in trusted operator
@@ -342,6 +345,12 @@ mod tests {
         let r = ExpiresRule::parse("now 30 minutes").unwrap();
         assert_eq!(r.base, ExpiresBase::Access);
         assert_eq!(r.age_secs, 30 * 60);
+    }
+
+    #[test]
+    fn parse_verbose_rejects_negative_amounts() {
+        assert!(ExpiresRule::parse("access plus -100000 seconds").is_none());
+        assert!(ExpiresRule::parse("access plus 1 day -5 seconds").is_none());
     }
 
     #[test]

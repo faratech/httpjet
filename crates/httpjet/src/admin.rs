@@ -112,7 +112,7 @@ fn snapshot(state: &ServerState) -> String {
     )
 }
 
-fn classify(buf: &[u8]) -> u16 {
+fn classify(buf: &[u8], local_port: u16) -> u16 {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
     if !matches!(req.parse(buf), Ok(httparse::Status::Complete(n)) if n == buf.len()) {
@@ -139,6 +139,7 @@ fn classify(buf: &[u8]) -> u16 {
         .parse::<SocketAddr>()
         .is_ok_and(|a| a.ip().is_loopback())
         && host != "localhost"
+        && host != format!("localhost:{local_port}")
     {
         return 400;
     }
@@ -152,12 +153,21 @@ fn classify(buf: &[u8]) -> u16 {
 }
 
 pub async fn serve(listener: TcpListener, holder: Arc<ArcSwap<ServerState>>) {
+    let local_port = listener.local_addr().map_or(0, |a| a.port());
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = listener.accept(), if tasks.len() < 4 => {
-                let Ok((mut stream, peer)) = accepted else { break; };
+                // A transient EMFILE/ENOBUFS must not end the listener for good.
+                let (mut stream, peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "admin: accept error");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 if !peer.ip().is_loopback() { continue; }
                 let holder = holder.clone();
                 tasks.spawn(async move {
@@ -168,7 +178,7 @@ pub async fn serve(listener: TcpListener, holder: Arc<ArcSwap<ServerState>>) {
                             if stream.read(&mut byte).await? == 0 { return Ok::<_, std::io::Error>(()); }
                             buf.push(byte[0]);
                         }
-                        let mut status = classify(&buf);
+                        let mut status = classify(&buf, local_port);
                         let mut body = if status == 200 { snapshot(&holder.load_full()) } else { "{}".into() };
                         if body.len() > MAX_BODY { status = 503; body = "{}".into(); }
                         let head = format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
@@ -190,8 +200,25 @@ mod tests {
         assert!(parse_addr("127.0.0.1:0").is_ok());
         assert!(parse_addr("0.0.0.0:9091").is_err());
         assert_eq!(
-            classify(b"GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:9091\r\n\r\n"),
+            classify(
+                b"GET /v1/status HTTP/1.1\r\nHost: 127.0.0.1:9091\r\n\r\n",
+                9091
+            ),
             200
+        );
+        assert_eq!(
+            classify(
+                b"GET /v1/status HTTP/1.1\r\nHost: localhost:9091\r\n\r\n",
+                9091
+            ),
+            200
+        );
+        assert_eq!(
+            classify(
+                b"GET /v1/status HTTP/1.1\r\nHost: localhost:9092\r\n\r\n",
+                9091
+            ),
+            400
         );
         for bad in [
             "Origin: https://evil.test\r\n",
@@ -200,13 +227,14 @@ mod tests {
         ] {
             assert_eq!(
                 classify(
-                    format!("GET /v1/status HTTP/1.1\r\nHost: localhost\r\n{bad}\r\n").as_bytes()
+                    format!("GET /v1/status HTTP/1.1\r\nHost: localhost\r\n{bad}\r\n").as_bytes(),
+                    9091
                 ),
                 400
             );
         }
         assert_eq!(
-            classify(b"POST /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+            classify(b"POST /v1/status HTTP/1.1\r\nHost: localhost\r\n\r\n", 9091),
             405
         );
         assert_eq!(quoted("a\n\"\\"), "\"a\\u000a\\\"\\\\\"");

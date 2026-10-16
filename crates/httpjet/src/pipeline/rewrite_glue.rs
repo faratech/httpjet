@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use hj_core::{ReqCtx, Request};
 use hj_rewrite::{
     CacheKeyVar, HeaderLookup, Htaccess, RewriteInput, RewriteOutcome, RuleSet, StatSource,
-    evaluate,
+    evaluate_with_engine,
 };
 use http::Uri;
 
@@ -86,6 +86,9 @@ const MAX_MEMO_UA_BYTES: usize = 1024;
 struct OutcomeKey {
     vhost: String,
     https: bool,
+    /// The listener port: a path-only `[R]` Location carries a non-default
+    /// SERVER_PORT, so two ports must not share an outcome (#692).
+    port: u16,
     method: String,
     host: String,
     path: String,
@@ -191,6 +194,7 @@ impl RewriteOutcomeCache {
         Self::parts_hash(
             &key.vhost,
             key.https,
+            key.port,
             &key.method,
             &key.host,
             &key.path,
@@ -202,6 +206,7 @@ impl RewriteOutcomeCache {
     fn parts_hash(
         vhost: &str,
         https: bool,
+        port: u16,
         method: &str,
         host: &str,
         path: &str,
@@ -215,6 +220,7 @@ impl RewriteOutcomeCache {
             h.write(part.as_bytes());
         }
         h.write(&[https as u8]);
+        h.write(&port.to_le_bytes());
         h.finish()
     }
 
@@ -337,6 +343,17 @@ impl RewriteOutcomeCache {
 /// are dropped wholesale by [`Self::clear`] on SIGHUP (see
 /// `ServerState::reload`) and otherwise bounded by the insert cap. No TTL: the
 /// mapping never goes stale while the id lives.
+/// Borrowed form of a [`UaClassifyCache`] key. Hashes exactly like the owned
+/// `(u64, String)` tuple (field order, `str` hashing), so a lookup needs no allocation.
+#[derive(Hash)]
+struct UaKeyRef<'a>(u64, &'a str);
+
+impl dashmap::Equivalent<(u64, String)> for UaKeyRef<'_> {
+    fn equivalent(&self, key: &(u64, String)) -> bool {
+        self.0 == key.0 && self.1 == key.1
+    }
+}
+
 pub(crate) struct UaClassifyCache {
     map: DashMap<(u64, String), u64>,
     cap: usize,
@@ -356,19 +373,21 @@ impl UaClassifyCache {
     }
 
     /// The memoized bitmap for (`rs`, `ua`), computing + (cap-gated) inserting on miss.
+    /// A hit allocates nothing: the probe borrows the UA.
     pub(crate) fn get_or_compute(&self, rs: &RuleSet, ua: &str) -> u64 {
         if ua.len() > MAX_MEMO_UA_BYTES {
             return rs.ua_cond_signature(ua);
         }
-        let key = (rs.id(), ua.to_string());
-        if let Some(sig) = self.map.get(&key) {
+        if let Some(sig) = self.map.get(&UaKeyRef(rs.id(), ua)) {
             return *sig;
         }
         let sig = rs.ua_cond_signature(ua);
         if self.count.load(Ordering::Relaxed) >= self.cap {
             self.maybe_flush_full();
         }
-        if self.count.load(Ordering::Relaxed) < self.cap && self.map.insert(key, sig).is_none() {
+        if self.count.load(Ordering::Relaxed) < self.cap
+            && self.map.insert((rs.id(), ua.to_string()), sig).is_none()
+        {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
         sig
@@ -585,10 +604,16 @@ pub(super) fn run_rewrite_with_headers(
             }
         }
     }
+    // The self-redirect guard reads the Host header's port (#703).
+    if let Some(p) = host_header_port(headers) {
+        key_vars.push_str("\nhp=");
+        key_vars.push_str(&p.to_string());
+    }
     // (#313) Borrow every key part for the size guard and the hash-first probe;
     // the owned OutcomeKey is built only on the miss path that inserts.
     let host = rewrite_host(ctx, headers);
     let https = ctx.is_tls;
+    let port = ctx.local_addr.port();
     let vhost = ctx.vhost_name.as_str();
     let host_s: &str = &host;
     // Every key component except the vhost is client-controlled (path, query,
@@ -615,10 +640,11 @@ pub(super) fn run_rewrite_with_headers(
         );
     }
     let hash =
-        RewriteOutcomeCache::parts_hash(vhost, https, method, host_s, path, query, &key_vars);
+        RewriteOutcomeCache::parts_hash(vhost, https, port, method, host_s, path, query, &key_vars);
     if let Some(hit) = state.rewrite_outcomes.probe(hash, &|k| {
         k.vhost == vhost
             && k.https == https
+            && k.port == port
             && k.method == method
             && k.host == host_s
             && k.path == path
@@ -648,6 +674,7 @@ pub(super) fn run_rewrite_with_headers(
     let key = OutcomeKey {
         vhost: vhost.to_string(),
         https,
+        port,
         method: method.to_string(),
         host: host_s.to_string(),
         path: path.to_string(),
@@ -658,6 +685,154 @@ pub(super) fn run_rewrite_with_headers(
         .rewrite_outcomes
         .insert_hashed(hash, key, result.clone());
     result
+}
+
+/// The page-cache key fragment for a request whose rewrite conditions read the
+/// User-Agent (#603): `fingerprint:bitmap;` for every UA-reading ruleset (the vhost's
+/// inline rules, then `chain`, which must be the chain whose conds actually ran) where
+/// some UA condition matched. The fingerprint is restart-stable because the page cache
+/// persists. `None` when nothing reads the UA, when no condition matched (ordinary
+/// browsers keep the historic key), or when a UA read is not classifiable — keying on
+/// the raw UA would shatter the public cache, so `httpjet check` warns about those.
+pub(crate) fn page_cache_ua_class(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    chain: &[(PathBuf, Arc<Htaccess>)],
+    headers: &http::HeaderMap,
+) -> Option<String> {
+    let inline = state
+        .inline_rules
+        .get(&ctx.vhost_name)
+        .map(|rs| &**rs)
+        .filter(|rs| rs.reads_user_agent());
+    let mut readers = inline
+        .into_iter()
+        .chain(chain.iter().map(|(_, ht)| &ht.rules))
+        .filter(|rs| rs.reads_user_agent())
+        .peekable();
+    readers.peek()?;
+    if !state.rewrite_ua_classify {
+        return None;
+    }
+    let ua = headers
+        .get_all(http::header::USER_AGENT)
+        .iter()
+        .next()
+        .map(hj_core::header_value_lossy);
+    let ua = ua.as_deref().unwrap_or("");
+    let mut class = String::new();
+    for rs in readers {
+        if !rs.ua_classify_eligible() {
+            return None;
+        }
+        let sig = state.ua_classify.get_or_compute(rs, ua);
+        if sig != 0 {
+            use std::fmt::Write;
+            let _ = write!(class, "{:x}:{:x};", rs.ua_fingerprint(), sig);
+        }
+    }
+    (!class.is_empty()).then_some(class)
+}
+
+/// (#617/#618) Page-cache key fragment for every OTHER request header the
+/// applied rules read — SetEnvIf attributes (`memo.vary_headers`) and
+/// `RewriteCond %{HTTP:...}` vars (`cache_key_vars`) from the chain whose
+/// conds actually ran PLUS the vhost's inline rules (the same sources as
+/// [`page_cache_ua_class`], not just the destination chain). Each present
+/// header contributes `name:<fnv64>;` in sorted order; absent headers keep
+/// the historic key. `user-agent` is excluded only when a rewrite cond set
+/// is fully UA-classifiable and no SetEnvIf reads it; otherwise its raw value
+/// is folded. `origin` is included so inline and pre-rewrite Origin reads key
+/// per-Origin even when the destination chain does not read it.
+/// Cookie reads confined to SetEnvIf discriminate on the evaluated assignments,
+/// including capture expansions. Raw Cookie remains required for rewrite reads.
+pub(crate) fn page_cache_header_vary(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    chain: &[(PathBuf, Arc<Htaccess>)],
+    headers: &http::HeaderMap,
+) -> Option<String> {
+    use std::collections::BTreeSet;
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    let mut rulesets: Vec<&hj_rewrite::RuleSet> = Vec::new();
+    if let Some(rs) = state.inline_rules.get(&ctx.vhost_name) {
+        rulesets.push(rs);
+    }
+    let mut setenv_reads_user_agent = false;
+    let mut rewrite_reads_cookie = false;
+    for (_, ht) in chain {
+        for name in &ht.memo.vary_headers {
+            if name == "user-agent" {
+                setenv_reads_user_agent = true;
+            }
+            names.insert(name.as_str());
+        }
+        rulesets.push(&ht.rules);
+    }
+    for rs in &rulesets {
+        for name in &rs.header_reads {
+            names.insert(name.as_str());
+            rewrite_reads_cookie |= name == "cookie";
+        }
+        for v in &rs.cache_key_vars {
+            match v {
+                hj_rewrite::CacheKeyVar::Origin => {
+                    names.insert("origin");
+                }
+                hj_rewrite::CacheKeyVar::Accept => {
+                    names.insert("accept");
+                }
+                hj_rewrite::CacheKeyVar::UserAgent => {}
+            }
+        }
+    }
+    let rewrite_ua_unclassified = rulesets.iter().any(|rs| {
+        rs.reads_user_agent() && !(state.rewrite_ua_classify && rs.ua_classify_eligible())
+    });
+    if !setenv_reads_user_agent && !rewrite_ua_unclassified {
+        names.remove("user-agent");
+    }
+    let mut out = String::new();
+    if names.contains("cookie") && !rewrite_reads_cookie {
+        let cookie = keyed_header(headers, "cookie");
+        let mut assignments = String::new();
+        let evaluated: Result<(), &'static str> = chain.iter().try_for_each(|(_, ht)| {
+            for (name, value) in ht.eval_cookie_env(cookie.as_deref())? {
+                use std::fmt::Write;
+                // Length prefixes preserve assignment boundaries and order,
+                // including values expanded from regex capture groups.
+                let _ = write!(assignments, "{}:{name}{}:{value}", name.len(), value.len());
+            }
+            Ok(())
+        });
+        if evaluated.is_ok() {
+            names.remove("cookie");
+            if !assignments.is_empty() {
+                // '@' cannot occur in a request-header name, keeping this
+                // derived dimension separate from arbitrary HTTP:* reads.
+                append_header_vary(&mut out, "@cookie-env", &assignments);
+            }
+        }
+        // Regex errors retain the full raw Cookie discrimination. Normal
+        // SetEnvIf evaluation refuses those requests before cache lookup.
+    }
+    for name in names {
+        let Some(value) = keyed_header(headers, name) else {
+            continue;
+        };
+        append_header_vary(&mut out, name, &value);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn append_header_vary(out: &mut String, name: &str, value: &str) {
+    use std::fmt::Write;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in value.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let _ = write!(out, "{name}:{hash:016x};");
 }
 
 /// Header extraction for outcome-cache keying, byte-identical to the engine's
@@ -679,6 +854,16 @@ fn keyed_header(headers: &http::HeaderMap, name: &str) -> Option<String> {
 /// IPv6-aware [`hj_core::host_without_port`] (a naive `split(':')` mangles a bracketed
 /// `[::1]:443` to `[`); this also matches how the router resolves the vhost, so the
 /// rewrite host is consistent with routing. The fallback vhost name borrows.
+/// The explicit port in the Host header (`host:8080`, `[::1]:8443`), if any.
+fn host_header_port(headers: &http::HeaderMap) -> Option<u16> {
+    let h = headers.get(http::header::HOST)?.to_str().ok()?.trim();
+    let port = match h.strip_prefix('[') {
+        Some(v6) => v6.split_once(']')?.1.strip_prefix(':')?,
+        None => h.rsplit_once(':')?.1,
+    };
+    port.parse().ok()
+}
+
 fn rewrite_host<'a>(ctx: &'a ReqCtx, headers: &'a http::HeaderMap) -> Cow<'a, str> {
     headers
         .get(http::header::HOST)
@@ -736,18 +921,30 @@ fn run_rewrite_inner(
 
     // A1: build the request representation ONCE — it is identical for every
     // ruleset (first-match-wins; only `per_directory_prefix` is adjusted below).
+    let host = rewrite_host(ctx, headers);
+    // SERVER_NAME (and so a path-only [R] Location) follows an explicitly mapped alias
+    // like OLS/Apache, but a wildcard-routed foreign Host keeps the canonical vhost
+    // name so the catch-all vhost never redirects to an arbitrary host (#688).
+    let server_name: Cow<'_, str> = if !host.eq_ignore_ascii_case(&ctx.vhost_name)
+        && state.router.host_maps_to_vhost(&host, &ctx.vhost_name)
+    {
+        Cow::Owned(host.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(ctx.vhost_name.as_str())
+    };
     let mut input = RewriteInput::new(path, docroot)
         .method(method)
-        .host(rewrite_host(ctx, headers))
+        .host(host)
         .https(ctx.is_tls)
         .query(query)
         .remote_addr(remote_addr)
         .remote_port(ctx.peer_port)
         .server_addr(server_addr)
-        .server_name(ctx.vhost_name.as_str())
+        .server_name(server_name)
         .server_port(server_port)
         .protocol(ctx.protocol.as_str());
     input.header_lookup = Some(HeaderLookup(&header_lookup));
+    input.host_port = host_header_port(headers);
     // Seed the env the rewrite engine reads (%{ENV:NAME}) from ctx (SetEnvIf +
     // anything set earlier), so .htaccess RewriteConds see SetEnvIf results. Borrow
     // ctx.env directly rather than cloning every entry into a fresh BTreeMap per
@@ -758,25 +955,36 @@ fn run_rewrite_inner(
     // (ruleset, per_directory_prefix). Inline rules have no prefix; each
     // .htaccess uses its directory path relative to docroot (no leading slash,
     // trailing slash) so Apache's per-directory prefix stripping is reproduced.
-    let mut rulesets: Vec<(&hj_rewrite::RuleSet, Option<String>)> = Vec::new();
+    let mut rulesets: Vec<(&hj_rewrite::RuleSet, Option<String>, bool)> = Vec::new();
     if let Some(rs) = inline.as_deref() {
-        rulesets.push((rs, None));
+        rulesets.push((rs, None, true));
     }
     for (dir, ht) in chain {
-        rulesets.push((&ht.rules, per_dir_prefix(&ctx.vhost.doc_root, dir)));
+        rulesets.push((&ht.rules, per_dir_prefix(&ctx.vhost.doc_root, dir), false));
     }
 
     // (audit) %{THE_REQUEST} must resolve from the VERBATIM pre-decode target.
     // `req.uri()` still carries the raw percent-encoded bytes — attach them only
     // when some ruleset actually reads the variable (zero cost otherwise).
-    if rulesets.iter().any(|(rs, _)| rs.uses_the_request) {
+    if rulesets.iter().any(|(rs, _, _)| rs.uses_the_request) {
         input.raw_request_target = Some(raw_request_target.to_owned());
     }
 
     let mut merged_env: Vec<(String, String)> = Vec::new();
-    for (rs, prefix) in rulesets {
+    // A per-directory ruleset without `RewriteEngine` inherits the nearest
+    // enclosing state, rooted at the vhost's rewrite enable (OLS context merge).
+    let mut inherited_engine = ctx.vhost.rewrite.enable;
+    for (rs, prefix, server_context) in rulesets {
         input.per_directory_prefix = prefix;
-        let outcome = evaluate(rs, &input);
+        input.server_context = server_context;
+        let engine_on = if server_context {
+            rs.engine_state().unwrap_or(false)
+        } else {
+            let on = rs.engine_state().unwrap_or(inherited_engine);
+            inherited_engine = on;
+            on
+        };
+        let outcome = evaluate_with_engine(rs, &input, engine_on);
         // Merge this ruleset's env regardless of outcome shape.
         let is_end = outcome.is_end();
         match outcome {
@@ -1062,12 +1270,41 @@ mod tests {
         OutcomeKey {
             vhost: "v".into(),
             https: true,
+            port: 443,
             method: "GET".into(),
             host: "h".into(),
             path: path.into(),
             query: String::new(),
             key_vars: String::new(),
         }
+    }
+
+    #[test]
+    fn host_header_port_parses_named_and_v6_hosts() {
+        let port = |h: &str| {
+            let mut m = http::HeaderMap::new();
+            m.insert(http::header::HOST, h.parse().unwrap());
+            host_header_port(&m)
+        };
+        assert_eq!(port("example.com"), None);
+        assert_eq!(port("example.com:8080"), Some(8080));
+        assert_eq!(port("[::1]"), None);
+        assert_eq!(port("[::1]:8443"), Some(8443));
+    }
+
+    #[test]
+    fn outcome_key_separates_listener_ports() {
+        // #692: a path-only [R] Location carries the listener port.
+        let c = Arc::new(RewriteOutcomeCache::new(DEFAULT_REWRITE_OUTCOME_TTL));
+        c.insert(okey("/p"), RwResult::Forbidden);
+        assert!(c.get(&okey("/p")).is_some());
+        assert!(
+            c.get(&OutcomeKey {
+                port: 8443,
+                ..okey("/p")
+            })
+            .is_none()
+        );
     }
 
     // Regression: a bracketed IPv6 Host must not be mangled into the rewrite host /
@@ -1494,5 +1731,78 @@ mod tests {
             1,
             "flush drops the old entries, admits the new"
         );
+    }
+
+    #[tokio::test]
+    async fn child_htaccess_without_rewrite_engine_inherits_the_parent_state() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        let root = std::env::temp_dir().join(format!("hj-engine-inherit-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let state = super::super::e2e::build_state(root.clone());
+        let mk_ctx = |vhost: Arc<hj_core::config::VHostConfig>| ReqCtx {
+            server: Arc::clone(&state.server),
+            vhost_name: "e2e".into(),
+            vhost,
+            peer_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            is_tls: false,
+            protocol: hj_core::Proto::Http1,
+            trusted_proxy: false,
+            forwarding_trusted: false,
+            env: Vec::new(),
+            local_addr: SocketAddr::from(([127, 0, 0, 1], 80)),
+            peer_port: 12345,
+            peer_unix: false,
+            tls: None,
+            redirect_guard: None,
+            request_time: std::time::SystemTime::now(),
+            request_id: Default::default(),
+        };
+        let vhost = |enable: bool| {
+            let mut v = hj_core::config::VHostConfig {
+                doc_root: root.clone(),
+                ..Default::default()
+            };
+            v.rewrite.enable = enable;
+            Arc::new(v)
+        };
+        let child = Arc::new(Htaccess::parse("RewriteRule ^private - [F]\n").unwrap());
+        let parsed = |src: &str| Arc::new(Htaccess::parse(src).unwrap());
+        let run = |ctx: &ReqCtx, chain: &[(PathBuf, Arc<Htaccess>)]| {
+            run_rewrite_inner(
+                &state,
+                ctx,
+                "GET",
+                &http::HeaderMap::new(),
+                "/sub/private",
+                chain,
+                "/sub/private",
+                "",
+            )
+        };
+        let off_vhost = mk_ctx(vhost(false));
+        let on_parent = [
+            (root.clone(), parsed("RewriteEngine On\n")),
+            (root.join("sub"), Arc::clone(&child)),
+        ];
+        assert!(matches!(run(&off_vhost, &on_parent), RwResult::Forbidden));
+        let off_parent = [
+            (root.clone(), parsed("RewriteEngine Off\n")),
+            (root.join("sub"), Arc::clone(&child)),
+        ];
+        assert!(matches!(
+            run(&mk_ctx(vhost(true)), &off_parent),
+            RwResult::Unchanged { .. }
+        ));
+        let child_only = [(root.join("sub"), Arc::clone(&child))];
+        assert!(matches!(
+            run(&mk_ctx(vhost(true)), &child_only),
+            RwResult::Forbidden
+        ));
+        assert!(matches!(
+            run(&off_vhost, &child_only),
+            RwResult::Unchanged { .. }
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

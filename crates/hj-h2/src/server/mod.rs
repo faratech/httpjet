@@ -43,7 +43,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::frame::{self, FrameHeader, error_code, settings};
 use recv::{FrameOutcome, process_frame};
-use send::{Pulls, apply_pull, begin_response, cancel_outstream, pump_streams};
+use send::{
+    Pulls, apply_pull, begin_response, cancel_outstream, pump_streams, reset_stalled_streams,
+};
 use state::{OutStream, PeerSettings, Recv, StreamState};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,6 +59,15 @@ static ACTIVE_H2_CONNS: AtomicUsize = AtomicUsize::new(0);
 /// would have reused the connection and every close costs it a fresh handshake.
 static IDLE_CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PEER_CLOSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Responses reset because they moved too little while waiting on the peer's flow-control
+/// credit for [`Config::send_stall_timeout`] (#599).
+pub(super) static SEND_STALL_RESETS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Responses reset by the send-stall deadline (both serve loops).
+pub fn send_stall_resets() -> u64 {
+    SEND_STALL_RESETS.load(Ordering::Relaxed)
+}
 
 /// `(closed by our idle timer, closed by the peer)` for the io_uring (monoio) loop.
 pub fn connection_close_counts() -> (u64, u64) {
@@ -66,7 +77,114 @@ pub fn connection_close_counts() -> (u64, u64) {
     )
 }
 
+/// Responses that entered a flow-control-blocked state with bytes pending, split by the
+/// window that ran out: the connection window vs. the stream's own window.
+pub(super) static SEND_BLOCKED_CONN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(super) static SEND_BLOCKED_STREAM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `(blocked on the connection window, blocked on the stream window)` transitions.
+pub fn send_blocked_counts() -> (u64, u64) {
+    (
+        SEND_BLOCKED_CONN.load(Ordering::Relaxed),
+        SEND_BLOCKED_STREAM.load(Ordering::Relaxed),
+    )
+}
+
+/// Inclusive upper bounds of the peer-SETTINGS buckets; a value above the last bound lands
+/// in one trailing overflow bucket. INITIAL_WINDOW_SIZE ≤ 2^31-1 and MAX_FRAME_SIZE ≤ 2^24-1
+/// by RFC 9113 §6.5.2, so only HEADER_TABLE_SIZE can reach its overflow bucket.
+const PEER_IWS_BOUNDS: [u64; 18] = [
+    1 << 14,
+    1 << 15,
+    1 << 16,
+    1 << 17,
+    1 << 18,
+    1 << 19,
+    1 << 20,
+    1 << 21,
+    1 << 22,
+    1 << 23,
+    1 << 24,
+    1 << 25,
+    1 << 26,
+    1 << 27,
+    1 << 28,
+    1 << 29,
+    1 << 30,
+    1 << 31,
+];
+const PEER_HTS_BOUNDS: [u64; 10] = [0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536];
+const PEER_MFS_BOUNDS: [u64; 11] = [
+    1 << 14,
+    1 << 15,
+    1 << 16,
+    1 << 17,
+    1 << 18,
+    1 << 19,
+    1 << 20,
+    1 << 21,
+    1 << 22,
+    1 << 23,
+    1 << 24,
+];
+static PEER_IWS: [std::sync::atomic::AtomicU64; PEER_IWS_BOUNDS.len() + 1] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; PEER_IWS_BOUNDS.len() + 1];
+static PEER_HTS: [std::sync::atomic::AtomicU64; PEER_HTS_BOUNDS.len() + 1] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; PEER_HTS_BOUNDS.len() + 1];
+static PEER_MFS: [std::sync::atomic::AtomicU64; PEER_MFS_BOUNDS.len() + 1] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; PEER_MFS_BOUNDS.len() + 1];
+
+fn peer_settings_bucket(bounds: &[u64], value: u64) -> usize {
+    bounds
+        .iter()
+        .position(|&b| value <= b)
+        .unwrap_or(bounds.len())
+}
+
+/// Count one connection's effective values after its FIRST peer SETTINGS frame (parameters
+/// the frame omits keep their RFC defaults).
+pub(super) fn record_peer_settings(initial_window: u64, header_table: u64, max_frame: u64) {
+    for (counts, bounds, value) in [
+        (&PEER_IWS[..], &PEER_IWS_BOUNDS[..], initial_window),
+        (&PEER_HTS[..], &PEER_HTS_BOUNDS[..], header_table),
+        (&PEER_MFS[..], &PEER_MFS_BOUNDS[..], max_frame),
+    ] {
+        if let Some(count) = counts.get(peer_settings_bucket(bounds, value)) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `(param, bucket, connections)` for every bucket, zeros included: `bucket` is `<=N` for an
+/// inclusive upper bound or `>N` for the overflow above the last bound. Non-cumulative.
+pub fn peer_settings_counts() -> Vec<(&'static str, String, u64)> {
+    let params: [(&'static str, &[u64], &[std::sync::atomic::AtomicU64]); 3] = [
+        ("initial_window_size", &PEER_IWS_BOUNDS, &PEER_IWS),
+        ("header_table_size", &PEER_HTS_BOUNDS, &PEER_HTS),
+        ("max_frame_size", &PEER_MFS_BOUNDS, &PEER_MFS),
+    ];
+    let mut out = Vec::new();
+    for (param, bounds, counts) in params {
+        for (i, count) in counts.iter().enumerate() {
+            let bucket = match bounds.get(i) {
+                Some(b) => format!("<={b}"),
+                None => format!(">{}", bounds.last().copied().unwrap_or_default()),
+            };
+            out.push((param, bucket, count.load(Ordering::Relaxed)));
+        }
+    }
+    out
+}
+
 const H2_INBUF_IDLE: usize = 8 * 1024;
+/// Upper bound on the closing flush of a connection that is shutting down.
+const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound on how long a peer that sent GOAWAY may keep the connection open while its
+/// in-flight responses finish; reads stop after it, so a peer cannot pin the task.
+const PEER_GOAWAY_DRAIN: std::time::Duration = std::time::Duration::from_secs(12);
+
 const H2_READ_CHUNK: usize = 8 * 1024;
 const H2_INBUF_SHRINK_TRIGGER: usize = 64 * 1024;
 
@@ -149,6 +267,12 @@ pub struct Config {
     /// head-of-line-blocks the connection by design. The H1 path refines per context;
     /// h2 multiplexing makes a per-response rate ill-defined.
     pub bandwidth_limit: u64,
+    /// Send-progress deadline, per response: a response with bytes waiting on the peer's
+    /// flow-control credit that delivers less than `SEND_STALL_MIN_PROGRESS` within this
+    /// window is reset (RST_STREAM CANCEL), releasing its pinned body and backend. Each
+    /// response is judged on its own progress, so traffic on other streams cannot keep a
+    /// starved one alive (#599). `None` disables it.
+    pub send_stall_timeout: Option<std::time::Duration>,
 }
 
 impl Default for Config {
@@ -166,6 +290,7 @@ impl Default for Config {
             frame_read_timeout: Some(std::time::Duration::from_secs(15)),
             request_body_timeout: Some(std::time::Duration::from_secs(60)),
             bandwidth_limit: 0,
+            send_stall_timeout: Some(std::time::Duration::from_secs(60)),
         }
     }
 }
@@ -362,7 +487,9 @@ where
     let mut enc = Encoder::new();
     let mut peer = PeerSettings::default();
     let mut recv = Recv {
+        seen_settings: false,
         last_client_stream: 0,
+        goaway_last: None,
         open_header_block: None,
         discarding_header_block: false,
         discard_header_block: Vec::new(),
@@ -414,6 +541,7 @@ where
     let cap = config.max_frame_size.min(1 << 24);
     let frame_read_timeout = config.frame_read_timeout;
     let request_body_timeout = config.request_body_timeout;
+    let send_stall_timeout = config.send_stall_timeout;
     let mut partial_frame_deadline: Option<tokio::time::Instant> = None;
 
     // (HTTP/2-Bomb hardening) Connection-idle deadline, reset at the top of every iteration so
@@ -436,7 +564,7 @@ where
         // cancellation can never split a frame). Each completed request is pushed into
         // `inflight`; control responses are queued into `wbuf`.
         let mut completed_frame = false;
-        while inbuf.len() - cursor >= FrameHeader::LEN {
+        while reading && inbuf.len() - cursor >= FrameHeader::LEN {
             // The loop guard guarantees 9 bytes, so parse always succeeds; fail closed with
             // a GOAWAY rather than panicking the connection task if that ever breaks.
             let Some(hdr) = FrameHeader::parse(&inbuf[cursor..]) else {
@@ -482,6 +610,15 @@ where
                     accepting = false;
                     draining = false;
                     break;
+                }
+                FrameOutcome::PeerGoaway => {
+                    if !draining {
+                        draining = true;
+                        drain
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + PEER_GOAWAY_DRAIN);
+                    }
+                    accepting = false;
                 }
                 FrameOutcome::ResetStream(sid) => {
                     cancel_outstream(&mut outstreams, sid);
@@ -560,10 +697,15 @@ where
                                     )
                                 });
                                 pending_window.remove(&stream_id);
-                                // The server just reset this stream, so stop any backend work
-                                // immediately. `Abortable` yields no response when it drains.
+                                // The server just reset this stream: tear down the receiving
+                                // side so later DATA cannot dispatch it (#598), and stop any
+                                // backend work. `Abortable` yields no response when it drains.
+                                recv.teardown_receiving(&mut streams, stream_id);
                                 if let Some(abort) = inflight_sids.remove(&stream_id) {
                                     abort.abort();
+                                    if cancelled.len() < recv.max_concurrent.saturating_mul(2) {
+                                        cancelled.insert(stream_id);
+                                    }
                                 }
                             }
                         }
@@ -619,11 +761,9 @@ where
             })
             .collect();
         for sid in expired {
-            if let Some(st) = streams.remove(&sid) {
-                recv.buffer_sub(st.body.len());
-            }
+            recv.teardown_receiving(&mut streams, sid);
+            pending_window.remove(&sid);
             out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
-            recv.note_reset(sid);
         }
         // Release a read buffer that a large body / frame burst grew, once it has fully
         // drained between frames; idle CF keep-alives should not pin their peak capacity.
@@ -679,6 +819,9 @@ where
             &mut pulls,
             &peer,
         );
+        // Checked on every pass (not only by the timer arm below) so a peer that keeps
+        // the biased, first-polled read arm ready cannot starve the deadline.
+        let stall_deadline = reset_stalled_streams(&mut outstreams, &mut out, send_stall_timeout);
 
         // Flush queued output (ACKs, WINDOW_UPDATEs, and the batch of DATA) BEFORE the
         // select blocks on a read — otherwise the peer waits for bytes still queued and
@@ -691,6 +834,7 @@ where
             inflight.is_empty(),
             pulls.is_empty(),
             outstreams.is_empty(),
+            streams.is_empty(),
         ) {
             break;
         }
@@ -704,8 +848,12 @@ where
             .unwrap_or(far_future);
         let frame_timer = tokio::time::sleep_until(frame_deadline);
         let body_timer = tokio::time::sleep_until(body_deadline);
+        let stall_timer = tokio::time::sleep_until(
+            stall_deadline.map_or(far_future, tokio::time::Instant::from_std),
+        );
         tokio::pin!(frame_timer);
         tokio::pin!(body_timer);
+        tokio::pin!(stall_timer);
 
         tokio::select! {
             biased;
@@ -733,7 +881,8 @@ where
                     None => std::future::pending::<()>().await,
                 }
             }, if reading && accepting => {
-                out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::NO_ERROR));
+                let last = recv.goaway_last_stream_id();
+                out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
                 accepting = false;
                 draining = true;
                 drain.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(12));
@@ -756,7 +905,8 @@ where
                 }
             }
             _ = &mut frame_timer, if reading && partial_frame_deadline.is_some() => {
-                out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::PROTOCOL_ERROR));
+                let last = recv.goaway_last_stream_id();
+                out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
                 reading = false;
                 accepting = false;
                 draining = false;
@@ -770,7 +920,8 @@ where
             // work always preempts it; gated on a configured timeout and `if reading` so it fires
             // at most once.
             _ = &mut idle, if reading && idle_timeout.is_some() => {
-                out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::NO_ERROR));
+                let last = recv.goaway_last_stream_id();
+                out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
                 reading = false;
                 accepting = false;
                 draining = false;
@@ -780,10 +931,16 @@ where
                 accepting = false;
                 draining = false;
             }
+            // Wake the loop at the earliest send-stall deadline; the pass at the loop
+            // top resets the expired responses.
+            _ = &mut stall_timer, if stall_deadline.is_some() => {}
         }
     }
 
-    flush(&mut writer, &mut out).await?;
+    match tokio::time::timeout(FINAL_FLUSH_TIMEOUT, flush(&mut writer, &mut out)).await {
+        Ok(result) => result?,
+        Err(_) => return Ok(()),
+    }
     // Graceful TCP close. Half-close the write side so the peer sees a clean FIN, then
     // drain whatever inbound remains before the socket drops. Closing a socket that still
     // has unread bytes in the kernel receive buffer makes the OS emit a RST instead of a
@@ -820,11 +977,15 @@ fn should_close(
     inflight_empty: bool,
     pulls_empty: bool,
     outstreams_empty: bool,
+    receiving_empty: bool,
 ) -> bool {
     if !reading && inflight_empty && pulls_empty {
         return true;
     }
-    if draining && inflight_empty && pulls_empty && outstreams_empty {
+    // A request still uploading its body has no handler yet (dispatch waits for
+    // END_STREAM) but was admitted below our GOAWAY's last-stream-id, so the peer
+    // cannot retry it: a drain must let it finish (#695).
+    if draining && inflight_empty && pulls_empty && outstreams_empty && receiving_empty {
         return true;
     }
     false
@@ -1296,7 +1457,9 @@ where
     let mut enc = Encoder::new();
     let mut peer = PeerSettings::default();
     let mut recv = Recv {
+        seen_settings: false,
         last_client_stream: 0,
+        goaway_last: None,
         open_header_block: None,
         discarding_header_block: false,
         discard_header_block: Vec::new(),
@@ -1331,6 +1494,7 @@ where
     // in-flight work clears. The overall drain is bounded by the per-core accept loop,
     // which abandons still-running connection tasks after a grace window.
     let mut draining = false;
+    let mut peer_goaway_deadline: Option<std::time::Instant> = None;
     let cap = config.max_frame_size.min(1 << 24);
     // Deadline state mirroring the tokio `serve` loop: a partially-received frame
     // gets `frame_read_timeout` to complete, and a request whose headers arrived
@@ -1340,6 +1504,7 @@ where
     // its buffers indefinitely.
     let frame_read_timeout = config.frame_read_timeout;
     let request_body_timeout = config.request_body_timeout;
+    let send_stall_timeout = config.send_stall_timeout;
     let mut partial_frame_deadline: Option<std::time::Instant> = None;
 
     // The read future stays pinned across select iterations because cancelling a monoio-rustls
@@ -1351,7 +1516,7 @@ where
     loop {
         // 1) Process every complete buffered frame (mirrors serve()).
         let mut completed_frame = false;
-        while inbuf.len() - cursor >= FrameHeader::LEN {
+        while reading && inbuf.len() - cursor >= FrameHeader::LEN {
             let Some(hdr) = FrameHeader::parse(&inbuf[cursor..]) else {
                 out.frames(|b| frame::write_goaway(b, 0, error_code::PROTOCOL_ERROR));
                 reading = false;
@@ -1392,6 +1557,13 @@ where
                     reading = false;
                     accepting = false;
                     break;
+                }
+                FrameOutcome::PeerGoaway => {
+                    if !draining {
+                        draining = true;
+                        peer_goaway_deadline = Some(std::time::Instant::now() + PEER_GOAWAY_DRAIN);
+                    }
+                    accepting = false;
                 }
                 FrameOutcome::ResetStream(sid) => {
                     cancel_outstream(&mut outstreams, sid);
@@ -1453,8 +1625,12 @@ where
                                 )
                             });
                             pending_window.remove(&stream_id);
+                            recv.teardown_receiving(&mut streams, stream_id);
                             if let Some(abort) = inflight_sids.remove(&stream_id) {
                                 abort.abort();
+                                if cancelled.len() < recv.max_concurrent.saturating_mul(2) {
+                                    cancelled.insert(stream_id);
+                                }
                             }
                         }
                     }
@@ -1513,11 +1689,9 @@ where
             })
             .collect();
         for sid in expired {
-            if let Some(st) = streams.remove(&sid) {
-                recv.buffer_sub(st.body.len());
-            }
+            recv.teardown_receiving(&mut streams, sid);
+            pending_window.remove(&sid);
             out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
-            recv.note_reset(sid);
         }
 
         // 2) Drain handlers + body pulls ready right now (immediate handlers resolve here).
@@ -1559,6 +1733,9 @@ where
             &mut pulls,
             &peer,
         );
+        // Checked on every pass (not only by the timer arm below) so a peer that keeps
+        // the biased, first-polled read arm ready cannot starve the deadline.
+        let stall_deadline = reset_stalled_streams(&mut outstreams, &mut out, send_stall_timeout);
 
         // 3) Flush queued output.
         paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer).await?;
@@ -1575,6 +1752,7 @@ where
             inflight.is_empty(),
             pulls.is_empty(),
             outstreams.is_empty(),
+            streams.is_empty(),
         ) {
             break;
         }
@@ -1595,19 +1773,29 @@ where
             .map(|dl| dl.into_std())
             .min()
             .map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+        let stall_wait =
+            stall_deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+        let peer_goaway_wait =
+            peer_goaway_deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
         monoio::select! {
             biased;
             rb = read_fut.as_mut(), if reading => { read_done = Some(rb); }
             // (c03e287 parity) A partially-received frame that outlives
             // `frame_read_timeout` is a slowloris: GOAWAY PROTOCOL_ERROR, stop reading.
             _ = async { match frame_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && frame_wait.is_some() => {
-                out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::PROTOCOL_ERROR));
+                let last = recv.goaway_last_stream_id();
+                out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
                 reading = false;
                 accepting = false;
             }
             // Wake the loop when the nearest request-body deadline elapses; the
             // centralized expiry pass at the loop top releases the accounting.
             _ = async { match body_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && body_wait.is_some() => {}
+            _ = async { match stall_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if stall_wait.is_some() => {}
+            _ = async { match peer_goaway_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && peer_goaway_wait.is_some() => {
+                reading = false;
+                accepting = false;
+            }
             Some((sid, is_head, resp)) = inflight.next(), if !inflight.is_empty() => {
                 inflight_sids.remove(&sid);
                 if let Some(resp) = resp && !cancelled.remove(&sid) {
@@ -1621,7 +1809,8 @@ where
                 apply_pull(sid, body, res, &mut outstreams, &mut out);
             }
             _ = async { match &shutdown { Some(t) => t.cancelled().await, None => std::future::pending::<()>().await } }, if reading && accepting => {
-                out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::NO_ERROR));
+                let last = recv.goaway_last_stream_id();
+                out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
                 accepting = false;
                 draining = true;
             }
@@ -1633,7 +1822,8 @@ where
             _ = async { match config.conn_idle_timeout { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading => {
                 if accepting {
                     IDLE_CLOSES.fetch_add(1, Ordering::Relaxed);
-                    out.frames(|b| frame::write_goaway(b, recv.last_client_stream, error_code::NO_ERROR));
+                    let last = recv.goaway_last_stream_id();
+                    out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
                     accepting = false;
                     draining = true;
                 } else {
@@ -1666,7 +1856,17 @@ where
         }
     }
 
-    paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer).await?;
+    // Bounded: a peer that stopped reading at the TCP level would otherwise pin the task
+    // on its full send buffer after the send-stall deadline already gave up on it.
+    match monoio::time::timeout(
+        FINAL_FLUSH_TIMEOUT,
+        paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => return Ok(()),
+    }
     let _ = AsyncWriteRent::shutdown(&mut wh).await;
     Ok(())
 }
@@ -1845,6 +2045,261 @@ mod tests {
     /// never arrives → RST_STREAM(CANCEL) on that stream. The idle timeout is
     /// DISABLED here so only the body deadline can act.
     #[cfg(feature = "monoio")]
+    #[derive(Clone, Copy, PartialEq)]
+    enum Credit {
+        /// Never grant stream credit.
+        Withhold,
+        /// Grant plenty of credit once.
+        Grant,
+        /// One byte of credit on stream 1 every 100 ms.
+        Trickle,
+        /// Starve streams 1-7 while downloading a fresh, fully granted request every
+        /// 100 ms, so the CONNECTION keeps making progress.
+        ProgressElsewhere,
+    }
+
+    #[cfg(feature = "monoio")]
+    #[derive(Default)]
+    struct StallReport {
+        resets: std::collections::HashMap<u32, u32>,
+        data: std::collections::HashMap<u32, usize>,
+        goaway: Option<u32>,
+        all_starved_reset_at: Option<Duration>,
+    }
+
+    /// Client side of the send-stall tests: open with INITIAL_WINDOW_SIZE=0, issue GETs on
+    /// streams 1-7, PING every 50 ms (so the idle timer never fires) and apply `credit`.
+    #[cfg(feature = "monoio")]
+    fn send_stall_client(address: std::net::SocketAddr, credit: Credit) -> StallReport {
+        use std::io::{Read, Write};
+        use std::time::Instant;
+
+        let starved = [1u32, 3, 5, 7];
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut enc = Encoder::new();
+        let mut get = |sid: u32, wire: &mut Vec<u8>| {
+            let mut block = Vec::new();
+            enc.encode_header(&mut block, ":method", "GET");
+            enc.encode_header(&mut block, ":path", "/big");
+            enc.encode_header(&mut block, ":scheme", "https");
+            enc.encode_header(&mut block, ":authority", "example.com");
+            frame::write_frame(
+                wire,
+                frame::kind::HEADERS,
+                frame::flags::END_HEADERS | frame::flags::END_STREAM,
+                sid,
+                &block,
+            );
+        };
+        let mut wire = crate::conn::PREFACE.to_vec();
+        frame::write_settings(&mut wire, &[(settings::INITIAL_WINDOW_SIZE, 0)]);
+        for sid in starved {
+            get(sid, &mut wire);
+        }
+        stream.write_all(&wire).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+
+        let started = Instant::now();
+        let run_for = Duration::from_millis(if credit == Credit::Grant { 900 } else { 2500 });
+        let mut report = StallReport::default();
+        let (mut seen, mut at) = (Vec::new(), 0usize);
+        let (mut last_ping, mut last_tick) = (Instant::now(), Instant::now());
+        let mut granted = false;
+        let mut next_sid = 9u32;
+        let mut buf = [0u8; 16384];
+        while started.elapsed() < run_for {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+            while let Some(header) = seen.get(at..at + 9) {
+                let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let Some(payload) = seen.get(at + 9..at + 9 + len) else {
+                    break;
+                };
+                let (kind, sid) = (
+                    header[3],
+                    u32::from_be_bytes(header[5..9].try_into().unwrap()),
+                );
+                match kind {
+                    frame::kind::DATA => *report.data.entry(sid).or_default() += len,
+                    frame::kind::RST_STREAM => {
+                        report
+                            .resets
+                            .insert(sid, u32::from_be_bytes(payload[..4].try_into().unwrap()));
+                    }
+                    frame::kind::GOAWAY => {
+                        report.goaway = Some(u32::from_be_bytes(payload[4..8].try_into().unwrap()));
+                    }
+                    _ => {}
+                }
+                at += 9 + len;
+            }
+            if report.all_starved_reset_at.is_none()
+                && starved.iter().all(|sid| report.resets.contains_key(sid))
+            {
+                report.all_starved_reset_at = Some(started.elapsed());
+            }
+            let mut send = Vec::new();
+            if last_ping.elapsed() >= Duration::from_millis(50) {
+                frame::write_frame(&mut send, frame::kind::PING, 0, 0, &[0u8; 8]);
+                last_ping = Instant::now();
+            }
+            let tick = last_tick.elapsed() >= Duration::from_millis(100);
+            match credit {
+                Credit::Grant if !granted && started.elapsed() > Duration::from_millis(100) => {
+                    for sid in [0u32, 1, 3, 5, 7] {
+                        frame::write_window_update(&mut send, sid, 1 << 20);
+                    }
+                    granted = true;
+                }
+                Credit::Trickle if tick => {
+                    frame::write_window_update(&mut send, 0, 1);
+                    frame::write_window_update(&mut send, 1, 1);
+                    last_tick = Instant::now();
+                }
+                Credit::ProgressElsewhere if tick => {
+                    get(next_sid, &mut send);
+                    frame::write_window_update(&mut send, 0, 64 * 1024);
+                    frame::write_window_update(&mut send, next_sid, 64 * 1024);
+                    next_sid += 2;
+                    last_tick = Instant::now();
+                }
+                _ => {}
+            }
+            if !send.is_empty() && stream.write_all(&send).is_err() {
+                break;
+            }
+        }
+        report
+    }
+
+    #[cfg(feature = "monoio")]
+    fn send_stall_server(std_listener: std::net::TcpListener) {
+        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = Config {
+                conn_idle_timeout: Some(Duration::from_secs(10)),
+                send_stall_timeout: Some(Duration::from_millis(300)),
+                ..Config::default()
+            };
+            let _ = serve_local_with_prefix(
+                stream,
+                Vec::new(),
+                |_| {
+                    std::future::ready(Response::new(hj_core::Body::Full(Bytes::from(vec![
+                        b'x';
+                        64 * 1024
+                    ]))))
+                },
+                config,
+                None,
+                None,
+            )
+            .await;
+        });
+    }
+
+    #[cfg(feature = "monoio")]
+    fn run_send_stall(credit: Credit) -> StallReport {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || send_stall_server(std_listener));
+        send_stall_client(address, credit)
+    }
+
+    #[cfg(feature = "monoio")]
+    fn assert_starved_streams_reset(report: &StallReport, mode: &str) {
+        for sid in [1u32, 3, 5, 7] {
+            assert_eq!(
+                report.resets.get(&sid),
+                Some(&frame::error_code::CANCEL),
+                "{mode}: stream {sid} must be reset with CANCEL"
+            );
+        }
+        let at = report.all_starved_reset_at.unwrap();
+        assert!(
+            at < Duration::from_millis(1500),
+            "{mode}: reset after {at:?}"
+        );
+        assert_eq!(
+            report.goaway, None,
+            "{mode}: only the starved responses are reset"
+        );
+    }
+
+    /// Regression (#599): a reader that withholds flow-control credit (while keeping the
+    /// connection alive with PINGs) can no longer pin finished responses indefinitely.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_send_stall_resets_responses_of_a_credit_withholding_reader() {
+        let before = send_stall_resets();
+        let report = run_send_stall(Credit::Withhold);
+        assert_starved_streams_reset(&report, "withhold");
+        assert!(report.data.is_empty(), "no credit, no DATA");
+        assert!(send_stall_resets() >= before + 4);
+    }
+
+    /// A reader granting a byte at a time does not restart a response's clock: it only
+    /// restarts after `SEND_STALL_MIN_PROGRESS` bytes of that response's own progress.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_send_stall_resets_a_trickled_response() {
+        let report = run_send_stall(Credit::Trickle);
+        assert_starved_streams_reset(&report, "trickle");
+        let trickled = report.data.get(&1).copied().unwrap_or(0);
+        assert!(trickled > 0, "the trickle delivered some bytes");
+        assert!((trickled as u64) < send::SEND_STALL_MIN_PROGRESS);
+    }
+
+    /// Progress on OTHER streams cannot keep a starved response alive: each response is
+    /// judged on its own delivery.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_send_stall_judges_each_response_on_its_own_progress() {
+        let report = run_send_stall(Credit::ProgressElsewhere);
+        assert_starved_streams_reset(&report, "progress elsewhere");
+        let elsewhere: usize = report
+            .data
+            .iter()
+            .filter(|(sid, _)| **sid >= 9)
+            .map(|(_, n)| n)
+            .sum();
+        assert!(
+            elsewhere >= 64 * 1024,
+            "the connection kept making progress"
+        );
+        assert!(
+            report.resets.keys().all(|sid| *sid < 9),
+            "fully granted responses are never reset: {:?}",
+            report.resets
+        );
+    }
+
+    /// Control: a reader that grants credit receives every body and nothing is reset.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_send_stall_spares_a_reader_that_grants_credit() {
+        let report = run_send_stall(Credit::Grant);
+        assert!(report.resets.is_empty(), "{:?}", report.resets);
+        for sid in [1u32, 3, 5, 7] {
+            assert_eq!(report.data.get(&sid), Some(&(64 * 1024)), "stream {sid}");
+        }
+    }
+
+    #[cfg(feature = "monoio")]
     #[test]
     fn monoio_body_deadline_resets_withheld_request_body() {
         use std::io::{Read, Write};
@@ -1937,26 +2392,28 @@ mod tests {
     fn should_close_drains_inflight_after_reads_stop() {
         // reading stopped, a handler still running -> must NOT close (the bug).
         assert!(!should_close(
-            false, false, /*inflight*/ false, /*pulls*/ true, true
+            false, false, /*inflight*/ false, /*pulls*/ true, true, true
         ));
         // reading stopped, a streaming body still producing -> must NOT close.
         assert!(!should_close(
-            false, false, true, /*pulls*/ false, true
+            false, false, true, /*pulls*/ false, true, true
         ));
         // reading stopped, nothing left to produce -> close (window-blocked outstreams
         // can't advance without reads, so they are intentionally ignored).
         assert!(should_close(
-            false, false, true, true, /*outstreams*/ false
+            false, false, true, true, /*outstreams*/ false, true
         ));
-        assert!(should_close(false, false, true, true, true));
+        assert!(should_close(false, false, true, true, true, true));
         // still reading -> never close here (the select drives the next read).
-        assert!(!should_close(true, false, true, true, true));
+        assert!(!should_close(true, false, true, true, true, true));
         // graceful drain keeps reading, so it only closes once EVERYTHING (incl.
         // outstreams) has drained.
         assert!(!should_close(
-            true, true, true, true, /*outstreams*/ false
+            true, true, true, true, /*outstreams*/ false, true
         ));
-        assert!(should_close(true, true, true, true, true));
+        assert!(should_close(true, true, true, true, true, true));
+        // #695: a graceful drain waits for a request still uploading its body.
+        assert!(!should_close(true, true, true, true, true, false));
     }
 
     /// `AbortOnDrop` must CANCEL its in-flight task on drop (not tokio's default detach), so a
@@ -2001,6 +2458,112 @@ mod tests {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::Release);
         }
+    }
+
+    fn peer_settings_count(param: &str, bucket: &str) -> u64 {
+        peer_settings_counts()
+            .into_iter()
+            .find(|(p, b, _)| *p == param && b == bucket)
+            .map(|(_, _, n)| n)
+            .unwrap_or_else(|| panic!("no bucket {param} {bucket}"))
+    }
+
+    #[test]
+    fn peer_settings_buckets_are_inclusive_powers_of_two() {
+        assert_eq!(peer_settings_bucket(&PEER_IWS_BOUNDS, 0), 0);
+        assert_eq!(peer_settings_bucket(&PEER_IWS_BOUNDS, 65_535), 2);
+        assert_eq!(peer_settings_bucket(&PEER_IWS_BOUNDS, 65_536), 2);
+        assert_eq!(peer_settings_bucket(&PEER_IWS_BOUNDS, 65_537), 3);
+        assert_eq!(
+            peer_settings_bucket(&PEER_IWS_BOUNDS, i32::MAX as u64),
+            PEER_IWS_BOUNDS.len() - 1
+        );
+        assert_eq!(peer_settings_bucket(&PEER_HTS_BOUNDS, 0), 0);
+        assert_eq!(peer_settings_bucket(&PEER_HTS_BOUNDS, 4096), 5);
+        assert_eq!(
+            peer_settings_bucket(&PEER_HTS_BOUNDS, u32::MAX as u64),
+            PEER_HTS_BOUNDS.len()
+        );
+        assert_eq!(
+            peer_settings_bucket(&PEER_MFS_BOUNDS, (1 << 24) - 1),
+            PEER_MFS_BOUNDS.len() - 1
+        );
+        let counts = peer_settings_counts();
+        assert_eq!(
+            counts.len(),
+            PEER_IWS_BOUNDS.len() + PEER_HTS_BOUNDS.len() + PEER_MFS_BOUNDS.len() + 3
+        );
+        assert!(
+            counts
+                .iter()
+                .any(|(p, b, _)| *p == "header_table_size" && b == ">65536")
+        );
+        assert!(
+            counts
+                .iter()
+                .any(|(p, b, _)| *p == "initial_window_size" && b == "<=2147483648")
+        );
+    }
+
+    /// Only a connection's FIRST SETTINGS frame is counted; a later one (and omitted
+    /// parameters, which keep their defaults) must not add samples.
+    #[test]
+    fn first_peer_settings_frame_is_counted_once_per_connection() {
+        use super::recv::process_frame;
+        use crate::frame::kind;
+
+        let service = |_req: Request| std::future::ready(Response::new(hj_core::Body::Empty));
+        let mut streams = FxHashMap::default();
+        let mut dec = Decoder::new(4096, 8192);
+        let mut enc = Encoder::new();
+        let mut out = OutQueue::default();
+        let mut peer = PeerSettings::default();
+        let mut recv = recv_for_header_test(0);
+        let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
+        let mut cancelled = FxHashSet::default();
+        let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
+        let mut payload = Vec::new();
+        for (id, value) in [
+            (settings::INITIAL_WINDOW_SIZE, 999_999_999u32),
+            (settings::MAX_FRAME_SIZE, 1 << 20),
+        ] {
+            payload.extend_from_slice(&id.to_be_bytes());
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+        let iws_before = peer_settings_count("initial_window_size", "<=1073741824");
+        let mfs_before = peer_settings_count("max_frame_size", "<=1048576");
+        let hts_before = peer_settings_count("header_table_size", "<=4096");
+        for _ in 0..3 {
+            let outcome = process_frame(
+                FrameHeader {
+                    length: payload.len() as u32,
+                    kind: kind::SETTINGS,
+                    flags: 0,
+                    stream_id: 0,
+                },
+                &payload,
+                &mut streams,
+                &mut dec,
+                &mut enc,
+                &mut out,
+                &mut peer,
+                &mut recv,
+                0,
+                true,
+                &service,
+                &mut inflight,
+                &mut cancelled,
+                &mut inflight_sids,
+            );
+            assert!(!matches!(outcome, FrameOutcome::StopReading));
+        }
+        assert!(peer.first_settings_recorded);
+        assert_eq!(
+            peer_settings_count("initial_window_size", "<=1073741824") - iws_before,
+            1
+        );
+        assert!(peer_settings_count("max_frame_size", "<=1048576") > mfs_before);
+        assert!(peer_settings_count("header_table_size", "<=4096") > hts_before);
     }
 
     #[tokio::test]
@@ -2131,7 +2694,9 @@ mod tests {
 
     fn recv_for_header_test(last_client_stream: u32) -> Recv {
         Recv {
+            seen_settings: true,
             last_client_stream,
+            goaway_last: None,
             open_header_block: None,
             discarding_header_block: false,
             discard_header_block: Vec::new(),
@@ -2151,6 +2716,59 @@ mod tests {
 
     fn request_block_referencing_first_dynamic_entry() -> Vec<u8> {
         vec![0x82, 0x87, 0x84, 0xbe]
+    }
+
+    #[tokio::test]
+    async fn first_frame_must_be_non_ack_settings() {
+        // #625 (RFC 9113 §3.4)
+        use super::recv::process_frame;
+        use crate::frame::{flags, kind};
+        let run = |kind: u8, flags_v: u8, payload: &[u8]| {
+            let mut streams = FxHashMap::default();
+            let mut dec = Decoder::new(4096, 8192);
+            let mut enc = Encoder::new();
+            let mut out = OutQueue::default();
+            let mut peer = PeerSettings::default();
+            let mut recv = recv_for_header_test(0);
+            recv.seen_settings = false;
+            let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
+            let mut cancelled = FxHashSet::default();
+            let mut inflight_sids = FxHashMap::default();
+            let service = |_req: Request| std::future::ready(Response::new(hj_core::Body::Empty));
+            process_frame(
+                FrameHeader {
+                    length: payload.len() as u32,
+                    kind,
+                    flags: flags_v,
+                    stream_id: if kind == kind::HEADERS { 1 } else { 0 },
+                },
+                payload,
+                &mut streams,
+                &mut dec,
+                &mut enc,
+                &mut out,
+                &mut peer,
+                &mut recv,
+                0,
+                true,
+                &service,
+                &mut inflight,
+                &mut cancelled,
+                &mut inflight_sids,
+            )
+        };
+        assert!(matches!(
+            run(kind::HEADERS, flags::END_HEADERS, &[0x82, 0x87, 0x84]),
+            FrameOutcome::StopReading
+        ));
+        assert!(matches!(
+            run(kind::SETTINGS, flags::ACK, &[]),
+            FrameOutcome::StopReading
+        ));
+        assert!(!matches!(
+            run(kind::SETTINGS, 0, &[]),
+            FrameOutcome::StopReading
+        ));
     }
 
     #[tokio::test]
@@ -2421,7 +3039,9 @@ mod tests {
         let mut out = OutQueue::default();
         let mut peer = PeerSettings::default();
         let mut recv = Recv {
+            seen_settings: true,
             last_client_stream: 1,
+            goaway_last: None,
             open_header_block: None,
             discarding_header_block: false,
             discard_header_block: Vec::new(),
@@ -2504,7 +3124,9 @@ mod tests {
         let mut out = OutQueue::default();
         let mut peer = PeerSettings::default();
         let mut recv = Recv {
+            seen_settings: true,
             last_client_stream: 1,
+            goaway_last: None,
             open_header_block: None,
             discarding_header_block: false,
             discard_header_block: Vec::new(),
@@ -2581,8 +3203,8 @@ mod tests {
     fn data_frame_respects_server_wide_body_budget() {
         // (#236 residual) The per-stream and per-connection caps leave the SERVER-WIDE
         // aggregate unbounded; the shared budget must refuse a reservation once exhausted
-        // (GOAWAY ENHANCE_YOUR_CALM) and release exactly what was buffered when a stream
-        // un-buffers, so the H1/H2/H3/LSAPI layers share one honest ledger.
+        // and release exactly what was buffered when a stream is torn down, so the
+        // H1/H2/H3/LSAPI layers share one honest ledger.
         let budget = std::sync::Arc::new(hj_core::budget::BodyBufferBudget::new(16));
         let mut body_lease = hj_core::budget::BodyBufferLease::new(budget.clone());
         assert!(body_lease.reserve(8));
@@ -2604,7 +3226,9 @@ mod tests {
         let mut out = OutQueue::default();
         let mut peer = PeerSettings::default();
         let mut recv = Recv {
+            seen_settings: true,
             last_client_stream: 1,
+            goaway_last: None,
             open_header_block: None,
             discarding_header_block: false,
             discard_header_block: Vec::new(),
@@ -2648,21 +3272,22 @@ mod tests {
             &mut cancelled,
             &mut inflight_sids,
         );
+        // (#597) The budget is server-wide, so its exhaustion refuses this stream
+        // (retry-safe) instead of tearing down a connection that may carry others.
         assert!(
-            matches!(outcome, FrameOutcome::StopReading),
-            "exhausting the server-wide budget must GOAWAY the connection"
+            matches!(outcome, FrameOutcome::ResetStream(1)),
+            "exhausting the server-wide budget must refuse the stream, not GOAWAY"
+        );
+        assert!(!streams.contains_key(&1), "the refused stream is torn down");
+        assert_eq!(
+            recv.total_buffered, 0,
+            "its buffered bytes are un-accounted"
         );
         assert_eq!(
             budget.in_flight(),
-            8,
-            "the refused reservation must not have mutated the ledger"
+            0,
+            "dropping the refused stream releases its lease; the failed reservation never landed"
         );
-
-        // The receive counter and the buffer allocation have separate lifetimes.
-        recv.buffer_sub(8);
-        assert_eq!(budget.in_flight(), 8, "live bytes must remain charged");
-        drop(streams);
-        assert_eq!(budget.in_flight(), 0, "teardown must release the budget");
     }
 
     fn body_budget_request_wire(end_stream: bool) -> Vec<u8> {
@@ -2749,6 +3374,14 @@ mod tests {
 
             match exit {
                 "eof" => drop(client),
+                "goaway" => {
+                    // A peer GOAWAY lets the admitted upload finish (#695); the peer
+                    // then going away is what tears the connection down.
+                    let mut wire = Vec::new();
+                    frame::write_goaway(&mut wire, 1, frame::error_code::NO_ERROR);
+                    client.write_all(&wire).await.unwrap();
+                    drop(client);
+                }
                 "cancel" => {
                     task.abort();
                     drop(client);
@@ -2762,9 +3395,7 @@ mod tests {
                 }
                 _ => {
                     let mut wire = Vec::new();
-                    if exit == "goaway" {
-                        frame::write_goaway(&mut wire, 1, frame::error_code::NO_ERROR);
-                    } else if exit == "protocol_error" {
+                    if exit == "protocol_error" {
                         // PING payload must be exactly eight bytes.
                         frame::write_frame(&mut wire, frame::kind::PING, 0, 0, &[0]);
                     }
@@ -3131,5 +3762,148 @@ mod pacer_tests {
     #[test]
     fn h2_config_pacing_defaults_off() {
         assert_eq!(Config::default().bandwidth_limit, 0);
+    }
+}
+
+#[cfg(all(test, feature = "monoio"))]
+mod peer_goaway_monoio_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    const BODY_LEN: usize = 100_000;
+
+    fn get(enc: &mut Encoder, wire: &mut Vec<u8>, sid: u32) {
+        let mut block = Vec::new();
+        enc.encode_header(&mut block, ":method", "GET");
+        enc.encode_header(&mut block, ":path", "/");
+        enc.encode_header(&mut block, ":scheme", "https");
+        enc.encode_header(&mut block, ":authority", "example.com");
+        frame::write_frame(
+            wire,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS | frame::flags::END_STREAM,
+            sid,
+            &block,
+        );
+    }
+
+    /// Returns (body bytes on stream 1, END_STREAM seen, streams refused, server closed).
+    fn run(credit_with_goaway: bool, extra_stream: bool) -> (usize, bool, Vec<u32>, bool) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .enable_timer()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_local_with_prefix(
+                    stream,
+                    Vec::new(),
+                    |_| {
+                        std::future::ready(Response::new(hj_core::Body::Full(Bytes::from(
+                            vec![b'x'; BODY_LEN],
+                        ))))
+                    },
+                    Config::default(),
+                    None,
+                    None,
+                )
+                .await
+            })
+        });
+
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut enc = Encoder::new();
+        let mut wire = crate::conn::PREFACE.to_vec();
+        frame::write_settings(&mut wire, &[(settings::INITIAL_WINDOW_SIZE, 16384)]);
+        get(&mut enc, &mut wire, 1);
+        frame::write_goaway(&mut wire, 0, error_code::NO_ERROR);
+        if credit_with_goaway {
+            frame::write_window_update(&mut wire, 1, 1_000_000);
+            frame::write_window_update(&mut wire, 0, 1_000_000);
+        }
+        if extra_stream {
+            get(&mut enc, &mut wire, 3);
+        }
+        stream.write_all(&wire).unwrap();
+
+        let (mut seen, mut at) = (Vec::new(), 0usize);
+        let (mut body, mut ended, mut refused, mut closed) = (0usize, false, Vec::new(), false);
+        let mut granted = credit_with_goaway;
+        let started = Instant::now();
+        let mut buf = [0u8; 16384];
+        while started.elapsed() < Duration::from_secs(3) {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+            while let Some(h) = seen.get(at..at + 9) {
+                let hdr = FrameHeader::parse(h).unwrap();
+                let Some(p) = seen.get(at + 9..at + 9 + hdr.length as usize) else {
+                    break;
+                };
+                match hdr.kind {
+                    frame::kind::DATA if hdr.stream_id == 1 => {
+                        body += p.len();
+                        ended |= hdr.flags & frame::flags::END_STREAM != 0;
+                    }
+                    frame::kind::RST_STREAM
+                        if u32::from_be_bytes(p[..4].try_into().unwrap())
+                            == error_code::REFUSED_STREAM =>
+                    {
+                        refused.push(hdr.stream_id);
+                    }
+                    _ => {}
+                }
+                at += 9 + hdr.length as usize;
+            }
+            if !granted && body >= 16384 {
+                granted = true;
+                let mut w = Vec::new();
+                frame::write_window_update(&mut w, 1, 1_000_000);
+                frame::write_window_update(&mut w, 0, 1_000_000);
+                stream.write_all(&w).unwrap();
+            }
+        }
+        drop(stream);
+        server.join().unwrap().unwrap();
+        (body, ended, refused, closed)
+    }
+
+    #[test]
+    fn monoio_peer_goaway_keeps_reading_window_updates() {
+        let (body, ended, _, closed) = run(false, false);
+        assert!(ended && body == BODY_LEN, "truncated: {body}/{BODY_LEN}");
+        assert!(closed, "server closes once the drained response completes");
+    }
+
+    #[test]
+    fn monoio_peer_goaway_with_window_update_in_same_write() {
+        let (body, ended, _, closed) = run(true, false);
+        assert!(ended && body == BODY_LEN, "truncated: {body}/{BODY_LEN}");
+        assert!(closed);
+    }
+
+    #[test]
+    fn monoio_peer_goaway_refuses_later_streams() {
+        let (body, ended, refused, closed) = run(false, true);
+        assert!(ended && body == BODY_LEN, "truncated: {body}/{BODY_LEN}");
+        assert_eq!(refused, vec![3]);
+        assert!(closed);
     }
 }

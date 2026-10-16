@@ -114,6 +114,16 @@ fn upstream_tls_config(
 const CB_THRESHOLD: u32 = 3;
 /// How long the breaker stays open before allowing a half-open trial dial.
 const CB_HALF_OPEN_AFTER: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BreakerGate {
+    Closed,
+    Open,
+    /// This checkout is the single admitted half-open trial; it must dial
+    /// fresh (#628) so its success/failure closes or re-arms the breaker —
+    /// idle reuse would consume the trial without ever reporting back.
+    HalfOpenTrial,
+}
 /// Default upstream response-head timeout: how long to wait for the upstream to
 /// return response *headers* (the streamed body is unaffected, so SSE / long
 /// downloads still flow freely). Bounds a hung backend that accepts the
@@ -302,9 +312,13 @@ impl Upstream {
     /// dial and re-arms the window, so concurrent checkouts stay fast-failed until
     /// that trial resolves.
     fn breaker_open(&self) -> bool {
+        matches!(self.breaker_gate(), BreakerGate::Open)
+    }
+
+    fn breaker_gate(&self) -> BreakerGate {
         let mut tripped = self.tripped_at.lock();
         match *tripped {
-            Some(at) if at.elapsed() < CB_HALF_OPEN_AFTER => true,
+            Some(at) if at.elapsed() < CB_HALF_OPEN_AFTER => BreakerGate::Open,
             Some(_) => {
                 // Half-open: admit EXACTLY ONE trial dial per window. RE-ARM the window
                 // (rather than clearing to None) so any concurrent/subsequent checkout sees
@@ -314,9 +328,9 @@ impl Upstream {
                 // in-flight flag) self-heals: a trial that never reports back simply lets the
                 // window elapse again and admit one more probe — never a stuck-open breaker.
                 *tripped = Some(Instant::now());
-                false
+                BreakerGate::HalfOpenTrial
             }
-            None => false,
+            None => BreakerGate::Closed,
         }
     }
 
@@ -359,9 +373,13 @@ impl Upstream {
     pub(crate) async fn checkout(&self) -> Result<AnySender, ProxyError> {
         // Breaker open: fast-fail (502) instead of dialing a known-dead upstream
         // and eating a full connect timeout. Checked before idle reuse, since idle
-        // entries to a dead upstream are stale anyway. Half-open trials fall through.
-        if self.breaker_open() {
-            return Err(ProxyError::CircuitOpen);
+        // entries to a dead upstream are stale anyway. The half-open trial must
+        // dial fresh (#628): reusing an idle sender would consume the one trial
+        // without note_dial_success, leaving the breaker armed forever.
+        match self.breaker_gate() {
+            BreakerGate::Open => return Err(ProxyError::CircuitOpen),
+            BreakerGate::HalfOpenTrial => return self.dial_tracked().await,
+            BreakerGate::Closed => {}
         }
         // Try to reuse a non-expired, still-open idle connection.
         loop {
@@ -1765,6 +1783,22 @@ mod tests {
         // A successful trial closes the breaker.
         u.note_dial_success();
         assert!(!u.breaker_open(), "trial success closes the breaker");
+    }
+
+    #[test]
+    fn breaker_gate_marks_the_half_open_trial_for_fresh_dial() {
+        // #628: checkout() must distinguish the trial from a closed breaker
+        // so it dials fresh instead of consuming the trial on idle reuse.
+        let t = ProxyTarget::parse_url("http://127.0.0.1:8002/").unwrap();
+        let u = Upstream::new(&t, 4, Duration::from_secs(30), Duration::from_secs(5));
+        assert_eq!(u.breaker_gate(), BreakerGate::Closed);
+        for _ in 0..CB_THRESHOLD {
+            u.note_dial_failure();
+        }
+        assert_eq!(u.breaker_gate(), BreakerGate::Open);
+        *u.tripped_at.lock() = Some(Instant::now() - CB_HALF_OPEN_AFTER - Duration::from_millis(1));
+        assert_eq!(u.breaker_gate(), BreakerGate::HalfOpenTrial);
+        assert_eq!(u.breaker_gate(), BreakerGate::Open);
     }
 
     #[test]

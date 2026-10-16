@@ -14,6 +14,9 @@ pub(super) struct PeerSettings {
     pub(super) max_frame_size: u32,
     /// Per-stream send window the peer grants us initially (SETTINGS_INITIAL_WINDOW_SIZE).
     pub(super) initial_window: i64,
+    /// The peer's first SETTINGS frame has been recorded in the process-wide
+    /// `httpjet_h2_peer_settings_total` buckets (once per connection).
+    pub(super) first_settings_recorded: bool,
 }
 
 impl Default for PeerSettings {
@@ -21,6 +24,7 @@ impl Default for PeerSettings {
         PeerSettings {
             max_frame_size: 16384,
             initial_window: 65535,
+            first_settings_recorded: false,
         }
     }
 }
@@ -29,8 +33,14 @@ impl Default for PeerSettings {
 /// ordering/parity, the open header-block (CONTINUATION continuity), and the concurrent
 /// stream cap we advertise.
 pub(super) struct Recv {
+    /// RFC 9113 §3.4: the client preface is magic + a (non-ACK) SETTINGS frame;
+    /// anything else first is a PROTOCOL_ERROR connection error (#625).
+    pub(super) seen_settings: bool,
     /// Highest client-initiated (odd) stream id opened so far (§5.1.1 ordering).
     pub(super) last_client_stream: u32,
+    /// Last-stream-id of the first GOAWAY we sent. RFC 9113 §6.8: a later GOAWAY must not
+    /// raise it, although refused racing streams still advance `last_client_stream`.
+    pub(super) goaway_last: Option<u32>,
     /// While a header block is open (HEADERS/CONTINUATION without END_HEADERS), the id of
     /// the stream it belongs to — only a CONTINUATION on that stream may follow (§6.10).
     pub(super) open_header_block: Option<u32>,
@@ -87,6 +97,15 @@ pub(super) struct Recv {
 }
 
 impl Recv {
+    /// The last-stream-id for a GOAWAY being sent now, never above an earlier one.
+    pub(super) fn goaway_last_stream_id(&mut self) -> u32 {
+        let id = self.goaway_last.map_or(self.last_client_stream, |prev| {
+            prev.min(self.last_client_stream)
+        });
+        self.goaway_last = Some(id);
+        id
+    }
+
     /// Remember a stream WE reset so a late HEADERS on it (trailers racing our
     /// RST_STREAM) is the tolerated §5.1 close race rather than §5.1.1 id reuse.
     /// Past the cap the id is not recorded, failing closed into a connection error.
@@ -101,6 +120,20 @@ impl Recv {
     /// its bytes are freed, including after dispatch and on connection teardown.
     pub(super) fn buffer_sub(&mut self, n: usize) {
         self.total_buffered = self.total_buffered.saturating_sub(n);
+    }
+
+    /// Receive-side teardown after WE reset `sid`: drop any half-received request
+    /// (returning its buffered-body accounting) and record the reset id, so a later
+    /// DATA...END_STREAM cannot complete and dispatch it (#581, #598).
+    pub(super) fn teardown_receiving(
+        &mut self,
+        streams: &mut rustc_hash::FxHashMap<u32, StreamState>,
+        sid: u32,
+    ) {
+        if let Some(s) = streams.remove(&sid) {
+            self.buffer_sub(s.body.len());
+        }
+        self.note_reset(sid);
     }
 }
 
@@ -163,6 +196,18 @@ pub(super) struct OutStream {
     pub(super) window: i64,
     /// Cancels an in-flight body pull when the peer resets this stream.
     pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// Send-stall clock while this response has bytes waiting on flow-control credit.
+    pub(super) stall: Option<SendStall>,
+    /// Already counted as flow-control blocked; cleared by the next DATA frame it sends.
+    pub(super) send_blocked: bool,
+}
+
+/// One response's send-stall clock: when its current window started and how many DATA
+/// bytes it has delivered since.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SendStall {
+    pub(super) since: std::time::Instant,
+    pub(super) progressed: u64,
 }
 
 impl Drop for OutStream {

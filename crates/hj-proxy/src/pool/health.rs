@@ -390,6 +390,23 @@ mod tests {
         candidate.pool().activate_health_checks();
         assert!(old.pool().peer_snapshots().is_empty());
     }
+    #[test]
+    fn prepared_group_uses_configured_peer_limits() {
+        let mut t = ProxyTarget::parse_url("http://127.0.0.1:1").unwrap();
+        t.name = Some("limits".into());
+        t.max_conns = Some(7);
+        t.keep_alive = Some(Duration::from_secs(11));
+        t.connect_timeout = Some(Duration::from_secs(3));
+        t.load_balance.policy = hj_core::config::LoadBalancePolicy::WeightedRoundRobin;
+        let pool = UpstreamPool::new();
+        pool.prepare_groups([t], 100, Duration::from_secs(60), Duration::from_secs(10));
+        let group = pool.groups.lock().values().next().cloned().unwrap();
+        let upstream = &group.peers[0].upstream;
+        assert_eq!(upstream.sem.available_permits(), 7);
+        assert_eq!(upstream.keep_alive, Duration::from_secs(11));
+        assert_eq!(upstream.connect_timeout, Duration::from_secs(3));
+    }
+
     #[tokio::test]
     async fn no_probes_before_activation_and_retirement_stops_them() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

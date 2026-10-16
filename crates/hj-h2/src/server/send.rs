@@ -15,7 +15,7 @@ use bytes::Bytes;
 use hj_core::{Body, Response};
 
 use super::OutQueue;
-use super::state::{OutStream, PeerSettings};
+use super::state::{OutStream, PeerSettings, SendStall};
 use crate::frame::{self, FrameHeader, error_code, flags, kind};
 
 /// Result of pulling one frame from a streaming body: the body handed back (so the next
@@ -254,6 +254,8 @@ pub(super) fn begin_response(
                 done: false,
                 window,
                 cancel: tokio_util::sync::CancellationToken::new(),
+                stall: None,
+                send_blocked: false,
             },
         );
         send_schedule.push_back(stream_id);
@@ -478,8 +480,10 @@ fn pump_one_frame(
     if !st.pending.is_empty() {
         let allow = (*send_conn).min(st.window).min(max_frame as i64);
         if allow <= 0 {
+            note_send_blocked(st, *send_conn <= 0);
             return false;
         }
+        st.send_blocked = false;
         let n = (allow as usize).min(st.pending.len());
         let chunk = st.pending.slice(..n);
         st.pending = st.pending.slice(n..);
@@ -526,6 +530,23 @@ fn pump_one_frame(
     false
 }
 
+/// Count `st` entering a flow-control-blocked state with bytes pending, once per
+/// transition: the pump revisits a blocked stream on every wake until credit arrives.
+/// Returns whether this call counted.
+fn note_send_blocked(st: &mut OutStream, conn_starved: bool) -> bool {
+    if st.send_blocked {
+        return false;
+    }
+    st.send_blocked = true;
+    let counter = if conn_starved {
+        &super::SEND_BLOCKED_CONN
+    } else {
+        &super::SEND_BLOCKED_STREAM
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
 /// Drive every active outgoing body: send what the windows allow, queue a chunk pull for
 /// any stream that has drained its buffer and has more to come, and drop finished streams.
 pub(super) fn pump_streams(
@@ -546,12 +567,17 @@ pub(super) fn pump_streams(
         let mut wrote = false;
         if let Some(st) = outstreams.get_mut(&sid) {
             if !st.done {
+                let window_before = st.window;
                 wrote = pump_one_frame(sid, st, out, send_conn, max_frame);
                 if !st.done && st.pending.is_empty() && !st.eof && !st.pulling {
                     if let Some(body) = st.body.take() {
                         st.pulling = true;
                         pulls.push(Box::pin(pull_next(sid, body, st.cancel.clone())));
                     }
+                }
+                if !st.done {
+                    let sent = (window_before - st.window).max(0) as u64;
+                    st.stall = advance_stall(st.stall, sent, !st.pending.is_empty());
                 }
                 keep = !st.done;
             }
@@ -567,6 +593,62 @@ pub(super) fn pump_streams(
             visits_without_output -= 1;
         }
     }
+}
+
+/// DATA bytes a response must deliver per send-stall window while it has bytes waiting
+/// on the peer's credit (~273 B/s at 60 s). Granting a byte at a time would otherwise
+/// restart the deadline forever and keep the response pinned (#599).
+pub(super) const SEND_STALL_MIN_PROGRESS: u64 = 16 * 1024;
+
+/// Advance one response's send-stall clock after it delivered `sent` DATA bytes. The
+/// clock runs only while the response has bytes `waiting` on credit (a merely slow
+/// backend leaves `pending` empty and never counts) and restarts only after
+/// [`SEND_STALL_MIN_PROGRESS`] bytes of real progress.
+fn advance_stall(stall: Option<SendStall>, sent: u64, waiting: bool) -> Option<SendStall> {
+    if !waiting {
+        return None;
+    }
+    match stall {
+        Some(s) if s.progressed.saturating_add(sent) < SEND_STALL_MIN_PROGRESS => Some(SendStall {
+            since: s.since,
+            progressed: s.progressed + sent,
+        }),
+        _ => Some(SendStall {
+            since: std::time::Instant::now(),
+            progressed: 0,
+        }),
+    }
+}
+
+/// Reset (RST_STREAM CANCEL) every response whose send-stall window expired, releasing
+/// its pinned body and streaming backend, and return the earliest remaining deadline.
+pub(super) fn reset_stalled_streams(
+    outstreams: &mut FxHashMap<u32, OutStream>,
+    out: &mut OutQueue,
+    timeout: Option<std::time::Duration>,
+) -> Option<std::time::Instant> {
+    let timeout = timeout?;
+    // The clock is read only once some response actually has a stall clock: the
+    // common pass (nothing waiting on credit) costs one scan and no clock read.
+    let mut now: Option<std::time::Instant> = None;
+    let mut earliest: Option<std::time::Instant> = None;
+    let mut expired = Vec::new();
+    for (&sid, st) in outstreams.iter() {
+        if let Some(stall) = st.stall {
+            let deadline = stall.since + timeout;
+            if deadline <= *now.get_or_insert_with(std::time::Instant::now) {
+                expired.push(sid);
+            } else {
+                earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+            }
+        }
+    }
+    for sid in expired {
+        super::SEND_STALL_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+        cancel_outstream(outstreams, sid);
+    }
+    earliest
 }
 
 pub(super) fn cancel_outstream(outstreams: &mut FxHashMap<u32, OutStream>, sid: u32) {
@@ -719,6 +801,8 @@ mod tests {
                 done: false,
                 window: 64,
                 cancel: tokio_util::sync::CancellationToken::new(),
+                stall: None,
+                send_blocked: false,
             }
         }
         fn data_stream_ids(out: &OutQueue) -> Vec<u32> {
@@ -744,6 +828,7 @@ mod tests {
         let peer = PeerSettings {
             max_frame_size: 4,
             initial_window: 64,
+            ..PeerSettings::default()
         };
 
         let mut connection_window = 4;
@@ -772,6 +857,50 @@ mod tests {
             [3],
             "new connection credit must go to the stream skipped in the prior round"
         );
+    }
+
+    #[test]
+    fn send_blocked_counts_once_per_transition_by_starved_window() {
+        let blocked = super::super::send_blocked_counts;
+        let mut st = OutStream {
+            completion: None,
+            pending: Bytes::from_static(b"abcdefgh"),
+            body: None,
+            pulling: false,
+            eof: true,
+            done: false,
+            window: 0,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            stall: None,
+            send_blocked: false,
+        };
+        let mut out = OutQueue::default();
+        let (conn0, stream0) = blocked();
+
+        // Stream window exhausted: counted once, however many pump passes spin on it.
+        let mut conn_window = 100;
+        for _ in 0..5 {
+            assert!(!pump_one_frame(1, &mut st, &mut out, &mut conn_window, 16));
+        }
+        assert!(st.send_blocked);
+        assert!(!note_send_blocked(&mut st, false), "already counted");
+        assert!(blocked().1 > stream0);
+
+        // A DATA frame clears the state; the next stall is a new transition.
+        st.window = 4;
+        assert!(pump_one_frame(1, &mut st, &mut out, &mut conn_window, 16));
+        assert!(!st.send_blocked);
+        st.window = 100;
+        conn_window = 0;
+        for _ in 0..5 {
+            assert!(!pump_one_frame(1, &mut st, &mut out, &mut conn_window, 16));
+        }
+        assert!(st.send_blocked);
+        assert!(blocked().0 > conn0);
+
+        st.send_blocked = false;
+        assert!(note_send_blocked(&mut st, true));
+        assert!(!note_send_blocked(&mut st, true));
     }
 
     #[tokio::test]
@@ -916,6 +1045,8 @@ mod tests {
                     done: false,
                     window: 0,
                     cancel,
+                    stall: None,
+                    send_blocked: false,
                 },
             );
         }

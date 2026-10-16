@@ -174,7 +174,12 @@ impl UpstreamPool {
                     .map(|(i, mut p)| {
                         p.failover.clear();
                         let upstream = self
-                            .get_or_create(&p, max, keep, connect)
+                            .get_or_create(
+                                &p,
+                                target.max_conns.unwrap_or(max),
+                                target.keep_alive.unwrap_or(keep),
+                                target.connect_timeout.unwrap_or(connect),
+                            )
                             .expect("operator-named upstream allocation");
                         Arc::new(Peer {
                             health: Mutex::new(super::health::HealthState::new(

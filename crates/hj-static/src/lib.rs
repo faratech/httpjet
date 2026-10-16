@@ -123,12 +123,30 @@ struct MetaKey {
     file_etag: u32,
 }
 
+/// `httpdate` panics outside 1970..=9999 (and release builds abort on panic), so
+/// a file whose mtime is out of that range gets no `Last-Modified` at all.
+fn http_date_header(t: SystemTime) -> Option<HeaderValue> {
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if secs > hj_compress::expires::MAX_HTTP_DATE_UNIX as u64 {
+        return None;
+    }
+    HeaderValue::from_str(&httpdate::fmt_http_date(t)).ok()
+}
+
+/// The modification time in seconds when it is representable as an HTTP date (the
+/// same range as [`http_date_header`]). Without a `Last-Modified`, date validators
+/// must be ignored (RFC 9110 §13.1.3-13.1.5) rather than compared against 0.
+fn http_date_secs(t: SystemTime) -> Option<u64> {
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    (secs <= hj_compress::expires::MAX_HTTP_DATE_UNIX as u64).then_some(secs)
+}
+
 /// Pre-built static response headers for a file version. Cheap `HeaderValue`
 /// clones replace per-request date formatting, hex-ETag building, and
 /// `HeaderValue` validation.
 struct CachedMeta {
     etag: Option<HeaderValue>,
-    last_modified: HeaderValue,
+    last_modified: Option<HeaderValue>,
     content_length: HeaderValue,
 }
 
@@ -197,8 +215,7 @@ impl StaticFiles {
         let etag = resolved
             .etag(key.file_etag)
             .and_then(|s| HeaderValue::from_str(&s).ok());
-        let last_modified = HeaderValue::from_str(&httpdate::fmt_http_date(resolved.mtime))
-            .unwrap_or_else(|_| HeaderValue::from_static(""));
+        let last_modified = http_date_header(resolved.mtime);
         let content_length = HeaderValue::from_str(&resolved.len.to_string())
             .unwrap_or_else(|_| HeaderValue::from_static("0"));
         let built = Arc::new(CachedMeta {
@@ -495,8 +512,18 @@ pub struct LexicalTargetPath(pub PathBuf);
 /// resolves against, for a static `<context>` whose `location` differs from the
 /// vhost docroot (LiteSpeed parity — e.g. a hybrid-docroot context). Set by the
 /// pipeline before dispatch; absent ⇒ the vhost docroot is used as before.
+/// The second field is the context URI: like OLS `translate()`, the part of the path
+/// after it is what resolves under the location (`/assets/x.css` → `<loc>/x.css`).
 #[derive(Clone)]
-pub struct DocRootOverride(pub std::path::PathBuf);
+pub struct DocRootOverride(pub std::path::PathBuf, pub String);
+
+/// The docroot-relative path a static context `location` maps `rel` to: `rel` with the
+/// context URI's leading components removed. A URI that is not a component prefix
+/// (a regex context) keeps the full path, which is still confined under the location.
+pub fn context_relative_path<'a>(rel: &'a Path, context_uri: &str) -> &'a Path {
+    rel.strip_prefix(context_uri.trim_matches('/'))
+        .unwrap_or(rel)
+}
 
 /// Request extension that overrides the directory-index file list for this
 /// request, after `.htaccess` `DirectoryIndex` resolution.
@@ -528,15 +555,19 @@ impl StaticFiles {
         // A static <context> with a `location` differing from the vhost docroot
         // pins it here via the DocRootOverride extension (set by the pipeline);
         // otherwise resolve against the vhost docroot.
-        let doc_root = match req.extensions().get::<DocRootOverride>() {
+        let doc_root_override = req.extensions().get::<DocRootOverride>();
+        let doc_root = match doc_root_override {
             Some(o) => o.0.clone(),
             None => ctx.vhost.doc_root.clone(),
         };
         let allow_symlink = ctx.vhost.allow_symbol_link;
 
         // Decode and clean the request path into doc_root-relative components.
-        let rel = clean_request_path(req.uri().path()).ok_or(HandlerError::Forbidden)?;
-        let wants_dir = req.uri().path().ends_with('/');
+        let mut rel = clean_request_path(req.uri().path()).ok_or(HandlerError::Forbidden)?;
+        if let Some(o) = doc_root_override {
+            rel = context_relative_path(&rel, &o.1).to_path_buf();
+        }
+        let wants_dir = path_names_directory(req.uri().path());
 
         // Resolve to a concrete regular file (handling directory -> index).
         // Borrow the index list (lives as long as `ctx`) instead of cloning the Vec<String>
@@ -697,7 +728,9 @@ impl StaticFiles {
             if let Some(ref e) = meta.etag {
                 h.insert(ETAG, e.clone());
             }
-            h.insert(LAST_MODIFIED, meta.last_modified.clone());
+            if let Some(lm) = &meta.last_modified {
+                h.insert(LAST_MODIFIED, lm.clone());
+            }
             h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             h.insert(CONTENT_TYPE, content_type.clone());
             return Ok(with_file_targets(resp, resolved_target, lexical_target));
@@ -739,7 +772,9 @@ impl StaticFiles {
                     if let Some(ref e) = meta.etag {
                         h.insert(ETAG, e.clone());
                     }
-                    h.insert(LAST_MODIFIED, meta.last_modified.clone());
+                    if let Some(lm) = &meta.last_modified {
+                        h.insert(LAST_MODIFIED, lm.clone());
+                    }
                     let clen = end - start + 1;
                     insert_static(h, CONTENT_LENGTH, &clen.to_string());
                     insert_static(
@@ -787,7 +822,9 @@ impl StaticFiles {
                         if let Some(ref e) = meta.etag {
                             h.insert(ETAG, e.clone());
                         }
-                        h.insert(LAST_MODIFIED, meta.last_modified.clone());
+                        if let Some(lm) = &meta.last_modified {
+                            h.insert(LAST_MODIFIED, lm.clone());
+                        }
                         insert_static(h, CONTENT_LENGTH, &wire_len.to_string());
                         return Ok(with_file_targets(resp, resolved_target, lexical_target));
                     }
@@ -824,7 +861,9 @@ impl StaticFiles {
             h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
         }
         h.insert(CONTENT_LENGTH, meta.content_length.clone());
-        h.insert(LAST_MODIFIED, meta.last_modified.clone());
+        if let Some(lm) = &meta.last_modified {
+            h.insert(LAST_MODIFIED, lm.clone());
+        }
         h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         if let Some(ref e) = meta.etag {
             h.insert(ETAG, e.clone());
@@ -875,6 +914,16 @@ fn insert_static(headers: &mut http::HeaderMap, name: http::header::HeaderName, 
 /// Returns `None` if the path tries to escape the root (a `..` that would pop
 /// above the top, or a NUL byte). An empty result (root request) is `Some` of
 /// an empty `PathBuf`.
+/// Whether the DECODED request path ends in `/`. The raw `ends_with('/')` missed
+/// `/x.bak%2F`, which the access checks see as `/x.bak/` while the file was still
+/// served (#697).
+fn path_names_directory(uri_path: &str) -> bool {
+    if uri_path.ends_with('/') {
+        return true;
+    }
+    uri_path.contains('%') && hj_core::percent_decode(uri_path).is_some_and(|d| d.ends_with(b"/"))
+}
+
 fn clean_request_path(uri_path: &str) -> Option<PathBuf> {
     let decoded = hj_core::percent_decode(uri_path)?;
     // Reject embedded NULs outright.
@@ -1009,6 +1058,11 @@ fn resolve_file(
     if !stat.is_file() {
         // Special file (socket, device, fifo): refuse.
         return Err(HandlerError::Forbidden);
+    }
+    // `/file.ext/` is path info on a static file: 404 like OLS, or a `$`-anchored
+    // `.htaccess` deny (`\.bak$ - [F]`) is bypassed by appending a slash.
+    if wants_dir {
+        return Err(HandlerError::NotFound);
     }
 
     let abs = doc_root.join(rel);
@@ -1518,7 +1572,9 @@ fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
             Err(_) => return RangeOutcome::Ignore,
         };
         if n == 0 {
-            return RangeOutcome::Unsatisfiable;
+            // RFC 9110 §14.1.1: a zero suffix-length is invalid, not
+            // unsatisfiable — the whole Range header is ignored.
+            return RangeOutcome::Ignore;
         }
         if len == 0 {
             return RangeOutcome::Unsatisfiable;
@@ -1547,7 +1603,8 @@ fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
     };
 
     if end < start {
-        return RangeOutcome::Unsatisfiable;
+        // RFC 9110 §14.1.1: last-byte-pos < first-byte-pos is invalid — ignore.
+        return RangeOutcome::Ignore;
     }
     RangeOutcome::Single(start, end)
 }
@@ -1588,10 +1645,9 @@ fn if_modified_since_not_modified(value: &HeaderValue, mtime: SystemTime) -> boo
         return false;
     };
     // HTTP dates have 1-second resolution; truncate mtime before comparing.
-    let mtime_secs = mtime
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let Some(mtime_secs) = http_date_secs(mtime) else {
+        return false;
+    };
     let since_secs = since
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1608,10 +1664,9 @@ fn if_unmodified_since_passes(value: &HeaderValue, mtime: SystemTime) -> bool {
     let Ok(since) = httpdate::parse_http_date(s) else {
         return true;
     };
-    let mtime_secs = mtime
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let Some(mtime_secs) = http_date_secs(mtime) else {
+        return true;
+    };
     let since_secs = since
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1631,10 +1686,9 @@ fn if_range_matches(value: &HeaderValue, etag: Option<&str>, mtime: SystemTime) 
         // ETag form: strong comparison required for If-Range.
         etag == Some(s)
     } else if let Ok(date) = httpdate::parse_http_date(s) {
-        let mtime_secs = mtime
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let Some(mtime_secs) = http_date_secs(mtime) else {
+            return false;
+        };
         let date_secs = date
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())

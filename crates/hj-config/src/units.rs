@@ -19,9 +19,13 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
         .and_then(|n| n.checked_mul(mult))
 }
 
-/// Parse a count of seconds; bare integer.
+/// Ceiling for any configured duration: every timeout is added to an `Instant`,
+/// which panics on overflow (#677).
+pub(crate) const MAX_CONFIG_SECS: u64 = 100 * 365 * 24 * 3600;
+
+/// Parse a count of seconds; bare integer, clamped to [`MAX_CONFIG_SECS`].
 pub(crate) fn parse_secs(s: &str) -> Option<u64> {
-    s.trim().parse::<u64>().ok()
+    s.trim().parse::<u64>().ok().map(|n| n.min(MAX_CONFIG_SECS))
 }
 
 /// Split a comma/whitespace separated list (e.g. index files, suffixes).
@@ -35,6 +39,16 @@ pub(crate) fn split_list(s: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_secs_clamps_instant_overflowing_values() {
+        assert_eq!(super::parse_secs(" 30 "), Some(30));
+        assert_eq!(
+            super::parse_secs("18446744073709551615"),
+            Some(super::MAX_CONFIG_SECS)
+        );
+        let _ = std::time::Instant::now() + std::time::Duration::from_secs(super::MAX_CONFIG_SECS);
+    }
+
     use super::*;
 
     #[test]

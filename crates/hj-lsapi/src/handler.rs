@@ -146,6 +146,19 @@ enum RetryKind {
     /// up to `IDEMPOTENT_RETRY_MAX` times with a short backoff so a burst can
     /// resolve, bounded so a real outage can't amplify load.
     IdempotentReset,
+    /// BEGIN_REQUEST could not be written to a REUSED idle socket on a bodiless
+    /// idempotent request: lsphp closed that keep-alive (idle/max-requests exit)
+    /// and nothing was delivered. The backend is not implicated, so retry on a
+    /// fresh dial at once — no restart nudge, no pool flush, no backoff.
+    StaleReuse,
+}
+
+fn begin_failure_kind(bodiless_idempotent: bool, reused: bool) -> RetryKind {
+    if bodiless_idempotent && reused {
+        RetryKind::StaleReuse
+    } else {
+        RetryKind::PreFlush
+    }
 }
 
 impl RetryKind {
@@ -154,6 +167,7 @@ impl RetryKind {
         match self {
             RetryKind::PreFlush => "preflush",
             RetryKind::IdempotentReset => "idempotent_reset",
+            RetryKind::StaleReuse => "stale_reuse",
         }
     }
 }
@@ -726,6 +740,14 @@ impl Lsapi {
             RetryKind::IdempotentReset => {
                 attempt <= IDEMPOTENT_RETRY_MAX && !self.supervisor_is_bad()
             }
+            RetryKind::StaleReuse => {
+                // A dead pooled socket usually means its whole family died (master
+                // crash, hard restart): drop every idle socket so the retry dials
+                // fresh instead of walking through more dead ones. No restart nudge,
+                // the backend is reachable.
+                self.pool.clear();
+                attempt <= IDEMPOTENT_RETRY_MAX && !self.supervisor_is_bad()
+            }
             RetryKind::PreFlush => attempt == 1 && self.retry && self.recover_before_retry().await,
         }
     }
@@ -886,12 +908,13 @@ impl Lsapi {
         // pre-flush failure is cleanly distinguishable (request is REPLAYABLE until
         // this flushes). The request body is NOT touched until after the flush
         // below, so a failure here is still safely replayable.
+        let begin_fail_kind = begin_failure_kind(idempotent && body_len == 0, conn.is_reused());
         if let Err(e) = conn.stream_mut().write_all(begin).await {
             conn.poison();
             return Attempt::Retry {
                 body,
                 reason: HandlerError::BadGateway(format!("lsapi write begin: {e}")),
-                kind: RetryKind::PreFlush,
+                kind: begin_fail_kind,
             };
         }
         if let Err(e) = conn.stream_mut().flush().await {
@@ -899,7 +922,7 @@ impl Lsapi {
             return Attempt::Retry {
                 body,
                 reason: HandlerError::BadGateway(format!("lsapi flush begin: {e}")),
-                kind: RetryKind::PreFlush,
+                kind: begin_fail_kind,
             };
         }
         // === COMMITTED: from here the request is non-replayable. ===
@@ -907,7 +930,13 @@ impl Lsapi {
         // Tier 2 in-flight clock starts HERE — request committed to lsphp (BEGIN_REQUEST
         // flushed), so the pool acquire above is excluded (#47). On an idempotent-reset
         // retry this replaces the prior attempt's guard.
-        *inflight = self.monitor.as_ref().map(|m| m.inflight().begin());
+        // A bodied request starts the clock when its upload finishes instead (#660): the
+        // Tier-2 kill must not fire on a slow but progressing upload (read_response).
+        *inflight = if body_len > 0 {
+            None
+        } else {
+            self.monitor.as_ref().map(|m| m.inflight().begin())
+        };
 
         let (read_half, mut write_half, guard) = conn.into_split();
         let guard = Arc::new(guard);
@@ -918,6 +947,7 @@ impl Lsapi {
         // and drops its Arc<ReturnGuard> — releasing the semaphore permit and the
         // write-half fd instead of leaking them.
         let cancel = Arc::new(tokio::sync::Notify::new());
+        let mut body_done = None;
 
         // (a) BODY-PUMP TASK: pull hyper frames -> write half, writing EXACTLY the
         //     declared `body_len` bytes. On a clean exact-length finish it deposits
@@ -945,6 +975,10 @@ impl Lsapi {
                 guard.deposit_write(write_half);
             }
         } else {
+            guard.expect_body_drained();
+            let done = Arc::new(tokio::sync::Notify::new());
+            let pump_done = done.clone();
+            body_done = Some(done);
             tokio::spawn(async move {
                 pump_request_body(PumpArgs {
                     body,
@@ -956,6 +990,7 @@ impl Lsapi {
                     idle_timeout: write_timeout,
                 })
                 .await;
+                pump_done.notify_one();
             });
         }
 
@@ -965,7 +1000,9 @@ impl Lsapi {
         //     observes `cancel` once the response side is done.
         let sent_at = Instant::now();
         match self
-            .read_response(read_half, guard, cancel, acquire, sent_at, is_head)
+            .read_response(
+                read_half, guard, cancel, body_done, inflight, acquire, sent_at, is_head,
+            )
             .await
         {
             Ok(resp) => Attempt::Done(Ok(resp)),
@@ -1050,12 +1087,13 @@ impl Lsapi {
         // partial/failed write of it leaves lsphp blocked inside `readReq` (the
         // packet is incomplete, Accept never returns, the script never starts), so
         // it is genuinely replayable.
+        let begin_fail_kind = begin_failure_kind(idempotent && body.is_empty(), conn.is_reused());
         if let Err(e) = conn.stream_mut().write_all(begin).await {
             conn.poison();
             return Attempt::Retry {
                 body,
                 reason: HandlerError::BadGateway(format!("lsapi write begin: {e}")),
-                kind: RetryKind::PreFlush,
+                kind: begin_fail_kind,
             };
         }
         if let Err(e) = conn.stream_mut().flush().await {
@@ -1063,7 +1101,7 @@ impl Lsapi {
             return Attempt::Retry {
                 body,
                 reason: HandlerError::BadGateway(format!("lsapi flush begin: {e}")),
-                kind: RetryKind::PreFlush,
+                kind: begin_fail_kind,
             };
         }
         // === COMMITTED: the BEGIN_REQUEST packet is on the wire; lsphp's readReq
@@ -1108,6 +1146,9 @@ impl Lsapi {
         // streaming path. The write half is already done; deposit it immediately
         // so a clean read can re-pool the socket.
         let (read_half, write_half, guard) = conn.into_split();
+        if !body.is_empty() {
+            guard.expect_body_drained();
+        }
         guard.deposit_write(write_half);
         // No concurrent body pump here, so the cancel notify has no listener; pass
         // a fresh one to keep one read_response signature.
@@ -1118,6 +1159,8 @@ impl Lsapi {
                 read_half,
                 Arc::new(guard),
                 cancel,
+                None,
+                inflight,
                 acquire,
                 sent_at,
                 is_head,
@@ -1147,11 +1190,14 @@ impl Lsapi {
     /// streaming body pump (RESP_STREAM -> channel) over the rest of the read half.
     /// `guard` re-pools the socket once BOTH the read completed cleanly here AND
     /// the write side deposited its half.
+    #[allow(clippy::too_many_arguments)]
     async fn read_response(
         &self,
         mut read_half: OwnedReadHalf,
         guard: Arc<ReturnGuard>,
         cancel: Arc<tokio::sync::Notify>,
+        mut body_done: Option<Arc<tokio::sync::Notify>>,
+        inflight: &mut Option<InFlightGuard>,
         acquire: Duration,
         sent_at: Instant,
         is_head: bool,
@@ -1168,11 +1214,35 @@ impl Lsapi {
         };
         // Tier 1 TOTAL processing deadline (in addition to the per-read idle
         // timeout). Spans BOTH the header read here and the streaming body below.
-        let deadline = self.max_process_time.map(|d| Instant::now() + d);
-        let mut reader = PacketReader::with_deadline(self.read_timeout, deadline);
+        // While a request-body pump is still delivering, neither the idle timeout
+        // nor the deadline runs (LSWS: the extapp timeout starts once the body is
+        // fully sent); the pump's own idle timer bounds a stalled upload, and its
+        // end (complete OR abort) arms both clocks.
+        let deadline = || self.max_process_time.map(|d| Instant::now() + d);
+        let mut reader = PacketReader::with_deadline(
+            self.read_timeout,
+            if body_done.is_none() {
+                deadline()
+            } else {
+                None
+            },
+        );
         let mut accept_worker_pid = true;
         let resp_header = loop {
-            match reader.next(&mut read_half).await {
+            let next = match &body_done {
+                None => reader.next(&mut read_half).await,
+                Some(done) => tokio::select! {
+                    biased;
+                    r = reader.next_untimed(&mut read_half) => r,
+                    _ = done.notified() => {
+                        body_done = None;
+                        reader.deadline = deadline();
+                        *inflight = self.monitor.as_ref().map(|m| m.inflight().begin());
+                        continue;
+                    }
+                },
+            };
+            match next {
                 Ok(Some(frame)) => match frame.ptype {
                     PacketType::RespHeader => {
                         match RespHeader::parse_flagged(&frame.body, frame.flag) {
@@ -1242,6 +1312,10 @@ impl Lsapi {
         };
         // First response byte (RESP_HEADER) received — this is the TTFB boundary.
         let ttfb = sent_at.elapsed();
+        if body_done.is_some() {
+            reader.deadline = deadline();
+            *inflight = self.monitor.as_ref().map(|m| m.inflight().begin());
+        }
 
         let declared_len = match parse_response_content_length(&resp_header.headers) {
             Ok(len) => len,
@@ -1285,6 +1359,15 @@ impl Lsapi {
             builder = builder.header(http::header::CONTENT_LENGTH, len.to_string());
         }
         let status = has_status_header.unwrap_or(status);
+        // A 1xx is never a final response: forwarded, an H1 client waits forever for the
+        // real one and H2/H3 frame a malformed stream (#668).
+        if status.is_informational() {
+            fail(&guard, &cancel);
+            return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                "lsapi final status {} is informational",
+                status.as_u16()
+            ))));
+        }
         let enforced_len = if hj_core::response_body_forbidden(is_head, status) {
             None
         } else {
@@ -1305,7 +1388,7 @@ impl Lsapi {
         let mut prelude_len: usize = 0;
         enum InlineEnd {
             Repool, // clean RESP_END: deposit the read half so the socket re-pools
-            Poison, // ConnClose: serve what we have but drop the socket
+            Poison, // ConnClose before RESP_END: complete only with a satisfied Content-Length
         }
         let inline_end: Option<InlineEnd> = loop {
             match reader.try_parse() {
@@ -1356,6 +1439,12 @@ impl Lsapi {
                 }
             };
             let over_delivered = enforced_len.is_some_and(|len| body.len() as u64 > len);
+            if matches!(end, InlineEnd::Poison) && enforced_len.is_none() {
+                fail(&guard, &cancel);
+                return Err(ReadFail::terminal(HandlerError::BadGateway(
+                    "lsapi connection closed before RESP_END".into(),
+                )));
+            }
             if let Some(len) = enforced_len {
                 if (body.len() as u64) < len {
                     fail(&guard, &cancel);
@@ -1371,7 +1460,10 @@ impl Lsapi {
             match end {
                 // Only a response that ended cleanly and honored its declared
                 // length may return the LSAPI socket to the pool.
-                InlineEnd::Repool if !over_delivered => {
+                // Bytes buffered past RESP_END (litespeed_finish_request's trailing
+                // CONN_CLOSE) mean lsphp is closing this socket, or the stream is
+                // out of sync; either way it must not be reused.
+                InlineEnd::Repool if !over_delivered && !reader.has_buffered() => {
                     guard.deposit_read(read_half);
                     cancel.notify_one();
                 }
@@ -1608,8 +1700,11 @@ async fn pump_body(
     // the socket can re-pool — the client/store/egress side is no longer waiting.
     // Over-delivery past the declared length is truncated for downstream framing
     // and poisons the LSAPI socket; under-delivery aborts the consumer body as a
-    // truncated upstream response. Without Content-Length, RESP_END remains the
-    // authoritative boundary.
+    // truncated upstream response. Without Content-Length, RESP_END is the only
+    // completion signal: lsphp always writes it (LSAPI_Finish_r), so CONN_CLOSE or
+    // EOF before it means the worker died mid-response and the consumer body is
+    // aborted, never ended cleanly (a clean end would let the page cache store the
+    // truncated page).
     let mut tx = Some(tx);
     let mut sent: u64 = 0;
     let mut over_delivered = false;
@@ -1628,7 +1723,6 @@ async fn pump_body(
             }
         }
     }
-    let mut clean_end = false;
     loop {
         match reader.next(&mut read_half).await {
             Ok(Some(frame)) => match frame.ptype {
@@ -1663,17 +1757,15 @@ async fn pump_body(
                         cancel.notify_one();
                         return;
                     }
-                    clean_end = true;
                     break;
                 }
                 PacketType::ConnClose => {
-                    if declared_len.is_some_and(|total| sent < total) {
-                        if let Some(tx) = tx.take() {
-                            tx.abort("lsapi response body closed before Content-Length".into());
-                        }
+                    if let Some(tx) = tx.take() {
+                        tx.abort("lsapi connection closed before RESP_END".into());
                     }
                     guard.poison();
-                    break;
+                    cancel.notify_one();
+                    return;
                 }
                 PacketType::InternalError => {
                     if let Some(tx) = tx.take() {
@@ -1686,13 +1778,12 @@ async fn pump_body(
                 _ => {}
             },
             Ok(None) => {
-                if declared_len.is_some_and(|total| sent < total) {
-                    if let Some(tx) = tx.take() {
-                        tx.abort("lsapi response EOF before Content-Length".into());
-                    }
+                if let Some(tx) = tx.take() {
+                    tx.abort("lsapi response EOF before RESP_END".into());
                 }
                 guard.poison();
-                break;
+                cancel.notify_one();
+                return;
             }
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                 if let Some(tx) = tx.take() {
@@ -1717,13 +1808,13 @@ async fn pump_body(
     // Wake the body pump in case it is still blocked (e.g. lsphp answered before
     // draining the whole body). This is harmless if it already finished.
     cancel.notify_one();
-    if clean_end && !over_delivered {
+    if !over_delivered && !reader.has_buffered() {
         // Deposit the read half so the guard can reunite + re-pool — this only
         // re-pools if the body writer also deposited its write half cleanly.
         guard.deposit_read(read_half);
+    } else {
+        guard.poison();
     }
-    // On a non-clean end the guard was poisoned above; dropping it (and the
-    // read half) closes the socket.
 }
 
 enum FeedOutcome {
@@ -1967,6 +2058,22 @@ impl PacketReader {
     where
         R: AsyncReadExt + Unpin,
     {
+        self.next_inner(r, true).await
+    }
+
+    /// [`Self::next`] without the idle timeout or deadline; the caller bounds the
+    /// wait. Cancel-safe: buffered bytes stay in `buf`.
+    async fn next_untimed<R>(&mut self, r: &mut R) -> std::io::Result<Option<LsapiFrame>>
+    where
+        R: AsyncReadExt + Unpin,
+    {
+        self.next_inner(r, false).await
+    }
+
+    async fn next_inner<R>(&mut self, r: &mut R, timed: bool) -> std::io::Result<Option<LsapiFrame>>
+    where
+        R: AsyncReadExt + Unpin,
+    {
         // (LST1) Reuse ONE pinned timer across every read in this call instead of
         // allocating a fresh `tokio::time::timeout` (hence a new `Sleep`) per loop
         // iteration — a PHP response arriving in N TCP segments otherwise churns N
@@ -1981,7 +2088,7 @@ impl PacketReader {
             }
             let now = Instant::now();
             // If the total processing deadline already passed, fail TimedOut now.
-            if let Some(dl) = self.deadline {
+            if let Some(dl) = self.deadline.filter(|_| timed) {
                 if dl <= now {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
@@ -2010,7 +2117,7 @@ impl PacketReader {
                     Ok(n) => n,
                     Err(e) => return Err(e),
                 },
-                _ = timer.as_mut() => {
+                _ = timer.as_mut(), if timed => {
                     // Distinguish a true deadline expiry from an idle gap only in
                     // the message; both map to GatewayTimeout/abort (504) upstream.
                     let msg = match self.deadline {
@@ -2033,6 +2140,10 @@ impl PacketReader {
                 ));
             }
         }
+    }
+
+    fn has_buffered(&self) -> bool {
+        !self.buf.is_empty()
     }
 
     fn try_parse(&mut self) -> std::io::Result<Option<LsapiFrame>> {

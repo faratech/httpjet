@@ -35,7 +35,8 @@ pub use admission::AdmissionFilter;
 pub use classify::{Disposition, classify_response};
 pub use diskstore::key_hash;
 pub use key::{
-    PageCacheKey, QsStrip, compute_vary_value, compute_vary_value_with_defaults, normalize_query,
+    PageCacheKey, PhpCookieName, QsStrip, compute_vary_value, compute_vary_value_with_defaults,
+    normalize_query, php_cookie_lookup, php_cookie_name, php_cookie_name_eq, php_trim,
     public_with_vary, vary_value_from_request,
 };
 pub use proto::{
@@ -44,6 +45,6 @@ pub use proto::{
 };
 pub use shared_paths::{SharedPathMatcher, parse_shared_paths, path_has_segment_prefix};
 pub use store::{
-    CacheListing, CacheStats, CachedResponse, EntryInfo, EntryState, FileId, Freshness, PageBody,
-    PageScope, PageStore, StaticNode, StoreConfig,
+    CacheFootprint, CacheListing, CacheStats, CachedResponse, EntryInfo, EntryState, FileId,
+    Freshness, PageBody, PageScope, PageStore, StaticNode, StoreConfig,
 };

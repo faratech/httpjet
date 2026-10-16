@@ -202,6 +202,23 @@ impl CidrList {
     }
 }
 
+/// Fold an IPv4-mapped IPv6 net (`::ffff:a.b.c.d/n`) to its IPv4 form (`/n-96`):
+/// clients are matched after v4 canonicalization, so a mapped net kept as v6 could
+/// never match (#689). `None` for a mapped net wider than `/96`, which spans more
+/// than the mapped range.
+pub fn fold_mapped_v4(net: IpNet) -> Option<IpNet> {
+    let IpNet::V6(v6) = net else {
+        return Some(net);
+    };
+    let Some(v4) = v6.addr().to_ipv4_mapped() else {
+        return Some(net);
+    };
+    let prefix = v6.prefix_len().checked_sub(96)?;
+    IpNet::new(std::net::IpAddr::V4(v4), prefix)
+        .ok()
+        .map(|n| n.trunc())
+}
+
 fn push_prefixes<'a>(
     entry: &mut Vec<IpNet>,
     prefixes: impl Iterator<Item = &'a str>,
@@ -212,6 +229,9 @@ fn push_prefixes<'a>(
         let net: IpNet = p
             .parse()
             .map_err(|e| format!("geo line {line_no}: bad prefix {p:?}: {e}"))?;
+        let net = fold_mapped_v4(net).ok_or_else(|| {
+            format!("geo line {line_no}: IPv4-mapped prefix {p:?} is wider than /96")
+        })?;
         entry.push(net);
         any = true;
     }
@@ -236,6 +256,15 @@ impl GeoSource for CidrList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_prefixes_fold_to_v4() {
+        let f = |s: &str| fold_mapped_v4(s.parse().unwrap()).map(|n| n.to_string());
+        assert_eq!(f("::ffff:10.0.0.0/104").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(f("::ffff:10.1.2.3/128").as_deref(), Some("10.1.2.3/32"));
+        assert_eq!(f("2001:db8::/32").as_deref(), Some("2001:db8::/32"));
+        assert_eq!(f("::ffff:0.0.0.0/95"), None);
+    }
 
     fn set(specs: &[&str]) -> IntervalSet {
         let prefixes: Vec<IpNet> = specs.iter().map(|s| s.parse().unwrap()).collect();

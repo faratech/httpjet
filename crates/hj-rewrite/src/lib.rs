@@ -71,9 +71,11 @@ pub use htaccess::{
     cache_directives, chain_cacheable_for_default, php_directives, php_handler_forced,
     php_handler_forced_iter,
 };
-pub use htaccess::{AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request};
+pub use htaccess::{
+    AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request, resolve_auth_for_request_paths,
+};
 pub use input::{FileTests, HeaderLookup, RewriteInput, StatSource};
-pub use rules::{CacheKeyVar, RewriteOutcome, RuleSet, evaluate};
+pub use rules::{CacheKeyVar, RewriteOutcome, RuleSet, evaluate, evaluate_with_engine};
 
 #[cfg(test)]
 mod tests;

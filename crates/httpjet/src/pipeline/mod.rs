@@ -49,6 +49,8 @@ pub(crate) use scoped_auth::set_auth_user_file_roots;
 mod suffix_routing;
 
 pub(crate) use rewrite_glue::{DEFAULT_REWRITE_OUTCOME_TTL, RewriteOutcomeCache, UaClassifyCache};
+#[cfg(test)]
+pub(crate) use rewrite_glue::{page_cache_header_vary, page_cache_ua_class};
 
 use htaccess_apply::{
     access_denied, access_deny_dir, apply_response_headers_for_request, apply_set_env,
@@ -160,6 +162,16 @@ fn apply_request_id_header(state: &ServerState, ctx: &ReqCtx, resp: &mut Respons
     }
 }
 
+/// The protocol a request is REPORTED as (SERVER_PROTOCOL, %{THE_REQUEST}, SetEnvIf
+/// Request_Protocol): an HTTP/1.0 request on an H1 connection says HTTP/1.0.
+fn effective_proto(proto: Proto, req: &Request) -> Proto {
+    if proto == Proto::Http1 && req.extensions().get::<hj_core::Http10Request>().is_some() {
+        Proto::Http10
+    } else {
+        proto
+    }
+}
+
 /// (#343 Step 1) Cookie-census classes for the on-core fast path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FastCookieClass {
@@ -172,9 +184,14 @@ enum FastCookieClass {
 /// private user/session cookies). Names only — cookie values are never read here.
 fn has_member_session_cookie(cookie: &str, session: &str, user: &str) -> bool {
     cookie.split(';').any(|kv| {
-        let name = kv.split('=').next().unwrap_or("").trim();
-        (!session.is_empty() && name.eq_ignore_ascii_case(session.trim()))
-            || (!user.is_empty() && name.eq_ignore_ascii_case(user.trim()))
+        let raw = kv.split('=').next().unwrap_or("").trim();
+        // #616/#656: compare PHP's `$_COOKIE` key (`xf.user`, `xf[user` → `xf_user`);
+        // a mangled member cookie must not take the guest fast path.
+        let Some(parsed) = hj_pagecache::php_cookie_name(raw) else {
+            return false;
+        };
+        let mangled_eq = |want: &str| parsed.name().eq_ignore_ascii_case(want.trim());
+        (!session.is_empty() && mangled_eq(session)) || (!user.is_empty() && mangled_eq(user))
     })
 }
 
@@ -192,6 +209,7 @@ pub(crate) async fn fast_serve(
     tls: Option<hj_core::TlsParams>,
     req: &Request,
 ) -> Option<Response> {
+    let proto = effective_proto(proto, req);
     let req_start = std::time::Instant::now();
     // The on-core memo/static/page-cache path cannot perform asynchronous WAF
     // inspection. When a sidecar is configured, force every request through the
@@ -242,7 +260,9 @@ pub(crate) async fn fast_serve(
         Some(h) => (Some(h.to_owned()), fast_memo::HostSource::Header),
         None => match req.uri().authority().map(|a| a.host().to_string()) {
             Some(a) => (Some(a), fast_memo::HostSource::Authority),
-            None => (None, fast_memo::HostSource::None),
+            // No Host and no authority (HTTP/1.0): `handle()` routes by the TLS SNI
+            // next, which this path does not see; bridge so both agree on the vhost.
+            None => return None,
         },
     };
     let resolved = state.router.resolve(listener, route_key.as_deref())?;
@@ -325,7 +345,7 @@ pub(crate) async fn fast_serve(
                 .map(|v| v.as_bytes())
                 .unwrap_or(b""),
         };
-        if let Some(resp) = fast_memo::probe(&mk, req, &state.ua_classify, req_start) {
+        if let Some(mut resp) = fast_memo::probe(&mk, req, &state.ua_classify, req_start) {
             state
                 .metrics
                 .fast_memo_hits
@@ -342,6 +362,16 @@ pub(crate) async fn fast_serve(
             }
             if !state.client_throttle.allow(ctx.client_ip) {
                 return None; // over the per-IP rate: dispatch() renders the 429
+            }
+            // The memo keeps no response extensions; re-derive the context egress rate.
+            if has_bandwidth_context(&ctx.vhost) {
+                let path = decode_request_path(req.uri().path())?;
+                stamp_bandwidth(
+                    &ctx,
+                    &normalized_request_path(&path),
+                    state.serve_config.bandwidth_limit,
+                    &mut resp,
+                );
             }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
@@ -509,7 +539,10 @@ pub(crate) async fn fast_serve(
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if state.page_cache.is_some() && !req.headers().contains_key(http::header::COOKIE) {
+    if state.page_cache.is_some()
+        && !req.headers().contains_key(http::header::COOKIE)
+        && lscache::raw_path_is_cache_canonical(req.uri().path(), &orig_path)
+    {
         if fast_post_rewrite_bridges(
             state,
             &ctx,
@@ -517,6 +550,7 @@ pub(crate) async fn fast_serve(
             &cache_path,
             &cache_rel,
             method.as_str(),
+            *cache_path != *orig_path,
         ) {
             return None;
         }
@@ -534,6 +568,10 @@ pub(crate) async fn fast_serve(
             .headers()
             .get(http::header::ORIGIN)
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+        let ua_class =
+            rewrite_glue::page_cache_ua_class(state, &ctx, &chain_with_dirs, req.headers());
+        let header_vary =
+            rewrite_glue::page_cache_header_vary(state, &ctx, &chain_with_dirs, req.headers());
         let cc = lscache::CacheCtx {
             enabled: true,
             method: &method,
@@ -549,6 +587,8 @@ pub(crate) async fn fast_serve(
             // Cookieless by branch precondition ⇒ the public vary value is "".
             vary_value: Some(""),
             origin: origin_vary.as_deref(),
+            ua_class: ua_class.as_deref(),
+            header_vary: header_vary.as_deref(),
         };
         let inm = req
             .headers()
@@ -557,6 +597,12 @@ pub(crate) async fn fast_serve(
         if let lscache::CacheOutcome::Hit(mut resp) =
             lscache::cache_lookup_fast_path(state, &ctx, &cc, inm)
         {
+            stamp_bandwidth(
+                &ctx,
+                &orig_path,
+                state.serve_config.bandwidth_limit,
+                &mut resp,
+            );
             apply_response_transforms(state, &ctx, &mut resp).await;
             state
                 .telemetry
@@ -600,12 +646,12 @@ pub(crate) async fn fast_serve(
     // the bridged path.
     let (static_extra_headers, static_location, static_charset): (
         Option<Vec<(String, String)>>,
-        Option<std::path::PathBuf>,
+        Option<(std::path::PathBuf, String)>,
         Option<String>,
     ) = match matching_static_context(&ctx, &orig_path) {
         Some(c) => (
             Some(c.extra_headers.clone()),
-            c.location.clone(),
+            c.location.clone().map(|loc| (loc, c.uri.clone())),
             effective_static_charset(c),
         ),
         None => (None, None, None),
@@ -634,10 +680,10 @@ pub(crate) async fn fast_serve(
         sreq.extensions_mut()
             .insert(hj_static::IndexFilesOverride(idx.to_vec()));
     }
-    if let Some(loc) = static_location {
+    if let Some((loc, uri)) = static_location {
         if loc != ctx.vhost.doc_root {
             sreq.extensions_mut()
-                .insert(hj_static::DocRootOverride(loc));
+                .insert(hj_static::DocRootOverride(loc, uri));
         }
     }
     if let Some(charset) = static_charset {
@@ -836,11 +882,12 @@ pub(crate) fn cookie_header_joined(headers: &http::HeaderMap) -> Option<String> 
         (None, _) => None,
         (Some(first), Some(second)) => {
             let mut joined = String::with_capacity(first.len() + second.len() + 16);
+            // `; ` like coalesce_cookie_crumbs: every cookie parser splits on `;` (#671).
             joined.push_str(&first);
-            joined.push_str(", ");
+            joined.push_str("; ");
             joined.push_str(&second);
             for line in lines {
-                joined.push_str(", ");
+                joined.push_str("; ");
                 joined.push_str(&line);
             }
             Some(joined)
@@ -860,6 +907,7 @@ fn fast_post_rewrite_bridges(
     cur_path: &str,
     cur_rel: &str,
     method: &str,
+    rewritten: bool,
 ) -> bool {
     if access_denied(chain, cur_rel, method, ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, cur_rel)
@@ -886,11 +934,22 @@ fn fast_post_rewrite_bridges(
     {
         return true;
     }
+    // dispatch() authenticates a rewritten target's mapped resources; the auth-free
+    // original chain says nothing about a symlinked or context-aliased target.
+    if rewritten
+        && script_split.is_none()
+        && scoped_auth::target_has_auth(state, ctx, cur_path, chain).0
+    {
+        return true;
+    }
     if let Some((script_abs, _, _)) = script_split {
         if unusable_script_handler_for_script(ctx, &script_abs).is_some() {
             return true;
         }
-        if allowed_script_target(&state.acl, &script_abs).is_none() {
+        let Some(target) = allowed_script_target(&state.acl, &script_abs) else {
+            return true;
+        };
+        if rewritten && scoped_auth::resolved_target_has_auth(state, ctx, cur_path, &target) {
             return true;
         }
         if let Ok(rel) = script_abs.strip_prefix(&ctx.vhost.doc_root) {
@@ -1275,6 +1334,7 @@ async fn handle_inner(
     sni: Option<&str>,
     mut req: Request,
 ) -> Response {
+    let proto = effective_proto(proto, &req);
     // (OPS2) Count this request as in-flight for the duration of handle().
     let _req_guard = RequestGuard::new(&state.metrics.active_requests);
     // (telemetry) Total wall time, recorded at the single response funnel below.
@@ -1531,8 +1591,11 @@ async fn handle_inner(
     // (Tier 2) Captured only when a context declares a bandwidthLimit — the per-request
     // path allocation stays off the hot path otherwise (the connection-wide tuning rate
     // needs no stamp; the transport already carries it).
-    let bw_path = (has_bandwidth_context(&ctx.vhost) || sub_filter_matches(&ctx, req.uri().path()))
-        .then(|| req.uri().path().to_owned());
+    // Matched on the decoded, dot-normalized path every other context matcher uses, so
+    // `/%73ub/` or `/x/../sub/` cannot slip past a context's rules.
+    let bw_path = (has_bandwidth_context(&ctx.vhost) || has_sub_filter_context(&ctx.vhost))
+        .then(|| decode_request_path(req.uri().path()).map(|p| normalized_request_path(&p)))
+        .flatten();
 
     let mut resp = if !state.acl.check_peer(peer_ip).is_allowed() {
         error_page(StatusCode::FORBIDDEN)
@@ -1837,6 +1900,13 @@ fn stamp_sub_filter(ctx: &ReqCtx, path: &str, resp: &mut Response) {
 /// bytes that a memo hit would re-filter (non-idempotent when a replacement
 /// contains its search string), and the page-cache hot path must not serve
 /// entries the transform vec would have to filter inconsistently.
+fn has_sub_filter_context(vhost: &hj_core::config::VHostConfig) -> bool {
+    vhost
+        .contexts
+        .iter()
+        .any(|c| c.enabled && c.sub_filter.as_ref().is_some_and(|s| s.is_active()))
+}
+
 fn sub_filter_matches(ctx: &ReqCtx, path: &str) -> bool {
     ctx.vhost.contexts.iter().any(|c| {
         c.enabled
@@ -3037,7 +3107,13 @@ async fn dispatch(
             // "moved" body. The CORS preflight rule is the live example.
             merge_rewrite_env(ctx, env);
             let rel = resolved_rel_path(&cur_path);
-            let mut resp = status_response(code);
+            // Apache routes a 4xx/5xx `[R=]` through `ap_die`, so ErrorDocument applies.
+            let mut resp = match StatusCode::from_u16(code) {
+                Ok(status) if code >= 400 => {
+                    error_doc_or_page(state, ctx, req.headers(), &chain, &cur_path, status).await
+                }
+                _ => status_response(code),
+            };
             apply_response_headers_for_request(ctx, &chain, &rel, &orig_path, &mut resp);
             return resp;
         }
@@ -3292,7 +3368,11 @@ async fn dispatch(
     // source), or across a precompressed script representation.
     let cache_on = state.page_cache.is_some()
         && !unresolved_script_candidate
-        && !precompressed_script_candidate;
+        && !precompressed_script_candidate
+        && lscache::raw_path_is_cache_canonical(req.uri().path(), &orig_path)
+        // A handshake belongs to the upgrade relay (OLS routes it before cache), and a
+        // stale hit's revalidation would dial the backend replaying the Upgrade headers.
+        && !is_websocket_upgrade(req.headers());
     let cache_method = req.method().clone();
     // Reuse the host already computed in `handle()` (B4) instead of recomputing the identical
     // value; dropped unused when the cache is off (cache_host stays empty as before).
@@ -3384,6 +3464,18 @@ async fn dispatch(
     } else {
         None
     };
+    // From the chain whose conds actually ran (`chain` may be the reloaded
+    // destination chain by now) plus the vhost's inline rules.
+    let ua_class = if cache_on {
+        rewrite_glue::page_cache_ua_class(state, ctx, &chain_with_dirs, req.headers())
+    } else {
+        None
+    };
+    let header_vary = if cache_on {
+        rewrite_glue::page_cache_header_vary(state, ctx, &chain_with_dirs, req.headers())
+    } else {
+        None
+    };
     let cc = lscache::CacheCtx {
         enabled: cache_on,
         method: &cache_method,
@@ -3398,6 +3490,8 @@ async fn dispatch(
         host_foreign: cache_host_foreign,
         vary_value: (cache_on && state.page_cache.is_some()).then_some(cache_vary.as_str()),
         origin: origin_vary.as_deref(),
+        ua_class: ua_class.as_deref(),
+        header_vary: header_vary.as_deref(),
     };
 
     // ---- 4d. Deferred terminal `[P]` proxy, with page-cache participation ------------
@@ -3573,6 +3667,14 @@ async fn dispatch(
                     .telemetry
                     .record_cache_bypass(ctx.peer_ip.is_loopback());
             }
+            // Only a GET can store, so only a GET may lead: a HEAD leader would park
+            // every concurrent GET for SINGLEFLIGHT_WAIT and then release them all at
+            // once with nothing stored (#657).
+            lscache::CacheOutcome::Miss(_) if req.method() != http::Method::GET => {
+                state
+                    .telemetry
+                    .record_cache_miss(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
+            }
             lscache::CacheOutcome::Miss(key_hash) => {
                 match state.page_cache_inflight.enter(key_hash) {
                     lscache::Enter::Leader(guard) => {
@@ -3624,11 +3726,14 @@ async fn dispatch(
     // ---- 5. WebSocket upgrade --------------------------------------------
     let ws_upgrade = is_websocket_upgrade(req.headers());
     if ws_upgrade {
+        // Most specific map wins (OLS `bestMatch`); `rev` keeps the first on a tie.
         if let Some(ws) = ctx
             .vhost
             .websockets
             .iter()
-            .find(|w| context_uri_matches(&cur_path, &w.uri))
+            .rev()
+            .filter(|w| context_uri_matches(&cur_path, &w.uri))
+            .max_by_key(|w| w.uri.len())
         {
             let target = ProxyTarget::from_websocket_map(ws).in_scope(&ctx.vhost_name);
             return proxy_websocket(state, ctx, req, target).await;
@@ -4033,21 +4138,22 @@ async fn dispatch(
     // the `&mut ctx` borrow needed to serve the file (the context borrows ctx).
     let (static_extra_headers, static_location, static_charset): (
         Option<Vec<(String, String)>>,
-        Option<PathBuf>,
+        Option<(PathBuf, String)>,
         Option<String>,
     ) = match matching_static_context(ctx, &cur_path) {
         Some(c) => (
             Some(c.extra_headers.clone()),
-            c.location.clone(),
+            c.location.clone().map(|loc| (loc, c.uri.clone())),
             effective_static_charset(c),
         ),
         None => (None, None, None),
     };
     // The location override only takes effect when it actually differs from the
     // vhost docroot; pinned via the DocRootOverride extension the static handler reads.
-    if let Some(loc) = static_location {
+    if let Some((loc, uri)) = static_location {
         if loc != ctx.vhost.doc_root {
-            req.extensions_mut().insert(hj_static::DocRootOverride(loc));
+            req.extensions_mut()
+                .insert(hj_static::DocRootOverride(loc, uri));
         }
     }
     if let Some(charset) = static_charset {
@@ -5411,6 +5517,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn http10_requests_report_http10() {
+        let mut req: Request = http::Request::new(hj_core::empty_incoming());
+        assert_eq!(effective_proto(Proto::Http1, &req), Proto::Http1);
+        req.extensions_mut().insert(hj_core::Http10Request);
+        assert_eq!(effective_proto(Proto::Http1, &req).as_str(), "HTTP/1.0");
+        assert_eq!(effective_proto(Proto::Http2, &req), Proto::Http2);
+    }
+
+    #[test]
     fn member_session_cookie_classification() {
         // Member marker present (either name, any case, any position).
         assert!(has_member_session_cookie(
@@ -5425,6 +5540,16 @@ mod tests {
         ));
         assert!(has_member_session_cookie(
             "consent=1; xf_session=abc",
+            "xf_session",
+            "xf_user"
+        ));
+        assert!(has_member_session_cookie(
+            "xf[user=42",
+            "xf_session",
+            "xf_user"
+        ));
+        assert!(has_member_session_cookie(
+            "xf_session[a]=1",
             "xf_session",
             "xf_user"
         ));

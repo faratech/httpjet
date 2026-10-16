@@ -1147,6 +1147,45 @@ async fn mock_lsphp_status_header_overrides_status() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Regression (#668): a 1xx can never be the final response.
+#[tokio::test]
+async fn mock_lsphp_informational_final_status_is_bad_gateway() {
+    for (resp_status, headers) in [(102, &[][..]), (200, &[("Status", "100 Continue")][..])] {
+        let path = tmp_sock("info-status");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server_task = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = read_packet(&mut s).await.unwrap();
+            let mut out = BytesMut::new();
+            put_packet(
+                &mut out,
+                PacketType::RespHeader,
+                &resp_header_body(resp_status, headers),
+            );
+            put_packet(&mut out, PacketType::RespStream, b"body");
+            put_packet(&mut out, PacketType::RespEnd, b"");
+            s.write_all(&out).await.unwrap();
+            let mut sink = [0u8; 8];
+            let _ = tokio::time::timeout(Duration::from_millis(100), s.read(&mut sink)).await;
+        });
+        let pool = Arc::new(LsapiPool::new(&path, 2, Duration::from_secs(2)));
+        let handler = Lsapi::new(pool).read_timeout(Duration::from_secs(2));
+        let req = http::Request::builder()
+            .uri("/early.php")
+            .header("Host", "test")
+            .body(empty_incoming())
+            .unwrap();
+        let mut c = ctx("/web/test");
+        match handler.handle(&mut c, req).await {
+            Err(HandlerError::BadGateway(_)) => {}
+            Err(other) => panic!("expected BadGateway, got {other:?}"),
+            Ok(resp) => panic!("expected BadGateway, got {}", resp.status()),
+        }
+        server_task.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Read the concrete `m_reqBodyLen` (field[1], LE i32) out of a BEGIN_REQUEST
 /// packet body. This is the exact count of raw body bytes lsphp will read off the
 /// socket after the packet, so the mock uses it to drain exactly the body.
@@ -1917,4 +1956,654 @@ async fn live_forwarding_headers_follow_peer_trust() {
         trusted.contains("HTTP_X_FORWARDED_FOR=-\n"),
         "underscore spoof: {trusted}"
     );
+}
+
+/// Fake lsphp that answers a POST either after consuming the whole request body
+/// (`drain`) or after reading only BEGIN_REQUEST, leaving the body in the socket
+/// as a script that partially reads `php://input` would. Returns the pool so the
+/// caller can see whether the connection was re-pooled.
+async fn post_with_body_drain(tag: &str, drain: bool, declare_length: bool) -> Arc<LsapiPool> {
+    const BODY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
+    let path = tmp_sock(tag);
+    let listener = UnixListener::bind(&path).unwrap();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (ptype, _) = read_packet(&mut stream).await.unwrap();
+        assert_eq!(ptype, PacketType::BeginRequest as u8);
+        if drain {
+            let mut body = [0u8; 32];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, BODY);
+        }
+        let mut out = BytesMut::new();
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[("Content-Length", "2")]),
+        );
+        put_packet(&mut out, PacketType::RespStream, b"ok");
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        stream.write_all(&out).await.unwrap();
+        stream.flush().await.unwrap();
+        // Keep the socket open until the client side has decided whether to
+        // re-pool, so a closed peer cannot be what refuses reuse.
+        let _ = done_rx.await;
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(1)));
+    let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(1));
+    let mut builder = http::Request::builder()
+        .method("POST")
+        .uri("/index.php")
+        .header("Host", "test");
+    if declare_length {
+        builder = builder.header("Content-Length", "32");
+    }
+    let request = builder.body(full_incoming(BODY)).unwrap();
+    let response = handler
+        .handle(&mut ctx("/web/test"), request)
+        .await
+        .expect("response");
+    let body = match response.into_body() {
+        hj_core::Body::Full(bytes) => bytes,
+        hj_core::Body::Stream(stream) => stream.collect().await.unwrap().to_bytes(),
+        other => panic!("unexpected body: {:?}", std::mem::discriminant(&other)),
+    };
+    assert_eq!(&body[..], b"ok");
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        if pool.idle_count() > 0 || pool.stats().unread_body_drops > 0 {
+            break;
+        }
+    }
+    let _ = done_tx.send(());
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(path);
+    pool
+}
+
+/// Regression (#596): keep-alive must not depend on PHP draining php://input.
+/// Unread request-body bytes would be parsed by lsphp as the next request.
+#[tokio::test]
+async fn unread_request_body_prevents_repool() {
+    for (tag, declare_length) in [
+        ("unread-body-stream", true),
+        ("unread-body-buffered", false),
+    ] {
+        let pool = post_with_body_drain(tag, false, declare_length).await;
+        assert_eq!(
+            pool.idle_count(),
+            0,
+            "{tag}: undrained socket was re-pooled"
+        );
+        assert_eq!(pool.stats().unread_body_drops, 1, "{tag}");
+    }
+}
+
+#[tokio::test]
+async fn drained_request_body_repools() {
+    for (tag, declare_length) in [
+        ("drained-body-stream", true),
+        ("drained-body-buffered", false),
+    ] {
+        let pool = post_with_body_drain(tag, true, declare_length).await;
+        assert_eq!(
+            pool.idle_count(),
+            1,
+            "{tag}: drained socket must be reusable"
+        );
+        assert_eq!(pool.stats().unread_body_drops, 0, "{tag}");
+    }
+}
+
+/// How a fake lsphp ends a response that carries no Content-Length.
+#[derive(Clone, Copy)]
+enum UnframedEnd {
+    RespEnd,
+    ConnClose,
+    Eof,
+}
+
+/// Fake lsphp: RESP_HEADER without Content-Length, then `chunk`, then `end`.
+/// `stream` forces the streaming path by holding the first chunk back until
+/// the handler has returned the response head.
+async fn unframed_response(
+    tag: &str,
+    end: UnframedEnd,
+    stream: bool,
+) -> (Result<Bytes, String>, Arc<LsapiPool>) {
+    let path = tmp_sock(tag);
+    let listener = UnixListener::bind(&path).unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let (ptype, _) = read_packet(&mut s).await.unwrap();
+        assert_eq!(ptype, PacketType::BeginRequest as u8);
+        let mut head = BytesMut::new();
+        put_packet(
+            &mut head,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[("Content-Type", "text/html")]),
+        );
+        let mut tail = BytesMut::new();
+        put_packet(&mut tail, PacketType::RespStream, b"abc");
+        match end {
+            UnframedEnd::RespEnd => put_packet(&mut tail, PacketType::RespEnd, b""),
+            UnframedEnd::ConnClose => put_packet(&mut tail, PacketType::ConnClose, b""),
+            UnframedEnd::Eof => {}
+        }
+        if stream {
+            s.write_all(&head).await.unwrap();
+            s.flush().await.unwrap();
+            release_rx.await.unwrap();
+            s.write_all(&tail).await.unwrap();
+        } else {
+            head.extend_from_slice(&tail);
+            s.write_all(&head).await.unwrap();
+        }
+        s.flush().await.unwrap();
+        if matches!(end, UnframedEnd::Eof) {
+            drop(s);
+            let _ = done_rx.await;
+        } else {
+            let _ = done_rx.await;
+        }
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(1)));
+    let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(1));
+    let request = http::Request::builder()
+        .uri("/index.php")
+        .header("Host", "test")
+        .body(empty_incoming())
+        .unwrap();
+    let result = match handler.handle(&mut ctx("/web/test"), request).await {
+        Err(e) => {
+            let _ = release_tx.send(());
+            Err(e.to_string())
+        }
+        Ok(response) => {
+            let _ = release_tx.send(());
+            match response.into_body() {
+                hj_core::Body::Full(bytes) => Ok(bytes),
+                hj_core::Body::Stream(body) => body
+                    .collect()
+                    .await
+                    .map(|b| b.to_bytes())
+                    .map_err(|e| e.to_string()),
+                other => panic!("unexpected body: {:?}", std::mem::discriminant(&other)),
+            }
+        }
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let _ = done_tx.send(());
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(path);
+    (result, pool)
+}
+
+/// Regression (#594): without a Content-Length, RESP_END is the only completion
+/// signal. A worker that dies mid-response (EOF) or sends CONN_CLOSE first must
+/// surface as an error, never as a clean, cacheable short body.
+#[tokio::test]
+async fn unframed_response_ending_before_resp_end_is_an_error() {
+    for stream in [true, false] {
+        for (end, name) in [
+            (UnframedEnd::ConnClose, "connclose"),
+            (UnframedEnd::Eof, "eof"),
+        ] {
+            let tag = format!(
+                "unframed-{name}-{}",
+                if stream { "stream" } else { "inline" }
+            );
+            let (result, pool) = unframed_response(&tag, end, stream).await;
+            let err = result.expect_err(&format!("{tag}: truncated body ended cleanly"));
+            assert!(err.contains("RESP_END"), "{tag}: {err}");
+            assert_eq!(pool.idle_count(), 0, "{tag}: socket must not be re-pooled");
+        }
+        let tag = format!(
+            "unframed-respend-{}",
+            if stream { "stream" } else { "inline" }
+        );
+        let (result, pool) = unframed_response(&tag, UnframedEnd::RespEnd, stream).await;
+        assert_eq!(&result.expect("clean RESP_END")[..], b"abc", "{tag}");
+        assert_eq!(pool.idle_count(), 1, "{tag}: clean socket must be reusable");
+    }
+}
+
+/// Streams `chunks` one byte-chunk at a time, `gap` apart, then (if `stall`)
+/// holds the body open without ending it.
+fn dripping_body(chunks: usize, gap: Duration, stall: bool) -> hj_core::IncomingBody {
+    let (mut tx, channel) = Channel::<Bytes, hj_core::BoxError>::new(1);
+    tokio::spawn(async move {
+        for i in 0..chunks {
+            tokio::time::sleep(gap).await;
+            if tx
+                .send_data(Bytes::from(vec![b'a' + i as u8]))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        if stall {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        drop(tx);
+    });
+    BoxBody::new(channel)
+}
+
+/// #660: an upload that keeps making progress for longer than `read_timeout`
+/// (and `max_process_time`) must not 504 — the response clocks start once the
+/// body has been delivered, as LSWS's extapp timeout does.
+#[tokio::test]
+async fn slow_progressing_upload_outlives_response_read_timeout() {
+    let path = tmp_sock("slow-upload");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (ptype, begin) = read_packet(&mut stream).await.unwrap();
+        assert_eq!(ptype, PacketType::BeginRequest as u8);
+        let mut body = vec![0; req_body_len_from_begin(&begin) as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        let mut out = BytesMut::new();
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[("Content-Length", "2")]),
+        );
+        put_packet(&mut out, PacketType::RespStream, b"ok");
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        stream.write_all(&out).await.unwrap();
+        stream.flush().await.unwrap();
+        body
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(1)));
+    let handler = Lsapi::new(pool)
+        .read_timeout(Duration::from_millis(500))
+        .max_process_time(Some(Duration::from_millis(800)));
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("/upload.php")
+        .header("Host", "test")
+        .header("Content-Length", "10")
+        .body(dripping_body(10, Duration::from_millis(150), false))
+        .unwrap();
+    let resp = handler
+        .handle(&mut ctx("/web/test"), req)
+        .await
+        .expect("a progressing upload must not time out");
+    assert_eq!(resp.status(), 200);
+    let body = match resp.into_body() {
+        hj_core::Body::Full(b) => b,
+        hj_core::Body::Stream(s) => s.collect().await.unwrap().to_bytes(),
+        other => panic!("unexpected body {:?}", std::mem::discriminant(&other)),
+    };
+    assert_eq!(&body[..], b"ok");
+    assert_eq!(server_task.await.unwrap(), b"abcdefghij");
+    let _ = std::fs::remove_file(path);
+}
+
+/// #660 companion: a genuinely stalled upload is still bounded — the pump's idle
+/// timer aborts it, which arms the response timer, so a worker that never
+/// answers yields a 504 instead of hanging.
+#[tokio::test]
+async fn stalled_upload_still_times_out() {
+    let path = tmp_sock("stalled-upload");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (ptype, begin) = read_packet(&mut stream).await.unwrap();
+        assert_eq!(ptype, PacketType::BeginRequest as u8);
+        let mut body = vec![0; req_body_len_from_begin(&begin) as usize];
+        let short = stream.read_exact(&mut body).await.is_err();
+        // Hold the socket without answering, like a wedged worker.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        short
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(1)));
+    let handler = Lsapi::new(pool).read_timeout(Duration::from_millis(500));
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("/upload.php")
+        .header("Host", "test")
+        .header("Content-Length", "10")
+        .body(dripping_body(2, Duration::from_millis(50), true))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let result = handler.handle(&mut ctx("/web/test"), req).await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(result, Err(HandlerError::GatewayTimeout)),
+        "stalled upload must 504, got {:?}",
+        result.map(|r| r.status())
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "stalled upload must be bounded, took {elapsed:?}"
+    );
+    assert!(
+        server_task.await.unwrap(),
+        "lsphp must see the truncated body"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+/// #660 follow-up: the Tier-2 in-flight clock starts when the upload finishes, so a
+/// slow but progressing upload cannot age into the hung-worker kill.
+#[tokio::test]
+async fn progressing_upload_is_not_counted_in_flight() {
+    let path = tmp_sock("inflight-upload");
+    let listener = UnixListener::bind(&path).unwrap();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let server_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let (_, begin) = read_packet(&mut stream).await.unwrap();
+        seen_tx.send(()).unwrap();
+        let mut body = vec![0; req_body_len_from_begin(&begin) as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        let mut out = BytesMut::new();
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[("Content-Length", "2")]),
+        );
+        put_packet(&mut out, PacketType::RespStream, b"ok");
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        stream.write_all(&out).await.unwrap();
+    });
+    let sup = Arc::new(LsphpSupervisor::new(SupervisorConfig {
+        command: PathBuf::from("/nonexistent/lsphp-inflight-upload"),
+        socket_path: path.clone(),
+        children: 1,
+        max_requests: 0,
+        env: vec![],
+        backlog: 8,
+        user: String::new(),
+        group: String::new(),
+        start_timeout: Duration::from_millis(50),
+        limits: Default::default(),
+        min_restart_interval: Duration::from_secs(1800),
+        max_restart_backoff: Duration::from_secs(30),
+        jail: Default::default(),
+        socket_source: Default::default(),
+        retry_timeout: Duration::ZERO,
+    }));
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(1)));
+    let (monitor, ticker) = Monitor::spawn(MonitorConfig::new(sup.clone(), pool.clone()));
+    let token = monitor.cancel_token();
+    token.cancel();
+    let _ = ticker.await;
+    let inflight = monitor.inflight();
+    let handler = Lsapi::new(pool).monitor(monitor);
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("/upload.php")
+        .header("Host", "test")
+        .header("Content-Length", "6")
+        .body(dripping_body(6, Duration::from_millis(50), false))
+        .unwrap();
+    let request = tokio::spawn(async move { handler.handle(&mut ctx("/web/test"), req).await });
+    seen_rx.await.unwrap();
+    assert!(
+        inflight.oldest_age().is_none(),
+        "upload time counted toward the Tier-2 hung-worker clock"
+    );
+    assert_eq!(request.await.unwrap().expect("ok").status(), 200);
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(path);
+}
+
+async fn get(handler: &Lsapi, uri: &str) -> Result<hj_core::Response, HandlerError> {
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("Host", "test")
+        .body(empty_incoming())
+        .unwrap();
+    handler.handle(&mut ctx("/web/test"), req).await
+}
+
+async fn body_bytes(resp: hj_core::Response) -> Bytes {
+    match resp.into_parts().1 {
+        hj_core::Body::Stream(s) => s.collect().await.unwrap().to_bytes(),
+        hj_core::Body::Full(b) => b,
+        _ => panic!("stream or full"),
+    }
+}
+
+/// `litespeed_finish_request()` (LSAPI_End_Response_r) writes RESP_END and
+/// CONN_CLOSE together and closes the socket. That socket must not be pooled:
+/// the next bodiless GET reuses pooled sockets unprobed and would hit EPIPE.
+#[tokio::test]
+async fn finish_request_conn_close_is_not_repooled() {
+    for streamed in [false, true] {
+        let path = tmp_sock(if streamed {
+            "finish-streamed"
+        } else {
+            "finish-inline"
+        });
+        let listener = UnixListener::bind(&path).unwrap();
+        let server_task = tokio::spawn(async move {
+            for i in 0..2u8 {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let (p, _) = read_packet(&mut s).await.unwrap();
+                assert_eq!(p, PacketType::BeginRequest as u8);
+                let mut head = BytesMut::new();
+                put_packet(
+                    &mut head,
+                    PacketType::RespHeader,
+                    &resp_header_body(200, &[("X-Conn", &i.to_string())]),
+                );
+                let mut tail = BytesMut::new();
+                put_packet(&mut tail, PacketType::RespStream, b"done");
+                put_packet(&mut tail, PacketType::RespEnd, b"");
+                put_packet(&mut tail, PacketType::ConnClose, b"");
+                if streamed {
+                    s.write_all(&head).await.unwrap();
+                    s.flush().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                } else {
+                    head.extend_from_slice(&tail);
+                    tail = head;
+                }
+                s.write_all(&tail).await.unwrap();
+                s.flush().await.unwrap();
+                drop(s);
+            }
+        });
+
+        let pool = Arc::new(LsapiPool::new(&path, 4, Duration::from_secs(2)));
+        let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(2));
+        let resp1 = get(&handler, "/a.php").await.expect("req1 ok");
+        assert_eq!(&body_bytes(resp1).await[..], b"done");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            pool.idle_count(),
+            0,
+            "streamed={streamed}: a CONN_CLOSE'd socket must not be pooled"
+        );
+
+        let resp2 = get(&handler, "/b.php")
+            .await
+            .expect("req2 ok on a fresh dial");
+        assert_eq!(resp2.headers().get("x-conn").unwrap(), "1");
+        assert!(
+            resp2
+                .extensions()
+                .get::<hj_lsapi::LsapiRetryInfo>()
+                .is_none(),
+            "streamed={streamed}: req2 must not need a retry"
+        );
+        server_task.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// lsphp closed a pooled keep-alive (LSAPI_MAX_IDLE / max-requests exit) with
+/// no CONN_CLOSE. The unprobed reuse fails BEGIN_REQUEST with EPIPE; that must
+/// retry on a fresh dial (even with no monitor/breaker), not 502 or restart.
+#[tokio::test]
+async fn closed_idle_socket_reuse_retries_as_stale_reuse() {
+    let path = tmp_sock("stale-epipe");
+    let listener = UnixListener::bind(&path).unwrap();
+    let closed = Arc::new(tokio::sync::Notify::new());
+    let closed_srv = closed.clone();
+    let server_task = tokio::spawn(async move {
+        let (mut s1, _) = listener.accept().await.unwrap();
+        let (p, _) = read_packet(&mut s1).await.unwrap();
+        assert_eq!(p, PacketType::BeginRequest as u8);
+        let mut out = BytesMut::new();
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[("X-Conn", "0")]),
+        );
+        put_packet(&mut out, PacketType::RespStream, b"one");
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        s1.write_all(&out).await.unwrap();
+        s1.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(s1);
+        closed_srv.notify_one();
+
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let (p, _) = read_packet(&mut s2).await.unwrap();
+        assert_eq!(p, PacketType::BeginRequest as u8);
+        let mut out = BytesMut::new();
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[("X-Conn", "1")]),
+        );
+        put_packet(&mut out, PacketType::RespStream, b"two");
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        s2.write_all(&out).await.unwrap();
+        s2.flush().await.unwrap();
+        let mut sink = [0u8; 64];
+        let _ = tokio::time::timeout(Duration::from_millis(100), s2.read(&mut sink)).await;
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 4, Duration::from_secs(2)));
+    let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(2));
+    let resp1 = get(&handler, "/a.php").await.expect("req1 ok");
+    assert_eq!(&body_bytes(resp1).await[..], b"one");
+    assert_eq!(pool.idle_count(), 1, "clean keep-alive is pooled");
+    closed.notified().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let resp2 = get(&handler, "/b.php")
+        .await
+        .expect("req2 must succeed via a fresh dial");
+    assert_eq!(resp2.headers().get("x-conn").unwrap(), "1");
+    assert_eq!(
+        resp2
+            .extensions()
+            .get::<hj_lsapi::LsapiRetryInfo>()
+            .map(|r| r.kind),
+        Some("stale_reuse")
+    );
+    assert_eq!(&body_bytes(resp2).await[..], b"two");
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+async fn stale_get(handler: &Lsapi, uri: &str) -> Result<hj_core::Response, HandlerError> {
+    let req = http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("Host", "test")
+        .body(empty_incoming())
+        .unwrap();
+    handler.handle(&mut ctx("/web/test"), req).await
+}
+
+/// Regression (#740 follow-up): a whole lsphp family dies (master crash / hard restart) while N>=3 keep-alive
+/// sockets sit idle in the pool. The next GET should still succeed on a fresh dial.
+#[tokio::test]
+async fn many_stale_idle_sockets_do_not_fail_the_next_get() {
+    let path = tmp_sock("xv-many-stale");
+    let listener = UnixListener::bind(&path).unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let dead = Arc::new(tokio::sync::Notify::new());
+    let dead_srv = dead.clone();
+    let b2 = barrier.clone();
+    let server_task = tokio::spawn(async move {
+        let mut socks = Vec::new();
+        for i in 0..3u8 {
+            let (s, _) = listener.accept().await.unwrap();
+            socks.push((i, s));
+        }
+        // Answer all three after all three are accepted (forces 3 distinct conns).
+        for (i, s) in socks.iter_mut() {
+            let (p, _) = read_packet(s).await.unwrap();
+            assert_eq!(p, PacketType::BeginRequest as u8);
+            let mut out = BytesMut::new();
+            put_packet(
+                &mut out,
+                PacketType::RespHeader,
+                &resp_header_body(200, &[("X-Conn", &i.to_string())]),
+            );
+            put_packet(&mut out, PacketType::RespStream, b"ok");
+            put_packet(&mut out, PacketType::RespEnd, b"");
+            s.write_all(&out).await.unwrap();
+            s.flush().await.unwrap();
+        }
+        b2.wait().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(socks); // family dies
+        dead_srv.notify_one();
+        // New family: answer on fresh dials.
+        loop {
+            let Ok(Ok((mut s, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            else {
+                break;
+            };
+            let (p, _) = read_packet(&mut s).await.unwrap();
+            assert_eq!(p, PacketType::BeginRequest as u8);
+            let mut out = BytesMut::new();
+            put_packet(
+                &mut out,
+                PacketType::RespHeader,
+                &resp_header_body(200, &[("X-Conn", "fresh")]),
+            );
+            put_packet(&mut out, PacketType::RespStream, b"ok");
+            put_packet(&mut out, PacketType::RespEnd, b"");
+            s.write_all(&out).await.unwrap();
+            s.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 8, Duration::from_secs(2)).with_circuit_breaker());
+    let handler = Arc::new(Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(2)));
+    let mut js = Vec::new();
+    for i in 0..3 {
+        let h = handler.clone();
+        js.push(tokio::spawn(async move {
+            let r = stale_get(&h, &format!("/p{i}.php")).await.expect("warm ok");
+            let _ = r.into_parts().1;
+        }));
+    }
+    for j in js {
+        j.await.unwrap();
+    }
+    barrier.wait().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    dead.notified().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let resp = stale_get(&handler, "/after.php")
+        .await
+        .expect("a stale pool must not turn a GET into a 502");
+    assert_eq!(resp.status(), 200);
+    drop(resp);
+    assert!(stale_get(&handler, "/after2.php").await.is_ok());
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(&path);
 }

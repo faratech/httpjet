@@ -70,9 +70,14 @@ pub const MAX_CHUNK_LINE: usize = 8 * 1024;
 /// non-final coding (`gzip, chunked`, `gzip`) is intentionally NOT treated as
 /// chunked here — we cannot safely length-frame it, so the caller rejects it.
 pub fn te_is_chunked(value: &[u8]) -> bool {
-    std::str::from_utf8(value)
-        .map(|v| v.trim().eq_ignore_ascii_case("chunked"))
-        .unwrap_or(false)
+    // ASCII OWS only (as in resolve_content_length): str::trim would strip obs-text
+    // padding such as "\xc2\xa0chunked" that hyper/LiteSpeed never frame as chunked.
+    let start = value.iter().position(|&b| b != b' ' && b != b'\t');
+    let end = value.iter().rposition(|&b| b != b' ' && b != b'\t');
+    match (start, end) {
+        (Some(s), Some(e)) => value[s..=e].eq_ignore_ascii_case(b"chunked"),
+        _ => false,
+    }
 }
 
 /// Strictly resolve the request Content-Length from its (possibly repeated) header
@@ -140,8 +145,31 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
 
+/// A framing line (chunk-size + extension, or trailer field) must be free of
+/// bare CR/LF and other controls (HTAB aside): `find_crlf` only locates the first
+/// CRLF, so `0\r\n\nGET /x` would otherwise be swallowed as one "line" here while
+/// an LF-lenient intermediary sees a second request (#684).
+fn framing_line_clean(line: &[u8]) -> bool {
+    line.iter().all(|&b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+}
+
+/// RFC 9112 §7.1.2 trailer field line: `token ":" value`.
+fn trailer_line_valid(line: &[u8]) -> bool {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    colon > 0
+        && line[..colon]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        && framing_line_clean(line)
+}
+
 /// Parse a chunk-size line (hex size, optional `;ext`). Returns None on garbage.
 pub fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    if !framing_line_clean(line) {
+        return None;
+    }
     let hex = line.split(|&b| b == b';').next().unwrap_or(line);
     // (#232 class) Validate 1*HEXDIG ourselves after trimming ASCII OWS:
     // `usize::from_str_radix` accepts a leading '+' ("+2" → 2), which RFC 9112
@@ -169,7 +197,7 @@ pub enum ChunkStep {
     Done(usize),
     /// Need more bytes appended to the buffer, then call `advance` again.
     NeedMore,
-    /// Malformed framing (or body over `MAX_BRIDGED_CHUNKED_BODY`).
+    /// Malformed framing, or a body over its cap (see [`ChunkedDecoder::too_large`]).
     Bad,
 }
 
@@ -187,6 +215,9 @@ pub struct ChunkedDecoder {
     pub max_body: usize,
     /// Raw-bytes budget from `start` (overridable in tests / by the config caller).
     pub max_raw: usize,
+    /// Set when `Bad` was the decoded body exceeding `max_body`: the caller answers 413
+    /// like an oversized Content-Length, not 400.
+    pub too_large: bool,
 }
 
 impl ChunkedDecoder {
@@ -198,6 +229,7 @@ impl ChunkedDecoder {
             start,
             max_body: MAX_BRIDGED_CHUNKED_BODY,
             max_raw: MAX_CHUNKED_RAW,
+            too_large: false,
         }
     }
 
@@ -223,6 +255,9 @@ impl ChunkedDecoder {
                 if rel == 0 {
                     return ChunkStep::Done(self.pos + 2);
                 }
+                if !trailer_line_valid(&rest[..rel]) {
+                    return ChunkStep::Bad;
+                }
                 self.pos += rel + 2;
                 continue;
             }
@@ -245,6 +280,7 @@ impl ChunkedDecoder {
                 continue;
             }
             if self.body.len().saturating_add(size) > self.max_body {
+                self.too_large = true;
                 return ChunkStep::Bad;
             }
             let need = data_start.saturating_add(size).saturating_add(2);
@@ -291,6 +327,32 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn chunked_framing_lines_reject_bare_lf_cr_and_bad_trailers() {
+        // #684: smuggling seams an LF-lenient intermediary would frame differently.
+        let decode = |wire: &[u8]| ChunkedDecoder::new(0).advance(wire);
+        for wire in [
+            &b"5\r\nhello\r\n0\r\n\nGET /admin HTTP/1.1\r\nHost: x\r\n\r\n"[..],
+            b"5;a\n0\n\nGET /admin\r\nhello\r\n0\r\n\r\n",
+            b"5;a\rb\r\nhello\r\n0\r\n\r\n",
+            b"5\r\nhello\r\n0\r\nno-colon\r\n\r\n",
+            b"5\r\nhello\r\n0\r\n: empty-name\r\n\r\n",
+        ] {
+            assert!(
+                matches!(decode(wire), ChunkStep::Bad),
+                "{:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
+        for wire in [
+            &b"5\r\nhello\r\n0\r\nX-T: 1\r\n\r\n"[..],
+            b"5;name=v\r\nhello\r\n0\r\n\r\n",
+            b"5\r\nhello\r\n0\r\nX-T:\tv\r\n\r\n",
+        ] {
+            assert!(matches!(decode(wire), ChunkStep::Done(n) if n == wire.len()));
+        }
+    }
 
     #[test]
     fn chunked_accounting_covers_raw_and_decoded_heap() {

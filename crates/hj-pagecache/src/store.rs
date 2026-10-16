@@ -1201,6 +1201,18 @@ impl StoreConfig {
     }
 }
 
+/// Byte gauges cheap enough for a periodic sampler; see [`PageStore::footprint`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheFootprint {
+    /// Bytes charged against `--page-cache-mem` (Σ shard `ram_used`). Unlike
+    /// [`CacheStats::memory_bytes`] this excludes the reverse tag-index allocations.
+    pub index_ram_bytes: u64,
+    /// Bytes resident in the in-RAM hot tier (0 without a file store).
+    pub hot_bytes: u64,
+    /// Charged tmpfs file-tier footprint (Σ shard `disk_used`; 0 without a file store).
+    pub disk_bytes: u64,
+}
+
 /// Snapshot of store counters (loopback-only `/_lscache/cache-stats`).
 #[derive(Debug, Clone, Default)]
 pub struct CacheStats {
@@ -1472,6 +1484,7 @@ impl StoreEvict {
             PENDING_UNLINKS.with(|q| q.borrow_mut().push(path.clone()));
             if let Some(h) = &self.hot {
                 h.invalidate(*body_id);
+                h.invalidate(*body_id | PageStore::HOT_IDENTITY_TAG);
             }
             let _ = &self.disk;
             if cause == EvictCause::Disk {
@@ -1584,6 +1597,10 @@ pub struct PageStore {
     /// before its index install, while `page_commit` remains held.
     #[cfg(test)]
     store_publish_probe: Mutex<Option<Box<dyn FnOnce(&PageStore) + Send>>>,
+    /// Test-only hook fired inside `purge_all` just before the page teardown,
+    /// standing in for a crash mid-purge.
+    #[cfg(test)]
+    purge_all_teardown_probe: Mutex<Option<Box<dyn FnOnce(&PageStore) + Send>>>,
     /// Entries the boot warm-scan loaded from the file tier (set once, when the scan finishes).
     scan_loaded: AtomicU64,
 
@@ -1771,6 +1788,8 @@ impl PageStore {
             store_commit_probe: Mutex::new(None),
             #[cfg(test)]
             store_publish_probe: Mutex::new(None),
+            #[cfg(test)]
+            purge_all_teardown_probe: Mutex::new(None),
             scan_loaded: AtomicU64::new(0),
             body_id_seq: AtomicU64::new(1),
             hits: CachePaddedAtomic(AtomicU64::new(0)),
@@ -3231,11 +3250,12 @@ impl PageStore {
     /// Tear one tag-carrying entry down under its shard lock and return the
     /// `(key, max_version_seq)` whose OLDER tmpfs versions still need unlinking.
     /// The index teardown stays synchronous under the lock (file-tier rule 3);
-    /// the older-version sweep is deliberately returned to the caller so it can
-    /// run OUTSIDE `page_commit`/the shard mutex — a hot tag's fanout bucket can
-    /// hold many `{hash}-{seq}.pc` files and the readdir+header walk must not
-    /// stall unrelated stores. Filename seq disambiguation plus the boot scan
-    /// tolerate their transient presence while the sweep runs unlocked.
+    /// the older-version sweep is returned to the caller, which runs it OUTSIDE
+    /// the shard mutex but still under `page_commit` (#592): `version_seq` is
+    /// allocated at prepare time, so a store prepared with a lower seq could
+    /// otherwise publish between the snapshot and the unlink and lose its live
+    /// body. Publication of a final `.pc` name happens only under `page_commit`;
+    /// a future narrowing must re-check index membership per file instead.
     /// The per-member body of a tag purge, run under the member's OWNING shard
     /// lock (the caller groups members by shard so each shard locks once per
     /// purge, #293).
@@ -3396,17 +3416,15 @@ impl PageStore {
                 buf.purged_all = true;
             }
         }
-        // Drop page entries only. Static-file bodies share the same index/budgets but are not
-        // LSCache entries, so an app/page purge must not flush them.
-        self.inner.purge_if(|_, e| matches!(e, CacheEntry::Page(_)));
         if let Some(disk) = &self.disk {
-            // The per-shard drain above already unlinked EVERY current file synchronously. We do NOT
+            // Durability across a restart is the stamp's job alone: the boot scan rejects anything
+            // stored at-or-before it. It is written BEFORE the teardown (as `purge_tags` journals
+            // first) so a crash mid-teardown cannot resurrect the files not yet unlinked. We do NOT
             // run a background tmpfs sweep: a store landing concurrently with (or just after)
             // purge_all is either vetoed by `purge_all_epoch` (and cleans up its own file) or is a
             // legitimately-newer live entry that MUST survive — and a millisecond-granular
             // `stored_unix_ms > stamp` background scan would wrongly unlink that fresh file, leaving
-            // its index entry permanently fileless (no reaper exists to fix it). Durability across a
-            // restart is the stamp's job alone: the boot scan rejects anything stored at-or-before it.
+            // its index entry permanently fileless (no reaper exists to fix it).
             if let Err(e) = disk.write_purge_stamp(stamp) {
                 tracing::warn!(error = %e, "jetcache: purge-all stamp write failed");
             }
@@ -3417,6 +3435,14 @@ impl PageStore {
                     .store(0, Ordering::Relaxed);
             }
         }
+        #[cfg(test)]
+        if let Some(hook) = self.purge_all_teardown_probe.lock().take() {
+            hook(self);
+        }
+        // Drop page entries only. Static-file bodies share the same index/budgets but are not
+        // LSCache entries, so an app/page purge must not flush them. The drain unlinks every
+        // current file synchronously.
+        self.inner.purge_if(|_, e| matches!(e, CacheEntry::Page(_)));
         self.purges.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3443,6 +3469,17 @@ impl PageStore {
     /// Exact live entry count (Σ over shards under each lock).
     pub fn entry_count(&self) -> u64 {
         self.inner.entry_count()
+    }
+
+    /// Budget byte gauges without walking entries or the tag index: one short lock per
+    /// shard to sum the totals the shards already maintain. For periodic samplers.
+    pub fn footprint(&self) -> CacheFootprint {
+        let index = self.inner.stats();
+        CacheFootprint {
+            index_ram_bytes: index.ram_bytes,
+            hot_bytes: self.hot.as_ref().map_or(0, |h| h.bytes()),
+            disk_bytes: index.disk_bytes,
+        }
     }
 
     /// A snapshot of counters for the stats endpoint.
@@ -5795,6 +5832,32 @@ mod tests {
             store.get_entry_uncounted(&key, "id", Instant::now()),
             EntryState::Miss
         ));
+    }
+
+    #[test]
+    fn purge_all_is_durable_before_its_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        for p in ["/a", "/b", "/c"] {
+            let key = PageCacheKey::public(1, true, "example.com", p, "");
+            store.store(key, entry(b"pre-purge", &["T"], Duration::from_secs(600)));
+        }
+        store.run_pending();
+        assert_eq!(pc_files(dir.path()), 3);
+        std::thread::sleep(Duration::from_millis(2));
+        let loaded = Arc::new(AtomicU64::new(u64::MAX));
+        let seen = loaded.clone();
+        let root = dir.path().to_path_buf();
+        *store.purge_all_teardown_probe.lock() = Some(Box::new(move |_s: &PageStore| {
+            let restarted = PageStore::new(disk_cfg(&root, 64 * 1024 * 1024));
+            seen.store(restarted.load_from_disk(|_| {}).loaded, Ordering::SeqCst);
+        }));
+        store.purge_all();
+        assert_eq!(
+            loaded.load(Ordering::SeqCst),
+            0,
+            "a restart during purge_all's teardown must not reload purged pages"
+        );
     }
 
     #[test]

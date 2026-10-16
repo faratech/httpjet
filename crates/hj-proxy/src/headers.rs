@@ -120,6 +120,14 @@ fn strip_forwarding_authority(headers: &mut HeaderMap) {
     for name in hj_core::FORWARDING_AUTHORITY_HEADERS {
         headers.remove(*name);
     }
+    let synonyms: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| hj_core::is_forwarding_authority_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in synonyms {
+        headers.remove(name);
+    }
 }
 
 /// Apply all forward-direction header rewrites to a request that is about to be
@@ -287,6 +295,46 @@ mod tests {
                 "{name} survived canonicalization"
             );
         }
+    }
+
+    /// Regression (#601): synonyms outside the enumerated list are stripped at
+    /// the upstream hop exactly as on the LSAPI feeds.
+    #[test]
+    fn forwarding_authority_synonyms_do_not_reach_upstreams() {
+        let mut h = HeaderMap::new();
+        let synonyms = [
+            "x-client-ip",
+            "proxy-client-ip",
+            "wl-proxy-client-ip",
+            "x-forwarded-scheme",
+            "x-forwarded-protocol",
+            "x-forwarded-ssl",
+            "x_forwarded_for",
+            "x-forwarded",
+            "x-remote-addr",
+            "cf-connecting-ipv6",
+        ];
+        for name in synonyms {
+            h.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static("attacker-chosen"),
+            );
+        }
+        h.insert(
+            "x-requested-with",
+            HeaderValue::from_static("XMLHttpRequest"),
+        );
+        h.insert("x-api-key", HeaderValue::from_static("k"));
+        let ctx = dummy_ctx("198.51.100.9".parse().unwrap(), true);
+        rewrite_request_headers(&mut h, &ctx, false);
+        for name in synonyms {
+            assert!(!h.contains_key(name), "{name} reached the upstream");
+        }
+        assert_eq!(h.get("x-forwarded-for").unwrap(), "198.51.100.9");
+        assert_eq!(h.get("x-real-ip").unwrap(), "198.51.100.9");
+        assert_eq!(h.get("x-forwarded-proto").unwrap(), "https");
+        assert_eq!(h.get("x-requested-with").unwrap(), "XMLHttpRequest");
+        assert_eq!(h.get("x-api-key").unwrap(), "k");
     }
 
     #[test]

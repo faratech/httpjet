@@ -51,6 +51,56 @@ pub struct Stream<IO, C> {
     pub(crate) session: C,
     r_buffer: ReadBuffer,
     w_buffer: WriteBuffer,
+    /// httpjet fork: record framing of every ciphertext byte handed to rustls, kept
+    /// until the first application read, so [`Stream::drain_received`] can tell whether
+    /// rustls still holds a partial record (it has no public accessor for that).
+    rx_records: Option<RecordBoundary>,
+}
+
+/// Tracks TLS record boundaries over a ciphertext byte stream.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RecordBoundary {
+    header: [u8; 5],
+    header_len: usize,
+    body_remaining: usize,
+}
+
+impl RecordBoundary {
+    pub(crate) fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            if self.body_remaining > 0 {
+                let take = self.body_remaining.min(bytes.len());
+                self.body_remaining -= take;
+                bytes = &bytes[take..];
+                continue;
+            }
+            let take = (5 - self.header_len).min(bytes.len());
+            self.header[self.header_len..self.header_len + take].copy_from_slice(&bytes[..take]);
+            self.header_len += take;
+            bytes = &bytes[take..];
+            if self.header_len == 5 {
+                self.body_remaining = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+                self.header_len = 0;
+            }
+        }
+    }
+
+    pub(crate) fn at_boundary(&self) -> bool {
+        self.header_len == 0 && self.body_remaining == 0
+    }
+}
+
+struct TrackedRead<'a> {
+    inner: &'a mut ReadBuffer,
+    records: &'a mut RecordBoundary,
+}
+
+impl Read for TrackedRead<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.records.feed(&buf[..n]);
+        Ok(n)
+    }
 }
 
 /// Read half of a TLS stream. Only the raw transport is split: the rustls
@@ -112,6 +162,7 @@ impl<IO, C> Stream<IO, C> {
             io,
             session,
             r_buffer: Default::default(),
+            rx_records: Some(RecordBoundary::default()),
             // httpjet fork: adaptive TLS write buffer. Nothing is held while idle; a write
             // takes a pooled 64 KiB buffer, large writes still grow to the old 512 KiB
             // batching ceiling for throughput, and the flush releases it again.
@@ -130,9 +181,13 @@ impl<IO, C> Stream<IO, C> {
             session,
             r_buffer: ReadBuffer::new_unsafe(),
             w_buffer: WriteBuffer::new_unsafe(),
+            rx_records: Some(RecordBoundary::default()),
         }
     }
 
+    /// Split into the transport and the rustls connection. Ciphertext still in the
+    /// adapter's read-ahead is dropped: call [`Stream::drain_received`] first and only
+    /// split when it reports nothing undecrypted remains.
     pub fn into_parts(self) -> (IO, C) {
         (self.io, self.session)
     }
@@ -168,6 +223,7 @@ impl<IO, C> Stream<IO, C> {
             session: self.session,
             r_buffer: self.r_buffer,
             w_buffer: self.w_buffer,
+            rx_records: self.rx_records,
         }
     }
 
@@ -177,6 +233,7 @@ impl<IO, C> Stream<IO, C> {
             session: f(self.session),
             r_buffer: self.r_buffer,
             w_buffer: self.w_buffer,
+            rx_records: self.rx_records,
         }
     }
 }
@@ -324,6 +381,25 @@ mod transition_tests {
         let initialized =
             unsafe { std::slice::from_raw_parts(buffer.read_ptr(), buffer.bytes_init()) };
         assert_eq!(initialized, b"cd");
+    }
+
+    #[test]
+    fn record_boundary_tracks_split_headers_and_bodies() {
+        use super::RecordBoundary;
+        let mut wire = Vec::new();
+        for body in [&b"hello"[..], b"", &[7u8; 300]] {
+            wire.extend_from_slice(&[0x17, 0x03, 0x03]);
+            wire.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            wire.extend_from_slice(body);
+        }
+        for split in 0..=wire.len() {
+            let mut records = RecordBoundary::default();
+            records.feed(&wire[..split]);
+            let boundary = [0, 10, 15, 320].contains(&split);
+            assert_eq!(records.at_boundary(), boundary, "split at {split}");
+            records.feed(&wire[split..]);
+            assert!(records.at_boundary(), "whole stream at {split}");
+        }
     }
 
     #[test]
@@ -663,9 +739,56 @@ impl<IO: AsyncReadRent + AsyncWriteRent, C, SD: SideData> Stream<IO, C>
 where
     C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
 {
+    /// httpjet fork: decrypt every record already received — the adapter's read-ahead
+    /// and rustls's own buffer — appending the plaintext to `out`, without socket I/O.
+    /// `Ok(true)` means no undecrypted ciphertext remains in this process, so the raw
+    /// transport may be handed to another TLS implementation (kernel TLS) at rustls's
+    /// current record sequence. `Ok(false)` (a partial record is buffered, or an
+    /// application read already happened) means only this stream can continue it.
+    /// A KeyUpdate may have rotated rustls's keys; the caller must check the extracted
+    /// secrets before programming another implementation.
+    pub fn drain_received(&mut self, out: &mut Vec<u8>) -> io::Result<bool> {
+        let mut chunk = [0u8; 8192];
+        loop {
+            loop {
+                match self.session.reader().read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => out.extend_from_slice(&chunk[..n]),
+                    Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(err) => return Err(err),
+                }
+            }
+            let Some(records) = self.rx_records.as_mut() else {
+                return Ok(false);
+            };
+            let read = self.session.read_tls(&mut TrackedRead {
+                inner: &mut self.r_buffer,
+                records,
+            });
+            match read {
+                Ok(0) => break,
+                Ok(_) => {
+                    self.session
+                        .process_new_packets()
+                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+                }
+                Err(ref err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(self.rx_records.is_some_and(|r| r.at_boundary()))
+    }
+
     pub(crate) async fn read_io(&mut self, splitted: bool) -> io::Result<usize> {
         let n = loop {
-            match self.session.read_tls(&mut self.r_buffer) {
+            let read = match self.rx_records.as_mut() {
+                Some(records) => self.session.read_tls(&mut TrackedRead {
+                    inner: &mut self.r_buffer,
+                    records,
+                }),
+                None => self.session.read_tls(&mut self.r_buffer),
+            };
+            match read {
                 Ok(n) => {
                     break n;
                 }
@@ -782,6 +905,7 @@ where
         mut buf: T,
         splitted: bool,
     ) -> BufResult<usize, T> {
+        self.rx_records = None;
         let slice = unsafe { std::slice::from_raw_parts_mut(buf.write_ptr(), buf.bytes_total()) };
         loop {
             // read from rustls to buffer

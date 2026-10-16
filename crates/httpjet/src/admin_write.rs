@@ -211,7 +211,15 @@ pub(crate) async fn serve(listener: TcpListener, auth: Arc<AuthToken>, control: 
             _ = shutdown.cancelled() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = listener.accept(), if tasks.len() < 4 => {
-                let Ok((mut stream, peer)) = accepted else { break; };
+                // A transient EMFILE/ENOBUFS must not end the listener for good.
+                let (mut stream, peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "admin-write: accept error");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
                 if !peer.ip().is_loopback() { continue; }
                 let auth = auth.clone();
                 let control = control.clone();

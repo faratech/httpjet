@@ -192,6 +192,29 @@ fn build_state_inner(
     peer_purge: Option<crate::peer_purge::PurgeForwarder>,
     config_tweak: impl FnOnce(&mut ServerConfig),
 ) -> Arc<ServerState> {
+    build_state_tuned(
+        doc_root,
+        contexts,
+        access_deny_dir,
+        htaccess,
+        page_cache,
+        peer_purge,
+        config_tweak,
+        crate::state::RewriteTuning::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_state_tuned(
+    doc_root: PathBuf,
+    contexts: Vec<Context>,
+    access_deny_dir: Vec<String>,
+    htaccess: bool,
+    page_cache: Option<Arc<hj_pagecache::PageStore>>,
+    peer_purge: Option<crate::peer_purge::PurgeForwarder>,
+    config_tweak: impl FnOnce(&mut ServerConfig),
+    rewrite_tuning: crate::state::RewriteTuning,
+) -> Arc<ServerState> {
     // AccessLogger writes under server_root/logs; give it a real writable dir.
     let server_root = temp_root("srv");
     std::fs::create_dir_all(server_root.join("logs")).unwrap();
@@ -282,7 +305,7 @@ fn build_state_inner(
         false, // cf_send_zstd
         None,  // php_slow
         false, // request_id_header
-        crate::state::RewriteTuning::default(),
+        rewrite_tuning,
     )
     .unwrap()
 }
@@ -557,6 +580,93 @@ async fn unsupported_header_guard_cannot_populate_public_page_cache() {
         assert_eq!(store.stats().entries, u64::from(supported));
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// Regression (#603): `.htaccess` headers set only for crawlers (KNOWN_CRAWLER via a
+/// User-Agent RewriteCond, as on the live forum) must not be replayed to browsers from a
+/// crawler-primed public entry, and browsers must not hand crawlers their entry either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn crawler_conditional_headers_are_not_served_across_ua_classes() {
+    let root = temp_root("ua-class-cache");
+    std::fs::write(root.join("page.txt"), b"same body for every client").unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "CacheLookup public on\n\
+         RewriteEngine On\n\
+         RewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot)\n\
+         RewriteRule .* - [E=KNOWN_CRAWLER:1]\n\
+         Header set X-LiteSpeed-Cache-Control \"public,max-age=60\"\n\
+         Header set X-Crawler-Detected \"true\" env=KNOWN_CRAWLER\n",
+    )
+    .unwrap();
+    let mut config = hj_pagecache::StoreConfig::default();
+    config.max_static_obj_bytes = 0;
+    let store = Arc::new(hj_pagecache::PageStore::new(config));
+    let state = build_state_tuned(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(store.clone()),
+        None,
+        |_| {},
+        crate::state::RewriteTuning {
+            ua_classify: true,
+            ..Default::default()
+        },
+    );
+    let as_ua = |ua: &str| {
+        let mut req = get(CANON_HOST, "/page.txt", None);
+        req.headers_mut()
+            .insert(header::USER_AGENT, ua.parse().unwrap());
+        req
+    };
+    let crawler_header = |resp: &Response| resp.headers().contains_key("x-crawler-detected");
+    let googlebot = "Mozilla/5.0 (compatible; Googlebot/2.1)";
+    let chrome = "Mozilla/5.0 (X11; Linux) Chrome/140";
+    for _ in 0..3 {
+        let resp = run(&state, as_ua(googlebot)).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert!(crawler_header(&resp), "a crawler gets the crawler headers");
+    }
+    assert_eq!(store.stats().entries, 1, "the crawler render was stored");
+    for _ in 0..3 {
+        let resp = run(&state, as_ua(chrome)).await;
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert!(
+            !crawler_header(&resp),
+            "a browser never gets the crawler's headers"
+        );
+    }
+    assert_eq!(store.stats().entries, 2, "browsers got their own entry");
+    let resp = run(&state, as_ua("Mozilla/5.0 (compatible; Bingbot/2.0)")).await;
+    assert!(
+        crawler_header(&resp),
+        "another crawler shares the crawler class"
+    );
+
+    // The on-core fast path (the first lookup for cookieless traffic in prod) must
+    // key by the same class: each UA gets its own entry's headers from a hit.
+    for (ua, crawler) in [(chrome, false), (googlebot, true)] {
+        let req = as_ua(ua);
+        let resp = fast_serve(
+            &state,
+            LISTENER,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::from(([127, 0, 0, 1], 80)),
+            40000,
+            false,
+            false,
+            false,
+            Proto::Http1,
+            None,
+            &req,
+        )
+        .await
+        .expect("a cookieless warm entry is served on-core");
+        assert_eq!(crawler_header(&resp), crawler, "{ua}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -877,6 +987,190 @@ async fn disabled_script_rewrite_proxy_strips_untrusted_cache_control_headers() 
     );
     assert_eq!(store.entry_count(), 0, "disabled route must not be stored");
     drop(response);
+    upstream.await.unwrap();
+}
+
+/// Registers `address` as a proxy ext-processor so a rewrite `[P]` to it passes the SSRF screen.
+fn register_upstream(server: &mut ServerConfig, address: SocketAddr) {
+    server.ext_processors.push(hj_core::config::ExtProcessor {
+        name: "test-upstream".into(),
+        kind: hj_core::config::ExtKind::Proxy,
+        address: hj_core::config::ExtAddress::Tcp(address),
+        extra_addresses: Vec::new(),
+        load_balance: Default::default(),
+        client_cert_file: None,
+        client_key_file: None,
+        max_conns: 4,
+        init_timeout: std::time::Duration::from_secs(1),
+        retry_timeout: std::time::Duration::ZERO,
+        pc_keep_alive_timeout: std::time::Duration::from_secs(1),
+        resp_buffer: false,
+        env: Vec::new(),
+        auto_start: 0,
+        path: None,
+        backlog: 0,
+        instances: 0,
+        run_on_startup: 0,
+    });
+}
+
+/// Regression (#658): a cached redirect is never answered 304 (RFC 9110 §13.2.1), and an
+/// empty-body redirect gets no synthesized body-hash ETag that every redirect would share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cached_redirect_ignores_if_none_match() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let etag = if head.windows(8).any(|w| w == b"/tagged ") {
+                "ETag: \"r1\"\r\n"
+            } else {
+                ""
+            };
+            let reply = format!(
+                "HTTP/1.1 301 Moved Permanently\r\n\
+                 Location: /new\r\n\
+                 {etag}Content-Length: 0\r\n\
+                 X-LiteSpeed-Cache-Control: public,max-age=60\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        }
+    });
+
+    let root = temp_root("redirect-inm");
+    std::fs::write(
+        root.join(".htaccess"),
+        format!(
+            "CacheLookup public on\n\
+             RewriteEngine On\n\
+             RewriteRule ^/(plain|tagged)$ http://{address}/$1 [P,L]\n\
+             Header set X-LiteSpeed-Cache-Control public,max-age=60\n"
+        ),
+    )
+    .unwrap();
+    let store = Arc::new(hj_pagecache::PageStore::new(
+        hj_pagecache::StoreConfig::default(),
+    ));
+    let state = build_state_inner(
+        root,
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(store.clone()),
+        None,
+        |server| register_upstream(server, address),
+    );
+    for _ in 0..3 {
+        let response = run(&state, get(CANON_HOST, "/plain", None)).await;
+        assert_eq!(response.status(), http::StatusCode::MOVED_PERMANENTLY);
+        assert!(!response.headers().contains_key(header::ETAG));
+        run(&state, get(CANON_HOST, "/tagged", None)).await;
+    }
+    assert!(store.entry_count() >= 2, "redirects were not cached");
+    let response = run(&state, get(CANON_HOST, "/tagged", Some("\"r1\""))).await;
+    assert_eq!(response.headers().get("x-litespeed-cache").unwrap(), "hit");
+    assert_eq!(response.status(), http::StatusCode::MOVED_PERMANENTLY);
+    let response = run(&state, get(CANON_HOST, "/plain", Some("*"))).await;
+    assert_eq!(response.status(), http::StatusCode::MOVED_PERMANENTLY);
+    upstream.abort();
+}
+
+/// Regression (#657): a HEAD miss can never store, so it must not become the single-flight
+/// leader that concurrent GETs of the same page park behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn head_miss_does_not_lead_page_cache_single_flight() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0_u8; 1024];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buf).await.unwrap();
+            assert_ne!(read, 0);
+            head.extend_from_slice(&buf[..read]);
+        }
+        seen_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Length: 2\r\n\
+                  X-LiteSpeed-Cache-Control: public,max-age=60\r\n\
+                  Connection: close\r\n\r\nOK",
+            )
+            .await
+            .unwrap();
+    });
+
+    let root = temp_root("head-single-flight");
+    std::fs::write(
+        root.join(".htaccess"),
+        "CacheLookup public on\nHeader set X-LiteSpeed-Cache-Control public,max-age=60\n",
+    )
+    .unwrap();
+    let store = Arc::new(hj_pagecache::PageStore::new(
+        hj_pagecache::StoreConfig::default(),
+    ));
+    let context = Context {
+        kind: ContextKind::Proxy,
+        uri: "/page".into(),
+        location: None,
+        handler: Some("test-upstream".into()),
+        enabled: true,
+        extra_headers: Vec::new(),
+        add_default_charset: false,
+        charset: None,
+        cache_policy: None,
+        max_body_override: None,
+        bandwidth_limit: 0,
+        timeout_override: None,
+        sub_filter: None,
+    };
+    let state = build_state_inner(
+        root,
+        vec![context],
+        Vec::new(),
+        true,
+        Some(store),
+        None,
+        |server| register_upstream(server, address),
+    );
+    let head_state = state.clone();
+    let head = tokio::spawn(async move {
+        let mut req = get(CANON_HOST, "/page", None);
+        *req.method_mut() = http::Method::HEAD;
+        run(&head_state, req).await
+    });
+    let mut head = head;
+    tokio::select! {
+        seen = seen_rx => seen.unwrap(),
+        done = &mut head => panic!("HEAD finished without reaching upstream: {:?}", done.unwrap().status()),
+    }
+    assert_eq!(
+        state.page_cache_inflight.len(),
+        0,
+        "HEAD miss registered as single-flight leader"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(head.await.unwrap().status(), http::StatusCode::OK);
     upstream.await.unwrap();
 }
 
@@ -1278,7 +1572,8 @@ async fn lsapi_script_symlink_into_access_deny_dir_is_forbidden_before_dispatch(
 async fn static_context_resolved_location_in_access_deny_dir_is_forbidden() {
     let doc_root = temp_root("deny-context-docroot");
     let context_root = temp_root("deny-context-target");
-    let target_dir = context_root.join("assets");
+    // `/assets/x` maps to `<location>/x` (OLS translate(), #673).
+    let target_dir = context_root.join("files");
     std::fs::create_dir_all(&target_dir).unwrap();
     std::fs::write(target_dir.join("secret.txt"), b"must not be served").unwrap();
     let context = Context {
@@ -1289,7 +1584,7 @@ async fn static_context_resolved_location_in_access_deny_dir_is_forbidden() {
         sub_filter: None,
         kind: ContextKind::Static,
         uri: "/assets".into(),
-        location: Some(context_root),
+        location: Some(context_root.join("files")),
         handler: None,
         enabled: true,
         extra_headers: Vec::new(),
@@ -1322,15 +1617,14 @@ async fn static_context_alternate_root_never_serves_or_replays_script_source() {
          </Files>\n",
     )
     .unwrap();
-    std::fs::create_dir_all(context_root.join("assets")).unwrap();
-    std::fs::write(context_root.join("assets/secret.php"), SOURCE).unwrap();
-    std::fs::write(context_root.join("assets/public.txt"), b"public").unwrap();
-    std::fs::write(context_root.join("assets/payload.txt"), SOURCE).unwrap();
-    symlink("payload.txt", context_root.join("assets/linked.php")).unwrap();
-    symlink("payload.txt", context_root.join("assets/forced.html")).unwrap();
-    std::fs::create_dir_all(context_root.join("assets/dir")).unwrap();
-    std::fs::write(context_root.join("assets/dir/payload.txt"), SOURCE).unwrap();
-    symlink("payload.txt", context_root.join("assets/dir/index.php")).unwrap();
+    std::fs::write(context_root.join("secret.php"), SOURCE).unwrap();
+    std::fs::write(context_root.join("public.txt"), b"public").unwrap();
+    std::fs::write(context_root.join("payload.txt"), SOURCE).unwrap();
+    symlink("payload.txt", context_root.join("linked.php")).unwrap();
+    symlink("payload.txt", context_root.join("forced.html")).unwrap();
+    std::fs::create_dir_all(context_root.join("dir")).unwrap();
+    std::fs::write(context_root.join("dir/payload.txt"), SOURCE).unwrap();
+    symlink("payload.txt", context_root.join("dir/index.php")).unwrap();
     let context = Context {
         cache_policy: None,
         bandwidth_limit: 0,
@@ -1600,6 +1894,63 @@ async fn fast_serve_get(state: &Arc<ServerState>, path: &str) -> Option<Response
     .await
 }
 
+/// A request with neither Host nor an absolute-form authority is routed by the full
+/// pipeline (which falls back to the TLS SNI); the on-core path must not resolve it to
+/// the default vhost on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_serve_bridges_a_request_without_host() {
+    let doc_root = temp_root("fastserve-no-host");
+    std::fs::write(doc_root.join("robots.txt"), b"default vhost").unwrap();
+    let state = build_state_inner(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        None,
+        None,
+        |_| {},
+    );
+    let mut req = get(CANON_HOST, "/robots.txt", None);
+    assert!(
+        fast_serve(
+            &state,
+            LISTENER,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::from(([127, 0, 0, 1], 443)),
+            40000,
+            true,
+            false,
+            false,
+            Proto::Http1,
+            None,
+            &req,
+        )
+        .await
+        .is_some(),
+        "control: with a Host the on-core path serves"
+    );
+    req.headers_mut().remove(header::HOST);
+    assert!(
+        fast_serve(
+            &state,
+            LISTENER,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            SocketAddr::from(([127, 0, 0, 1], 443)),
+            40000,
+            true,
+            false,
+            false,
+            Proto::Http1,
+            None,
+            &req,
+        )
+        .await
+        .is_none(),
+        "a Host-less request must be bridged to the SNI-aware pipeline"
+    );
+    std::fs::remove_dir_all(doc_root).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
     let doc_root = temp_root("fastserve");
@@ -1657,6 +2008,8 @@ async fn fast_serve_bridges_stale_hit_when_htaccess_disables_cache_or_denies() {
         has_range: false,
         host_foreign: false,
         origin: None,
+        ua_class: None,
+        header_vary: None,
         vary_value: None,
     };
     let key =
@@ -1752,6 +2105,16 @@ async fn seed_public_entry(
     path: &str,
     body: &'static [u8],
 ) {
+    seed_public_entry_for_headers(state, store, path, body, &http::HeaderMap::new()).await;
+}
+
+async fn seed_public_entry_for_headers(
+    state: &Arc<ServerState>,
+    store: &Arc<hj_pagecache::PageStore>,
+    path: &str,
+    body: &'static [u8],
+    headers: &http::HeaderMap,
+) {
     let method = http::Method::GET;
     let identity = format!("http\n{VHOST}\n{path}");
     let chain: Vec<std::sync::Arc<hj_rewrite::Htaccess>> = Vec::new();
@@ -1776,6 +2139,13 @@ async fn seed_public_entry(
         request_time: std::time::SystemTime::UNIX_EPOCH,
         request_id: Default::default(),
     };
+    let ran = state.rewrite_cache.load_chain_with_dirs(
+        &rctx.vhost.doc_root,
+        path,
+        rctx.vhost.access_file_name_or_default(),
+    );
+    let header_vary = super::rewrite_glue::page_cache_header_vary(state, &rctx, &ran, headers);
+    let ua_class = super::rewrite_glue::page_cache_ua_class(state, &rctx, &ran, headers);
     let cc = crate::lscache::CacheCtx {
         enabled: true,
         method: &method,
@@ -1789,6 +2159,8 @@ async fn seed_public_entry(
         has_range: false,
         host_foreign: false,
         origin: None,
+        ua_class: ua_class.as_deref(),
+        header_vary: header_vary.as_deref(),
         vary_value: None,
     };
     let key =
@@ -1836,7 +2208,14 @@ async fn fast_serve_runs_rewrite_before_serving_a_cache_hit() {
         Some(store.clone()),
         None,
     );
-    seed_public_entry(&state, &store, "/pages/index.html", b"<h1>page</h1>\n").await;
+    seed_public_entry_for_headers(
+        &state,
+        &store,
+        "/pages/index.html",
+        b"<h1>page</h1>\n",
+        get_with_ua("/pages/index.html", "Mozilla/5.0").headers(),
+    )
+    .await;
 
     // Baseline: an unbanned UA is served on-core from the entry.
     let ok = fast_serve_req(&state, &get_with_ua("/pages/index.html", "Mozilla/5.0")).await;
@@ -1888,6 +2267,11 @@ fn cookie_header_with_non_ascii_byte_is_still_classified() {
     assert!(
         joined.contains("xf_user=7") && joined.contains("xf_style_id=9"),
         "{joined:?}"
+    );
+    // #671: the joined view must expose the second line's crumbs to the vary key.
+    assert_eq!(
+        hj_pagecache::compute_vary_value(Some(&joined), &["xf_style_id"]),
+        "xf_style_id=v:9"
     );
     // Raw obs-text (invalid UTF-8) is replaced, and the crumb before it survives.
     let mut h = http::HeaderMap::new();
@@ -3266,5 +3650,489 @@ async fn static_cache_promotion_reads_the_selected_descriptor_for_full_range_and
         "fast promotion must read the same selected descriptor as the ordinary funnel"
     );
 
+    std::fs::remove_dir_all(root).ok();
+}
+
+async fn response_text(resp: Response) -> String {
+    use http_body_util::BodyExt;
+    let bytes = match resp.into_body() {
+        Body::Stream(s) => s.collect().await.unwrap().to_bytes(),
+        other => body_bytes(other),
+    };
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Upstream that renders the RAW request-target it received, cacheable for 60 s — the shape of
+/// a front controller that routes `REQUEST_URI` (XenForo 404s `/./` while `/` is the homepage).
+async fn spawn_raw_echo_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let line = String::from_utf8_lossy(&head);
+            let target = line.split(' ').nth(1).unwrap_or("").to_string();
+            let body = format!("raw={target}");
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+    (address, task)
+}
+
+fn raw_echo_proxy_state(tag: &str, address: SocketAddr) -> Arc<ServerState> {
+    let root = temp_root(tag);
+    std::fs::write(
+        root.join(".htaccess"),
+        "CacheLookup public on\nHeader set X-LiteSpeed-Cache-Control public,max-age=60\n",
+    )
+    .unwrap();
+    let store = Arc::new(hj_pagecache::PageStore::new(
+        hj_pagecache::StoreConfig::default(),
+    ));
+    let context = Context {
+        kind: ContextKind::Proxy,
+        uri: "/".into(),
+        location: None,
+        handler: Some("test-upstream".into()),
+        enabled: true,
+        extra_headers: Vec::new(),
+        add_default_charset: false,
+        charset: None,
+        cache_policy: None,
+        max_body_override: None,
+        bandwidth_limit: 0,
+        timeout_override: None,
+        sub_filter: None,
+    };
+    build_state_inner(
+        root,
+        vec![context],
+        Vec::new(),
+        true,
+        Some(store),
+        None,
+        |server| register_upstream(server, address),
+    )
+}
+
+/// The page cache keys by the decoded, dot-normalized path but the backend routes the raw
+/// URI: a non-canonical spelling (`/./`, `/x/../`, `//`, `%2F`) must neither populate nor read
+/// the canonical URL's entry, or one request poisons the homepage for every visitor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dot_segment_spelling_cannot_poison_or_read_the_canonical_page_cache_entry() {
+    let (address, upstream) = spawn_raw_echo_upstream().await;
+    let state = raw_echo_proxy_state("dot-poison", address);
+
+    for (attack, victim) in [
+        ("/./", "/"),
+        ("/zzz/..", "/"),
+        ("/zzz/%2e%2e/target/", "/target/"),
+        ("//target/", "/target/"),
+        ("/a%2Fb", "/a/b"),
+    ] {
+        for _ in 0..3 {
+            let resp = run(&state, get(CANON_HOST, attack, None)).await;
+            assert_ne!(
+                resp.headers()
+                    .get("x-litespeed-cache")
+                    .map(|v| v.as_bytes()),
+                Some(&b"hit"[..]),
+                "{attack} must bypass the page cache"
+            );
+            assert_eq!(response_text(resp).await, format!("raw={attack}"));
+        }
+        let resp = run(&state, get(CANON_HOST, victim, None)).await;
+        assert_eq!(
+            response_text(resp).await,
+            format!("raw={victim}"),
+            "{attack} poisoned the entry for {victim}"
+        );
+    }
+
+    // The canonical spelling still caches; any other spelling, including an escaped
+    // unreserved byte (XenForo strips SCRIPT_NAME from the RAW URI, so `/index%2Ephp/x`
+    // routes differently), never reads it — neither on the full pipeline nor on-core.
+    for _ in 0..3 {
+        run(&state, get(CANON_HOST, "/target/", None)).await;
+    }
+    let hit = run(&state, get(CANON_HOST, "/target/", None)).await;
+    assert_eq!(hit.headers().get("x-litespeed-cache").unwrap(), "hit");
+    let escaped = run(&state, get(CANON_HOST, "/t%61rget/", None)).await;
+    assert_ne!(
+        escaped
+            .headers()
+            .get("x-litespeed-cache")
+            .map(|v| v.as_bytes()),
+        Some(&b"hit"[..]),
+        "an escaped unreserved byte must not read the canonical entry"
+    );
+    assert!(is_cache_hit(
+        fast_serve_req(&state, &get(CANON_HOST, "/target/", None))
+            .await
+            .as_ref()
+    ));
+    for spelling in ["/./target/", "//target/", "/x/../target/"] {
+        assert!(
+            !is_cache_hit(
+                fast_serve_req(&state, &get(CANON_HOST, spelling, None))
+                    .await
+                    .as_ref()
+            ),
+            "{spelling} read the canonical entry on-core"
+        );
+        let resp = run(&state, get(CANON_HOST, spelling, None)).await;
+        assert_eq!(response_text(resp).await, format!("raw={spelling}"));
+    }
+    upstream.abort();
+}
+
+fn plain_context(kind: ContextKind, uri: &str) -> Context {
+    Context {
+        kind,
+        uri: uri.into(),
+        location: None,
+        handler: None,
+        enabled: true,
+        extra_headers: Vec::new(),
+        add_default_charset: false,
+        charset: None,
+        cache_policy: None,
+        bandwidth_limit: 0,
+        max_body_override: None,
+        timeout_override: None,
+        sub_filter: None,
+    }
+}
+
+fn websocket_get(path: &str) -> Request {
+    http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::HOST, CANON_HOST)
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(hj_core::empty_incoming())
+        .unwrap()
+}
+
+async fn spawn_fixed_upstream(head: &'static str, body: &'static str) -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut req = Vec::new();
+                let mut buf = [0_u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                let reply = format!(
+                    "{head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    address
+}
+
+/// The on-core cache hit must authenticate a REWRITTEN target like dispatch() does: an
+/// auth-free original chain says nothing about a symlink into an auth-protected directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_path_cache_hit_bridges_when_rewritten_target_requires_auth() {
+    let root = temp_root("auth-rewritten-target");
+    std::fs::create_dir_all(root.join("private")).unwrap();
+    std::fs::write(root.join("private/secret.txt"), b"secret").unwrap();
+    std::fs::write(
+        root.join("users"),
+        "Admin:{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("private/.htaccess"),
+        format!(
+            "AuthType Basic\nAuthName \"p\"\nAuthUserFile {}/users\nRequire valid-user\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(root.join("private/secret.txt"), root.join("alias.txt")).unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "RewriteEngine On\nRewriteRule ^app/ /alias.txt [L]\n\
+         Header set Cache-Control \"public, max-age=600\"\n",
+    )
+    .unwrap();
+    let mut cfg = hj_pagecache::StoreConfig::default();
+    cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+    let state = build_state_full(root.clone(), Vec::new(), Vec::new(), Some(store), None);
+
+    assert_eq!(
+        run(&state, get(CANON_HOST, "/app/x", None)).await.status(),
+        401
+    );
+    let mut stored = false;
+    for _ in 0..3 {
+        let mut authed = get(CANON_HOST, "/app/x", None);
+        authed.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Basic QWRtaW46cGFzc3dvcmQ=".parse().unwrap(),
+        );
+        let resp = run(&state, authed).await;
+        assert_eq!(resp.status(), 200);
+        stored |= resp
+            .headers()
+            .get("x-litespeed-cache")
+            .map(|v| v.as_bytes())
+            == Some(b"hit");
+    }
+    assert!(
+        stored,
+        "precondition: the authenticated render is publicly cached"
+    );
+    let fast = fast_serve_get(&state, "/app/x").await;
+    assert!(
+        fast.is_none(),
+        "on-core path served an auth-protected target without credentials: {:?}",
+        fast.map(|r| r.status())
+    );
+    assert_eq!(
+        run(&state, get(CANON_HOST, "/app/x", None)).await.status(),
+        401
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// OLS resolves the single most specific context of any kind, so a static context nested
+/// under a proxy root serves the local file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn static_context_nested_under_proxy_root_serves_locally() {
+    let address = spawn_fixed_upstream("HTTP/1.1 200 OK", "UPSTREAM").await;
+    let root = temp_root("nested-static-under-proxy");
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::write(root.join("assets/app.txt"), b"LOCAL").unwrap();
+    std::fs::write(root.join("other.txt"), b"LOCAL-OTHER").unwrap();
+    let mut proxy = plain_context(ContextKind::Proxy, "/");
+    proxy.handler = Some("test-upstream".into());
+    let mut assets = plain_context(ContextKind::Static, "/assets/");
+    assets.location = Some(root.join("assets"));
+    let state = build_state_inner(
+        root.clone(),
+        vec![proxy, assets],
+        Vec::new(),
+        false,
+        None,
+        None,
+        |server| register_upstream(server, address),
+    );
+    let resp = run(&state, get(CANON_HOST, "/assets/app.txt", None)).await;
+    assert_eq!(response_text(resp).await, "LOCAL");
+    let resp = run(&state, get(CANON_HOST, "/other.txt", None)).await;
+    assert_eq!(response_text(resp).await, "UPSTREAM");
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A WebSocket handshake is routed to the upgrade relay, never answered from the page cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_upgrade_is_never_served_from_page_cache() {
+    let root = temp_root("ws-page-cache");
+    let mut cfg = hj_pagecache::StoreConfig::default();
+    cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+    let state = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(store.clone()),
+        None,
+        |config| {
+            let vhost = config
+                .vhosts
+                .get_mut(VHOST)
+                .unwrap()
+                .config
+                .as_mut()
+                .unwrap();
+            Arc::make_mut(vhost)
+                .websockets
+                .push(hj_core::config::WebSocketMap {
+                    uri: "/ws".into(),
+                    address: "127.0.0.1:1".into(),
+                });
+        },
+    );
+    seed_public_entry(&state, &store, "/ws", b"<h1>cached page</h1>").await;
+    let plain = run(&state, get(CANON_HOST, "/ws", None)).await;
+    assert_eq!(plain.headers().get("x-litespeed-cache").unwrap(), "hit");
+    let resp = run(&state, websocket_get("/ws")).await;
+    assert_ne!(
+        resp.headers()
+            .get("x-litespeed-cache")
+            .map(|v| v.as_bytes()),
+        Some(&b"hit"[..]),
+        "a WebSocket handshake was answered from the page cache"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// The most specific `websocketList` map wins, as with OLS `bestMatch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_map_selection_prefers_the_longest_uri() {
+    let a = spawn_fixed_upstream("HTTP/1.1 403 Forbidden\r\nX-Backend: root", "").await;
+    let b = spawn_fixed_upstream("HTTP/1.1 403 Forbidden\r\nX-Backend: chat", "").await;
+    let root = temp_root("ws-longest");
+    let state = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        false,
+        None,
+        None,
+        |config| {
+            let vhost = config
+                .vhosts
+                .get_mut(VHOST)
+                .unwrap()
+                .config
+                .as_mut()
+                .unwrap();
+            let v = Arc::make_mut(vhost);
+            for (uri, address) in [("/", a), ("/chat", b)] {
+                v.websockets.push(hj_core::config::WebSocketMap {
+                    uri: uri.into(),
+                    address: address.to_string(),
+                });
+            }
+        },
+    );
+    for (path, backend) in [("/chat/room", "chat"), ("/lobby", "root")] {
+        let resp = run(&state, websocket_get(path)).await;
+        assert_eq!(
+            resp.headers().get("x-backend").map(|v| v.as_bytes()),
+            Some(backend.as_bytes()),
+            "{path}"
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// sub_filter and the context egress rate match the same decoded, dot-normalized path as
+/// every other context matcher on the bridged pipeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_filter_and_bandwidth_match_the_normalized_request_path() {
+    let root = temp_root("subfilter-normalized");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/page.html"), b"<html>hello</html>").unwrap();
+    let mut context = sub_filter_context("/sub", &[("hello", "goodbye")], false);
+    context.bandwidth_limit = 1000;
+    let state = build_state_with(root.clone(), vec![context], Vec::new());
+    for path in [
+        "/sub/page.html",
+        "/%73ub/page.html",
+        "/x/../sub/page.html",
+        "//sub/page.html",
+    ] {
+        let resp = run(&state, get(CANON_HOST, path, None)).await;
+        assert_eq!(
+            resp.extensions()
+                .get::<super::PerConnBandwidth>()
+                .map(|b| b.0),
+            Some(1000),
+            "{path}"
+        );
+        assert_eq!(
+            body_bytes(resp.into_body()).as_ref(),
+            b"<html>goodbye</html>",
+            "{path}"
+        );
+    }
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// On-core memo hits and page-cache hits carry the context egress rate like every other
+/// serve funnel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_path_memo_and_cache_hits_keep_the_bandwidth_stamp() {
+    let root = temp_root("bw-fast-hits");
+    std::fs::create_dir_all(root.join("dl")).unwrap();
+    std::fs::write(root.join("dl/big.txt"), vec![b'x'; 4096]).unwrap();
+    let mut throttled = plain_context(ContextKind::Static, "/dl");
+    throttled.bandwidth_limit = 250_000;
+    let rate = |r: &Option<Response>| {
+        r.as_ref()
+            .and_then(|r| r.extensions().get::<super::PerConnBandwidth>().map(|b| b.0))
+    };
+    let state = build_state_with(root.clone(), vec![throttled.clone()], Vec::new());
+    for i in 0..3 {
+        let resp = fast_serve_get(&state, "/dl/big.txt").await;
+        assert!(resp.is_some(), "iteration {i} served on-core");
+        assert_eq!(rate(&resp), Some(250_000), "iteration {i}");
+    }
+    let mut cfg = hj_pagecache::StoreConfig::default();
+    cfg.standard_cc_vhosts.push(VHOST.into());
+    let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+    let state = build_state_full(
+        root.clone(),
+        vec![throttled],
+        Vec::new(),
+        Some(store.clone()),
+        None,
+    );
+    seed_public_entry(&state, &store, "/dl/page", b"<h1>cached</h1>").await;
+    let fast = fast_serve_get(&state, "/dl/page").await;
+    assert!(is_cache_hit(fast.as_ref()));
+    assert_eq!(rate(&fast), Some(250_000));
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// A 4xx/5xx `[R=]` renders the ErrorDocument (Apache `ap_die`); a 2xx stays bare.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_error_status_applies_error_document() {
+    let root = temp_root("rewrite-status-errordoc");
+    std::fs::write(
+        root.join(".htaccess"),
+        "ErrorDocument 404 \"custom404\"\nErrorDocument 503 \"custom503\"\n\
+         RewriteEngine On\nRewriteRule ^gone$ - [R=404,L]\nRewriteRule ^busy$ - [R=503,L]\n\
+         RewriteRule ^ok$ - [R=204,L]\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root.clone());
+    for (path, status, body) in [
+        ("/gone", 404, &b"custom404"[..]),
+        ("/busy", 503, &b"custom503"[..]),
+        ("/ok", 204, &b""[..]),
+    ] {
+        let resp = run(&state, get(CANON_HOST, path, None)).await;
+        assert_eq!(resp.status(), status, "{path}");
+        assert_eq!(body_bytes(resp.into_body()).as_ref(), body, "{path}");
+    }
     std::fs::remove_dir_all(root).ok();
 }

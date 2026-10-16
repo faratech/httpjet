@@ -4,6 +4,68 @@ const ADMIN: &str = "Basic QWRtaW46cGFzc3dvcmQ=";
 const VISITOR: &str = "Basic VmlzaXRvcjpwYXNzd29yZA==";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlinked_docroot_directory_aliases_preserve_configuration_merge_order() {
+    let root = fixture("auth_root_alias_order", "");
+    let link = root.with_extension("link");
+    std::os::unix::fs::symlink(&root, &link).unwrap();
+    std::fs::create_dir(root.join("private")).unwrap();
+    std::fs::write(root.join("private/secret.txt"), b"secret").unwrap();
+    std::fs::write(root.join(".htaccess"), format!(
+        "AuthType Basic\nAuthUserFile users\n<Directory \"{}/private\">\nRequire user Visitor\n</Directory>\n<Directory \"{}/private\">\nRequire user Admin\n</Directory>\n", link.display(), root.display()
+    )).unwrap();
+    let state = build_state_htaccess(link.clone());
+    assert_eq!(
+        status(&state, "/private/secret.txt", Some(ADMIN)).await,
+        200
+    );
+    assert_eq!(
+        status(&state, "/private/secret.txt", Some(VISITOR)).await,
+        401
+    );
+    assert_eq!(status(&state, "/private/secret.txt", None).await, 401);
+    std::fs::remove_file(link).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlinked_docroot_protects_canonical_targets_and_absolute_directory_rules() {
+    for tag in ["Files", "Directory", "DirectoryMatch"] {
+        let root = fixture("auth_symlink_root", "");
+        std::fs::create_dir(root.join("private")).unwrap();
+        std::fs::write(root.join("private/secret.txt"), b"secret").unwrap();
+        std::fs::write(root.join("public.txt"), b"public").unwrap();
+        std::os::unix::fs::symlink(root.join("private/secret.txt"), root.join("alias.txt"))
+            .unwrap();
+        let link = root.with_extension("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let pattern = match tag {
+            "Files" => "secret.txt".to_owned(),
+            "Directory" => root.join("private").to_string_lossy().into_owned(),
+            _ => format!("^{}/private(?:/|$)", root.display()),
+        };
+        std::fs::write(root.join(".htaccess"), format!(
+            "AuthType Basic\nAuthUserFile users\n<{tag} \"{pattern}\">\nRequire user Admin\n</{tag}>\n"
+        )).unwrap();
+        let state = build_state_htaccess(link.clone());
+        for path in ["/private/secret.txt", "/alias.txt"] {
+            assert_eq!(status(&state, path, None).await, 401, "{tag}: {path}");
+            assert_eq!(
+                status(&state, path, Some(VISITOR)).await,
+                401,
+                "{tag}: {path}"
+            );
+            assert_eq!(
+                status(&state, path, Some(ADMIN)).await,
+                200,
+                "{tag}: {path}"
+            );
+            assert!(fast_serve_req(&state, &request(path, None)).await.is_none());
+        }
+        assert_eq!(status(&state, "/public.txt", None).await, 200);
+        std::fs::remove_file(link).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn filesystem_absolute_directory_patterns_protect_direct_and_aliased_resources() {
     for tag in ["Directory", "DirectoryMatch"] {
         let root = fixture("auth_absolute_directory", "");
@@ -339,13 +401,14 @@ async fn public_symlink_into_protected_directory_checks_auth_before_cached_body(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn static_context_location_resolves_its_own_auth_chain() {
     let root = fixture("auth_context", "");
-    std::fs::create_dir_all(root.join("private/assets")).unwrap();
+    std::fs::create_dir_all(root.join("private")).unwrap();
     std::fs::write(
         root.join("private/.htaccess"),
         "AuthType Basic\nAuthUserFile users\nRequire user Admin",
     )
     .unwrap();
-    std::fs::write(root.join("private/assets/secret.txt"), b"secret").unwrap();
+    // `/assets/secret.txt` maps to `<location>/secret.txt` (#673).
+    std::fs::write(root.join("private/secret.txt"), b"secret").unwrap();
     let context = Context {
         cache_policy: None,
         bandwidth_limit: 0,

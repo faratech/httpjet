@@ -310,7 +310,7 @@ impl TelemetryShard {
             self.status_code[i].fetch_add(1, Relaxed);
         }
         match proto {
-            hj_core::Proto::Http1 => &self.proto_h1,
+            hj_core::Proto::Http1 | hj_core::Proto::Http10 => &self.proto_h1,
             hj_core::Proto::Http2 => &self.proto_h2,
             hj_core::Proto::Http3 => &self.proto_h3,
         }
@@ -837,11 +837,11 @@ impl Telemetry {
         self.render_per_vhost(out);
     }
 
-    /// One cumulative TSV snapshot row (no timestamp — the flusher prepends it):
-    /// all counters, then each histogram's buckets + `inf` + `sum_us` + `count`,
-    /// summed across shards. A reader diffs two rows to get any window. Pairs with
-    /// [`Self::tsv_header`].
-    pub fn snapshot_row(&self) -> String {
+    /// One TSV snapshot row (no timestamp — the flusher prepends it): all
+    /// counters, then each histogram's buckets + `inf` + `sum_us` + `count`, summed
+    /// across shards, then the trailing [`EXTRA_NAMES`] section. A reader diffs two
+    /// rows to get any window. Pairs with [`Self::tsv_header`].
+    pub fn snapshot_row(&self, extra: &ExtraSample) -> String {
         let mut cells: Vec<String> = self
             .counter_values()
             .iter()
@@ -857,6 +857,7 @@ impl Telemetry {
             cells.push(s.sum_us.to_string());
             cells.push(s.count.to_string());
         }
+        cells.extend(extra.values().iter().map(|v| v.to_string()));
         cells.join("\t")
     }
 
@@ -874,16 +875,343 @@ impl Telemetry {
             cols.push(format!("{prefix}_sum_us"));
             cols.push(format!("{prefix}_count"));
         }
+        cols.extend(EXTRA_NAMES.iter().map(|c| c.to_string()));
         cols.join("\t")
     }
 }
 
+/// Trailing TSV section, after the histogram columns so every earlier column keeps its
+/// position: process/transport measurements sampled once per flush, never on a request.
+/// Cumulative counters (raw totals since process start; diff two rows like the leading
+/// counters): `tls_handshakes_*`, `conn_*_closes_*`, `cpu_ticks_*` (USER_HZ ticks),
+/// `slices_*` (schedstat timeslices) and `minflt_total`. Instantaneous gauges at the
+/// row's `ts`: `active_*`, `rss_anon_bytes`, `pagecache_*_bytes` and `lsapi_inflight_now`;
+/// `lsapi_inflight_max_tick` is the peak in-flight count since the previous row.
+/// A source that cannot be read (no page cache, no PHP pool, a /proc failure) emits 0.
+pub const EXTRA_NAMES: [&str; 21] = [
+    "tls_handshakes_full",
+    "tls_handshakes_resumed",
+    "conn_idle_closes_h1",
+    "conn_peer_closes_h1",
+    "conn_idle_closes_h2",
+    "conn_peer_closes_h2",
+    "active_connections",
+    "active_requests",
+    "rss_anon_bytes",
+    "pagecache_memory_bytes",
+    "pagecache_hot_bytes",
+    "pagecache_disk_bytes",
+    "lsapi_inflight_now",
+    "lsapi_inflight_max_tick",
+    "cpu_ticks_tokio",
+    "cpu_ticks_uring_tls",
+    "cpu_ticks_uring",
+    "cpu_ticks_other",
+    "slices_tokio",
+    "slices_uring_tls",
+    "minflt_total",
+];
+
+/// One sample of the [`EXTRA_NAMES`] columns.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ExtraSample {
+    pub tls_handshakes_full: u64,
+    pub tls_handshakes_resumed: u64,
+    pub conn_idle_closes_h1: u64,
+    pub conn_peer_closes_h1: u64,
+    pub conn_idle_closes_h2: u64,
+    pub conn_peer_closes_h2: u64,
+    pub active_connections: u64,
+    pub active_requests: u64,
+    pub rss_anon_bytes: u64,
+    /// Bytes charged against `--page-cache-mem` (excludes the tag index).
+    pub pagecache_memory_bytes: u64,
+    pub pagecache_hot_bytes: u64,
+    pub pagecache_disk_bytes: u64,
+    pub lsapi_inflight_now: u64,
+    pub lsapi_inflight_max_tick: u64,
+    pub cpu: CpuTotals,
+}
+
+impl ExtraSample {
+    /// Values in [`EXTRA_NAMES`] order.
+    fn values(&self) -> [u64; EXTRA_NAMES.len()] {
+        [
+            self.tls_handshakes_full,
+            self.tls_handshakes_resumed,
+            self.conn_idle_closes_h1,
+            self.conn_peer_closes_h1,
+            self.conn_idle_closes_h2,
+            self.conn_peer_closes_h2,
+            self.active_connections,
+            self.active_requests,
+            self.rss_anon_bytes,
+            self.pagecache_memory_bytes,
+            self.pagecache_hot_bytes,
+            self.pagecache_disk_bytes,
+            self.lsapi_inflight_now,
+            self.lsapi_inflight_max_tick,
+            self.cpu.ticks_tokio,
+            self.cpu.ticks_uring_tls,
+            self.cpu.ticks_uring,
+            self.cpu.ticks_other,
+            self.cpu.slices_tokio,
+            self.cpu.slices_uring_tls,
+            self.cpu.minflt_total,
+        ]
+    }
+}
+
+/// Per-thread-class CPU totals; see [`CpuSampler`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CpuTotals {
+    pub ticks_tokio: u64,
+    pub ticks_uring_tls: u64,
+    pub ticks_uring: u64,
+    pub ticks_other: u64,
+    pub slices_tokio: u64,
+    pub slices_uring_tls: u64,
+    pub minflt_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadClass {
+    Tokio,
+    UringTls,
+    Uring,
+    Other,
+}
+
+/// By thread name (`comm`, 15 bytes max): the tokio runtime's workers and blocking
+/// pool, the TLS listener cores (`hj-uring-tls-N`), every other io_uring core
+/// (`hj-uring-N`, `hj-uring-h3p-N`, ...), and everything else.
+fn classify_thread(comm: &str) -> ThreadClass {
+    if comm.starts_with("tokio") {
+        ThreadClass::Tokio
+    } else if comm.starts_with("hj-uring-tls") {
+        ThreadClass::UringTls
+    } else if comm.starts_with("hj-uring") {
+        ThreadClass::Uring
+    } else {
+        ThreadClass::Other
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThreadSample {
+    tid: u32,
+    class: ThreadClass,
+    ticks: u64,
+    slices: u64,
+}
+
+/// Turns per-thread `/proc/self/task/*` readings into monotonic per-class totals.
+/// Threads come and go (the tokio blocking pool idles threads out), so each class
+/// accumulates per-thread deltas between samples instead of summing live threads;
+/// `ticks_other` is the process total (which keeps exited threads' time) minus the
+/// classified sum, so the four tick columns add up to the process's CPU and a thread's
+/// final unsampled ticks land in `other` rather than vanishing.
+#[derive(Debug, Default)]
+pub struct CpuSampler {
+    last: std::collections::HashMap<u32, (ThreadClass, u64, u64)>,
+    acc: CpuTotals,
+}
+
+impl CpuSampler {
+    fn absorb(&mut self, threads: &[ThreadSample]) {
+        let mut next = std::collections::HashMap::with_capacity(threads.len());
+        for t in threads {
+            if t.class == ThreadClass::Other {
+                continue;
+            }
+            // A reused tid (or a renamed thread) restarts from zero.
+            let (dt, ds) = match self.last.get(&t.tid) {
+                Some(&(class, ticks, slices))
+                    if class == t.class && t.ticks >= ticks && t.slices >= slices =>
+                {
+                    (t.ticks - ticks, t.slices - slices)
+                }
+                _ => (t.ticks, t.slices),
+            };
+            let acc = &mut self.acc;
+            match t.class {
+                ThreadClass::Tokio => {
+                    acc.ticks_tokio += dt;
+                    acc.slices_tokio += ds;
+                }
+                ThreadClass::UringTls => {
+                    acc.ticks_uring_tls += dt;
+                    acc.slices_uring_tls += ds;
+                }
+                ThreadClass::Uring => acc.ticks_uring += dt,
+                ThreadClass::Other => {}
+            }
+            next.insert(t.tid, (t.class, t.ticks, t.slices));
+        }
+        self.last = next;
+    }
+
+    fn totals(&self, process_ticks: u64, minflt_total: u64) -> CpuTotals {
+        let a = self.acc;
+        CpuTotals {
+            ticks_other: process_ticks
+                .saturating_sub(a.ticks_tokio + a.ticks_uring_tls + a.ticks_uring),
+            minflt_total,
+            ..a
+        }
+    }
+
+    /// Read `/proc/self/task/*` and `/proc/self/stat` (blocking; a few dozen tiny
+    /// procfs reads). A thread that exits mid-scan is skipped; an unreadable process
+    /// stat yields 0 for `ticks_other` and `minflt_total`.
+    fn sample(&mut self) -> CpuTotals {
+        let mut threads = Vec::new();
+        if let Ok(dir) = std::fs::read_dir("/proc/self/task") {
+            for entry in dir.flatten() {
+                let Some(tid) = entry.file_name().to_str().and_then(|t| t.parse().ok()) else {
+                    continue;
+                };
+                let base = entry.path();
+                let Ok(comm) = std::fs::read_to_string(base.join("comm")) else {
+                    continue;
+                };
+                let class = classify_thread(comm.trim_end());
+                if class == ThreadClass::Other {
+                    continue;
+                }
+                let Some(stat) = std::fs::read_to_string(base.join("stat"))
+                    .ok()
+                    .and_then(|s| parse_proc_stat(&s))
+                else {
+                    continue;
+                };
+                let slices = if matches!(class, ThreadClass::Tokio | ThreadClass::UringTls) {
+                    std::fs::read_to_string(base.join("schedstat"))
+                        .ok()
+                        .and_then(|s| parse_schedstat_slices(&s))
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                threads.push(ThreadSample {
+                    tid,
+                    class,
+                    ticks: stat.ticks,
+                    slices,
+                });
+            }
+        }
+        self.absorb(&threads);
+        let process = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| parse_proc_stat(&s))
+            .unwrap_or_default();
+        self.totals(process.ticks, process.minflt)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProcStat {
+    minflt: u64,
+    /// utime + stime.
+    ticks: u64,
+}
+
+/// `minflt` (field 10) and `utime`+`stime` (fields 14, 15) of a `/proc/*/stat` line. The
+/// `comm` field may contain spaces or parentheses, so fields are counted from the LAST `)`.
+fn parse_proc_stat(line: &str) -> Option<ProcStat> {
+    let (_, rest) = line.rsplit_once(')')?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // `rest` starts at field 3 (state).
+    let field = |n: usize| fields.get(n - 3)?.parse::<u64>().ok();
+    Some(ProcStat {
+        minflt: field(10)?,
+        ticks: field(14)?.saturating_add(field(15)?),
+    })
+}
+
+/// Third `/proc/*/schedstat` field: timeslices run on a CPU.
+fn parse_schedstat_slices(line: &str) -> Option<u64> {
+    line.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// Gathers the [`EXTRA_NAMES`] columns for the flusher from the gen-0 [`ServerState`],
+/// whose counters, page cache and PHP pools are shared by every SIGHUP generation.
+///
+/// [`ServerState`]: crate::state::ServerState
+pub struct TelemetrySampler {
+    state: std::sync::Arc<crate::state::ServerState>,
+    cpu: std::sync::Mutex<CpuSampler>,
+}
+
+impl TelemetrySampler {
+    pub fn new(state: std::sync::Arc<crate::state::ServerState>) -> Self {
+        TelemetrySampler {
+            state,
+            cpu: std::sync::Mutex::new(CpuSampler::default()),
+        }
+    }
+
+    pub fn telemetry(&self) -> &Telemetry {
+        &self.state.telemetry
+    }
+
+    fn sample_blocking(&self) -> ExtraSample {
+        let state = &*self.state;
+        let m = &state.metrics;
+        let (h2_idle, h2_peer) = hj_h2::server::connection_close_counts();
+        let page = state
+            .page_cache
+            .as_ref()
+            .map(|pc| pc.footprint())
+            .unwrap_or_default();
+        let (lsapi_now, lsapi_max) = state
+            .lsapi
+            .as_ref()
+            .and_then(|registry| registry.default_pool_inflight())
+            .unwrap_or_default();
+        let cpu = self
+            .cpu
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sample();
+        ExtraSample {
+            tls_handshakes_full: m.tls_handshakes_full.load(Relaxed),
+            tls_handshakes_resumed: m.tls_handshakes_resumed.load(Relaxed),
+            conn_idle_closes_h1: m.h1_idle_closes.load(Relaxed),
+            conn_peer_closes_h1: m.h1_peer_closes.load(Relaxed),
+            conn_idle_closes_h2: h2_idle,
+            conn_peer_closes_h2: h2_peer,
+            active_connections: m.active_conns.load(Relaxed),
+            active_requests: m.active_requests.load(Relaxed),
+            rss_anon_bytes: crate::metrics::proc_mem().map_or(0, |p| p.rss_anon_bytes),
+            pagecache_memory_bytes: page.index_ram_bytes,
+            pagecache_hot_bytes: page.hot_bytes,
+            pagecache_disk_bytes: page.disk_bytes,
+            lsapi_inflight_now: lsapi_now,
+            lsapi_inflight_max_tick: lsapi_max,
+            cpu,
+        }
+    }
+
+    /// One sample, taken on the blocking pool (procfs reads + one short lock per
+    /// page-cache shard) so it never stalls the runtime the flusher shares.
+    async fn sample(self: &std::sync::Arc<Self>) -> ExtraSample {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || this.sample_blocking())
+            .await
+            .unwrap_or_default()
+    }
+}
+
 /// Background task: append a cumulative telemetry snapshot to `path` every
-/// `interval`, plus a final flush on shutdown. Once-per-interval, so plain async
-/// file I/O (never on a request hot path). Writes the TSV header when the file is
-/// new; a reader diffs two rows for any window. Rotates to `<path>.1` past 32 MiB.
+/// `interval` until shutdown. The final row is the caller's [`flush_once`] after the
+/// connection drain: a second shutdown flush from here raced the runtime teardown
+/// and failed its write. Once-per-interval, so plain async file I/O (never on a
+/// request hot path). Writes the TSV header when the file is new; a reader diffs two
+/// rows for any window. Rotates to `<path>.1` past 32 MiB.
 pub async fn run_flush(
-    telemetry: std::sync::Arc<Telemetry>,
+    sampler: std::sync::Arc<TelemetrySampler>,
     path: std::path::PathBuf,
     interval: std::time::Duration,
     shutdown: tokio_util::sync::CancellationToken,
@@ -911,22 +1239,20 @@ pub async fn run_flush(
         }
     }
     loop {
-        let stopping = tokio::select! {
-            _ = tokio::time::sleep(interval) => false,
-            _ = shutdown.cancelled() => true,
-        };
-        append_snapshot(&telemetry, &path).await;
-        if stopping {
-            break;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.cancelled() => break,
         }
+        flush_once(&sampler, &path).await;
     }
 }
 
-pub async fn flush_once(t: &Telemetry, path: &std::path::Path) {
-    append_snapshot(t, path).await;
+pub async fn flush_once(sampler: &std::sync::Arc<TelemetrySampler>, path: &std::path::Path) {
+    let extra = sampler.sample().await;
+    append_snapshot(sampler.telemetry(), &extra, path).await;
 }
 
-async fn append_snapshot(t: &Telemetry, path: &std::path::Path) {
+async fn append_snapshot(t: &Telemetry, extra: &ExtraSample, path: &std::path::Path) {
     use tokio::io::AsyncWriteExt;
     // Size-based rotation: keep exactly one backup (`<path>.1`).
     if let Ok(md) = tokio::fs::metadata(path).await {
@@ -959,7 +1285,7 @@ async fn append_snapshot(t: &Telemetry, path: &std::path::Path) {
     }
     buf.push_str(&ts.to_string());
     buf.push('\t');
-    buf.push_str(&t.snapshot_row());
+    buf.push_str(&t.snapshot_row(extra));
     buf.push('\n');
     if let Err(e) = f.write_all(buf.as_bytes()).await {
         tracing::warn!(error = %e, "telemetry: snapshot write failed");
@@ -1102,11 +1428,145 @@ mod tests {
     #[test]
     fn snapshot_row_matches_header_arity() {
         let t = Telemetry::default();
-        let cols = Telemetry::tsv_header().split('\t').count();
-        let cells = t.snapshot_row().split('\t').count();
-        assert_eq!(cols, cells);
-        // Counters + 11 histograms * (16 buckets + inf + sum + count = 19).
-        assert_eq!(cols, COUNTER_NAMES.len() + 11 * (NB + 3));
+        let header = Telemetry::tsv_header();
+        let cols: Vec<&str> = header.split('\t').collect();
+        let row = t.snapshot_row(&ExtraSample::default());
+        assert_eq!(cols.len(), row.split('\t').count());
+        // Counters + 11 histograms * (16 buckets + inf + sum + count = 19) + the trailing
+        // section, which must stay LAST so every earlier column keeps its position.
+        let fixed = COUNTER_NAMES.len() + 11 * (NB + 3);
+        assert_eq!(cols.len(), fixed + EXTRA_NAMES.len());
+        assert_eq!(cols[fixed - 1], "phase_collect_cl_count");
+        assert_eq!(&cols[fixed..], &EXTRA_NAMES[..]);
+        let unique: std::collections::HashSet<&str> = cols.iter().copied().collect();
+        assert_eq!(unique.len(), cols.len(), "column names must be unique");
+    }
+
+    #[test]
+    fn extra_values_follow_extra_names() {
+        let e = ExtraSample {
+            tls_handshakes_full: 1,
+            tls_handshakes_resumed: 2,
+            conn_idle_closes_h1: 3,
+            conn_peer_closes_h1: 4,
+            conn_idle_closes_h2: 5,
+            conn_peer_closes_h2: 6,
+            active_connections: 7,
+            active_requests: 8,
+            rss_anon_bytes: 9,
+            pagecache_memory_bytes: 10,
+            pagecache_hot_bytes: 11,
+            pagecache_disk_bytes: 12,
+            lsapi_inflight_now: 13,
+            lsapi_inflight_max_tick: 14,
+            cpu: CpuTotals {
+                ticks_tokio: 15,
+                ticks_uring_tls: 16,
+                ticks_uring: 17,
+                ticks_other: 18,
+                slices_tokio: 19,
+                slices_uring_tls: 20,
+                minflt_total: 21,
+            },
+        };
+        let expected: Vec<u64> = (1..=EXTRA_NAMES.len() as u64).collect();
+        assert_eq!(e.values().to_vec(), expected);
+    }
+
+    #[test]
+    fn thread_classifier_by_comm() {
+        for (comm, class) in [
+            ("tokio-rt-worker", ThreadClass::Tokio),
+            ("tokio-runtime-w", ThreadClass::Tokio),
+            ("hj-uring-tls-0", ThreadClass::UringTls),
+            ("hj-uring-tls-15", ThreadClass::UringTls),
+            ("hj-uring-0", ThreadClass::Uring),
+            ("hj-uring-h3p-7", ThreadClass::Uring),
+            ("hj-uring-h2-3", ThreadClass::Uring),
+            ("hj-uring-bridge", ThreadClass::Uring),
+            ("httpjet", ThreadClass::Other),
+            ("lsphp", ThreadClass::Other),
+            ("", ThreadClass::Other),
+        ] {
+            assert_eq!(classify_thread(comm), class, "{comm}");
+        }
+    }
+
+    #[test]
+    fn proc_stat_parsing_counts_fields_after_the_last_paren() {
+        // Real shape: a comm with spaces and parentheses must not shift the fields.
+        let line = "4122921 (my (odd) name) S 1 4122921 4122921 0 -1 4194560 3162 0 7 0 \
+                    40 5 0 0 17 -3 38 0 17281586 2800082944 248954";
+        assert_eq!(
+            parse_proc_stat(line),
+            Some(ProcStat {
+                minflt: 3162,
+                ticks: 45
+            })
+        );
+        assert_eq!(parse_proc_stat("garbage"), None);
+        assert_eq!(parse_proc_stat("1 (x) S 1 2"), None);
+        assert_eq!(
+            parse_schedstat_slices("97352608 87256497 3170\n"),
+            Some(3170)
+        );
+        assert_eq!(parse_schedstat_slices("1 2"), None);
+    }
+
+    #[test]
+    fn cpu_sampler_accumulates_monotonic_deltas_per_class() {
+        let t = |tid, class, ticks, slices| ThreadSample {
+            tid,
+            class,
+            ticks,
+            slices,
+        };
+        let mut s = CpuSampler::default();
+        s.absorb(&[
+            t(1, ThreadClass::Tokio, 100, 10),
+            t(2, ThreadClass::Tokio, 50, 5),
+            t(3, ThreadClass::UringTls, 30, 3),
+            t(4, ThreadClass::Uring, 20, 2),
+            t(5, ThreadClass::Other, 1_000, 99),
+        ]);
+        let c = s.totals(500, 77);
+        assert_eq!(
+            (c.ticks_tokio, c.ticks_uring_tls, c.ticks_uring),
+            (150, 30, 20)
+        );
+        assert_eq!((c.slices_tokio, c.slices_uring_tls), (15, 3));
+        assert_eq!(c.ticks_other, 500 - 200, "residual of the process total");
+        assert_eq!(c.minflt_total, 77);
+
+        // Thread 2 (a blocking-pool thread) exits; its ticks stay counted. Thread 1 moves
+        // on; tid 3 is reused by a NEW tls thread with fewer ticks (restarts from zero).
+        s.absorb(&[
+            t(1, ThreadClass::Tokio, 130, 12),
+            t(3, ThreadClass::UringTls, 4, 1),
+            t(4, ThreadClass::Uring, 25, 2),
+        ]);
+        let c = s.totals(600, 80);
+        assert_eq!(
+            (c.ticks_tokio, c.ticks_uring_tls, c.ticks_uring),
+            (180, 34, 25)
+        );
+        assert_eq!((c.slices_tokio, c.slices_uring_tls), (17, 4));
+        assert_eq!(c.ticks_other, 600 - 239);
+
+        // A tid reappearing under another class is a new thread, not a delta.
+        s.absorb(&[t(1, ThreadClass::Uring, 5, 0)]);
+        assert_eq!(s.totals(0, 0).ticks_uring, 30);
+        assert_eq!(s.totals(0, 0).ticks_other, 0, "saturates, never wraps");
+    }
+
+    #[test]
+    fn cpu_sampler_reads_this_process() {
+        let mut s = CpuSampler::default();
+        let first = s.sample();
+        assert!(first.minflt_total > 0, "{first:?}");
+        let second = s.sample();
+        assert!(second.minflt_total >= first.minflt_total);
+        assert!(second.ticks_other + second.ticks_tokio >= first.ticks_tokio);
     }
 
     #[test]
@@ -1177,24 +1637,115 @@ mod tests {
         assert_eq!(counter(&v, "cache_misses"), 1);
     }
 
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "httpjet_telemetry_{tag}_{}_{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn cell<'a>(header: &str, row: &'a str, name: &str) -> &'a str {
+        let idx = header
+            .split('\t')
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("no column {name}"));
+        row.split('\t').nth(idx).unwrap()
+    }
+
     #[tokio::test]
-    async fn flush_once_writes_snapshot_file() {
+    async fn append_snapshot_writes_header_and_named_cells() {
         let t = Telemetry::default();
         t.record_cache_hit(false, "");
-        let path = std::env::temp_dir().join(format!(
-            "httpjet_telemetry_flush_{}.tsv",
+        let path = temp_path("append");
+        let extra = ExtraSample {
+            lsapi_inflight_max_tick: 42,
+            cpu: CpuTotals {
+                minflt_total: 9,
+                ..CpuTotals::default()
+            },
+            ..ExtraSample::default()
+        };
+        append_snapshot(&t, &extra, &path).await;
+        append_snapshot(&t, &ExtraSample::default(), &path).await;
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().count(),
+            3,
+            "header once, then two rows: {body}"
+        );
+        let header = body.lines().next().unwrap();
+        let row = body.lines().nth(1).unwrap();
+        assert_eq!(cell(header, row, "cache_hits"), "1", "{body}");
+        assert_eq!(cell(header, row, "lsapi_inflight_max_tick"), "42");
+        assert_eq!(cell(header, row, "minflt_total"), "9");
+        assert_eq!(cell(header, row, "request_duration_count"), "0");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The flusher's sampler reads the gen-0 state's shared counters, the page cache and
+    /// procfs, and the row lands under the right header names.
+    #[tokio::test]
+    async fn flush_once_samples_server_state_into_named_columns() {
+        use crate::state::{RewriteTuning, ServerState, XfCapsuleConfig};
+        let server_root = std::env::temp_dir().join(format!(
+            "httpjet_telemetry_srv_{}_{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        flush_once(&t, &path).await;
+        std::fs::create_dir_all(server_root.join("logs")).unwrap();
+        let server = hj_core::config::ServerConfig {
+            server_root: server_root.clone(),
+            ..hj_core::config::ServerConfig::default()
+        };
+        let page_cache = std::sync::Arc::new(hj_pagecache::PageStore::new(
+            hj_pagecache::StoreConfig::default(),
+        ));
+        let state = ServerState::new(
+            std::sync::Arc::new(server),
+            None,
+            None,
+            Some(page_cache),
+            std::sync::Arc::new(hj_compress::PageDictRegistry::empty()),
+            1,
+            XfCapsuleConfig::disabled(),
+            None,
+            false,
+            None,
+            false,
+            RewriteTuning::default(),
+        )
+        .unwrap();
+        state.metrics.active_conns.store(7, Relaxed);
+        state.metrics.active_requests.store(3, Relaxed);
+        state.metrics.tls_handshakes_full.store(11, Relaxed);
+        state.metrics.tls_handshakes_resumed.store(2, Relaxed);
+        state.metrics.h1_idle_closes.store(5, Relaxed);
+        state.metrics.h1_peer_closes.store(6, Relaxed);
+        let sampler = std::sync::Arc::new(TelemetrySampler::new(state));
+        let path = temp_path("sampler");
+        flush_once(&sampler, &path).await;
         let body = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(body.lines().count(), 2, "{body}");
         let header = body.lines().next().unwrap();
         let row = body.lines().nth(1).unwrap();
-        let hit_idx = header.split('\t').position(|c| c == "cache_hits").unwrap();
-        assert_eq!(row.split('\t').nth(hit_idx), Some("1"), "{body}");
+        assert_eq!(header.split('\t').count(), row.split('\t').count());
+        assert_eq!(cell(header, row, "active_connections"), "7");
+        assert_eq!(cell(header, row, "active_requests"), "3");
+        assert_eq!(cell(header, row, "tls_handshakes_full"), "11");
+        assert_eq!(cell(header, row, "tls_handshakes_resumed"), "2");
+        assert_eq!(cell(header, row, "conn_idle_closes_h1"), "5");
+        assert_eq!(cell(header, row, "conn_peer_closes_h1"), "6");
+        assert_eq!(cell(header, row, "lsapi_inflight_now"), "0");
+        assert_eq!(cell(header, row, "pagecache_disk_bytes"), "0");
+        assert_ne!(cell(header, row, "rss_anon_bytes"), "0");
+        assert_ne!(cell(header, row, "minflt_total"), "0");
         let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(server_root);
     }
 }

@@ -61,19 +61,21 @@ impl Default for ServeConfig {
 }
 
 impl ServeConfig {
-    /// Build a [`ServeConfig`] from the server-wide [`hj_core::config::Tuning`] block,
-    /// translating LiteSpeed semantics: a `0` keep-alive timeout means "no keep-alive".
+    /// Build a [`ServeConfig`] from the server-wide [`hj_core::config::Tuning`] block.
+    /// Both connection deadlines are always armed: the config parser clamps
+    /// `connTimeout`/`keepAliveTimeout` to LiteSpeed's [1, 10000] range, and a zero
+    /// reaching here (a programmatic `Tuning`) falls back to the same defaults, since
+    /// every transport treats `None` as "no deadline" (#605).
     pub fn from_tuning(t: &hj_core::config::Tuning) -> Self {
-        let keep_alive_timeout = if t.keep_alive_timeout.is_zero() {
-            None
-        } else {
-            Some(t.keep_alive_timeout)
+        let armed = |d: Duration, default: u64| {
+            Some(if d.is_zero() {
+                Duration::from_secs(default)
+            } else {
+                d
+            })
         };
-        let header_read_timeout = if t.conn_timeout.is_zero() {
-            None
-        } else {
-            Some(t.conn_timeout)
-        };
+        let keep_alive_timeout = armed(t.keep_alive_timeout, 5);
+        let header_read_timeout = armed(t.conn_timeout, 60);
         ServeConfig {
             keep_alive_timeout,
             header_read_timeout,
@@ -101,13 +103,16 @@ mod tests {
         assert_eq!(c.max_req_url_len, 8192);
     }
 
+    /// Regression (#605): a zero timeout must never become an unbounded deadline.
     #[test]
-    fn from_tuning_disables_keepalive_when_timeout_zero() {
+    fn from_tuning_never_disarms_connection_deadlines() {
         let t = hj_core::config::Tuning {
             keep_alive_timeout: Duration::ZERO,
+            conn_timeout: Duration::ZERO,
             ..hj_core::config::Tuning::default()
         };
         let c = ServeConfig::from_tuning(&t);
-        assert_eq!(c.keep_alive_timeout, None);
+        assert_eq!(c.keep_alive_timeout, Some(Duration::from_secs(5)));
+        assert_eq!(c.header_read_timeout, Some(Duration::from_secs(60)));
     }
 }

@@ -83,7 +83,6 @@ pub(super) fn enabled() -> bool {
 pub(super) enum HostSource {
     Header,
     Authority,
-    None,
 }
 
 pub(super) struct MemoKey<'a> {

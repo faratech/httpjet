@@ -242,17 +242,31 @@ fn apply_header_op(resp: &mut Response, op: &HeaderOp) {
                 headers.append(&name, v);
             }
         }
-        // Append: concatenate ", value" onto the existing (last) value, else Set.
+        // Fold list fields across every line; Set-Cookie remains non-combinable.
         HeaderOp::Append { value, .. } | HeaderOp::Edit { value, .. } => {
-            let existing = headers
-                .get(&name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let merged = match existing {
-                Some(prev) if !prev.is_empty() => format!("{prev}, {value}"),
-                _ => value.clone(),
+            if name == http::header::SET_COOKIE {
+                if let Ok(value) = HeaderValue::from_str(value) {
+                    headers.append(name, value);
+                }
+                return;
+            }
+            let existing = {
+                let values: Vec<&[u8]> = headers
+                    .get_all(&name)
+                    .iter()
+                    .map(|v| v.as_bytes())
+                    .collect();
+                (!values.is_empty()).then(|| values.join(&b", "[..]))
             };
-            if let Ok(v) = HeaderValue::from_str(&merged) {
+            let merged = match existing {
+                Some(mut prev) if !prev.is_empty() => {
+                    prev.extend_from_slice(b", ");
+                    prev.extend_from_slice(value.as_bytes());
+                    prev
+                }
+                _ => value.as_bytes().to_vec(),
+            };
+            if let Ok(v) = HeaderValue::from_bytes(&merged) {
                 headers.remove(&name);
                 headers.insert(&name, v);
             }
@@ -264,6 +278,51 @@ fn apply_header_op(resp: &mut Response, op: &HeaderOp) {
 mod tests {
     use super::super::rewrite_glue::resolved_rel_path;
     use super::*;
+
+    #[test]
+    fn append_preserves_cookie_lines_and_non_ascii_list_values() {
+        let mut response = http::Response::new(hj_core::Body::Empty);
+        response
+            .headers_mut()
+            .append(http::header::SET_COOKIE, "first=a".parse().unwrap());
+        response
+            .headers_mut()
+            .append(http::header::SET_COOKIE, "second=b".parse().unwrap());
+        apply_header_op(
+            &mut response,
+            &HeaderOp::Append {
+                name: "Set-Cookie".into(),
+                value: "third=c".into(),
+            },
+        );
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(http::header::SET_COOKIE)
+            .iter()
+            .map(|v| v.as_bytes())
+            .collect();
+        assert_eq!(
+            cookies,
+            vec![b"first=a".as_slice(), b"second=b", b"third=c"]
+        );
+        response
+            .headers_mut()
+            .append("x-list", http::HeaderValue::from_bytes(b"\xff").unwrap());
+        response
+            .headers_mut()
+            .append("x-list", "second".parse().unwrap());
+        apply_header_op(
+            &mut response,
+            &HeaderOp::Edit {
+                name: "X-List".into(),
+                value: "third".into(),
+            },
+        );
+        assert_eq!(
+            response.headers()["x-list"].as_bytes(),
+            b"\xff, second, third"
+        );
+    }
 
     #[test]
     fn set_env_if_cannot_overwrite_reserved_hj_env() {
@@ -467,8 +526,12 @@ mod tests {
             HeaderName::from_static("vary"),
             http::HeaderValue::from_static("Accept"),
         );
+        resp.headers_mut().append(
+            HeaderName::from_static("vary"),
+            http::HeaderValue::from_static("Origin"),
+        );
 
-        // Append concatenates onto the existing value.
+        // Append concatenates onto every existing value.
         apply_header_op(
             &mut resp,
             &HeaderOp::Append {
@@ -478,7 +541,7 @@ mod tests {
         );
         assert_eq!(
             resp.headers().get("vary").unwrap(),
-            "Accept, Accept-Encoding"
+            "Accept, Origin, Accept-Encoding"
         );
 
         // Set replaces.

@@ -201,7 +201,9 @@ fn decode_body(
     let mut chunk = [0; 8192];
     let result = match coding {
         ContentCoding::Gzip => {
-            let mut decoder = flate2::read::GzDecoder::new(encoded.as_ref());
+            // Multi-member gzip streams are valid RFC 1952; GzDecoder would
+            // silently drop every member after the first.
+            let mut decoder = flate2::read::MultiGzDecoder::new(encoded.as_ref());
             decode_reader(
                 &mut decoder,
                 &mut chunk,
@@ -329,6 +331,22 @@ mod tests {
         assert!(lease.reserve(data.len() as u64));
         let result = finish_body(&mut headers, data, Some(lease), budget, max, policy);
         (result, headers)
+    }
+
+    #[test]
+    fn multi_member_gzip_decodes_all_members() {
+        // #624: concatenated gzip members must not truncate at member 1.
+        let budget = Arc::new(BodyBufferBudget::new(64 * 1024 * 1024));
+        let mut data = encode(ContentCoding::Gzip, b"hello ");
+        data.extend(encode(ContentCoding::Gzip, b"world"));
+        let (result, _) = run(
+            ContentCoding::Gzip,
+            data,
+            &budget,
+            64_000,
+            RequestDecompression::default(),
+        );
+        assert_eq!(result.unwrap().as_ref(), b"hello world");
     }
 
     #[test]

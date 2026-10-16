@@ -124,10 +124,8 @@ fn range_unsatisfiable() {
         parse_range(b"bytes=200-300", 100),
         RangeOutcome::Unsatisfiable
     ));
-    assert!(matches!(
-        parse_range(b"bytes=-0", 100),
-        RangeOutcome::Unsatisfiable
-    ));
+    // bytes=-0 is invalid (not unsatisfiable) per RFC 9110 §14.1.1 — see
+    // single_range_invalid_forms_are_ignored_not_unsatisfiable (#630).
 }
 
 #[test]
@@ -2060,6 +2058,24 @@ async fn range_multi_all_unsatisfiable_is_416() {
     fs::remove_dir_all(&root).ok();
 }
 
+#[test]
+fn single_range_invalid_forms_are_ignored_not_unsatisfiable() {
+    // RFC 9110 §14.1.1 (#630): zero suffix / end<start are invalid -> ignore.
+    assert!(matches!(parse_range(b"bytes=-0", 10), RangeOutcome::Ignore));
+    assert!(matches!(
+        parse_range(b"bytes=5-3", 10),
+        RangeOutcome::Ignore
+    ));
+    assert!(matches!(
+        parse_range(b"bytes=99-100", 10),
+        RangeOutcome::Unsatisfiable
+    ));
+    assert!(matches!(
+        parse_range(b"bytes=0-9", 10),
+        RangeOutcome::Single(0, 9)
+    ));
+}
+
 #[tokio::test]
 async fn multipart_memory_lease_survives_bytes_clones_and_head_needs_no_read() {
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
@@ -2083,5 +2099,122 @@ async fn multipart_memory_lease_survives_bytes_clones_and_head_needs_no_read() {
         materialize_multipart("test", "text/plain", 8, &[(0, 1), (4, 5)], None, false)
             .await
             .is_none()
+    );
+}
+
+/// `/file/` is path info on a static file: 404 (OLS), so a `$`-anchored deny on the
+/// file name cannot be bypassed by appending a slash.
+#[tokio::test]
+async fn file_with_trailing_slash_is_not_found() {
+    let root = temp_root("file-slash");
+    fs::write(root.join("dump.sql"), b"secret").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    for path in ["/dump.sql/", "/dump.sql%2F", "/dump.sql%2f%2f"] {
+        let err = expect_err(serve(&mut ctx, req(Method::GET, path)).await);
+        assert!(matches!(err, HandlerError::NotFound), "{path}: {err:?}");
+    }
+    let resp = serve(&mut ctx, req(Method::GET, "/dump.sql"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn out_of_range_mtime_omits_last_modified_instead_of_panicking() {
+    let root = temp_root("mtime-range");
+    let cases = [
+        (
+            "old.txt",
+            SystemTime::UNIX_EPOCH - Duration::from_secs(86_400),
+        ),
+        (
+            "far.txt",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_800),
+        ),
+    ];
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut exercised = 0;
+    for (name, mtime) in cases {
+        let path = root.join(name);
+        fs::write(&path, b"timestamped").unwrap();
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        if file.set_modified(mtime).is_err()
+            || fs::metadata(&path).unwrap().modified().unwrap() != mtime
+        {
+            continue;
+        }
+        exercised += 1;
+        for (method, range) in [
+            (Method::GET, None),
+            (Method::HEAD, None),
+            (Method::GET, Some("bytes=0-3")),
+        ] {
+            let mut ctx = make_ctx(Arc::new(make_server()), vhost.clone());
+            let mut request = req(method.clone(), &format!("/{name}"));
+            if let Some(r) = range {
+                request
+                    .headers_mut()
+                    .insert(RANGE, HeaderValue::from_static(r));
+            }
+            let resp = serve(&mut ctx, request).await.unwrap();
+            assert!(
+                resp.status() == StatusCode::OK || resp.status() == StatusCode::PARTIAL_CONTENT,
+                "{name} {method} {range:?}: {}",
+                resp.status()
+            );
+            assert!(!resp.headers().contains_key(LAST_MODIFIED), "{name}");
+        }
+        // No Last-Modified, so date validators are ignored rather than compared to 0.
+        let mut ctx = make_ctx(Arc::new(make_server()), vhost.clone());
+        let mut ims = req(Method::GET, &format!("/{name}"));
+        ims.headers_mut().insert(
+            IF_MODIFIED_SINCE,
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+        );
+        assert_eq!(
+            serve(&mut ctx, ims).await.unwrap().status(),
+            StatusCode::OK,
+            "{name}"
+        );
+        let mut ranged = req(Method::GET, &format!("/{name}"));
+        ranged
+            .headers_mut()
+            .insert(RANGE, HeaderValue::from_static("bytes=0-3"));
+        ranged.headers_mut().insert(
+            IF_RANGE,
+            HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"),
+        );
+        assert_eq!(
+            serve(&mut ctx, ranged).await.unwrap().status(),
+            StatusCode::OK,
+            "{name}"
+        );
+    }
+    assert!(
+        exercised > 0,
+        "filesystem accepted neither out-of-range mtime"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn http_date_header_bounds() {
+    let max = SystemTime::UNIX_EPOCH + Duration::from_secs(253_402_300_799);
+    assert_eq!(
+        http_date_header(max).unwrap(),
+        "Fri, 31 Dec 9999 23:59:59 GMT"
+    );
+    assert!(http_date_header(max + Duration::from_secs(1)).is_none());
+    assert!(http_date_header(SystemTime::UNIX_EPOCH - Duration::from_secs(1)).is_none());
+    assert_eq!(
+        http_date_header(SystemTime::UNIX_EPOCH).unwrap(),
+        "Thu, 01 Jan 1970 00:00:00 GMT"
     );
 }

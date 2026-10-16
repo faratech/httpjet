@@ -507,6 +507,14 @@ impl LsapiRegistry {
         Some(slot.cell.get()?.pool.stats())
     }
 
+    /// `(checked out now, peak since the previous call)` for the started default client
+    /// pool — the one external-mode web tiers dial. Resets the peak window.
+    pub fn default_pool_inflight(&self) -> Option<(u64, u64)> {
+        let slot = self.entries.read().get(&PoolKey::default()).cloned()?;
+        let pool = &slot.cell.get()?.pool;
+        Some((pool.inflight(), pool.take_inflight_max()))
+    }
+
     /// Candidate-first hot reload of the default socket-activated pool. `Ok(g)`
     /// means the candidate was promoted, the client-pool epoch advanced to `g`,
     /// and the complete old process family was drained or force-reaped.
@@ -1288,6 +1296,11 @@ mod tests {
             .await
             .expect("the shared external pool should be wired without dialing");
         assert_eq!(reg.default_pool_stats().unwrap().generation_advances, 1);
+        assert_eq!(
+            reg.default_pool_inflight(),
+            Some((0, 0)),
+            "external web tiers expose their client pool's in-flight gauge"
+        );
         assert!(
             !reg.set_external_generation_file(&generation_path),
             "a started pool must not silently ignore a replacement mapping"

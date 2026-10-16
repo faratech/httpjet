@@ -194,6 +194,35 @@ fn crypto_info_header(cipher_type: u32) -> kb::tls_crypto_info {
     }
 }
 
+/// Whether `secret` (a key-log traffic secret) derives exactly `key`/`iv`, the keys
+/// rustls is CURRENTLY using. A TLS 1.3 KeyUpdate that rustls processed during the
+/// handshake rotates its keys past the logged secret; programming the kernel from the
+/// stale secret would then fail every following record.
+pub(crate) fn secret_derives(
+    suite: SupportedCipherSuite,
+    secret: &[u8],
+    key: &[u8],
+    iv: &[u8],
+) -> bool {
+    let Some(kind) = SuiteKind::from_suite(suite) else {
+        return false;
+    };
+    let alg = kind.hkdf_alg();
+    hkdf_expand_label(alg, secret, b"key", kind.key_len()) == key
+        && hkdf_expand_label(alg, secret, b"iv", 12) == iv
+}
+
+/// The AEAD key and IV of an extracted rustls traffic secret.
+pub(crate) fn traffic_key_iv(s: &rustls::ConnectionTrafficSecrets) -> Option<(&[u8], &[u8])> {
+    use rustls::ConnectionTrafficSecrets as T;
+    match s {
+        T::Aes128Gcm { key, iv } | T::Aes256Gcm { key, iv } | T::Chacha20Poly1305 { key, iv } => {
+            Some((key.as_ref(), iv.as_ref()))
+        }
+        _ => None,
+    }
+}
+
 /// Derive key+iv from `secret` for `kind` and install it on `fd` for `direction`
 /// (`TLS_TX`/`TLS_RX`) at record sequence `seq` (0 after a handshake or a KeyUpdate).
 fn set_tls_key(
@@ -272,7 +301,7 @@ struct Cmsg<const N: usize> {
 /// Emit `payload` as a TLS record of `content_type` over the kTLS socket `fd`
 /// (`sendmsg` with a `TLS_SET_RECORD_TYPE` control message). The kernel AEAD-encrypts it
 /// with the current TX key.
-fn send_record(fd: RawFd, content_type: u8, payload: &[u8]) -> io::Result<()> {
+async fn send_record(fd: RawFd, content_type: u8, payload: &[u8]) -> io::Result<()> {
     let mut cmsg = Cmsg::<1> {
         hdr: libc::cmsghdr {
             cmsg_len: (std::mem::offset_of!(Cmsg::<1>, data) + 1) as _,
@@ -294,12 +323,51 @@ fn send_record(fd: RawFd, content_type: u8, payload: &[u8]) -> io::Result<()> {
         msg_controllen: cmsg.hdr.cmsg_len as _,
         msg_flags: 0,
     };
-    // SAFETY: msg/iov/cmsg are valid for the synchronous sendmsg; payload outlives the call.
-    let rc = unsafe { libc::sendmsg(fd, &msg, 0) };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
+    retry_record_send(payload.len(), || {
+        // SAFETY: msg/iov/cmsg are valid for the synchronous sendmsg; payload outlives the call.
+        let rc = unsafe { libc::sendmsg(fd, &msg, libc::MSG_NOSIGNAL) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(rc as usize)
+        }
+    })
+    .await
+}
+
+async fn retry_record_send(
+    expected: usize,
+    mut send: impl FnMut() -> io::Result<usize>,
+) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match send() {
+            Ok(n) if n == expected => return Ok(()),
+            Ok(_) => {
+                // Control records are atomic. Replaying a short record could
+                // duplicate a handshake prefix under the old traffic key.
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short kTLS control-record send",
+                ));
+            }
+            Err(error) => {
+                if !matches!(error.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
+                    return Err(error);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out waiting to send kTLS KeyUpdate",
+                    ));
+                }
+                // This runs on a monoio core while holding the rekey gate.
+                // Yield under backpressure so other connections can progress;
+                // application writes remain excluded until TX is rekeyed.
+                monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
     }
-    Ok(())
 }
 
 // ── per-connection rekey state ────────────────────────────────────────────────
@@ -326,10 +394,10 @@ impl RekeyState {
         set_tls_key(self.fd, TLS_TX, self.kind, &self.tx_secret, 0)
     }
     /// Send our own KeyUpdate (request_update = not_requested) as a handshake record.
-    fn send_key_update(&self) -> io::Result<()> {
+    async fn send_key_update(&self) -> io::Result<()> {
         // handshake: msg_type(24) + uint24 length(1) + body: request_update(1 byte)
         let body = [HS_KEY_UPDATE, 0, 0, 1, UPDATE_NOT_REQUESTED];
-        send_record(self.fd, CONTENT_HANDSHAKE, &body)
+        send_record(self.fd, CONTENT_HANDSHAKE, &body).await
     }
 }
 
@@ -381,7 +449,7 @@ enum RxControl {
 
 /// A plain read on a kTLS socket returned EIO because the next record is a non-application
 /// record. Consume it via `recvmsg` (the record type is in a control message) and act on it.
-fn handle_rx_control(state: &mut RekeyState) -> io::Result<RxControl> {
+async fn handle_rx_control(state: &mut RekeyState) -> io::Result<RxControl> {
     use nix::sys::socket::{
         ControlMessageOwned, MsgFlags, SockaddrStorage, TlsGetRecordType, recvmsg,
     };
@@ -410,7 +478,7 @@ fn handle_rx_control(state: &mut RekeyState) -> io::Result<RxControl> {
                 if data[4] == UPDATE_REQUESTED {
                     // RFC 8446 §4.6.3: we MUST send our own KeyUpdate (not_requested) before
                     // our next application data, then our TX key advances.
-                    state.send_key_update()?;
+                    state.send_key_update().await?;
                     state.rekey_tx()?;
                 }
             }
@@ -484,7 +552,7 @@ impl<S: AsyncReadRent + AsRawFd> AsyncReadRent for KtlsStream<S> {
                     Ok(n) => return (Ok(n), buf),
                     Err(e) => {
                         if e.raw_os_error() == Some(libc::EIO) {
-                            match handle_rx_control(&mut self.rekey) {
+                            match handle_rx_control(&mut self.rekey).await {
                                 Ok(RxControl::Continue) => continue,
                                 Ok(RxControl::Closed) => return (Ok(0), buf),
                                 Err(e2) => return (Err(e2), buf),
@@ -515,7 +583,7 @@ impl<S: AsyncReadRent + AsRawFd> AsyncReadRent for KtlsStream<S> {
                     Ok(n) => return (Ok(n), buf),
                     Err(e) => {
                         if e.raw_os_error() == Some(libc::EIO) {
-                            match handle_rx_control(&mut self.rekey) {
+                            match handle_rx_control(&mut self.rekey).await {
                                 Ok(RxControl::Continue) => continue,
                                 Ok(RxControl::Closed) => return (Ok(0), buf),
                                 Err(e2) => return (Err(e2), buf),
@@ -613,7 +681,7 @@ impl<R: AsyncReadRent> AsyncReadRent for KtlsReadHalf<R> {
                     Ok(n) => return (Ok(n), buf),
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => {
                         let mut rekey = self.rekey.lock().await;
-                        match handle_rx_control(&mut rekey) {
+                        match handle_rx_control(&mut rekey).await {
                             Ok(RxControl::Continue) => continue,
                             Ok(RxControl::Closed) => return (Ok(0), buf),
                             Err(control_error) => return (Err(control_error), buf),
@@ -638,7 +706,7 @@ impl<R: AsyncReadRent> AsyncReadRent for KtlsReadHalf<R> {
                     Ok(n) => return (Ok(n), buf),
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => {
                         let mut rekey = self.rekey.lock().await;
-                        match handle_rx_control(&mut rekey) {
+                        match handle_rx_control(&mut rekey).await {
                             Ok(RxControl::Continue) => continue,
                             Ok(RxControl::Closed) => return (Ok(0), buf),
                             Err(control_error) => return (Err(control_error), buf),
@@ -708,5 +776,64 @@ impl<W: AsyncWriteRent> AsyncWriteRent for KtlsWriteHalf<W> {
             drop(rekey);
             result
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rotated_traffic_secret_is_detected_before_kernel_handoff() {
+        let suite = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256;
+        let kind = super::SuiteKind::Aes128Gcm;
+        let logged = vec![7u8; 32];
+        let key = super::hkdf_expand_label(kind.hkdf_alg(), &logged, b"key", kind.key_len());
+        let iv = super::hkdf_expand_label(kind.hkdf_alg(), &logged, b"iv", 12);
+        assert!(super::secret_derives(suite, &logged, &key, &iv));
+        // A KeyUpdate moves rustls one "traffic upd" generation past the logged secret.
+        let next = super::next_traffic_secret(kind, &logged);
+        let key1 = super::hkdf_expand_label(kind.hkdf_alg(), &next, b"key", kind.key_len());
+        let iv1 = super::hkdf_expand_label(kind.hkdf_alg(), &next, b"iv", 12);
+        assert!(!super::secret_derives(suite, &logged, &key1, &iv1));
+    }
+    use super::*;
+
+    #[test]
+    fn control_record_retries_transient_errors_without_blocking_the_core() {
+        let mut runtime = crate::uring::build_core_runtime().unwrap();
+        runtime.block_on(async {
+            let progressed = Rc::new(std::cell::Cell::new(false));
+            monoio::spawn({
+                let progressed = progressed.clone();
+                async move {
+                    progressed.set(true);
+                }
+            });
+            let mut attempts = 0;
+            retry_record_send(5, || {
+                attempts += 1;
+                match attempts {
+                    1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                    2 => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                    _ => {
+                        assert!(progressed.get(), "other connections must progress");
+                        Ok(5)
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(attempts, 3);
+            assert_eq!(
+                retry_record_send(5, || Ok(2)).await.unwrap_err().kind(),
+                io::ErrorKind::WriteZero
+            );
+            assert_eq!(
+                retry_record_send(5, || Err(io::Error::from_raw_os_error(libc::EPIPE)))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        });
     }
 }

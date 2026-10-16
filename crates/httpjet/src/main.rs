@@ -782,10 +782,11 @@ type LogReloadHandle =
 /// journal rotation. Also installs a panic hook. MUST be called within a tokio
 /// runtime context (the error logger spawns a writer task). Returns the reload
 /// handle (SIGUSR2) and the error logger (SIGUSR1 reopen).
-fn init_logging(root: &std::path::Path) -> (LogReloadHandle, hj_log::ErrorLogger) {
+fn init_logging(root: &std::path::Path) -> (LogReloadHandle, hj_log::ErrorLogger, String) {
     use tracing_subscriber::prelude::*;
+    let boot_directive = boot_filter_directive();
     let (filter_layer, reload_handle) =
-        tracing_subscriber::reload::Layer::new(default_env_filter());
+        tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new(&boot_directive));
     // keep_days=30 (unlike access/php-slow at 7): errors are low-volume but
     // high-value — postmortems reach back weeks, so they get the deeper window.
     let err_logger = hj_log::ErrorLogger::spawn(
@@ -800,7 +801,35 @@ fn init_logging(root: &std::path::Path) -> (LogReloadHandle, hj_log::ErrorLogger
         .with(hj_log::ErrorLogLayer::new(err_logger.clone()))
         .init();
     install_panic_hook();
-    (reload_handle, err_logger)
+    (reload_handle, err_logger, boot_directive)
+}
+
+fn boot_filter_directive() -> String {
+    match std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV) {
+        Ok(v) if !v.trim().is_empty() && tracing_subscriber::EnvFilter::try_new(&v).is_ok() => v,
+        _ => "info".to_string(),
+    }
+}
+
+/// The SIGUSR2 filter: the boot directives with only httpjet's own level
+/// changed. A bare `httpjet=debug` would make every other target (hj_* crates,
+/// the panic hook) default to OFF, silently dropping their WARN/ERROR events.
+fn sigusr2_directive(boot: &str, debug_on: bool) -> String {
+    if !debug_on {
+        return boot.to_string();
+    }
+    let mut parts: Vec<&str> = boot
+        .split(',')
+        .map(str::trim)
+        .filter(|d| {
+            !d.is_empty() && {
+                let target = d.split(['=', '[']).next().unwrap_or("");
+                target != "httpjet"
+            }
+        })
+        .collect();
+    parts.push("httpjet=debug");
+    parts.join(",")
 }
 
 /// Route panics into `tracing::error!(target:"panic", …)` (→ the structured error
@@ -976,7 +1005,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     // Initialize logging FIRST: inside the runtime context (the persistent error
     // logger spawns a writer task) and BEFORE config load, so startup warnings are
     // captured. The `enter` guard is scoped and dropped before `block_on`.
-    let (reload_handle, err_logger) = {
+    let (reload_handle, err_logger, boot_directive) = {
         let _enter = rt.enter();
         init_logging(root)
     };
@@ -1737,7 +1766,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                     Ok(listener) => {
                         handles.push(tokio::spawn(metrics::serve_metrics(
                             listener,
-                            state.clone(),
+                            holder.clone(),
                             profile_token.clone(),
                         )));
                         tracing::info!(%addr, "metrics endpoint up (Prometheus text)");
@@ -1787,9 +1816,10 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // across restarts + a self-contained time-series for the two-node A/B).
         let telemetry_file =
             state::redirect_log_path(std::path::Path::new(args.telemetry_file.trim()));
+        let telemetry_sampler = Arc::new(telemetry::TelemetrySampler::new(state.clone()));
         if !args.telemetry_file.trim().is_empty() && args.telemetry_flush_secs > 0 {
             handles.push(tokio::spawn(telemetry::run_flush(
-                state.telemetry.clone(),
+                telemetry_sampler.clone(),
                 telemetry_file.clone(),
                 std::time::Duration::from_secs(args.telemetry_flush_secs),
                 state.shutdown.clone(),
@@ -1949,12 +1979,11 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 }
                 _ = sigusr2.recv() => {
                     // (OPS5) Toggle httpjet's log level at runtime — turn up verbosity
-                    // on a live issue without a restart. The error file stays warn+
-                    // regardless (the ErrorLogLayer gates on level independently).
+                    // on a live issue without a restart; off restores the boot filter.
                     debug_on = !debug_on;
-                    let directive = if debug_on { "httpjet=debug" } else { "httpjet=info" };
-                    match reload_handle.reload(tracing_subscriber::EnvFilter::new(directive)) {
-                        Ok(()) => tracing::info!(level = directive, "SIGUSR2: log level toggled"),
+                    let directive = sigusr2_directive(&boot_directive, debug_on);
+                    match reload_handle.reload(tracing_subscriber::EnvFilter::new(&directive)) {
+                        Ok(()) => tracing::info!(level = %directive, "SIGUSR2: log level toggled"),
                         Err(e) => tracing::error!(error = %e, "SIGUSR2: log-level reload failed"),
                     }
                 }
@@ -1991,7 +2020,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             "connections drained; stopping"
         );
         if !args.telemetry_file.trim().is_empty() && args.telemetry_flush_secs > 0 {
-            telemetry::flush_once(&state.telemetry, &telemetry_file).await;
+            telemetry::flush_once(&telemetry_sampler, &telemetry_file).await;
         }
         for h in handles {
             h.abort();
@@ -2459,7 +2488,7 @@ fn lsphp(root: &std::path::Path, args: LsphpArgs) -> anyhow::Result<()> {
             control_listener,
             control_guard,
             registry.clone(),
-            generation_publisher,
+            generation_publisher.clone(),
             control_shutdown.clone(),
         ));
         let control_error = tokio::select! {
@@ -2483,8 +2512,28 @@ fn lsphp(root: &std::path::Path, args: LsphpArgs) -> anyhow::Result<()> {
                 let _ = control_task.await;
             }
         }
-        tracing::info!("shutdown signal received; draining lsphp pool");
-        if let Err(error) = registry.drain_all().await {
+        // Without a new epoch the web tier keeps reusing keep-alive sockets to
+        // this family and the drain always runs to its grace deadline.
+        let retired_generation = generation_publisher.retire_all();
+        let forced_cleanup_before = registry
+            .default_forced_cleanup_count()
+            .unwrap_or_default();
+        tracing::info!(
+            generation = retired_generation,
+            "shutdown signal received; retirement epoch published, draining lsphp pool"
+        );
+        let drain_started = std::time::Instant::now();
+        let drain_result = registry.drain_all().await;
+        let forced_cleanup_total = registry
+            .default_forced_cleanup_count()
+            .unwrap_or_default();
+        tracing::info!(
+            drain_ms = drain_started.elapsed().as_millis() as u64,
+            forced_cleanups = forced_cleanup_total.saturating_sub(forced_cleanup_before),
+            forced_cleanup_total,
+            "lsphp stop drain finished"
+        );
+        if let Err(error) = drain_result {
             tracing::error!(%error, "lsphp pool failed to drain completely; exiting with failure");
             let _ = systemd_notify("STATUS=lsphp shutdown cleanup failed");
             if let Some(control_error) = &control_error {
@@ -2781,6 +2830,21 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
         "cgiRlimit",
     ];
     for (file, text) in &texts {
+        for tag in ["connTimeout", "keepAliveTimeout"] {
+            let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+            let Some(start) = text.find(&open).map(|i| i + open.len()) else {
+                continue;
+            };
+            let Some(len) = text[start..].find(&close) else {
+                continue;
+            };
+            let raw = text[start..start + len].trim();
+            if raw.parse::<u64>().is_ok_and(|v| !(1..=10_000).contains(&v)) {
+                warnings.push(format!(
+                    "<{tag}>{raw}</{tag}> in {file} is outside LiteSpeed's range [1, 10000]; httpjet uses its default instead"
+                ));
+            }
+        }
         for tag in UNIMPLEMENTED {
             if text.contains(&format!("<{tag}>")) || text.contains(&format!("<{tag} ")) {
                 warnings.push(format!(
@@ -2826,6 +2890,18 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
         {
             match hj_rewrite::Htaccess::parse(&text) {
                 Ok(ht) => {
+                    // (#603) The page cache folds a UA *class* into its key only for
+                    // classifiable RewriteCond reads (under --rewrite-ua-classify); any
+                    // other User-Agent read yields UA-conditional responses it caches
+                    // without a UA dimension.
+                    let unclassifiable_ua = ht.memo.vary_headers.iter().any(|v| v == "user-agent")
+                        || (ht.rules.reads_user_agent() && !ht.rules.ua_classify_eligible());
+                    if unclassifiable_ua {
+                        warnings.push(format!(
+                            "vhost {name}: {} reads User-Agent in a way the page cache cannot classify; UA-conditional responses (Header ... env=, [E=]) would be cached without a UA dimension",
+                            htaccess.display()
+                        ));
+                    }
                     for lineno in ht.auth_warnings() {
                         warnings.push(format!(
                         "vhost {name}: {}:{lineno} authentication configuration may be incomplete or unsupported; unresolved matching resources fail closed (403)",
@@ -3110,6 +3186,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sigusr2_toggle_keeps_non_httpjet_targets() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::prelude::*;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.metadata().target().to_string());
+            }
+        }
+
+        for boot in ["info", "httpjet=info,hj_pagecache=warn"] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (filter, handle) =
+                tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new(boot));
+            let subscriber = tracing_subscriber::registry()
+                .with(filter)
+                .with(Capture(seen.clone()));
+            tracing::subscriber::with_default(subscriber, || {
+                let mut debug_on = false;
+                for round in 0..2 {
+                    debug_on = !debug_on;
+                    handle
+                        .reload(tracing_subscriber::EnvFilter::new(sigusr2_directive(
+                            boot, debug_on,
+                        )))
+                        .unwrap();
+                    seen.lock().unwrap().clear();
+                    tracing::error!(target: "hj_pagecache", "e");
+                    tracing::debug!(target: "httpjet", "d");
+                    tracing::debug!(target: "httpjet::pipeline", "d");
+                    let got = seen.lock().unwrap().clone();
+                    assert!(
+                        got.iter().any(|t| t == "hj_pagecache"),
+                        "boot={boot} round={round}: hj_pagecache error dropped ({got:?})"
+                    );
+                    let debug_seen = got.iter().filter(|t| t.starts_with("httpjet")).count();
+                    assert_eq!(debug_seen, if debug_on { 2 } else { 0 }, "boot={boot}");
+                }
+            });
+        }
+        assert_eq!(
+            sigusr2_directive("httpjet=info,hj_pagecache=warn", true),
+            "hj_pagecache=warn,httpjet=debug"
+        );
+        assert_eq!(sigusr2_directive("info", true), "info,httpjet=debug");
+    }
+
+    #[test]
     fn opt_in_status_accepts_only_redirect_and_gone_codes() {
         assert_eq!(
             parse_opt_in_status("404, 410,303").unwrap(),
@@ -3225,6 +3357,42 @@ mod tests {
         }
         // A hostname bind claims nothing classifiable — no warning.
         assert!(!pp_bind_is_public("origin.example.com:443"));
+    }
+
+    /// Regression (#605): `check` surfaces a connection timeout LiteSpeed would reject.
+    #[test]
+    fn out_of_range_connection_timeouts_are_linted() {
+        let dir = std::env::temp_dir().join(format!(
+            "hj-lint-timeouts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        std::fs::write(
+            dir.join("conf/httpd_config.xml"),
+            b"<httpServerConfig><tuning><connTimeout>0</connTimeout>\
+              <keepAliveTimeout>5</keepAliveTimeout></tuning></httpServerConfig>",
+        )
+        .unwrap();
+        let cfg = hj_config::ServerConfig {
+            server_root: dir.clone(),
+            ..Default::default()
+        };
+        let warnings = lint_unsupported_features(&cfg, &dir);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("<connTimeout>0</connTimeout>")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("keepAliveTimeout")),
+            "an in-range value is not linted: {warnings:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3499,6 +3667,71 @@ mod tests {
         );
         std::fs::write(doc_root.join("users"), "Admin:password\n").unwrap();
         assert!(!lint(std::path::Path::new("users")), "inside the docroot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression (#603): `check` names a docroot chain whose User-Agent reads the page
+    /// cache cannot fold into its key.
+    #[test]
+    fn unclassifiable_user_agent_reads_are_linted() {
+        let dir = std::env::temp_dir().join(format!("hj-ua-lint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let doc_root = dir.join("docroot");
+        std::fs::create_dir_all(&doc_root).unwrap();
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let vhost_xml = dir.join("conf/vhost.xml");
+        std::fs::write(&vhost_xml, b"<vhost></vhost>").unwrap();
+        let lint = |htaccess: &str| {
+            std::fs::write(doc_root.join(".htaccess"), htaccess).unwrap();
+            let mut vhost = hj_config::VHostConfig::default();
+            vhost.doc_root = doc_root.clone();
+            vhost.rewrite.auto_load_htaccess = true;
+            let mut cfg = hj_config::ServerConfig {
+                server_root: dir.clone(),
+                ..Default::default()
+            };
+            cfg.vhosts.insert(
+                "t.example".into(),
+                hj_config::VHostDecl {
+                    name: "t.example".into(),
+                    vh_root: dir.clone(),
+                    config_file: vhost_xml.clone(),
+                    allow_symbol_link: None,
+                    restrained: false,
+                    enable_script: true,
+                    config: Some(Arc::new(vhost)),
+                },
+            );
+            lint_unsupported_features(&cfg, &dir)
+                .into_iter()
+                .any(|w| w.contains("reads User-Agent"))
+        };
+        assert!(lint("SetEnvIf User-Agent Googlebot KNOWN_CRAWLER\n"));
+        assert!(
+            !lint(
+                "RewriteEngine On\nRewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot)\nRewriteRule .* - [E=KNOWN_CRAWLER:1]\n"
+            ),
+            "classifiable RewriteCond reads are folded as a UA class"
+        );
+        assert!(!lint(
+            "RewriteEngine On\nRewriteRule ^old$ /new [R=301,L]\n"
+        ));
+        assert!(
+            !lint(
+                "RewriteEngine On\nRewriteCond %{HTTP_REFERER} !^$\nRewriteCond %{HTTP_USER_AGENT} Googlebot\nRewriteRule .* - [E=KNOWN_CRAWLER:1]\n"
+            ),
+            "a classifiable UA cond in a non-path-cacheable ruleset is still folded"
+        );
+        assert!(
+            lint("RewriteEngine On\nRewriteRule ^ua$ /x?ua=%{HTTP_USER_AGENT} [L]\n"),
+            "a raw UA in a substitution cannot be classified"
+        );
+        assert!(
+            lint(
+                "RewriteEngine On\nRewriteCond %{HTTP_REFERER} !^$\nRewriteRule ^ua$ /x?ua=%{HTTP_USER_AGENT} [L]\n"
+            ),
+            "also when the ruleset is not path-cacheable (no cache_key_vars)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

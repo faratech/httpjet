@@ -149,7 +149,7 @@ fn set_pair(resource: Resource, soft: Option<u64>, hard: Option<u64>) -> io::Res
 fn merge_limit_pair(inherited: Rlimit, soft: Option<u64>, hard: Option<u64>) -> Rlimit {
     let maximum = hard.or(inherited.maximum);
     let current = match soft {
-        Some(value) => Some(value),
+        Some(value) => Some(maximum.map_or(value, |max| value.min(max))),
         None => match hard {
             Some(maximum) => Some(
                 inherited
@@ -207,6 +207,28 @@ mod tests {
             merge_limit_pair(inherited, Some(300), Some(600)),
             Rlimit {
                 current: Some(300),
+                maximum: Some(600),
+            }
+        );
+    }
+
+    #[test]
+    fn soft_limit_is_clamped_to_hard_maximum() {
+        let inherited = Rlimit {
+            current: Some(400),
+            maximum: Some(800),
+        };
+        assert_eq!(
+            merge_limit_pair(inherited, Some(900), None),
+            Rlimit {
+                current: Some(800),
+                maximum: Some(800),
+            }
+        );
+        assert_eq!(
+            merge_limit_pair(inherited, Some(900), Some(600)),
+            Rlimit {
+                current: Some(600),
                 maximum: Some(600),
             }
         );

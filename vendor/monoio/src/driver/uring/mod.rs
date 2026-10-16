@@ -82,12 +82,97 @@ pub(crate) struct UringInner {
 
     // Uring support ext_arg
     ext_arg: bool,
+    // Opt-in only; the ring's kernel feature bit controls compatibility.
+    no_iowait: bool,
 }
 
 // When dropping the driver, all in-flight operations must have completed. This
 // type wraps the slab and ensures that, on drop, the slab is empty.
 struct Ops {
     slab: Slab<Lifecycle>,
+}
+
+fn no_iowait_enabled(params: &io_uring::Parameters) -> bool {
+    no_iowait_allowed(
+        params.is_feature_no_iowait(),
+        std::env::var("HTTPJET_URING_NO_IOWAIT").as_deref() == Ok("1"),
+    )
+}
+
+fn no_iowait_allowed(supported: bool, configured: bool) -> bool {
+    supported && configured
+}
+
+fn submit_event_wait(
+    inner: &mut UringInner,
+    args: Option<&io_uring::types::SubmitArgs<'_, '_>>,
+) -> io::Result<usize> {
+    if !inner.no_iowait {
+        return match args {
+            Some(args) => inner.uring.submitter().submit_with_args(1, args),
+            None => inner.uring.submit_and_wait(1),
+        };
+    }
+    submit_no_iowait(&mut inner.uring, args)
+}
+
+fn submit_no_iowait(
+    uring: &mut IoUring,
+    args: Option<&io_uring::types::SubmitArgs<'_, '_>>,
+) -> io::Result<usize> {
+    // This path always waits for one completion. GETEVENTS therefore also
+    // preserves deferred task work and CQ-overflow flushing. Queue handles
+    // are dropped before enter, publishing the tail with the crate's normal
+    // Release synchronization. need_wakeup includes its SQPOLL SeqCst fence.
+    let sqpoll = uring.params().is_setup_sqpoll();
+    let (len, wakeup) = {
+        let sq = uring.submission();
+        (sq.len(), sqpoll && sq.need_wakeup())
+    };
+    let mut flags = io_uring::EnterFlags::GETEVENTS | io_uring::EnterFlags::NO_IOWAIT;
+    if wakeup {
+        flags.insert(io_uring::EnterFlags::SQ_WAKEUP);
+    }
+    // SAFETY: exactly the same SubmitArgs/sigset_t layout and lifetime used
+    // by io-uring 0.7.15's submit methods. The timeout lives through enter;
+    // queued operations retain Monoio's existing ownership until completion.
+    match args {
+        Some(args) => {
+            flags.insert(io_uring::EnterFlags::EXT_ARG);
+            unsafe { uring.submitter().enter(len as u32, 1, flags.bits(), Some(args)) }
+        }
+        None => unsafe {
+            uring.submitter().enter::<libc::sigset_t>(len as u32, 1, flags.bits(), None)
+        },
+    }
+}
+
+#[cfg(test)]
+mod no_iowait_tests {
+    use super::*;
+
+    #[test]
+    fn requires_kernel_feature_and_explicit_configuration() {
+        assert!(!no_iowait_allowed(false, false));
+        assert!(!no_iowait_allowed(false, true));
+        assert!(!no_iowait_allowed(true, false));
+        assert!(no_iowait_allowed(true, true));
+    }
+
+    #[test]
+    fn kernel_wait_preserves_submission_completion_and_timeout() {
+        let mut uring = IoUring::new(8).expect("test requires an available kernel ring");
+        assert!(uring.params().is_feature_no_iowait(), "host acceptance requires NO_IOWAIT support");
+        let entry = opcode::Nop::new().build().user_data(42);
+        unsafe { uring.submission().push(&entry).unwrap(); }
+        assert_eq!(submit_no_iowait(&mut uring, None).unwrap(), 1);
+        let completion = uring.completion().next().expect("submitted NOP completion");
+        assert_eq!(completion.user_data(), 42);
+        assert_eq!(completion.result(), 0);
+        let timeout = Timespec::from(Duration::from_millis(5));
+        let args = io_uring::types::SubmitArgs::new().timespec(&timeout);
+        assert_eq!(submit_no_iowait(&mut uring, Some(&args)).unwrap_err().raw_os_error(), Some(libc::ETIME));
+    }
 }
 
 impl IoUringDriver {
@@ -111,6 +196,7 @@ impl IoUringDriver {
             poller_installed: false,
             ops: Ops::new(),
             ext_arg: uring.params().is_feature_ext_arg(),
+            no_iowait: no_iowait_enabled(uring.params()),
             uring,
         }));
 
@@ -145,6 +231,7 @@ impl IoUringDriver {
             poll: super::poll::Poll::with_capacity(entries as usize)?,
             ops: Ops::new(),
             ext_arg: uring.params().is_feature_ext_arg(),
+            no_iowait: no_iowait_enabled(uring.params()),
             uring,
             shared_waker: std::sync::Arc::new(waker::EventWaker::new(waker)),
             eventfd_installed: false,
@@ -285,14 +372,14 @@ impl IoUringDriver {
                     // Better compatibility(5.4+).
                     false => {
                         self.install_timeout(inner, duration);
-                        inner.uring.submit_and_wait(1)?;
+                        submit_event_wait(inner, None)?;
                     }
                     // Submit and Wait with enter args.
                     // Better performance(5.11+).
                     true => {
                         let timespec = timespec(duration);
                         let args = io_uring::types::SubmitArgs::new().timespec(&timespec);
-                        if let Err(e) = inner.uring.submitter().submit_with_args(1, &args) {
+                        if let Err(e) = submit_event_wait(inner, Some(&args)) {
                             if e.raw_os_error() != Some(libc::ETIME) {
                                 return Err(e);
                             }
@@ -301,7 +388,7 @@ impl IoUringDriver {
                 }
             } else {
                 // Submit and Wait without timeout
-                inner.uring.submit_and_wait(1)?;
+                submit_event_wait(inner, None)?;
             }
         } else {
             // Submit only

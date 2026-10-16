@@ -10,7 +10,9 @@
 
 mod auth_scope;
 mod cache;
-pub use auth_scope::{AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request};
+pub use auth_scope::{
+    AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request, resolve_auth_for_request_paths,
+};
 mod mod_access;
 mod parse;
 mod php;
@@ -84,6 +86,8 @@ pub enum UriExpr {
     Cond(UriCond),
     And(Vec<UriExpr>),
     Or(Vec<UriExpr>),
+    /// An `<Else>`/`<ElseIf>` branch: none of the preceding chain matched.
+    Not(Box<UriExpr>),
 }
 
 impl UriExpr {
@@ -98,6 +102,7 @@ impl UriExpr {
             },
             UriExpr::And(parts) => parts.iter().all(|part| part.matches(path, on_err)),
             UriExpr::Or(parts) => parts.iter().any(|part| part.matches(path, on_err)),
+            UriExpr::Not(inner) => !inner.matches(path, !on_err),
         }
     }
 
@@ -105,6 +110,7 @@ impl UriExpr {
         match self {
             UriExpr::Cond(cond) => cond,
             UriExpr::And(parts) | UriExpr::Or(parts) => parts[0].first_cond(),
+            UriExpr::Not(inner) => inner.first_cond(),
         }
     }
 }
@@ -323,6 +329,9 @@ pub enum AccessMatcher {
     IfUri { regex: Option<Regex>, negate: bool },
     /// Compound `<If>` expression preserving boolean grouping and precedence.
     IfUriExpr(UriExpr),
+    /// `<Limit METHODS>` (or, with `except`, `<LimitExcept METHODS>`). Apache
+    /// method names are case-sensitive and `GET` also covers `HEAD`.
+    Method { methods: Vec<String>, except: bool },
 }
 
 impl AccessMatcher {
@@ -369,7 +378,19 @@ impl AccessMatcher {
                 None => true,
             },
             AccessMatcher::IfUriExpr(expr) => expr.matches(rel_path, on_err),
+            // No method in this context: fail closed toward the rule's polarity.
+            AccessMatcher::Method { .. } => on_err,
         }
+    }
+
+    fn matches_method(&self, method: &str) -> Option<bool> {
+        let AccessMatcher::Method { methods, except } = self else {
+            return None;
+        };
+        let listed = methods
+            .iter()
+            .any(|m| m == method || (m == "GET" && method == "HEAD"));
+        Some(listed != *except)
     }
 }
 
@@ -401,13 +422,36 @@ impl AccessRule {
         }
     }
 
-    pub(crate) fn matches(&self, rel_path: &str, basename: &str) -> bool {
+    pub(crate) fn matches(&self, rel_path: &str, basename: &str, method: &str) -> bool {
         // Fail CLOSED toward this rule's polarity on a regex match-time error (issue A6): for a
         // deny rule an un-evaluable matcher counts as matched (deny applies); for an allow rule
         // it counts as not matched (grant withheld).
+        self.matchers.iter().all(|m| {
+            m.matches_method(method)
+                .unwrap_or_else(|| m.matches(rel_path, basename, self.denied))
+        })
+    }
+
+    /// Apache's per-directory merge order: directory-level directives (including
+    /// `<Limit>`) first, then `<Files*>` sections, then `<If>` sections. A later
+    /// phase overrides an earlier one regardless of source position.
+    /// Scoped by an httpjet `<Directory*>`/`<DirectoryMatch>` path matcher.
+    pub(crate) fn is_directory_scoped(&self) -> bool {
         self.matchers
             .iter()
-            .all(|m| m.matches(rel_path, basename, self.denied))
+            .any(|m| matches!(m, AccessMatcher::Path(_)))
+    }
+
+    pub(crate) fn merge_phase(&self) -> u8 {
+        self.matchers
+            .iter()
+            .map(|m| match m {
+                AccessMatcher::Basename(_) => 1,
+                AccessMatcher::IfUri { .. } | AccessMatcher::IfUriExpr(_) => 2,
+                AccessMatcher::Path(_) | AccessMatcher::Method { .. } => 0,
+            })
+            .max()
+            .unwrap_or(0)
     }
 }
 

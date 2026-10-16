@@ -114,12 +114,23 @@ where
     if !chain.clone().any(Htaccess::has_auth) {
         return Ok(());
     }
-    let filesystem_path = ctx.vhost.doc_root.join(path.trim_start_matches('/'));
-    let realm = match hj_rewrite::resolve_auth_for_request(
+    let lexical = ctx.vhost.doc_root.join(path.trim_start_matches('/'));
+    let canonical = ctx
+        .vhost
+        .doc_root
+        .canonicalize()
+        .ok()
+        .map(|root| root.join(path.trim_start_matches('/')));
+    let names = [
+        Some(lexical.to_string_lossy()),
+        canonical.as_ref().map(|path| path.to_string_lossy()),
+    ];
+    let filesystem_paths: Vec<&str> = names.iter().filter_map(|name| name.as_deref()).collect();
+    let realm = match hj_rewrite::resolve_auth_for_request_paths(
         chain,
         path,
         request_path,
-        Some(filesystem_path.to_string_lossy().as_ref()),
+        &filesystem_paths,
     ) {
         Ok(None) => return Ok(()),
         Ok(Some(realm)) => realm,
@@ -214,6 +225,17 @@ async fn enforce_resource(
     enforce_chain(ctx, headers, &chain, path, request_path, authenticated).await
 }
 
+fn relative_to_doc_root(ctx: &ReqCtx, target: &Path) -> Option<PathBuf> {
+    if let Ok(relative) = target.strip_prefix(&ctx.vhost.doc_root) {
+        return Some(relative.to_path_buf());
+    }
+    let canonical_root = ctx.vhost.doc_root.canonicalize().ok()?;
+    target
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(Path::to_path_buf)
+}
+
 pub(super) async fn enforce_target(
     state: &ServerState,
     ctx: &mut ReqCtx,
@@ -222,7 +244,7 @@ pub(super) async fn enforce_target(
     request_path: &str,
     authenticated: &mut Vec<AuthRealm>,
 ) -> Result<(), Response> {
-    if let Ok(relative) = target.strip_prefix(&ctx.vhost.doc_root) {
+    if let Some(relative) = relative_to_doc_root(ctx, target) {
         let path = format!("/{}", relative.to_string_lossy());
         enforce_resource(state, ctx, headers, &path, request_path, authenticated).await?;
     }
@@ -235,10 +257,18 @@ fn static_candidates(
     path: &str,
     chain: &[Arc<Htaccess>],
 ) -> Vec<(String, PathBuf)> {
-    let root = matching_static_context(ctx, path)
-        .and_then(|c| c.location.as_ref())
-        .unwrap_or(&ctx.vhost.doc_root);
-    let lexical = root.join(path.trim_start_matches('/'));
+    // Same mapping as the static handler's DocRootOverride (#673).
+    let rel = std::path::Path::new(path.trim_start_matches('/'));
+    let (root, rel) = match matching_static_context(ctx, path)
+        .and_then(|c| c.location.as_ref().map(|loc| (loc, c.uri.as_str())))
+    {
+        Some((loc, uri)) if loc != &ctx.vhost.doc_root => {
+            (loc, hj_static::context_relative_path(rel, uri))
+        }
+        Some((loc, _)) => (loc, rel),
+        None => (&ctx.vhost.doc_root, rel),
+    };
+    let lexical = root.join(rel);
     if path.ends_with('/') && lexical.is_dir() {
         for index in effective_index_files(state, ctx, chain) {
             let candidate = lexical.join(index);
@@ -287,22 +317,53 @@ pub(super) fn target_has_auth(
         let Ok(target) = opened_target_path(&lexical) else {
             continue;
         };
-        let Ok(rel) = target.strip_prefix(&ctx.vhost.doc_root) else {
+        let Some((protected, checked_until)) = opened_target_has_auth(state, ctx, &target) else {
             continue;
         };
-        let resource = format!("/{}", rel.to_string_lossy());
-        let (entries, checked_until) = state.rewrite_cache.load_chain_with_dirs_and_deadline(
-            &ctx.vhost.doc_root,
-            &resource,
-            ctx.vhost.access_file_name_or_default(),
-        );
         deadline = Some(deadline.map_or(checked_until, |old| old.min(checked_until)));
-        let chain: Vec<_> = entries.into_iter().map(|(_, ht)| ht).collect();
-        if chain.iter().any(|ht| ht.has_auth()) || access_denied(&chain, &resource, "GET", ctx) {
+        if protected {
             return (true, deadline);
         }
     }
     (false, deadline)
+}
+
+fn opened_target_has_auth(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    target: &Path,
+) -> Option<(bool, std::time::Instant)> {
+    let rel = relative_to_doc_root(ctx, target)?;
+    let resource = format!("/{}", rel.to_string_lossy());
+    let (entries, checked_until) = state.rewrite_cache.load_chain_with_dirs_and_deadline(
+        &ctx.vhost.doc_root,
+        &resource,
+        ctx.vhost.access_file_name_or_default(),
+    );
+    let chain: Vec<_> = entries.into_iter().map(|(_, ht)| ht).collect();
+    Some((
+        chain.iter().any(|ht| ht.has_auth()) || access_denied(&chain, &resource, "GET", ctx),
+        checked_until,
+    ))
+}
+
+/// [`target_has_auth`] for a script the caller already opened and resolved, so the
+/// on-core path does not open it twice.
+pub(super) fn resolved_target_has_auth(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    target: &Path,
+) -> bool {
+    ctx.vhost
+        .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess)
+        && aliases_possible(ctx, path)
+        // An unaliased target's chain is a prefix of the request chain the caller
+        // already auth-checked (a rewrite into a non-ancestor directory bridges
+        // first), so only an aliased target needs its own chain load. This keeps the
+        // load off every front-controller cache hit (`/threads/..` -> `/index.php`).
+        && target != ctx.vhost.doc_root.join(path.trim_start_matches('/'))
+        && opened_target_has_auth(state, ctx, target).is_some_and(|(protected, _)| protected)
 }
 
 /// Prefer the opened inode over a lexical target hint for the final backstop.

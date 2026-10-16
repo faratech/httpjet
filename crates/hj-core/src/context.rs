@@ -10,14 +10,23 @@ use hj_config::model::{ServerConfig, VHostConfig};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proto {
     Http1,
+    /// An HTTP/1.0 request on an H1 connection (LiteSpeed reports `SERVER_PROTOCOL`
+    /// HTTP/1.0 for these); the transport still treats it as H1.
+    Http10,
     Http2,
     Http3,
 }
+
+/// Request extension the H1 transport sets on an HTTP/1.0 request, so the pipeline
+/// can report [`Proto::Http10`] while the request itself stays normalized to 1.1.
+#[derive(Debug, Clone, Copy)]
+pub struct Http10Request;
 
 impl Proto {
     pub fn as_str(&self) -> &'static str {
         match self {
             Proto::Http1 => "HTTP/1.1",
+            Proto::Http10 => "HTTP/1.0",
             Proto::Http2 => "HTTP/2",
             Proto::Http3 => "HTTP/3",
         }

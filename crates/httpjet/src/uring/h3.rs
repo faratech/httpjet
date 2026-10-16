@@ -61,6 +61,7 @@ static H3_RETRIES_SENT: AtomicU64 = AtomicU64::new(0);
 static H3_REFUSED_BUDGET: AtomicU64 = AtomicU64::new(0);
 static H3_REFUSED_HANDSHAKES: AtomicU64 = AtomicU64::new(0);
 static H3_HANDSHAKE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static H3_SEND_STALL_RESETS: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide HTTP/3 admission counters for the metrics endpoint.
 pub(crate) struct H3AdmissionCounts {
@@ -696,6 +697,7 @@ struct H3State {
     peer_qpack_encoder: Option<StreamId>,
     peer_qpack_decoder: Option<StreamId>,
     peer_settings: Option<PeerSettings>,
+    peer_max_field_section_size: std::rc::Rc<std::cell::Cell<Option<u64>>>,
     /// Total raw request bytes retained across all unfinished streams on this connection.
     total_req_bytes: std::rc::Rc<std::cell::Cell<usize>>,
     /// Set once a required-client-certificate decision closes the connection.
@@ -710,6 +712,9 @@ struct H3State {
     /// as the peer grants more window (`StreamEvent::Writable`). Without this, a large
     /// response is silently truncated to the first window.
     pending: std::collections::HashMap<StreamId, PendingSend>,
+    /// Live `header_read_timeout`, refreshed per drive: how long a response may wait
+    /// on the peer's flow-control credit without [`SEND_STALL_MIN_PROGRESS`] progress.
+    send_stall_timeout: Option<Duration>,
     /// Cancellation handles for requests already dispatched through the bridge. A peer
     /// STOP_SENDING must drop the monoio request task so the bridge drops its response
     /// receiver, cancels the tokio pipeline future, and releases the global slot.
@@ -785,12 +790,24 @@ impl H3State {
         }
     }
 
+    fn next_send_stall_deadline(&self) -> Option<Instant> {
+        let timeout = self.send_stall_timeout?;
+        self.pending
+            .values()
+            .filter_map(|p| p.stall.map(|s| s.since + timeout))
+            .min()
+    }
+
     /// The earliest instant the driver must revisit this connection on its own.
     fn next_deadline(&self) -> Option<Instant> {
-        match (self.handshake_deadline(), self.next_request_deadline()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [
+            self.handshake_deadline(),
+            self.next_request_deadline(),
+            self.next_send_stall_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn first_expired_request(&self, now: Instant) -> Option<StreamId> {
@@ -798,6 +815,14 @@ impl H3State {
             .first()
             .filter(|key| key.when <= now)
             .map(|key| key.stream)
+    }
+}
+
+fn request_local_addr(bound: SocketAddr, dst_ip: Option<std::net::IpAddr>) -> SocketAddr {
+    match dst_ip {
+        // A dual-stack `[::]` socket reports an IPv4 destination as `::ffff:a.b.c.d`.
+        Some(ip) if bound.ip().is_unspecified() => SocketAddr::new(ip.to_canonical(), bound.port()),
+        _ => bound,
     }
 }
 
@@ -961,6 +986,41 @@ struct PendingSend {
     completion: Option<hj_core::ResponseCompletion>,
     parts: std::collections::VecDeque<PendingPart>,
     fin: bool,
+    /// Runs while queued bytes wait on the peer's flow-control credit (#599 on h2).
+    stall: Option<SendStall>,
+}
+
+/// Bytes a response must deliver per send-stall window while it waits on credit, so
+/// a peer granting a byte at a time cannot restart the deadline forever (as on h2).
+const SEND_STALL_MIN_PROGRESS: u64 = 16 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct SendStall {
+    since: Instant,
+    progressed: u64,
+}
+
+/// Advance a response's send-stall clock after a pump that accepted `sent` bytes. The
+/// clock runs only while bytes remain `waiting` (a slow backend leaves none queued).
+fn advance_send_stall(
+    stall: Option<SendStall>,
+    sent: u64,
+    waiting: bool,
+    now: Instant,
+) -> Option<SendStall> {
+    if !waiting {
+        return None;
+    }
+    match stall {
+        Some(s) if s.progressed.saturating_add(sent) < SEND_STALL_MIN_PROGRESS => Some(SendStall {
+            since: s.since,
+            progressed: s.progressed + sent,
+        }),
+        _ => Some(SendStall {
+            since: now,
+            progressed: 0,
+        }),
+    }
 }
 impl PendingSend {
     /// Report completion only after every queued byte has entered QUIC and its
@@ -1052,12 +1112,17 @@ impl PendingPart {
     /// `Ok(false)` remains only as a defensive can't-spin exit for a
     /// zero-progress `Ok(0)`, which quinn-proto never produces for non-empty
     /// input.
-    fn write(&mut self, stream: &mut quinn_proto::SendStream<'_>) -> Result<bool, WriteError> {
+    fn write(
+        &mut self,
+        stream: &mut quinn_proto::SendStream<'_>,
+        sent: &mut u64,
+    ) -> Result<bool, WriteError> {
         match self {
             Self::Contiguous { data, off, .. } => {
                 while *off < data.len() {
                     let n = stream.write(&data[*off..])?;
                     *off += n;
+                    *sent += n as u64;
                     if n == 0 {
                         return Ok(false);
                     }
@@ -1075,6 +1140,7 @@ impl PendingPart {
                 while *header_off < *header_len {
                     let n = stream.write(&header[*header_off..*header_len])?;
                     *header_off += n;
+                    *sent += n as u64;
                     if n == 0 {
                         return Ok(false);
                     }
@@ -1082,6 +1148,7 @@ impl PendingPart {
                 while *data_off < data.len() {
                     let n = stream.write(&data[*data_off..])?;
                     *data_off += n;
+                    *sent += n as u64;
                     if n == 0 {
                         return Ok(false);
                     }
@@ -1857,6 +1924,9 @@ fn consume_peer_uni(
     if stream.kind == PeerUniKind::Control {
         stream.control.consume(&input[pos..])?;
         if let Some(settings) = stream.control.completed_settings.take() {
+            state
+                .peer_max_field_section_size
+                .set(settings.max_field_section_size);
             state.peer_settings = Some(settings);
         }
     }
@@ -2623,11 +2693,12 @@ fn pump_stream(conn: &mut quinn_proto::Connection, st: &mut H3State, id: StreamI
     };
     let mut ss = conn.send_stream(id);
     let mut cancelled = false;
+    let mut sent = 0u64;
     let done = loop {
         let Some(part) = entry.parts.front_mut() else {
             break entry.finish_if_drained(|| ss.finish().is_ok());
         };
-        match part.write(&mut ss) {
+        match part.write(&mut ss, &mut sent) {
             Ok(true) => {
                 acknowledge_front_part(entry);
             }
@@ -2642,7 +2713,29 @@ fn pump_stream(conn: &mut quinn_proto::Connection, st: &mut H3State, id: StreamI
         cancel_dispatched_request(st, id);
     } else if done {
         st.pending.remove(&id);
+    } else {
+        entry.stall =
+            advance_send_stall(entry.stall, sent, !entry.parts.is_empty(), Instant::now());
     }
+}
+
+/// Reset every response whose send-stall window expired, releasing its bridge
+/// admission slot, backend body and egress leases (the H3 form of h2's #599).
+fn reclaim_stalled_sends(st: &mut H3State, now: Instant) -> Vec<StreamId> {
+    let Some(timeout) = st.send_stall_timeout else {
+        return Vec::new();
+    };
+    let expired: Vec<StreamId> = st
+        .pending
+        .iter()
+        .filter(|(_, p)| p.stall.is_some_and(|s| s.since + timeout <= now))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in &expired {
+        H3_SEND_STALL_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cancel_dispatched_request(st, *id);
+    }
+    expired
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2682,6 +2775,7 @@ async fn write_completion(
                     completion,
                     parts: std::iter::once(PendingPart::contiguous(resp, lease)).collect(),
                     fin: true,
+                    stall: None,
                 },
             );
         }
@@ -2693,6 +2787,7 @@ async fn write_completion(
                     completion,
                     parts: std::iter::once(PendingPart::contiguous(head, lease)).collect(),
                     fin: false,
+                    stall: None,
                 },
             );
         }
@@ -2792,6 +2887,16 @@ async fn drive_one_conn(
             let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
             let _ = c.recv_stream(id).stop(code);
             let _ = c.send_stream(id).reset(code);
+        }
+    }
+    // QUIC's idle timer restarts on any peer packet (a PING), so it cannot bound a
+    // response the peer starves of flow-control credit.
+    st.send_stall_timeout = fallback_request_config.timeout;
+    for id in reclaim_stalled_sends(st, now) {
+        if let Some(c) = conns.get_mut(&hd) {
+            let _ = c
+                .send_stream(id)
+                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
         }
     }
     let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
@@ -2899,6 +3004,9 @@ async fn drive_one_conn(
             .get(&hd)
             .map(|c| c.remote_address())
             .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
+        // SERVER_ADDR is the interface the client reached, not a wildcard bind (the
+        // TCP paths take it from getsockname; QUIC from the datagram's IP_PKTINFO).
+        let local = request_local_addr(local, conns.get(&hd).and_then(|c| c.local_ip()));
         let leaf = st.client_leaf.clone();
         let has_client_cert = leaf.is_some();
         let tls = Some(hj_tls::tls_params_from_parts(
@@ -2925,6 +3033,7 @@ async fn drive_one_conn(
         let cancel = CancellationToken::new();
         st.request_cancellations.insert(id, cancel.clone());
         let egress_budget = st.egress_budget.clone();
+        let peer_max_field_section = st.peer_max_field_section_size.clone();
         let bridge = bridge.clone();
         let tx = comp_tx.clone();
         let request_limits = request_snapshot.config.limits;
@@ -2952,6 +3061,7 @@ async fn drive_one_conn(
                 request_limits,
                 request_generation,
                 egress_budget.clone(),
+                peer_max_field_section,
             )
             .await;
             drop(charge);
@@ -3657,6 +3767,16 @@ fn prepare_h3_response_headers(
 /// Encode an HTTP/3 response HEADERS frame (QPACK field section using static-table
 /// references where they help, literals otherwise — see [`qpack_field`]). Split out so the
 /// streaming path can send the head before the body and frame each DATA chunk separately.
+/// RFC 9114 §7.2.4.1 field-section size: sum of name+value lengths plus 32
+/// bytes of overhead per field (the HTTP/2 §6.5.2 accounting H3 reuses).
+fn h3_field_section_size(status: http::StatusCode, headers: &http::HeaderMap) -> u64 {
+    let mut size: u64 = 32 + 7 + status.as_str().len() as u64;
+    for (name, value) in headers {
+        size = size.saturating_add(32 + name.as_str().len() as u64 + value.len() as u64);
+    }
+    size
+}
+
 fn encode_h3_headers_frame(status: http::StatusCode, headers: &http::HeaderMap) -> Vec<u8> {
     // (#288) The field section goes into a REUSED per-thread scratch (cleared per
     // call, capacity retained) so a response allocates only its final wire buffer;
@@ -3901,6 +4021,7 @@ async fn handle_h3_request(
     request_limits: H3RequestLimits,
     request_generation: Option<crate::serving_generation::RequestGeneration>,
     egress_budget: Option<H3EgressBudget>,
+    max_field_section_size: std::rc::Rc<std::cell::Cell<Option<u64>>>,
 ) -> H3Outcome {
     if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
         return H3Outcome::full(h3_error(http::StatusCode::FORBIDDEN));
@@ -3983,7 +4104,7 @@ async fn handle_h3_request(
     // emit headers only and don't open a streamed body.
     let is_head = req.method() == http::Method::HEAD;
     match bridge.dispatch(req, ctx).await {
-        Some(r) => {
+        Some(mut r) => {
             let mut completion = r.completion;
             let status = r.status;
             let mut headers = r.headers;
@@ -3993,6 +4114,22 @@ async fn handle_h3_request(
             );
             let body_forbidden =
                 prepare_h3_response_headers(&mut headers, is_head, status, streaming_unknown_len);
+            // #626 (RFC 9114 §7.2.4.1): never emit a field section larger than
+            // the peer's SETTINGS_MAX_FIELD_SECTION_SIZE — a conforming client
+            // would abort the stream with H3_MESSAGE_ERROR. Fall back to a
+            // minimal 500 head (status only, the smallest legal section).
+            if max_field_section_size
+                .get()
+                .is_some_and(|limit| h3_field_section_size(status, &headers) > limit)
+            {
+                if let crate::uring::bridge::BridgeBody::Stream { rx, .. } = &mut r.body {
+                    rx.close();
+                }
+                if let Some(completion) = completion.take() {
+                    completion.finish(hj_core::ResponseEnd::Cancelled);
+                }
+                return H3Outcome::full(h3_error(http::StatusCode::INTERNAL_SERVER_ERROR));
+            }
             match r.body {
                 // Small / HIT / sub-threshold dynamic bodies: buffered + sent whole — byte-identical
                 // to the previous path.
@@ -4220,6 +4357,25 @@ fn per_core_h3_pipeline(
 mod h3_codec_tests {
     use super::*;
 
+    #[test]
+    fn wildcard_bind_reports_the_datagram_destination_as_local() {
+        let bound: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        let dst = Some("203.0.113.5".parse().unwrap());
+        assert_eq!(
+            request_local_addr(bound, dst),
+            "203.0.113.5:443".parse().unwrap()
+        );
+        assert_eq!(request_local_addr(bound, None), bound);
+        let dual: SocketAddr = "[::]:443".parse().unwrap();
+        let mapped = Some("::ffff:203.0.113.5".parse().unwrap());
+        assert_eq!(
+            request_local_addr(dual, mapped),
+            "203.0.113.5:443".parse().unwrap()
+        );
+        let specific: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        assert_eq!(request_local_addr(specific, dst), specific);
+    }
+
     #[derive(Default)]
     struct FlowLimitedLocalUni {
         next_index: u64,
@@ -4314,6 +4470,78 @@ mod h3_codec_tests {
 
     // Decode a request block exercising: indexed static field lines, literal-with-name-ref
     // (static), and literal-with-literal-name. Byte layouts per RFC 9204 §4.5.
+    #[tokio::test]
+    async fn peer_settings_received_during_dispatch_limit_the_response() {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let bridge = crate::uring::bridge::spawn_on_current(1, {
+            let started = started.clone();
+            let release = release.clone();
+            move |_req, _ctx| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    release.notified().await;
+                    http::Response::builder()
+                        .header("x-large", "x".repeat(128))
+                        .body(hj_core::Body::Empty)
+                        .unwrap()
+                }
+            }
+        });
+        let fields = literal_qpack_fields(&[
+            (b":method", b"GET"),
+            (b":scheme", b"https"),
+            (b":authority", b"canon.test"),
+            (b":path", b"/"),
+        ]);
+        let mut wire = Vec::new();
+        write_varint(&mut wire, 1);
+        write_varint(&mut wire, fields.len() as u64);
+        wire.extend(fields);
+        let mut state = H3State::default();
+        let limit = state.peer_max_field_section_size.clone();
+        let request = handle_h3_request(
+            wire,
+            None,
+            false,
+            None,
+            "127.0.0.1:32000".parse().unwrap(),
+            "127.0.0.1:8443".parse().unwrap(),
+            &bridge,
+            false,
+            H3RequestLimits::new(4096, 4096),
+            None,
+            None,
+            limit,
+        );
+        let update = async {
+            started.notified().await;
+            let mut payload = Vec::new();
+            write_varint(&mut payload, 6);
+            write_varint(&mut payload, 80);
+            let mut control = vec![0, 4]; // uni control stream, SETTINGS
+            write_varint(&mut control, payload.len() as u64);
+            control.extend(payload);
+            let mut stream = PeerUniStream::default();
+            consume_peer_uni(
+                &mut state,
+                StreamId::new(quinn_proto::Side::Client, Dir::Uni, 0),
+                &mut stream,
+                &control,
+            )
+            .unwrap();
+            assert_eq!(state.peer_max_field_section_size.get(), Some(80));
+            release.notify_one();
+        };
+        let (response, ()) = tokio::join!(request, update);
+        let H3Body::Full { data, .. } = response.body else {
+            panic!("full error response")
+        };
+        assert_eq!(data, h3_error(http::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
     #[test]
     fn qpack_decode_static_and_literals() {
         let mut buf = vec![0x00, 0x00]; // field section prefix: RIC=0, Base=0
@@ -4403,6 +4631,16 @@ mod h3_codec_tests {
         headers.insert("content-length", "152034".parse().unwrap());
         // Unknown name -> literal with literal name (unchanged form).
         headers.insert("x-litespeed-cache", "hit".parse().unwrap());
+
+        // #626: field-section size accounting (name+value+32 per field).
+        assert_eq!(
+            h3_field_section_size(http::StatusCode::OK, &http::HeaderMap::new()),
+            32 + 7 + 3
+        );
+        assert!(
+            h3_field_section_size(http::StatusCode::OK, &headers)
+                > h3_field_section_size(http::StatusCode::OK, &http::HeaderMap::new())
+        );
 
         let frame = encode_h3_headers_frame(http::StatusCode::OK, &headers);
         let mut pos = 0usize;
@@ -4760,6 +4998,7 @@ mod h3_codec_tests {
             request_snapshot.config.limits,
             request_snapshot.generation,
             None,
+            Default::default(),
         )
         .await;
         assert_eq!(seen.load(Ordering::SeqCst), application.generation);
@@ -5320,6 +5559,7 @@ mod h3_codec_tests {
             completion: None,
             parts: std::iter::once(PendingPart::contiguous(vec![1, 2, 3], Some(lease))).collect(),
             fin: true,
+            stall: None,
         };
         assert_eq!(global.in_flight(), 8);
         drop(pending);
@@ -5334,6 +5574,7 @@ mod h3_codec_tests {
             completion: None,
             parts: std::iter::once(part).collect(),
             fin: false,
+            stall: None,
         };
         assert!(matches!(ack_rx.try_recv(), Err(flume::TryRecvError::Empty)));
         assert!(acknowledge_front_part(&mut pending));
@@ -5351,6 +5592,7 @@ mod h3_codec_tests {
                 })),
                 parts: std::iter::once(PendingPart::contiguous(vec![1, 2, 3], None)).collect(),
                 fin: false,
+                stall: None,
             };
             assert!(!pending.finish_if_drained(|| panic!("body not drained")));
             assert!(acknowledge_front_part(&mut pending));
@@ -5406,12 +5648,80 @@ mod h3_codec_tests {
             completion: None,
             parts: std::iter::once(part).collect(),
             fin: false,
+            stall: None,
         };
         drop(pending);
         assert!(matches!(
             ack_rx.try_recv(),
             Err(flume::TryRecvError::Disconnected)
         ));
+    }
+
+    #[test]
+    fn send_stall_clock_needs_real_progress_to_restart() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(5);
+        let started = advance_send_stall(None, 0, true, t0).unwrap();
+        assert_eq!(started.since, t0);
+        // A trickle below the progress floor keeps the original clock.
+        let trickled = advance_send_stall(Some(started), 100, true, later).unwrap();
+        assert_eq!((trickled.since, trickled.progressed), (t0, 100));
+        let restarted =
+            advance_send_stall(Some(trickled), SEND_STALL_MIN_PROGRESS, true, later).unwrap();
+        assert_eq!((restarted.since, restarted.progressed), (later, 0));
+        // Nothing queued (backend slow, or all bytes accepted): no clock.
+        assert!(advance_send_stall(Some(started), 0, false, later).is_none());
+    }
+
+    #[test]
+    fn credit_starved_response_is_reset_at_the_stall_deadline() {
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let other = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let t0 = Instant::now();
+        let timeout = Duration::from_millis(300);
+        let token = CancellationToken::new();
+        let mut st = H3State::default();
+        st.send_stall_timeout = Some(timeout);
+        st.request_cancellations.insert(id, token.clone());
+        for (stream, stall) in [
+            (
+                id,
+                Some(SendStall {
+                    since: t0,
+                    progressed: 0,
+                }),
+            ),
+            (other, None),
+        ] {
+            st.pending.insert(
+                stream,
+                PendingSend {
+                    completion: None,
+                    parts: std::iter::once(PendingPart::contiguous(vec![0; 64], None)).collect(),
+                    fin: false,
+                    stall,
+                },
+            );
+        }
+        assert_eq!(st.next_deadline(), Some(t0 + timeout));
+        assert!(reclaim_stalled_sends(&mut st, t0 + timeout - Duration::from_nanos(1)).is_empty());
+        assert_eq!(reclaim_stalled_sends(&mut st, t0 + timeout), vec![id]);
+        assert!(
+            token.is_cancelled(),
+            "the bridge request and its slot are released"
+        );
+        assert!(!st.pending.contains_key(&id));
+        assert!(
+            st.pending.contains_key(&other),
+            "a response not waiting on credit stays"
+        );
+        assert_eq!(st.next_deadline(), None);
+        st.send_stall_timeout = None;
+        st.pending.get_mut(&other).unwrap().stall = Some(SendStall {
+            since: t0,
+            progressed: 0,
+        });
+        assert!(reclaim_stalled_sends(&mut st, t0 + timeout * 10).is_empty());
     }
 
     #[test]
@@ -5436,6 +5746,7 @@ mod h3_codec_tests {
                 ))
                 .collect(),
                 fin: false,
+                stall: None,
             },
         );
 

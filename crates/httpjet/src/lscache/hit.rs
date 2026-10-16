@@ -167,6 +167,20 @@ pub(super) fn build_hit_response(
             h.insert(CONTENT_ENCODING, v);
         }
         merge_vary_accept_encoding(h);
+        // The stored ETag validates the identity body; the encoded representation needs
+        // its own, exactly as the miss path's compress transform labels it (#659).
+        let enc = match tok {
+            "zstd" => Some(Encoding::Zstd),
+            "br" => Some(Encoding::Brotli),
+            "gzip" => Some(Encoding::Gzip),
+            _ => None,
+        };
+        match enc {
+            Some(enc) => hj_compress::tag_etag_variant(&mut resp, enc),
+            None => {
+                resp.headers_mut().remove(ETAG);
+            }
+        }
     }
     Some(resp)
 }
@@ -711,6 +725,30 @@ mod tests {
                 .0,
             "gzip"
         );
+    }
+
+    #[test]
+    fn variant_hit_relabels_strong_etag_like_the_miss_path() {
+        // #659: the stored strong ETag validates the identity body only.
+        let hit = |etag: &'static str, ae: &str| {
+            let mut e = entry_with_variants(b"identity-body", &[("zstd", b"ZS")]);
+            e.headers.push((ETAG, HeaderValue::from_static(etag)));
+            build_hit_response(
+                &e,
+                Instant::now(),
+                AcceptEncoding::parse(ae),
+                false,
+                None,
+                None,
+                || e.body.in_mem(),
+                || None,
+            )
+            .unwrap()
+        };
+        assert_eq!(hit("\"1-2-3;;;\"", "zstd").headers()[ETAG], "\"1-2-3;zs\"");
+        assert!(!hit("\"abc\"", "zstd").headers().contains_key(ETAG));
+        assert_eq!(hit("W/\"pc1\"", "zstd").headers()[ETAG], "W/\"pc1\"");
+        assert_eq!(hit("\"1-2-3;;;\"", "").headers()[ETAG], "\"1-2-3;;;\"");
     }
 
     #[test]

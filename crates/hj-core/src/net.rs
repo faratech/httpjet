@@ -277,29 +277,58 @@ pub const FORWARDING_AUTHORITY_HEADERS: &[&str] = &[
     "x-cluster-client-ip",
 ];
 
+/// Whether `name` asserts a client identity or scheme on behalf of a proxy.
+///
+/// Names compare case-insensitively with `_` folded to `-` (lsphp maps both to
+/// the same `HTTP_*` variable). Besides the enumerated list, whole classes fail
+/// closed (#585, #600): `forwarded*`, `x-forwarded*` (including a bare
+/// `X-Forwarded`), `*-client-ip`, `*-real-ip`, Cloudflare's `CF-Connecting-IPv6`
+/// and `Cf-Pseudo-IPv4`, and any `x-`/`cf-`/`true-`/`fastly-` name ending in
+/// `-ip`, `-ipv4`, `-ipv6` or `-addr` (`X-Remote-Addr`, `X-Originating-IP`,
+/// `X-AppEngine-User-IP`, `X-ProxyUser-Ip`, ...) — the lookup set of common
+/// client-IP resolvers such as npm `request-ip`.
 pub fn is_forwarding_authority_header(name: &str) -> bool {
+    let n = name.as_bytes();
     if FORWARDING_AUTHORITY_HEADERS
         .iter()
-        .any(|known| known.eq_ignore_ascii_case(name))
+        .any(|known| folded_eq(n, known.as_bytes()))
     {
         return true;
     }
-    // Class-based catch for synonyms the enumeration misses (#585): any
-    // normalized (dash/underscore-folded) name that asserts a client identity
-    // or scheme on behalf of a proxy — the *-client-ip family (X-Client-IP,
-    // Proxy-Client-IP, WL-Proxy-Client-IP), the X-Forwarded-* family beyond
-    // the listed members (X-Forwarded-Protocol/-Scheme), and *-real-ip forms.
-    // Unrecognized members of the class fail closed; ordinary headers
-    // (user-agent, accept, x-requested-with) are outside the class.
-    let n = name.to_ascii_lowercase().replace('_', "-");
-    n == "forwarded"
-        || n.starts_with("forwarded-")
-        || n.starts_with("x-forwarded-")
-        || n == "client-ip"
-        || n.ends_with("-client-ip")
-        || n == "real-ip"
-        || n.ends_with("-real-ip")
-        || n == "x-client-ip"
+    const IDENTITY_PREFIXES: [&[u8]; 4] = [b"x-", b"cf-", b"true-", b"fastly-"];
+    const IDENTITY_SUFFIXES: [&[u8]; 4] = [b"-ip", b"-ipv4", b"-ipv6", b"-addr"];
+    folded_eq(n, b"forwarded")
+        || folded_starts(n, b"forwarded-")
+        || folded_starts(n, b"x-forwarded")
+        || folded_eq(n, b"client-ip")
+        || folded_ends(n, b"-client-ip")
+        || folded_eq(n, b"real-ip")
+        || folded_ends(n, b"-real-ip")
+        || folded_starts(n, b"cf-connecting-ip")
+        || folded_eq(n, b"cf-pseudo-ipv4")
+        || (IDENTITY_PREFIXES.iter().any(|p| folded_starts(n, p))
+            && IDENTITY_SUFFIXES.iter().any(|s| folded_ends(n, s)))
+}
+
+fn fold(b: u8) -> u8 {
+    if b == b'_' {
+        b'-'
+    } else {
+        b.to_ascii_lowercase()
+    }
+}
+
+/// `name` equals the lowercase, dash-separated `lit` after folding.
+fn folded_eq(name: &[u8], lit: &[u8]) -> bool {
+    name.len() == lit.len() && name.iter().zip(lit).all(|(&a, &b)| fold(a) == b)
+}
+
+fn folded_starts(name: &[u8], lit: &[u8]) -> bool {
+    name.len() >= lit.len() && folded_eq(&name[..lit.len()], lit)
+}
+
+fn folded_ends(name: &[u8], lit: &[u8]) -> bool {
+    name.len() >= lit.len() && folded_eq(&name[name.len() - lit.len()..], lit)
 }
 
 #[cfg(test)]
@@ -333,6 +362,45 @@ mod forwarding_authority_tests {
             assert!(is_forwarding_authority_header(name), "{name}");
         }
         for name in ["user-agent", "accept", "x-requested-with", "x-cache"] {
+            assert!(!is_forwarding_authority_header(name), "{name}");
+        }
+    }
+
+    /// Regression (#600): identity headers honored by common client-IP
+    /// resolvers fail closed too, without catching ordinary `x-*` names.
+    #[test]
+    fn resolver_identity_headers_fail_closed() {
+        for name in [
+            "X-Forwarded",
+            "X-AppEngine-User-IP",
+            "Cf-Pseudo-IPv4",
+            "CF-Connecting-IPv6",
+            "X-ProxyUser-Ip",
+            "X-Remote-Addr",
+            "X-Remote-IP",
+            "X-Originating-IP",
+            "X_Forwarded_For",
+            "True-Client-IPv6",
+            "Fastly-Client-Addr",
+        ] {
+            assert!(is_forwarding_authority_header(name), "{name}");
+        }
+        for name in [
+            "x-requested-with",
+            "x-csrf-token",
+            "x-api-key",
+            "x-xss-protection",
+            "x-content-type-options",
+            "x-ship",
+            "x-zip",
+            "x-tip-jar",
+            "cf-ray",
+            "cf-ipcountry",
+            "cf-visitor",
+            "accept-encoding",
+            "referer",
+            "cookie",
+        ] {
             assert!(!is_forwarding_authority_header(name), "{name}");
         }
     }

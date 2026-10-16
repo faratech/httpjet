@@ -152,6 +152,106 @@ fn bounded_vary_value(v: &str) -> String {
     format!("h:{:016x}", h.finish())
 }
 
+/// The `$_COOKIE` key PHP derives from a raw cookie name (php_register_variable_ex):
+/// leading spaces are dropped, ` `/`.` become `_`, and a `[` opens an array index when a
+/// `]` follows it — otherwise that `[` and every later ` `/`.`/`[` become `_`
+/// (`xf[style_id` arrives as `xf_style_id`, #656). Trailing whitespace is NOT trimmed
+/// (`xf_style_id ` arrives as `xf_style_id_`). `None` for a name PHP drops (empty base).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhpCookieName<'a> {
+    Scalar(std::borrow::Cow<'a, str>),
+    /// `base[...]`: PHP stores an ARRAY under `base`.
+    Array(std::borrow::Cow<'a, str>),
+}
+
+impl PhpCookieName<'_> {
+    pub fn name(&self) -> &str {
+        match self {
+            PhpCookieName::Scalar(n) | PhpCookieName::Array(n) => n,
+        }
+    }
+}
+
+pub fn php_cookie_name(raw_name: &str) -> Option<PhpCookieName<'_>> {
+    use std::borrow::Cow;
+    fn map(s: &str, bracket: bool) -> Cow<'_, str> {
+        let hit = |c: char| c == ' ' || c == '.' || (bracket && c == '[');
+        if s.contains(hit) {
+            Cow::Owned(s.replace(hit, "_"))
+        } else {
+            Cow::Borrowed(s)
+        }
+    }
+    let s = raw_name.trim_start_matches(' ');
+    let result = match s.find('[') {
+        Some(i) if s[i + 1..].contains(']') => PhpCookieName::Array(map(&s[..i], false)),
+        Some(i) => {
+            let mut n = map(&s[..i], false).into_owned();
+            n.push('_');
+            n.push_str(&map(&s[i + 1..], true));
+            PhpCookieName::Scalar(Cow::Owned(n))
+        }
+        None => PhpCookieName::Scalar(map(s, false)),
+    };
+    (!result.name().is_empty()).then_some(result)
+}
+
+/// True when `raw_name` is a cookie PHP will expose under the `$_COOKIE` key `canonical`
+/// (scalar or array form; see [`php_cookie_name`]). Callers pass the name UNtrimmed at
+/// its end: PHP keeps trailing whitespace as `_`.
+pub fn php_cookie_name_eq(raw_name: &str, canonical: &str) -> bool {
+    php_cookie_name(raw_name).is_some_and(|n| n.name() == canonical)
+}
+
+/// PHP's cookie parser skips only ASCII whitespace (` \t\n\v\f\r`); `str::trim` would also
+/// strip U+00A0 and friends, which PHP keeps as part of the name (#656).
+pub fn php_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b')
+}
+
+/// The pair PHP exposes as `$_COOKIE[canonical]`: scalars are first-wins, but an array-form
+/// name (`canonical[k]=v`) replaces a scalar in either order (#656).
+pub fn php_cookie_lookup<'a>(
+    cookies: &'a str,
+    canonical: &str,
+) -> Option<(PhpCookieName<'a>, &'a str, &'a str)> {
+    let mut scalar = None;
+    for pair in cookies.split(';') {
+        // A bare `name` (no `=`) is registered by PHP with an empty value, and only
+        // leading whitespace is skipped: `xf_style_id ;` arrives as `xf_style_id_`.
+        let pair = pair.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(parsed) = php_cookie_name(name) else {
+            continue;
+        };
+        if parsed.name() != canonical {
+            continue;
+        }
+        if matches!(parsed, PhpCookieName::Array(_)) {
+            return Some((parsed, name, value));
+        }
+        if scalar.is_none() {
+            scalar = Some((parsed, name, value));
+        }
+    }
+    scalar
+}
+
+/// The vary token for one matched cookie: an array-form cookie (`name[k]=v`) renders
+/// differently from any scalar value, so it keys its own slot instead of `v:<value>`.
+fn cookie_vary_token(parsed: &PhpCookieName<'_>, raw_name: &str, value: &str) -> String {
+    match parsed {
+        PhpCookieName::Scalar(_) => bounded_vary_value(value),
+        PhpCookieName::Array(_) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            raw_name.hash(&mut h);
+            value.hash(&mut h);
+            format!("a:{:016x}", h.finish())
+        }
+    }
+}
+
 pub fn compute_vary_value<S: AsRef<str>>(
     cookie_header: Option<&str>,
     vary_cookies: &[S],
@@ -181,16 +281,13 @@ pub fn compute_vary_value_with_defaults<S: AsRef<str>>(
     // a format!/Vec<String>/join chain. The no-match guest case allocates nothing.
     let mut found: Vec<(&str, String)> = Vec::new();
     for configured_name in vary_cookies {
-        let value = cookies.split(';').find_map(|pair| {
-            let (name, value) = pair.trim().split_once('=')?;
-            (name.trim() == *configured_name).then_some(value.trim())
-        });
-        if let Some(value) = value {
-            let is_default = defaults
-                .iter()
-                .any(|(n, v)| n == *configured_name && v == value);
+        if let Some((parsed, raw_name, value)) = php_cookie_lookup(cookies, configured_name) {
+            let is_default = matches!(parsed, PhpCookieName::Scalar(_))
+                && defaults
+                    .iter()
+                    .any(|(n, v)| n == *configured_name && v == value);
             if !is_default {
-                found.push((configured_name, bounded_vary_value(value)));
+                found.push((configured_name, cookie_vary_token(&parsed, raw_name, value)));
             }
         }
     }
@@ -241,15 +338,9 @@ pub fn vary_value_from_request(cookie_header: Option<&str>, vary_cookie_name: &s
     if vary_cookie_name.is_empty() {
         return String::new();
     }
-    for pair in cookies.split(';') {
-        let pair = pair.trim();
-        if let Some((name, val)) = pair.split_once('=') {
-            if name.trim() == vary_cookie_name {
-                return bounded_vary_value(val.trim());
-            }
-        }
-    }
-    String::new()
+    php_cookie_lookup(cookies, vary_cookie_name)
+        .map(|(parsed, name, val)| cookie_vary_token(&parsed, name, val))
+        .unwrap_or_default()
 }
 
 /// Unified 64-bit cache key that discriminates between page and static entries.
@@ -491,6 +582,123 @@ mod tests {
         assert_eq!(canon, "xf_style_variation=v:dark");
         assert_eq!(upper, "");
         assert_ne!(canon, upper);
+    }
+
+    #[test]
+    fn vary_value_matches_php_mangled_cookie_names() {
+        // #616: PHP maps `.`/` ` in cookie names to `_`.
+        assert_eq!(
+            compute_vary_value(Some("xf.style.id=7"), &style_cookies()),
+            "xf_style_id=v:7"
+        );
+        assert_eq!(
+            compute_vary_value(Some("xf style id=7"), &style_cookies()),
+            "xf_style_id=v:7"
+        );
+        assert_eq!(
+            vary_value_from_request(Some("xf.session=abc"), "xf_session"),
+            "v:abc"
+        );
+        assert!(!php_cookie_name_eq("xf_style_id", "xf.style.id"));
+        assert!(!php_cookie_name_eq("xfXstyle_id", "xf_style_id"));
+    }
+
+    #[test]
+    fn vary_value_follows_php_bracket_and_trailing_space_mangling() {
+        // #656: expectations from php-cgi 8.5 `var_export($_COOKIE)`.
+        for raw in [
+            "xf[style_id=7",
+            "xf.style[id=7",
+            "xf[style.id=7",
+            " xf_style_id=7",
+        ] {
+            assert_eq!(
+                compute_vary_value(Some(raw), &style_cookies()),
+                "xf_style_id=v:7",
+                "{raw}"
+            );
+        }
+        // PHP sees `xf_style_id_` / `xf_style_id]`: not the vary cookie.
+        for raw in ["xf_style_id =7", "xf_style_id[=7", "xf_style_id]=7"] {
+            assert_eq!(compute_vary_value(Some(raw), &style_cookies()), "", "{raw}");
+        }
+        let array = compute_vary_value(Some("xf_style_id[a]=7"), &style_cookies());
+        assert!(array.starts_with("xf_style_id=a:"), "{array}");
+        assert_ne!(
+            array,
+            compute_vary_value(Some("xf_style_id[b]=7"), &style_cookies())
+        );
+        assert_eq!(
+            php_cookie_name("xf[[style_id"),
+            Some(PhpCookieName::Scalar("xf__style_id".into()))
+        );
+        assert_eq!(
+            php_cookie_name("xf[style_id]x"),
+            Some(PhpCookieName::Array("xf".into()))
+        );
+        assert_eq!(php_cookie_name("[a]"), None);
+        assert!(php_cookie_name_eq("xf[user", "xf_user"));
+        assert!(!php_cookie_name_eq("xf_user ", "xf_user"));
+    }
+
+    #[test]
+    fn vary_lookup_lets_arrays_override_scalars_and_trims_ascii_only() {
+        // #656 residuals, expectations from php-cgi 8.5.
+        for raw in [
+            "xf_style_id=8; xf_style_id[a]=7",
+            "xf_style_id[a]=7; xf_style_id=8",
+        ] {
+            let v = compute_vary_value(Some(raw), &style_cookies());
+            assert!(v.starts_with("xf_style_id=a:"), "{raw}: {v}");
+        }
+        assert_eq!(
+            compute_vary_value(Some("xf_style_id=8; xf.style_id=7"), &style_cookies()),
+            "xf_style_id=v:8"
+        );
+        assert_eq!(
+            compute_vary_value(Some("a=1;\u{a0}xf_style_id=7"), &style_cookies()),
+            ""
+        );
+        assert_eq!(
+            compute_vary_value(Some("a=1;\x0bxf_style_id=7"), &style_cookies()),
+            "xf_style_id=v:7"
+        );
+        assert_eq!(
+            vary_value_from_request(Some("xf_session=s; xf_session[x]=1"), "xf_session")
+                .split(':')
+                .next(),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn cookie_values_keep_their_whitespace_like_php() {
+        // PHP keeps `dark ` distinct from `dark`; trimming would merge two renders.
+        let v = |h: &str| compute_vary_value(Some(h), &["xf_style_variation"]);
+        assert_ne!(v("xf_style_variation=dark "), v("xf_style_variation=dark"));
+        assert_ne!(v("xf_style_variation= dark"), v("xf_style_variation=dark"));
+        assert_eq!(
+            v("a=1; xf_style_variation=dark"),
+            v("xf_style_variation=dark")
+        );
+    }
+
+    #[test]
+    fn valueless_cookie_registers_empty_value_like_php() {
+        // php-cgi: `xf_style_id; xf_style_id=7` → $_COOKIE['xf_style_id'] === ''.
+        assert_eq!(
+            compute_vary_value(Some("xf_style_id; xf_style_id=7"), &style_cookies()),
+            compute_vary_value(Some("xf_style_id="), &style_cookies())
+        );
+        assert_eq!(
+            compute_vary_value(Some("xf_style_id=7; xf_style_id"), &style_cookies()),
+            "xf_style_id=v:7"
+        );
+        assert_eq!(
+            php_cookie_lookup("xf_user", "xf_user").map(|(_, _, v)| v),
+            Some("")
+        );
+        assert_eq!(php_cookie_lookup(" xf_user ;a=1", "xf_user"), None);
     }
 
     #[test]

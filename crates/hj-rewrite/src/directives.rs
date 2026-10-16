@@ -17,8 +17,8 @@
 //!   basename.
 //! * `<DirectoryMatch "regex">` / `<Directory>` match against the directory
 //!   path.
-//! * Access merges in source order, later wins for the same target — but a
-//!   matched `denied` is treated *fail-safe*: see [`Htaccess::access_decision`].
+//! * Access merges in Apache's section order, later wins within a phase: see
+//!   [`Htaccess::access_decision`].
 //! * `Header` honors `always` vs `onsuccess` (the latter only applies on a 2xx/
 //!   3xx response), the `env=[!]NAME` guard, FilesMatch/`<If>` scoping, and
 //!   `%{VAR}e` environment interpolation in the value.
@@ -59,10 +59,9 @@ impl Htaccess {
     /// * `<Files ~ "re">` / `<FilesMatch "re">` -> regex against the basename.
     /// * `<DirectoryMatch "re">` / `<Directory>` -> regex against `rel_path`.
     ///
-    /// Sections are evaluated in source order; a later same-scope section wins
-    /// (matching Apache's `Require` merge). The result is **fail-safe**: the
-    /// method is currently advisory (Apache `<Limit>` is not modelled here), so
-    /// any matching `denied` section produces [`AccessDecision::Denied`].
+    /// Rules merge in Apache's order — directory-level (including `<Limit>`
+    /// method filters), then `<Files*>`, then `<If>`/`<Else>` — and within a
+    /// phase a later matching rule wins.
     pub fn access_decision(&self, rel_path: &str, method: &str) -> AccessDecision {
         // Standalone convenience check: incomplete auth cannot be satisfied.
         // The pipeline uses access_decision_for for host ACLs and separately
@@ -84,10 +83,10 @@ impl Htaccess {
         method: &str,
         subject: &AccessSubject<'_>,
     ) -> AccessDecision {
-        let _ = method; // reserved for future <Limit METHOD> support.
         let basename = basename(rel_path);
         let ext = ext_lower(basename);
         let mut decision = AccessDecision::NoOpinion;
+        let mut winner_phase = 0;
         // The `access_rules` model is authoritative: it carries directory-wide
         // rules (top-level `Deny from all`, #4), `<If>`-scoped rules (#5), and
         // fail-closed unrecognized `Require` predicates (#2) — none of which the
@@ -95,15 +94,33 @@ impl Htaccess {
         // scan to rules whose scope could match (a pure superset filter); the
         // matcher below is still the arbiter, and candidates arrive in ascending
         // source order so "later wins" is preserved.
+        // Source-order winner among directory-level (phase 0) rules, and whether it
+        // is an httpjet `<Directory*>` deny.
+        let mut directory_deny = false;
         for i in self.access_index.candidates(basename, &ext) {
             let rule = &self.access_rules[i];
-            if rule.matches(rel_path, basename) {
-                decision = if rule.denies(subject) {
+            let phase = rule.merge_phase();
+            if !rule.matches(rel_path, basename, method) {
+                continue;
+            }
+            let denies = rule.denies(subject);
+            if phase == 0 {
+                directory_deny = denies && rule.is_directory_scoped();
+            }
+            if phase >= winner_phase {
+                winner_phase = phase;
+                decision = if denies {
                     AccessDecision::Denied
                 } else {
                     AccessDecision::Granted
                 };
             }
+        }
+        // A `<Files>`/`<If>` grant must not open a sensitive directory denied by a
+        // `<Directory*>` matcher (no Apache .htaccess analogue; the live forum file
+        // relies on it, e.g. `<Files auth.md>` grant vs a later backups/ deny).
+        if directory_deny && decision == AccessDecision::Granted && winner_phase > 0 {
+            return AccessDecision::Denied;
         }
         decision
     }
@@ -494,26 +511,48 @@ impl Htaccess {
             let Some(subject) = attrs.resolve(&s.attribute) else {
                 continue;
             };
-            // (#312) Literal-prefix prefilter (fail open): a ^-anchored pattern's
-            // leading literal run must be a prefix of the subject.
-            if !s.literal_prefix.is_empty()
-                && !subject
-                    .as_ref()
-                    .as_bytes()
-                    .starts_with(s.literal_prefix.as_ref())
-            {
-                continue;
-            }
-            match s.regex.captures(subject.as_ref()) {
-                Ok(Some(caps)) => {
-                    let value = expand_backrefs(&s.value, &caps);
-                    out.push((s.var.clone(), value));
-                }
-                Ok(None) => {}
-                Err(_) => return Err("SetEnvIf regex failed at match time"),
+            if let Some(value) = eval_set_env_subject(s, subject.as_ref())? {
+                out.push((s.var.clone(), value));
             }
         }
         Ok(out)
+    }
+
+    /// Cookie-dependent assignments in the same order and with the same
+    /// capture expansion as `eval_set_env`. Cache keys can distinguish their
+    /// effects without fragmenting on unrelated cookies in the same header.
+    pub fn eval_cookie_env(
+        &self,
+        cookie: Option<&str>,
+    ) -> Result<Vec<(String, String)>, &'static str> {
+        let mut out = Vec::new();
+        let Some(cookie) = cookie else { return Ok(out) };
+        for rule in &self.set_env_if {
+            if rule.attribute.eq_ignore_ascii_case("cookie")
+                && let Some(value) = eval_set_env_subject(rule, cookie)?
+            {
+                out.push((rule.var.clone(), value));
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn eval_set_env_subject(
+    rule: &crate::htaccess::SetEnvIf,
+    subject: &str,
+) -> Result<Option<String>, &'static str> {
+    // Keep the literal-prefix guard shared by normal evaluation and cache
+    // discrimination, including the empty-prefix NoCase behavior.
+    if !rule.literal_prefix.is_empty()
+        && !subject.as_bytes().starts_with(rule.literal_prefix.as_ref())
+    {
+        return Ok(None);
+    }
+    match rule.regex.captures(subject) {
+        Ok(Some(caps)) => Ok(Some(expand_backrefs(&rule.value, &caps))),
+        Ok(None) => Ok(None),
+        Err(_) => Err("SetEnvIf regex failed at match time"),
     }
 }
 
@@ -584,6 +623,7 @@ fn ext_lower(basename: &str) -> std::borrow::Cow<'_, str> {
 mod directive_tests {
     use super::*;
     use crate::Htaccess;
+    use crate::error::RewriteError;
 
     /// A case-insensitive header lookup closure over a `(name, value)` slice — the test analogue
     /// of the production `req.headers()` callback. Bind it to a `let` so the `&` lives long enough
@@ -810,17 +850,52 @@ mod directive_tests {
         );
     }
 
+    /// Regression (#604): an access section whose regex does not compile is a parse
+    /// error, so the file fails closed (deny-all sentinel), never a silent drop of
+    /// the `Require`/`Deny` it encloses.
     #[test]
-    fn access_uncompilable_section_pattern_does_not_deny_whole_directory() {
-        // A <FilesMatch> whose regex fails to compile must NOT collapse into a
-        // directory-wide deny (that would 403 every file). It is dropped.
-        let h =
-            Htaccess::parse("<FilesMatch \"[unterminated\">\n  Require all denied\n</FilesMatch>")
-                .unwrap();
+    fn uncompilable_regex_section_fails_the_file_closed() {
+        for text in [
+            "<FilesMatch \"[unterminated\">\n  Require all denied\n</FilesMatch>",
+            "<Files ~ \"(\">\n  Require all denied\n</Files>",
+            "<DirectoryMatch \"[\">\n  Deny from all\n</DirectoryMatch>",
+        ] {
+            assert!(
+                matches!(
+                    Htaccess::parse(text),
+                    Err(RewriteError::BadRegex { line: 1, .. })
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    /// A glob can always be translated: an unterminated `[` is literal (fnmatch),
+    /// so `<Files "glob">` never trips the fail-closed path by accident.
+    #[test]
+    fn glob_section_with_unbalanced_bracket_matches_literally() {
+        let h = Htaccess::parse("<Files \"[x\">\n  Require all denied\n</Files>").unwrap();
+        assert_eq!(h.access_decision("/dir/[x", "GET"), AccessDecision::Denied);
         assert_eq!(
-            h.access_decision("/anything.txt", "GET"),
+            h.access_decision("/dir/a.txt", "GET"),
             AccessDecision::NoOpinion
         );
+        let h = Htaccess::parse("<Files \"*.[ch]\">\n  Require all denied\n</Files>").unwrap();
+        assert_eq!(h.access_decision("/src/a.c", "GET"), AccessDecision::Denied);
+        assert_eq!(
+            h.access_decision("/src/a.o", "GET"),
+            AccessDecision::NoOpinion
+        );
+        for glob in [
+            "[", "]", "[!", "[]", "[]]", "[!]]", "a[\\\\]b", "[[x]", "[a-", "\\\\", "[!]", "[^]",
+            "[^]]", "[z-a]*", "*.[z-a]",
+        ] {
+            let text = format!("<Files \"{glob}\">\n  Require all denied\n</Files>");
+            assert!(
+                Htaccess::parse(&text).is_ok(),
+                "glob {glob:?} must always compile"
+            );
+        }
     }
 
     #[test]

@@ -112,20 +112,14 @@ impl HostEntry {
                     .filter(|_| addr.is_ipv4())
                     .and_then(contiguous_mask_prefix),
             };
-            return match prefix {
-                Some(prefix) => HostEntry::Net {
-                    addr: normalize(addr),
-                    prefix,
-                },
-                None => HostEntry::Unevaluable(token.to_string()),
-            };
+            return prefix
+                .and_then(|prefix| net_entry(addr, prefix))
+                .unwrap_or_else(|| HostEntry::Unevaluable(token.to_string()));
         }
         if let Ok(addr) = token.parse::<IpAddr>() {
             let prefix = if addr.is_ipv4() { 32 } else { 128 };
-            return HostEntry::Net {
-                addr: normalize(addr),
-                prefix,
-            };
+            return net_entry(addr, prefix)
+                .unwrap_or_else(|| HostEntry::Unevaluable(token.to_string()));
         }
         // Partial dotted-quad (`10`, `10.1`, `10.1.2`): the leading 1-3 octets.
         let octets: Vec<&str> = token.split('.').collect();
@@ -205,6 +199,22 @@ fn normalize(addr: IpAddr) -> IpAddr {
     }
 }
 
+/// An IPv4-mapped IPv6 network folds to its V4 form, so its prefix drops the
+/// 96-bit `::ffff:` head; a mapped prefix shorter than that spans non-mapped
+/// space and is rejected.
+fn net_entry(addr: IpAddr, prefix: u8) -> Option<HostEntry> {
+    match addr {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => prefix.checked_sub(96).map(|prefix| HostEntry::Net {
+                addr: IpAddr::V4(v4),
+                prefix,
+            }),
+            None => Some(HostEntry::Net { addr, prefix }),
+        },
+        IpAddr::V4(_) => Some(HostEntry::Net { addr, prefix }),
+    }
+}
+
 fn contiguous_mask_prefix(mask: Ipv4Addr) -> Option<u8> {
     let bits = u32::from(mask);
     let ones = bits.leading_ones();
@@ -214,11 +224,15 @@ fn contiguous_mask_prefix(mask: Ipv4Addr) -> Option<u8> {
 fn net_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
     match (net, normalize(ip)) {
         (IpAddr::V4(n), IpAddr::V4(a)) => {
-            let shift = 32 - u32::from(prefix);
+            let Some(shift) = 32u32.checked_sub(u32::from(prefix)) else {
+                return false;
+            };
             shift >= 32 || (u32::from(n) >> shift) == (u32::from(a) >> shift)
         }
         (IpAddr::V6(n), IpAddr::V6(a)) => {
-            let shift = 128 - u32::from(prefix);
+            let Some(shift) = 128u32.checked_sub(u32::from(prefix)) else {
+                return false;
+            };
             shift >= 128 || (u128::from(n) >> shift) == (u128::from(a) >> shift)
         }
         _ => false,
@@ -412,5 +426,45 @@ mod tests {
             parse_host_entries("from all 10.0.0.0/8"),
             Some(vec![HostEntry::All, HostEntry::parse("10.0.0.0/8")])
         );
+    }
+
+    #[test]
+    fn ipv4_mapped_v6_operands_fold_to_v4_prefix_width() {
+        assert_eq!(
+            HostEntry::parse("::ffff:10.1.2.3"),
+            HostEntry::Net {
+                addr: "10.1.2.3".parse().unwrap(),
+                prefix: 32
+            }
+        );
+        assert_eq!(
+            HostEntry::parse("::ffff:10.1.0.0/112"),
+            HostEntry::Net {
+                addr: "10.1.0.0".parse().unwrap(),
+                prefix: 16
+            }
+        );
+        assert!(HostEntry::parse("::ffff:10.1.0.0/95").is_unevaluable());
+
+        let deny = HostAccess {
+            order: AccessOrder::DenyAllow,
+            allow: vec![],
+            deny: vec![HostEntry::parse("::ffff:10.1.2.3")],
+        };
+        let subject = |s| AccessSubject {
+            client_ip: ip(s),
+            env_set: None,
+        };
+        assert!(deny.permits(&subject("8.8.8.8")));
+        assert!(!deny.permits(&subject("10.1.2.3")));
+        assert!(!deny.permits(&subject("::ffff:10.1.2.3")));
+
+        let allow = HostAccess {
+            order: AccessOrder::parse("Allow,Deny"),
+            allow: vec![HostEntry::parse("::ffff:10.1.0.0/112")],
+            deny: vec![],
+        };
+        assert!(allow.permits(&subject("10.1.200.7")));
+        assert!(!allow.permits(&subject("8.8.8.8")));
     }
 }

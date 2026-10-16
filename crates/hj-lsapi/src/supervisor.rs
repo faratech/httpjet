@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+#[cfg(test)]
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -432,6 +433,7 @@ pub struct LsphpSupervisor {
     /// `dup` (it is never mutated after [`Self::with_listen_fd`]); kept OUTSIDE
     /// `Inner` so `start()`'s pre_exec path never touches the async-state lock.
     listen_fd: Mutex<Option<OwnedFd>>,
+    bound_socket: Mutex<Option<BoundSocketPath>>,
 }
 
 impl LsphpSupervisor {
@@ -458,6 +460,7 @@ impl LsphpSupervisor {
             subreaper_ready,
             cancel: CancellationToken::new(),
             listen_fd: Mutex::new(None),
+            bound_socket: Mutex::new(None),
         }
     }
 
@@ -665,12 +668,10 @@ impl LsphpSupervisor {
         // acquire this per-start OwnedFd differs.
         let listen_fd: OwnedFd = match self.cfg.socket_source {
             SocketSource::Bind => {
-                // Bind a fresh listening socket (remove any stale socket file first).
-                let _ = std::fs::remove_file(&self.cfg.socket_path);
-                let listener = StdUnixListener::bind(&self.cfg.socket_path)?;
-                rustix::net::listen(&listener, self.cfg.backlog as i32)
-                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
-                listener.into()
+                let (fd, owned) =
+                    bind_private_socket(&self.cfg.socket_path, self.cfg.backlog as i32)?;
+                *self.bound_socket.lock() = Some(owned);
+                fd
             }
             SocketSource::Inherited => {
                 // Systemd owns the socket. Duplicate it with CLOEXEC so the pre_exec source
@@ -926,20 +927,7 @@ impl LsphpSupervisor {
     /// LSAPI request (or, where a chroot makes the probe script unavailable,
     /// returns lsphp's worker PID frame) or the timeout elapses.
     async fn wait_until_ready(&self, expected_master: u32) -> io::Result<()> {
-        let script = match ReadinessScript::create(&self.cfg, expected_master) {
-            Ok(script) => Some(script),
-            Err(error)
-                if self.cfg.jail.chroot.is_some() && error.kind() == io::ErrorKind::Unsupported =>
-            {
-                None
-            }
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("could not create lsphp readiness script: {error}"),
-                ));
-            }
-        };
+        let script = readiness_script_or_fallback(&self.cfg, expected_master)?;
         let deadline = tokio::time::Instant::now() + self.cfg.start_timeout;
         let mut last_error = io::Error::new(io::ErrorKind::NotConnected, "no readiness attempt");
         loop {
@@ -1070,7 +1058,7 @@ impl LsphpSupervisor {
         // socket file and must keep it across the drain so the next adopter (and any client
         // dialing during the swap) still finds it.
         if matches!(self.cfg.socket_source, SocketSource::Bind) {
-            let _ = std::fs::remove_file(&self.cfg.socket_path);
+            self.unlink_bound_socket();
         }
         {
             let mut g = self.inner.lock();
@@ -1458,6 +1446,12 @@ impl LsphpSupervisor {
     }
 }
 
+impl LsphpSupervisor {
+    fn unlink_bound_socket(&self) {
+        self.bound_socket.lock().take();
+    }
+}
+
 fn duplicate_listen_fd(fd: &impl AsFd) -> io::Result<OwnedFd> {
     rustix::io::fcntl_dupfd_cloexec(fd, 3)
         .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
@@ -1476,6 +1470,56 @@ struct ReadinessScript {
     path: PathBuf,
 }
 
+/// The readiness script for a candidate, or `None` when the probe must rely on the
+/// kernel-generated worker PID frame alone: inside a chroot (the script is not
+/// visible there), or when its name in a shared temp directory is already taken.
+/// A same-uid process can pre-create names there, and failing the candidate on
+/// that would let it block every lsphp start and reload (#607).
+fn readiness_script_or_fallback(
+    cfg: &SupervisorConfig,
+    master_pid: u32,
+) -> io::Result<Option<ReadinessScript>> {
+    match ReadinessScript::create(cfg, master_pid) {
+        Ok(script) => Ok(Some(script)),
+        Err(error) if cfg.jail.chroot.is_some() && error.kind() == io::ErrorKind::Unsupported => {
+            Ok(None)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            tracing::warn!(
+                target: "hj_lsapi",
+                error = %error,
+                "lsphp readiness script name is already taken; probing by worker PID frame only"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("could not create lsphp readiness script: {error}"),
+        )),
+    }
+}
+
+/// Where the readiness script is written: the socket's directory when only this
+/// uid can write it AND any uid can traverse it (prod: the root-owned 0755
+/// /run/httpjet RuntimeDirectory) — lsphp workers run with dropped credentials and
+/// must be able to open the script. Otherwise the temp directory. `true` means the
+/// directory is private.
+fn readiness_dir(cfg: &SupervisorConfig) -> (PathBuf, bool) {
+    use std::os::unix::fs::MetadataExt;
+    let private = cfg.socket_path.parent().filter(|dir| {
+        std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+            meta.is_dir()
+                && meta.uid() == rustix::process::geteuid().as_raw()
+                && meta.mode() & 0o022 == 0
+                && meta.mode() & 0o001 != 0
+        })
+    });
+    match private {
+        Some(dir) => (dir.to_path_buf(), true),
+        None => (std::env::temp_dir(), false),
+    }
+}
+
 impl ReadinessScript {
     fn create(cfg: &SupervisorConfig, master_pid: u32) -> io::Result<Self> {
         use std::io::Write;
@@ -1487,10 +1531,19 @@ impl ReadinessScript {
                 "readiness script is not visible inside a chroot",
             ));
         }
-        let path = std::env::temp_dir().join(format!(
+        let (dir, private) = readiness_dir(cfg);
+        let path = dir.join(format!(
             ".httpjet-lsapi-ready-{}-{master_pid}.php",
             std::process::id()
         ));
+        if private {
+            // Only this uid writes here: a leftover is ours (a SIGKILLed supervisor).
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1983,6 +2036,100 @@ fn process_belongs_to(mut pid: u32, master: u32) -> bool {
     false
 }
 
+fn prepare_bind_socket_path(path: &std::path::Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta)
+            if meta.file_type().is_socket()
+                && meta.uid() == rustix::process::geteuid().as_raw() =>
+        {
+            std::fs::remove_file(path)
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "LSAPI socket path {} is occupied by an unowned or non-socket file",
+                path.display()
+            ),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+struct BoundSocketPath {
+    _directory: std::fs::File,
+    pinned: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl Drop for BoundSocketPath {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::symlink_metadata(&self.pinned)
+            && (metadata.dev(), metadata.ino()) == (self.device, self.inode)
+        {
+            let _ = std::fs::remove_file(&self.pinned);
+        }
+    }
+}
+
+fn bind_private_socket(path: &Path, backlog: i32) -> io::Result<(OwnedFd, BoundSocketPath)> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "LSAPI socket needs a filename")
+    })?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let metadata = directory.metadata()?;
+    if ![0, rustix::process::geteuid().as_raw()].contains(&metadata.uid())
+        || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "LSAPI socket directory must be operator-owned and protected from entry replacement",
+        ));
+    }
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+    prepare_bind_socket_path(&pinned)?;
+    let listener = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )?;
+    // Preserve the configured name in /proc/net/unix for generation draining.
+    // If an ancestor changed after the directory was pinned, no owned socket
+    // appears at `pinned`: fail before admitting a dial or touching permissions.
+    rustix::net::bind(&listener, &SocketAddrUnix::new(path)?)?;
+    let metadata = std::fs::symlink_metadata(&pinned)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(io::Error::other(
+            "LSAPI socket pathname changed during bind",
+        ));
+    }
+    let owned = BoundSocketPath {
+        _directory: directory,
+        pinned,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    // std's UnixListener::bind already listens. Restrict the pinned pathname
+    // first so even umask zero cannot admit another uid before chmod.
+    std::fs::set_permissions(&owned.pinned, std::fs::Permissions::from_mode(0o600))?;
+    rustix::net::listen(&listener, backlog)?;
+    Ok((listener, owned))
+}
+
 fn process_has_marker(pid: u32, marker: &str) -> io::Result<bool> {
     let expected = format!("{GENERATION_MARKER_ENV}={marker}");
     match std::fs::read(format!("/proc/{pid}/environ")) {
@@ -1991,8 +2138,14 @@ fn process_has_marker(pid: u32, marker: &str) -> io::Result<bool> {
             .any(|entry| entry == expected.as_bytes())),
         Err(error)
             if error.kind() == io::ErrorKind::NotFound
-                || matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
+                || error.kind() == io::ErrorKind::PermissionDenied
+                || matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOENT) | Some(libc::ESRCH) | Some(libc::EACCES) | Some(libc::EPERM)
+                ) =>
         {
+            // Workers we spawned share our uid, so an unreadable environ is
+            // another user's process and cannot be in this generation.
             Ok(false)
         }
         Err(_) if proc_stat(pid).is_none() => Ok(false),
@@ -2405,6 +2558,7 @@ async fn finish_generation_drain(
     }
 
     forced_cleanup_count.fetch_add(1, Ordering::Relaxed);
+    log_drain_survivors(marker, master, &tracked, socket_path);
     tracing::warn!(
         generation_marker = marker,
         master_pid = ?master,
@@ -2501,6 +2655,78 @@ async fn finish_generation_drain(
             };
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+const SURVIVOR_LOG_LIMIT: usize = 32;
+const SURVIVOR_CMDLINE_CHARS: usize = 96;
+
+/// Name every tracked process still alive when the graceful window closes, so
+/// the operator can see why the drain needed SIGKILL. Logged under the binary's
+/// target because the production unit filters to `httpjet=info`.
+fn log_drain_survivors(
+    marker: &str,
+    master: Option<u32>,
+    tracked: &[TrackedPid],
+    socket_path: &Path,
+) {
+    let connections = lsapi_connection_inodes(socket_path).unwrap_or_default();
+    let survivors: Vec<&TrackedPid> = tracked.iter().filter(|process| process.alive()).collect();
+    tracing::warn!(
+        target: "httpjet",
+        generation_marker = marker,
+        master_pid = ?master,
+        survivors = survivors.len(),
+        lsapi_connections = connections.len(),
+        grace_secs = GRACE_TIMEOUT.as_secs(),
+        "lsphp generation survivors at the end of the graceful drain; forcing cleanup"
+    );
+    for process in survivors.iter().take(SURVIVOR_LOG_LIMIT) {
+        let state = process.state().map_or('?', char::from);
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", process.pid))
+            .map(|comm| comm.trim_end().to_string())
+            .unwrap_or_default();
+        let cmdline = std::fs::read(format!("/proc/{}/cmdline", process.pid))
+            .map(|raw| short_cmdline(&raw))
+            .unwrap_or_default();
+        let busy = process.is_lsapi && !process.lsapi_worker_is_idle();
+        let holds_connection =
+            process_holds_socket_inode(process.pid, process.start_time, &connections);
+        tracing::warn!(
+            target: "httpjet",
+            pid = process.pid,
+            comm = %comm,
+            cmdline = %cmdline,
+            state = %state,
+            master = Some(process.pid) == master,
+            is_lsapi = process.is_lsapi,
+            busy,
+            holds_connection,
+            "lsphp drain survivor"
+        );
+    }
+    if survivors.len() > SURVIVOR_LOG_LIMIT {
+        tracing::warn!(
+            target: "httpjet",
+            unlisted = survivors.len() - SURVIVOR_LOG_LIMIT,
+            "further lsphp drain survivors not listed"
+        );
+    }
+}
+
+fn short_cmdline(raw: &[u8]) -> String {
+    let joined = raw
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if joined.chars().count() > SURVIVOR_CMDLINE_CHARS {
+        let mut short: String = joined.chars().take(SURVIVOR_CMDLINE_CHARS).collect();
+        short.push('…');
+        short
+    } else {
+        joined
     }
 }
 
@@ -2686,7 +2912,7 @@ impl Drop for LsphpSupervisor {
         }
         // Never unlink a systemd-owned (socket-activated) socket; only one we bound.
         if matches!(self.cfg.socket_source, SocketSource::Bind) {
-            let _ = std::fs::remove_file(&self.cfg.socket_path);
+            self.unlink_bound_socket();
         }
     }
 }
@@ -2697,6 +2923,73 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    #[test]
+    fn bind_socket_path_rejects_non_socket_occupant() {
+        let path = std::env::temp_dir().join(format!("hj-bind-socket-path-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(prepare_bind_socket_path(&path).is_err());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn bind_socket_is_private_and_cleanup_preserves_replacement_files() {
+        use std::os::unix::fs::MetadataExt;
+        let path =
+            std::env::temp_dir().join(format!("hj-private-bind-{}.sock", std::process::id()));
+        let (fd, owned) = bind_private_socket(&path, 16).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        let client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        drop(client);
+        if rustix::process::geteuid().is_root() {
+            use std::os::unix::process::CommandExt;
+            let denied = std::process::Command::new("/usr/bin/python3")
+                .arg("-c")
+                .arg("import socket,sys\ns=socket.socket(socket.AF_UNIX)\ntry:\n s.connect(sys.argv[1])\nexcept PermissionError:\n sys.exit(0)\nsys.exit(1)")
+                .arg(&path).gid(65534).uid(65534).status().unwrap();
+            assert!(denied.success(), "another local uid must not connect");
+        }
+        let cfg = SupervisorConfig::from_php_config(&sample_php(), &path, "", "");
+        let supervisor = LsphpSupervisor::new(cfg);
+        *supervisor.bound_socket.lock() = Some(owned);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        drop(supervisor);
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert!(prepare_bind_socket_path(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("/does-not-exist", &path).unwrap();
+        assert!(prepare_bind_socket_path(&path).is_err());
+        assert!(std::fs::symlink_metadata(&path).is_ok());
+        std::fs::remove_file(&path).unwrap();
+        drop(fd);
+    }
+
+    #[test]
+    fn bound_socket_cleanup_follows_pinned_parent_and_rejects_unsafe_directories() {
+        let base = std::env::temp_dir().join(format!("hj-bind-parent-{}", std::process::id()));
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(bind_private_socket(&base.join("socket"), 16).is_err());
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = base.join("parent");
+        let moved = base.join("moved");
+        std::fs::create_dir(&parent).unwrap();
+        let (fd, owned) = bind_private_socket(&parent.join("socket"), 16).unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("socket"), b"replacement").unwrap();
+        drop(owned);
+        assert!(!moved.join("socket").exists());
+        assert_eq!(
+            std::fs::read(parent.join("socket")).unwrap(),
+            b"replacement"
+        );
+        drop(fd);
+        std::os::unix::fs::symlink(&moved, base.join("link")).unwrap();
+        assert!(bind_private_socket(&base.join("link/socket"), 16).is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn child_exec_cannot_gain_new_privileges() {
@@ -2936,6 +3229,95 @@ while True:
             b"/usr/local/lsws/lsphp8/bin/lsphp\0"
         ));
         assert!(!lsapi_cmdline_is_idle(b""));
+    }
+
+    #[test]
+    fn survivor_cmdline_is_joined_and_bounded() {
+        assert_eq!(
+            short_cmdline(b"lsphp:/web/public_html/index.php\0"),
+            "lsphp:/web/public_html/index.php"
+        );
+        assert_eq!(
+            short_cmdline(b"/bin/curl\0-s\0https://x\0"),
+            "/bin/curl -s https://x"
+        );
+        let long = short_cmdline(format!("lsphp:/{}\0", "a".repeat(300)).as_bytes());
+        assert_eq!(long.chars().count(), SURVIVOR_CMDLINE_CHARS + 1);
+        assert!(long.ends_with('…'));
+    }
+
+    fn readiness_tmpdir(tag: &str, mode: u32) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hj-lsapi-readiness-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    /// Regression (#607): the readiness script goes to the socket's private
+    /// directory, and a stale leftover there is replaced rather than fatal.
+    #[test]
+    fn readiness_script_prefers_the_private_socket_dir() {
+        let dir = readiness_tmpdir("private", 0o755);
+        let cfg = fake_supervisor_config(PathBuf::from("/bin/true"), &dir.join("php.sock"));
+        let stale = dir.join(format!(
+            ".httpjet-lsapi-ready-{}-4242.php",
+            std::process::id()
+        ));
+        std::fs::write(&stale, "stale").unwrap();
+        let script = ReadinessScript::create(&cfg, 4242).expect("private dir replaces a leftover");
+        assert_eq!(script.path, stale);
+        assert_eq!(
+            std::fs::metadata(&script.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o444
+        );
+        assert_eq!(
+            std::fs::read_to_string(&script.path).unwrap(),
+            "<?php echo getmypid();"
+        );
+        drop(script);
+        assert!(!stale.exists(), "the script is removed when dropped");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A socket directory the privilege-dropped workers cannot traverse (a root 0700
+    /// `mktemp -d`, as the cache gates use) must not receive the readiness script:
+    /// the candidate would never see a 2xx and every start/reload would fail.
+    #[test]
+    fn readiness_script_skips_a_dir_the_workers_cannot_traverse() {
+        for mode in [0o700, 0o750] {
+            let dir = readiness_tmpdir(&format!("untraversable-{mode:o}"), mode);
+            let cfg = fake_supervisor_config(PathBuf::from("/bin/true"), &dir.join("php.sock"));
+            let (chosen, private) = readiness_dir(&cfg);
+            assert!(!private, "mode {mode:o}");
+            assert_eq!(chosen, std::env::temp_dir());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Regression (#607): in a shared, world-writable directory a pre-created name
+    /// must not fail the candidate; the probe falls back to the worker PID frame.
+    #[test]
+    fn squatted_readiness_name_in_a_shared_dir_falls_back_to_the_pid_probe() {
+        let dir = readiness_tmpdir("shared", 0o1777);
+        let cfg = fake_supervisor_config(PathBuf::from("/bin/true"), &dir.join("php.sock"));
+        let (chosen, private) = readiness_dir(&cfg);
+        assert!(!private, "a world-writable socket dir is not private");
+        let squatted = chosen.join(format!(
+            ".httpjet-lsapi-ready-{}-4343.php",
+            std::process::id()
+        ));
+        std::fs::write(&squatted, "<?php exit;").unwrap();
+        let script = readiness_script_or_fallback(&cfg, 4343).expect("not fatal");
+        assert!(script.is_none(), "falls back to the PID-frame probe");
+        assert_eq!(std::fs::read_to_string(&squatted).unwrap(), "<?php exit;");
+        std::fs::remove_file(&squatted).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn probe_socket(tag: &str) -> PathBuf {

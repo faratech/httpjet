@@ -159,6 +159,8 @@ pub(crate) struct PreparedEntry {
     leaf: fs::File,
     tmp_file: fs::File,
     tmp_name: String,
+    tmp_path: PathBuf,
+    live_tmp_files: Arc<Mutex<HashSet<PathBuf>>>,
     dir: PathBuf,
     hex: String,
     final_ext: &'static str,
@@ -168,6 +170,7 @@ pub(crate) struct PreparedEntry {
 
 impl Drop for PreparedEntry {
     fn drop(&mut self) {
+        self.live_tmp_files.lock().remove(&self.tmp_path);
         let _ = rustix::fs::unlinkat(
             &self.leaf,
             self.tmp_name.as_str(),
@@ -197,6 +200,7 @@ pub struct DiskStore {
     /// and scan membership checks share this mutex, so the scanner can never mistake a
     /// just-linked live file for inherited state and reject/unlink it.
     live_files: Mutex<HashSet<PathBuf>>,
+    live_tmp_files: Arc<Mutex<HashSet<PathBuf>>>,
     boot_scan_pending: AtomicBool,
     /// Uniquifies the per-version filename. Re-seeded to max(seen)+1 by `scan`
     /// so a restart can never reuse a live file's name.
@@ -425,6 +429,7 @@ impl DiskStore {
             root_fd,
             openat2_state: AtomicU8::new(OPENAT2_UNKNOWN),
             live_files: Mutex::new(HashSet::new()),
+            live_tmp_files: Arc::new(Mutex::new(HashSet::new())),
             boot_scan_pending: AtomicBool::new(true),
             seq: AtomicU64::new(seed),
         })
@@ -536,11 +541,17 @@ impl DiskStore {
         let dir = self.display_dir(&hex);
         let first_seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let tmp_name = format!("{hex}-{first_seq}{final_ext}.tmp");
+        let mut live_tmp_files = self.live_tmp_files.lock();
         let tmp_file = create_private_file_at(&leaf, &tmp_name)?;
+        let tmp_path = dir.join(&tmp_name);
+        live_tmp_files.insert(tmp_path.clone());
+        drop(live_tmp_files);
         let mut prepared = PreparedEntry {
             leaf,
             tmp_file,
             tmp_name,
+            tmp_path,
+            live_tmp_files: self.live_tmp_files.clone(),
             dir,
             hex,
             final_ext,
@@ -870,7 +881,10 @@ impl DiskStore {
             // teardown UNLINKS (never truncates), which leaves already-mapped
             // pages intact until the map drops. `validate_header` has proven
             // `file_len` covers the mapped range, so no access can fault past
-            // EOF.
+            // EOF. This rests on httpjet being the only writer of the store root:
+            // another principal truncating a mapped container would raise SIGBUS
+            // on the next access. Keep the root unwritable to anything else (the
+            // lsphp sandbox runbook isolates /dev/shm/jetcache from PHP workers).
             let map = unsafe { memmap2::Mmap::map(&f) }?;
             let start = body_start as usize;
             return Ok(Bytes::from_owner(map).slice(start..start + body_len as usize));
@@ -918,6 +932,10 @@ impl DiskStore {
         self.walk_parallel(|leaf, name_os, file, sum, max_seq| {
             let name = name_os.to_str().unwrap_or("");
             if name.ends_with(".tmp") {
+                let live_tmp_files = self.live_tmp_files.lock();
+                if live_tmp_files.contains(file) {
+                    return;
+                }
                 // Only reap crash debris (mtime before this scan began); a
                 // newer `.tmp` may be an in-flight `write_entry` whose hard_link
                 // hasn't landed yet — unlinking it would ENOENT that write.
@@ -971,6 +989,10 @@ impl DiskStore {
         self.walk_parallel(|leaf, name_os, file, sum, max_seq| {
             let name = name_os.to_str().unwrap_or("");
             if name.ends_with(".sc.tmp") {
+                let live_tmp_files = self.live_tmp_files.lock();
+                if live_tmp_files.contains(file) {
+                    return;
+                }
                 // See `scan`: spare in-flight writes, reap only crash debris.
                 let stale = open_owned_file_at_with_metadata(leaf, name_os, file, true)
                     .ok()
@@ -1870,6 +1892,30 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let ds = DiskStore::open(td.path()).unwrap();
         (td, ds)
+    }
+
+    #[test]
+    fn boot_scans_preserve_old_but_live_prepared_files() {
+        let (_td, store) = store();
+        for ext in [".pc", ".sc"] {
+            let prepared = store
+                .prepare_container(format!("{:016x}", key_hash(&key())), ext, 4, |file| {
+                    file.write_all(b"live")
+                })
+                .unwrap();
+            prepared
+                .tmp_file
+                .set_modified(SystemTime::UNIX_EPOCH)
+                .unwrap();
+            assert_eq!(store.scan(|_| true).tmp_removed, 0);
+            assert_eq!(store.scan_static(|_| true).tmp_removed, 0);
+            assert!(prepared.tmp_path.exists());
+            let temporary = prepared.tmp_path.clone();
+            let (published, _) = store.publish_entry(prepared).unwrap();
+            assert!(published.exists());
+            assert!(!temporary.exists());
+            assert!(store.live_tmp_files.lock().is_empty());
+        }
     }
 
     #[cfg(target_os = "linux")]

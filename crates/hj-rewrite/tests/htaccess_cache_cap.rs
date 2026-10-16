@@ -77,3 +77,38 @@ fn correctness_holds_past_cap() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+/// An absent-path flood fills only the absent-entry budget: a real access file
+/// first seen afterwards is still memoized, absent entries are reclaimed by the
+/// sweep, and an oversized absent key is never stored.
+#[test]
+fn absent_flood_cannot_crowd_out_real_access_files() {
+    let cache = HtaccessCache::with_revalidate_ttl(Duration::from_secs(60));
+    let cap = HtaccessCache::MAX_ENTRIES;
+    let base = PathBuf::from("/nonexistent-httpjet-cap-test-root3");
+    for i in 0..(cap + 10) {
+        let _ = cache.get_or_load_named(&base.join(format!("seg-{i}")), ".htaccess");
+        assert!(cache.len() <= cap);
+    }
+    // The first full-cap insert swept every absent entry instead of refusing.
+    assert!(cache.len() < cap, "absent entries were not reclaimed");
+
+    let tmp = std::env::temp_dir().join(format!("hj-cap-crowd-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join(".htaccess"), "Require all denied\n").unwrap();
+    // Refill the absent class to the cap (the sweep is rate-limited, so it stays full).
+    let mut i = 0;
+    while cache.len() < cap {
+        let _ = cache.get_or_load_named(&base.join(format!("refill-{i}")), ".htaccess");
+        i += 1;
+    }
+    let before = cache.len();
+    assert!(cache.get_or_load_named(&tmp, ".htaccess").is_some());
+    assert_eq!(cache.len(), before + 1, "real access file was not memoized");
+
+    let fresh = HtaccessCache::with_revalidate_ttl(Duration::from_secs(60));
+    let _ = fresh.get_or_load_named(&base.join("x".repeat(2048)), ".htaccess");
+    assert_eq!(fresh.len(), 0, "oversized absent key was memoized");
+    let _ = fs::remove_dir_all(&tmp);
+}

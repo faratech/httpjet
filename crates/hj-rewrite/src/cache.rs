@@ -24,6 +24,48 @@ const REVALIDATE_TTL: Duration = Duration::from_secs(1);
 /// (mirrors `hj-static`'s `META_CACHE_CAP`).
 const MAX_HTACCESS_ENTRIES: usize = 16_384;
 
+/// Access-file paths longer than this are never memoized as absent: real
+/// directories are short, and a long attacker-chosen key would pin its bytes.
+const MAX_NEGATIVE_KEY_BYTES: usize = 1024;
+
+/// Minimum spacing of the sweeps that reclaim absent-file entries once their
+/// class is full, so a flood cannot make every request scan the map.
+const NEGATIVE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Upper bound for one `.htaccess` file (#620). A tenant-writable access file
+/// must not be buffered whole (OOM) or block a worker (FIFO): read via
+/// O_NONBLOCK regular-file open under this cap, failing closed beyond it.
+const MAX_HTACCESS_BYTES: u64 = 16 << 20;
+
+fn read_htaccess_capped(file: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(file)?
+    };
+    #[cfg(not(unix))]
+    let f = std::fs::File::open(file)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            ".htaccess is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    (&f).take(MAX_HTACCESS_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_HTACCESS_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            ".htaccess exceeds size cap",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Cap on how many ancestor directories a request may make the chain walk
 /// consult. The walk stats one directory per `/` segment and `maxReqURLLen`
 /// (default 8192) admits ~4096 segments, so a single cold deep path — or a
@@ -64,10 +106,17 @@ pub struct HtaccessCache {
     /// How long a validated entry is trusted before re-`stat`-ing. Production
     /// uses [`REVALIDATE_TTL`]; tests can set `0` to force per-call revalidation.
     revalidate_ttl: Duration,
-    /// Approximate entry count for the cap gate — `DashMap::len()` sweeps every
-    /// shard. Entries are never removed, so a counter bumped on new-key insert
-    /// is exact up to insert races.
+    /// Approximate count of entries WITH an access file (`parsed` set). Their
+    /// keys name real files, so request floods cannot grow this class; it has its
+    /// own budget so absent-path floods can never crowd a real file out.
     count: AtomicUsize,
+    /// Approximate count of absent-file / missing-directory entries. These keys
+    /// are attacker-chosen, so when the class is full a rate-limited sweep drops
+    /// them all (each costs one or two stats to rebuild).
+    negative_count: AtomicUsize,
+    created: Instant,
+    /// Milliseconds after `created` of the last negative sweep (+1; 0 = never).
+    last_sweep_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Default for HtaccessCache {
@@ -104,6 +153,9 @@ impl HtaccessCache {
             inner: DashMap::new(),
             revalidate_ttl,
             count: AtomicUsize::new(0),
+            negative_count: AtomicUsize::new(0),
+            created: Instant::now(),
+            last_sweep_ms: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -263,7 +315,7 @@ impl HtaccessCache {
         // Bytes, not read_to_string: a non-UTF-8 byte (any comment in a legacy
         // encoding) must not downgrade a protected directory to "no rules".
         let read_result =
-            std::fs::read(&file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+            read_htaccess_capped(&file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         let read_failed = cur_mtime.is_some() && read_result.is_err();
         let dir_missing = cur_mtime.is_none() && !is_dir(dir);
         let parsed = match (cur_mtime, read_result) {
@@ -291,15 +343,25 @@ impl HtaccessCache {
             _ => None,
         };
 
-        // Cap growth: only memoize when under the soft cap or refreshing a key
-        // that is already present (a refresh replaces in place and never grows the
-        // map). Past the cap an absent/new directory still resolves correctly — it
-        // just isn't cached, so it re-stats on each request rather than poisoning
-        // the bound. Keeps the existing `DashMap` API (no eviction machinery).
+        // Cap growth: an entry is memoized when its class (present access file vs
+        // absent) is under the soft cap or it refreshes a key already present.
+        // Past the cap a path still resolves correctly, it just is not cached.
         let checked_at = Instant::now();
-        if self.count.load(Ordering::Relaxed) < MAX_HTACCESS_ENTRIES
-            || self.inner.contains_key(&file)
-        {
+        let negative = parsed.is_none();
+        let class = if negative {
+            &self.negative_count
+        } else {
+            &self.count
+        };
+        let admit = self.inner.contains_key(&file)
+            || if negative {
+                file.as_os_str().len() <= MAX_NEGATIVE_KEY_BYTES
+                    && (class.load(Ordering::Relaxed) < MAX_HTACCESS_ENTRIES
+                        || self.sweep_negative())
+            } else {
+                class.load(Ordering::Relaxed) < MAX_HTACCESS_ENTRIES
+            };
+        if admit {
             let prev = self.inner.insert(
                 file,
                 Entry {
@@ -310,11 +372,47 @@ impl HtaccessCache {
                     dir_missing,
                 },
             );
-            if prev.is_none() {
-                self.count.fetch_add(1, Ordering::Relaxed);
+            match prev {
+                Some(p) if p.parsed.is_none() == negative => {}
+                Some(_) => {
+                    class.fetch_add(1, Ordering::Relaxed);
+                    let other = if negative {
+                        &self.count
+                    } else {
+                        &self.negative_count
+                    };
+                    saturating_dec(other, 1);
+                }
+                None => {
+                    class.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         (parsed, dir_missing, checked_at + self.revalidate_ttl)
+    }
+
+    /// Drop every absent-file entry (rate-limited). Returns whether room was made.
+    fn sweep_negative(&self) -> bool {
+        let now_ms = self.created.elapsed().as_millis() as u64 + 1;
+        let last = self.last_sweep_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < NEGATIVE_SWEEP_INTERVAL.as_millis() as u64 {
+            return false;
+        }
+        if self
+            .last_sweep_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        let mut removed = 0;
+        self.inner.retain(|_, e| {
+            let keep = e.parsed.is_some();
+            removed += usize::from(!keep);
+            keep
+        });
+        saturating_dec(&self.negative_count, removed);
+        self.negative_count.load(Ordering::Relaxed) < MAX_HTACCESS_ENTRIES
     }
 
     /// Number of cached directory entries (for diagnostics/tests).
@@ -336,19 +434,48 @@ impl HtaccessCache {
     pub fn clear(&self) {
         self.inner.clear();
         self.count.store(0, Ordering::Relaxed);
+        self.negative_count.store(0, Ordering::Relaxed);
     }
 
     /// (test) Entries counted against the soft cap. Diverges from [`len`](Self::len)
     /// only when `clear` fails to reset the counter — the regression hook.
     #[cfg(test)]
     pub(crate) fn cap_count(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
+        self.count.load(Ordering::Relaxed) + self.negative_count.load(Ordering::Relaxed)
     }
+}
+
+fn saturating_dec(counter: &AtomicUsize, n: usize) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+        Some(c.saturating_sub(n))
+    });
 }
 
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
+
+    /// Regression (#604): a docroot `.htaccess` whose access-section regex does not
+    /// compile denies everything under it until the file is fixed.
+    #[test]
+    fn uncompilable_section_regex_installs_the_deny_all_sentinel() {
+        let root = std::env::temp_dir().join(format!("hj-bad-section-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(".htaccess"),
+            "<FilesMatch \"[unterminated\">\n  Require all denied\n</FilesMatch>\n",
+        )
+        .unwrap();
+        let cache = HtaccessCache::new();
+        let (chain, _) =
+            cache.load_chain_with_dirs_and_deadline(&root, "/anything.txt", ".htaccess");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(
+            chain[0].1.access_decision("/anything.txt", "GET"),
+            crate::directives::AccessDecision::Denied
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn absence_and_nested_entries_keep_original_freshness_deadlines() {
         let root = std::env::temp_dir().join(format!("hj-policy-deadline-{}", std::process::id()));
@@ -377,5 +504,21 @@ mod deadline_tests {
                 == crate::directives::AccessDecision::Denied
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn htaccess_read_rejects_non_regular_files() {
+        // #620: a directory (or FIFO/device) named .htaccess must fail, not block/OOM.
+        let root = std::env::temp_dir().join(format!("hj-htcap-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".htaccess")).unwrap();
+        assert!(read_htaccess_capped(&root.join(".htaccess")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".htaccess"), "Require all denied").unwrap();
+        assert_eq!(
+            read_htaccess_capped(&root.join(".htaccess")).unwrap(),
+            b"Require all denied"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

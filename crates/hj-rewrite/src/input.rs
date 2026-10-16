@@ -19,8 +19,12 @@ pub struct FileTests {
     pub is_dir: bool,
     /// `-l`: exists and is a symbolic link.
     pub is_link: bool,
-    /// `-s`: exists and has size > 0.
+    /// `-s`: a regular file with size > 0 (OLS/Apache: a directory never passes).
     pub is_nonempty: bool,
+    /// `-e`/`-x`: exists after following symlinks, so a dangling link is false (#686).
+    pub exists: bool,
+    /// `-x`: a regular file with the owner-execute bit.
+    pub is_exec: bool,
 }
 
 impl FileTests {
@@ -31,7 +35,12 @@ impl FileTests {
             is_file: md.is_file(),
             is_dir: md.is_dir(),
             is_link: md.file_type().is_symlink(),
-            is_nonempty: md.len() > 0,
+            is_nonempty: md.is_file() && md.len() > 0,
+            exists: true,
+            is_exec: md.is_file() && {
+                use std::os::unix::fs::PermissionsExt;
+                md.permissions().mode() & 0o100 != 0
+            },
         }
     }
 }
@@ -149,6 +158,13 @@ pub struct RewriteInput<'a> {
     /// `None` for server/vhost-level rules. Example: rules from
     /// `/web/app/sub/.htaccess` with docroot `/web/app` -> `Some("sub/")`.
     pub per_directory_prefix: Option<String>,
+    /// Vhost/server-level rules (not `.htaccess`): a changed URI does not re-run the
+    /// ruleset; only `[N]` restarts (OLS processVHostRewrite runs the list once).
+    pub server_context: bool,
+    /// The port in the client's Host header, if any (`%{HTTP_HOST}` is port-stripped).
+    /// The self-redirect guard compares a Location against what the client asked for,
+    /// not the socket port, which differs behind PROXY protocol or port mapping (#703).
+    pub host_port: Option<u16>,
     /// The VERBATIM request target (`path[?query]`, still percent-encoded) as the
     /// client sent it, attached only when a ruleset reads `%{THE_REQUEST}` (audit:
     /// the var used to resolve from the DECODED canonical path, so e.g. `/a%2Eb`
@@ -180,6 +196,8 @@ impl<'a> RewriteInput<'a> {
             env: BTreeMap::new(),
             env_seed: None,
             per_directory_prefix: None,
+            server_context: false,
+            host_port: None,
             raw_request_target: None,
         }
     }

@@ -161,7 +161,22 @@ impl Slots {
                 }
             }
             Decision::Staple(staple) => {
-                let bytes = staple.bytes()?;
+                let Some(bytes) = staple.bytes() else {
+                    // Expired between decision() and use: re-decide so an
+                    // optional slot omits the staple instead of failing.
+                    return match entry.slot.decision() {
+                        Decision::Omit => {
+                            if key.ocsp.is_none() {
+                                Some(key)
+                            } else {
+                                let mut clean = (*key).clone();
+                                clean.ocsp = None;
+                                Some(Arc::new(clean))
+                            }
+                        }
+                        _ => None,
+                    };
+                };
                 let mut cached = entry.stapled.lock();
                 if let Some((old, key)) = &*cached {
                     if Arc::ptr_eq(old, &staple) {

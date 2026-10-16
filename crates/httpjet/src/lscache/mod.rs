@@ -98,14 +98,9 @@ fn cookie_value<'a>(cookie: Option<&'a str>, name: &str) -> Option<&'a str> {
     if name.is_empty() {
         return None;
     }
-    for pair in cookie?.split(';') {
-        if let Some((n, v)) = pair.trim().split_once('=') {
-            if n.trim() == name {
-                return Some(v.trim());
-            }
-        }
-    }
-    None
+    // #616/#656: PHP's `$_COOKIE` view, so a mangled xf.session/xf[user counts as the
+    // private cookie here too.
+    hj_pagecache::php_cookie_lookup(cookie?, name).map(|(_, _, v)| v)
 }
 
 /// FNV-1a 64 with a caller-chosen basis — the private tier derives TWO
@@ -410,8 +405,16 @@ pub struct CacheCtx<'a> {
     pub host_foreign: bool,
     /// The raw first `Origin` header value (lossy-decoded, `None` = absent,
     /// `Some("")` = present-but-empty). Only consulted when the applied chain
-    /// reads `Origin` — see [`origin_vary_suffix`].
+    /// reads `Origin` — see [`request_vary_suffix`].
     pub origin: Option<&'a str>,
+    /// The User-Agent CLASS key fragment when the applied chain reads User-Agent and
+    /// the request matched at least one UA condition (see
+    /// `rewrite_glue::page_cache_ua_class`); `None` keeps the historic key.
+    pub ua_class: Option<&'a str>,
+    /// (#617/#618) Fold of every other chain-read request header (Accept,
+    /// Referer, X-*, plus Origin from inline/pre-rewrite sources), computed by
+    /// `rewrite_glue::page_cache_header_vary`; `None` keeps the historic key.
+    pub header_vary: Option<&'a str>,
 }
 
 /// Try to look the request up in the page cache. `Some(resp)` ⇒ serve the hit
@@ -699,7 +702,12 @@ fn lookup(
     // answer 304 (validators only) instead of re-shipping the full 50–200 KB HTML body
     // across the CF→origin hop. The store path synthesizes a weak ETag when the backend
     // gives none (XenForo pages usually don't), so this is what makes CF revalidation cheap.
-    if let (Some(inm), Some(etag)) = (if_none_match, hit::entry_etag(&entry)) {
+    // RFC 9110 §13.2.1: preconditions are ignored when the response would not be 2xx.
+    if let (Some(inm), Some(etag), true) = (
+        if_none_match,
+        hit::entry_etag(&entry),
+        (200..300).contains(&entry.status),
+    ) {
         if hit::if_none_match_matches(inm, etag) {
             let mut resp = hit::not_modified(&entry, etag, now);
             // Apply the SAME private-tier guarantees as the 200 hit below: a private-routed
@@ -1442,7 +1450,7 @@ pub(crate) fn build_cache_key(
         PrivateRoute::Private { owner2, .. } => owner2.clone(),
         _ => public_vary_value(cc, store),
     };
-    vary_value.push_str(&origin_vary_suffix(cc));
+    vary_value.push_str(&request_vary_suffix(cc));
     let mut key = public_with_vary(
         vhost_id_hash(&ctx.vhost_name),
         ctx.is_tls,
@@ -1467,20 +1475,32 @@ pub(crate) fn build_cache_key(
 /// the capsule keys — they all thread this `CacheCtx`). Absent/empty Origin
 /// keeps the historic base key, so caches populated before this fold stay
 /// hit-able for the (dominant) no-Origin traffic.
-fn origin_vary_suffix(cc: &CacheCtx<'_>) -> String {
-    let reads = cc
+///
+/// User-Agent works the same way (#603): a chain whose rewrite conditions read the
+/// UA (`RewriteCond %{HTTP_USER_AGENT} ... [E=KNOWN_CRAWLER:1]` driving
+/// `Header set ... env=KNOWN_CRAWLER`) yields UA-conditional responses, so the
+/// UA *class* (which conditions matched) is folded in. A request that matched none
+/// keeps the historic key, so ordinary browsers keep their entries.
+fn request_vary_suffix(cc: &CacheCtx<'_>) -> String {
+    let reads_origin = cc
         .chain
         .iter()
         .any(|h| h.memo.vary_headers.iter().any(|v| v == "origin"));
-    if !reads {
-        return String::new();
-    }
-    match cc.origin {
-        Some(o) if !o.is_empty() => {
+    let mut suffix = match cc.origin {
+        Some(o) if reads_origin && !o.is_empty() => {
             format!("\0origin:{:016x}", fnv64(o.as_bytes(), OWNER_BASIS_A))
         }
         _ => String::new(),
+    };
+    if let Some(class) = cc.ua_class {
+        suffix.push_str("\0ua:");
+        suffix.push_str(class);
     }
+    if let Some(hdr) = cc.header_vary {
+        suffix.push_str("\0hdr:");
+        suffix.push_str(hdr);
+    }
+    suffix
 }
 
 fn configuration_key(
@@ -1512,7 +1532,11 @@ fn capsule_key(
         ctx.vhost_name.to_ascii_lowercase(),
         path,
         normalized_query_for(cc.chain, cc.req_query),
-        format!("{}{}", public_vary_value(cc, store), origin_vary_suffix(cc)),
+        format!(
+            "{}{}",
+            public_vary_value(cc, store),
+            request_vary_suffix(cc)
+        ),
     )
 }
 
@@ -1544,7 +1568,7 @@ fn capsule_public_fallback_key(
         format!(
             "{}{}",
             capsule_public_vary_value(cc.cookie, store),
-            origin_vary_suffix(cc)
+            request_vary_suffix(cc)
         ),
     )
 }
@@ -1941,8 +1965,10 @@ fn stored_headers_from(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
     stored_headers
 }
 
-fn ensure_stored_etag(headers: &mut Vec<(HeaderName, HeaderValue)>, bytes: &Bytes) {
-    if !headers.iter().any(|(k, _)| k == ETAG) {
+/// Only a 2xx gets a synthesized validator: a body hash says nothing about a redirect's
+/// Location, so every empty-body 301 would share one ETag (#658).
+fn ensure_stored_etag(status: u16, headers: &mut Vec<(HeaderName, HeaderValue)>, bytes: &Bytes) {
+    if (200..300).contains(&status) && !headers.iter().any(|(k, _)| k == ETAG) {
         if let Ok(v) = HeaderValue::from_str(&hit::weak_etag(bytes)) {
             headers.push((ETAG, v));
         }
@@ -2020,14 +2046,16 @@ pub(crate) fn capsule_public_refresh_cookie(
     let cfg = store.config();
     let mut pairs = Vec::new();
     for pair in cookie?.split(';') {
-        let Some((raw_name, raw_value)) = pair.trim().split_once('=') else {
+        let pair = pair.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+        let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        // Array-form cookies key their own slot (#656); re-emitting them as a
+        // scalar would refresh a different one.
+        let Some(hj_pagecache::PhpCookieName::Scalar(parsed)) =
+            hj_pagecache::php_cookie_name(raw_name)
+        else {
             continue;
         };
-        let Some(name) = cfg
-            .vary_cookies
-            .iter()
-            .find(|name| name.as_str() == raw_name.trim())
-        else {
+        let Some(name) = cfg.vary_cookies.iter().find(|name| **name == *parsed) else {
             continue;
         };
         if name == &cfg.private_user_cookie
@@ -2041,7 +2069,7 @@ pub(crate) fn capsule_public_refresh_cookie(
         }
         // Preserve every matching pair, including explicit empty values and duplicates:
         // `compute_vary_value` keys both, so collapsing either would refresh a different slot.
-        pairs.push(format!("{name}={}", raw_value.trim()));
+        pairs.push(format!("{name}={}", raw_value));
     }
     if pairs.is_empty() {
         None
@@ -2102,7 +2130,12 @@ fn capsule_public_fallback_lookup(
         return CacheOutcome::Miss(dedicated_key_hash);
     }
 
-    if let (Some(inm), Some(etag)) = (if_none_match, hit::entry_etag(&entry)) {
+    // RFC 9110 §13.2.1: preconditions are ignored when the response would not be 2xx.
+    if let (Some(inm), Some(etag), true) = (
+        if_none_match,
+        hit::entry_etag(&entry),
+        (200..300).contains(&entry.status),
+    ) {
         if hit::if_none_match_matches(inm, etag) {
             let mut resp = hit::not_modified(&entry, etag, now);
             mark_capsule(
@@ -2417,7 +2450,12 @@ pub fn capsule_lookup(
         record_capsule_miss(state, "dedicated_miss");
         return capsule_public_fallback_lookup(state, ctx, cc, store, now, key_hash, if_none_match);
     }
-    if let (Some(inm), Some(etag)) = (if_none_match, hit::entry_etag(&entry)) {
+    // RFC 9110 §13.2.1: preconditions are ignored when the response would not be 2xx.
+    if let (Some(inm), Some(etag), true) = (
+        if_none_match,
+        hit::entry_etag(&entry),
+        (200..300).contains(&entry.status),
+    ) {
         if hit::if_none_match_matches(inm, etag) {
             let mut resp = hit::not_modified(&entry, etag, now);
             mark_capsule(resp.headers_mut(), "hit");
@@ -2726,6 +2764,89 @@ pub(crate) fn normalize_self_redirect_pq(pq: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn is_canonical_path_literal(b: u8) -> bool {
+    is_unreserved_uri_byte(b)
+        || matches!(
+            b,
+            b'/' | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+        )
+}
+
+fn escaped_byte_at(raw: &[u8], i: usize) -> Option<u8> {
+    if raw[i] == b'%' && i + 2 < raw.len() {
+        Some((hex_val(raw[i + 1])? << 4) | hex_val(raw[i + 2])?)
+    } else {
+        None
+    }
+}
+
+/// Entries are keyed and identified by the decoded, dot-normalized path, but the backend
+/// routes the RAW `REQUEST_URI`. Only the one raw spelling that canonically encodes that path
+/// (modulo escaped unreserved bytes and hex case) may read or populate an entry. Any other
+/// spelling — `/./`, `/x/../`, `//`, `%2F`, an escaped sub-delim — shares the key yet can
+/// render different content (XenForo 404s `/./`), which would poison the canonical URL.
+pub(crate) fn raw_path_is_cache_canonical(raw: &str, normalized: &str) -> bool {
+    let raw = raw.as_bytes();
+    let mut i = 0;
+    for &b in normalized.as_bytes() {
+        if i >= raw.len() {
+            return false;
+        }
+        if is_canonical_path_literal(b) && raw[i] == b {
+            i += 1;
+        // An unreserved byte must appear literally: XenForo strips the SCRIPT_NAME
+        // prefix from the RAW REQUEST_URI before decoding, so `/index%2Ephp/x/`
+        // routes differently from `/index.php/x/` (#705 follow-up).
+        } else if !is_canonical_path_literal(b) && escaped_byte_at(raw, i) == Some(b) {
+            i += 3;
+        } else {
+            return false;
+        }
+    }
+    i == raw.len()
+}
+
+/// The decoded, dot-segment-collapsed form of a `Location` path, comparable to the request's
+/// canonical `orig_path` (a trailing slash is kept, and an escaped `/` is not a separator:
+/// both name a different URL).
+fn canonical_location_path(path: &str) -> Option<String> {
+    if path.contains("%2F") || path.contains("%2f") {
+        return None;
+    }
+    let decoded = hj_core::percent_decode_cow(path)?;
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in decoded.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    let mut out = String::with_capacity(decoded.len() + 1);
+    for s in &segs {
+        out.push('/');
+        out.push_str(s);
+    }
+    if out.is_empty() || (decoded.ends_with('/') && !out.ends_with('/')) {
+        out.push('/');
+    }
+    Some(out)
+}
+
 /// Core of [`is_self_redirect`], split out so the serve-time guard in [`cache_lookup`]
 /// can re-check a stored entry's `Location` directly. Resolves `loc` to host + `/path
 /// [?query]`, dropping any `#fragment`, and compares it to the request. Both hosts are
@@ -2791,7 +2912,19 @@ fn location_is_self_impl(
         format!("{req_path}?{req_query}")
     };
     if normalize {
-        normalize_self_redirect_pq(&loc_pq) == normalize_self_redirect_pq(&req_pq)
+        if normalize_self_redirect_pq(&loc_pq) == normalize_self_redirect_pq(&req_pq) {
+            return true;
+        }
+        // `req_path` is the fully decoded canonical path: `Location: /a%20b` from `/a b`
+        // (or `/caf%C3%A9/` from `/café/`) is a loop the unreserved-only compare misses.
+        let (loc_path, loc_query) = match loc_pq.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (loc_pq.as_str(), None),
+        };
+        let req_path = if req_path.is_empty() { "/" } else { req_path };
+        canonical_location_path(loc_path).is_some_and(|p| p == req_path)
+            && loc_query.map(normalize_self_redirect_pq)
+                == (!req_query.is_empty()).then(|| normalize_self_redirect_pq(req_query))
     } else {
         loc_pq == req_pq
     }
@@ -3228,7 +3361,7 @@ pub async fn cache_store_leading(
         // Synthesize a weak validator when the backend gave none (XenForo pages usually
         // don't), so CF can revalidate a stale-but-cacheable page with a conditional GET and
         // get a 304 (headers only) instead of re-pulling the whole body. Served on every hit.
-        ensure_stored_etag(&mut stored_headers, &bytes);
+        ensure_stored_etag(parts.status.as_u16(), &mut stored_headers, &bytes);
         let stored_etag = stored_headers
             .iter()
             .find(|(name, _)| name == ETAG)
@@ -3502,7 +3635,7 @@ impl FillCommit {
                     "page-cache: refusing to store empty/error streamed body"
                 );
             } else {
-                ensure_stored_etag(&mut entry.headers, &bytes);
+                ensure_stored_etag(entry.status, &mut entry.headers, &bytes);
                 if let Some(target) = store_admitted(&state, store, entry, &bytes) {
                     state
                         .metrics
@@ -3629,7 +3762,9 @@ fn sets_private_cookie(headers: &HeaderMap, private_cookies: &[String]) -> bool 
     headers.get_all(SET_COOKIE).iter().any(|v| {
         let Ok(s) = v.to_str() else { return false };
         let name = s.split('=').next().unwrap_or("").trim();
-        private_cookies.iter().any(|p| p == name)
+        private_cookies
+            .iter()
+            .any(|p| hj_pagecache::php_cookie_name_eq(name, p))
     })
 }
 
@@ -3817,6 +3952,8 @@ mod tests {
                     vary_value: None,
                     host_foreign: false,
                     origin: origin.map(|s| s.as_str()),
+                    ua_class: None,
+                    header_vary: None,
                 };
                 build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public)
             };
@@ -3835,6 +3972,279 @@ mod tests {
             key_for(&silent_chain, Some(&origin_a), "i"),
             key_for(&silent_chain, Some(&origin_b), "i"),
             "a chain that does not read Origin ignores Origin entirely"
+        );
+    }
+
+    // Regression (#617/#618): a chain reading a non-Origin/UA header (Accept
+    // here, via both SetEnvIf and %{HTTP:Accept}) must key per header value.
+    #[tokio::test]
+    async fn accept_reading_chain_varies_the_cache_key_by_header_vary() {
+        let (state, ctx, _store) = cache_test_ctx();
+        let ran: Vec<(std::path::PathBuf, Arc<hj_rewrite::Htaccess>)> = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(
+                hj_rewrite::Htaccess::parse(
+                    "RewriteEngine On\nRewriteCond %{HTTP:Accept} text/event-stream\nRewriteCond %{HTTP:X-Partner} ^yes\nRewriteRule .* - [E=SSE:1]\nSetEnvIf Referer ^https://ref\\.example REF=1\nSetEnvIf User_Agent Googlebot BOT=1\nSetEnvIf Cookie ab_test=b AB=B\n",
+                )
+                .expect("parse"),
+            ),
+        )];
+        let vary = |accept: Option<&str>, referer: Option<&str>| {
+            let mut h = http::HeaderMap::new();
+            if let Some(a) = accept {
+                h.insert(http::header::ACCEPT, a.parse().unwrap());
+            }
+            if let Some(r) = referer {
+                h.insert(http::header::REFERER, r.parse().unwrap());
+            }
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &h)
+        };
+        assert!(
+            vary(None, None).is_none(),
+            "absent headers keep historic key"
+        );
+        assert_ne!(
+            vary(Some("text/event-stream"), None),
+            vary(Some("text/html"), None)
+        );
+        assert_eq!(vary(Some("text/html"), None), vary(Some("text/html"), None));
+        assert_ne!(vary(None, Some("https://ref.example/x")), vary(None, None));
+
+        let vary_named = |name: &'static str, value: &str| {
+            let mut h = http::HeaderMap::new();
+            h.insert(name, value.parse().unwrap());
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &h)
+        };
+        assert_ne!(
+            vary_named("x-partner", "yes"),
+            vary_named("x-partner", "no")
+        );
+        assert_ne!(vary_named("user-agent", "Googlebot"), vary(None, None));
+        assert_ne!(
+            vary_named("cookie", "ab_test=b"),
+            vary_named("cookie", "ab_test=a")
+        );
+    }
+
+    #[tokio::test]
+    async fn setenvif_empty_origin_distinguishes_absent_from_present_empty() {
+        let (state, ctx, _) = cache_test_ctx();
+        let ran = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(hj_rewrite::Htaccess::parse("SetEnvIf Origin ^$ EMPTY=1\n").unwrap()),
+        )];
+        let absent = http::HeaderMap::new();
+        let mut empty = http::HeaderMap::new();
+        empty.insert(http::header::ORIGIN, http::HeaderValue::from_static(""));
+        assert_ne!(
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &absent),
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &empty)
+        );
+    }
+
+    #[tokio::test]
+    async fn cookie_setenv_vary_tracks_assignments_and_shares_unrelated_cookies() {
+        let (state, ctx, _) = cache_test_ctx();
+        let ran = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(
+                hj_rewrite::Htaccess::parse(concat!(
+                    "SetEnvIfNoCase Cookie admin=1 ADMIN=1\n",
+                    "SetEnvIf Cookie ab_test=([ab]) AB=$1\n",
+                ))
+                .unwrap(),
+            ),
+        )];
+        let vary = |cookie: Option<&str>| {
+            let mut headers = http::HeaderMap::new();
+            if let Some(value) = cookie {
+                headers.insert(http::header::COOKIE, value.parse().unwrap());
+            }
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &headers)
+        };
+        assert_eq!(vary(None), vary(Some("xf_csrf=guest-one")));
+        assert_eq!(
+            vary(None),
+            vary(Some("xf_user=1; xf_csrf=member-two")),
+            "an ordinary member can find the visitor-invariant capsule shell"
+        );
+        assert_eq!(
+            vary(Some("ab_test=b; xf_csrf=one")),
+            vary(Some("ab_test=b; xf_csrf=two"))
+        );
+        assert_ne!(
+            vary(Some("ab_test=a")),
+            vary(Some("ab_test=b")),
+            "captures must discriminate"
+        );
+        assert_ne!(vary(Some("admin=1")), vary(None));
+        assert_eq!(vary(Some("ADMIN=1")), vary(Some("admin=1")));
+    }
+
+    #[tokio::test]
+    async fn cookie_rewrite_reads_keep_raw_vary_despite_equal_setenv_results() {
+        let (state, ctx, _) = cache_test_ctx();
+        let ran = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(
+                hj_rewrite::Htaccess::parse(concat!(
+                    "SetEnvIf Cookie admin=1 ADMIN=1\n",
+                    "RewriteEngine On\nRewriteCond %{HTTP:Cookie} token=one\n",
+                    "RewriteRule .* - [E=TOKEN:1]\n",
+                ))
+                .unwrap(),
+            ),
+        )];
+        let vary = |cookie: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(http::header::COOKIE, cookie.parse().unwrap());
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &headers)
+        };
+        assert_ne!(vary("token=one"), vary("token=two"));
+        assert!(vary("token=one").unwrap().starts_with("cookie:"));
+    }
+
+    #[tokio::test]
+    async fn cookie_setenv_vary_cannot_alias_a_real_header_dimension() {
+        let (state, ctx, _) = cache_test_ctx();
+        let ran = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(
+                hj_rewrite::Htaccess::parse(concat!(
+                    "SetEnvIf Cookie ab_test=b AB=b\n",
+                    "RewriteEngine On\nRewriteCond %{HTTP:Cookie-Env} .\n",
+                    "RewriteRule .* - [E=HEADER:1]\n",
+                ))
+                .unwrap(),
+            ),
+        )];
+        let mut cookie = http::HeaderMap::new();
+        cookie.insert(http::header::COOKIE, "ab_test=b".parse().unwrap());
+        let mut header = http::HeaderMap::new();
+        header.insert("cookie-env", "2:AB1:b".parse().unwrap());
+        assert_ne!(
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &cookie),
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &header)
+        );
+    }
+
+    #[tokio::test]
+    async fn setenvif_host_aliases_distinguish_the_canonical_vhost_key() {
+        let (state, ctx, _) = cache_test_ctx();
+        let ran = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(hj_rewrite::Htaccess::parse("SetEnvIf Host ^alias ALIAS=1\n").unwrap()),
+        )];
+        let mut canonical = http::HeaderMap::new();
+        canonical.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("forum.example"),
+        );
+        let mut alias = http::HeaderMap::new();
+        alias.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("alias.example"),
+        );
+        assert_ne!(
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &canonical),
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &alias)
+        );
+    }
+
+    // Regression (#603): a chain whose rewrite conditions read User-Agent produces
+    // UA-conditional headers (`Header set X-Crawler-Detected ... env=KNOWN_CRAWLER`), so
+    // a crawler's render must not land in (or be served from) the browsers' entry. The
+    // UA *class* is folded in; a request matching no UA condition keeps the historic key.
+    #[tokio::test]
+    async fn user_agent_reading_chain_varies_the_cache_key_by_ua_class() {
+        let classified = crate::state::RewriteTuning {
+            ua_classify: true,
+            ..Default::default()
+        };
+        let (state, ctx, store) = cache_test_ctx_with_rewrite(
+            crate::state::XfCapsuleConfig::disabled(),
+            |_| {},
+            classified,
+        );
+        let chain: Vec<Arc<hj_rewrite::Htaccess>> = vec![Arc::new(
+            hj_rewrite::Htaccess::parse(
+                "RewriteEngine On\nRewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot)\nRewriteRule .* - [E=KNOWN_CRAWLER:1]\n",
+            )
+            .expect("parse"),
+        )];
+        let silent_chain: Vec<Arc<hj_rewrite::Htaccess>> = vec![];
+        let ran: Vec<(std::path::PathBuf, Arc<hj_rewrite::Htaccess>)> = chain
+            .iter()
+            .map(|h| (std::path::PathBuf::from("/"), h.clone()))
+            .collect();
+        let class = |state: &ServerState, ua: &str| {
+            let mut h = http::HeaderMap::new();
+            h.insert(http::header::USER_AGENT, ua.parse().unwrap());
+            crate::pipeline::page_cache_ua_class(state, &ctx, &ran, &h)
+        };
+        let browser = class(&state, "Mozilla/5.0 (X11; Linux) Chrome/140");
+        let googlebot = class(&state, "Mozilla/5.0 (compatible; Googlebot/2.1)");
+        let bingbot = class(&state, "Mozilla/5.0 (compatible; Bingbot/2.0)");
+        assert!(browser.is_none(), "a browser matches no UA condition");
+        assert!(googlebot.is_some());
+        assert_eq!(googlebot, bingbot, "both crawlers share one class");
+
+        let key_for = |chain: &Vec<Arc<hj_rewrite::Htaccess>>, ua_class: Option<&String>| {
+            let cc = CacheCtx {
+                enabled: true,
+                method: &Method::GET,
+                host: "forum.example",
+                cookie: None,
+                identity: "i",
+                req_path: "/threads/x.1/",
+                req_query: "",
+                chain,
+                render_epoch: store.purge_epoch(),
+                has_range: false,
+                vary_value: None,
+                host_foreign: false,
+                origin: None,
+                ua_class: ua_class.map(|s| s.as_str()),
+                header_vary: None,
+            };
+            build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public)
+        };
+        assert_ne!(
+            key_for(&chain, googlebot.as_ref()),
+            key_for(&chain, browser.as_ref()),
+            "a crawler's render gets its own entry"
+        );
+        assert_eq!(
+            key_for(&chain, browser.as_ref()),
+            key_for(&silent_chain, None),
+            "browsers keep the historic key"
+        );
+
+        let (unclassified, _, _) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |_| {});
+        assert!(
+            class(&unclassified, "Googlebot/2.1").is_none(),
+            "without --rewrite-ua-classify the raw UA is never folded (check warns instead)"
+        );
+
+        // A UA cond in a ruleset that is NOT path-cacheable (here: it also reads a
+        // cookie) still classifies — the page cache must not depend on that (#603).
+        let mixed: Vec<(std::path::PathBuf, Arc<hj_rewrite::Htaccess>)> = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(
+                hj_rewrite::Htaccess::parse(
+                    "RewriteEngine On\nRewriteCond %{HTTP_REFERER} !^$\nRewriteCond %{HTTP_USER_AGENT} (Googlebot|Bingbot)\nRewriteRule .* - [E=KNOWN_CRAWLER:1]\n",
+                )
+                .expect("parse"),
+            ),
+        )];
+        assert!(!mixed[0].1.rules.path_cacheable);
+        let mut h = http::HeaderMap::new();
+        h.insert(http::header::USER_AGENT, "Googlebot/2.1".parse().unwrap());
+        assert_eq!(
+            crate::pipeline::page_cache_ua_class(&state, &ctx, &mixed, &h),
+            googlebot,
+            "same UA conds, same restart-stable class"
         );
     }
 
@@ -4272,6 +4682,18 @@ mod tests {
             &hdrs(&[("set-cookie", "xf_session=secret; path=/")]),
             &priv_set
         ));
+        for name in ["xf.session", "xf session", "xf.user", "xf user"] {
+            let mut headers = hdrs(&[("set-cookie", "analytics=x")]);
+            headers.append(
+                SET_COOKIE,
+                format!("{name}=secret; path=/").parse().unwrap(),
+            );
+            assert!(sets_private_cookie(&headers, &priv_set), "{name}");
+        }
+        assert!(!sets_private_cookie(
+            &hdrs(&[("set-cookie", "xf.session_extra=x")]),
+            &priv_set
+        ));
         // empty guard list => never blocks.
         assert!(!sets_private_cookie(
             &hdrs(&[("set-cookie", "xf_session=x")]),
@@ -4397,6 +4819,8 @@ mod tests {
                     vary_value: None,
                     host_foreign: false,
                     origin: None,
+                    ua_class: None,
+                    header_vary: None,
                 };
                 let _ = cache_lookup(&state, &ctx, &cc, None, false, None);
                 let mut resp = http::Response::builder()
@@ -4464,6 +4888,12 @@ mod tests {
             .await,
             "a 404 setting a private cookie is not"
         );
+        for (path, name) in [
+            ("/cookie-dot-404/", "xf.session=abc; path=/"),
+            ("/cookie-space-404/", "xf session=abc; path=/"),
+        ] {
+            assert!(!run(path, 404, vec![("set-cookie", name)]).await);
+        }
     }
 
     /// #490: the fill response Cloudflare caches must carry the same synthesized validator as
@@ -4486,6 +4916,8 @@ mod tests {
             vary_value: None,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
         };
         // The lookup that precedes a real render records the admission sighting.
         assert!(matches!(
@@ -4589,6 +5021,8 @@ mod tests {
             vary_value: None,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
         }
     }
 
@@ -4762,6 +5196,32 @@ mod tests {
         }
     }
 
+    /// Regression (#594): a buffered (non-stream-fill) miss whose backend body ends
+    /// in an error (LSAPI now surfaces a worker that died before RESP_END this way)
+    /// must store nothing, so a truncated page can never become a hit.
+    #[tokio::test]
+    async fn buffered_miss_with_errored_body_stores_nothing() {
+        let (state, ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |_| {});
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/cut".to_string();
+        let cc = page_cc(&method, "/cut", &identity, store.purge_epoch());
+        let _ = cache_lookup(&state, &ctx, &cc, None, false, None);
+        let (feed, resp) = fed_page(None);
+        feed.send(Ok(Bytes::from_static(b"<page>"))).unwrap();
+        feed.send(Err("lsapi response EOF before RESP_END".into()))
+            .unwrap();
+        drop(feed);
+        let _ = cache_store(&state, &ctx, &cc, resp).await;
+        assert!(
+            matches!(
+                cache_lookup(&state, &ctx, &cc, None, false, None),
+                CacheOutcome::Miss(_)
+            ),
+            "a truncated body must not be stored"
+        );
+    }
+
     /// Regression (30b7fda): a cookieless request probes on the fast path and, on a miss,
     /// looks up again in dispatch. Both used to record the admission sighting and the miss,
     /// so the "seen twice" bar passed on first sight and the miss count doubled.
@@ -4783,6 +5243,8 @@ mod tests {
             vary_value: None,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
         };
         let key = configuration_key(
             &state,
@@ -4844,6 +5306,8 @@ mod tests {
             vary_value: None,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
         };
         let base = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
         let old_key = configuration_key(&old, base.clone());
@@ -4918,6 +5382,8 @@ mod tests {
     fn cookie_lookup_is_case_sensitive_and_first_exact_match_wins() {
         let header = Some("XF_USER=wrong; xf_user=first; xf_user=second");
         assert_eq!(cookie_value(header, "xf_user"), Some("first"));
+        assert_eq!(cookie_value(Some("xf[user=m"), "xf_user"), Some("m"));
+        assert_eq!(cookie_value(Some("xf_user =m"), "xf_user"), None);
         assert_eq!(cookie_value(header, "XF_USER"), Some("wrong"));
         assert_eq!(cookie_value(header, "Xf_User"), None);
     }
@@ -5014,6 +5480,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         private_route(state, ctx, store, &cc, count)
@@ -5246,6 +5714,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -5317,6 +5787,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -5374,6 +5846,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -5446,6 +5920,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let public_key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -5543,6 +6019,14 @@ mod tests {
         xf_capsule: crate::state::XfCapsuleConfig,
         tweak: impl FnOnce(&mut hj_pagecache::StoreConfig),
     ) -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
+        cache_test_ctx_with_rewrite(xf_capsule, tweak, crate::state::RewriteTuning::default())
+    }
+
+    fn cache_test_ctx_with_rewrite(
+        xf_capsule: crate::state::XfCapsuleConfig,
+        tweak: impl FnOnce(&mut hj_pagecache::StoreConfig),
+        rewrite_tuning: crate::state::RewriteTuning,
+    ) -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
         let mut cfg = hj_pagecache::StoreConfig::default();
         cfg.standard_cc_vhosts.push("forum.example".into());
         cfg.private_user_cookie = "xf_user".into();
@@ -5588,7 +6072,7 @@ mod tests {
             false,
             None,
             false,
-            crate::state::RewriteTuning::default(),
+            rewrite_tuning,
         )
         .unwrap();
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
@@ -5643,6 +6127,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -5726,6 +6212,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -5781,6 +6269,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -5856,6 +6346,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -5932,6 +6424,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -5980,6 +6474,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_cookie_aliases_block_public_and_dedicated_capsule_stores() {
+        let mut capsule = capsule_member_config();
+        capsule.dedicated_store = true;
+        let (state, ctx, store) = cache_test_ctx_with(capsule, |cfg| {
+            cfg.private_cookies = vec!["xf_session".into()];
+        });
+        for (number, cookie, stored) in [
+            (0, "xf.session=secret", false),
+            (1, "xf session=secret", false),
+            (2, "analytics=ok", true),
+        ] {
+            let path = format!("/threads/cookie.{number}/");
+            let identity = format!("https\nforum.example\n{path}");
+            let cc = CacheCtx {
+                enabled: true,
+                method: &Method::GET,
+                host: "forum.example",
+                cookie: None,
+                identity: &identity,
+                req_path: &path,
+                req_query: "",
+                chain: &[],
+                render_epoch: store.purge_epoch(),
+                has_range: false,
+                host_foreign: false,
+                origin: None,
+                ua_class: None,
+                header_vary: None,
+                vary_value: None,
+            };
+            let public = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
+            let dedicated = configuration_key(&state, capsule_key(&ctx, &cc, &store));
+            state.page_cache_admission.record(hash_key(&public));
+            let response = http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, "text/html")
+                .header(HDR_CACHE_CONTROL, "public,max-age=60")
+                .header(
+                    HDR_XF_CAPSULE,
+                    "public-shell, hydrate=account-nav-v1, max-age=60",
+                )
+                .header(SET_COOKIE, cookie)
+                .body(Body::Full(Bytes::from_static(b"<html>shell</html>")))
+                .unwrap();
+            let _ = cache_store(&state, &ctx, &cc, response).await;
+            for key in [&public, &dedicated] {
+                assert_eq!(
+                    matches!(
+                        store.get_entry_uncounted(key, &identity, Instant::now()),
+                        hj_pagecache::EntryState::Fresh(_)
+                    ),
+                    stored,
+                    "cookie={cookie} key={key:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn capsule_member_serve_refuses_non_public_dedicated_entry() {
         // (A.4 defense-in-depth) A non-Public entry occupying the dedicated capsule slot must
         // NEVER be handed to a member — the scope guard degrades it to a miss. (The slot is
@@ -6002,6 +6555,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         // Plant a PRIVATE entry directly at the dedicated capsule key, shell-tagged so the only
@@ -6066,6 +6621,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -6149,6 +6706,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -6194,6 +6753,8 @@ mod tests {
             has_range: false,
             host_foreign: false,
             origin: None,
+            ua_class: None,
+            header_vary: None,
             vary_value: None,
         };
         let route = PrivateRoute::Public;
@@ -6933,5 +7494,64 @@ mod tests {
             "/x",
             ""
         ));
+    }
+
+    #[test]
+    fn raw_path_cache_canonical_admits_only_the_canonical_spelling() {
+        for (raw, norm) in [
+            ("/", "/"),
+            ("/threads/x.422156/", "/threads/x.422156/"),
+            ("/a%20b", "/a b"),
+            ("/caf%C3%A9/", "/café/"),
+            ("/caf%c3%a9/", "/café/"),
+            ("/tag/r&d", "/tag/r&d"),
+            ("/a%5D", "/a]"),
+        ] {
+            assert!(raw_path_is_cache_canonical(raw, norm), "{raw} -> {norm}");
+        }
+        for (raw, norm) in [
+            ("/./", "/"),
+            ("/index%2Ephp", "/index.php"),
+            ("/a%5fb", "/a_b"),
+            ("/zzz/..", "/"),
+            ("/zzz/%2e%2e/target/", "/target/"),
+            ("//target/", "/target/"),
+            ("/a//b", "/a/b"),
+            ("/a%2Fb", "/a/b"),
+            ("/tag/r%26d", "/tag/r&d"),
+            ("/a]", "/a]"),
+            ("/a%2", "/a%2"),
+            ("/a", "/a/"),
+        ] {
+            assert!(!raw_path_is_cache_canonical(raw, norm), "{raw} -> {norm}");
+        }
+    }
+
+    #[test]
+    fn self_redirect_detection_decodes_reserved_and_non_ascii_location() {
+        let host = "forum.example";
+        let loc = |l: &str| hdrs(&[("location", l)]);
+        for (l, path, query) in [
+            ("/self%20x/", "/self x/", ""),
+            ("/self%C3%A9/", "/selfé/", ""),
+            ("https://forum.example/a%2Bb?p=1", "/a+b", "p=1"),
+            ("/a/./b", "/a/b", ""),
+        ] {
+            assert!(
+                is_self_redirect(301, &loc(l), true, host, path, query),
+                "{l} from {path}"
+            );
+        }
+        for (l, path, query) in [
+            ("/self%20x", "/self x/", ""),
+            ("/self%20y/", "/self x/", ""),
+            ("/a%20b?p=2", "/a b", "p=1"),
+            ("/a%20b?", "/a b", ""),
+        ] {
+            assert!(
+                !is_self_redirect(301, &loc(l), true, host, path, query),
+                "{l} from {path}"
+            );
+        }
     }
 }

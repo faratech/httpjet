@@ -560,15 +560,16 @@ fn add_glob_ci(builder: &mut GlobSetBuilder, pat: &str) {
 /// Parse a CIDR or bare IP into an [`IpNet`]. A bare address becomes a host
 /// route (`/32` or `/128`).
 fn parse_cidr(spec: &str) -> Option<IpNet> {
-    if let Ok(net) = spec.parse::<IpNet>() {
-        return Some(net);
-    }
-    // Bare IP → host network.
-    if let Ok(ip) = spec.parse::<IpAddr>() {
+    let net = if let Ok(net) = spec.parse::<IpNet>() {
+        net
+    } else {
+        // Bare IP → host network.
+        let ip = spec.parse::<IpAddr>().ok()?;
         let prefix = if ip.is_ipv4() { 32 } else { 128 };
-        return IpNet::new(ip, prefix).ok();
-    }
-    None
+        IpNet::new(ip, prefix).ok()?
+    };
+    // Peers are canonicalized to v4 before matching (#689).
+    hj_geo::fold_mapped_v4(net)
 }
 
 /// Parse an IP address, tolerating an IPv6 zone id and surrounding brackets.
@@ -670,6 +671,45 @@ mod tests {
         // Public DNS — not Cloudflare.
         assert!(!acl.is_trusted(ip("8.8.8.8")));
         assert!(!acl.is_trusted(ip("1.1.1.1"))); // CF's resolver IP is NOT in the proxy ranges
+    }
+
+    #[test]
+    fn ipv4_mapped_rules_match_canonical_v4_peers() {
+        // #689: peers are folded to v4, so a mapped rule must be folded too.
+        let sec = Security {
+            access_control: vec![
+                AccessRule {
+                    spec: "ALL".into(),
+                    trusted: false,
+                    allow: true,
+                },
+                AccessRule {
+                    spec: "::ffff:203.0.113.7".into(),
+                    trusted: false,
+                    allow: false,
+                },
+                AccessRule {
+                    spec: "::ffff:198.51.100.0/120".into(),
+                    trusted: true,
+                    allow: true,
+                },
+            ],
+            ..Default::default()
+        };
+        let acl = AccessControl::from_security(&sec).unwrap();
+        assert_eq!(acl.check_peer(ip("203.0.113.7")), AclDecision::Deny);
+        assert_eq!(acl.check_peer(ip("::ffff:203.0.113.7")), AclDecision::Deny);
+        assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
+        assert!(acl.is_trusted(ip("198.51.100.9")));
+        let wide = Security {
+            access_control: vec![AccessRule {
+                spec: "::ffff:0.0.0.0/95".into(),
+                trusted: false,
+                allow: false,
+            }],
+            ..Default::default()
+        };
+        assert!(AccessControl::from_security(&wide).is_err());
     }
 
     #[test]

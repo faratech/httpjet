@@ -222,12 +222,21 @@ fn matching_proxy_context_in<'a>(
     path: &str,
 ) -> Option<&'a hj_core::config::Context> {
     use hj_core::config::ContextKind;
-    contexts
+    let proxy = contexts
         .iter()
         .filter(|c| {
             c.kind == ContextKind::Proxy && c.enabled && super::context_uri_matches(path, &c.uri)
         })
-        .max_by_key(|c| c.uri.len())
+        .max_by_key(|c| c.uri.len())?;
+    // OLS resolves ONE most-specific context of any kind: a static context nested under
+    // the proxy mount (the "app + local assets dir" layout) serves locally.
+    let shadowed = contexts.iter().any(|c| {
+        c.kind == ContextKind::Static
+            && c.enabled
+            && c.uri.len() > proxy.uri.len()
+            && super::context_uri_matches(path, &c.uri)
+    });
+    (!shadowed).then_some(proxy)
 }
 
 pub(super) fn matching_proxy_context<'a>(

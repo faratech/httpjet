@@ -14,7 +14,7 @@ pub mod router;
 
 pub use body::{Body, BoxError, CountingBody, FileBody, IncomingBody, StreamBody, empty_incoming};
 pub use completion::{ResponseCompletion, ResponseEnd};
-pub use context::{ClientCert, Proto, RedirectGuard, ReqCtx, TlsParams};
+pub use context::{ClientCert, Http10Request, Proto, RedirectGuard, ReqCtx, TlsParams};
 pub use handler::{Handler, HandlerError, Request, Response, ResponseTransform, text_response};
 pub use http_util::{
     CONNECTION_SPECIFIC_REQUEST_HEADERS, body_forbidden_status, coalesce_cookie_crumbs,
