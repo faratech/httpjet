@@ -244,6 +244,7 @@ fn synthesize(raw: Vec<(String, String, String)>) -> Vec<Line> {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
+    super::e2e::sweep_stale_test_dirs();
     let p = std::env::temp_dir().join(format!(
         "hj-rwdiff-{tag}-{}-{}",
         std::process::id(),
@@ -717,6 +718,496 @@ async fn differential_replay_production_corpus() {
     assert!(
         s.hits_classified >= s.hits_raw,
         "bitmap keying collapses UA diversity; it cannot hit less than raw-UA keying"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// (#822) Env assigned by an earlier ruleset (`[E=]`, `[E=!VAR]`) is what the
+/// `%{ENV:}` reads of every later ruleset see: inline vhost → root → child.
+fn env_carry_state(inline: Option<&str>) -> Arc<ServerState> {
+    let mut state = make_state(RewriteTuning {
+        outcome_ttl: std::time::Duration::from_secs(600),
+        ua_classify: false,
+    });
+    if let Some(rules) = inline {
+        Arc::get_mut(&mut state).unwrap().inline_rules.insert(
+            VHOST.into(),
+            Arc::new(hj_rewrite::RuleSet::parse(rules).unwrap()),
+        );
+    }
+    state
+}
+
+fn rewritten_path(r: &super::rewrite_glue::RwResult) -> Option<&str> {
+    match r {
+        super::rewrite_glue::RwResult::Rewritten { path, .. } => Some(path),
+        _ => None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_env_set_is_visible_to_htaccess_cond() {
+    let root = make_docroot(
+        "envcarry-inline",
+        "RewriteEngine On\n\
+         RewriteCond %{ENV:VFLAG} =1\n\
+         RewriteRule ^p$ /hit.php [L]\n",
+    );
+    let state = env_carry_state(Some("RewriteEngine On\nRewriteRule ^/p$ - [E=VFLAG:1]\n"));
+    let r = run_one(&state, &root, "/p", None, None);
+    assert_eq!(rewritten_path(&r), Some("/hit.php"), "{r:?}");
+    // A path the inline rule does not flag leaves the cond false.
+    let other = run_one(&state, &root, "/q", None, None);
+    assert_eq!(rewritten_path(&other), None, "{other:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_env_set_is_visible_to_child_htaccess_cond() {
+    let root = make_docroot(
+        "envcarry-child",
+        "RewriteEngine On\nRewriteRule ^ - [E=RFLAG:1]\n",
+    );
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(
+        root.join("sub/.htaccess"),
+        "RewriteEngine On\nRewriteCond %{ENV:RFLAG} =1\nRewriteRule ^x$ /sub/hit [L]\n",
+    )
+    .unwrap();
+    let state = env_carry_state(None);
+    let r = run_one(&state, &root, "/sub/x", None, None);
+    assert_eq!(rewritten_path(&r), Some("/sub/hit"), "{r:?}");
+    match &r {
+        super::rewrite_glue::RwResult::Rewritten { env, .. } => {
+            assert!(env.iter().any(|(k, v)| k == "RFLAG" && v == "1"), "{env:?}");
+        }
+        _ => unreachable!(),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn earlier_unset_hides_seed_from_later_ruleset() {
+    // SetEnvIf seeds FOO=1 into ctx.env; the root ruleset unsets it, so the child's
+    // cond must no longer see it.
+    let root = make_docroot(
+        "envcarry-unset",
+        "SetEnvIf Request_URI ^/sub/ FOO=1\nRewriteEngine On\nRewriteRule ^ - [E=!FOO]\n",
+    );
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(
+        root.join("sub/.htaccess"),
+        "RewriteEngine On\nRewriteCond %{ENV:FOO} =1\nRewriteRule ^x$ /sub/hit [L]\n",
+    )
+    .unwrap();
+    let state = env_carry_state(None);
+    let r = run_one(&state, &root, "/sub/x", None, None);
+    assert_eq!(rewritten_path(&r), None, "{r:?}");
+    // An inline unset followed by a root re-set: the last layer wins.
+    std::fs::write(
+        root.join(".htaccess"),
+        "SetEnvIf Request_URI ^/sub/ FOO=1\nRewriteEngine On\nRewriteRule ^ - [E=FOO:1]\n",
+    )
+    .unwrap();
+    let state = env_carry_state(Some("RewriteEngine On\nRewriteRule ^ - [E=!FOO]\n"));
+    let r = run_one(&state, &root, "/sub/x", None, None);
+    assert_eq!(rewritten_path(&r), Some("/sub/hit"), "{r:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reserved_hj_env_is_not_carried_between_rulesets() {
+    let root = make_docroot(
+        "envcarry-hj",
+        "RewriteEngine On\nRewriteCond %{ENV:HJ_X} =1\nRewriteRule ^p$ /hit.php [L]\n",
+    );
+    let state = env_carry_state(Some("RewriteEngine On\nRewriteRule ^/p$ - [E=HJ_X:1]\n"));
+    let r = run_one(&state, &root, "/p", None, None);
+    assert_eq!(rewritten_path(&r), None, "{r:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_status_writer_keeps_chain_out_of_outcome_cache() {
+    // The REDIRECT_STATUS reader is classified constant-empty; an earlier ruleset
+    // that writes the name would make that false, so the writer is uncacheable and
+    // the reader observes the carried value.
+    let root = make_docroot(
+        "envcarry-redirstatus",
+        "RewriteEngine On\n\
+         RewriteCond %{ENV:REDIRECT_STATUS} ^403\n\
+         RewriteRule ^p$ /err.php [L]\n",
+    );
+    let state = env_carry_state(Some(
+        "RewriteEngine On\nRewriteRule ^/p$ - [E=REDIRECT_STATUS:403]\n",
+    ));
+    for _ in 0..2 {
+        let r = run_one(&state, &root, "/p", None, None);
+        assert_eq!(rewritten_path(&r), Some("/err.php"), "{r:?}");
+    }
+    let m = &state.metrics;
+    assert_eq!(m.rewrite_outcome_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(m.rewrite_outcome_uncacheable.load(Ordering::Relaxed), 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// (#826) `run_rewrite_traced` over `docroot` with `.htaccess` loading enabled
+/// (so a rewrite into another directory can load that directory's chain).
+fn run_hop(
+    state: &Arc<ServerState>,
+    docroot: &Path,
+    path: &str,
+) -> (super::rewrite_glue::RwResult, Vec<(PathBuf, Arc<Htaccess>)>) {
+    let l = Line {
+        method: "GET".into(),
+        uri: path.into(),
+        ua: String::new(),
+        cookie: None,
+        origin: None,
+    };
+    let req = build_request(&l).unwrap();
+    let orig_path = normalized_request_path(&decode_request_path(path).unwrap());
+    let chain = state
+        .rewrite_cache
+        .load_chain_with_dirs(docroot, &orig_path, ".htaccess");
+    let vhost = Arc::new(VHostConfig {
+        doc_root: docroot.to_path_buf(),
+        allow_override: 1,
+        ..VHostConfig::default()
+    });
+    let mut ctx = make_ctx(&state.server, &vhost);
+    seed_server_env(&mut ctx);
+    let mut trace = super::rewrite_glue::RewriteTrace::default();
+    let r = super::rewrite_glue::run_rewrite_traced(
+        state, &ctx, &req, &chain, &orig_path, "", &mut trace,
+    );
+    (r, trace.extra)
+}
+
+fn write_ht(root: &Path, dir: &str, rules: &str) {
+    std::fs::create_dir_all(root.join(dir)).unwrap();
+    std::fs::write(root.join(dir).join(".htaccess"), rules).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_dir_rewrite_runs_destination_front_controller() {
+    let root = make_docroot(
+        "dest-fc",
+        "RewriteEngine On\nRewriteRule ^blog/(.*)$ /wp/$1 [L]\n",
+    );
+    write_ht(
+        &root,
+        "wp",
+        "RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteRule . /wp/index.php [L]\n",
+    );
+    std::fs::write(root.join("wp/index.php"), "<?php\n").unwrap();
+    let state = env_carry_state(None);
+    let (direct, direct_extra) = run_hop(&state, &root, "/wp/post");
+    assert_eq!(rewritten_path(&direct), Some("/wp/index.php"), "{direct:?}");
+    assert!(direct_extra.is_empty());
+    let (r, extra) = run_hop(&state, &root, "/blog/post");
+    assert_eq!(rewritten_path(&r), Some("/wp/index.php"), "{r:?}");
+    assert_eq!(
+        extra.len(),
+        1,
+        "the wp chain ran outside the request's chain"
+    );
+    assert_eq!(extra[0].0, root.join("wp"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_rewrite_runs_the_rewritten_uris_htaccess() {
+    let root = make_docroot(
+        "dest-inline",
+        "RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteRule ^ /index.php [L]\n",
+    );
+    let state = env_carry_state(Some(
+        "RewriteEngine On\nRewriteRule ^/old/(.*)$ /new/$1 [L]\n",
+    ));
+    let (r, extra) = run_hop(&state, &root, "/old/x");
+    assert_eq!(rewritten_path(&r), Some("/index.php"), "{r:?}");
+    assert!(
+        extra.is_empty(),
+        "the destination chain is the request's chain"
+    );
+    // [END] in server context suppresses every per-directory pass.
+    let state = env_carry_state(Some(
+        "RewriteEngine On\nRewriteRule ^/old/(.*)$ /new/$1 [END]\n",
+    ));
+    let (r, _) = run_hop(&state, &root, "/old/x");
+    assert_eq!(rewritten_path(&r), Some("/new/x"), "{r:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn end_flag_stops_before_the_destination_chain() {
+    let root = make_docroot(
+        "dest-end",
+        "RewriteEngine On\nRewriteRule ^blog/(.*)$ /wp/$1 [END]\n",
+    );
+    write_ht(
+        &root,
+        "wp",
+        "RewriteEngine On\nRewriteRule . /wp/index.php [L]\n",
+    );
+    let state = env_carry_state(None);
+    let (r, extra) = run_hop(&state, &root, "/blog/post");
+    assert_eq!(rewritten_path(&r), Some("/wp/post"), "{r:?}");
+    assert!(extra.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_loop_across_directories_hits_the_recursion_limit() {
+    let root = make_docroot("dest-loop", "RewriteEngine On\n");
+    write_ht(
+        &root,
+        "a",
+        "RewriteEngine On\nRewriteRule ^(.*)$ /b/$1 [L]\n",
+    );
+    write_ht(
+        &root,
+        "b",
+        "RewriteEngine On\nRewriteRule ^(.*)$ /a/$1 [L]\n",
+    );
+    let state = env_carry_state(None);
+    let (r, _) = run_hop(&state, &root, "/a/x");
+    assert_eq!(
+        r,
+        super::rewrite_glue::RwResult::Failed {
+            reason: super::rewrite_glue::INTERNAL_REDIRECT_LIMIT
+        }
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_hops_up_to_the_limit_succeed() {
+    // /d0/x -> /d1/x -> ... -> /d10/x is exactly ten internal redirects.
+    let root = make_docroot("dest-chain10", "RewriteEngine On\n");
+    for i in 0..10 {
+        write_ht(
+            &root,
+            &format!("d{i}"),
+            &format!("RewriteEngine On\nRewriteRule ^(.*)$ /d{}/$1 [L]\n", i + 1),
+        );
+    }
+    write_ht(&root, "d10", "RewriteEngine On\n");
+    let state = env_carry_state(None);
+    let (r, _) = run_hop(&state, &root, "/d0/x");
+    assert_eq!(rewritten_path(&r), Some("/d10/x"), "{r:?}");
+    // One more hop is the eleventh internal redirect.
+    write_ht(
+        &root,
+        "d10",
+        "RewriteEngine On\nRewriteRule ^(.*)$ /d11/$1 [L]\n",
+    );
+    write_ht(&root, "d11", "RewriteEngine On\n");
+    let state = env_carry_state(None);
+    let (r, _) = run_hop(&state, &root, "/d0/x");
+    assert_eq!(
+        r,
+        super::rewrite_glue::RwResult::Failed {
+            reason: super::rewrite_glue::INTERNAL_REDIRECT_LIMIT
+        }
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn internal_redirect_sees_redirect_status_and_carried_env() {
+    let root = make_docroot(
+        "dest-env",
+        "RewriteEngine On\nRewriteRule ^blog/(.*)$ /wp/$1 [L,E=FROM_BLOG:1]\n",
+    );
+    write_ht(
+        &root,
+        "wp",
+        "RewriteEngine On\n\
+         RewriteCond %{ENV:REDIRECT_STATUS} =200\n\
+         RewriteCond %{ENV:FROM_BLOG} =1\n\
+         RewriteRule ^post$ /wp/redirected.php [L]\n",
+    );
+    let state = env_carry_state(None);
+    let (r, _) = run_hop(&state, &root, "/blog/post");
+    assert_eq!(rewritten_path(&r), Some("/wp/redirected.php"), "{r:?}");
+    match &r {
+        super::rewrite_glue::RwResult::Rewritten { env, .. } => {
+            assert!(
+                env.iter().any(|(k, v)| k == "FROM_BLOG" && v == "1"),
+                "{env:?}"
+            );
+            assert!(
+                !env.iter().any(|(k, _)| k == "REDIRECT_STATUS"),
+                "REDIRECT_STATUS stays engine-only: {env:?}"
+            );
+        }
+        _ => unreachable!(),
+    }
+    let (direct, _) = run_hop(&state, &root, "/wp/post");
+    assert_eq!(rewritten_path(&direct), None, "{direct:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rewrite_into_a_parent_directory_reruns_the_parent_chain() {
+    // The sub ruleset moves the request into the docroot's context; the root
+    // rules then see the new URI (OLS context change / Apache internal redirect).
+    let root = make_docroot(
+        "dest-parent",
+        "RewriteEngine On\n\
+         RewriteCond %{ENV:REDIRECT_STATUS} =200\n\
+         RewriteRule ^target\\.php$ /final.php [L]\n",
+    );
+    write_ht(
+        &root,
+        "sub",
+        "RewriteEngine On\nRewriteRule ^x$ /target.php [L]\n",
+    );
+    let state = env_carry_state(None);
+    for _ in 0..2 {
+        let (r, extra) = run_hop(&state, &root, "/sub/x");
+        assert_eq!(rewritten_path(&r), Some("/final.php"), "{r:?}");
+        assert!(
+            extra.is_empty(),
+            "the parent chain is part of the request's chain"
+        );
+    }
+    // Every ruleset that ran is in the request's chain, but the intermediate hop
+    // (`/target.php`) must pass its own access phase in dispatch (#836): uncached.
+    assert_eq!(
+        state.metrics.rewrite_outcome_hits.load(Ordering::Relaxed),
+        0
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// (#836) A hop straight to the final target, into a subset of the request's chain
+/// (the subdirectory front controller), is covered by dispatch's final-target checks:
+/// it stays cacheable and on-core. A realm in that subset is not (a deeper chain may
+/// lift it), so the hop goes to dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subset_hop_to_the_final_target_stays_cacheable_without_auth() {
+    for auth in [false, true] {
+        let root_rules = if auth {
+            "AuthType Basic\nAuthName \"p\"\nAuthUserFile /nonexistent\nRequire valid-user\n"
+        } else {
+            ""
+        };
+        let root = make_docroot(
+            if auth {
+                "subset-hop-auth"
+            } else {
+                "subset-hop"
+            },
+            root_rules,
+        );
+        write_ht(
+            &root,
+            "sub",
+            "RewriteEngine On\nRewriteRule ^x$ /index.php [L]\n",
+        );
+        let state = env_carry_state(None);
+        let mut needs = Vec::new();
+        for _ in 0..2 {
+            let l = Line {
+                method: "GET".into(),
+                uri: "/sub/x".into(),
+                ua: String::new(),
+                cookie: None,
+                origin: None,
+            };
+            let req = build_request(&l).unwrap();
+            let chain = state
+                .rewrite_cache
+                .load_chain_with_dirs(&root, "/sub/x", ".htaccess");
+            let vhost = Arc::new(VHostConfig {
+                doc_root: root.clone(),
+                allow_override: 1,
+                ..VHostConfig::default()
+            });
+            let mut ctx = make_ctx(&state.server, &vhost);
+            seed_server_env(&mut ctx);
+            let mut trace = super::rewrite_glue::RewriteTrace::default();
+            let r = super::rewrite_glue::run_rewrite_traced(
+                &state, &ctx, &req, &chain, "/sub/x", "", &mut trace,
+            );
+            assert_eq!(rewritten_path(&r), Some("/index.php"), "{r:?}");
+            needs.push(trace.needs_dispatch(&chain, &r));
+        }
+        let hits = state.metrics.rewrite_outcome_hits.load(Ordering::Relaxed);
+        if auth {
+            assert_eq!(needs, [true, true]);
+            assert_eq!(hits, 0);
+        } else {
+            assert_eq!(needs, [false, false]);
+            assert_eq!(hits, 1);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn same_chain_rewrite_does_not_rerun_the_chain() {
+    // The front-controller shape: a rewrite that stays inside the evaluated
+    // chain is final (OLS keeps the context), so a REDIRECT_STATUS-gated rule
+    // in the same ruleset never fires.
+    let root = make_docroot(
+        "dest-same",
+        "RewriteEngine On\n\
+         RewriteCond %{ENV:REDIRECT_STATUS} =200\n\
+         RewriteRule ^index\\.php$ /looped.php [L]\n\
+         RewriteCond %{REQUEST_FILENAME} !-f\n\
+         RewriteRule ^ /index.php [L]\n",
+    );
+    let state = env_carry_state(None);
+    let (r, extra) = run_hop(&state, &root, "/whats-new/");
+    assert_eq!(rewritten_path(&r), Some("/index.php"), "{r:?}");
+    assert!(extra.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outcome_depending_on_a_foreign_chain_is_not_cached() {
+    let root = make_docroot(
+        "dest-nocache",
+        "RewriteEngine On\nRewriteRule ^blog/(.*)$ /wp/$1 [L]\n",
+    );
+    write_ht(
+        &root,
+        "wp",
+        "RewriteEngine On\nRewriteRule ^post$ /wp/index.php [L]\n",
+    );
+    let state = env_carry_state(None);
+    for _ in 0..2 {
+        let (r, extra) = run_hop(&state, &root, "/blog/post");
+        assert_eq!(rewritten_path(&r), Some("/wp/index.php"), "{r:?}");
+        assert_eq!(extra.len(), 1);
+    }
+    let m = &state.metrics;
+    assert_eq!(m.rewrite_outcome_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(m.rewrite_outcome_misses.load(Ordering::Relaxed), 2);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Regression (#900): a vhost rewrite sets REDIRECT_STATUS for the per-directory
+/// chain (OLS processRule), so a Symfony guard does not redirect its own target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inline_rewrite_sets_redirect_status_for_the_htaccess_chain() {
+    let root = make_docroot(
+        "inline-redirect-status",
+        "RewriteEngine On\n\
+         RewriteCond %{ENV:REDIRECT_STATUS} =\"\"\n\
+         RewriteRule ^index\\.php(?:/(.*)|$) /$1 [R=301,L]\n",
+    );
+    let state = env_carry_state(Some(
+        "RewriteEngine On\nRewriteRule ^/api/(.*)$ /index.php/$1\n",
+    ));
+    let (r, _) = run_hop(&state, &root, "/api/foo");
+    assert!(
+        !matches!(r, super::rewrite_glue::RwResult::Redirect { .. }),
+        "{r:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

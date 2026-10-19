@@ -27,9 +27,7 @@ fn implemented_response_actions_are_emitted_in_source_order() {
                 name: "Vary".into(),
                 value: "Accept-Encoding".into(),
             },
-            // Current gap: Merge is represented as Append and does not
-            // de-duplicate an existing comma-delimited value.
-            HeaderOp::Append {
+            HeaderOp::Merge {
                 name: "Cache-Control".into(),
                 value: "no-store".into(),
             },
@@ -72,7 +70,7 @@ fn parsed_semantic_gaps_remain_explicit() {
     let ht = Htaccess::parse(SEMANTIC_GAPS).unwrap();
 
     let success = ht.response_headers("/index.html", 200, &[]);
-    assert!(success.contains(&HeaderOp::Append {
+    assert!(success.contains(&HeaderOp::Merge {
         name: "Cache-Control".into(),
         value: "no-cache".into(),
     }));

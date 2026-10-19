@@ -39,7 +39,10 @@
 //!     the next LSAPI packet -> protocol desync on a reused socket. We stop at
 //!     `body_len` and poison.
 //!
-//! Only an exact match deposits the write half for re-pooling.
+//! Only an exact match deposits the write half, and even then a connection that
+//! carried body bytes is closed rather than re-pooled after RESP_END (#833): a
+//! body tail the script left unread is parsed by lsphp as a new request, whose
+//! response would otherwise reach the next request on the socket.
 //!
 //! ## Retry contract
 //! [`Lsapi::handle`] reports a request as non-replayable once any byte has been
@@ -74,10 +77,10 @@ use hj_core::{Body, BoxError, Handler, HandlerError, ReqCtx, Request, Response};
 
 use crate::cgi::CgiEnvBuilder;
 use crate::monitor::{InFlightGuard, Monitor};
-use crate::pool::{DialAdmission, LsapiPool, ReturnGuard, TrialGuard};
+use crate::pool::{DialAdmission, LsapiPool, ResponseBodyPath, ReturnGuard, TrialGuard};
 use crate::proto::{
     ENDIAN_BIT, HOST_LSAPI_ENDIAN, LsapiFrame, PACKET_HEADER_LEN, PacketType, RespHeader,
-    SpecialEnvType, VERSION_B0, VERSION_B1, build_begin_request_framed_into,
+    SpecialEnvType, VERSION_B0, VERSION_B1, WireHeader, build_begin_request_framed_into,
 };
 use crate::supervisor::WorkerState;
 
@@ -98,17 +101,122 @@ const IDEMPOTENT_RETRY_MAX: u32 = 2;
 // (#317a) Buffered-only inline ceiling: a response FULLY buffered after the header
 // read returns Body::Full with no Channel + spawned pump. 256 KiB covers real page
 // renders (the old 64 KiB streamed every large render despite it being entirely in
-// the reader buffer). Memory stays bounded because draining is try_parse-only —
-// dispatch NEVER awaits un-buffered body bytes (see the D1 barrier contract) — and
+// the reader buffer). Memory stays bounded because draining never waits (try_parse
+// plus at most INLINE_FILL_READS non-blocking reads) — dispatch NEVER awaits
+// un-buffered body bytes (see the D1 barrier contract) — and
 // declared-length truncation/over-delivery enforcement applies to the inlined body
 // exactly as before.
 const INLINE_BODY_CAP: usize = 256 * 1024;
+
+/// Non-blocking socket reads the inline drain may add to complete a declared-length
+/// body (#987): each takes up to a 64 KiB read buffer's spare room, so four cover
+/// INLINE_BODY_CAP behind the header read.
+const INLINE_FILL_READS: u32 = 4;
+
+/// Largest single-chunk inline body copied out of the read buffer instead of
+/// sliced (#989): a slice keeps the whole >= 64 KiB buffer alive behind a body the
+/// page cache charges by its length, and leaves the recycled buffer shared, so the
+/// next reader on this thread allocates a fresh one.
+const INLINE_COPY_MAX: usize = 64 * 1024;
+
+/// The first `len` bytes of `chunks` (`len` <= their total) as one `Bytes`.
+fn inline_body(chunks: Vec<Bytes>, len: usize) -> Bytes {
+    let mut chunks = chunks.into_iter();
+    let Some(mut first) = chunks.next() else {
+        return Bytes::new();
+    };
+    if first.len() >= len || chunks.as_slice().is_empty() {
+        first.truncate(len);
+        return if first.len() <= INLINE_COPY_MAX {
+            Bytes::copy_from_slice(&first)
+        } else {
+            first
+        };
+    }
+    let mut body = bytes::BytesMut::with_capacity(len);
+    body.extend_from_slice(&first);
+    for chunk in chunks {
+        let take = (len - body.len()).min(chunk.len());
+        body.extend_from_slice(chunk.get(..take).unwrap_or_default());
+        if body.len() == len {
+            break;
+        }
+    }
+    body.freeze()
+}
 
 /// Short backoff before each idempotent-reset retry. During a recycle BURST the
 /// first retry's fresh dial can ALSO re-hit a pool still mid-respawn; a brief pause
 /// lets the recycle resolve / a fresh worker become available. Worst case
 /// ~2×25ms = 50ms of added latency on a failing request.
 const IDEMPOTENT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+/// Largest POST body whose connection may be reused (#833): far below any sane
+/// post_max_size, so PHP has always read it in full before the script runs.
+const PREREAD_POST_MAX: i32 = 64 * 1024;
+
+/// Whether PHP reads a POST of this Content-Type in full at request start: any
+/// non-empty media type except `multipart/*`, whose rfc1867 handler reads lazily
+/// and may stop early. The media type is cut where PHP's sapi_activate cuts it
+/// (`;`, `,`, space), plus tab, so both sides see the same type.
+fn php_preread_content_type(value: &[u8]) -> bool {
+    let value = value.trim_ascii_start();
+    let end = value
+        .iter()
+        .position(|&b| matches!(b, b';' | b',' | b' ' | b'\t'))
+        .unwrap_or(value.len());
+    let (media, _) = value.split_at(end);
+    !media.is_empty()
+        && !media
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"multipart/"))
+}
+
+/// The header's value when it occurs exactly once: a repeated field could make
+/// this gate and the value lsphp receives disagree.
+fn single_header(
+    headers: &http::HeaderMap,
+    name: http::header::HeaderName,
+) -> Option<&http::HeaderValue> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next()?;
+    values.next().is_none().then_some(first)
+}
+
+#[cfg(test)]
+mod preread_tests {
+    #[test]
+    fn multipart_post_is_never_assumed_preread() {
+        // #835: rfc1867 reads lazily and stops early without a boundary.
+        assert!(super::php_preread_content_type(
+            b"application/x-www-form-urlencoded"
+        ));
+        assert!(super::php_preread_content_type(b"text/plain;charset=UTF-8"));
+        assert!(!super::php_preread_content_type(b"multipart/form-data"));
+        assert!(!super::php_preread_content_type(
+            b" Multipart/Form-Data ; boundary=zz"
+        ));
+        assert!(!super::php_preread_content_type(b"  "));
+        assert!(!super::php_preread_content_type(b";x=1"));
+        // PHP cuts the media type at `,` and space too.
+        assert!(!super::php_preread_content_type(b"multipart/form-data, x"));
+        assert!(!super::php_preread_content_type(
+            b"multipart/form-data boundary=zz"
+        ));
+        assert!(!super::php_preread_content_type(b"MULTIPART/mixed"));
+    }
+
+    #[test]
+    fn repeated_content_type_is_not_trusted() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+        assert!(super::single_header(&headers, http::header::CONTENT_TYPE).is_some());
+        headers.append(
+            http::header::CONTENT_TYPE,
+            "multipart/form-data".parse().unwrap(),
+        );
+        assert!(super::single_header(&headers, http::header::CONTENT_TYPE).is_none());
+    }
+}
 
 /// Per-request LSAPI timing breakdown, attached to the response's extensions so
 /// the caller (telemetry) can split "waiting for a worker" from "actual render".
@@ -242,6 +350,24 @@ fn empty_incoming_body() -> hj_core::IncomingBody {
         .map_err(|e| Box::new(e) as BoxError)
         .boxed()
 }
+
+/// `lease` rides inside the body so the buffered-body reservation lasts as long as
+/// the detached pump still holds the bytes.
+fn full_incoming_body(body: Bytes, lease: Option<Arc<BodyBufferLease>>) -> hj_core::IncomingBody {
+    use http_body_util::{BodyExt, Full};
+    Full::new(body)
+        .map_frame(move |frame| {
+            let _held = &lease;
+            frame
+        })
+        .map_err(|e| Box::new(e) as BoxError)
+        .boxed()
+}
+
+/// A buffered body up to this size is written inline before the response is read: it
+/// fits the default AF_UNIX send buffer, so the write completes without lsphp reading
+/// it. A larger one goes through the full-duplex streaming path (#806).
+const BUFFERED_INLINE_WRITE_MAX: usize = 64 * 1024;
 
 /// Request extension the pipeline inserts to pin an already-resolved
 /// `SCRIPT_FILENAME` (e.g. a directory's `index.php`), so `REQUEST_URI` keeps
@@ -446,14 +572,13 @@ impl Lsapi {
         // (#236) The lease lives to the end of `handle` so the reservation tracks
         // the buffered body's lifetime, not just the collection loop. Never read —
         // held purely for its Drop.
-        #[allow(unused_variables, unused_assignments)]
-        // Held to the END of this fn (never read, only dropped): the RAII lease
-        // keeps the server-wide buffered-body reservation alive while the buffer
-        // is handed to lsphp.
-        let _body_lease: Option<BodyBufferLease>;
+        // Held to the END of this fn: the RAII lease keeps the server-wide
+        // buffered-body reservation alive while the buffer is handed to lsphp. A
+        // concurrent body pump holds a clone until it finishes writing (#806).
+        let body_lease: Option<Arc<BodyBufferLease>>;
         let buffered: Option<Bytes> = match declared_len {
             Some(_) => {
-                _body_lease = None;
+                body_lease = None;
                 None
             }
             None => {
@@ -465,11 +590,20 @@ impl Lsapi {
                             return (Err(error), parts);
                         }
                     };
-                _body_lease = Some(lease);
+                body_lease = Some(Arc::new(lease));
                 Some(b)
             }
         };
-        let buffered_len = buffered.as_ref().map(|body| body.len().to_string());
+        // A bodyless GET/HEAD/... carries no Content-Length on the wire; inventing
+        // `Content-Length: 0` would surface in getallheaders()/$_SERVER, unlike LSWS.
+        let method_has_body = matches!(
+            *req.method(),
+            http::Method::POST | http::Method::PUT | http::Method::PATCH
+        );
+        let buffered_len = buffered
+            .as_ref()
+            .filter(|body| !body.is_empty() || method_has_body)
+            .map(|body| body.len().to_string());
 
         // Build the CGI env + raw wire headers (both borrow `req`). lsphp reads
         // $_SERVER HTTP_* / getallheaders() from the LSAPI header index over this
@@ -533,6 +667,25 @@ impl Lsapi {
         build_begin_request_framed_into(&mut begin, &env, &special_env, &headers, body_len);
         drop(env);
         drop(headers);
+        // PHP reads a POST body in full before the script runs (the form handlers,
+        // or php_default_post_reader for any other type) while enable_post_data_reading
+        // is on and the body is under post_max_size, so no unread tail can follow
+        // RESP_END and the socket may be reused. Any other bodied request closes its
+        // connection: lsphp would parse an unread tail as a new request (#833).
+        // PHP pre-reads only a POST that carries a Content-Type (sapi_activate), and
+        // only through sapi_read_standard_form_data: multipart is consumed lazily by
+        // rfc1867, which reads nothing on an early exit (no boundary, too many
+        // parts), so it never qualifies (#835). An operator .user.ini/php.ini turning
+        // enable_post_data_reading off is not visible here and must not be deployed
+        // alongside this rule.
+        let body_preread = req.method() == http::Method::POST
+            && (0..=PREREAD_POST_MAX).contains(&body_len)
+            && single_header(req.headers(), http::header::CONTENT_TYPE)
+                .is_some_and(|v| php_preread_content_type(v.as_bytes()))
+            && !special_env.iter().any(|(_, name, _)| {
+                name.eq_ignore_ascii_case("enable_post_data_reading")
+                    || name.eq_ignore_ascii_case("post_max_size")
+            });
         let (parts, body) = req.into_parts();
 
         // `begin` is owned here and only borrowed (`&[u8]`) by the dispatch/retry
@@ -552,8 +705,10 @@ impl Lsapi {
                 self.dispatch_buffered_retrying(
                     idempotent,
                     is_head,
+                    body_preread,
                     &begin,
                     buffered,
+                    body_lease.as_ref(),
                     &mut inflight,
                 )
                 .await
@@ -562,6 +717,7 @@ impl Lsapi {
                 self.dispatch_streaming_retrying(
                     idempotent,
                     is_head,
+                    body_preread,
                     &begin,
                     body_len,
                     body,
@@ -760,6 +916,7 @@ impl Lsapi {
         &self,
         idempotent: bool,
         is_head: bool,
+        body_preread: bool,
         begin: &[u8],
         body_len: i32,
         body: hj_core::IncomingBody,
@@ -776,7 +933,15 @@ impl Lsapi {
         let mut last_retry: Option<RetryKind> = None;
         loop {
             match self
-                .dispatch_streaming(idempotent, is_head, begin, body_len, body, &mut *inflight)
+                .dispatch_streaming(
+                    idempotent,
+                    is_head,
+                    body_preread,
+                    begin,
+                    body_len,
+                    body,
+                    &mut *inflight,
+                )
                 .await
             {
                 Attempt::Done(r) => return tag_retry(r, last_retry),
@@ -807,8 +972,10 @@ impl Lsapi {
         &self,
         idempotent: bool,
         is_head: bool,
+        body_preread: bool,
         begin: &[u8],
         body: Bytes,
+        lease: Option<&Arc<BodyBufferLease>>,
         inflight: &mut Option<InFlightGuard>,
     ) -> Result<Response, HandlerError> {
         // Held for the whole dispatch: on drop (any exit path) it releases the
@@ -822,7 +989,15 @@ impl Lsapi {
         let mut last_retry: Option<RetryKind> = None;
         loop {
             match self
-                .dispatch_buffered(idempotent, is_head, begin, body, &mut *inflight)
+                .dispatch_buffered(
+                    idempotent,
+                    is_head,
+                    body_preread,
+                    begin,
+                    body,
+                    lease,
+                    &mut *inflight,
+                )
                 .await
             {
                 Attempt::Done(r) => return tag_retry(r, last_retry),
@@ -865,6 +1040,7 @@ impl Lsapi {
         &self,
         idempotent: bool,
         is_head: bool,
+        body_preread: bool,
         begin: &[u8],
         body_len: i32,
         body: hj_core::IncomingBody,
@@ -975,7 +1151,11 @@ impl Lsapi {
                 guard.deposit_write(write_half);
             }
         } else {
-            guard.expect_body_drained();
+            if body_preread {
+                guard.mark_preread_body();
+            } else {
+                guard.mark_carried_body();
+            }
             let done = Arc::new(tokio::sync::Notify::new());
             let pump_done = done.clone();
             body_done = Some(done);
@@ -1037,10 +1217,37 @@ impl Lsapi {
         &self,
         idempotent: bool,
         is_head: bool,
+        body_preread: bool,
         begin: &[u8],
         body: Bytes,
+        lease: Option<&Arc<BodyBufferLease>>,
         inflight: &mut Option<InFlightGuard>,
     ) -> Attempt<Bytes> {
+        // A large buffered body written in full before any response read deadlocks
+        // against a script that writes a large response before draining its input
+        // (#806). Stream it concurrently with the response instead; the BEGIN packet
+        // already carries the buffered length, and the streaming path hands back an
+        // untouched body only for a pre-flush failure, so replaying the retained
+        // bytes there is exactly as safe as replaying them here.
+        if body.len() > BUFFERED_INLINE_WRITE_MAX {
+            // collect_to_cap bounds a buffered body to i32::MAX.
+            let body_len = body.len() as i32;
+            return match self
+                .dispatch_streaming(
+                    idempotent,
+                    is_head,
+                    body_preread,
+                    begin,
+                    body_len,
+                    full_incoming_body(body.clone(), lease.cloned()),
+                    inflight,
+                )
+                .await
+            {
+                Attempt::Done(r) => Attempt::Done(r),
+                Attempt::Retry { reason, kind, .. } => Attempt::Retry { body, reason, kind },
+            };
+        }
         // PRE-FLUSH (replayable): pool acquire. Hand the buffered body back on a
         // failure so the caller can replay it on a fresh connection.
         let acq_start = Instant::now();
@@ -1147,7 +1354,11 @@ impl Lsapi {
         // so a clean read can re-pool the socket.
         let (read_half, write_half, guard) = conn.into_split();
         if !body.is_empty() {
-            guard.expect_body_drained();
+            if body_preread {
+                guard.mark_preread_body();
+            } else {
+                guard.mark_carried_body();
+            }
         }
         guard.deposit_write(write_half);
         // No concurrent body pump here, so the cancel notify has no listener; pass
@@ -1327,11 +1538,14 @@ impl Lsapi {
             }
         };
 
-        // Build the response head.
+        // Build the response head straight into a pre-sized map, consuming the
+        // parsed header list (no per-field clone).
         let status = http::StatusCode::from_u16(resp_header.status).unwrap_or(http::StatusCode::OK);
-        let mut builder = http::Response::builder().status(status);
+        let mut head = http::HeaderMap::with_capacity(
+            resp_header.headers.len() + usize::from(declared_len.is_some()),
+        );
         let mut has_status_header = None;
-        for (name, value) in &resp_header.headers {
+        for (name, value) in resp_header.headers {
             // PHP may emit a "Status: 404 Not Found" header.
             if name.as_str().eq_ignore_ascii_case("status") {
                 if let Some(code) = value
@@ -1350,13 +1564,20 @@ impl Lsapi {
             if name == http::header::CONTENT_LENGTH {
                 continue;
             }
-            builder = builder.header(name.clone(), value.clone());
+            if let Err(e) = head.try_append(name, value) {
+                fail(&guard, &cancel);
+                return Err(ReadFail::terminal(HandlerError::Other(format!(
+                    "build response: {e}"
+                ))));
+            }
         }
-        if let Some(code) = has_status_header {
-            builder = builder.status(code);
-        }
-        if let Some(len) = declared_len {
-            builder = builder.header(http::header::CONTENT_LENGTH, len.to_string());
+        if let Some(len) = declared_len
+            && let Err(e) = head.try_append(http::header::CONTENT_LENGTH, len.into())
+        {
+            fail(&guard, &cancel);
+            return Err(ReadFail::terminal(HandlerError::Other(format!(
+                "build response: {e}"
+            ))));
         }
         let status = has_status_header.unwrap_or(status);
         // A 1xx is never a final response: forwarded, an H1 client waits forever for the
@@ -1373,22 +1594,42 @@ impl Lsapi {
         } else {
             declared_len
         };
+        // (#949) A script that opts out of buffering (`X-Accel-Buffering: no`, then
+        // `flush()`) is feeding a client that consumes it as it arrives: it keeps the
+        // streaming path and its unbuffered-feed marker.
+        let unbuffered = accel_buffering_off(&head);
+        let mut response = Response::new(Body::Empty);
+        *response.status_mut() = status;
+        *response.headers_mut() = head;
+        response
+            .extensions_mut()
+            .insert(LsapiTiming { acquire, ttfb });
 
-        // FAST PATH (the common small PHP response): lsphp usually delivers the
-        // whole response (RESP_HEADER + RESP_STREAM + RESP_END) in one socket write,
-        // so the body packets are ALREADY in the reader's buffer after the header
-        // read. Drain them with the SYNC `try_parse` (no extra socket read / await)
-        // and, if the whole body is in hand, return a `Body::Full` — skipping the
-        // per-request response Channel + a spawned pump task (a real cross-core hop
-        // between the LSAPI read and the h2/h1 send). The moment more bytes are
-        // needed (Ok(None)) or the body exceeds INLINE_BODY_CAP, fall back to the
-        // streaming pump, handing it the chunks already collected as a `prelude` so
-        // none are lost. Re-pool / poison handling mirrors the streaming path.
+        // FAST PATH (the common PHP response): lsphp usually delivers the whole
+        // response (RESP_HEADER + RESP_STREAM + RESP_END) in one socket write, so the
+        // body packets are ALREADY in the reader's buffer after the header read. Drain
+        // them with the SYNC `try_parse` and, if the whole body is in hand, return a
+        // `Body::Full` — skipping the per-request response Channel + a spawned pump
+        // task (a real cross-core hop between the LSAPI read and the h2/h1 send).
+        //
+        // (D1, #987) A declared Content-Length within the inline cap completes the
+        // body once that many bytes are in hand: lsphp sends RESP_END only after the
+        // app's post-flush deferred work (~100ms on XenForo pages). A few NON-BLOCKING
+        // reads take in what the socket already holds; nothing un-buffered is ever
+        // awaited here. RESP_END still decides re-pooling: when it is not buffered
+        // yet, a tail task drains to it under the streaming pump's rules.
+        //
+        // The moment more bytes would have to be awaited, or the body exceeds
+        // INLINE_BODY_CAP, fall back to the streaming pump, handing it the chunks
+        // already collected as a `prelude` so none are lost.
+        let complete_at = enforced_len.filter(|&len| len <= INLINE_BODY_CAP as u64 && !unbuffered);
         let mut prelude: Vec<Bytes> = Vec::new();
         let mut prelude_len: usize = 0;
+        let mut fills = 0;
         enum InlineEnd {
-            Repool, // clean RESP_END: deposit the read half so the socket re-pools
-            Poison, // ConnClose before RESP_END: complete only with a satisfied Content-Length
+            Repool,    // clean RESP_END: deposit the read half so the socket re-pools
+            Poison,    // ConnClose before RESP_END: complete only with a satisfied Content-Length
+            Tail(u64), // declared length in hand before RESP_END: a task drains to it
         }
         let inline_end: Option<InlineEnd> = loop {
             match reader.try_parse() {
@@ -1414,9 +1655,21 @@ impl Lsapi {
                     }
                     _ => {}
                 },
-                // No more COMPLETE packet is buffered — a socket read is needed, so
-                // hand off to the async streaming pump (with the prelude).
-                Ok(None) => break None,
+                // No more COMPLETE packet is buffered.
+                Ok(None) => {
+                    if let Some(len) = complete_at {
+                        if prelude_len as u64 >= len {
+                            break Some(InlineEnd::Tail(len));
+                        }
+                        if fills < INLINE_FILL_READS && reader.try_fill(&read_half) {
+                            fills += 1;
+                            continue;
+                        }
+                    }
+                    // A socket read would have to wait: hand off to the async
+                    // streaming pump (with the prelude).
+                    break None;
+                }
                 Err(e) => {
                     fail(&guard, &cancel);
                     return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
@@ -1427,37 +1680,26 @@ impl Lsapi {
         };
 
         if let Some(end) = inline_end {
-            let mut body = match prelude.len() {
-                0 => Bytes::new(),
-                1 => prelude.into_iter().next().expect("len==1"),
-                _ => {
-                    let mut buf = bytes::BytesMut::with_capacity(prelude_len);
-                    for c in &prelude {
-                        buf.extend_from_slice(c);
-                    }
-                    buf.freeze()
-                }
-            };
-            let over_delivered = enforced_len.is_some_and(|len| body.len() as u64 > len);
             if matches!(end, InlineEnd::Poison) && enforced_len.is_none() {
                 fail(&guard, &cancel);
                 return Err(ReadFail::terminal(HandlerError::BadGateway(
                     "lsapi connection closed before RESP_END".into(),
                 )));
             }
-            if let Some(len) = enforced_len {
-                if (body.len() as u64) < len {
-                    fail(&guard, &cancel);
-                    return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
-                        "lsapi response body truncated: declared {len} bytes, received {}",
-                        body.len()
-                    ))));
-                }
-                if over_delivered {
-                    body.truncate(len as usize);
-                }
+            if let Some(len) = enforced_len
+                && (prelude_len as u64) < len
+            {
+                fail(&guard, &cancel);
+                return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                    "lsapi response body truncated: declared {len} bytes, received {prelude_len}"
+                ))));
             }
-            match end {
+            let over_delivered = enforced_len.is_some_and(|len| prelude_len as u64 > len);
+            let body = inline_body(
+                prelude,
+                enforced_len.map_or(prelude_len, |len| len as usize),
+            );
+            let path = match end {
                 // Only a response that ended cleanly and honored its declared
                 // length may return the LSAPI socket to the pool.
                 // Bytes buffered past RESP_END (litespeed_finish_request's trailing
@@ -1466,15 +1708,34 @@ impl Lsapi {
                 InlineEnd::Repool if !over_delivered && !reader.has_buffered() => {
                     guard.deposit_read(read_half);
                     cancel.notify_one();
+                    ResponseBodyPath::Inline
                 }
-                InlineEnd::Repool | InlineEnd::Poison => fail(&guard, &cancel),
-            }
-            let mut response = builder.body(Body::Full(body)).map_err(|e| {
-                ReadFail::terminal(HandlerError::Other(format!("build response: {e}")))
-            })?;
-            response
-                .extensions_mut()
-                .insert(LsapiTiming { acquire, ttfb });
+                InlineEnd::Repool | InlineEnd::Poison => {
+                    fail(&guard, &cancel);
+                    ResponseBodyPath::Inline
+                }
+                // The consumer's body is already complete, so the tail only drains,
+                // exactly as the streaming pump does once it has forwarded the
+                // declared length.
+                InlineEnd::Tail(len) => {
+                    tokio::spawn(pump_body(
+                        ResponseTail {
+                            read_half,
+                            reader,
+                            guard,
+                            cancel,
+                            declared_len: enforced_len,
+                        },
+                        None,
+                        Vec::new(),
+                        len,
+                        over_delivered,
+                    ));
+                    ResponseBodyPath::InlineTail
+                }
+            };
+            self.pool.note_response_body(path);
+            *response.body_mut() = Body::Full(body);
             return Ok(response);
         }
 
@@ -1490,24 +1751,36 @@ impl Lsapi {
         // client's clock.
         let (tx, channel) = Channel::<Bytes, BoxError>::new(8);
         tokio::spawn(pump_body(
-            read_half,
-            reader,
-            tx,
-            guard,
-            cancel,
+            ResponseTail {
+                read_half,
+                reader,
+                guard,
+                cancel,
+                declared_len: enforced_len,
+            },
+            Some(tx),
             prelude,
-            enforced_len,
+            0,
+            false,
         ));
+        self.pool.note_response_body(ResponseBodyPath::Streamed);
 
         let boxed: BoxBody<Bytes, BoxError> = BoxBody::new(channel);
-        let mut response = builder
-            .body(Body::Stream(boxed))
-            .map_err(|e| ReadFail::terminal(HandlerError::Other(format!("build response: {e}"))))?;
-        response
-            .extensions_mut()
-            .insert(LsapiTiming { acquire, ttfb });
+        *response.body_mut() = Body::Stream(boxed);
+        // (#949) The transport streams a body so marked instead of holding it to
+        // the buffering threshold; other PHP output keeps the buffered path.
+        if unbuffered {
+            response.extensions_mut().insert(hj_core::ProxiedBody);
+        }
         Ok(response)
     }
+}
+
+fn accel_buffering_off(headers: &http::HeaderMap) -> bool {
+    headers
+        .get_all("x-accel-buffering")
+        .iter()
+        .any(|v| v.as_bytes().trim_ascii().eq_ignore_ascii_case(b"no"))
 }
 
 /// Arguments to [`pump_request_body`] (grouped to keep the spawn call readable).
@@ -1673,20 +1946,39 @@ async fn pump_request_body(args: PumpArgs) {
     }
 }
 
+/// The read side of an LSAPI response once its head is built: what the body pump
+/// needs to finish the body and then settle the socket.
+struct ResponseTail {
+    read_half: OwnedReadHalf,
+    reader: PacketReader,
+    guard: Arc<ReturnGuard>,
+    cancel: Arc<tokio::sync::Notify>,
+    declared_len: Option<u64>,
+}
+
 /// Pump RESP_STREAM packets into the channel body, ending on RESP_END/close.
 /// STDERR goes to tracing. On any error path (including the client receiver going
 /// away mid-stream) we poison the guard so the connection is not reused; on a
 /// clean RESP_END we deposit the read half so the guard can re-pool the socket
 /// (only succeeds if the body writer also deposited its half).
+///
+/// `tx = None` with `sent` at the declared length is the inline tail: the consumer
+/// already holds the whole body, so this only drains to RESP_END. `over_delivered`
+/// carries bytes the inline drain already saw past the declared length.
 async fn pump_body(
-    mut read_half: OwnedReadHalf,
-    mut reader: PacketReader,
-    tx: Sender<Bytes, BoxError>,
-    guard: Arc<ReturnGuard>,
-    cancel: Arc<tokio::sync::Notify>,
+    tail: ResponseTail,
+    tx: Option<Sender<Bytes, BoxError>>,
     prelude: Vec<Bytes>,
-    declared_len: Option<u64>,
+    mut sent: u64,
+    mut over_delivered: bool,
 ) {
+    let ResponseTail {
+        mut read_half,
+        mut reader,
+        guard,
+        cancel,
+        declared_len,
+    } = tail;
     // Whatever happens, when this task ends it wakes the body pump (the only task
     // that waits on `cancel`) in case it is still blocked on a slow/stalled/
     // abandoned upload, so it stops and drops its Arc<ReturnGuard> (freeing the
@@ -1705,9 +1997,7 @@ async fn pump_body(
     // EOF before it means the worker died mid-response and the consumer body is
     // aborted, never ended cleanly (a clean end would let the page cache store the
     // truncated page).
-    let mut tx = Some(tx);
-    let mut sent: u64 = 0;
-    let mut over_delivered = false;
+    let mut tx = tx;
     if declared_len == Some(0) {
         tx = None;
     }
@@ -1942,10 +2232,10 @@ const LSAPI_MAX_FIELD_LEN: usize = (u16::MAX as usize) - 1;
 
 /// True if any `(key, value)` in `fields` has a key OR value whose byte length
 /// would overflow the LSAPI u16 length prefix (see [`LSAPI_MAX_FIELD_LEN`]).
-fn lsapi_fields_overflow_u16<K: AsRef<str>, V: AsRef<str>>(fields: &[(K, V)]) -> bool {
-    fields.iter().any(|(k, v)| {
-        k.as_ref().len() > LSAPI_MAX_FIELD_LEN || v.as_ref().len() > LSAPI_MAX_FIELD_LEN
-    })
+fn lsapi_fields_overflow_u16<F: WireHeader>(fields: &[F]) -> bool {
+    fields
+        .iter()
+        .any(|f| f.name().len() > LSAPI_MAX_FIELD_LEN || f.value().len() > LSAPI_MAX_FIELD_LEN)
 }
 
 /// As [`lsapi_fields_overflow_u16`] but for the special-env (php.ini override)
@@ -1974,7 +2264,7 @@ fn collect_wire_headers<'r>(
     req: &'r Request,
     content_length: Option<&'r str>,
     forwarding_trusted: bool,
-) -> Vec<(Cow<'r, str>, Cow<'r, str>)> {
+) -> Vec<WireField<'r>> {
     let mut headers: Vec<_> = req
         .headers()
         .iter()
@@ -1983,16 +2273,69 @@ fn collect_wire_headers<'r>(
                 && !(content_length.is_some() && *name == http::header::CONTENT_LENGTH)
         })
         .map(|(name, value)| {
-            let v = value.to_str().map(Cow::Borrowed).unwrap_or_else(|_| {
+            let value = value.to_str().map(Cow::Borrowed).unwrap_or_else(|_| {
                 Cow::Owned(String::from_utf8_lossy(value.as_bytes()).into_owned())
             });
-            (Cow::Borrowed(name.as_str()), v)
+            let known = crate::proto::known_header_index(name.as_str());
+            WireField {
+                name: wire_header_name(name.as_str(), known),
+                value,
+                known,
+            }
         })
         .collect();
     if let Some(length) = content_length {
-        headers.push((Cow::Borrowed("content-length"), Cow::Borrowed(length)));
+        headers.push(WireField {
+            name: Cow::Borrowed("content-length"),
+            value: Cow::Borrowed(length),
+            known: crate::proto::known_header_index("content-length"),
+        });
     }
     headers
+}
+
+/// A request header bound for lsphp's header block, with its well-known index
+/// slot resolved once: the name mapping and both builder passes all need it.
+struct WireField<'r> {
+    name: Cow<'r, str>,
+    value: Cow<'r, str>,
+    known: Option<usize>,
+}
+
+impl WireHeader for WireField<'_> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn value(&self) -> &str {
+        &self.value
+    }
+    fn known_index(&self) -> Option<usize> {
+        self.known
+    }
+}
+
+/// The name lsphp reports for a header (`getallheaders()`, #950). A well-known
+/// header is sent by index slot, so the SAPI names it from its own table and the
+/// name text is never read. Any other name is reported verbatim; the h1 case is
+/// gone by now (the `http` crate lower-cases), so restore the conventional
+/// Title-Case FPM/Apache present (`x-hub-signature-256` -> `X-Hub-Signature-256`).
+/// Only `[A-Za-z0-9-]` names get here ([`crate::cgi::header_forwardable`]), so the
+/// mapping is case-only: `HTTP_*` names and duplicate grouping are unchanged.
+fn wire_header_name(name: &str, known: Option<usize>) -> Cow<'_, str> {
+    if known.is_some() {
+        return Cow::Borrowed(name);
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut start = true;
+    for c in name.chars() {
+        out.push(if start {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        });
+        start = c == '-';
+    }
+    Cow::Owned(out)
 }
 
 fn log_stderr(body: &[u8]) {
@@ -2021,6 +2364,9 @@ struct PacketReader {
     /// Absolute total-processing deadline; reads also fail `TimedOut` once it
     /// passes. `None` disables it (only the idle `timeout` applies).
     deadline: Option<Instant>,
+    /// A socket error a non-blocking [`Self::try_fill`] hit, returned by the next
+    /// read that would otherwise have reached the socket (and seen it there).
+    parked: Option<std::io::Error>,
 }
 
 impl PacketReader {
@@ -2050,6 +2396,32 @@ impl PacketReader {
             buf: take_packet_buf(Self::READ_CHUNK),
             timeout,
             deadline,
+            parked: None,
+        }
+    }
+
+    /// Append whatever the socket already holds, WITHOUT waiting; true if bytes
+    /// were appended. An error is parked for the next read rather than lost; EOF
+    /// recurs on that read by itself.
+    fn try_fill(&mut self, r: &OwnedReadHalf) -> bool {
+        if self.parked.is_some() {
+            return false;
+        }
+        self.buf.reserve(Self::READ_CHUNK);
+        match r.try_read_buf(&mut self.buf) {
+            Ok(n) => n > 0,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                false
+            }
+            Err(e) => {
+                self.parked = Some(e);
+                false
+            }
         }
     }
 
@@ -2102,6 +2474,9 @@ impl PacketReader {
                 Some(dl) => dl.min(idle_deadline),
                 None => idle_deadline,
             };
+            if let Some(e) = self.parked.take() {
+                return Err(e);
+            }
             timer
                 .as_mut()
                 .reset(tokio::time::Instant::from_std(effective));
@@ -2192,6 +2567,104 @@ impl PacketReader {
 impl Drop for PacketReader {
     fn drop(&mut self) {
         self.recycle_buf();
+    }
+}
+
+#[cfg(test)]
+mod inline_body_tests {
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use tokio::io::AsyncWriteExt;
+
+    use super::{INLINE_COPY_MAX, PACKET_BUF, PacketReader, inline_body, take_packet_buf};
+    use crate::proto::{HOST_LSAPI_ENDIAN, PACKET_HEADER_LEN, PacketType, VERSION_B0, VERSION_B1};
+
+    fn stream_packet(body: &[u8]) -> Vec<u8> {
+        let mut out = vec![
+            VERSION_B0,
+            VERSION_B1,
+            PacketType::RespStream as u8,
+            HOST_LSAPI_ENDIAN,
+        ];
+        out.extend_from_slice(&((PACKET_HEADER_LEN + body.len()) as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn joins_and_cuts_chunks_at_the_declared_length() {
+        let chunks = |parts: &[&'static [u8]]| -> Vec<Bytes> {
+            parts.iter().map(|p| Bytes::from_static(p)).collect()
+        };
+        assert!(inline_body(Vec::new(), 0).is_empty());
+        assert_eq!(
+            &inline_body(chunks(&[b"abc", b"def", b"ghi"]), 9)[..],
+            b"abcdefghi"
+        );
+        assert_eq!(
+            &inline_body(chunks(&[b"abc", b"def", b"ghi"]), 7)[..],
+            b"abcdefg"
+        );
+        assert_eq!(&inline_body(chunks(&[b"abcdef", b"xyz"]), 4)[..], b"abcd");
+        assert_eq!(&inline_body(chunks(&[b"abcdef"]), 3)[..], b"abc");
+        assert!(inline_body(chunks(&[b"abc"]), 0).is_empty());
+    }
+
+    // (#989) A small single chunk is copied; only a large one stays a slice.
+    #[test]
+    fn copies_small_single_chunks_and_slices_large_ones() {
+        let small = Bytes::from(vec![7u8; INLINE_COPY_MAX]);
+        let body = inline_body(vec![small.clone()], small.len());
+        assert!(body.is_unique());
+        assert_ne!(body.as_ptr(), small.as_ptr());
+
+        let large = Bytes::from(vec![7u8; INLINE_COPY_MAX + 1]);
+        let body = inline_body(vec![large.clone()], large.len());
+        assert_eq!(body.as_ptr(), large.as_ptr());
+    }
+
+    // (#989) Once the inline body is out, the parked read buffer is unique again:
+    // the next reader on the thread reclaims the same allocation (#280) instead of
+    // allocating a fresh 64 KiB.
+    #[test]
+    fn single_chunk_inline_body_leaves_the_read_buffer_reusable() {
+        PACKET_BUF.with(|slot| *slot.borrow_mut() = None);
+        let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
+        let base = reader.buf.as_ptr();
+        reader.buf.extend_from_slice(&stream_packet(b"hello"));
+        let frame = reader.try_parse().unwrap().unwrap();
+        let body = inline_body(vec![frame.body], 5);
+        assert_eq!(&body[..], b"hello");
+        assert!(body.is_unique());
+        drop(reader);
+
+        let mut buf = take_packet_buf(PacketReader::READ_CHUNK);
+        buf.reserve(PacketReader::READ_CHUNK);
+        assert_eq!(buf.as_ptr(), base, "the recycled buffer was reallocated");
+        drop(body);
+    }
+
+    #[tokio::test]
+    async fn try_fill_takes_only_what_the_socket_already_holds() {
+        let (ours, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let (mut read_half, _write_half) = ours.into_split();
+        let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
+
+        peer.write_all(&stream_packet(b"queued")).await.unwrap();
+        read_half.readable().await.unwrap();
+        assert!(reader.try_fill(&read_half));
+        let frame = reader.try_parse().unwrap().unwrap();
+        assert_eq!(&frame.body[..], b"queued");
+        assert!(
+            !reader.try_fill(&read_half),
+            "nothing queued: must not wait"
+        );
+
+        drop(peer);
+        read_half.readable().await.unwrap();
+        assert!(!reader.try_fill(&read_half));
+        assert!(reader.next(&mut read_half).await.unwrap().is_none());
     }
 }
 
@@ -2328,16 +2801,16 @@ mod wire_header_tests {
             .unwrap();
         let headers = collect_wire_headers(&req, None, true);
         assert!(
-            !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("proxy")),
+            !headers.iter().any(|h| h.name.eq_ignore_ascii_case("proxy")),
             "Proxy header must be stripped from the LSAPI wire header index"
         );
         // Benign headers still pass through.
         assert!(
             headers
                 .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+                .any(|h| h.name.eq_ignore_ascii_case("user-agent"))
         );
-        assert!(headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")));
+        assert!(headers.iter().any(|h| h.name.eq_ignore_ascii_case("host")));
     }
 
     #[test]
@@ -2351,9 +2824,8 @@ mod wire_header_tests {
             .header("CF-Connecting-IP", "198.51.100.9")
             .body(empty_incoming_body())
             .unwrap();
-        let has = |headers: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
-                   name: &str| {
-            headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+        let has = |headers: &[super::WireField<'_>], name: &str| {
+            headers.iter().any(|h| h.name.eq_ignore_ascii_case(name))
         };
         for trusted in [false, true] {
             let headers = collect_wire_headers(&req, None, trusted);
@@ -2362,6 +2834,32 @@ mod wire_header_tests {
             assert!(has(&headers, "user-agent"));
             assert_eq!(has(&headers, "cf-connecting-ip"), trusted);
         }
+    }
+
+    // (#990) Carrying each header's slot resolved once encodes the same packet as
+    // resolving it in the builder.
+    #[test]
+    fn cached_header_slots_encode_identically() {
+        let req = http::Request::builder()
+            .uri("/index.php")
+            .header("Host", "forum.example")
+            .header("User-Agent", "curl/8")
+            .header("x-hub-signature-256", "sha256=abc")
+            .header("Cookie", "a=1")
+            .header("dnt", "1")
+            .header("Accept-Encoding", "zstd")
+            .body(empty_incoming_body())
+            .unwrap();
+        let fields = collect_wire_headers(&req, Some("3"), true);
+        let tuples: Vec<(String, String)> = fields
+            .iter()
+            .map(|h| (h.name.to_string(), h.value.to_string()))
+            .collect();
+        let env = [("REQUEST_METHOD", "POST"), ("SCRIPT_NAME", "/index.php")];
+        assert_eq!(
+            crate::proto::build_begin_request_framed(&env, &[], &fields, 3),
+            crate::proto::build_begin_request_framed(&env, &[], &tuples, 3)
+        );
     }
 
     #[test]
@@ -2374,10 +2872,13 @@ mod wire_header_tests {
         let headers = collect_wire_headers(&req, Some("3"), true);
         let lengths: Vec<_> = headers
             .iter()
-            .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-            .map(|(_, value)| value.as_ref())
+            .filter(|h| h.name.eq_ignore_ascii_case("content-length"))
+            .map(|h| (h.value.as_ref(), h.known))
             .collect();
-        assert_eq!(lengths, ["3"]);
+        assert_eq!(
+            lengths,
+            [("3", crate::proto::known_header_index("content-length"))]
+        );
         assert_eq!(req.headers()[http::header::CONTENT_LENGTH], "malformed");
     }
 }

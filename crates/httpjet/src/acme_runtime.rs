@@ -326,8 +326,16 @@ impl Prepared {
             "ACME requires a live certificate resolver"
         );
         self.targets.replace(handles)?;
-        if let Some(pair) = self.manager.installed(&self.validator)? {
-            self.targets.install(&self.domains, pair.certified_key())?;
+        // A stored pair that no longer validates (expired, issuer no longer trusted)
+        // must not stop the boot: the renewal loop, whose attempt is then due, and the
+        // HTTP-01 responder are what replace it (#904).
+        match self.manager.installed(&self.validator) {
+            Ok(Some(pair)) => self.targets.install(&self.domains, pair.certified_key())?,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                %error,
+                "stored ACME certificate no longer validates; serving without it until renewal"
+            ),
         }
         Ok(())
     }

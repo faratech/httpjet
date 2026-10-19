@@ -86,8 +86,45 @@ impl ClientThrottle {
         self.rate != 0
     }
 
+    /// Same rate and window: a config reload keeps this throttle's per-IP windows.
+    pub fn same_limits(&self, other: &Self) -> bool {
+        self.rate == other.rate && self.window == other.window
+    }
+
+    /// Continue `old`'s monotonic counters when a reload changes the limits.
+    pub fn inherit_counters(&self, old: &Self) {
+        self.rejected
+            .fetch_add(old.rejected.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.allowed
+            .fetch_add(old.allowed.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
     /// Count one request from `ip`; `false` when the IP is over its window rate.
     pub fn allow(&self, ip: IpAddr) -> bool {
+        self.admit(ip, true)
+    }
+
+    /// [`allow`](Self::allow) for a caller that hands a refusal to another path
+    /// which calls `allow` itself: an admission is charged, a refusal is not
+    /// counted here, so one 429 counts once.
+    pub fn allow_deferring_rejection(&self, ip: IpAddr) -> bool {
+        self.admit(ip, false)
+    }
+
+    /// Whether `ip` is under its rate right now, without counting anything: a
+    /// precheck for a path that must not do work for a request about to be refused.
+    pub fn would_allow(&self, ip: IpAddr) -> bool {
+        if self.rate == 0 {
+            return true;
+        }
+        let ip = ip.to_canonical();
+        let map = self.shards[shard_of_canonical(ip)].lock();
+        map.get(&ip).is_none_or(|w| {
+            Instant::now().duration_since(w.start) >= self.window || w.count < self.rate
+        })
+    }
+
+    fn admit(&self, ip: IpAddr, count_rejection: bool) -> bool {
         if self.rate == 0 {
             return true;
         }
@@ -104,6 +141,7 @@ impl ClientThrottle {
         let Some(w) = map.get_mut(&ip) else {
             if map.len() >= MAX_IPS_PER_SHARD {
                 // Still saturated after eviction: allow untracked (fail-open).
+                self.allowed.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
             map.insert(
@@ -113,6 +151,7 @@ impl ClientThrottle {
                     count: 1,
                 },
             );
+            self.allowed.fetch_add(1, Ordering::Relaxed);
             return true;
         };
         if now.duration_since(w.start) >= self.window {
@@ -120,10 +159,13 @@ impl ClientThrottle {
                 start: now,
                 count: 1,
             };
+            self.allowed.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         if w.count >= self.rate {
-            self.rejected.fetch_add(1, Ordering::Relaxed);
+            if count_rejection {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+            }
             return false;
         }
         w.count += 1;
@@ -247,5 +289,27 @@ mod tests {
         let tracked = IpAddr::V4(Ipv4Addr::new(172, 0, 0, 1));
         assert!(!t.allow(tracked));
         assert_eq!(t.rejected_total(), 1);
+    }
+
+    #[test]
+    fn every_admission_and_one_rejection_per_refused_request_are_counted() {
+        // #824: the first request of a window is an admission too, and a fast-path
+        // refusal handed to the pipeline (which re-checks) counts once.
+        let t = throttle(1);
+        assert!(t.allow_deferring_rejection(ip(1)));
+        assert_eq!(t.allowed_total(), 1);
+        assert!(!t.allow_deferring_rejection(ip(1)));
+        assert!(!t.allow(ip(1)));
+        assert_eq!(t.rejected_total(), 1);
+        assert_eq!(t.allowed_total(), 1);
+    }
+
+    #[test]
+    fn would_allow_counts_nothing() {
+        let t = throttle(1);
+        assert!(t.would_allow(ip(1)));
+        assert!(t.allow(ip(1)));
+        assert!(!t.would_allow(ip(1)));
+        assert_eq!((t.allowed_total(), t.rejected_total()), (1, 0));
     }
 }

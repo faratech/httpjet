@@ -90,6 +90,46 @@ pub(super) fn bounded_u8(s: &Option<String>, min: u8, max: u8, default: u8) -> u
     }
 }
 
+/// OLS `ConfigCtx::getLongValue` exactly: `strtoll` reads the leading integer
+/// (no digits ⇒ 0, so `true` reads as 0) scaled by a trailing K/M/G, and a value
+/// outside `[min, max]` falls back to `default`, as does an absent or empty
+/// element (OLS stores no value for one).
+pub(super) fn ols_long_value(s: &Option<String>, min: i64, max: i64, default: i64) -> i64 {
+    let Some(v) = s.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    let mult: i64 = match v.as_bytes().last() {
+        Some(b'G' | b'g') => 1 << 30,
+        Some(b'M' | b'm') => 1 << 20,
+        Some(b'K' | b'k') => 1 << 10,
+        _ => 1,
+    };
+    let (negative, rest) = match v.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, v.strip_prefix('+').unwrap_or(v)),
+    };
+    let digits = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .unwrap_or("");
+    let magnitude = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<i64>().unwrap_or(i64::MAX)
+    };
+    let value = if negative {
+        magnitude.saturating_neg()
+    } else {
+        magnitude
+    }
+    .saturating_mul(mult);
+    if (min..=max).contains(&value) {
+        value
+    } else {
+        default
+    }
+}
+
 /// Like [`bounded_u8`] but `max` is treated as an upper clamp (mirrors OLS's
 /// `max == INT_MAX` branch): values above `max` are clamped to `max`, values
 /// below `min` fall back to `default`.
@@ -143,6 +183,31 @@ pub(super) fn secs_in_range(
 
 pub(super) fn bytes_of(s: &Option<String>, default: u64) -> u64 {
     s.as_deref().and_then(parse_bytes).unwrap_or(default)
+}
+
+/// Byte-size counterpart of [`secs_in_range`]: LSWS `getLongValue` falls back to
+/// the default (with a warning) for a value outside `range` (#926).
+pub(super) fn bytes_in_range(
+    s: &Option<String>,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+    tag: &str,
+) -> u64 {
+    match s.as_deref().and_then(parse_bytes) {
+        Some(v) if range.contains(&v) => v,
+        Some(v) => {
+            tracing::warn!(
+                tag,
+                value = v,
+                default,
+                "tuning value outside [{}, {}]; using the default",
+                range.start(),
+                range.end()
+            );
+            default
+        }
+        None => default,
+    }
 }
 
 pub(super) fn nonempty(s: Option<String>) -> Option<String> {
@@ -200,9 +265,19 @@ pub(super) fn parse_env_pair(s: &str) -> Option<(String, String)> {
     Some((k.trim().to_string(), v.trim().to_string()))
 }
 
+/// Strip an ASCII-case-insensitive `prefix`.
+pub(super) fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    s.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &s[prefix.len()..])
+}
+
+/// OLS `extappregistry.cpp` accepts `uds://` and `unix:/` case-insensitively.
 pub(super) fn ext_address(addr: &str) -> ExtAddress {
     let addr = addr.trim();
-    if let Some(rest) = addr.strip_prefix("uds://") {
+    let uds = strip_prefix_ci(addr, "uds://")
+        .or_else(|| strip_prefix_ci(addr, "unix:").filter(|rest| rest.starts_with('/')));
+    if let Some(rest) = uds {
         // LiteSpeed writes UDS paths without a leading slash after the scheme.
         let p = if rest.starts_with('/') {
             rest.to_string()
@@ -217,15 +292,25 @@ pub(super) fn ext_address(addr: &str) -> ExtAddress {
     }
 }
 
+/// OLS `HandlerType::getHandlerType` compares case-insensitively and spells
+/// static as `null` (the webadmin's choice) or `static`.
 pub(super) fn context_kind(s: &Option<String>) -> ContextKind {
-    match s.as_deref().map(str::trim) {
-        Some("proxy") => ContextKind::Proxy,
-        Some("lsapi") => ContextKind::Lsapi,
-        Some("cgi") => ContextKind::Cgi,
-        Some("rails") | Some("appserver") => ContextKind::AppServer,
-        Some("redirect") => ContextKind::Redirect,
-        Some("static") | Some("") | None => ContextKind::Static,
-        Some(_) => ContextKind::Other,
+    let t = s.as_deref().map(str::trim).unwrap_or("");
+    let is = |name: &str| t.eq_ignore_ascii_case(name);
+    if t.is_empty() || is("static") || is("null") {
+        ContextKind::Static
+    } else if is("proxy") {
+        ContextKind::Proxy
+    } else if is("lsapi") {
+        ContextKind::Lsapi
+    } else if is("cgi") {
+        ContextKind::Cgi
+    } else if is("rails") || is("appserver") {
+        ContextKind::AppServer
+    } else if is("redirect") {
+        ContextKind::Redirect
+    } else {
+        ContextKind::Other
     }
 }
 

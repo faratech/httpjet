@@ -755,29 +755,89 @@ async fn refused_stream_window_update_does_not_goaway() {
     let _ = srv.await;
 }
 
-#[tokio::test]
-async fn request_body_over_config_max_is_refused() {
-    // Regression (#84): the per-stream request-body cap is driven by Config.max_request_body
-    // (LiteSpeed maxReqBodySize), NOT a hardcoded 64 MiB. With a tiny configured cap, a 16-byte
-    // body is over-cap and the stream is RST'd REFUSED_STREAM — a body this small could never
-    // trip the old const, so this proves the cap is config-driven. The window is sized well
-    // above the body so the BODY cap (not flow control) is what trips.
-    let (mut client, server) = tokio::io::duplex(64 * 1024);
-    let mut cfg = Config::default();
-    cfg.max_request_body = 8;
-    cfg.initial_window_size = 1 << 16;
-    let srv = tokio::spawn(async move { serve(server, noop_service, cfg, None).await });
+/// What the server sent on `sid` before acknowledging a PING the test wrote after its
+/// frames: each response HEADERS as (`:status`, END_STREAM) and each RST_STREAM code.
+/// Panics on GOAWAY; decodes every HEADERS block to keep `dec` in sync.
+#[derive(Debug, Default, PartialEq)]
+struct StreamEvents {
+    responses: Vec<(String, bool)>,
+    resets: Vec<u32>,
+}
 
-    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
-    let mut f = Vec::new();
-    frame::write_settings(&mut f, &[]);
-    client.write_all(&f).await.unwrap();
-    client.flush().await.unwrap();
-    for _ in 0..3 {
-        let _ = read_frame(&mut client).await; // SETTINGS, conn WINDOW_UPDATE, SETTINGS ACK
+async fn stream_events_until_ping_ack<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    dec: &mut Decoder,
+    sid: u32,
+) -> StreamEvents {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut events = StreamEvents::default();
+        loop {
+            let (hdr, payload) = read_frame(r).await;
+            match hdr.kind {
+                frame::kind::GOAWAY => panic!("connection GOAWAYed; stream {sid}: {events:?}"),
+                frame::kind::HEADERS => {
+                    let mut status = String::new();
+                    dec.decode(&payload, |n, v| {
+                        if n == ":status" {
+                            status = v.to_owned();
+                        }
+                    })
+                    .unwrap();
+                    if hdr.stream_id == sid {
+                        let end = hdr.flags & frame::flags::END_STREAM != 0;
+                        events.responses.push((status, end));
+                    }
+                }
+                frame::kind::RST_STREAM if hdr.stream_id == sid => {
+                    events
+                        .resets
+                        .push(u32::from_be_bytes(payload[..4].try_into().unwrap()));
+                }
+                frame::kind::PING if hdr.flags & frame::flags::ACK != 0 => return events,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for the PING ACK after stream {sid}"))
+}
+
+fn write_ping(buf: &mut Vec<u8>) {
+    frame::write_frame(buf, frame::kind::PING, 0, 0, &[7u8; 8]);
+}
+
+fn small_body_cap_config() -> Config {
+    Config {
+        max_request_body: 8,
+        initial_window_size: 1 << 16,
+        ..Config::default()
     }
+}
 
+/// A 413 and nothing else, then RST_STREAM(NO_ERROR) iff the client was still sending.
+fn too_large(status: &str, client_open: bool) -> StreamEvents {
+    StreamEvents {
+        responses: vec![(status.to_owned(), true)],
+        resets: if client_open {
+            vec![frame::error_code::NO_ERROR]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+#[tokio::test]
+async fn request_body_over_config_max_is_answered_413() {
+    // Regression (#84): the per-stream request-body cap is driven by Config.max_request_body
+    // (LiteSpeed maxReqBodySize), NOT a hardcoded 64 MiB: with a tiny cap a 16-byte body is
+    // over it. The window is sized well above the body so the BODY cap is what trips.
+    // (#1014) With no declared length to reject up front, the overflowing DATA frame is
+    // answered 413 + RST_STREAM(NO_ERROR) — not the retry-safe REFUSED_STREAM — and the rest
+    // of the upload is ignored rather than reset again.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut client, srv) = open_client(small_body_cap_config(), calls.clone()).await;
     let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
     let mut buf = Vec::new();
     frame::write_frame(
         &mut buf,
@@ -787,32 +847,136 @@ async fn request_body_over_config_max_is_refused() {
         &encode_get(&mut enc, "/upload"),
     );
     frame::write_frame(&mut buf, frame::kind::DATA, 0, 1, &[b'x'; 16]); // 16 > 8-byte body cap
+    write_ping(&mut buf);
     client.write_all(&buf).await.unwrap();
-    client.flush().await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        too_large("413", true)
+    );
 
-    let saw_refused = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let (hdr, payload) = read_frame(&mut client).await;
-            match hdr.kind {
-                frame::kind::GOAWAY => {
-                    panic!("an over-cap body must RST the stream, not GOAWAY the connection")
-                }
-                frame::kind::RST_STREAM if hdr.stream_id == 1 => {
-                    let code = u32::from_be_bytes(payload[..4].try_into().unwrap());
-                    assert_eq!(
-                        code,
-                        frame::error_code::REFUSED_STREAM,
-                        "over-cap body → REFUSED_STREAM"
-                    );
-                    break true;
-                }
-                _ => {}
-            }
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::DATA,
+        frame::flags::END_STREAM,
+        1,
+        &[b'x'; 16],
+    );
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        StreamEvents::default(),
+        "DATA after our RST_STREAM is ignored (§5.1)"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn over_cap_final_data_frame_is_answered_413_without_a_reset() {
+    // (#1014) The client already ended the stream, so the 413 closes it; a RST_STREAM on a
+    // closed stream would be a protocol violation (§5.1).
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut client, srv) = open_client(small_body_cap_config(), calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get(&mut enc, "/upload"),
+    );
+    frame::write_frame(
+        &mut buf,
+        frame::kind::DATA,
+        frame::flags::END_STREAM,
+        1,
+        &[b'x'; 16],
+    );
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        too_large("413", false)
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn declared_content_length_over_cap_is_answered_413_before_the_body() {
+    // (#1014) H1 parity: a declared length over the cap is rejected when the headers
+    // complete, without waiting for (or buffering) a single body byte.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut client, srv) = open_client(small_body_cap_config(), calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get_with(&mut enc, "/upload", &[("content-length", "9")]),
+    );
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        too_large("413", true)
+    );
+
+    // The connection, and the HPACK state the 413 updated, still serve the next request.
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        3,
+        &encode_get(&mut enc, "/after"),
+    );
+    client.write_all(&buf).await.unwrap();
+    let (status, _) = read_response(&mut client, &mut dec, 3).await;
+    assert_eq!(status.as_deref(), Some("200"));
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn data_past_declared_content_length_resets_on_the_first_overrunning_frame() {
+    // (#1014) §8.1.1: DATA beyond the declared content-length is malformed. The stream is
+    // reset on the overrunning frame itself — no END_STREAM is ever sent here, so the old
+    // completion-time check would have buffered until the body deadline.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut client, srv) = open_client(Config::default(), calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get_with(&mut enc, "/upload", &[("content-length", "10")]),
+    );
+    frame::write_frame(&mut buf, frame::kind::DATA, 0, 1, &[b'x'; 6]);
+    frame::write_frame(&mut buf, frame::kind::DATA, 0, 1, &[b'x'; 6]);
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        StreamEvents {
+            responses: Vec::new(),
+            resets: vec![frame::error_code::PROTOCOL_ERROR],
         }
-    })
-    .await
-    .expect("server must RST the over-config-cap-body stream");
-    assert!(saw_refused);
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     drop(client);
     let _ = srv.await;
 }
@@ -1634,6 +1798,45 @@ async fn malformed_host_fallback_is_reset_on_the_wire() {
     let _ = srv.await;
 }
 
+#[tokio::test]
+async fn connect_request_is_reset_as_malformed() {
+    // (#1015) RFC 9113 §8.5: CONNECT carrying :scheme/:path is malformed and must never be
+    // dispatched as an ordinary method (H3 rejects it the same way); the connection lives on.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut client, srv) = open_client(Config::default(), calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let mut block = Vec::new();
+    for (n, v) in [
+        (":method", "CONNECT"),
+        (":path", "/"),
+        (":scheme", "https"),
+        (":authority", "example.com:443"),
+    ] {
+        enc.encode_header(&mut block, n, v);
+    }
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        1,
+        &block,
+    );
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        StreamEvents {
+            responses: Vec::new(),
+            resets: vec![frame::error_code::PROTOCOL_ERROR],
+        }
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    drop(client);
+    let _ = srv.await;
+}
+
 /// Echo `x-dyn` back as `x-echo`; count every dispatched request.
 fn echo_counting_service(
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1703,7 +1906,8 @@ async fn header_bomb_is_a_stream_reset_not_connection_fatal() {
     // must. Regression (#595): that used to GOAWAY the whole connection, so one oversized
     // request relayed by Cloudflare tore down a pooled origin connection carrying other
     // users' streams. Now the block is still decoded to the end (keeping the HPACK table in
-    // sync — here it inserts `x-dyn: v1` before the bomb) and only its stream is refused.
+    // sync — here it inserts `x-dyn: v1` before the bomb) and only its stream is answered,
+    // with H1's 431 rather than the retry-safe REFUSED_STREAM (#1014).
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let config = Config {
         header_list_size: 1024,
@@ -1727,11 +1931,12 @@ async fn header_bomb_is_a_stream_reset_not_connection_fatal() {
     block.extend_from_slice(b"v1");
     let mut buf = Vec::new();
     frame::write_frame(&mut buf, frame::kind::HEADERS, end, 1, &block);
+    write_ping(&mut buf);
     client.write_all(&buf).await.unwrap();
     client.flush().await.unwrap();
     assert_eq!(
-        expect_reset(&mut client, &mut dec, 1).await,
-        frame::error_code::REFUSED_STREAM
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        too_large("431", false)
     );
 
     // Stream 3 references dynamic index 62: it resolves to `x-dyn: v1` only if the
@@ -1754,6 +1959,39 @@ async fn header_bomb_is_a_stream_reset_not_connection_fatal() {
         1,
         "bomb never dispatched"
     );
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn oversized_headers_with_a_body_pending_get_431_then_a_no_error_reset() {
+    // (#1014) The client has not ended the stream, so the 431 is followed by
+    // RST_STREAM(NO_ERROR) asking it to stop sending (§8.1).
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = Config {
+        header_list_size: 1024,
+        ..Config::default()
+    };
+    let (mut client, srv) = open_client(config, calls.clone()).await;
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let mut block = vec![0x82, 0x84, 0x87, 0x01, 0x0b];
+    block.extend_from_slice(b"example.com");
+    block.extend(std::iter::repeat_n(0xA0u8, 1024));
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &block,
+    );
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        too_large("431", true)
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     drop(client);
     let _ = srv.await;
 }
@@ -2041,6 +2279,61 @@ async fn partial_frame_has_an_absolute_deadline() {
 }
 
 #[tokio::test]
+async fn unfinished_header_block_has_an_absolute_deadline() {
+    // Regression (#1012): complete, empty CONTINUATION frames neither leave a partial frame
+    // nor let the idle timer fire, so the open header block needs its own deadline.
+    let (client, server) = tokio::io::duplex(16 * 1024);
+    let config = Config {
+        conn_idle_timeout: Some(std::time::Duration::from_secs(2)),
+        frame_read_timeout: Some(std::time::Duration::from_millis(100)),
+        ..Config::default()
+    };
+    let srv = tokio::spawn(async move { serve(server, noop_service, config, None).await });
+    let (mut reader, mut writer) = tokio::io::split(client);
+    let mut wire = hj_h2::conn::PREFACE.to_vec();
+    frame::write_settings(&mut wire, &[]);
+    let block = encode_get(&mut Encoder::new(), "/");
+    frame::write_frame(
+        &mut wire,
+        frame::kind::HEADERS,
+        frame::flags::END_STREAM,
+        1,
+        &block,
+    );
+    writer.write_all(&wire).await.unwrap();
+    let trickle = tokio::spawn(async move {
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let mut empty = Vec::new();
+            frame::write_frame(&mut empty, frame::kind::CONTINUATION, 0, 1, &[]);
+            if writer.write_all(&empty).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let code = tokio::time::timeout(std::time::Duration::from_millis(700), async {
+        loop {
+            let (hdr, payload) = read_frame(&mut reader).await;
+            assert_ne!(
+                hdr.kind,
+                frame::kind::HEADERS,
+                "unfinished block dispatched"
+            );
+            if hdr.kind == frame::kind::GOAWAY {
+                return u32::from_be_bytes(payload[4..8].try_into().unwrap());
+            }
+        }
+    })
+    .await
+    .expect("CONTINUATION frames must not extend the header-block deadline");
+    assert_eq!(code, frame::error_code::PROTOCOL_ERROR);
+    trickle.abort();
+    drop(reader);
+    let _ = srv.await;
+}
+
+#[tokio::test]
 async fn unfinished_request_body_expires_while_other_frames_arrive() {
     let (mut client, server) = tokio::io::duplex(32 * 1024);
     let config = Config {
@@ -2098,6 +2391,105 @@ async fn unfinished_request_body_expires_while_other_frames_arrive() {
     assert_eq!(code, frame::error_code::CANCEL);
     drop(client);
     let _ = srv.await;
+}
+
+/// (#1035) Each 16 KiB of a stream's own DATA restarts its body window, so a steady upload
+/// outlasting the timeout is answered, while the ceiling still resets it. Paused clock:
+/// `chunks` DATA frames of 16 KiB, one every 400 ms, against a 1 s body timeout.
+async fn paced_upload_end(
+    ceiling: std::time::Duration,
+    chunks: usize,
+) -> (Result<Vec<u8>, u32>, std::time::Duration) {
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let config = Config {
+        conn_idle_timeout: None,
+        request_body_timeout: Some(std::time::Duration::from_secs(1)),
+        request_body_ceiling: ceiling,
+        ..Config::default()
+    };
+    let service = |req: Request| async move {
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        hj_core::text_response(http::StatusCode::OK, body.len().to_string())
+    };
+    let srv = tokio::spawn(async move { serve(server, service, config, None).await });
+    let (mut reader, mut writer) = tokio::io::split(client);
+    let mut wire = hj_h2::conn::PREFACE.to_vec();
+    frame::write_settings(&mut wire, &[]);
+    let mut enc = Encoder::new();
+    let mut block = Vec::new();
+    let length = (chunks * 16 * 1024).to_string();
+    for (name, value) in [
+        (":method", "POST"),
+        (":scheme", "https"),
+        (":path", "/upload"),
+        ("content-length", length.as_str()),
+    ] {
+        enc.encode_header(&mut block, name, value);
+    }
+    frame::write_frame(
+        &mut wire,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &block,
+    );
+    writer.write_all(&wire).await.unwrap();
+    let started = tokio::time::Instant::now();
+    let upload = tokio::spawn(async move {
+        for index in 0..chunks {
+            let flags = if index + 1 == chunks {
+                frame::flags::END_STREAM
+            } else {
+                0
+            };
+            let mut data = Vec::new();
+            frame::write_frame(&mut data, frame::kind::DATA, flags, 1, &[b'x'; 16 * 1024]);
+            writer.write_all(&data).await.unwrap();
+            if index + 1 < chunks {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
+        }
+        writer
+    });
+    let mut body = Vec::new();
+    let end = loop {
+        let (hdr, payload) = read_frame(&mut reader).await;
+        if hdr.stream_id != 1 {
+            continue;
+        }
+        if hdr.kind == frame::kind::RST_STREAM {
+            break Err(u32::from_be_bytes(payload[..4].try_into().unwrap()));
+        }
+        if hdr.kind == frame::kind::DATA {
+            body.extend_from_slice(&payload);
+            if hdr.flags & frame::flags::END_STREAM != 0 {
+                break Ok(body);
+            }
+        }
+    };
+    let took = started.elapsed();
+    drop(upload.await.unwrap());
+    drop(reader);
+    let _ = srv.await;
+    (end, took)
+}
+
+#[tokio::test(start_paused = true)]
+async fn steady_request_body_outlasting_the_timeout_is_answered() {
+    let (end, took) = paced_upload_end(hj_core::body_deadline::BODY_DEADLINE_CEILING, 7).await;
+    assert_eq!(end, Ok(b"114688".to_vec()));
+    assert!(took >= std::time::Duration::from_millis(2400), "{took:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn steady_request_body_is_reset_at_the_ceiling() {
+    let ceiling = std::time::Duration::from_millis(1500);
+    let (end, took) = paced_upload_end(ceiling, 10).await;
+    assert_eq!(end, Err(frame::error_code::CANCEL));
+    assert!(
+        took >= ceiling && took < ceiling + std::time::Duration::from_millis(10),
+        "{took:?}"
+    );
 }
 
 #[tokio::test]
@@ -3833,4 +4225,128 @@ async fn continue_interim_leads_with_pending_table_size_update() {
     drop(client);
     let _ = srv.await;
     assert_eq!(block[0], 0x20, "update(0) must lead the 100-continue block");
+}
+
+/// A streamed body whose exact size hint confirms its Content-Length (a bridged
+/// file) keeps the header; a stream of unknown length loses a declared one.
+#[tokio::test]
+async fn known_length_stream_keeps_content_length() {
+    for (exact, want) in [(true, Some("16")), (false, None)] {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let service = move |_req: Request| async move {
+            use http_body_util::{BodyExt, Full, StreamBody};
+            let body = if exact {
+                Full::new(Bytes::from_static(b"alpha-beta-gamma"))
+                    .map_err(|n| match n {})
+                    .boxed()
+            } else {
+                let chunks: Vec<Result<http_body::Frame<Bytes>, hj_core::BoxError>> = vec![Ok(
+                    http_body::Frame::data(Bytes::from_static(b"alpha-beta-gamma")),
+                )];
+                StreamBody::new(futures_util::stream::iter(chunks)).boxed()
+            };
+            http::Response::builder()
+                .status(200)
+                .header(http::header::CONTENT_LENGTH, "16")
+                .body(Body::Stream(body))
+                .unwrap()
+        };
+        let srv =
+            tokio::spawn(async move { serve(server, service, Config::default(), None).await });
+        client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+        let mut f = Vec::new();
+        frame::write_settings(&mut f, &[]);
+        client.write_all(&f).await.unwrap();
+        let mut enc = Encoder::new();
+        let mut req = Vec::new();
+        frame::write_frame(
+            &mut req,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS | frame::flags::END_STREAM,
+            1,
+            &encode_get(&mut enc, "/file"),
+        );
+        client.write_all(&req).await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut dec = Decoder::new(4096, 1 << 20);
+        let mut content_length = None;
+        let mut body = Vec::new();
+        loop {
+            let (hdr, payload) = read_frame(&mut client).await;
+            match hdr.kind {
+                frame::kind::HEADERS => dec
+                    .decode(&payload, |n, v| {
+                        if n == "content-length" {
+                            content_length = Some(v.to_string());
+                        }
+                    })
+                    .unwrap(),
+                frame::kind::DATA => {
+                    body.extend_from_slice(&payload);
+                    if hdr.flags & frame::flags::END_STREAM != 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(content_length.as_deref(), want, "exact={exact}");
+        assert_eq!(body, b"alpha-beta-gamma");
+        drop(client);
+        let _ = srv.await;
+    }
+}
+
+#[tokio::test]
+async fn frame_size_and_window_overflow_goaways_carry_last_client_stream() {
+    // #876: the loop-level connection errors (oversized frame, connection
+    // WINDOW_UPDATE overflow) must report stream 1 as processed, not last=0.
+    for trigger in ["oversized", "window"] {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let srv =
+            tokio::spawn(async move { serve(server, noop_service, Config::default(), None).await });
+        client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+        let mut f = Vec::new();
+        frame::write_settings(&mut f, &[]);
+        client.write_all(&f).await.unwrap();
+        let mut enc = Encoder::new();
+        let end = frame::flags::END_HEADERS | frame::flags::END_STREAM;
+        let mut req = Vec::new();
+        frame::write_frame(
+            &mut req,
+            frame::kind::HEADERS,
+            end,
+            1,
+            &encode_get(&mut enc, "/"),
+        );
+        match trigger {
+            "oversized" => frame::write_frame(&mut req, frame::kind::PING, 0, 0, &[0u8; 20000]),
+            _ => frame::write_frame(
+                &mut req,
+                frame::kind::WINDOW_UPDATE,
+                0,
+                0,
+                &0x7fff_ffffu32.to_be_bytes(),
+            ),
+        }
+        client.write_all(&req).await.unwrap();
+        client.flush().await.unwrap();
+        let last_stream = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let (hdr, payload) = read_frame(&mut client).await;
+                if hdr.kind == frame::kind::GOAWAY {
+                    return u32::from_be_bytes(payload[..4].try_into().unwrap()) & 0x7fff_ffff;
+                }
+            }
+        })
+        .await
+        .expect("connection error must GOAWAY");
+        assert_eq!(
+            last_stream, 1,
+            "{trigger}: GOAWAY must report stream 1 as processed"
+        );
+        drop(client);
+        let _ = srv.await;
+    }
 }

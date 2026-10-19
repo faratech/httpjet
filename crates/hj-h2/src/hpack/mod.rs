@@ -124,9 +124,9 @@ const STATIC_LEN: usize = 61; // static_table::TABLE.len()
 
 /// HPACK encoder with a connection-scoped dynamic table (incremental indexing), like
 /// lshpack's history mode: headers that repeat across requests on a connection collapse
-/// to a single index byte after their first appearance. Per-request-varying headers
-/// (`date`, `set-cookie`, oversized values) are intentionally NOT indexed so they don't
-/// churn the table.
+/// to a single index byte after their first appearance. Per-message-varying headers
+/// (`date`, `content-length`, validators, … — see `indexable`) and oversized values are
+/// intentionally NOT indexed so they don't churn the table.
 pub struct Encoder {
     /// Values are raw octets: HPACK string literals are byte strings (RFC 7541 §5.2),
     /// and `http::HeaderValue` already guarantees no NUL/CR/LF — so the encoder never
@@ -296,10 +296,26 @@ impl Encoder {
         }
     }
 
-    /// Whether a header is worth adding to the dynamic table. Excludes values that
-    /// change per request (would evict useful entries) and very large values.
+    /// Whether a header is worth adding to the dynamic table. Excludes very large values
+    /// and fields that change on every message (#1013): inserting each response's age or
+    /// expiry turns the 4 KiB table over every few responses and evicts the stable
+    /// security/CORS/Link headers that would otherwise repeat as one-byte indexes.
+    /// A resource's length, validators and redirect target stay indexed: they repeat
+    /// whenever that resource is served again on the connection.
     fn indexable(name: &str, value: &[u8]) -> bool {
-        !matches!(name, "date" | "set-cookie") && value.len() <= 256
+        value.len() <= 256
+            && !matches!(
+                name,
+                ":path"
+                    | "age"
+                    | "content-range"
+                    | "date"
+                    | "expires"
+                    | "if-modified-since"
+                    | "if-none-match"
+                    | "set-cookie"
+                    | "x-wf-shell-age"
+            )
     }
 
     /// Encode one header field into `out`. `name` must be lowercase (HTTP/2 invariant).
@@ -348,15 +364,18 @@ impl Encoder {
             self.pending_min_size = None; // no pending change, discard any stale min
         }
         // 1. Exact (name,value) already in the static or dynamic table -> 1 indexed ref.
-        if let Some(idx) =
-            static_table::find_name_value(name, value).or_else(|| self.find_dynamic(name, value))
+        //    Only an indexable pair can ever have been inserted, so the dynamic probe is
+        //    skipped for the rest.
+        let indexable = Self::indexable(name, value);
+        if let Some(idx) = static_table::find_name_value(name, value)
+            .or_else(|| indexable.then(|| self.find_dynamic(name, value)).flatten())
         {
             integer::encode(out, idx as u64, 7, 0x80);
             return;
         }
         // 2. Indexable -> literal WITH incremental indexing (6-bit name prefix), then add
         //    it so the next occurrence on this connection is a single index byte.
-        if Self::indexable(name, value) {
+        if indexable {
             match static_table::find_name(name).or_else(|| self.find_dynamic_name(name)) {
                 Some(i) => integer::encode(out, i as u64, 6, 0x40),
                 None => {
@@ -806,6 +825,93 @@ mod tests {
         let mut b = Vec::new();
         enc.encode_header(&mut b, "date", "Wed, 03 Jun 2026 09:49:06 GMT");
         assert!(b.len() > 1);
+    }
+
+    #[test]
+    fn per_response_values_do_not_churn_the_dynamic_table() {
+        // (#1013) A run of responses for one resource that differ only in per-message
+        // fields must stop inserting after the first: the stable fields (including the
+        // resource's length and validators) are indexed once, the varying ones never, and
+        // one decoder fed every block in order reproduces each header list.
+        let mut enc = Encoder::new();
+        let mut dec = Decoder::new(4096, 1 << 20);
+        let mut inserts_after_first = None;
+        for i in 0..64u32 {
+            let headers: Vec<(&str, String)> = vec![
+                (":status", "200".into()),
+                ("content-type", "text/html; charset=utf-8".into()),
+                ("strict-transport-security", "max-age=31536000".into()),
+                ("content-length", "10000".into()),
+                ("age", i.to_string()),
+                ("etag", "\"2710-6a1ce183;;;\"".into()),
+                ("last-modified", "Mon, 01 Jun 2026 01:02:55 GMT".into()),
+                (
+                    "expires",
+                    format!("Tue, 02 Jun 2026 01:{:02}:55 GMT", i % 60),
+                ),
+                ("location", "/threads/1/".into()),
+                ("content-range", format!("bytes 0-{i}/4096")),
+                ("x-wf-shell-age", i.to_string()),
+                ("date", format!("Wed, 03 Jun 2026 09:49:{:02} GMT", i % 60)),
+                ("set-cookie", format!("xf_csrf={i}; path=/")),
+            ];
+            let mut block = Vec::new();
+            for (n, v) in &headers {
+                enc.encode_header(&mut block, n, v);
+            }
+            let mut got = Vec::new();
+            dec.decode(&block, |n, v| got.push((n.to_owned(), v.to_owned())))
+                .unwrap();
+            let want: Vec<(String, String)> = headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.clone()))
+                .collect();
+            assert_eq!(got, want, "response {i} must decode identically");
+            match inserts_after_first {
+                None => inserts_after_first = Some(enc.ins_count),
+                Some(n) => assert_eq!(enc.ins_count, n, "response {i} inserted"),
+            }
+        }
+        assert_eq!(
+            inserts_after_first,
+            Some(6),
+            "only the stable literal fields are indexed"
+        );
+        for name in [
+            "content-type",
+            "strict-transport-security",
+            "content-length",
+            "etag",
+            "last-modified",
+            "location",
+        ] {
+            assert!(
+                enc.find_dynamic_name(name).is_some(),
+                "{name} stays indexed"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_resource_validators_cost_one_index_byte() {
+        // (#1013) The same resource served twice on a connection: its length, ETag and
+        // Last-Modified go out as literals once and as one-byte indexes after that.
+        let mut enc = Encoder::new();
+        let fields = [
+            ("content-length", "1024"),
+            ("etag", "\"400-6a1ce183;;;\""),
+            ("last-modified", "Mon, 01 Jun 2026 01:02:55 GMT"),
+        ];
+        let mut first = Vec::new();
+        for (n, v) in fields {
+            enc.encode_header(&mut first, n, v);
+        }
+        let mut second = Vec::new();
+        for (n, v) in fields {
+            enc.encode_header(&mut second, n, v);
+        }
+        assert_eq!(second.len(), fields.len(), "{second:?}");
+        assert!(second.iter().all(|b| b & 0x80 != 0), "{second:?}");
     }
 
     #[test]

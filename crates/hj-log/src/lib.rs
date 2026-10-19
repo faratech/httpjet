@@ -12,8 +12,8 @@
 //! rendering is fully deterministic and unit-testable.
 //!
 //! Lines are rendered in the Apache/LiteSpeed **combined** or **common** log
-//! format. `logHeaders=7` in LiteSpeed corresponds to [`LogFormat::Combined`]
-//! (Referer + User-Agent appended).
+//! format. LiteSpeed `logHeaders` is a bitmask (1 Referer, 2 User-Agent, 4 Host):
+//! the default 3 is [`LogFormat::Combined`], 7 is [`LogFormat::CombinedHost`].
 //!
 //! # Rolling
 //!
@@ -176,11 +176,47 @@ pub enum LogFormat {
     /// `%h %l %u %t "%r" %>s %b` — the NCSA Common Log Format.
     Common,
     /// Common + `"%{Referer}i" "%{User-Agent}i"` — the Combined Log Format
-    /// (LiteSpeed `logHeaders=7`).
+    /// (LiteSpeed `logHeaders=3`, its default).
     Combined,
+    /// Combined + `"%{Host}i"`: LiteSpeed `logHeaders` with bit 4 (`LOG_VHOST`)
+    /// set, e.g. `logHeaders=7` (OLS `AccessLog::log`).
+    CombinedHost,
     /// (Tier 2) One JSON object per line — structured logging for log shippers.
     /// Field order is fixed; absent optionals render as `null`.
     Json,
+    /// Common + any other `logHeaders` selection (bits [`LOG_REFERER`],
+    /// [`LOG_USERAGENT`], [`LOG_VHOST`]); see [`LogFormat::from_log_headers`].
+    Headers(u8),
+}
+
+/// LiteSpeed `logHeaders` bit: append the quoted `Referer`.
+pub const LOG_REFERER: u8 = 1;
+/// LiteSpeed `logHeaders` bit: append the quoted `User-Agent`.
+pub const LOG_USERAGENT: u8 = 2;
+/// LiteSpeed `logHeaders` bit: append the quoted `Host`.
+pub const LOG_VHOST: u8 = 4;
+
+impl LogFormat {
+    /// The text format for a LiteSpeed `logHeaders` bitmask (OLS
+    /// `AccessLog::log`): 0 is Common, 3 Combined, 7 CombinedHost, anything else
+    /// selects exactly the fields whose bits are set, in Referer/UA/Host order.
+    pub fn from_log_headers(mask: u8) -> LogFormat {
+        match mask & (LOG_REFERER | LOG_USERAGENT | LOG_VHOST) {
+            0 => LogFormat::Common,
+            3 => LogFormat::Combined,
+            7 => LogFormat::CombinedHost,
+            m => LogFormat::Headers(m),
+        }
+    }
+
+    fn header_mask(self) -> u8 {
+        match self {
+            LogFormat::Common | LogFormat::Json => 0,
+            LogFormat::Combined => LOG_REFERER | LOG_USERAGENT,
+            LogFormat::CombinedHost => LOG_REFERER | LOG_USERAGENT | LOG_VHOST,
+            LogFormat::Headers(m) => m,
+        }
+    }
 }
 
 /// JSON string escape: quotes, backslashes and control characters. `<`/`>` and
@@ -227,13 +263,15 @@ pub struct AccessRecord {
     pub status: u16,
     /// Response body bytes sent (the `%b` field).
     pub bytes: u64,
-    /// `Referer` header, if present (combined format only).
-    pub referer: Option<String>,
-    /// `User-Agent` header, if present (combined format only).
-    pub user_agent: Option<String>,
-    /// `Host` header / vhost — retained for vhost-keyed splitting by callers.
-    pub host: Option<String>,
-    /// Authenticated remote user (the `%u` field), if any.
+    /// Raw `Referer` header bytes, if present (escaped `\xNN` at render time, so
+    /// a non-ASCII value is logged rather than dropped).
+    pub referer: Option<Vec<u8>>,
+    /// Raw `User-Agent` header bytes, if present.
+    pub user_agent: Option<Vec<u8>>,
+    /// Raw `Host` header bytes (`logHeaders` bit 4).
+    pub host: Option<Vec<u8>>,
+    /// The Basic-auth user the server VERIFIED (the `%u` field), if any — never a
+    /// client-asserted value.
     pub remote_user: Option<String>,
     /// Per-request correlation id, rendered as a trailing ` reqid=<id>` token so a
     /// line is joinable with the error/php-slow logs. `None` (e.g. tests / records
@@ -251,70 +289,34 @@ impl AccessRecord {
     /// newline). Quotes and backslashes inside header values are escaped so a
     /// crafted `User-Agent` cannot break the line structure.
     pub fn render(&self, format: LogFormat) -> String {
-        use std::fmt::Write;
-        if format == LogFormat::Json {
-            let null = |v: Option<&str>| {
-                v.map(|s| format!("\"{}\"", json_escape(s)))
-                    .unwrap_or_else(|| "null".into())
-            };
-            let reqid = self
-                .request_id
-                .as_deref()
-                .map(|id| format!("\"{}\"", json_escape(id)))
-                .unwrap_or_else(|| "null".into());
-            let client = if self.peer_unix {
-                "unix:".to_string()
-            } else {
-                self.client_ip.to_string()
-            };
-            return format!(
-                "{{\"ts\":\"{}\",\"client_ip\":\"{}\",\"remote_user\":{},\"method\":\"{}\",\"uri\":\"{}\",\"protocol\":\"{}\",\"status\":{},\"bytes\":{},\"referer\":{},\"user_agent\":{},\"reqid\":{}}}",
-                fmt::clf_time(self.ts),
-                json_escape(&client),
-                null(self.remote_user.as_deref()),
-                json_escape(&self.method),
-                json_escape(&self.uri),
-                json_escape(self.protocol),
-                self.status,
-                self.bytes,
-                null(self.referer.as_deref()),
-                null(self.user_agent.as_deref()),
-                reqid,
-            );
-        }
-        let client_field = if self.peer_unix {
-            Cow::Borrowed("unix:")
-        } else {
-            Cow::Owned(self.client_ip.to_string())
-        };
-        let mut line = format!(
-            "{} - {} [{}] \"{} {} {}\" {} {}",
-            client_field,
-            field_or_dash(self.remote_user.as_deref()),
-            fmt::clf_time(self.ts),
-            escape(&self.method),
-            escape(&self.uri),
-            escape(self.protocol),
-            self.status,
-            self.bytes,
+        let reqid = self.request_id.as_deref().map(escape);
+        let mut out = Vec::with_capacity(192);
+        render_line(
+            &mut out,
+            format,
+            &LineFields {
+                client_ip: self.client_ip,
+                ts: self.ts,
+                method: &self.method,
+                path: &self.uri,
+                query: None,
+                protocol: self.protocol,
+                status: self.status,
+                bytes: self.bytes,
+                referer: self.referer.as_deref(),
+                user_agent: self.user_agent.as_deref(),
+                host: self.host.as_deref(),
+                remote_user: self.remote_user.as_deref(),
+                request_id: reqid.as_ref().map(|r| r as &dyn std::fmt::Display),
+                peer_unix: self.peer_unix,
+            },
         );
-        if format == LogFormat::Combined {
-            // Append directly into `line` rather than format!-ing a second String
-            // and copying it in (one fewer allocation per combined line on the
-            // writer task). `write!` to a String is infallible.
-            let _ = write!(
-                line,
-                " \"{}\" \"{}\"",
-                quoted_field(self.referer.as_deref()),
-                quoted_field(self.user_agent.as_deref()),
-            );
+        // Every byte the renderer emits is either escaped ASCII or a UTF-8 `&str`
+        // copied through, so this never actually takes the lossy branch.
+        match String::from_utf8(out) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
         }
-        if let Some(id) = self.request_id.as_deref() {
-            // Trailing token in both formats so the line is joinable with the
-            // error/php-slow logs; absent ⇒ nothing appended (legacy layout).
-            let _ = write!(line, " reqid={}", escape(id));
-        }
-        line
     }
 }
 
@@ -334,90 +336,171 @@ pub fn render_access_line_into(
     protocol: &str,
     status: u16,
     bytes: u64,
-    referer: Option<&str>,
-    user_agent: Option<&str>,
+    referer: Option<&[u8]>,
+    user_agent: Option<&[u8]>,
     request_id: Option<&dyn std::fmt::Display>,
     peer_unix: bool,
 ) {
+    render_access_line_with_host_into(
+        out, format, client_ip, ts, method, path, query, protocol, status, bytes, referer,
+        user_agent, None, None, request_id, peer_unix,
+    );
+}
+
+/// [`render_access_line_into`] with the `Host` header (`logHeaders` bit 4) and the
+/// verified Basic-auth user (`%u`).
+#[allow(clippy::too_many_arguments)]
+pub fn render_access_line_with_host_into(
+    out: &mut Vec<u8>,
+    format: LogFormat,
+    client_ip: std::net::IpAddr,
+    ts: SystemTime,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    protocol: &str,
+    status: u16,
+    bytes: u64,
+    referer: Option<&[u8]>,
+    user_agent: Option<&[u8]>,
+    host: Option<&[u8]>,
+    remote_user: Option<&str>,
+    request_id: Option<&dyn std::fmt::Display>,
+    peer_unix: bool,
+) {
+    render_line(
+        out,
+        format,
+        &LineFields {
+            client_ip,
+            ts,
+            method,
+            path,
+            query,
+            protocol,
+            status,
+            bytes,
+            referer,
+            user_agent,
+            host,
+            remote_user,
+            request_id,
+            peer_unix,
+        },
+    );
+    out.push(b'\n');
+}
+
+struct LineFields<'a> {
+    client_ip: IpAddr,
+    ts: SystemTime,
+    method: &'a str,
+    path: &'a str,
+    query: Option<&'a str>,
+    protocol: &'a str,
+    status: u16,
+    bytes: u64,
+    referer: Option<&'a [u8]>,
+    user_agent: Option<&'a [u8]>,
+    host: Option<&'a [u8]>,
+    remote_user: Option<&'a str>,
+    request_id: Option<&'a dyn std::fmt::Display>,
+    peer_unix: bool,
+}
+
+/// The one line renderer behind [`AccessRecord::render`] and the borrowed chunk
+/// path, so the two can never drift. No trailing newline.
+fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
     use std::io::Write;
     if format == LogFormat::Json {
-        let je = |v: &str| json_escape(v);
-        let jopt = |v: Option<&str>| {
-            v.map(|s| format!("\"{}\"", je(s)))
+        let jopt = |v: Option<&[u8]>| {
+            v.map(|s| format!("\"{}\"", json_escape_bytes(s)))
                 .unwrap_or_else(|| "null".to_string())
         };
         let mut line = String::with_capacity(192);
         line.push_str("{\"ts\":\"");
-        line.push_str(&je(&fmt::clf_time(ts)));
+        line.push_str(&json_escape(&fmt::clf_time(f.ts)));
         line.push_str("\",\"client_ip\":\"");
-        if peer_unix {
+        if f.peer_unix {
             line.push_str("unix:");
         } else {
-            line.push_str(&je(&client_ip.to_string()));
+            line.push_str(&json_escape(&f.client_ip.to_string()));
         }
-        // Borrowed path has no authenticated user; AccessRecord renders null.
-        line.push_str("\",\"remote_user\":null,\"method\":\"");
-        line.push_str(&je(method));
+        line.push_str("\",\"remote_user\":");
+        line.push_str(&jopt(f.remote_user.map(str::as_bytes)));
+        line.push_str(",\"method\":\"");
+        line.push_str(&json_escape(f.method));
         line.push_str("\",\"uri\":\"");
-        line.push_str(&je(path));
-        if let Some(q) = query {
+        line.push_str(&json_escape(f.path));
+        if let Some(q) = f.query {
             line.push('?');
-            line.push_str(&je(q));
+            line.push_str(&json_escape(q));
         }
         line.push_str("\",\"protocol\":\"");
-        line.push_str(&je(protocol));
+        line.push_str(&json_escape(f.protocol));
         line.push_str("\",\"status\":");
-        line.push_str(&status.to_string());
+        line.push_str(&f.status.to_string());
         line.push_str(",\"bytes\":");
-        line.push_str(&bytes.to_string());
+        line.push_str(&f.bytes.to_string());
         line.push_str(",\"referer\":");
-        line.push_str(&jopt(referer));
+        line.push_str(&jopt(f.referer));
         line.push_str(",\"user_agent\":");
-        line.push_str(&jopt(user_agent));
+        line.push_str(&jopt(f.user_agent));
         line.push_str(",\"reqid\":");
-        line.push_str(&jopt(request_id.map(|d| d.to_string()).as_deref()));
+        match f.request_id {
+            Some(id) => line.push_str(&format!("\"{}\"", json_escape(&id.to_string()))),
+            None => line.push_str("null"),
+        }
         line.push('}');
-        line.push('\n');
         out.extend_from_slice(line.as_bytes());
         return;
     }
-    if peer_unix {
-        let _ = write!(out, "unix: - - [{}] \"", fmt::clf_time(ts));
+    if f.peer_unix {
+        out.extend_from_slice(b"unix:");
     } else {
-        let _ = write!(out, "{} - - [{}] \"", client_ip, fmt::clf_time(ts));
+        let _ = write!(out, "{}", f.client_ip);
     }
-    let _ = write!(out, "{} ", escape(method));
-    let _ = write!(out, "{}", escape(path));
-    if let Some(q) = query {
+    // OLS `AccessLog::log`: the verified auth user is quoted, ` - "alice" `.
+    match f.remote_user {
+        Some(user) if !user.is_empty() => {
+            let _ = write!(out, " - \"{}\" ", escape_bytes(user.as_bytes()));
+        }
+        _ => out.extend_from_slice(b" - - "),
+    }
+    let _ = write!(out, "[{}] \"", fmt::clf_time(f.ts));
+    let _ = write!(out, "{} ", escape(f.method));
+    let _ = write!(out, "{}", escape(f.path));
+    if let Some(q) = f.query {
         let _ = write!(out, "?{}", escape(q));
     }
-    let _ = write!(out, " {}\" {} {}", escape(protocol), status, bytes);
-    if format == LogFormat::Combined {
-        let _ = write!(
-            out,
-            " \"{}\" \"{}\"",
-            quoted_field(referer),
-            quoted_field(user_agent),
-        );
+    let _ = write!(out, " {}\" {} ", escape(f.protocol), f.status);
+    // `%b`: OLS writes `-` when no body byte was sent (`contentWritten == 0`).
+    if f.bytes == 0 {
+        out.push(b'-');
+    } else {
+        let _ = write!(out, "{}", f.bytes);
     }
-    if let Some(id) = request_id {
+    let mask = format.header_mask();
+    if mask & LOG_REFERER != 0 {
+        let _ = write!(out, " \"{}\"", quoted_bytes(f.referer));
+    }
+    if mask & LOG_USERAGENT != 0 {
+        let _ = write!(out, " \"{}\"", quoted_bytes(f.user_agent));
+    }
+    if mask & LOG_VHOST != 0 {
+        let _ = write!(out, " \"{}\"", quoted_bytes(f.host));
+    }
+    if let Some(id) = f.request_id {
+        // Trailing token in every text format so the line is joinable with the
+        // error/php-slow logs; absent ⇒ nothing appended (legacy layout).
         let _ = write!(out, " reqid={}", id);
     }
-    out.push(b'\n');
 }
 
-/// Unquoted optional field: render `-` when absent/empty (the `%l`/`%u` fields).
-fn field_or_dash(v: Option<&str>) -> Cow<'_, str> {
+/// Quoted optional header value: absent/empty -> `-` (so it reads `"-"`).
+fn quoted_bytes(v: Option<&[u8]>) -> Cow<'_, str> {
     match v {
-        Some(s) if !s.is_empty() => escape(s),
-        _ => Cow::Borrowed("-"),
-    }
-}
-
-/// Quoted optional header value: absent -> `-` (so it reads `"-"`).
-fn quoted_field(v: Option<&str>) -> Cow<'_, str> {
-    match v {
-        Some(s) if !s.is_empty() => escape(s),
+        Some(s) if !s.is_empty() => escape_bytes(s),
         _ => Cow::Borrowed("-"),
     }
 }
@@ -451,6 +534,46 @@ fn escape(s: &str) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
+}
+
+/// [`escape`] for raw header bytes (Apache `ap_escape_logitem`): ASCII renders
+/// exactly as [`escape`] does, and every byte >= 0x80 becomes `\xNN`, so a
+/// non-ASCII `User-Agent` is logged instead of collapsing to `-`.
+fn escape_bytes(s: &[u8]) -> Cow<'_, str> {
+    if !s
+        .iter()
+        .any(|&b| b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b))
+        && let Ok(clean) = std::str::from_utf8(s)
+    {
+        return Cow::Borrowed(clean);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for &b in s {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            b if !(0x20..0x7f).contains(&b) => out.push_str(&format!("\\x{b:02x}")),
+            b => out.push(char::from(b)),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// JSON string body for raw header bytes: valid UTF-8 is escaped as
+/// [`json_escape`] does; each byte of an invalid sequence becomes the literal
+/// text `\xNN` (JSON-encoded as `\\xNN`).
+fn json_escape_bytes(s: &[u8]) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for chunk in s.utf8_chunks() {
+        out.push_str(&json_escape(chunk.valid()));
+        for b in chunk.invalid() {
+            out.push_str(&format!("\\\\x{b:02x}"));
+        }
+    }
+    out
 }
 
 /// Messages on the writer control channel.
@@ -797,7 +920,7 @@ mod json_render_tests {
             200,
             12,
             None,
-            Some("Mozilla \"quoted\""),
+            Some(b"Mozilla \"quoted\""),
             Some(&1u64),
             false,
         );
@@ -884,9 +1007,10 @@ mod tests {
     fn remote_user_rendered() {
         let mut r = sample();
         r.remote_user = Some("alice".into());
+        // OLS `AccessLog::log` quotes the user: ` - "alice" [`.
         assert!(
             r.render(LogFormat::Common)
-                .starts_with("203.0.113.7 - alice [")
+                .starts_with("203.0.113.7 - \"alice\" [")
         );
     }
 
@@ -943,13 +1067,20 @@ mod tests {
     #[test]
     fn borrowed_render_matches_record_render() {
         let ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_766_000_000);
-        for format in [LogFormat::Common, LogFormat::Combined, LogFormat::Json] {
+        for format in [
+            LogFormat::Common,
+            LogFormat::Combined,
+            LogFormat::CombinedHost,
+            LogFormat::Headers(LOG_VHOST),
+            LogFormat::Headers(LOG_USERAGENT | LOG_VHOST),
+            LogFormat::Json,
+        ] {
             for (query, referer, ua, reqid) in [
                 (None, None, None, None),
                 (
                     Some("a=1&b=%22x"),
                     Some("https://ref.example/\"q"),
-                    Some("UA/1.0 (X11; \u{7f})"),
+                    Some("UA/1.0 (X11; \u{7f}) caf\u{e9}"),
                     Some("00ffab12cd34ef56"),
                 ),
             ] {
@@ -965,10 +1096,10 @@ mod tests {
                     protocol: "HTTP/2",
                     status: 200,
                     bytes: 1234,
-                    referer: referer.map(str::to_string),
-                    user_agent: ua.map(str::to_string),
-                    host: None,
-                    remote_user: None,
+                    referer: referer.map(|v: &str| v.as_bytes().to_vec()),
+                    user_agent: ua.map(|v: &str| v.as_bytes().to_vec()),
+                    host: reqid.map(|_| b"forum.example".to_vec()),
+                    remote_user: reqid.map(|_| "alice".to_string()),
                     request_id: reqid.map(str::to_string),
                     peer_unix: false,
                 };
@@ -976,7 +1107,7 @@ mod tests {
                 expected.push(b'\n');
                 let mut got = Vec::new();
                 let id_disp = reqid.map(|r| r.to_string());
-                render_access_line_into(
+                render_access_line_with_host_into(
                     &mut got,
                     format,
                     record.client_ip,
@@ -987,8 +1118,10 @@ mod tests {
                     "HTTP/2",
                     200,
                     1234,
-                    referer,
-                    ua,
+                    referer.map(str::as_bytes),
+                    ua.map(str::as_bytes),
+                    reqid.map(|_| &b"forum.example"[..]),
+                    reqid.map(|_| "alice"),
                     id_disp.as_ref().map(|s| s as &dyn std::fmt::Display),
                     false,
                 );
@@ -1037,6 +1170,146 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&got),
             String::from_utf8_lossy(&expected)
+        );
+    }
+
+    #[test]
+    fn combined_host_appends_the_host_field() {
+        // LiteSpeed logHeaders bit 4 (LOG_VHOST): Host follows the User-Agent (#825).
+        let record = AccessRecord {
+            client_ip: "203.0.113.9".parse().unwrap(),
+            ts: SystemTime::UNIX_EPOCH,
+            method: std::borrow::Cow::Borrowed("GET"),
+            uri: "/".into(),
+            protocol: "HTTP/2",
+            status: 200,
+            bytes: 1,
+            referer: None,
+            user_agent: Some("UA".into()),
+            host: Some("forum.example".into()),
+            remote_user: None,
+            request_id: Some("ab".into()),
+            peer_unix: false,
+        };
+        assert!(
+            record
+                .render(LogFormat::CombinedHost)
+                .ends_with("\"-\" \"UA\" \"forum.example\" reqid=ab")
+        );
+        assert!(!record.render(LogFormat::Combined).contains("forum.example"));
+    }
+
+    /// Prod runs `logHeaders` 3 and 7: both must render byte-for-byte as before
+    /// the per-bit selection existed (#917).
+    #[test]
+    fn log_headers_three_and_seven_are_byte_identical() {
+        let r = sample();
+        assert_eq!(LogFormat::from_log_headers(3), LogFormat::Combined);
+        assert_eq!(LogFormat::from_log_headers(7), LogFormat::CombinedHost);
+        assert_eq!(
+            r.render(LogFormat::from_log_headers(3)),
+            r#"203.0.113.7 - - [10/Oct/2000:13:55:36 +0000] "GET /index.html?x=1 HTTP/1.1" 200 2326 "https://example.com/start" "Mozilla/5.0""#
+        );
+        assert_eq!(
+            r.render(LogFormat::from_log_headers(7)),
+            r#"203.0.113.7 - - [10/Oct/2000:13:55:36 +0000] "GET /index.html?x=1 HTTP/1.1" 200 2326 "https://example.com/start" "Mozilla/5.0" "example.com""#
+        );
+    }
+
+    #[test]
+    fn log_headers_bits_select_each_field() {
+        let r = sample();
+        let head = r#"203.0.113.7 - - [10/Oct/2000:13:55:36 +0000] "GET /index.html?x=1 HTTP/1.1" 200 2326"#;
+        let cases: [(u8, &str); 8] = [
+            (0, ""),
+            (1, r#" "https://example.com/start""#),
+            (2, r#" "Mozilla/5.0""#),
+            (3, r#" "https://example.com/start" "Mozilla/5.0""#),
+            (4, r#" "example.com""#),
+            (5, r#" "https://example.com/start" "example.com""#),
+            (6, r#" "Mozilla/5.0" "example.com""#),
+            (
+                7,
+                r#" "https://example.com/start" "Mozilla/5.0" "example.com""#,
+            ),
+        ];
+        for (mask, fields) in cases {
+            assert_eq!(
+                r.render(LogFormat::from_log_headers(mask)),
+                format!("{head}{fields}"),
+                "logHeaders={mask}"
+            );
+        }
+        assert_eq!(LogFormat::from_log_headers(0), LogFormat::Common);
+    }
+
+    #[test]
+    fn zero_body_bytes_render_dash_in_text_and_zero_in_json() {
+        let mut r = sample();
+        r.bytes = 0;
+        assert!(
+            r.render(LogFormat::Common)
+                .ends_with(r#""GET /index.html?x=1 HTTP/1.1" 200 -"#)
+        );
+        assert!(r.render(LogFormat::Combined).contains(r#"" 200 - "https"#));
+        assert!(r.render(LogFormat::Json).contains(r#""bytes":0,"#));
+    }
+
+    #[test]
+    fn non_ascii_headers_are_escaped_not_dropped() {
+        let mut r = sample();
+        r.user_agent = Some(b"caf\xc3\xa9 \xff\"x\\".to_vec());
+        r.referer = Some(b"https://r.example/\xe9".to_vec());
+        r.host = Some(b"h\xc3\xb6st.example".to_vec());
+        let line = r.render(LogFormat::CombinedHost);
+        assert!(
+            line.ends_with(
+                r#" "https://r.example/\xe9" "caf\xc3\xa9 \xff\"x\\" "h\xc3\xb6st.example""#
+            ),
+            "{line}"
+        );
+        let json = r.render(LogFormat::Json);
+        assert!(
+            json.contains("\"user_agent\":\"caf\u{e9} \\\\xff\\\"x\\\\\""),
+            "{json}"
+        );
+        assert!(
+            json.contains(r#""referer":"https://r.example/\\xe9""#),
+            "{json}"
+        );
+        let mut borrowed = Vec::new();
+        render_access_line_with_host_into(
+            &mut borrowed,
+            LogFormat::CombinedHost,
+            r.client_ip,
+            r.ts,
+            "GET",
+            "/index.html",
+            Some("x=1"),
+            "HTTP/1.1",
+            200,
+            2326,
+            r.referer.as_deref(),
+            r.user_agent.as_deref(),
+            r.host.as_deref(),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(String::from_utf8(borrowed).unwrap(), format!("{line}\n"));
+    }
+
+    #[test]
+    fn remote_user_is_quoted_and_escaped_like_ols() {
+        let mut r = sample();
+        r.remote_user = Some("bob \"x\" caf\u{e9}".into());
+        assert!(
+            r.render(LogFormat::Combined)
+                .starts_with(r#"203.0.113.7 - "bob \"x\" caf\xc3\xa9" ["#)
+        );
+        assert!(
+            r.render(LogFormat::Json)
+                .contains("\"remote_user\":\"bob \\\"x\\\" caf\u{e9}\"")
         );
     }
 }

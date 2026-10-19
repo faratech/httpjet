@@ -282,11 +282,23 @@ fn ims_logic() {
     let hv_earlier = http::HeaderValue::from_str(&httpdate::fmt_http_date(earlier)).unwrap();
 
     // mtime == since → not modified (304).
-    assert!(if_modified_since_not_modified(&hv_base, base));
+    assert!(if_modified_since_not_modified(
+        &hv_base,
+        base,
+        SystemTime::now()
+    ));
     // mtime < since → not modified.
-    assert!(if_modified_since_not_modified(&hv_later, base));
+    assert!(if_modified_since_not_modified(
+        &hv_later,
+        base,
+        SystemTime::now()
+    ));
     // mtime > since → modified (serve 200).
-    assert!(!if_modified_since_not_modified(&hv_earlier, base));
+    assert!(!if_modified_since_not_modified(
+        &hv_earlier,
+        base,
+        SystemTime::now()
+    ));
 }
 
 #[test]
@@ -295,19 +307,44 @@ fn if_range_etag_and_date() {
     let etag = "\"a-b\"";
     let good_etag = http::HeaderValue::from_static("\"a-b\"");
     let bad_etag = http::HeaderValue::from_static("\"x-y\"");
-    assert!(if_range_matches(&good_etag, Some(etag), mtime));
-    assert!(!if_range_matches(&bad_etag, Some(etag), mtime));
+    assert!(if_range_matches(
+        &good_etag,
+        Some(etag),
+        mtime,
+        SystemTime::now()
+    ));
+    assert!(!if_range_matches(
+        &bad_etag,
+        Some(etag),
+        mtime,
+        SystemTime::now()
+    ));
     // No ETag on the entity: an ETag-form If-Range can never match.
-    assert!(!if_range_matches(&good_etag, None, mtime));
+    assert!(!if_range_matches(
+        &good_etag,
+        None,
+        mtime,
+        SystemTime::now()
+    ));
 
     let good_date = http::HeaderValue::from_str(&httpdate::fmt_http_date(mtime)).unwrap();
-    assert!(if_range_matches(&good_date, Some(etag), mtime));
+    assert!(if_range_matches(
+        &good_date,
+        Some(etag),
+        mtime,
+        SystemTime::now()
+    ));
     // Date-form If-Range matches purely on mtime, regardless of ETag presence.
-    assert!(if_range_matches(&good_date, None, mtime));
+    assert!(if_range_matches(&good_date, None, mtime, SystemTime::now()));
     let bad_date =
         http::HeaderValue::from_str(&httpdate::fmt_http_date(mtime + Duration::from_secs(10)))
             .unwrap();
-    assert!(!if_range_matches(&bad_date, Some(etag), mtime));
+    assert!(!if_range_matches(
+        &bad_date,
+        Some(etag),
+        mtime,
+        SystemTime::now()
+    ));
 }
 
 #[test]
@@ -385,7 +422,10 @@ fn test_mime() -> MimeMap {
     by_suffix.insert("html".to_string(), "text/html".to_string());
     by_suffix.insert("txt".to_string(), "text/plain".to_string());
     by_suffix.insert("css".to_string(), "text/css".to_string());
-    MimeMap { by_suffix }
+    MimeMap {
+        by_suffix,
+        default_type: None,
+    }
 }
 
 fn make_server() -> ServerConfig {
@@ -2169,7 +2209,12 @@ async fn out_of_range_mtime_omits_last_modified_instead_of_panicking() {
                 "{name} {method} {range:?}: {}",
                 resp.status()
             );
-            assert!(!resp.headers().contains_key(LAST_MODIFIED), "{name}");
+            // A far-future mtime is reported as the request time (#942).
+            assert_eq!(
+                resp.headers().contains_key(LAST_MODIFIED),
+                name == "far.txt",
+                "{name}"
+            );
         }
         // No Last-Modified, so date validators are ignored rather than compared to 0.
         let mut ctx = make_ctx(Arc::new(make_server()), vhost.clone());
@@ -2217,4 +2262,540 @@ fn http_date_header_bounds() {
         http_date_header(SystemTime::UNIX_EPOCH).unwrap(),
         "Thu, 01 Jan 1970 00:00:00 GMT"
     );
+}
+
+/// Regression (#887): a sibling response must not advertise byte ranges, since a
+/// Range request is answered from the primary's identity bytes.
+#[tokio::test]
+async fn precompressed_sibling_does_not_advertise_ranges() {
+    let root = temp_root("precomp-ranges");
+    fs::write(root.join("style.css"), b"IDENTITY").unwrap();
+    fs::write(root.join("style.css.gz"), b"GZIP").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    for (ae, encoded) in [("gzip", true), ("identity", false)] {
+        let mut request = req(Method::GET, "/style.css");
+        request
+            .headers_mut()
+            .insert(ACCEPT_ENCODING, http::HeaderValue::from_static(ae));
+        let resp = serve(&mut ctx, request).await.unwrap();
+        assert_eq!(
+            resp.headers().contains_key(CONTENT_ENCODING),
+            encoded,
+            "{ae}"
+        );
+        assert_eq!(resp.headers().contains_key(ACCEPT_RANGES), !encoded, "{ae}");
+
+        // (#992) The revalidation 304 must not re-introduce what its 200 withheld:
+        // a cache merges the 304's headers into the stored (encoded) response.
+        let mut revalidate = req(Method::GET, "/style.css");
+        revalidate
+            .headers_mut()
+            .insert(ACCEPT_ENCODING, http::HeaderValue::from_static(ae));
+        revalidate
+            .headers_mut()
+            .insert(IF_NONE_MATCH, resp.headers()[ETAG].clone());
+        let not_modified = serve(&mut ctx, revalidate).await.unwrap();
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED, "{ae}");
+        assert_eq!(
+            not_modified.headers().contains_key(ACCEPT_RANGES),
+            !encoded,
+            "{ae} 304"
+        );
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
+/// (#992) An identity file revalidated with the compress transform's encoded
+/// variant tag describes that encoded 200, which carried no `Accept-Ranges`.
+#[tokio::test]
+async fn encoded_variant_revalidation_does_not_advertise_ranges() {
+    let root = temp_root("variant-ranges");
+    fs::write(root.join("page.txt"), b"identity bytes").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    let first = serve(&mut ctx, req(Method::GET, "/page.txt"))
+        .await
+        .unwrap();
+    let identity = first.headers()[ETAG].to_str().unwrap().to_owned();
+    let gz = identity.replace(";;;\"", ";gz\"");
+    for (tag, ranges) in [(identity.as_str(), true), (gz.as_str(), false)] {
+        let resp = serve(&mut ctx, get_with_header("/page.txt", IF_NONE_MATCH, tag))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{tag}");
+        assert_eq!(resp.headers()[ETAG], tag);
+        assert_eq!(resp.headers().contains_key(ACCEPT_RANGES), ranges, "{tag}");
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
+fn target_paths(resp: &Response<Body>) -> (std::ffi::OsString, Option<std::ffi::OsString>) {
+    let resolved = resp
+        .extensions()
+        .get::<ResolvedTargetPath>()
+        .expect("resolved target")
+        .0
+        .clone()
+        .into_os_string();
+    let lexical = resp
+        .extensions()
+        .get::<LexicalTargetPath>()
+        .map(|p| p.0.clone().into_os_string());
+    (resolved, lexical)
+}
+
+/// (#988) Skipping the `/proc/self/fd` readlink when no symlink was crossed
+/// reports byte-for-byte the target it would have read, for an unnormalized
+/// docroot spelling and every resolver outcome; without accessDenyDir the
+/// lexical join is reported as before.
+#[tokio::test]
+async fn symlink_free_targets_match_the_descriptor_path() {
+    let real = temp_root("symfree-targets");
+    fs::write(real.join("a.txt"), b"a").unwrap();
+    fs::create_dir(real.join("d")).unwrap();
+    fs::write(real.join("d/index.html"), b"<i>").unwrap();
+    fs::write(real.join("s.css"), b"body{}").unwrap();
+    fs::write(real.join("s.css.br"), b"BR").unwrap();
+    let parent = real.parent().unwrap();
+    let name = real.file_name().unwrap().to_string_lossy();
+    let doc_root = PathBuf::from(format!("{}//{}/", parent.display(), name));
+    let canonical = fs::canonicalize(&real).unwrap();
+    if symlink_free_candidate(&real).as_ref() != Some(&canonical) {
+        return; // the temp dir itself sits behind a symlink
+    }
+    let cases = [
+        ("/a.txt", None, "a.txt", StatusCode::OK),
+        ("/d/", None, "d/index.html", StatusCode::OK),
+        ("/d", None, "d", StatusCode::MOVED_PERMANENTLY),
+        ("/s.css", Some("br"), "s.css.br", StatusCode::OK),
+    ];
+    for want_resolved in [true, false] {
+        let mut server = make_server();
+        if want_resolved {
+            server.security.access_deny_dir = vec!["/nonexistent-denied/*".into()];
+        }
+        let server = Arc::new(server);
+        for allow_symbol_link in [true, false] {
+            let vhost = Arc::new(VHostConfig {
+                doc_root: doc_root.clone(),
+                allow_symbol_link,
+                ..Default::default()
+            });
+            let handler = StaticFiles::new();
+            // Twice: the second request of each file is a resolve-memo hit, which
+            // reports the memo's lexical spelling of an unchanged target.
+            for pass in 0..2 {
+                for (uri, ae, rel, status) in cases {
+                    let mut request = req(Method::GET, uri);
+                    if let Some(ae) = ae {
+                        request
+                            .headers_mut()
+                            .insert(ACCEPT_ENCODING, http::HeaderValue::from_static(ae));
+                    }
+                    let mut ctx = make_ctx(server.clone(), vhost.clone());
+                    let resp = handler.handle(&mut ctx, request).await.unwrap();
+                    assert_eq!(resp.status(), status, "{uri}");
+                    let expected = if want_resolved {
+                        canonical.join(rel)
+                    } else {
+                        doc_root.join(rel)
+                    };
+                    let (resolved, lexical) = target_paths(&resp);
+                    assert_eq!(lexical, None, "{uri}");
+                    if pass == 0 {
+                        if want_resolved {
+                            let opened = fs::File::open(real.join(rel)).unwrap();
+                            let fd_path =
+                                fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd()))
+                                    .unwrap();
+                            assert_eq!(resolved, fd_path.into_os_string(), "{uri}");
+                        }
+                        assert_eq!(resolved, expected.into_os_string(), "{uri}");
+                    } else {
+                        assert_eq!(Path::new(&resolved), expected, "{uri}");
+                    }
+                }
+            }
+            assert!(handler.hdr.symlinked_roots.is_empty());
+        }
+    }
+    fs::remove_dir_all(&real).ok();
+}
+
+/// (#988) A docroot reached through a symlink, and a symlink inside the tree,
+/// still report the descriptor's canonical target plus the lexical name; the
+/// docroot verdict is remembered and reused without changing either.
+#[tokio::test]
+async fn symlinked_docroot_and_tree_symlinks_report_canonical_targets() {
+    let real = temp_root("symlinked-root");
+    fs::write(real.join("a.txt"), b"a").unwrap();
+    fs::create_dir(real.join("d")).unwrap();
+    fs::write(real.join("d/index.html"), b"<i>").unwrap();
+    fs::write(real.join("s.css"), b"body{}").unwrap();
+    fs::write(real.join("s.css.gz"), b"GZ").unwrap();
+    std::os::unix::fs::symlink(real.join("a.txt"), real.join("alias.txt")).unwrap();
+    std::os::unix::fs::symlink(real.join("d"), real.join("dlink")).unwrap();
+    let link = real.with_extension("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let canonical = fs::canonicalize(&real).unwrap();
+
+    let mut server = make_server();
+    server.security.access_deny_dir = vec!["/nonexistent-denied/*".into()];
+    let server = Arc::new(server);
+    // (docroot, uri, accept-encoding, lexical rel, canonical rel, status)
+    let cases = [
+        (&link, "/a.txt", None, "a.txt", "a.txt", StatusCode::OK),
+        (
+            &link,
+            "/d/",
+            None,
+            "d/index.html",
+            "d/index.html",
+            StatusCode::OK,
+        ),
+        (&link, "/d", None, "d", "d", StatusCode::MOVED_PERMANENTLY),
+        (
+            &link,
+            "/s.css",
+            Some("gzip"),
+            "s.css.gz",
+            "s.css.gz",
+            StatusCode::OK,
+        ),
+        (
+            &real,
+            "/alias.txt",
+            None,
+            "alias.txt",
+            "a.txt",
+            StatusCode::OK,
+        ),
+        (
+            &real,
+            "/dlink/",
+            None,
+            "dlink/index.html",
+            "d/index.html",
+            StatusCode::OK,
+        ),
+        (
+            &real,
+            "/dlink",
+            None,
+            "dlink",
+            "d",
+            StatusCode::MOVED_PERMANENTLY,
+        ),
+    ];
+    let handler = StaticFiles::new();
+    for _ in 0..2 {
+        for (root, uri, ae, lexical, target, status) in cases {
+            let vhost = Arc::new(VHostConfig {
+                doc_root: root.clone(),
+                allow_symbol_link: true,
+                ..Default::default()
+            });
+            let mut request = req(Method::GET, uri);
+            if let Some(ae) = ae {
+                request
+                    .headers_mut()
+                    .insert(ACCEPT_ENCODING, http::HeaderValue::from_static(ae));
+            }
+            let mut ctx = make_ctx(server.clone(), vhost);
+            let resp = handler.handle(&mut ctx, request).await.unwrap();
+            assert_eq!(resp.status(), status, "{uri}");
+            let (resolved, lexical_ext) = target_paths(&resp);
+            assert_eq!(resolved, canonical.join(target).into_os_string(), "{uri}");
+            // A DirectorySlash redirect reports only its canonical target.
+            if status == StatusCode::OK {
+                assert_eq!(
+                    lexical_ext,
+                    Some(root.join(lexical).into_os_string()),
+                    "{uri}"
+                );
+            }
+        }
+        assert!(handler.hdr.symlinked_roots.contains_key(link.as_path()));
+        assert!(!handler.hdr.symlinked_roots.contains_key(real.as_path()));
+    }
+    fs::remove_file(&link).ok();
+    fs::remove_dir_all(&real).ok();
+}
+
+/// (#991) A full header cache is cleared and keeps admitting new file versions
+/// instead of rebuilding their headers on every request for the generation.
+#[test]
+fn full_header_caches_clear_and_keep_admitting() {
+    let handler = StaticFiles::new();
+    let file = ResolvedFile {
+        path: PathBuf::from("/x"),
+        len: 1,
+        mtime: UNIX_EPOCH,
+        inode: 1,
+        dev: 1,
+        resolved_path: PathBuf::from("/x"),
+        file: None,
+    };
+    let key = |inode| MetaKey {
+        inode,
+        len: 1,
+        mtime_secs: 0,
+        file_etag: ETAG_ALL,
+    };
+    for inode in 0..META_CACHE_CAP as u64 {
+        handler.meta_for(key(inode), &file);
+    }
+    assert_eq!(handler.hdr.meta.len(), META_CACHE_CAP);
+    let fresh = key(u64::MAX);
+    handler.meta_for(fresh, &file);
+    assert!(handler.hdr.meta.contains_key(&fresh));
+    assert_eq!(handler.hdr.meta.len(), 1);
+    assert_eq!(handler.hdr.meta_count.load(Ordering::Relaxed), 1);
+
+    let ctx = make_ctx(Arc::new(make_server()), Arc::new(VHostConfig::default()));
+    for n in 0..CT_CACHE_CAP {
+        handler.content_type_for(&ctx, &format!("x{n}"), None);
+    }
+    assert_eq!(handler.content_type_for(&ctx, "css", None), "text/css");
+    assert!(handler.hdr.ct.contains_key("css"));
+    assert_eq!(handler.hdr.ct.len(), 1);
+}
+
+/// (#991) A full resolve memo drops its expired entries (or everything, when
+/// live ones still fill half of it) to admit a new resolution.
+#[tokio::test]
+async fn full_resolve_memo_makes_room_for_new_paths() {
+    let root = temp_root("resolve-full");
+    fs::write(root.join("new.txt"), b"new").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        allow_symbol_link: true,
+        ..Default::default()
+    });
+    let server = Arc::new(make_server());
+    let filler = |expires| {
+        Arc::new(ResolveEntry {
+            root: root.clone(),
+            rel: PathBuf::from("old"),
+            wants_dir: false,
+            allow_symlink: true,
+            file: ResolvedFile {
+                path: root.join("old"),
+                len: 0,
+                mtime: UNIX_EPOCH,
+                inode: 0,
+                dev: 0,
+                resolved_path: root.join("old"),
+                file: None,
+            },
+            expires,
+        })
+    };
+    let past = Instant::now() - Duration::from_millis(1);
+    let future = Instant::now() + Duration::from_secs(60);
+    // (expired filler, live filler) -> entries expected to survive.
+    for (expired, live, survivors) in [(RESOLVE_CACHE_CAP - 10, 10, 10), (0, RESOLVE_CACHE_CAP, 0)]
+    {
+        let handler = StaticFiles::new();
+        for n in 0..expired {
+            handler.hdr.resolve.insert(n as u64, filler(past));
+        }
+        for n in expired..expired + live {
+            handler.hdr.resolve.insert(n as u64, filler(future));
+        }
+        handler
+            .hdr
+            .resolve_count
+            .store(RESOLVE_CACHE_CAP, Ordering::Relaxed);
+        let mut ctx = make_ctx(server.clone(), vhost.clone());
+        let resp = handler
+            .handle(&mut ctx, req(Method::GET, "/new.txt"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            handler
+                .hdr
+                .resolve
+                .iter()
+                .any(|e| e.rel == Path::new("new.txt"))
+        );
+        assert_eq!(handler.hdr.resolve.len(), survivors + 1);
+        assert_eq!(
+            handler.hdr.resolve_count.load(Ordering::Relaxed),
+            survivors + 1
+        );
+    }
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Regression (#931): a type that already names a charset gets no second one.
+#[test]
+fn content_type_with_charset_is_not_given_a_second() {
+    let v = super::content_type_value("text/html; charset=utf-8", Some("UTF-8"));
+    assert_eq!(v, "text/html; charset=utf-8");
+    let v = super::content_type_value("text/html", Some("UTF-8"));
+    assert_eq!(v, "text/html; charset=UTF-8");
+}
+
+fn get_with_header(
+    uri: &str,
+    name: http::header::HeaderName,
+    value: &str,
+) -> http::Request<hj_core::IncomingBody> {
+    let mut request = req(Method::GET, uri);
+    request
+        .headers_mut()
+        .insert(name, http::HeaderValue::from_str(value).unwrap());
+    request
+}
+
+/// Regression (#942): a future mtime is reported as the request time, and the
+/// client cannot pin a 304 with it after the file changes.
+#[tokio::test]
+async fn future_mtime_last_modified_is_clamped_to_request_time() {
+    let root = temp_root("future-mtime");
+    let path = root.join("f.txt");
+    fs::write(&path, b"future").unwrap();
+    let future = SystemTime::now() + Duration::from_secs(5 * 365 * 86_400);
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(future)
+        .unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let server = Arc::new(make_server());
+    let handler = StaticFiles::new();
+    let mut ctx = make_ctx(server.clone(), vhost.clone());
+    let now = ctx.request_time;
+    let resp = handler
+        .handle(&mut ctx, req(Method::GET, "/f.txt"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let lm = resp.headers()[LAST_MODIFIED].to_str().unwrap().to_owned();
+    assert_eq!(lm, httpdate::fmt_http_date(now));
+    // The ETag still encodes the real mtime (LiteSpeed layout unchanged).
+    let secs = future.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    assert!(
+        resp.headers()[ETAG]
+            .to_str()
+            .unwrap()
+            .contains(&format!("-{secs:x}-"))
+    );
+
+    // Revalidating with the clamped Last-Modified is NOT a 304 (mtime is later).
+    let mut ctx = make_ctx(server.clone(), vhost.clone());
+    let resp = handler
+        .handle(&mut ctx, get_with_header("/f.txt", IF_MODIFIED_SINCE, &lm))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // A future IMS (e.g. the old unclamped Last-Modified) is ignored.
+    let ims = httpdate::fmt_http_date(future + Duration::from_secs(1));
+    let mut ctx = make_ctx(server.clone(), vhost.clone());
+    let resp = handler
+        .handle(&mut ctx, get_with_header("/f.txt", IF_MODIFIED_SINCE, &ims))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The future mtime is not a usable If-Range date validator.
+    let exact = httpdate::fmt_http_date(future);
+    let mut ctx = make_ctx(server.clone(), vhost.clone());
+    let mut request = get_with_header("/f.txt", IF_RANGE, &exact);
+    request
+        .headers_mut()
+        .insert(RANGE, http::HeaderValue::from_static("bytes=0-1"));
+    let resp = handler.handle(&mut ctx, request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    fs::remove_dir_all(&root).ok();
+}
+
+/// Regression (#942): an If-Modified-Since later than the request time is
+/// ignored even for a past mtime (a skewed client clock must not pin a 304).
+#[test]
+fn ims_later_than_now_is_ignored() {
+    let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let now = mtime + Duration::from_secs(60);
+    let ok = http::HeaderValue::from_str(&httpdate::fmt_http_date(now)).unwrap();
+    let ahead = http::HeaderValue::from_str(&httpdate::fmt_http_date(now + Duration::from_secs(1)))
+        .unwrap();
+    assert!(if_modified_since_not_modified(&ok, mtime, now));
+    assert!(!if_modified_since_not_modified(&ahead, mtime, now));
+}
+
+/// Regression (#944): the mime map's `default` type is the unknown/no-suffix
+/// fallback.
+#[tokio::test]
+async fn mime_default_type_is_the_fallback() {
+    let root = temp_root("mime-default");
+    fs::write(root.join("README"), b"r").unwrap();
+    fs::write(root.join("a.unknownext"), b"u").unwrap();
+    fs::write(root.join("a.css"), b"t").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let mut server = make_server();
+    server.mime.default_type = Some("text/plain".into());
+    let server = Arc::new(server);
+    for (uri, ct) in [
+        ("/README", "text/plain"),
+        ("/a.unknownext", "text/plain"),
+        ("/a.css", "text/css"),
+    ] {
+        // A fresh handler: the Content-Type cache is keyed by extension only.
+        let mut ctx = make_ctx(server.clone(), vhost.clone());
+        let resp = serve(&mut ctx, req(Method::GET, uri)).await.unwrap();
+        assert_eq!(resp.headers()[CONTENT_TYPE], ct, "{uri}");
+    }
+    let mut ctx = make_ctx(Arc::new(make_server()), vhost);
+    let resp = serve(&mut ctx, req(Method::GET, "/README")).await.unwrap();
+    assert_eq!(resp.headers()[CONTENT_TYPE], "application/octet-stream");
+    fs::remove_dir_all(&root).ok();
+}
+
+/// (#941) A substituted sibling is marked so policy layers can fall back to the
+/// identity file; the identity response carries no marker.
+#[tokio::test]
+async fn precompressed_sibling_is_marked() {
+    let root = temp_root("sibling-marker");
+    fs::write(root.join("s.css"), b"body{}").unwrap();
+    fs::write(root.join("s.css.gz"), b"GZ").unwrap();
+    let vhost = Arc::new(VHostConfig {
+        doc_root: root.clone(),
+        ..Default::default()
+    });
+    let server = Arc::new(make_server());
+    let mut ctx = make_ctx(server.clone(), vhost.clone());
+    let resp = serve(&mut ctx, get_with_header("/s.css", ACCEPT_ENCODING, "gzip"))
+        .await
+        .unwrap();
+    assert!(
+        resp.extensions()
+            .get::<PrecompressedSiblingSelected>()
+            .is_some()
+    );
+    let mut request = get_with_header("/s.css", ACCEPT_ENCODING, "gzip");
+    request.extensions_mut().insert(NoPrecompressedSibling);
+    let mut ctx = make_ctx(server, vhost);
+    let resp = serve(&mut ctx, request).await.unwrap();
+    assert!(
+        resp.extensions()
+            .get::<PrecompressedSiblingSelected>()
+            .is_none()
+    );
+    assert!(!resp.headers().contains_key(CONTENT_ENCODING));
+    fs::remove_dir_all(&root).ok();
 }

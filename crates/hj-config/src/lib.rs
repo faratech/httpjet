@@ -4,6 +4,7 @@
 //! root and every referenced vhost file, returning a normalized
 //! [`model::ServerConfig`].
 
+pub mod domain_map;
 pub mod error;
 pub mod model;
 pub(crate) mod parse;
@@ -12,7 +13,7 @@ pub mod units;
 
 pub use error::{ConfigError, Result};
 pub use model::*;
-pub use parse::{load, parse_bundle};
+pub use parse::{load, load_report, parse_bundle};
 
 /// Redacted failure for an in-memory configuration submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -129,6 +130,10 @@ mod integration_tests {
             php_cfg.suffixes.iter().any(|s| s == "html"),
             ".html handled as PHP"
         );
+        assert!(
+            php_cfg.suffixes.contains(&php_cfg.handler_id),
+            "the phpHandler id is a handled suffix (#1027)"
+        );
 
         // Tuning sanity.
         assert_eq!(cfg.tuning.max_connections, 65000);
@@ -221,16 +226,36 @@ mod integration_tests {
         assert!(loaded >= 1, "expected at least one vhost file to load");
     }
 
+    /// Regression (#1001): OLS fails a vhost without a document root; an empty
+    /// docRoot used to become "" and resolve against the process cwd.
     #[test]
-    fn empty_vhost_config_is_tolerated() {
+    fn vhost_config_without_doc_root_is_refused() {
         use crate::subst::SubstCtx;
         let ctx = SubstCtx {
             server_root: "/usr/local/lsws".into(),
             ..Default::default()
         };
-        let vc = parse::parse_vhost_config("<virtualHostConfig/>", &ctx)
-            .expect("empty vhost config parses");
-        assert!(vc.doc_root.as_os_str().is_empty());
-        assert!(!vc.rewrite.enable);
+        for xml in [
+            "<virtualHostConfig/>",
+            "<virtualHostConfig><docRoot></docRoot></virtualHostConfig>",
+            "<virtualHostConfig><docRoot>  </docRoot></virtualHostConfig>",
+        ] {
+            assert!(
+                matches!(
+                    parse::parse_vhost_config(xml, &ctx),
+                    Err(ConfigError::MissingDirective {
+                        directive: "docRoot",
+                        ..
+                    })
+                ),
+                "{xml}"
+            );
+        }
+        let vc = parse::parse_vhost_config(
+            "<virtualHostConfig><docRoot>/web</docRoot></virtualHostConfig>",
+            &ctx,
+        )
+        .expect("a minimal vhost config parses");
+        assert!(!vc.rewrite.enable && !vc.disabled);
     }
 }

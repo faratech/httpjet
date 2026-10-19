@@ -434,6 +434,7 @@ fn render(state: &ServerState) -> String {
         state.page_cache.as_ref().map(|pc| pc.stats()),
     );
     append_body_budget_metrics(&mut body, &state.body_budget);
+    append_fast_bridge_metrics(&mut body, &state.metrics.fast_bridge);
     #[cfg(feature = "otel")]
     {
         let (attempts, failures) = crate::otel::export_stats();
@@ -496,6 +497,9 @@ fn render(state: &ServerState) -> String {
     append_dict_recompress_metrics(&mut body, &state.page_cache_dict_metrics);
     append_variant_metrics(&mut body, &state.metrics);
     append_stream_fill_metrics(&mut body, &state.metrics);
+    if let Some(pc) = state.page_cache.as_ref() {
+        append_url_vary_metrics(&mut body, pc, &state.metrics);
+    }
     append_connection_metrics(&mut body, &state.metrics);
     // Point-in-time gauge: stale-while-revalidate background refreshes in flight.
     if state.page_cache.is_some() {
@@ -529,6 +533,17 @@ fn render(state: &ServerState) -> String {
                 .as_ref()
                 .map(|l| l.dropped_lines())
                 .unwrap_or(0),
+            vhost_log_dropped: state
+                .vhost_access_logs
+                .iter()
+                .map(|(vhost, l)| (vhost.clone(), "access", l.logger.dropped_lines()))
+                .chain(
+                    state
+                        .vhost_error_logs
+                        .iter()
+                        .map(|(vhost, l)| (vhost.clone(), "error", l.dropped_lines())),
+                )
+                .collect(),
         },
     );
     body
@@ -556,8 +571,13 @@ fn append_lsapi_pool_metrics(out: &mut String, stats: Option<hj_lsapi::PoolStats
         ),
         (
             "httpjet_lsapi_unread_body_drops_total",
-            "LSAPI connections closed instead of re-pooled because lsphp left request-body bytes unread.",
+            "LSAPI connections whose request body lsphp left unread when the response ended.",
             stats.unread_body_drops,
+        ),
+        (
+            "httpjet_lsapi_body_conn_closes_total",
+            "LSAPI connections closed instead of re-pooled because they carried request-body bytes.",
+            stats.body_conn_closes,
         ),
         (
             "httpjet_lsapi_stale_worker_retire_signals_total",
@@ -584,6 +604,21 @@ fn append_lsapi_pool_metrics(out: &mut String, stats: Option<hj_lsapi::PoolStats
             "LSAPI fresh-dial EAGAIN failures that exhausted the retry window.",
             stats.eagain_terminal_exhaustions,
         ),
+        (
+            "httpjet_lsapi_inline_bodies_total",
+            "PHP response bodies returned whole instead of streamed.",
+            stats.inline_bodies,
+        ),
+        (
+            "httpjet_lsapi_inline_tail_drains_total",
+            "Whole PHP response bodies returned before RESP_END, the socket settled by a drain task.",
+            stats.inline_tail_drains,
+        ),
+        (
+            "httpjet_lsapi_streamed_bodies_total",
+            "PHP response bodies streamed through the LSAPI body pump.",
+            stats.streamed_bodies,
+        ),
     ] {
         out.push_str(&format!("# HELP {name} {help}\n"));
         out.push_str(&format!("# TYPE {name} counter\n"));
@@ -603,46 +638,41 @@ fn append_dict_recompress_metrics(
     }
     let mut rows: Vec<_> = metrics_by_vhost
         .iter()
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .map(|entry| {
+            let vhost = entry
+                .key()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            (vhost, entry.value().clone())
+        })
         .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
+    // Each family's HELP/TYPE is immediately followed by ALL of its samples: the
+    // exposition format requires a family's lines to be contiguous (#915).
     out.push_str(
         "# HELP httpjet_pagecache_dict_recompress_total Background dictionary recompression jobs by result.\n",
     );
     out.push_str("# TYPE httpjet_pagecache_dict_recompress_total counter\n");
+    for (vhost, metrics) in &rows {
+        for (result, value) in [
+            ("queued", &metrics.queued),
+            ("dropped", &metrics.dropped),
+            ("attempted", &metrics.attempts),
+            ("completed", &metrics.completed),
+            ("skipped", &metrics.skipped),
+        ] {
+            out.push_str(&format!(
+                "httpjet_pagecache_dict_recompress_total{{vhost=\"{vhost}\",result=\"{result}\"}} {}\n",
+                value.load(Ordering::Relaxed)
+            ));
+        }
+    }
     out.push_str(
         "# HELP httpjet_pagecache_dict_recompress_skipped_total Entries left as identity bodies, by reason.\n",
     );
     out.push_str("# TYPE httpjet_pagecache_dict_recompress_skipped_total counter\n");
-    out.push_str(
-        "# HELP httpjet_pagecache_dict_recompress_bytes_total Background dictionary recompression bytes by stage.\n",
-    );
-    out.push_str("# TYPE httpjet_pagecache_dict_recompress_bytes_total counter\n");
-    for (vhost, metrics) in rows {
-        let vhost = vhost
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_total{{vhost=\"{vhost}\",result=\"queued\"}} {}\n",
-            metrics.queued.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_total{{vhost=\"{vhost}\",result=\"dropped\"}} {}\n",
-            metrics.dropped.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_total{{vhost=\"{vhost}\",result=\"attempted\"}} {}\n",
-            metrics.attempts.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_total{{vhost=\"{vhost}\",result=\"completed\"}} {}\n",
-            metrics.completed.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_total{{vhost=\"{vhost}\",result=\"skipped\"}} {}\n",
-            metrics.skipped.load(Ordering::Relaxed)
-        ));
+    for (vhost, metrics) in &rows {
         for why in crate::state::DictSkip::ALL {
             out.push_str(&format!(
                 "httpjet_pagecache_dict_recompress_skipped_total{{vhost=\"{vhost}\",reason=\"{}\"}} {}\n",
@@ -650,18 +680,22 @@ fn append_dict_recompress_metrics(
                 metrics.skipped_by_reason[why as usize].load(Ordering::Relaxed)
             ));
         }
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_bytes_total{{vhost=\"{vhost}\",stage=\"input\"}} {}\n",
-            metrics.input_bytes.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_bytes_total{{vhost=\"{vhost}\",stage=\"output\"}} {}\n",
-            metrics.output_bytes.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!(
-            "httpjet_pagecache_dict_recompress_bytes_total{{vhost=\"{vhost}\",stage=\"saved\"}} {}\n",
-            metrics.saved_bytes.load(Ordering::Relaxed)
-        ));
+    }
+    out.push_str(
+        "# HELP httpjet_pagecache_dict_recompress_bytes_total Background dictionary recompression bytes by stage.\n",
+    );
+    out.push_str("# TYPE httpjet_pagecache_dict_recompress_bytes_total counter\n");
+    for (vhost, metrics) in &rows {
+        for (stage, value) in [
+            ("input", &metrics.input_bytes),
+            ("output", &metrics.output_bytes),
+            ("saved", &metrics.saved_bytes),
+        ] {
+            out.push_str(&format!(
+                "httpjet_pagecache_dict_recompress_bytes_total{{vhost=\"{vhost}\",stage=\"{stage}\"}} {}\n",
+                value.load(Ordering::Relaxed)
+            ));
+        }
     }
 }
 
@@ -722,8 +756,15 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
          # TYPE httpjet_h3_refused_total counter\n\
          httpjet_h3_refused_total{{reason=\"connection_budget\"}} {}\n\
          httpjet_h3_refused_total{{reason=\"handshake_cap\"}} {}\n\
-         httpjet_h3_refused_total{{reason=\"handshake_timeout\"}} {}\n",
-        h3.retries_sent, h3.refused_budget, h3.refused_handshakes, h3.handshake_timeouts,
+         httpjet_h3_refused_total{{reason=\"handshake_timeout\"}} {}\n\
+         # HELP httpjet_h3_send_stall_resets_total HTTP/3 responses reset because they made too little progress while waiting on withheld flow-control credit.\n\
+         # TYPE httpjet_h3_send_stall_resets_total counter\n\
+         httpjet_h3_send_stall_resets_total {}\n",
+        h3.retries_sent,
+        h3.refused_budget,
+        h3.refused_handshakes,
+        h3.handshake_timeouts,
+        h3.send_stall_resets,
     ));
 }
 
@@ -762,6 +803,28 @@ fn append_stream_fill_metrics(out: &mut String, metrics: &crate::state::Metrics)
          httpjet_pagecache_stream_fill_stores_total {}\n",
         metrics.pagecache_stream_fills.load(Ordering::Relaxed),
         metrics.pagecache_stream_fill_stores.load(Ordering::Relaxed),
+    ));
+}
+
+/// Per-URL (`X-LiteSpeed-Vary: cookie=…`) vary specs and the stores they refused.
+fn append_url_vary_metrics(
+    out: &mut String,
+    pc: &hj_pagecache::PageStore,
+    metrics: &crate::state::Metrics,
+) {
+    out.push_str(&format!(
+        "# HELP httpjet_pagecache_url_vary_specs URLs whose responses declared a per-URL cookie vary.\n\
+         # TYPE httpjet_pagecache_url_vary_specs gauge\n\
+         httpjet_pagecache_url_vary_specs {}\n\
+         # HELP httpjet_pagecache_url_vary_bytes Approximate memory held by the per-URL vary specs.\n\
+         # TYPE httpjet_pagecache_url_vary_bytes gauge\n\
+         httpjet_pagecache_url_vary_bytes {}\n\
+         # HELP httpjet_pagecache_url_vary_refused_total Admitted variants the per-URL vary bookkeeping refused.\n\
+         # TYPE httpjet_pagecache_url_vary_refused_total counter\n\
+         httpjet_pagecache_url_vary_refused_total {}\n",
+        pc.url_vary_spec_count(),
+        pc.url_vary_bytes(),
+        metrics.pagecache_url_vary_refused.load(Ordering::Relaxed),
     ));
 }
 
@@ -1006,10 +1069,22 @@ fn try_enter_cache_entries_render(state: &ServerState) -> bool {
 struct RuntimeDiagnostics {
     cache_entries_renders: u64,
     cache_entries_throttled: u64,
+    /// The unified access log's shed lines.
     access_log_dropped: u64,
+    /// Per-vhost writers: (vhost, "access" | "error", shed lines).
+    vhost_log_dropped: Vec<(String, &'static str, u64)>,
 }
 
-fn append_runtime_diagnostics(out: &mut String, d: RuntimeDiagnostics) {
+fn append_runtime_diagnostics(out: &mut String, mut d: RuntimeDiagnostics) {
+    let vhost_dropped = |log: &str| -> u64 {
+        d.vhost_log_dropped
+            .iter()
+            .filter(|(_, kind, _)| *kind == log)
+            .map(|(_, _, n)| n)
+            .sum()
+    };
+    let access_log_dropped = d.access_log_dropped + vhost_dropped("access");
+    let error_log_dropped = vhost_dropped("error");
     let mut metric = |name: &str, kind: &str, help: &str, value: u64| {
         out.push_str(&format!(
             "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
@@ -1030,9 +1105,32 @@ fn append_runtime_diagnostics(out: &mut String, d: RuntimeDiagnostics) {
     metric(
         "httpjet_log_access_dropped_lines_total",
         "counter",
-        "Access-log lines shed because the non-blocking writer queue was full or gone.",
-        d.access_log_dropped,
+        "Access-log lines shed because the non-blocking writer queue was full or gone (unified plus per-vhost logs).",
+        access_log_dropped,
     );
+    metric(
+        "httpjet_log_error_dropped_lines_total",
+        "counter",
+        "Per-vhost error-log lines shed because the non-blocking writer queue was full or gone.",
+        error_log_dropped,
+    );
+    if d.vhost_log_dropped.is_empty() {
+        return;
+    }
+    d.vhost_log_dropped.sort();
+    out.push_str(
+        "# HELP httpjet_log_vhost_dropped_lines_total Lines shed by a vhost's own access or error log writer.\n\
+         # TYPE httpjet_log_vhost_dropped_lines_total counter\n",
+    );
+    for (vhost, log, n) in &d.vhost_log_dropped {
+        let vhost = vhost
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        out.push_str(&format!(
+            "httpjet_log_vhost_dropped_lines_total{{vhost=\"{vhost}\",log=\"{log}\"}} {n}\n"
+        ));
+    }
 }
 
 /// Render the live page-cache contents (loopback debug): per-URL-class histogram + the largest
@@ -1203,15 +1301,17 @@ fn render_cache_entries(state: &ServerState) -> String {
         s.expired_misses,
     ));
     out.push_str(&format!(
-        "health: hits={} misses={} stores={} purges={} store_purge_rejects={} disk_read_err={} disk_write_err={} disk_full_err={} meta_decode_err={} key_id_collisions={} poisoned_locks={} store_commit_hold_us={} store_commit_calls={}\n",
+        "health: hits={} misses={} stores={} purges={} store_purge_rejects={} disk_read_err={} disk_read_swap_retries={} disk_write_err={} disk_full_err={} fanout_recreated={} meta_decode_err={} key_id_collisions={} poisoned_locks={} store_commit_hold_us={} store_commit_calls={}\n",
         s.hits,
         s.misses,
         s.stores,
         s.purges,
         s.store_purge_rejections,
         s.disk_read_errors,
+        s.disk_read_swap_retries,
         s.disk_write_errors,
         s.disk_full_errors,
+        s.fanout_recreations,
         s.meta_decode_errors,
         s.key_id_collisions,
         s.poisoned_locks,
@@ -1301,6 +1401,20 @@ fn mimalloc_stats_text() -> String {
         libmimalloc_sys::mi_stats_print_out(Some(sink), (&mut buf as *mut String).cast());
     }
     buf
+}
+
+fn append_fast_bridge_metrics(
+    out: &mut String,
+    counters: &crate::pipeline::fast_bridge::FastBridgeCounters,
+) {
+    out.push_str(
+        "# HELP httpjet_fast_bridge_total On-core fast_serve requests handed to the full pipeline, by the gate that declined them.\n# TYPE httpjet_fast_bridge_total counter\n",
+    );
+    for (reason, n) in counters.snapshot() {
+        out.push_str(&format!(
+            "httpjet_fast_bridge_total{{reason=\"{reason}\"}} {n}\n"
+        ));
+    }
 }
 
 /// (OPS3) Loopback purge-endpoint counters, snapshotted for the metrics render.
@@ -1610,6 +1724,12 @@ fn render_metrics(
             s.disk_read_errors.to_string(),
         );
         metric(
+            "httpjet_pagecache_disk_read_swap_retries_total",
+            "counter",
+            "Hits whose snapshot body a concurrent recompress swap retired, served from the successor (not read errors).",
+            s.disk_read_swap_retries.to_string(),
+        );
+        metric(
             "httpjet_pagecache_disk_write_errors_total",
             "counter",
             "File-tier persists that failed (entry stayed in RAM).",
@@ -1620,6 +1740,12 @@ fn render_metrics(
             "counter",
             "File-tier persists that failed specifically due to a full tmpfs (ENOSPC).",
             s.disk_full_errors.to_string(),
+        );
+        metric(
+            "httpjet_pagecache_fanout_recreations_total",
+            "counter",
+            "File-tier fanout directories found removed at persist time (external tmpfs cleaner) and recreated.",
+            s.fanout_recreations.to_string(),
         );
         metric(
             "httpjet_pagecache_meta_decode_errors_total",
@@ -1682,6 +1808,22 @@ mod tests {
                 "{bad} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn fast_bridge_reasons_render_as_one_labelled_counter() {
+        let counters = crate::pipeline::fast_bridge::FastBridgeCounters::default();
+        counters.bump(crate::pipeline::fast_bridge::FastBridge::Rewritten);
+        let mut body = String::new();
+        append_fast_bridge_metrics(&mut body, &counters);
+        assert!(body.starts_with("# HELP httpjet_fast_bridge_total "));
+        assert_eq!(
+            body.matches("# TYPE httpjet_fast_bridge_total counter\n")
+                .count(),
+            1
+        );
+        assert!(body.contains("httpjet_fast_bridge_total{reason=\"rewritten\"} 1\n"));
+        assert!(body.contains("httpjet_fast_bridge_total{reason=\"acl\"} 0\n"));
     }
 
     #[test]
@@ -1777,6 +1919,10 @@ mod tests {
                 eagain_retries: 8,
                 eagain_terminal_exhaustions: 9,
                 unread_body_drops: 10,
+                body_conn_closes: 11,
+                inline_bodies: 12,
+                inline_tail_drains: 13,
+                streamed_bodies: 14,
             }),
         );
         for expected in [
@@ -1789,6 +1935,10 @@ mod tests {
             "httpjet_lsapi_eagain_retries_total 8\n",
             "httpjet_lsapi_eagain_terminal_exhaustions_total 9\n",
             "httpjet_lsapi_unread_body_drops_total 10\n",
+            "httpjet_lsapi_body_conn_closes_total 11\n",
+            "httpjet_lsapi_inline_bodies_total 12\n",
+            "httpjet_lsapi_inline_tail_drains_total 13\n",
+            "httpjet_lsapi_streamed_bodies_total 14\n",
         ] {
             assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
         }
@@ -1916,6 +2066,56 @@ mod tests {
         }
     }
 
+    /// #915: every metric family's HELP/TYPE header is immediately followed by
+    /// all of its samples, across several vhosts — no family interleaving.
+    #[test]
+    fn dict_recompress_families_are_contiguous() {
+        let by_vhost = dashmap::DashMap::new();
+        for vhost in ["a.example", "b.example", "c.example"] {
+            by_vhost.insert(
+                vhost.to_owned(),
+                std::sync::Arc::new(crate::state::DictRecompressMetrics::default()),
+            );
+        }
+        let mut body = String::new();
+        append_dict_recompress_metrics(&mut body, &by_vhost);
+        let family_of = |line: &str| -> String {
+            let name = line
+                .strip_prefix("# HELP ")
+                .or_else(|| line.strip_prefix("# TYPE "))
+                .unwrap_or(line);
+            name.split(['{', ' '])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let mut seen: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for line in body.lines() {
+            let fam = family_of(line);
+            if fam != current {
+                assert!(
+                    !seen.contains(&fam),
+                    "family {fam} split across non-contiguous blocks:\n{body}"
+                );
+                assert!(
+                    line.starts_with("# HELP "),
+                    "family {fam} must open with HELP:\n{body}"
+                );
+                seen.push(fam.clone());
+                current = fam;
+            }
+        }
+        assert_eq!(seen.len(), 3, "{body}");
+        for fam in &seen {
+            let samples = body
+                .lines()
+                .filter(|l| !l.starts_with('#') && family_of(l) == *fam)
+                .count();
+            assert!(samples >= 3, "{fam} has samples for every vhost");
+        }
+    }
+
     #[test]
     fn runtime_diagnostics_include_debug_and_log_counters() {
         let mut body = String::new();
@@ -1925,6 +2125,11 @@ mod tests {
                 cache_entries_renders: 2,
                 cache_entries_throttled: 3,
                 access_log_dropped: 4,
+                vhost_log_dropped: vec![
+                    ("windowsforum.com".into(), "error", 2),
+                    ("windowsforum.com".into(), "access", 5),
+                    ("moon\"time".into(), "access", 1),
+                ],
             },
         );
         assert!(
@@ -1936,9 +2141,37 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("httpjet_log_access_dropped_lines_total 4\n"),
+            body.contains("httpjet_log_access_dropped_lines_total 10\n"),
+            "unified + per-vhost access drops are summed: {body}"
+        );
+        assert!(
+            body.contains("httpjet_log_error_dropped_lines_total 2\n"),
             "{body}"
         );
+        for series in [
+            "httpjet_log_vhost_dropped_lines_total{vhost=\"moon\\\"time\",log=\"access\"} 1\n",
+            "httpjet_log_vhost_dropped_lines_total{vhost=\"windowsforum.com\",log=\"access\"} 5\n",
+            "httpjet_log_vhost_dropped_lines_total{vhost=\"windowsforum.com\",log=\"error\"} 2\n",
+        ] {
+            assert!(body.contains(series), "missing {series}: {body}");
+        }
+        assert_eq!(
+            body.matches("# TYPE httpjet_log_vhost_dropped_lines_total counter\n")
+                .count(),
+            1
+        );
+
+        let mut unified_only = String::new();
+        append_runtime_diagnostics(
+            &mut unified_only,
+            RuntimeDiagnostics {
+                access_log_dropped: 4,
+                ..Default::default()
+            },
+        );
+        assert!(unified_only.contains("httpjet_log_access_dropped_lines_total 4\n"));
+        assert!(unified_only.contains("httpjet_log_error_dropped_lines_total 0\n"));
+        assert!(!unified_only.contains("httpjet_log_vhost_dropped_lines_total"));
     }
 
     #[test]
@@ -1955,6 +2188,8 @@ mod tests {
             "httpjet_h2_peer_settings_total{param=\"header_table_size\",bucket=\">65536\"} ",
             "httpjet_h2_peer_settings_total{param=\"max_frame_size\",bucket=\"<=16384\"} ",
             "httpjet_tls_cert_reload_retained_total ",
+            "# TYPE httpjet_h2_send_stall_resets_total counter\n",
+            "# TYPE httpjet_h3_send_stall_resets_total counter\nhttpjet_h3_send_stall_resets_total ",
         ] {
             assert!(body.contains(series), "missing {series}: {body}");
         }

@@ -37,6 +37,15 @@ const RAPID_RESET_BUDGET: u32 = 200;
 /// churn hits it in a fraction of a second.
 const NO_PROGRESS_BUDGET: u32 = 10_000;
 
+impl Recv {
+    /// Charge one reset of a stream whose handler was still in flight against the
+    /// rapid-reset budget, whichever side sent the RST_STREAM. True once exceeded.
+    pub(super) fn charge_inflight_reset(&mut self) -> bool {
+        self.rst_unanswered = self.rst_unanswered.saturating_add(1);
+        self.rst_unanswered > RAPID_RESET_BUDGET
+    }
+}
+
 /// Strip PADDED/PRIORITY framing from a HEADERS payload, yielding the header block.
 fn headers_block(flags_byte: u8, payload: &[u8]) -> Option<&[u8]> {
     let mut p = payload;
@@ -166,7 +175,46 @@ where
                 if cancelled.len() < recv.max_concurrent.saturating_mul(2) {
                     cancelled.insert($sid);
                 }
+                // (#905, MadeYouReset / CVE-2025-8671) A reset the peer PROVOKED
+                // (WINDOW_UPDATE 0, self-dependent PRIORITY, DATA on a half-closed
+                // stream) discards backend work exactly like a peer RST_STREAM, so
+                // it draws on the same rapid-reset budget. Resets of streams with no
+                // live handler cost nothing and are not counted.
+                if recv.charge_inflight_reset() {
+                    goaway!(error_code::ENHANCE_YOUR_CALM);
+                }
             }
+            return FrameOutcome::ResetStream($sid);
+        }};
+    }
+    // (#1014) A request too large to accept gets a complete, bodiless response with the
+    // status H1 sends (413/431) — not REFUSED_STREAM, which tells the client the request
+    // was never processed and is safe to resend whole (§8.7). If the client is still
+    // sending, RST_STREAM(NO_ERROR) follows the response so it stops without error (§8.1);
+    // the rest of its body is then ignored unbuffered (§5.1).
+    macro_rules! reject_too_large {
+        ($sid:expr_2021, $status:literal, $client_open:expr_2021) => {{
+            let client_open = $client_open;
+            let mut block = Vec::with_capacity(8);
+            enc.encode_header(&mut block, ":status", $status);
+            enc.encode_header(&mut block, "content-length", "0");
+            out.frames(|b| {
+                frame::write_frame(
+                    b,
+                    kind::HEADERS,
+                    flags::END_HEADERS | flags::END_STREAM,
+                    $sid,
+                    &block,
+                )
+            });
+            if client_open {
+                rst!($sid, error_code::NO_ERROR);
+            }
+            if let Some(s) = streams.remove(&$sid) {
+                recv.buffer_sub(s.body.len());
+            }
+            // Both sides have ended the stream: nothing is reset, but its pre-response
+            // window credit must still be dropped.
             return FrameOutcome::ResetStream($sid);
         }};
     }
@@ -410,7 +458,7 @@ where
                 goaway!(error_code::PROTOCOL_ERROR);
             }
             if opens_new_stream && sid <= recv.last_client_stream {
-                if !recv.reset_ids.contains(&sid) {
+                if !recv.reset_ids.contains(sid) {
                     // §5.1.1: client stream ids are never reused — HEADERS on a lower id
                     // that no RST_STREAM (ours or the peer's) ever closed was either
                     // ended cleanly or skipped entirely, a connection error. Only reset
@@ -517,6 +565,9 @@ where
                 match decoded {
                     Decoded::Ok => {
                         refuse_if_marked!(sid);
+                        if declared_body_too_large(streams.get(&sid), recv.max_request_body) {
+                            reject_too_large!(sid, "413", true);
+                        }
                         if let Some(st) = streams.get(&sid) {
                             maybe_send_100_continue(st, sid, out, enc);
                         }
@@ -525,7 +576,11 @@ where
                         }
                     }
                     Decoded::Compression => goaway!(error_code::COMPRESSION_ERROR),
-                    Decoded::TooLarge => rst!(sid, error_code::REFUSED_STREAM),
+                    Decoded::TooLarge => {
+                        refuse_if_marked!(sid);
+                        let client_open = streams.get(&sid).is_some_and(|s| !s.end_stream);
+                        reject_too_large!(sid, "431", client_open);
+                    }
                     Decoded::Malformed => {
                         // A malformed trailer arrives AFTER the body was buffered, so un-account it
                         // (mirror the other removal sites) — else `total_buffered` leaks by the body
@@ -573,6 +628,9 @@ where
                 match decode_block(dec, st) {
                     Decoded::Ok => {
                         refuse_if_marked!(sid);
+                        if declared_body_too_large(streams.get(&sid), recv.max_request_body) {
+                            reject_too_large!(sid, "413", true);
+                        }
                         if let Some(st) = streams.get(&sid) {
                             maybe_send_100_continue(st, sid, out, enc);
                         }
@@ -581,7 +639,11 @@ where
                         }
                     }
                     Decoded::Compression => goaway!(error_code::COMPRESSION_ERROR),
-                    Decoded::TooLarge => rst!(sid, error_code::REFUSED_STREAM),
+                    Decoded::TooLarge => {
+                        refuse_if_marked!(sid);
+                        let client_open = streams.get(&sid).is_some_and(|s| !s.end_stream);
+                        reject_too_large!(sid, "431", client_open);
+                    }
                     Decoded::Malformed => {
                         // Same as the HEADERS arm: un-account any buffered body before dropping the
                         // stream so a CONTINUATION-spanning malformed trailer can't leak the budget.
@@ -631,6 +693,10 @@ where
                 if sid.is_multiple_of(2) || sid > recv.last_client_stream {
                     goaway!(error_code::PROTOCOL_ERROR);
                 }
+                // §5.1: frames on a stream WE reset are ignored, not re-reset (#877).
+                if recv.sent_reset_ids.contains(sid) {
+                    return FrameOutcome::Continue;
+                }
                 rst!(sid, error_code::STREAM_CLOSED);
             };
             st.recv_window -= flow;
@@ -640,13 +706,17 @@ where
                 }
                 rst!(sid, error_code::FLOW_CONTROL_ERROR);
             }
-            if st.body.len() + data.len() > recv.max_request_body {
-                // Buffered request body exceeds the per-stream cap (LiteSpeed maxReqBodySize) —
-                // the custom stack buffers the body before dispatch, so cap it and reset.
-                if let Some(s) = streams.remove(&sid) {
-                    recv.buffer_sub(s.body.len());
-                }
-                rst!(sid, error_code::REFUSED_STREAM);
+            let body_len = st.body.len() + data.len();
+            if st.content_length.is_some_and(|cl| body_len as u64 > cl) {
+                // §8.1.1: DATA past the declared content-length is malformed; reset on the
+                // first overrunning frame instead of buffering the excess until END_STREAM.
+                rst!(sid, error_code::PROTOCOL_ERROR);
+            }
+            if body_len > recv.max_request_body {
+                // Over the per-stream cap (LiteSpeed maxReqBodySize) with no declared length
+                // to reject up front. Dispatch waits for the whole body, so no response has
+                // started and the 413 can still be sent.
+                reject_too_large!(sid, "413", hdr.flags & flags::END_STREAM == 0);
             }
             // (per-CONNECTION cap) bound the SUM of buffered bodies across streams, not just
             // per-stream — else max_concurrent x max_request_body is reachable on one conn.
@@ -718,8 +788,7 @@ where
                 // (CVE-2023-44487) The peer reset a stream whose handler is still doing
                 // (now-discarded) backend work — the rapid-reset signal. Track the imbalance
                 // vs completed responses; a sustained open→reset flood trips the budget below.
-                recv.rst_unanswered = recv.rst_unanswered.saturating_add(1);
-                if recv.rst_unanswered > RAPID_RESET_BUDGET {
+                if recv.charge_inflight_reset() {
                     goaway!(error_code::ENHANCE_YOUR_CALM);
                 }
             }
@@ -735,6 +804,18 @@ where
     FrameOutcome::Continue
 }
 
+/// The request headers just completed and declare a body over `max_request_body` that is
+/// still to come. With END_STREAM already set the declared length cannot match the empty
+/// body, which is malformed (§8.1.1) and left to `complete!`'s PROTOCOL_ERROR.
+fn declared_body_too_large(st: Option<&StreamState>, max_request_body: usize) -> bool {
+    st.is_some_and(|st| {
+        !st.end_stream
+            && st
+                .content_length
+                .is_some_and(|cl| cl > max_request_body as u64)
+    })
+}
+
 /// Outcome of decoding a header block.
 enum Decoded {
     /// Valid request headers, captured into `st`.
@@ -742,8 +823,8 @@ enum Decoded {
     /// HPACK decode failure — connection-fatal COMPRESSION_ERROR (§4.3).
     Compression,
     /// The decoded list exceeded SETTINGS_MAX_HEADER_LIST_SIZE. The block was fully
-    /// decoded (HPACK state intact), so this is a stream error: one oversized request
-    /// must not tear down a pooled connection carrying other clients' streams (#595).
+    /// decoded (HPACK state intact), so only this stream is answered (431): one oversized
+    /// request must not tear down a pooled connection carrying other clients' streams (#595).
     TooLarge,
     /// A malformed request per §8.1.2 (bad pseudo-headers, uppercase names,
     /// connection-specific headers, …) — a stream error (RST_STREAM PROTOCOL_ERROR).
@@ -836,8 +917,7 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
                 // carrying its own scheme/authority is malformed AND dangerous: it lets
                 // uri().host() disagree with the routed :authority/Host downstream (the
                 // foreign-host CDN-cache-protection bypass). Reject anything with a scheme
-                // or authority. (CONNECT — which omits :path/:scheme — is already rejected
-                // by the required-pseudo-header set check.)
+                // or authority.
                 ":path" => {
                     // Check the raw value before `http::Uri` parsing: that parser accepts a
                     // fragment and silently drops `#...`, but fragments are not request-target
@@ -967,6 +1047,13 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
         if !seen[0] || !seen[1] || !seen[2] {
             return Decoded::Malformed;
         }
+        // (#1015) RFC 9113 §8.5: a CONNECT omits :scheme/:path (so a proper one already
+        // failed above) and extended CONNECT is never advertised, so one that carries them
+        // is malformed — the same verdict the H3 transport reaches. There is no tunnel to
+        // offer, and it must not reach the pipeline (PHP, hj-proxy) as an ordinary method.
+        if st.method.as_ref() == Some(&http::Method::CONNECT) {
+            return Decoded::Malformed;
+        }
         // RFC 9112 §3.2.4: asterisk-form is only a server-wide OPTIONS request.
         if path_is_asterisk && st.method.as_ref() != Some(&http::Method::OPTIONS) {
             return Decoded::Malformed;
@@ -1085,6 +1172,32 @@ mod pseudo_header_tests {
                 ("host", "user@example.com"),
             ]),
             Decoded::Malformed
+        ));
+    }
+
+    #[test]
+    fn connect_is_malformed_with_or_without_scheme_and_path() {
+        assert!(matches!(
+            decode(&[
+                (":method", "CONNECT"),
+                (":scheme", "https"),
+                (":path", "/"),
+                (":authority", "example.com:443"),
+            ]),
+            Decoded::Malformed
+        ));
+        assert!(matches!(
+            decode(&[(":method", "CONNECT"), (":authority", "example.com:443")]),
+            Decoded::Malformed
+        ));
+        assert!(matches!(
+            decode(&[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":path", "/"),
+                (":authority", "example.com:443"),
+            ]),
+            Decoded::Ok
         ));
     }
 

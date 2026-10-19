@@ -283,6 +283,12 @@ impl Upstream {
         })
     }
 
+    /// Whether any request holds a `maxConns` permit. An h2 response stream keeps
+    /// only its permit (not the `Upstream`) alive for the stream's lifetime.
+    fn has_requests_in_flight(&self) -> bool {
+        self.sem.available_permits() < self.max_conns as usize
+    }
+
     /// Upper bound on how long a request PARKS waiting for a `maxConns` slot.
     /// `connect_timeout` doubles as this wait for extProcessor targets, and prod
     /// configures `initTimeout=600s` there — parking every new request ~10 minutes
@@ -656,6 +662,14 @@ struct DynamicPool {
     last_used: Instant,
 }
 
+impl DynamicPool {
+    // Busy pools cannot be evicted: recreating their semaphore would bypass the
+    // per-upstream limit.
+    fn upstream_in_use(&self) -> bool {
+        Arc::strong_count(&self.upstream) > 1 || self.upstream.has_requests_in_flight()
+    }
+}
+
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -801,11 +815,9 @@ impl UpstreamPool {
     ) -> Result<Arc<Upstream>, hj_core::HandlerError> {
         let now = Instant::now();
         let mut registry = self.dynamic.lock();
-        // Busy pools cannot be evicted: recreating their semaphore would bypass
-        // the per-upstream limit. Failure/backoff state lives in the same entry.
+        // Failure/backoff state lives in the same entry as the semaphore.
         registry.retain(|_, pool| {
-            now.duration_since(pool.last_used) < DYNAMIC_POOL_TTL
-                || Arc::strong_count(&pool.upstream) > 1
+            now.duration_since(pool.last_used) < DYNAMIC_POOL_TTL || pool.upstream_in_use()
         });
         let peers = target.peers();
         let now_ms = now_epoch_ms();
@@ -841,7 +853,7 @@ impl UpstreamPool {
         if registry.len() >= MAX_DYNAMIC_POOLS {
             let oldest = registry
                 .iter()
-                .filter(|(_, p)| Arc::strong_count(&p.upstream) == 1)
+                .filter(|(_, p)| !p.upstream_in_use())
                 .min_by_key(|(_, p)| p.last_used)
                 .map(|(k, _)| k.clone());
             if let Some(key) = oldest {
@@ -990,6 +1002,33 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(pool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_pool_holding_only_a_permit_is_not_evicted() {
+        let pool = UpstreamPool::new();
+        let busy = ProxyTarget::parse_url("h2://192.0.2.3:1").unwrap();
+        let other = ProxyTarget::parse_url("http://192.0.2.4:1").unwrap();
+        let first = pool
+            .get_or_create(&busy, 1, Duration::from_secs(1), Duration::from_secs(1))
+            .unwrap();
+        let permit = first.acquire().await.expect("free slot");
+        drop(first);
+        for value in pool.dynamic.lock().values_mut() {
+            value.last_used -= DYNAMIC_POOL_TTL;
+        }
+        pool.get_or_create(&other, 1, Duration::from_secs(1), Duration::from_secs(1))
+            .unwrap();
+        let again = pool
+            .get_or_create(&busy, 1, Duration::from_secs(1), Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            again.sem.available_permits(),
+            0,
+            "an in-flight stream's pool must survive TTL eviction"
+        );
+        drop(permit);
+        assert_eq!(again.sem.available_permits(), 1);
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub(super) enum RwResult {
     },
     Proxy {
         target_url: String,
+        proxy_host: Option<String>,
         env: Vec<(String, String)>,
     },
     Redirect {
@@ -60,6 +61,23 @@ pub(super) enum RwResult {
     Unchanged {
         env: Vec<(String, String)>,
     },
+}
+
+impl RwResult {
+    /// Move the outcome's `[E=]` env out, leaving it empty.
+    pub(super) fn take_env(&mut self) -> Vec<(String, String)> {
+        match self {
+            RwResult::Proxy { env, .. }
+            | RwResult::Redirect { env, .. }
+            | RwResult::Status { env, .. }
+            | RwResult::Rewritten { env, .. }
+            | RwResult::Unchanged { env } => std::mem::take(env),
+            RwResult::Failed { .. }
+            | RwResult::Forbidden
+            | RwResult::Gone
+            | RwResult::InvalidTarget => Vec::new(),
+        }
+    }
 }
 
 /// Default TTL for the rewrite-outcome cache. Matched to `StatCache`'s 1 s TTL:
@@ -441,6 +459,7 @@ impl UaClassifyCache {
 /// default [`DEFAULT_REWRITE_OUTCOME_TTL`]; 0 disables the cache). Uncacheable
 /// chains (e.g. any rule reading `%{HTTP_COOKIE}`) bypass the cache with no
 /// added work beyond the per-ruleset boolean check.
+#[cfg(test)]
 pub(super) fn run_rewrite(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -448,6 +467,82 @@ pub(super) fn run_rewrite(
     chain: &[(PathBuf, Arc<Htaccess>)],
     path: &str,
     query: &str,
+) -> RwResult {
+    run_rewrite_traced(
+        state,
+        ctx,
+        req,
+        chain,
+        path,
+        query,
+        &mut RewriteTrace::default(),
+    )
+}
+
+/// One internal redirect of a rewrite: the URI a rewrite moved the request to and
+/// the `.htaccess` chain (differing from the one evaluated before it) whose rules
+/// then ran for that URI. Apache/OLS run the access phase of every such hop before
+/// its rewrite outcome is honoured, so the caller must enforce `chain`'s access and
+/// auth for `path` and render a terminal outcome produced there with `chain`.
+#[derive(Debug, Clone)]
+pub(super) struct RewriteHop {
+    pub(super) path: String,
+    pub(super) chain: Vec<(PathBuf, Arc<Htaccess>)>,
+}
+
+/// What a rewrite evaluated beyond the caller's chain (see [`run_rewrite_inner`]).
+#[derive(Debug, Default)]
+pub(super) struct RewriteTrace {
+    /// Every `.htaccess` outside the caller's chain whose rules ran. Callers keying a
+    /// cache on `chain`'s reads must add these, or decline when it is non-empty.
+    pub(super) extra: Vec<(PathBuf, Arc<Htaccess>)>,
+    /// Every hop into a different chain, in order. The last hop's chain produced the
+    /// outcome; with no hop, the caller's chain did.
+    pub(super) hops: Vec<RewriteHop>,
+}
+
+impl RewriteTrace {
+    /// Whether the outcome depends on more than `chain` (the caller's chain) and the
+    /// final-target checks every rewrite gets: a chain outside `chain` ran, or some
+    /// hop's access phase is not implied by those checks. A hop is implied when it
+    /// entered the final rewritten path itself with a subset of `chain` holding no
+    /// auth realm: dispatch then checks that path against `chain` (or the identical
+    /// reloaded chain), and a deny anywhere in a chain denies (the front controller
+    /// `/sub/x` -> `/index.php` keeps its on-core path and outcome cache). An
+    /// enclosing realm may be lifted by a deeper chain, so auth always counts.
+    pub(super) fn needs_dispatch(
+        &self,
+        chain: &[(PathBuf, Arc<Htaccess>)],
+        outcome: &RwResult,
+    ) -> bool {
+        if !self.extra.is_empty() {
+            return true;
+        }
+        if self.hops.is_empty() {
+            return false;
+        }
+        let RwResult::Rewritten { path, .. } = outcome else {
+            return true;
+        };
+        self.hops.iter().any(|hop| {
+            hop.path != *path
+                || hop.chain.iter().any(|(dir, ht)| {
+                    ht.has_auth() || !chain.iter().any(|(d, h)| d == dir && Arc::ptr_eq(h, ht))
+                })
+        })
+    }
+}
+
+/// [`run_rewrite`] that also reports, in `trace`, the chains a rewrite moved the
+/// request into (see [`RewriteTrace`]).
+pub(super) fn run_rewrite_traced(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    req: &Request,
+    chain: &[(PathBuf, Arc<Htaccess>)],
+    path: &str,
+    query: &str,
+    trace: &mut RewriteTrace,
 ) -> RwResult {
     let raw_request_target = req
         .uri()
@@ -463,6 +558,7 @@ pub(super) fn run_rewrite(
         chain,
         path,
         query,
+        trace,
     )
 }
 
@@ -479,6 +575,7 @@ pub(super) fn run_rewrite_with_headers(
     chain: &[(PathBuf, Arc<Htaccess>)],
     path: &str,
     query: &str,
+    trace: &mut RewriteTrace,
 ) -> RwResult {
     #[cfg(feature = "otel")]
     let _trace_stage = crate::otel::stage(crate::otel::StageKind::Rewrite);
@@ -494,6 +591,7 @@ pub(super) fn run_rewrite_with_headers(
             chain,
             path,
             query,
+            trace,
         );
     }
     let inline = state.inline_rules.get(&ctx.vhost_name);
@@ -527,6 +625,7 @@ pub(super) fn run_rewrite_with_headers(
             chain,
             path,
             query,
+            trace,
         );
     }
     // Fold in the values of the KEYABLE dynamic vars the chain reads (User-Agent,
@@ -637,6 +736,7 @@ pub(super) fn run_rewrite_with_headers(
             chain,
             path,
             query,
+            trace,
         );
     }
     let hash =
@@ -670,7 +770,14 @@ pub(super) fn run_rewrite_with_headers(
         chain,
         path,
         query,
+        trace,
     );
+    // A rewrite that ran rules outside `chain` depends on inputs the key (built from
+    // `chain`'s reads) does not cover, and a hop whose access the caller must enforce
+    // has to reach it (a hit carries no hops).
+    if trace.needs_dispatch(chain, &result) {
+        return result;
+    }
     let key = OutcomeKey {
         vhost: vhost.to_string(),
         https,
@@ -734,6 +841,29 @@ pub(crate) fn page_cache_ua_class(
     (!class.is_empty()).then_some(class)
 }
 
+/// (#857) Whether the vhost's inline rules or any of `chains` read a request
+/// input the page cache neither keys nor varies on (client/server address or
+/// port, protocol, time, env). A response built under such a chain may depend
+/// on that input, so the request must neither read nor populate the cache.
+/// The classification is parse-time ([`hj_rewrite::Htaccess::page_cache_keyed`]).
+pub(crate) fn page_cache_unkeyed<'a>(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    chains: impl IntoIterator<Item = &'a Htaccess>,
+) -> bool {
+    state
+        .inline_rules
+        .get(&ctx.vhost_name)
+        .is_some_and(|rs| !rs.page_cache_keyed())
+        || chains.into_iter().any(|ht| !ht.page_cache_keyed())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `page_cache_header_vary` calls made on this thread.
+    pub(crate) static HEADER_VARY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// (#617/#618) Page-cache key fragment for every OTHER request header the
 /// applied rules read — SetEnvIf attributes (`memo.vary_headers`) and
 /// `RewriteCond %{HTTP:...}` vars (`cache_key_vars`) from the chain whose
@@ -753,6 +883,8 @@ pub(crate) fn page_cache_header_vary(
     headers: &http::HeaderMap,
 ) -> Option<String> {
     use std::collections::BTreeSet;
+    #[cfg(test)]
+    HEADER_VARY_CALLS.with(|n| n.set(n.get() + 1));
     let mut names: BTreeSet<&str> = BTreeSet::new();
     let mut rulesets: Vec<&hj_rewrite::RuleSet> = Vec::new();
     if let Some(rs) = state.inline_rules.get(&ctx.vhost_name) {
@@ -797,7 +929,7 @@ pub(crate) fn page_cache_header_vary(
         let cookie = keyed_header(headers, "cookie");
         let mut assignments = String::new();
         let evaluated: Result<(), &'static str> = chain.iter().try_for_each(|(_, ht)| {
-            for (name, value) in ht.eval_cookie_env(cookie.as_deref())? {
+            for (name, value) in ht.cookie_env(cookie.as_deref())?.iter() {
                 use std::fmt::Write;
                 // Length prefixes preserve assignment boundaries and order,
                 // including values expanded from regex capture groups.
@@ -872,7 +1004,80 @@ fn rewrite_host<'a>(ctx: &'a ReqCtx, headers: &'a http::HeaderMap) -> Cow<'a, st
         .unwrap_or_else(|| Cow::Borrowed(ctx.vhost_name.as_str()))
 }
 
+/// Apache's `LimitInternalRecursion` default: a request may be internally
+/// redirected this many times before it fails with a 500.
+pub(super) const MAX_INTERNAL_REDIRECTS: usize = 10;
+
+/// `RwResult::Failed` reason for a rewrite loop that exceeded
+/// [`MAX_INTERNAL_REDIRECTS`].
+pub(super) const INTERNAL_REDIRECT_LIMIT: &str = "internal redirect limit exceeded";
+
+/// The `.htaccess` chain for `path` after a rewrite moved the request out of
+/// `cur_path` (whose chain is `cur_chain`). `None` means the destination chain
+/// holds exactly the directories already evaluated, so OLS stays in the same
+/// context and no rule re-runs. An ancestor-or-equal destination is a prefix of
+/// `cur_chain` (the walk visits the same directories), so the hot front
+/// controller (`/whats-new/` -> `/index.php`) needs no filesystem lookup.
+fn destination_chain(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    cur_chain: &[(PathBuf, Arc<Htaccess>)],
+    cur_path: &str,
+    path: &str,
+) -> Option<Vec<(PathBuf, Arc<Htaccess>)>> {
+    let dest_dir = url_parent_dir(path);
+    if url_parent_dir(cur_path).starts_with(dest_dir) {
+        let target = ctx.vhost.doc_root.join(dest_dir.trim_start_matches('/'));
+        let kept = cur_chain
+            .iter()
+            .filter(|(dir, _)| target.starts_with(dir))
+            .count();
+        if kept == cur_chain.len() {
+            return None;
+        }
+        return Some(
+            cur_chain
+                .iter()
+                .filter(|(dir, _)| target.starts_with(dir))
+                .cloned()
+                .collect(),
+        );
+    }
+    let dest = if ctx
+        .vhost
+        .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess)
+    {
+        state.rewrite_cache.load_chain_with_dirs(
+            &ctx.vhost.doc_root,
+            path,
+            ctx.vhost.access_file_name_or_default(),
+        )
+    } else {
+        Vec::new()
+    };
+    let same = dest.len() == cur_chain.len()
+        && dest
+            .iter()
+            .zip(cur_chain)
+            .all(|((a, ha), (b, hb))| a == b && Arc::ptr_eq(ha, hb));
+    (!same).then_some(dest)
+}
+
 /// Evaluate the inline rewrite rules then the `.htaccess` chain (uncached).
+///
+/// A non-`[END]` rewrite re-enters per-directory processing for the new URI, as
+/// OLS does (`postRewriteProcess` -> context rewrite) and Apache does through
+/// its internal redirect: an inline (server-context) rewrite runs the rewritten
+/// URI's chain instead of the original's, and a per-directory rewrite that
+/// moves the request into a different chain runs that whole chain (root-first,
+/// like a direct request for the new URI) with `REDIRECT_STATUS=200` and the
+/// accumulated env visible. A rewrite that stays within the evaluated chain
+/// stops, as in OLS. More than [`MAX_INTERNAL_REDIRECTS`] re-entries fail.
+///
+/// Every evaluated `.htaccess` that is not in `chain` is appended to `trace.extra`:
+/// the outcome then depends on rules outside the caller's chain, so the outcome
+/// cache must not store it and page-cache/memo keys must include their reads.
+/// Every move into a different chain is appended to `trace.hops`.
 fn run_rewrite_inner(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -882,6 +1087,7 @@ fn run_rewrite_inner(
     chain: &[(PathBuf, Arc<Htaccess>)],
     path: &str,
     query: &str,
+    trace: &mut RewriteTrace,
 ) -> RwResult {
     // Rule sets: inline first, then the docroot→leaf htaccess chain.
     let inline = state.inline_rules.get(&ctx.vhost_name).cloned();
@@ -952,106 +1158,261 @@ fn run_rewrite_inner(
     input.env_seed = Some(&ctx.env);
     input.stat = StatSource::LiveTests(&stat);
 
-    // (ruleset, per_directory_prefix). Inline rules have no prefix; each
-    // .htaccess uses its directory path relative to docroot (no leading slash,
-    // trailing slash) so Apache's per-directory prefix stripping is reproduced.
-    let mut rulesets: Vec<(&hj_rewrite::RuleSet, Option<String>, bool)> = Vec::new();
-    if let Some(rs) = inline.as_deref() {
-        rulesets.push((rs, None, true));
-    }
-    for (dir, ht) in chain {
-        rulesets.push((&ht.rules, per_dir_prefix(&ctx.vhost.doc_root, dir), false));
-    }
-
     // (audit) %{THE_REQUEST} must resolve from the VERBATIM pre-decode target.
     // `req.uri()` still carries the raw percent-encoded bytes — attach them only
     // when some ruleset actually reads the variable (zero cost otherwise).
-    if rulesets.iter().any(|(rs, _, _)| rs.uses_the_request) {
-        input.raw_request_target = Some(raw_request_target.to_owned());
-    }
+    let attach_the_request = |input: &mut RewriteInput<'_>, rs: &RuleSet| {
+        if rs.uses_the_request && input.raw_request_target.is_none() {
+            input.raw_request_target = Some(raw_request_target.to_owned());
+        }
+    };
 
     let mut merged_env: Vec<(String, String)> = Vec::new();
-    // A per-directory ruleset without `RewriteEngine` inherits the nearest
-    // enclosing state, rooted at the vhost's rewrite enable (OLS context merge).
-    let mut inherited_engine = ctx.vhost.rewrite.enable;
-    for (rs, prefix, server_context) in rulesets {
-        input.per_directory_prefix = prefix;
-        input.server_context = server_context;
-        let engine_on = if server_context {
-            rs.engine_state().unwrap_or(false)
-        } else {
-            let on = rs.engine_state().unwrap_or(inherited_engine);
-            inherited_engine = on;
-            on
+    // The latest internal rewrite (canonical path, engine query), if any.
+    let mut rewritten: Option<(String, Option<String>)> = None;
+    let finish =
+        |rewritten: Option<(String, Option<String>)>, env: Vec<(String, String)>| match rewritten {
+            Some((path, query)) => RwResult::Rewritten { path, query, env },
+            None => RwResult::Unchanged { env },
         };
-        let outcome = evaluate_with_engine(rs, &input, engine_on);
-        // Merge this ruleset's env regardless of outcome shape.
+
+    // Server context: the vhost's inline rules see the original URI once.
+    if let Some(rs) = inline.as_deref() {
+        attach_the_request(&mut input, rs);
+        input.per_directory_prefix = None;
+        input.server_context = true;
+        let outcome = evaluate_with_engine(rs, &input, rs.engine_state().unwrap_or(false));
         let is_end = outcome.is_end();
         match outcome {
-            RewriteOutcome::Failed { reason, .. } => return RwResult::Failed { reason },
             RewriteOutcome::Unchanged { env, .. } => {
+                carry_env_forward(&mut input.env, &env);
                 merged_env.extend(env);
                 // [END] on a `-` rule: stop the whole chain; the URI is unchanged.
                 if is_end {
                     return RwResult::Unchanged { env: merged_env };
                 }
             }
-            RewriteOutcome::Proxy {
-                target_url,
-                mut env,
-                ..
-            } => {
-                let mut all = std::mem::take(&mut merged_env);
-                all.append(&mut env);
-                return RwResult::Proxy {
-                    target_url,
-                    env: all,
-                };
-            }
-            RewriteOutcome::Redirect {
-                code,
-                location,
-                mut env,
-                ..
-            } => {
-                let mut all = std::mem::take(&mut merged_env);
-                all.append(&mut env);
-                return RwResult::Redirect {
-                    code,
-                    location,
-                    env: all,
-                };
-            }
-            RewriteOutcome::Status { code, mut env, .. } => {
-                let mut all = std::mem::take(&mut merged_env);
-                all.append(&mut env);
-                return RwResult::Status { code, env: all };
-            }
-            RewriteOutcome::Forbidden { .. } => return RwResult::Forbidden,
-            RewriteOutcome::Gone { .. } => return RwResult::Gone,
             RewriteOutcome::Rewritten {
                 new_uri,
                 new_query,
-                mut env,
+                env,
                 ..
             } => {
-                let mut all = std::mem::take(&mut merged_env);
-                all.append(&mut env);
+                carry_env_forward(&mut input.env, &env);
+                merged_env.extend(env);
                 let Some(path) = canonical_rewritten_path(&new_uri) else {
                     return RwResult::InvalidTarget;
                 };
-                // Pass the engine's `Option` query through unchanged: `None` (incl. `[QSD]`)
-                // means "no query", which the dispatch loop turns into an empty string —
-                // NOT the original query (that bug made `[QSD]` a no-op).
-                return RwResult::Rewritten {
+                // [END] also suppresses every per-directory pass (Apache/OLS).
+                if is_end {
+                    return RwResult::Rewritten {
+                        path,
+                        query: new_query,
+                        env: merged_env,
+                    };
+                }
+                // OLS sets REDIRECT_STATUS on every substitution, the vhost
+                // rewrite's included, so the per-directory chain sees it.
+                input
+                    .env
+                    .insert("REDIRECT_STATUS".to_string(), "200".to_string());
+                rewritten = Some((path, new_query));
+            }
+            other => return terminal_outcome(other, merged_env),
+        }
+    }
+
+    // Per-directory phase. After an inline rewrite this is the rewritten URI's
+    // chain (OLS maps the context from the new URI after the vhost rewrite).
+    let mut hop_chain: Cow<'_, [(PathBuf, Arc<Htaccess>)]> = Cow::Borrowed(chain);
+    if let Some((new_path, new_query)) = &rewritten {
+        if let Some(dest) = destination_chain(state, ctx, chain, path, new_path) {
+            note_extra(&mut trace.extra, chain, &dest);
+            trace.hops.push(RewriteHop {
+                path: new_path.clone(),
+                chain: dest.clone(),
+            });
+            hop_chain = Cow::Owned(dest);
+        }
+        input.uri = Cow::Owned(new_path.clone());
+        input.query = Cow::Owned(new_query.clone().unwrap_or_default());
+    }
+    let mut redirects = 0usize;
+    loop {
+        // A per-directory ruleset without `RewriteEngine` inherits the nearest
+        // enclosing state, rooted at the vhost's rewrite enable (OLS context merge).
+        let mut inherited_engine = ctx.vhost.rewrite.enable;
+        let mut moved = false;
+        for (dir, ht) in hop_chain.iter() {
+            let rs = &ht.rules;
+            attach_the_request(&mut input, rs);
+            input.per_directory_prefix = per_dir_prefix(&ctx.vhost.doc_root, dir);
+            input.server_context = false;
+            let engine_on = rs.engine_state().unwrap_or(inherited_engine);
+            inherited_engine = engine_on;
+            let outcome = evaluate_with_engine(rs, &input, engine_on);
+            let is_end = outcome.is_end();
+            match outcome {
+                RewriteOutcome::Unchanged { env, .. } => {
+                    carry_env_forward(&mut input.env, &env);
+                    merged_env.extend(env);
+                    if is_end {
+                        return finish(rewritten, merged_env);
+                    }
+                }
+                RewriteOutcome::Rewritten {
+                    new_uri,
+                    new_query,
+                    env,
+                    ..
+                } => {
+                    carry_env_forward(&mut input.env, &env);
+                    merged_env.extend(env);
+                    let Some(path) = canonical_rewritten_path(&new_uri) else {
+                        return RwResult::InvalidTarget;
+                    };
+                    // Pass the engine's `Option` query through unchanged: `None` (incl.
+                    // `[QSD]`) means "no query", which the dispatch loop turns into an
+                    // empty string — NOT the original query (that bug made `[QSD]` a no-op).
+                    rewritten = Some((path, new_query));
+                    if is_end {
+                        return finish(rewritten, merged_env);
+                    }
+                    moved = true;
+                    break;
+                }
+                other => return terminal_outcome(other, merged_env),
+            }
+        }
+        if !moved {
+            break;
+        }
+        let Some((new_path, new_query)) = &rewritten else {
+            break;
+        };
+        let Some(dest) = destination_chain(state, ctx, &hop_chain, &input.uri, new_path) else {
+            break;
+        };
+        redirects += 1;
+        if redirects > MAX_INTERNAL_REDIRECTS {
+            return RwResult::Failed {
+                reason: INTERNAL_REDIRECT_LIMIT,
+            };
+        }
+        note_extra(&mut trace.extra, chain, &dest);
+        trace.hops.push(RewriteHop {
+            path: new_path.clone(),
+            chain: dest.clone(),
+        });
+        // The internal redirect's env (Apache sets it on the redirected request;
+        // OLS sets it on every rewrite). Engine-only: lsphp gets its own.
+        input
+            .env
+            .insert("REDIRECT_STATUS".to_string(), "200".to_string());
+        input.uri = Cow::Owned(new_path.clone());
+        input.query = Cow::Owned(new_query.clone().unwrap_or_default());
+        hop_chain = Cow::Owned(dest);
+    }
+    finish(rewritten, merged_env)
+}
+
+/// Record each `dest` entry the caller's `chain` does not hold (once).
+fn note_extra(
+    extra: &mut Vec<(PathBuf, Arc<Htaccess>)>,
+    chain: &[(PathBuf, Arc<Htaccess>)],
+    dest: &[(PathBuf, Arc<Htaccess>)],
+) {
+    let same = |(a, ha): &(PathBuf, Arc<Htaccess>), (b, hb): &(PathBuf, Arc<Htaccess>)| {
+        a == b && Arc::ptr_eq(ha, hb)
+    };
+    for entry in dest {
+        if !chain.iter().any(|c| same(c, entry)) && !extra.iter().any(|e| same(e, entry)) {
+            extra.push(entry.clone());
+        }
+    }
+}
+
+/// Map a terminal (non-rewrite, non-unchanged) engine outcome, prefixing the env
+/// merged from every earlier ruleset.
+fn terminal_outcome(outcome: RewriteOutcome, mut all: Vec<(String, String)>) -> RwResult {
+    match outcome {
+        RewriteOutcome::Failed { reason, .. } => RwResult::Failed { reason },
+        RewriteOutcome::Proxy {
+            target_url,
+            proxy_host,
+            mut env,
+        } => {
+            all.append(&mut env);
+            RwResult::Proxy {
+                target_url,
+                proxy_host,
+                env: all,
+            }
+        }
+        RewriteOutcome::Redirect {
+            code,
+            location,
+            mut env,
+            ..
+        } => {
+            all.append(&mut env);
+            RwResult::Redirect {
+                code,
+                location,
+                env: all,
+            }
+        }
+        RewriteOutcome::Status { code, mut env, .. } => {
+            all.append(&mut env);
+            RwResult::Status { code, env: all }
+        }
+        RewriteOutcome::Forbidden { .. } => RwResult::Forbidden,
+        RewriteOutcome::Gone { .. } => RwResult::Gone,
+        RewriteOutcome::Unchanged { env, .. } => {
+            all.extend(env);
+            RwResult::Unchanged { env: all }
+        }
+        RewriteOutcome::Rewritten {
+            new_uri,
+            new_query,
+            mut env,
+            ..
+        } => {
+            all.append(&mut env);
+            match canonical_rewritten_path(&new_uri) {
+                Some(path) => RwResult::Rewritten {
                     path,
                     query: new_query,
                     env: all,
-                };
+                },
+                None => RwResult::InvalidTarget,
             }
         }
     }
-    RwResult::Unchanged { env: merged_env }
+}
+
+/// Make one ruleset's `[E=]` output visible to the `%{ENV:}` reads of every later
+/// ruleset (OLS `setEnv` writes the request env the next ruleset reads, #822).
+/// `carried` is the engine's owned env layer, which shadows the borrowed `ctx.env`
+/// seed: an unset is recorded as `""` so the seed value is hidden (unset and empty
+/// expand alike). The reserved `HJ_` namespace stays out of reach, exactly as when
+/// the assignment is later merged into `ctx.env`.
+fn carry_env_forward(
+    carried: &mut std::collections::BTreeMap<String, String>,
+    env: &[(String, String)],
+) {
+    for (key, value) in env {
+        let assignment = hj_rewrite::EnvAssignment::classify(key, value);
+        let name = assignment.name();
+        if name.is_empty() || !super::htaccess_apply::env_key_allowed(name) {
+            continue;
+        }
+        let value = match assignment {
+            hj_rewrite::EnvAssignment::Set { value, .. } => value,
+            hj_rewrite::EnvAssignment::Unset { .. } => "",
+        };
+        carried.insert(name.to_string(), value.to_string());
+    }
 }
 
 /// The path of an `.htaccess`'s directory relative to `docroot`, normalized for
@@ -1778,6 +2139,7 @@ mod tests {
                 chain,
                 "/sub/private",
                 "",
+                &mut RewriteTrace::default(),
             )
         };
         let off_vhost = mk_ctx(vhost(false));

@@ -3,6 +3,7 @@
 //! vhost [`Router`]. Other crates implement handlers/transforms against these.
 
 pub mod body;
+pub mod body_deadline;
 pub mod budget;
 pub mod completion;
 pub mod context;
@@ -14,13 +15,16 @@ pub mod router;
 
 pub use body::{Body, BoxError, CountingBody, FileBody, IncomingBody, StreamBody, empty_incoming};
 pub use completion::{ResponseCompletion, ResponseEnd};
-pub use context::{ClientCert, Http10Request, Proto, RedirectGuard, ReqCtx, TlsParams};
+pub use context::{
+    ClientCert, Http10Request, Proto, ProxiedBody, RedirectGuard, ReqCtx, TlsParams,
+};
 pub use handler::{Handler, HandlerError, Request, Response, ResponseTransform, text_response};
 pub use http_util::{
     CONNECTION_SPECIFIC_REQUEST_HEADERS, body_forbidden_status, coalesce_cookie_crumbs,
     header_value_lossy, http_date_now, if_none_match_matches,
-    is_connection_specific_request_header, percent_decode, percent_decode_cow,
-    response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date, strip_hop_by_hop_response,
+    is_connection_specific_request_header, matched_etag_variant, percent_decode,
+    percent_decode_cow, response_body_forbidden, sanitize_h2_h3_body_headers, stamp_date,
+    strip_hop_by_hop_response,
 };
 pub use net::{
     FORWARDING_AUTHORITY_HEADERS, host_without_port, is_forwarding_authority_header,

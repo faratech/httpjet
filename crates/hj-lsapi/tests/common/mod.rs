@@ -16,7 +16,12 @@ import struct
 import os
 
 {signal_setup}
-os.setsid()
+# The supervisor's pre_exec already made this a session leader; like lsphp,
+# ignore setsid's EPERM.
+try:
+    os.setsid()
+except PermissionError:
+    pass
 listener = socket.socket(fileno=0)
 
 while True:

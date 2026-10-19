@@ -31,6 +31,10 @@ pub struct ServeConfig {
     /// dribbles or never completes the header block; the io_uring H1 loop applies it to
     /// the head read (and the TLS handshake). `None` leaves the read unbounded.
     pub header_read_timeout: Option<Duration>,
+    /// (#1035) Hard bound on receiving one request body. A body that keeps delivering
+    /// `hj_core::body_deadline::BODY_MIN_PROGRESS` per `header_read_timeout` window has
+    /// its deadline extended up to here (H1/H2/H3). No XML knob sets it.
+    pub request_body_ceiling: Duration,
     /// Maximum number of requests to serve on a single keep-alive connection before
     /// signaling the client to close (h1). `0` means unlimited.
     pub max_keepalive_requests: u32,
@@ -51,6 +55,7 @@ impl Default for ServeConfig {
         ServeConfig {
             keep_alive_timeout: Some(Duration::from_secs(75)),
             header_read_timeout: Some(Duration::from_secs(30)),
+            request_body_ceiling: hj_core::body_deadline::BODY_DEADLINE_CEILING,
             max_keepalive_requests: 1000,
             max_req_header_size: 16380,
             max_req_body_size: 100 * 1024 * 1024,
@@ -79,6 +84,7 @@ impl ServeConfig {
         ServeConfig {
             keep_alive_timeout,
             header_read_timeout,
+            request_body_ceiling: hj_core::body_deadline::BODY_DEADLINE_CEILING,
             max_keepalive_requests: t.max_keep_alive_req,
             max_req_header_size: t.max_req_header_size,
             max_req_body_size: t.max_req_body_size as usize,

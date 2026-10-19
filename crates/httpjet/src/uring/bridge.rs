@@ -54,6 +54,10 @@ pub(crate) struct BridgeCtx {
     /// normal bridged request does not allocate an extension map merely to pin
     /// its reload snapshot.
     pub request_generation: Option<RequestGeneration>,
+    /// This connection's share of the server-wide body budget for bridged
+    /// response streams, shared by every request the connection carries
+    /// (see [`CONNECTION_RESPONSE_MEM`]).
+    pub response_budget: Arc<hj_core::budget::BodyBufferBudget>,
 }
 
 impl BridgeCtx {
@@ -71,6 +75,7 @@ impl BridgeCtx {
             sni: None,
             tls: None,
             request_generation: None,
+            response_budget: connection_response_budget(),
         }
     }
 
@@ -91,6 +96,7 @@ impl BridgeCtx {
             sni: None,
             tls: None,
             request_generation: None,
+            response_budget: connection_response_budget(),
         }
     }
 }
@@ -165,6 +171,21 @@ const STREAM_THRESHOLD: usize = 256 * 1024;
 const FILE_CHUNK: usize = 64 * 1024;
 /// Bounded backpressure between the tokio forwarder and the monoio drainer.
 const STREAM_CHANNEL_DEPTH: usize = 8;
+/// File chunks read ahead of the drainer. Each one holds up to a 1 MiB body-budget
+/// lease, so this (not `STREAM_CHANNEL_DEPTH`) bounds what a stalled reader pins.
+const FILE_READ_AHEAD: usize = 2;
+/// Bridged response bytes one connection may hold queued across all its streams, so
+/// a peer that stops reading (h2 window 0 on up to 256 streams) stalls only its own
+/// streams instead of pinning the 512 MiB server-wide budget. A stalled >4 MiB file
+/// stream pins ~3 MiB (`FILE_READ_AHEAD` 1 MiB chunks plus the one the h2 sender
+/// pulls even at window 0), so ~10 fit; a stream whose reader keeps up holds at most
+/// `FILE_READ_AHEAD + 1` chunks, so draining downloads never wait on it.
+pub(crate) const CONNECTION_RESPONSE_MEM: u64 = 32 * 1024 * 1024;
+/// Connection share a stream claims before pulling its next upstream frame, held
+/// while the backend produces it (unbounded for SSE). The connection's maximum
+/// concurrent streams (256) all holding it idle take half of
+/// [`CONNECTION_RESPONSE_MEM`].
+const FRAME_CLAIM: u64 = 64 * 1024;
 /// Global cap across every monoio core sharing this bridge. This stays above the
 /// normal backend pool sizes while preventing multiplexed H2/H3 connections from
 /// creating an unbounded number of pipeline futures.
@@ -398,10 +419,22 @@ impl Bridge {
     /// unlike the H1 path which writes the wire bytes directly from a `BridgeResp`.
     pub(crate) async fn dispatch_response(&self, req: Request, ctx: BridgeCtx) -> Response {
         match self.dispatch(req, ctx).await {
-            Some(r) => bridge_resp_to_response(r),
+            Some(r) => bridge_resp_to_response(no_upgrade_final(r)),
             None => hj_core::text_response(http::StatusCode::BAD_GATEWAY, "bridge unavailable\n"),
         }
     }
+}
+
+/// H2/H3 have no `101` (RFC 9113 §8.6, RFC 9114 §4.5) and carry no upgrade, so a
+/// backend's `101` final response becomes a 502, as the H1 writer already answers a 101
+/// it has no upgrade for.
+pub(crate) fn no_upgrade_final(r: BridgeResp) -> BridgeResp {
+    if r.status != http::StatusCode::SWITCHING_PROTOCOLS {
+        return r;
+    }
+    let mut out = bad_gateway();
+    out.completion = r.completion;
+    out
 }
 
 /// Reassemble a [`BridgeResp`] into an `hj_core::Response`. A `Full` body becomes
@@ -412,7 +445,22 @@ pub(crate) fn bridge_resp_to_response(r: BridgeResp) -> Response {
     let body = match r.body {
         BridgeBody::Full(b) => Body::Full(b),
         BridgeBody::File(f) => Body::File(f),
-        BridgeBody::Stream { rx, .. } => Body::Stream(ChannelBody { rx }.boxed()),
+        BridgeBody::Stream { rx, len } => {
+            let mut headers = r.headers;
+            // A known-length stream (an uncached file) keeps its Content-Length:
+            // the exact size hint tells the h2 framer the header is truthful.
+            if let Some(n) = len {
+                headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(n));
+            }
+            let body = Body::Stream(ChannelBody { rx, remaining: len }.boxed());
+            let mut resp = http::Response::new(body);
+            *resp.status_mut() = r.status;
+            *resp.headers_mut() = headers;
+            if let Some(completion) = r.completion {
+                resp.extensions_mut().insert(completion);
+            }
+            return resp;
+        }
     };
     let mut resp = http::Response::new(body);
     *resp.status_mut() = r.status;
@@ -430,6 +478,9 @@ pub(crate) fn bridge_resp_to_response(r: BridgeResp) -> Response {
 /// surfaces as a body error, which the h2/h3 stack turns into a stream reset.
 struct ChannelBody {
     rx: mpsc::Receiver<Result<Bytes, ()>>,
+    /// Bytes still owed when the total is known (the forwarder aborts a short
+    /// body with an error item, so the count never undershoots silently).
+    remaining: Option<u64>,
 }
 
 impl http_body::Body for ChannelBody {
@@ -441,12 +492,24 @@ impl http_body::Body for ChannelBody {
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
         use std::task::Poll;
         match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(Ok(b))) => Poll::Ready(Some(Ok(http_body::Frame::data(b)))),
+            Poll::Ready(Some(Ok(b))) => {
+                if let Some(r) = self.remaining.as_mut() {
+                    *r = r.saturating_sub(b.len() as u64);
+                }
+                Poll::Ready(Some(Ok(http_body::Frame::data(b))))
+            }
             Poll::Ready(Some(Err(()))) => {
                 Poll::Ready(Some(Err("bridged upstream body error".into())))
             }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self.remaining {
+            Some(n) => http_body::SizeHint::with_exact(n),
+            None => http_body::SizeHint::default(),
         }
     }
 }
@@ -491,8 +554,12 @@ where
                         _ = cancel.cancelled() => {}
                         _ = async move {
                             let direct_file = ctx.direct_file_egress;
+                            let budget = ResponseBudget {
+                                global: body_budget,
+                                connection: ctx.response_budget.clone(),
+                            };
                             let response = handler(req, ctx).await;
-                            forward_response_with_budget(response, resp, direct_file, &body_budget).await;
+                            forward_response_with_budget(response, resp, direct_file, &budget).await;
                         } => {}
                     }
                     drop(permit);
@@ -633,9 +700,12 @@ fn is_event_stream(h: &http::HeaderMap) -> bool {
 /// files and large/SSE streams are forwarded incrementally.
 #[cfg(test)]
 async fn forward_response(r: Response, resp: oneshot::Sender<BridgeResp>, direct_file: bool) {
-    let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(
-        hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
-    ));
+    let budget = ResponseBudget {
+        global: Arc::new(hj_core::budget::BodyBufferBudget::new(
+            hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
+        )),
+        connection: connection_response_budget(),
+    };
     forward_response_with_budget(r, resp, direct_file, &budget).await;
 }
 
@@ -643,7 +713,7 @@ async fn forward_response_with_budget(
     r: Response,
     resp: oneshot::Sender<BridgeResp>,
     direct_file: bool,
-    body_budget: &Arc<hj_core::budget::BodyBufferBudget>,
+    body_budget: &ResponseBudget,
 ) {
     let (mut parts, body) = r.into_parts();
     let bw_rate = parts
@@ -683,10 +753,66 @@ async fn forward_response_with_budget(
     }
 }
 
-fn leased_bytes(data: Bytes, lease: hj_core::budget::BodyBufferLease) -> Bytes {
+pub(crate) fn connection_response_budget() -> Arc<hj_core::budget::BodyBufferBudget> {
+    Arc::new(hj_core::budget::BodyBufferBudget::new(
+        CONNECTION_RESPONSE_MEM,
+    ))
+}
+
+/// The server-wide body budget and the connection's share of it; every bridged
+/// response chunk is charged to both.
+#[derive(Clone)]
+struct ResponseBudget {
+    global: Arc<hj_core::budget::BodyBufferBudget>,
+    connection: Arc<hj_core::budget::BodyBufferBudget>,
+}
+
+impl ResponseBudget {
+    fn lease(&self) -> ResponseLease {
+        ResponseLease {
+            connection: hj_core::budget::BodyBufferLease::new(self.connection.clone()),
+            global: hj_core::budget::BodyBufferLease::new(self.global.clone()),
+        }
+    }
+
+    /// `preferred` capped to what both budgets can ever hold at once.
+    fn chunk_size(&self, preferred: usize) -> usize {
+        let fits = |budget: &hj_core::budget::BodyBufferBudget| match budget.capacity() {
+            0 => usize::MAX,
+            cap => usize::try_from(cap).unwrap_or(usize::MAX),
+        };
+        preferred
+            .min(fits(&self.global))
+            .min(fits(&self.connection))
+    }
+
+    /// A frame larger than the whole connection share is charged all of it, so it
+    /// still queues (alone) instead of being refused.
+    fn connection_share(&self, n: u64) -> u64 {
+        match self.connection.capacity() {
+            0 => n,
+            cap => n.min(cap),
+        }
+    }
+}
+
+/// Bytes held on both budgets of a [`ResponseBudget`]; dropping it releases both.
+struct ResponseLease {
+    connection: hj_core::budget::BodyBufferLease,
+    global: hj_core::budget::BodyBufferLease,
+}
+
+impl ResponseLease {
+    fn release(&mut self, n: u64) {
+        self.connection.release(n);
+        self.global.release(n);
+    }
+}
+
+fn leased_bytes(data: Bytes, lease: ResponseLease) -> Bytes {
     struct Owned {
         data: Bytes,
-        _lease: hj_core::budget::BodyBufferLease,
+        _lease: ResponseLease,
     }
     impl AsRef<[u8]> for Owned {
         fn as_ref(&self) -> &[u8] {
@@ -699,55 +825,78 @@ fn leased_bytes(data: Bytes, lease: hj_core::budget::BodyBufferLease) -> Bytes {
     })
 }
 
+/// Wait for `bytes` on the connection's share, then on the server-wide budget, so a
+/// connection whose streams stall waits on itself. `None` once the receiver is gone.
 async fn reserve_queue_bytes(
     tx: &mpsc::Sender<Result<Bytes, ()>>,
-    budget: &Arc<hj_core::budget::BodyBufferBudget>,
+    budget: &ResponseBudget,
     bytes: usize,
-) -> Option<hj_core::budget::BodyBufferLease> {
-    if budget.capacity() != 0 && bytes as u64 > budget.capacity() {
-        return None;
-    }
-    loop {
-        let mut lease = hj_core::budget::BodyBufferLease::new(budget.clone());
-        if lease.reserve(bytes as u64) {
-            return Some(lease);
-        }
-        if tx.is_closed() {
-            return None;
-        }
-        tokio::select! {
-            _ = tx.closed() => return None,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
-        }
-    }
+) -> Option<ResponseLease> {
+    let bytes = bytes as u64;
+    let mut lease = budget.lease();
+    let reserved = tokio::select! {
+        biased;
+        reserved = async {
+            lease.connection.reserve_wait(bytes).await && lease.global.reserve_wait(bytes).await
+        } => reserved,
+        _ = tx.closed() => false,
+    };
+    reserved.then_some(lease)
 }
 
-fn queue_chunk_size(budget: &hj_core::budget::BodyBufferBudget, preferred: usize) -> usize {
-    match budget.capacity() {
-        0 => preferred,
-        cap => preferred.min(usize::try_from(cap).unwrap_or(usize::MAX)),
-    }
-}
-
+/// Queue one already-pulled frame. `Err` ends the stream: the receiver is gone, or the
+/// frame was refused and the abort is already queued in its place.
 async fn send_leased_chunk(
     tx: &mpsc::Sender<Result<Bytes, ()>>,
-    budget: &Arc<hj_core::budget::BodyBufferBudget>,
+    budget: &ResponseBudget,
     data: Bytes,
 ) -> Result<(), ()> {
     if data.is_empty() {
         return Ok(());
     }
-    // The upstream has already allocated this frame. Refuse pressure rather
-    // than retaining an uncharged frame while waiting for other responses.
+    let permit = tx.reserve().await.map_err(|_| ())?;
+    send_leased(permit, tx, budget, budget.lease(), data).await
+}
+
+/// Charge `data` and queue it into the slot `permit` holds. The upstream has already
+/// allocated this frame, so server-wide pressure refuses rather than waits: the frame
+/// is released and the slot carries the abort instead. The connection's own share
+/// (`lease` may already hold a claim on it) waits for the connection's other streams
+/// to drain.
+async fn send_leased(
+    permit: mpsc::Permit<'_, Result<Bytes, ()>>,
+    tx: &mpsc::Sender<Result<Bytes, ()>>,
+    budget: &ResponseBudget,
+    mut lease: ResponseLease,
+    data: Bytes,
+) -> Result<(), ()> {
     // Reserve the whole frame: splitting Bytes would pin its entire allocation
     // behind every slice and release accounting before the allocation dies.
-    let mut lease = hj_core::budget::BodyBufferLease::new(budget.clone());
-    if !lease.reserve(data.len() as u64) {
-        // Let the caller release any other pending frame before notifying the
-        // receiver: an error send can itself wait behind a stalled full queue.
+    let n = data.len() as u64;
+    if !lease.global.reserve(n) {
+        drop(data);
+        permit.send(Err(()));
         return Err(());
     }
-    tx.send(Ok(leased_bytes(data, lease))).await.map_err(|_| ())
+    let share = budget.connection_share(n);
+    let claimed = lease.connection.held();
+    if claimed >= share {
+        lease.connection.release(claimed - share);
+    } else if !lease.connection.reserve(share - claimed) {
+        // Wait holding none of the share: streams that each hold a claim while
+        // waiting for more could otherwise exhaust the connection between them.
+        lease.connection.release(claimed);
+        let reserved = tokio::select! {
+            biased;
+            reserved = lease.connection.reserve_wait(share) => reserved,
+            _ = tx.closed() => false,
+        };
+        if !reserved {
+            return Err(());
+        }
+    }
+    permit.send(Ok(leased_bytes(data, lease)));
+    Ok(())
 }
 
 /// Stream an uncached `Body::File` from disk (the fast path already buffered small/cached
@@ -758,7 +907,7 @@ async fn forward_file(
     mut f: hj_core::FileBody,
     resp: oneshot::Sender<BridgeResp>,
     bw_rate: Option<u64>,
-    body_budget: &Arc<hj_core::budget::BodyBufferBudget>,
+    body_budget: &ResponseBudget,
 ) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
     let (start, len) = match f.range {
@@ -783,7 +932,7 @@ async fn forward_file(
     let status = parts.status;
     observe_response_head(&mut parts, status);
     let headers = strip_framing(parts.headers);
-    let (tx, rrx) = mpsc::channel(STREAM_CHANNEL_DEPTH);
+    let (tx, rrx) = mpsc::channel(FILE_READ_AHEAD);
     let _ = resp.send(BridgeResp {
         completion: take_response_completion(&mut parts.extensions),
         status: parts.status,
@@ -813,53 +962,69 @@ async fn forward_file(
             rustix::fs::Advice::Sequential,
         );
     }
-    let chunk_size = queue_chunk_size(body_budget, chunk_size);
+    let chunk_size = body_budget.chunk_size(chunk_size);
     while remaining > 0 {
+        // Queue slot first, then budget (the connection's share, then the server's),
+        // then the read: a reader that stops draining parks this loop holding no
+        // lease, so it pins only the chunks already queued.
+        let Ok(permit) = tx.reserve().await else {
+            return; // client gone
+        };
         let want = remaining.min(chunk_size as u64) as usize;
-        let mut lease = match reserve_queue_bytes(&tx, body_budget, want).await {
-            Some(lease) => lease,
-            None => return,
+        let Some(mut lease) = reserve_queue_bytes(&tx, body_budget, want).await else {
+            return;
         };
         let mut buf = bytes::BytesMut::with_capacity(want);
         match (&mut file).take(want as u64).read_buf(&mut buf).await {
             Ok(0) => {
                 // Short file (truncated since stat): we already committed Content-Length, so
                 // signal an abort rather than finish a short body under the wrong CL.
-                let _ = tx.send(Err(())).await;
+                permit.send(Err(()));
                 return;
             }
             Ok(n) => {
                 lease.release((want - n) as u64);
-                if tx
-                    .send(Ok(leased_bytes(buf.freeze(), lease)))
-                    .await
-                    .is_err()
-                {
-                    return; // client gone
-                }
+                permit.send(Ok(leased_bytes(buf.freeze(), lease)));
                 remaining -= n as u64;
             }
             Err(_) => {
-                let _ = tx.send(Err(())).await;
+                permit.send(Err(()));
                 return;
             }
         }
     }
 }
 
-/// Forward a `Body::Stream`. SSE streams immediately and a progressive body from its first
-/// byte; everything else buffers up to `STREAM_THRESHOLD` (so small dynamic responses stay
-/// `Full` + byte-identical) and only switches to incremental delivery past it. An error
-/// BEFORE the switch is a clean 502; after it, the stream is aborted.
+/// A proxied upstream body that must reach the client as it arrives: hj-proxy marked
+/// it (unsized upstream framing or `X-Accel-Buffering: no`), and it still has no
+/// `Content-Length` or still says `X-Accel-Buffering: no`. A sized proxied body keeps
+/// the buffered path below, so small proxied responses stay `Full` and byte-identical.
+fn is_unbuffered_proxy_body(parts: &http::response::Parts) -> bool {
+    if parts.extensions.get::<hj_core::ProxiedBody>().is_none() {
+        return false;
+    }
+    let accel_off = parts
+        .headers
+        .get_all("x-accel-buffering")
+        .iter()
+        .any(|v| v.as_bytes().trim_ascii().eq_ignore_ascii_case(b"no"));
+    accel_off || !parts.headers.contains_key(http::header::CONTENT_LENGTH)
+}
+
+/// Forward a `Body::Stream`. SSE and an unbuffered proxied body stream immediately and a
+/// progressive body from its first byte; everything else buffers up to `STREAM_THRESHOLD`
+/// (so small dynamic responses stay `Full` + byte-identical) and only switches to
+/// incremental delivery past it. An error BEFORE the switch is a clean 502; after it, the
+/// stream is aborted. A receiver that goes away while buffering drops the body at once.
 async fn forward_stream(
     mut parts: http::response::Parts,
     mut s: hj_core::StreamBody,
-    resp: oneshot::Sender<BridgeResp>,
+    mut resp: oneshot::Sender<BridgeResp>,
     bw_rate: Option<u64>,
-    body_budget: &Arc<hj_core::budget::BodyBufferBudget>,
+    body_budget: &ResponseBudget,
 ) {
     use http_body_util::BodyExt;
-    if is_event_stream(&parts.headers) {
+    if is_event_stream(&parts.headers) || is_unbuffered_proxy_body(&parts) {
         let status = parts.status;
         observe_response_head(&mut parts, status);
         let headers = strip_framing(parts.headers);
@@ -894,7 +1059,15 @@ async fn forward_stream(
         .and_then(|v| v.parse::<usize>().ok());
     let mut acc: Vec<u8> = Vec::with_capacity(declared.map_or(0, |n| n.min(threshold)));
     loop {
-        match s.frame().await {
+        // The client side dropping its receiver (disconnect, stream reset) must drop
+        // the upstream body here: it can hold a backend maxConns permit for as long as
+        // the backend keeps producing.
+        let frame = tokio::select! {
+            biased;
+            frame = s.frame() => frame,
+            _ = resp.closed() => return,
+        };
+        match frame {
             Some(Ok(frame)) => {
                 if let Ok(d) = frame.into_data() {
                     if acc.len().saturating_add(d.len()) > threshold {
@@ -912,13 +1085,8 @@ async fn forward_stream(
                         if send_leased_chunk(&tx, body_budget, Bytes::from(acc))
                             .await
                             .is_err()
+                            || send_leased_chunk(&tx, body_budget, d).await.is_err()
                         {
-                            drop(d);
-                            let _ = tx.send(Err(())).await;
-                            return;
-                        }
-                        if send_leased_chunk(&tx, body_budget, d).await.is_err() {
-                            let _ = tx.send(Err(())).await;
                             return;
                         }
                         pump_body(s, tx, body_budget).await;
@@ -952,29 +1120,51 @@ async fn forward_stream(
 async fn pump_body(
     mut s: hj_core::StreamBody,
     tx: mpsc::Sender<Result<Bytes, ()>>,
-    body_budget: &Arc<hj_core::budget::BodyBufferBudget>,
+    body_budget: &ResponseBudget,
 ) {
     use http_body_util::BodyExt;
+    let claim = body_budget.connection_share(FRAME_CLAIM);
     loop {
-        let frame = tokio::select! {
-            frame = s.frame() => frame,
-            _ = tx.closed() => return,
+        // Claim the queue slot and a frame's worth of the connection's share before
+        // pulling: while the reader (or the whole connection) stalls, the next frame
+        // stays with the backend instead of sitting here uncharged.
+        let Ok(permit) = tx.reserve().await else {
+            return;
         };
-        match frame {
-            Some(Ok(frame)) => {
-                if let Ok(d) = frame.into_data()
-                    && !d.is_empty()
-                    && send_leased_chunk(&tx, body_budget, d).await.is_err()
-                {
-                    let _ = tx.send(Err(())).await;
+        let mut lease = body_budget.lease();
+        let claimed = tokio::select! {
+            biased;
+            claimed = lease.connection.reserve_wait(claim) => claimed,
+            _ = tx.closed() => false,
+        };
+        if !claimed {
+            return;
+        }
+        let data = loop {
+            let frame = tokio::select! {
+                frame = s.frame() => frame,
+                _ = tx.closed() => return,
+            };
+            match frame {
+                Some(Ok(frame)) => {
+                    if let Ok(d) = frame.into_data()
+                        && !d.is_empty()
+                    {
+                        break d;
+                    }
+                }
+                Some(Err(_)) => {
+                    permit.send(Err(()));
                     return;
                 }
+                None => return,
             }
-            Some(Err(_)) => {
-                let _ = tx.send(Err(())).await;
-                return;
-            }
-            None => return,
+        };
+        if send_leased(permit, &tx, body_budget, lease, data)
+            .await
+            .is_err()
+        {
+            return;
         }
     }
 }
@@ -1504,6 +1694,7 @@ mod tests {
                 sni: None,
                 tls: None,
                 request_generation: None,
+                response_budget: connection_response_budget(),
             };
             let resp = bridge.dispatch(req, ctx).await.expect("bridged response");
             assert_eq!(resp.status, http::StatusCode::OK);
@@ -1802,42 +1993,47 @@ mod tests {
     #[tokio::test]
     async fn streamed_queue_budget_follows_last_alias_and_refuses_oversized_frames() {
         let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(12));
+        let conn = one_connection(&budget);
         let (tx, mut rx) = mpsc::channel(8);
-        send_leased_chunk(&tx, &budget, Bytes::from(vec![1; 8]))
+        send_leased_chunk(&tx, &conn, Bytes::from(vec![1; 8]))
             .await
             .unwrap();
         let data = rx.recv().await.unwrap().unwrap();
         let alias = data.slice(0..1);
         drop(data);
         assert_eq!(budget.in_flight(), 8);
+        assert_eq!(conn.connection.in_flight(), 8);
         assert!(
-            send_leased_chunk(&tx, &budget, Bytes::from(vec![2; 8]))
+            send_leased_chunk(&tx, &conn, Bytes::from(vec![2; 8]))
                 .await
                 .is_err()
         );
         drop(alias);
         assert_eq!(budget.in_flight(), 0);
+        assert_eq!(conn.connection.in_flight(), 0);
         assert!(
-            send_leased_chunk(&tx, &budget, Bytes::from(vec![3; 13]))
+            send_leased_chunk(&tx, &conn, Bytes::from(vec![3; 13]))
                 .await
                 .is_err()
         );
-        send_leased_chunk(&tx, &budget, Bytes::from(vec![4; 12]))
+        send_leased_chunk(&tx, &conn, Bytes::from(vec![4; 12]))
             .await
             .unwrap();
         assert_eq!(budget.in_flight(), 12);
         drop(rx);
         assert_eq!(budget.in_flight(), 0);
+        assert_eq!(conn.connection.in_flight(), 0);
     }
 
     #[tokio::test]
     async fn file_queue_wait_is_cancelled_when_client_disconnects() {
         let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(4));
+        let conn = one_connection(&budget);
         let (tx, rx) = mpsc::channel(1);
-        let held = reserve_queue_bytes(&tx, &budget, 4).await.unwrap();
+        let held = reserve_queue_bytes(&tx, &conn, 4).await.unwrap();
         let waiter = tokio::spawn({
-            let budget = budget.clone();
-            async move { reserve_queue_bytes(&tx, &budget, 4).await }
+            let conn = conn.clone();
+            async move { reserve_queue_bytes(&tx, &conn, 4).await }
         });
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
@@ -1851,43 +2047,506 @@ mod tests {
         );
         drop(held);
         assert_eq!(budget.in_flight(), 0);
-        assert_eq!(queue_chunk_size(&budget, 256 * 1024), 4);
+        assert_eq!(conn.connection.in_flight(), 0);
+        assert_eq!(conn.chunk_size(256 * 1024), 4);
     }
 
-    #[tokio::test]
-    async fn queue_pressure_drops_rejected_frame_before_waiting_to_report_error() {
-        struct Tracked(ActiveGuard);
-        impl AsRef<[u8]> for Tracked {
-            fn as_ref(&self) -> &[u8] {
-                let _ = &self.0;
-                b"overflow"
-            }
+    struct Tracked(ActiveGuard);
+
+    impl AsRef<[u8]> for Tracked {
+        fn as_ref(&self) -> &[u8] {
+            let _ = &self.0;
+            b"overflow"
         }
-        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(8));
-        let (tx, mut rx) = mpsc::channel(1);
-        send_leased_chunk(&tx, &budget, Bytes::from(vec![0; 8]))
-            .await
-            .unwrap();
-        let alive = Arc::new(AtomicUsize::new(1));
+    }
+
+    fn tracked_stream(alive: &Arc<AtomicUsize>) -> hj_core::StreamBody {
         let frame = Bytes::from_owner(Tracked(ActiveGuard(alive.clone())));
-        let body = VecStream {
+        VecStream {
             frames: vec![frame].into(),
             err_at_end: false,
         }
-        .boxed();
+        .boxed()
+    }
+
+    #[tokio::test]
+    async fn stalled_stream_queue_leaves_the_next_frame_with_the_upstream() {
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(8));
+        let conn = one_connection(&budget);
+        let (tx, mut rx) = mpsc::channel(1);
+        send_leased_chunk(&tx, &conn, Bytes::from(vec![0; 8]))
+            .await
+            .unwrap();
+        let alive = Arc::new(AtomicUsize::new(1));
+        let body = tracked_stream(&alive);
         let pump = tokio::spawn({
-            let budget = budget.clone();
-            async move { pump_body(body, tx, &budget).await }
+            let conn = conn.clone();
+            async move { pump_body(body, tx, &conn).await }
         });
-        wait_for_count(&alive, 0).await;
-        assert!(
-            !pump.is_finished(),
-            "error notification still waits for queue capacity"
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            1,
+            "a full queue must not pull (and hold uncharged) the next upstream frame"
         );
+        assert!(!pump.is_finished());
         drop(rx.recv().await.unwrap().unwrap());
-        assert!(rx.recv().await.unwrap().is_err());
+        assert_eq!(&rx.recv().await.unwrap().unwrap()[..], b"overflow");
+        assert!(rx.recv().await.is_none());
         pump.await.unwrap();
+        assert_eq!(alive.load(Ordering::SeqCst), 0);
         assert_eq!(budget.in_flight(), 0);
+        assert_eq!(budget.rejected(), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_frame_refused_by_the_budget_is_released_and_aborts() {
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(8));
+        let mut hog = hj_core::budget::BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(8));
+        let (tx, mut rx) = mpsc::channel(1);
+        let alive = Arc::new(AtomicUsize::new(1));
+        let conn = one_connection(&budget);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            pump_body(tracked_stream(&alive), tx, &conn),
+        )
+        .await
+        .expect("a refused frame aborts instead of waiting for budget");
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            0,
+            "the refused frame is freed"
+        );
+        assert!(rx.recv().await.unwrap().is_err());
+        assert!(rx.recv().await.is_none());
+        assert_eq!(budget.rejected(), 1);
+        assert_eq!(
+            conn.connection.in_flight(),
+            0,
+            "the refused frame's claim is freed"
+        );
+        drop(hog);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    fn one_connection(global: &Arc<hj_core::budget::BodyBufferBudget>) -> ResponseBudget {
+        ResponseBudget {
+            global: global.clone(),
+            connection: connection_response_budget(),
+        }
+    }
+
+    fn temp_file(tag: &str, len: usize) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("httpjet-bridge-{tag}-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![0x5a; len]).unwrap();
+        path
+    }
+
+    async fn start_file_stream(
+        path: &std::path::Path,
+        len: u64,
+        budget: &ResponseBudget,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        mpsc::Receiver<Result<Bytes, ()>>,
+    ) {
+        let response = http::Response::new(Body::File(hj_core::FileBody {
+            path: path.to_path_buf(),
+            file: None,
+            len,
+            range: None,
+            cached: None,
+        }));
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn({
+            let budget = budget.clone();
+            async move { forward_response_with_budget(response, tx, false, &budget).await }
+        });
+        let BridgeBody::Stream { rx, len: Some(n) } = rx.await.unwrap().body else {
+            panic!("a large uncached file must stream with its length");
+        };
+        assert_eq!(n, len);
+        (task, rx)
+    }
+
+    async fn wait_for_in_flight(budget: &hj_core::budget::BodyBufferBudget, n: u64) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while budget.in_flight() != n {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("in_flight stuck at {} (want {n})", budget.in_flight()));
+    }
+
+    async fn settled_in_flight(budget: &hj_core::budget::BodyBufferBudget) -> u64 {
+        let mut last = u64::MAX;
+        for _ in 0..200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let now = budget.in_flight();
+            if now == last && now != 0 {
+                return now;
+            }
+            last = now;
+        }
+        last
+    }
+
+    async fn drain_len(mut rx: mpsc::Receiver<Result<Bytes, ()>>) -> usize {
+        let mut total = 0;
+        while let Some(chunk) = rx.recv().await {
+            let chunk = chunk.expect("file stream must not abort");
+            assert!(chunk.iter().all(|&b| b == 0x5a));
+            total += chunk.len();
+        }
+        total
+    }
+
+    #[tokio::test]
+    async fn stalled_file_streams_keep_the_body_budget_bounded() {
+        const STREAMS: usize = 8;
+        const LEN: usize = 12 * MIB;
+        let path = temp_file("stalled-file", LEN);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(64 * MIB as u64));
+        let mut streams = Vec::new();
+        for _ in 0..STREAMS {
+            let conn = one_connection(&budget);
+            streams.push(start_file_stream(&path, LEN as u64, &conn).await);
+        }
+        let pinned = settled_in_flight(&budget).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(budget.in_flight(), pinned, "undrained streams stop reading");
+        assert!(
+            pinned <= (STREAMS * FILE_READ_AHEAD * MIB) as u64,
+            "undrained file streams pinned {pinned} bytes"
+        );
+        assert_eq!(
+            budget.rejected(),
+            0,
+            "a stream waiting on its queue is not a refusal"
+        );
+        let mut fresh = hj_core::budget::BodyBufferLease::new(budget.clone());
+        assert!(fresh.reserve(64 * 1024), "unrelated bodies still fit");
+        drop(fresh);
+
+        let (first_task, first_rx) = streams.remove(0);
+        assert_eq!(drain_len(first_rx).await, LEN);
+        first_task.await.unwrap();
+        for (task, rx) in streams {
+            drop(rx);
+            task.await.unwrap();
+        }
+        assert_eq!(budget.in_flight(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn file_streams_waiting_on_an_exhausted_budget_wake_on_release() {
+        const LEN: usize = 12 * MIB;
+        let path = temp_file("budget-wait", LEN);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(2 * MIB as u64));
+        let (a_task, a_rx) = start_file_stream(&path, LEN as u64, &one_connection(&budget)).await;
+        let (b_task, b_rx) = start_file_stream(&path, LEN as u64, &one_connection(&budget)).await;
+        assert_eq!(settled_in_flight(&budget).await, 2 * MIB as u64);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            tokio::join!(drain_len(a_rx), drain_len(b_rx))
+        })
+        .await
+        .expect("a waiter must wake when the budget is released");
+        assert_eq!((a, b), (LEN, LEN));
+        a_task.await.unwrap();
+        b_task.await.unwrap();
+        assert_eq!(budget.rejected(), 0, "waiting for budget is not a refusal");
+        assert_eq!(budget.in_flight(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn one_connections_stalled_streams_wait_on_its_own_share() {
+        const STREAMS: usize = 32;
+        const LEN: usize = 12 * MIB;
+        let path = temp_file("conn-share", LEN);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(64 * MIB as u64));
+        let stalled = one_connection(&budget);
+        let mut streams = Vec::new();
+        for _ in 0..STREAMS {
+            streams.push(start_file_stream(&path, LEN as u64, &stalled).await);
+        }
+        // 32 streams x FILE_READ_AHEAD chunks ask for twice the share: it fills.
+        let pinned = CONNECTION_RESPONSE_MEM;
+        wait_for_in_flight(&stalled.connection, pinned).await;
+        // A window-0 h2 sender still pulls one chunk per stream and holds it.
+        let mut pulled = Vec::new();
+        for (_, rx) in &mut streams {
+            if let Ok(chunk) = rx.try_recv() {
+                pulled.push(chunk.unwrap());
+            }
+        }
+        assert!(!pulled.is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            stalled.connection.in_flight(),
+            pinned,
+            "the stalled streams stop at the connection's share"
+        );
+        assert_eq!(
+            budget.in_flight(),
+            pinned,
+            "one connection pins no more than its share of the server-wide budget"
+        );
+        assert_eq!(
+            budget.rejected(),
+            0,
+            "waiting on the share is not a refusal"
+        );
+        let mut fresh = hj_core::budget::BodyBufferLease::new(budget.clone());
+        assert!(fresh.reserve(64 * 1024), "unrelated bodies still fit");
+        drop(fresh);
+
+        let (other_task, other_rx) =
+            start_file_stream(&path, LEN as u64, &one_connection(&budget)).await;
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(20), drain_len(other_rx))
+            .await
+            .expect("another connection must not wait behind the stalled one");
+        assert_eq!(drained, LEN);
+        other_task.await.unwrap();
+        assert_eq!(
+            budget.in_flight(),
+            pinned,
+            "the stalled connection is untouched"
+        );
+
+        drop(pulled);
+        for (task, rx) in streams {
+            drop(rx);
+            task.await.unwrap();
+        }
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(stalled.connection.in_flight(), 0);
+        assert_eq!(budget.rejected(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn draining_streams_never_reach_the_connection_share() {
+        const STREAMS: usize = 8;
+        const LEN: usize = 10 * MIB;
+        let path = temp_file("conn-drain", LEN);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(
+            hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
+        ));
+        let conn = one_connection(&budget);
+        let mut streams = Vec::new();
+        for _ in 0..STREAMS {
+            streams.push(start_file_stream(&path, LEN as u64, &conn).await);
+        }
+        let peak = Arc::new(AtomicU64::new(0));
+        let mut drains = tokio::task::JoinSet::new();
+        for (task, mut rx) in streams {
+            let conn = conn.clone();
+            let peak = peak.clone();
+            drains.spawn(async move {
+                let mut total = 0;
+                // Like the h2 sender, hold one chunk (the one being written) at a time.
+                let mut pending: Option<Bytes> = None;
+                loop {
+                    drop(pending.take());
+                    let Some(chunk) = rx.recv().await else {
+                        break;
+                    };
+                    let chunk = chunk.expect("file stream must not abort");
+                    peak.fetch_max(conn.connection.in_flight(), Ordering::SeqCst);
+                    total += chunk.len();
+                    pending = Some(chunk);
+                }
+                task.await.unwrap();
+                total
+            });
+        }
+        let totals = tokio::time::timeout(std::time::Duration::from_secs(30), drains.join_all())
+            .await
+            .expect("draining streams complete");
+        assert_eq!(totals, vec![LEN; STREAMS]);
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= (STREAMS * (FILE_READ_AHEAD + 1) * MIB) as u64
+                && peak < CONNECTION_RESPONSE_MEM,
+            "draining 1 MiB-chunk streams peaked at {peak} bytes of the connection share"
+        );
+        assert_eq!(conn.connection.in_flight(), 0);
+        assert_eq!(budget.in_flight(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn frames_stream(frames: Vec<Bytes>) -> hj_core::StreamBody {
+        VecStream {
+            frames: frames.into(),
+            err_at_end: false,
+        }
+        .boxed()
+    }
+
+    fn connection_of(global: &Arc<hj_core::budget::BodyBufferBudget>, cap: u64) -> ResponseBudget {
+        ResponseBudget {
+            global: global.clone(),
+            connection: Arc::new(hj_core::budget::BodyBufferBudget::new(cap)),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_connection_share_leaves_the_next_frame_with_the_upstream() {
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(MIB as u64));
+        let conn = connection_of(&global, FRAME_CLAIM);
+        let (a_tx, mut a_rx) = mpsc::channel(8);
+        send_leased_chunk(&a_tx, &conn, Bytes::from(vec![1; FRAME_CLAIM as usize]))
+            .await
+            .unwrap();
+        let alive = Arc::new(AtomicUsize::new(1));
+        let (b_tx, mut b_rx) = mpsc::channel(8);
+        let pump = tokio::spawn({
+            let conn = conn.clone();
+            let body = tracked_stream(&alive);
+            async move { pump_body(body, b_tx, &conn).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            alive.load(Ordering::SeqCst),
+            1,
+            "a stream on a full connection must not pull its next upstream frame"
+        );
+        drop(a_rx.recv().await.unwrap().unwrap());
+        assert_eq!(&b_rx.recv().await.unwrap().unwrap()[..], b"overflow");
+        assert!(b_rx.recv().await.is_none());
+        pump.await.unwrap();
+        assert_eq!(conn.connection.in_flight(), 0);
+        assert_eq!(global.in_flight(), 0);
+        assert_eq!(global.rejected(), 0);
+    }
+
+    #[tokio::test]
+    async fn frames_larger_than_the_claim_are_charged_in_full_and_never_refused() {
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(4 * MIB as u64));
+        let cap = 256 * 1024;
+        let conn = connection_of(&global, cap);
+        let (tx, mut rx) = mpsc::channel(8);
+        let body = frames_stream(vec![
+            Bytes::from(vec![1; 200 * 1024]),
+            Bytes::from(vec![2; 200 * 1024]),
+            Bytes::from(vec![3; 300 * 1024]),
+        ]);
+        let pump = tokio::spawn({
+            let conn = conn.clone();
+            async move { pump_body(body, tx, &conn).await }
+        });
+        let first = rx.recv().await.unwrap().unwrap();
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(first.len(), 200 * 1024);
+        assert_eq!(
+            conn.connection.in_flight(),
+            200 * 1024,
+            "the second frame waits for its claim instead of being pulled"
+        );
+        drop(first);
+        let second = rx.recv().await.unwrap().unwrap();
+        assert_eq!(second.len(), 200 * 1024);
+        drop(second);
+        let third = rx.recv().await.unwrap().unwrap();
+        assert_eq!(third.len(), 300 * 1024);
+        assert_eq!(
+            conn.connection.in_flight(),
+            cap,
+            "a frame beyond the whole share holds all of it"
+        );
+        assert_eq!(global.in_flight(), 300 * 1024);
+        drop(third);
+        assert!(rx.recv().await.is_none());
+        pump.await.unwrap();
+        assert_eq!(conn.connection.in_flight(), 0);
+        assert_eq!(global.in_flight(), 0);
+        assert_eq!(global.rejected(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pulled_frame_waits_for_its_share_holding_no_claim() {
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(MIB as u64));
+        let conn = connection_of(&global, 128 * 1024);
+        let (a_tx, mut a_rx) = mpsc::channel(8);
+        send_leased_chunk(&a_tx, &conn, Bytes::from(vec![1; 60 * 1024]))
+            .await
+            .unwrap();
+        let (b_tx, mut b_rx) = mpsc::channel(8);
+        let pump = tokio::spawn({
+            let conn = conn.clone();
+            let body = frames_stream(vec![Bytes::from(vec![2; 100 * 1024])]);
+            async move { pump_body(body, b_tx, &conn).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            b_rx.try_recv().is_err(),
+            "the frame does not fit beside A's chunk"
+        );
+        assert_eq!(
+            conn.connection.in_flight(),
+            60 * 1024,
+            "the waiting frame gave its claim back"
+        );
+        assert_eq!(
+            global.in_flight(),
+            160 * 1024,
+            "the pulled frame stays charged server-wide"
+        );
+        drop(a_rx.recv().await.unwrap().unwrap());
+        let b = b_rx.recv().await.unwrap().unwrap();
+        assert_eq!(b.len(), 100 * 1024);
+        assert_eq!(conn.connection.in_flight(), 100 * 1024);
+        drop(b);
+        assert!(b_rx.recv().await.is_none());
+        pump.await.unwrap();
+        assert_eq!(conn.connection.in_flight(), 0);
+        assert_eq!(global.in_flight(), 0);
+        assert_eq!(global.rejected(), 0);
+    }
+
+    #[tokio::test]
+    async fn bridged_streams_charge_their_own_connections_share() {
+        let bridge = spawn_on_current(4, |_req: Request, _ctx: BridgeCtx| async move {
+            let body = frames_stream(vec![Bytes::from(vec![7; 1024])]);
+            http::Response::builder()
+                .header(http::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::Stream(body))
+                .unwrap()
+        });
+        let ctx = test_ctx();
+        let other = test_ctx();
+        assert!(Arc::ptr_eq(
+            &ctx.response_budget,
+            &ctx.clone().response_budget
+        ));
+        assert!(!Arc::ptr_eq(&ctx.response_budget, &other.response_budget));
+        assert_eq!(ctx.response_budget.capacity(), CONNECTION_RESPONSE_MEM);
+        let resp = bridge.dispatch(test_request(1), ctx.clone()).await.unwrap();
+        let BridgeBody::Stream { mut rx, len: None } = resp.body else {
+            panic!("an event stream is forwarded incrementally");
+        };
+        let chunk = rx.recv().await.unwrap().unwrap();
+        assert!(rx.recv().await.is_none());
+        assert_eq!(ctx.response_budget.in_flight(), 1024);
+        assert_eq!(other.response_budget.in_flight(), 0);
+        drop(chunk);
+        assert_eq!(ctx.response_budget.in_flight(), 0);
     }
 
     async fn run_forward(r: Response) -> BridgeResp {
@@ -2108,6 +2767,169 @@ mod tests {
         }
     }
 
+    /// A backend body fed by the test, that records being dropped.
+    struct FeedBody {
+        rx: mpsc::Receiver<Bytes>,
+        _dropped: Option<oneshot::Sender<()>>,
+    }
+    impl http_body::Body for FeedBody {
+        type Data = Bytes;
+        type Error = hj_core::BoxError;
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+            self.rx
+                .poll_recv(cx)
+                .map(|b| b.map(|b| Ok(http_body::Frame::data(b))))
+        }
+    }
+
+    fn feed_resp(
+        proxied: bool,
+        headers: &[(&str, &str)],
+    ) -> (Response, mpsc::Sender<Bytes>, oneshot::Receiver<()>) {
+        let (feed, rx) = mpsc::channel(4);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let mut b = http::Response::builder().status(200);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut r = b
+            .body(Body::Stream(
+                FeedBody {
+                    rx,
+                    _dropped: Some(dropped_tx),
+                }
+                .boxed(),
+            ))
+            .unwrap();
+        if proxied {
+            r.extensions_mut().insert(hj_core::ProxiedBody);
+        }
+        (r, feed, dropped_rx)
+    }
+
+    /// #866: a proxied body of unknown length (TTS audio, ndjson) reaches the client
+    /// frame by frame instead of being buffered to the threshold or EOF.
+    #[tokio::test]
+    async fn proxied_unknown_length_stream_is_forwarded_as_it_arrives() {
+        let (r, feed, _dropped) = feed_resp(true, &[("content-type", "audio/ogg")]);
+        let (tx, rx) = oneshot::channel();
+        let pump = tokio::spawn(forward_response(r, tx, false));
+        feed.send(Bytes::from_static(b"OggS-1")).await.unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("head is sent while the upstream is still producing")
+            .unwrap();
+        let BridgeBody::Stream { mut rx, len } = resp.body else {
+            panic!("a proxied unknown-length body streams");
+        };
+        assert_eq!(len, None);
+        assert_eq!(rx.recv().await.unwrap().unwrap(), "OggS-1");
+        feed.send(Bytes::from_static(b"OggS-2")).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap().unwrap(), "OggS-2");
+        drop(feed);
+        assert!(rx.recv().await.is_none());
+        pump.await.unwrap();
+    }
+
+    /// #866: `X-Accel-Buffering: no` streams a proxied body even with a Content-Length.
+    #[tokio::test]
+    async fn proxied_accel_buffering_off_streams_despite_content_length() {
+        let (r, feed, _dropped) = feed_resp(
+            true,
+            &[("content-length", "8"), ("x-accel-buffering", "no")],
+        );
+        let (tx, rx) = oneshot::channel();
+        let pump = tokio::spawn(forward_response(r, tx, false));
+        feed.send(Bytes::from_static(b"part")).await.unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("X-Accel-Buffering: no is honoured")
+            .unwrap();
+        assert!(matches!(resp.body, BridgeBody::Stream { .. }));
+        drop(feed);
+        pump.await.unwrap();
+    }
+
+    /// #866: a small proxied response WITH a Content-Length keeps the buffered,
+    /// byte-identical `Full` path.
+    #[tokio::test]
+    async fn proxied_small_response_with_content_length_stays_full() {
+        let mut r = stream_resp(vec![Bytes::from_static(b"hello")], false, None);
+        r.headers_mut()
+            .insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(5));
+        r.extensions_mut().insert(hj_core::ProxiedBody);
+        let out = run_forward(r).await;
+        assert_eq!(out.headers[http::header::CONTENT_LENGTH], "5");
+        match out.body {
+            BridgeBody::Full(b) => assert_eq!(&b[..], b"hello"),
+            _ => panic!("a small proxied response with Content-Length must buffer"),
+        }
+    }
+
+    /// #866: an unmarked (LSAPI-style) stream of unknown length still buffers: its
+    /// head is not sent while the backend is still producing.
+    #[tokio::test]
+    async fn unmarked_lsapi_style_stream_still_buffers() {
+        let (r, feed, _dropped) = feed_resp(false, &[("content-type", "text/html")]);
+        let (tx, mut rx) = oneshot::channel();
+        let pump = tokio::spawn(forward_response(r, tx, false));
+        feed.send(Bytes::from_static(b"<html>")).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an LSAPI-style body must keep buffering until EOF or the threshold"
+        );
+        feed.send(Bytes::from_static(b"</html>")).await.unwrap();
+        drop(feed);
+        match rx.await.unwrap().body {
+            BridgeBody::Full(b) => assert_eq!(&b[..], b"<html></html>"),
+            _ => panic!("an LSAPI-style sub-threshold body buffers to Full"),
+        }
+        pump.await.unwrap();
+    }
+
+    /// #866: while buffering, a receiver that goes away (client disconnect / stream
+    /// reset) drops the backend body at once, releasing whatever it holds.
+    #[tokio::test]
+    async fn buffering_stream_is_dropped_when_the_receiver_goes_away() {
+        let (r, feed, dropped) = feed_resp(true, &[("content-length", "100000")]);
+        let (tx, rx) = oneshot::channel();
+        let pump = tokio::spawn(forward_response(r, tx, false));
+        feed.send(Bytes::from_static(b"partial")).await.unwrap();
+        drop(rx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), dropped)
+            .await
+            .expect("the backend body is dropped promptly");
+        tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+            .await
+            .expect("the forwarder returns")
+            .unwrap();
+        drop(feed);
+    }
+
+    /// #871: a 101 final response is never framed on H2/H3.
+    #[test]
+    fn switching_protocols_final_becomes_bad_gateway_off_h1() {
+        let resp = |status| BridgeResp {
+            completion: None,
+            status,
+            headers: http::HeaderMap::new(),
+            body: BridgeBody::Full(Bytes::new()),
+            bw_rate: None,
+        };
+        assert_eq!(
+            no_upgrade_final(resp(http::StatusCode::SWITCHING_PROTOCOLS)).status,
+            http::StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            no_upgrade_final(resp(http::StatusCode::OK)).status,
+            http::StatusCode::OK
+        );
+    }
+
     #[tokio::test]
     async fn error_before_threshold_is_a_clean_502() {
         let r = stream_resp(vec![Bytes::from_static(b"partial")], true, None);
@@ -2171,6 +2993,35 @@ mod tests {
             BridgeBody::Full(_) => panic!("an uncached Body::File must stream via forward_file"),
             BridgeBody::File(_) => panic!("non-direct forwarding must stream files"),
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (#777) A non-direct file stream keeps its known length through the
+    /// rebuilt response the H2/H3 framers see.
+    #[tokio::test]
+    async fn bridged_file_stream_restates_content_length() {
+        use http_body::Body as _;
+        use http_body_util::BodyExt;
+        let path = std::env::temp_dir().join(format!("hj-bridge-len-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![b'c'; 5000]).unwrap();
+        let resp = http::Response::builder()
+            .status(200)
+            .header(http::header::CONTENT_LENGTH, "5000")
+            .body(Body::File(hj_core::FileBody {
+                path: path.clone(),
+                file: None,
+                len: 5000,
+                range: None,
+                cached: None,
+            }))
+            .unwrap();
+        let rebuilt = bridge_resp_to_response(run_forward(resp).await);
+        assert_eq!(rebuilt.headers()[http::header::CONTENT_LENGTH], "5000");
+        let Body::Stream(body) = rebuilt.into_body() else {
+            panic!("a large uncached file streams");
+        };
+        assert_eq!(body.size_hint().exact(), Some(5000));
+        assert_eq!(body.collect().await.unwrap().to_bytes().len(), 5000);
         let _ = std::fs::remove_file(&path);
     }
 

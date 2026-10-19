@@ -268,7 +268,7 @@ struct PoolParams {
     /// Refused/missing-socket dial retry budget (LiteSpeed `retryTimeout`); rides
     /// out an lsphp restart window instead of 502ing. 0 ⇒ pool's built-in floor.
     retry_timeout: Duration,
-    /// Max pooled connections (≈ children * 2).
+    /// Max pooled connections (= children).
     max_conns: u32,
     /// Max request body fed to lsphp.
     max_body: u64,
@@ -364,11 +364,10 @@ impl LsapiRegistry {
             max_process_time,
             init_timeout: template.start_timeout,
             retry_timeout: template.retry_timeout,
-            max_conns: if external {
-                template.children.max(1)
-            } else {
-                (template.children * 2).max(2)
-            },
+            // One connection per child: each pooled keep-alive socket holds a child, so
+            // extra dials queue in lsphp's backlog behind idle sockets until the idle
+            // TTL prunes one (#896).
+            max_conns: template.children.max(1),
             max_body,
             body_budget: Arc::new(BodyBufferBudget::new(DEFAULT_BODY_BUFFER_MEM)),
             base_env: template.env.clone(),

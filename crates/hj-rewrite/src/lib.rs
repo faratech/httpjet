@@ -13,8 +13,8 @@
 //!   the rewrite directives inside a `.htaccess`) into a [`RuleSet`] via
 //!   [`RuleSet::parse`].
 //! * Evaluates a [`RuleSet`] against a [`RewriteInput`] with
-//!   [`evaluate`], implementing Apache's per-pass + restart-on-URI-change loop
-//!   (bounded by [`MAX_ITERATIONS`]), honoring `[L]`, `[QSA]`, `[R=NNN]`, `[F]`,
+//!   [`evaluate`], implementing OLS's single pass (re-run only by `[N]`,
+//!   bounded by [`MAX_ITERATIONS`]), honoring `[L]`, `[QSA]`, `[R=NNN]`, `[F]`,
 //!   `[P]`, `[NC]`, `[NE]`, `[E=var:val]`, `[OR]`-chained conditions, the
 //!   `-f/-d/-l/-s` file tests and lexical `<`/`>`/`=` comparisons, and the
 //!   `%{...}` variable namespace (`REQUEST_FILENAME`, `REQUEST_URI`,
@@ -63,13 +63,17 @@ mod rules;
 
 pub use auth::AuthRealm;
 pub use cache::HtaccessCache;
-pub use directives::{AccessDecision, ErrorDoc, HeaderOp, ReqAttrs};
+pub use directives::{
+    AccessDecision, EnvAssignment, ErrorDoc, HeaderOp, ReqAttrs, chain_response_headers,
+};
+pub use directives::{HeaderOpKind, PreparedHeaderOp, chain_prepared_headers};
 pub use error::RewriteError;
 pub use htaccess::{
     AccessMatcher, AccessOrder, AccessRule, AccessSubject, CacheDirectives, CacheKeyModifier,
-    HostAccess, HostEntry, Htaccess, MemoClass, ResolvedPhp, Scope, ScopeIndex, ScopeKind,
-    cache_directives, chain_cacheable_for_default, php_directives, php_handler_forced,
-    php_handler_forced_iter,
+    HostAccess, HostEntry, Htaccess, LimitedAccess, MemoClass, ResolvedPhp, Scope, ScopeIndex,
+    ScopeKind, cache_directives, chain_cacheable_for_default, content_type_override,
+    default_charset, php_directives, php_handler_forced, php_handler_forced_iter,
+    set_env_assignments,
 };
 pub use htaccess::{
     AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request, resolve_auth_for_request_paths,

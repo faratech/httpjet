@@ -32,11 +32,13 @@ use http_body::Body as _;
 
 use crate::lscache;
 use crate::state::ServerState;
+use fast_bridge::FastBridge;
 
 #[cfg(test)]
 pub(crate) mod e2e;
 #[cfg(test)]
 mod expires_tests;
+pub(crate) mod fast_bridge;
 pub(crate) mod fast_memo;
 mod htaccess_apply;
 mod proxy_glue;
@@ -53,17 +55,20 @@ pub(crate) use rewrite_glue::{DEFAULT_REWRITE_OUTCOME_TTL, RewriteOutcomeCache, 
 pub(crate) use rewrite_glue::{page_cache_header_vary, page_cache_ua_class};
 
 use htaccess_apply::{
-    access_denied, access_deny_dir, apply_response_headers_for_request, apply_set_env,
+    access_denied, access_deny_dir, apply_response_headers_for_request, apply_set_env_scoped,
     seed_server_env,
 };
+pub(crate) use proxy_glue::UPGRADE_HALF_CLOSE_DRAIN;
 use proxy_glue::{ProxyHandler, matching_proxy_context, proxy_websocket, resolve_proxy_target};
 use response_util::{
-    apply_error_document, apply_static_context_headers, cache_identity_for, error_doc_or_page,
-    matching_static_context, redirect, status_response,
+    apply_error_document, apply_static_context_headers, apply_static_context_request,
+    cache_identity_for, context_refusal, context_slash_redirect, error_doc_or_page,
+    matching_static_context, redirect, static_context_extra_headers, static_location_override,
+    status_response,
 };
 use rewrite_glue::{
-    RwResult, build_uri, decode_request_path, normalized_request_path, percent_encode_path,
-    resolved_rel_path, run_rewrite, url_parent_dir,
+    RewriteTrace, RwResult, build_uri, decode_request_path, normalized_request_path,
+    percent_encode_path, resolved_rel_path, run_rewrite_traced, url_parent_dir,
 };
 use suffix_routing::split_script_path;
 
@@ -93,12 +98,14 @@ fn base_index_files<'a>(state: &'a ServerState, ctx: &'a ReqCtx) -> &'a [String]
     }
 }
 
+/// The deepest `.htaccess` `DirectoryIndex` override. `Some(&[])` is
+/// `DirectoryIndex disabled`: no index is searched, and neither a parent's list
+/// nor the vhost's may stand in for it.
 fn htaccess_index_files(chain: &[Arc<Htaccess>]) -> Option<&[String]> {
     chain
         .iter()
         .rev()
-        .find(|ht| !ht.directory_index.is_empty())
-        .map(|ht| ht.directory_index.as_slice())
+        .find_map(|ht| ht.directory_index_override())
 }
 
 fn effective_index_files<'a>(
@@ -195,6 +202,32 @@ fn has_member_session_cookie(cookie: &str, session: &str, user: &str) -> bool {
     })
 }
 
+/// A front-controller route (`/threads/x.123/`, `/tags/x/page-2`): its last segment is
+/// empty or has no `.`. Asset and script paths (`.css`, `.php`, …) skip the existence
+/// test entirely, so a cookied request for a real file pays nothing for it.
+fn looks_like_route(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or("");
+    last.is_empty() || !last.contains('.')
+}
+
+/// `false` when `path` names nothing under `doc_root`. Read through the rewrite
+/// engine's 1 s stat cache (front-controller chains `-f`-test the same path), so a
+/// cookied request for an existing file pays no extra syscall. A stale answer only
+/// moves where the request is served: a stale "missing" bridges, and dispatch()
+/// consults the same cache.
+fn docroot_target_may_exist(state: &ServerState, doc_root: &Path, path: &str) -> bool {
+    state
+        .stat_cache
+        .tests(&doc_root.join(path.trim_start_matches('/')))
+        .is_some()
+}
+
+/// Decline the on-core path (dispatch() serves the request) and count why.
+fn bridge(state: &ServerState, why: FastBridge) -> Option<Response> {
+    state.metrics.fast_bridge.bump(why);
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_serve(
     state: &Arc<ServerState>,
@@ -218,13 +251,13 @@ pub(crate) async fn fast_serve(
         || state.extensions.has_pre_handlers()
         || req.headers().contains_key(http::header::RANGE)
     {
-        return None;
+        return bridge(state, FastBridge::PreHandler);
     }
     #[cfg(feature = "acme")]
     if state.acme.is_some() && req.uri().path().starts_with("/.well-known/acme-challenge/") {
         // Never memoize a challenge or let static/page-cache state hide a token
         // transition. The full funnel checks the raw URI before normalization.
-        return None;
+        return bridge(state, FastBridge::Acme);
     }
     // Reserved cache endpoints (`/__hj_cache_purge|_ready`) are intercepted
     // before vhost routing on BOTH entry points: `handle()` checks them below the
@@ -233,24 +266,26 @@ pub(crate) async fn fast_serve(
     // endpoint contract (`classify()` accepts every method by design).
     if let Some(pp) = state.peer_purge.as_ref() {
         if let Some(resp) = pp.handle_inbound(req, peer_ip, state) {
-            return Some(resp);
+            return Some(record_unrouted(
+                state, proto, peer_ip, peer_unix, req, req_start, resp,
+            ));
         }
     }
     let method = req.method().clone();
     if method != http::Method::GET && method != http::Method::HEAD {
-        return None;
+        return bridge(state, FastBridge::Method);
     }
     // Request bodies are outside the on-core memo/cache/static contract. The
     // final routed path may rewrite into a capped context, and body bytes are
     // not part of any fast-path cache key, so always bridge nonempty or inexact
     // bodies before probing a finished response.
     if exact_request_body_size(req) != Some(0) {
-        return None;
+        return bridge(state, FastBridge::RequestBody);
     }
     // (SEC1) request-target length cap — bridge the 414 to the full pipeline.
     let target_len = req.uri().path().len() + req.uri().query().map_or(0, |q| q.len() + 1);
     if target_len > state.serve_config.max_req_url_len {
-        return None;
+        return bridge(state, FastBridge::UrlTooLong);
     }
     let (route_key, host_src): (Option<String>, fast_memo::HostSource) = match req
         .headers()
@@ -262,12 +297,17 @@ pub(crate) async fn fast_serve(
             Some(a) => (Some(a), fast_memo::HostSource::Authority),
             // No Host and no authority (HTTP/1.0): `handle()` routes by the TLS SNI
             // next, which this path does not see; bridge so both agree on the vhost.
-            None => return None,
+            None => return bridge(state, FastBridge::NoHost),
         },
     };
-    let resolved = state.router.resolve(listener, route_key.as_deref())?;
+    let Some(resolved) = state.router.resolve(listener, route_key.as_deref()) else {
+        return bridge(state, FastBridge::NoVhost);
+    };
+    if resolved.config.disabled {
+        return bridge(state, FastBridge::VhostDisabled);
+    }
     if !state.acl.check_peer(peer_ip).is_allowed() {
-        return None; // let the bridge render the 403 with the full pipeline
+        return bridge(state, FastBridge::Acl); // let the bridge render the 403 with the full pipeline
     }
     let trusted_proxy = state.acl.is_trusted(peer_ip);
     let effective_https = effective_request_https(is_tls, trusted_proxy, req.headers());
@@ -282,7 +322,7 @@ pub(crate) async fn fast_serve(
         state.mtls_required_vhosts.contains(&resolved.name),
         peer_ip,
     ) {
-        return None;
+        return bridge(state, FastBridge::MtlsRedirect);
     }
     let mut ctx = ReqCtx {
         server: state.server.clone(),
@@ -346,10 +386,6 @@ pub(crate) async fn fast_serve(
                 .unwrap_or(b""),
         };
         if let Some(mut resp) = fast_memo::probe(&mk, req, &state.ua_classify, req_start) {
-            state
-                .metrics
-                .fast_memo_hits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mtls_ok = mtls_ok(mtls_required, is_tls, ctx.tls.as_ref());
             ctx.client_ip = state.acl.resolve_client_ip(
                 peer_ip,
@@ -357,15 +393,28 @@ pub(crate) async fn fast_serve(
                 state.server.use_ip_in_proxy_header,
                 mtls_ok,
             );
+            if !state.acl.check_client(peer_ip, ctx.client_ip).is_allowed() {
+                return bridge(state, FastBridge::Acl); // the full pipeline renders the identical ACL 403
+            }
             if !state.geo.allows(ctx.client_ip) {
-                return None; // the full pipeline renders the identical geo 403
+                return bridge(state, FastBridge::Acl); // the full pipeline renders the identical geo 403
             }
-            if !state.client_throttle.allow(ctx.client_ip) {
-                return None; // over the per-IP rate: dispatch() renders the 429
+            if !state
+                .client_throttle
+                .allow_deferring_rejection(ctx.client_ip)
+            {
+                return bridge(state, FastBridge::Throttle); // over the per-IP rate: dispatch() renders the 429
             }
+            // Counted only once admitted: a refused probe is rendered (and counted) by handle().
+            state
+                .metrics
+                .fast_memo_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // The memo keeps no response extensions; re-derive the context egress rate.
             if has_bandwidth_context(&ctx.vhost) {
-                let path = decode_request_path(req.uri().path())?;
+                let Some(path) = decode_request_path(req.uri().path()) else {
+                    return bridge(state, FastBridge::MalformedPath);
+                };
                 stamp_bandwidth(
                     &ctx,
                     &normalized_request_path(&path),
@@ -389,130 +438,13 @@ pub(crate) async fn fast_serve(
     set_redirect_guard(&mut ctx, req.uri(), &req_host);
     let orig_path = match decode_request_path(req.uri().path()) {
         Some(p) => normalized_request_path(&p),
-        None => return None, // malformed path → let the bridge render the error
+        None => return bridge(state, FastBridge::MalformedPath), // let the bridge render the error
     };
     let orig_query = req.uri().query().unwrap_or("").to_string();
-
-    // ---- SYNC PREFIX (shared by both branches): reproduce dispatch()'s pre-backend
-    // state with the SAME helpers in the SAME order — per-dir `.htaccess` chain
-    // (mtime-cached), REAL client IP, server env + SetEnvIf (`[E=no-cache]` included),
-    // then the per-dir deny + accessDenyDir gates — so neither on-core branch can serve
-    // content the tokio path would refuse. A deny declines (None) and dispatch() renders.
-    let htaccess_enabled = ctx
-        .vhost
-        .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess);
-    let (chain_with_dirs, mut policy_deadline) = if htaccess_enabled {
-        state.rewrite_cache.load_chain_with_dirs_and_deadline(
-            &ctx.vhost.doc_root,
-            &orig_path,
-            ctx.vhost.access_file_name_or_default(),
-        )
-    } else {
-        (Vec::new(), req_start + std::time::Duration::from_secs(1))
-    };
-    let chain: Vec<std::sync::Arc<Htaccess>> =
-        chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
-    // (Tier 1.3) An auth-protected tree never serves on-core: dispatch() enforces
-    // the 401 challenge / credential verification before anything else.
-    let (target_auth, target_deadline) =
-        scoped_auth::target_has_auth(state, &ctx, &orig_path, &chain);
-    if let Some(deadline) = target_deadline {
-        policy_deadline = policy_deadline.min(deadline);
-    }
-    if chain.iter().any(|h| h.has_auth()) || target_auth {
-        return None;
-    }
-    // (#349) Memo store eligibility — the response must be a pure function of
-    // the memo key plus the entry's vary-set. Each chain file's verdict is
-    // parse-time (`MemoClass`, fail-closed): SetEnvIf on client/server address
-    // or protocol, IP/env access rules, and any rewrite input outside the key +
-    // keyable vars withdraw it; header reads become vary dimensions. The vhost
-    // inline ruleset must be `path_cacheable`. `Header`/`extraHeaders`
-    // conditionality is URI/env-modelled in this engine, so under these gates
-    // it is key-deterministic too. A directory change that adds any such
-    // directive is visible within the memo's 1 s TTL.
-    let memo_chain_ok = memo_inline_ok
-        && chain_with_dirs
-            .iter()
-            .all(|(_, ht)| ht.memo.eligible && ht.rules.path_cacheable);
-    // (Tier 2) sub_filter paths are memo-ineligible: the memo stores
-    // POST-transform bytes and a memo hit re-runs the transforms, which would
-    // substitute twice whenever a replacement contains its own search string.
-    let memo_store_ok = memo_eligible_req && memo_chain_ok && !sub_filter_matches(&ctx, &orig_path);
-    // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
-    // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
-    // path judges the SAME identity the tokio `handle()` path does — not the raw socket
-    // peer (the Cloudflare edge IP). Mirrors `record_fast_serve` / `handle()`; honors
-    // the mtls-ok-vs-real-IP invariant (no client cert required under a non-mTLS vhost).
-    let mtls_ok = mtls_ok(mtls_required, is_tls, ctx.tls.as_ref());
-    ctx.client_ip = state.acl.resolve_client_ip(
-        peer_ip,
-        req.headers(),
-        state.server.use_ip_in_proxy_header,
-        mtls_ok,
-    );
-    if !state.geo.allows(ctx.client_ip) {
-        // (Tier 2) Decline so the bridge renders the identical geo 403 the full
-        // pipeline would (fast_serve cannot produce an error page itself).
-        return None;
-    }
-    seed_server_env(&mut ctx);
-    if apply_set_env(&mut ctx, &chain, req, &orig_path, &orig_query).is_err() {
-        return None;
-    }
-    let orig_rel = resolved_rel_path(&orig_path);
-    if access_denied(&chain, &orig_rel, method.as_str(), &ctx)
-        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
-    {
-        return None;
-    }
-
-    // ---- REWRITE (shared by both branches): dispatch() runs the engine BEFORE its
-    // cache lookup (step 3 → step 4c), as LSWS/OLS hook the cache at URI_MAP after
-    // `processContextRewrite`. Serving a hit first let a `RewriteCond
-    // %{REMOTE_ADDR}|%{HTTP_USER_AGENT}|…` + `[F]`/`[G]`/`[E=no-cache]` — inputs
-    // outside the cache key — be skipped for a warm cookieless URL (#358). Redirect/
-    // status/forbidden/gone outcomes bridge so dispatch() renders them; `[P]` merges
-    // its env and keeps the original path exactly as dispatch() defers it; a
-    // rewritten target carries dispatch()'s post-rewrite gates below.
-    let rw = run_rewrite(state, &ctx, req, &chain_with_dirs, &orig_path, &orig_query);
-    let (cache_path, cache_rel, rewrite_unchanged): (Cow<'_, str>, Cow<'_, str>, bool) = match rw {
-        RwResult::Unchanged { env } => {
-            merge_rewrite_env(&mut ctx, env);
-            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), true)
-        }
-        RwResult::Proxy { env, .. } => {
-            merge_rewrite_env(&mut ctx, env);
-            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), false)
-        }
-        RwResult::Rewritten { path, env, .. } => {
-            merge_rewrite_env(&mut ctx, env);
-            // A rewrite INTO a non-ancestor directory makes dispatch() reload the
-            // destination chain (#8); the on-core path bridges instead of guessing.
-            if !url_parent_dir(&orig_path).starts_with(url_parent_dir(&path)) {
-                return None;
-            }
-            let rel = resolved_rel_path(&path);
-            (Cow::Owned(path), Cow::Owned(rel), false)
-        }
-        RwResult::Failed { .. }
-        | RwResult::Redirect { .. }
-        | RwResult::Status { .. }
-        | RwResult::Forbidden
-        | RwResult::Gone
-        | RwResult::InvalidTarget => {
-            return None;
-        }
-    };
-
-    // ---- Branch 1: GUEST cookieless page-cache HIT (B1) ----
-    // Any Cookie may carry membership (`xf_user`) or a vary dimension; bridge cookied
-    // requests so the full pipeline decides (the cache_private gate catches a leak
-    // without this). The lookup sees the SAME loaded chain `dispatch()` uses, so
-    // request-side cache policy cannot diverge from the store/slow-path decisions.
-    // (#343 Step 1) Cookie census on every fast-path GET/HEAD: names only, values never
-    // read — the benign-only share among cookied requests decides whether extending the
-    // fast path past literally-cookieless guests is worth building.
+    // (#343 Step 1) Cookie census on every fast-path GET/HEAD that reaches the routed
+    // prefix: names only, values never read — the benign-only share among cookied
+    // requests decides whether extending the fast path past literally-cookieless guests
+    // is worth building.
     if let Some(store) = state.page_cache.as_ref() {
         let cfg = store.config();
         let class = match req
@@ -539,10 +471,210 @@ pub(crate) async fn fast_serve(
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    if state.page_cache.is_some()
+    // A cookied request skips the page-cache branch, so only the static branch below can
+    // serve it, and that needs a file at the unrewritten path. With no static `<context>`
+    // remapping the path and nothing there (a front-controller URL), it is certain to
+    // bridge — decide that before the prefix (chain, SetEnvIf, access, rewrite, target
+    // policy), which dispatch() runs again in full.
+    // A script never serves from the static branch either, so a cookied request whose
+    // last segment carries a script suffix (`/index.php`, `/css.php`) bridges the same way:
+    // its SetEnvIf, access, rewrite and target-policy work is all repeated by dispatch().
+    if req.headers().contains_key(http::header::COOKIE)
+        && suffix_routing::last_segment_is_script(state, &ctx, &orig_path)
+    {
+        return bridge(state, FastBridge::CookiedScript);
+    }
+    if req.headers().contains_key(http::header::COOKIE)
+        && looks_like_route(&orig_path)
+        && matching_static_context(&ctx, &orig_path).is_none()
+        && !docroot_target_may_exist(state, &ctx.vhost.doc_root, &orig_path)
+    {
+        return bridge(state, FastBridge::CookiedNoTarget);
+    }
+
+    // ---- SYNC PREFIX (shared by both branches): reproduce dispatch()'s pre-backend
+    // state with the SAME helpers in the SAME order — per-dir `.htaccess` chain
+    // (mtime-cached), REAL client IP, server env + SetEnvIf (`[E=no-cache]` included),
+    // then the per-dir deny + accessDenyDir gates — so neither on-core branch can serve
+    // content the tokio path would refuse. A deny declines (None) and dispatch() renders.
+    let htaccess_enabled = ctx
+        .vhost
+        .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess);
+    let (chain_with_dirs, mut policy_deadline) = if htaccess_enabled {
+        state.rewrite_cache.load_chain_with_dirs_and_deadline(
+            &ctx.vhost.doc_root,
+            &orig_path,
+            ctx.vhost.access_file_name_or_default(),
+        )
+    } else {
+        (Vec::new(), req_start + std::time::Duration::from_secs(1))
+    };
+    let chain: Vec<std::sync::Arc<Htaccess>> =
+        chain_with_dirs.iter().map(|(_, h)| h.clone()).collect();
+    // (Tier 1.3) An auth-protected tree never serves on-core: dispatch() enforces
+    // the 401 challenge / credential verification before anything else.
+    if chain.iter().any(|h| h.has_auth()) {
+        return bridge(state, FastBridge::Auth);
+    }
+    // (#349) Memo store eligibility — the response must be a pure function of
+    // the memo key plus the entry's vary-set. Each chain file's verdict is
+    // parse-time (`MemoClass`, fail-closed): SetEnvIf on client/server address
+    // or protocol, IP/env access rules, and any rewrite input outside the key +
+    // keyable vars withdraw it; header reads become vary dimensions. The vhost
+    // inline ruleset must be `path_cacheable`. `Header`/`extraHeaders`
+    // conditionality is URI/env-modelled in this engine, so under these gates
+    // it is key-deterministic too. A directory change that adds any such
+    // directive is visible within the memo's 1 s TTL.
+    let memo_chain_ok = memo_inline_ok
+        && chain_with_dirs
+            .iter()
+            .all(|(_, ht)| ht.memo.eligible && ht.rules.path_cacheable);
+    // (Tier 2) sub_filter paths are memo-ineligible: the memo stores
+    // POST-transform bytes and a memo hit re-runs the transforms, which would
+    // substitute twice whenever a replacement contains its own search string.
+    let mut memo_store_ok =
+        memo_eligible_req && memo_chain_ok && !sub_filter_matches(&ctx, &orig_path);
+    // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
+    // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
+    // path judges the SAME identity the tokio `handle()` path does — not the raw socket
+    // peer (the Cloudflare edge IP). Mirrors `record_fast_serve` / `handle()`; honors
+    // the mtls-ok-vs-real-IP invariant (no client cert required under a non-mTLS vhost).
+    let mtls_ok = mtls_ok(mtls_required, is_tls, ctx.tls.as_ref());
+    ctx.client_ip = state.acl.resolve_client_ip(
+        peer_ip,
+        req.headers(),
+        state.server.use_ip_in_proxy_header,
+        mtls_ok,
+    );
+    if !state.acl.check_client(peer_ip, ctx.client_ip).is_allowed() {
+        return bridge(state, FastBridge::Acl); // the full pipeline renders the identical ACL 403
+    }
+    if !state.geo.allows(ctx.client_ip) {
+        // (Tier 2) Decline so the bridge renders the identical geo 403 the full
+        // pipeline would (fast_serve cannot produce an error page itself).
+        return bridge(state, FastBridge::Acl);
+    }
+    seed_server_env(&mut ctx);
+    let set_env_basename = set_env_scope_basename(state, &ctx, &orig_path, &chain);
+    if apply_set_env_scoped(
+        &mut ctx,
+        &chain,
+        req,
+        &orig_path,
+        &orig_query,
+        set_env_basename.as_deref(),
+    )
+    .is_err()
+    {
+        return bridge(state, FastBridge::SetEnv);
+    }
+    let orig_rel = resolved_rel_path(&orig_path);
+    if access_denied(&chain, &orig_path, method.as_str(), &ctx)
+        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
+    {
+        return bridge(state, FastBridge::AccessDenied);
+    }
+    // ---- REWRITE (shared by both branches): dispatch() runs the engine BEFORE its
+    // cache lookup (step 3 → step 4c), as LSWS/OLS hook the cache at URI_MAP after
+    // `processContextRewrite`. Serving a hit first let a `RewriteCond
+    // %{REMOTE_ADDR}|%{HTTP_USER_AGENT}|…` + `[F]`/`[G]`/`[E=no-cache]` — inputs
+    // outside the cache key — be skipped for a warm cookieless URL (#358). Redirect/
+    // status/forbidden/gone outcomes bridge so dispatch() renders them; `[P]` merges
+    // its env and keeps the original path exactly as dispatch() defers it; a
+    // rewritten target carries dispatch()'s post-rewrite gates below.
+    let mut rewrite_trace = RewriteTrace::default();
+    let rw = run_rewrite_traced(
+        state,
+        &ctx,
+        req,
+        &chain_with_dirs,
+        &orig_path,
+        &orig_query,
+        &mut rewrite_trace,
+    );
+    // Rules outside the loaded chain ran (a cross-directory rewrite, #826): the memo
+    // vary-set and page-cache key below see only this chain; or a hop's access phase
+    // is not implied by the rewritten-target gates below (#836). Bridge to dispatch().
+    if rewrite_trace.needs_dispatch(&chain_with_dirs, &rw) {
+        return bridge(state, FastBridge::RewriteCrossDir);
+    }
+    let cache_vary_env;
+    let (cache_path, cache_rel, rewrite_unchanged): (Cow<'_, str>, Cow<'_, str>, bool) = match rw {
+        RwResult::Unchanged { env } => {
+            cache_vary_env = merge_rewrite_env(&mut ctx, env);
+            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), true)
+        }
+        RwResult::Proxy { env, .. } => {
+            cache_vary_env = merge_rewrite_env(&mut ctx, env);
+            (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), false)
+        }
+        RwResult::Rewritten { path, env, .. } => {
+            cache_vary_env = merge_rewrite_env(&mut ctx, env);
+            // A rewrite INTO a non-ancestor directory makes dispatch() reload the
+            // destination chain (#8); the on-core path bridges instead of guessing.
+            if !url_parent_dir(&orig_path).starts_with(url_parent_dir(&path)) {
+                return bridge(state, FastBridge::RewriteNewDir);
+            }
+            let rel = resolved_rel_path(&path);
+            (Cow::Owned(path), Cow::Owned(rel), false)
+        }
+        RwResult::Failed { .. }
+        | RwResult::Redirect { .. }
+        | RwResult::Status { .. }
+        | RwResult::Forbidden
+        | RwResult::Gone
+        | RwResult::InvalidTarget => {
+            return bridge(state, FastBridge::RewriteTerminal);
+        }
+    };
+    // dispatch() renders the context's 403/503 (before any cache lookup).
+    if context_refusal(&ctx.vhost.contexts, &cache_path).is_some()
+        || context_slash_redirect(&ctx.vhost.contexts, &cache_path)
+    {
+        return bridge(state, FastBridge::Context);
+    }
+
+    // ---- Branch 1 gate: GUEST cookieless page-cache HIT (B1) ----
+    // Any Cookie may carry membership (`xf_user`) or a vary dimension; bridge cookied
+    // requests so the full pipeline decides (the cache_private gate catches a leak
+    // without this). The lookup sees the SAME loaded chain `dispatch()` uses, so
+    // request-side cache policy cannot diverge from the store/slow-path decisions.
+    // (#857) `needs_dispatch` above guarantees `chain_with_dirs` is every chain
+    // whose rules ran, so it is the whole input set of this request's response.
+    let page_cache_branch = state.page_cache.is_some()
         && !req.headers().contains_key(http::header::COOKIE)
         && lscache::raw_path_is_cache_canonical(req.uri().path(), &orig_path)
+        && lscache::raw_host_is_cache_canonical(req, ctx.is_tls)
+        && !rewrite_glue::page_cache_unkeyed(state, &ctx, chain.iter().map(|h| &**h));
+    // Without that branch only the static branch can serve, and its own bridges do not
+    // depend on the target policy: decide them before paying for it.
+    if !page_cache_branch
+        && let Some(why) = static_branch_bridge(
+            state,
+            &ctx,
+            &chain,
+            &orig_path,
+            method.as_str(),
+            host_foreign,
+            rewrite_unchanged,
+        )
     {
+        return bridge(state, why);
+    }
+
+    // A symlinked target's own chain may deny by env or client IP, so it is judged
+    // only once both are final (SetEnvIf AND the rewrite's [E=] env, #747), exactly as dispatch()'s target enforcer sees them.
+    let target_policy = scoped_auth::target_policy(state, &ctx, &orig_path, &chain);
+    if let Some(deadline) = target_policy.deadline {
+        policy_deadline = policy_deadline.min(deadline);
+    }
+    if target_policy.protected {
+        return bridge(state, FastBridge::Auth);
+    }
+    memo_store_ok &= target_policy.memo_ok;
+
+    // ---- Branch 1: GUEST cookieless page-cache HIT (B1) ----
+    if page_cache_branch {
         if fast_post_rewrite_bridges(
             state,
             &ctx,
@@ -551,19 +683,16 @@ pub(crate) async fn fast_serve(
             &cache_rel,
             method.as_str(),
             *cache_path != *orig_path,
+            target_policy.script.as_ref(),
         ) {
-            return None;
+            return bridge(state, FastBridge::PostRewrite);
         }
-        let identity = cache_identity_for(ctx.is_tls, &ctx.vhost_name, &orig_path);
-        let render_epoch = state
-            .page_cache
-            .as_ref()
-            .map(|pc| pc.purge_epoch())
-            .unwrap_or(0);
-        let _render_guard = state
-            .page_cache
-            .as_ref()
-            .map(|pc| pc.begin_render(render_epoch));
+        let identity = cache_identity_for(
+            ctx.is_tls,
+            &ctx.vhost_name,
+            lscache::cache_alias_host(&ctx.vhost_name, &req_host, host_foreign),
+            &orig_path,
+        );
         let origin_vary = req
             .headers()
             .get(http::header::ORIGIN)
@@ -581,7 +710,8 @@ pub(crate) async fn fast_serve(
             req_path: &orig_path,
             req_query: &orig_query,
             chain: &chain,
-            render_epoch,
+            // Only a store reads the render epoch, and this branch never stores.
+            render_epoch: 0,
             has_range: req.headers().contains_key(http::header::RANGE),
             host_foreign,
             // Cookieless by branch precondition ⇒ the public vary value is "".
@@ -589,11 +719,17 @@ pub(crate) async fn fast_serve(
             origin: origin_vary.as_deref(),
             ua_class: ua_class.as_deref(),
             header_vary: header_vary.as_deref(),
+            env_vary: cache_vary_env,
         };
         let inm = req
             .headers()
             .get(http::header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok());
+        // The fast-path lookup records the hit it returns; an over-rate client must
+        // not reach it, or its 429 would count as a cache hit (#838).
+        if !state.client_throttle.would_allow(ctx.client_ip) {
+            return bridge(state, FastBridge::Throttle);
+        }
         if let lscache::CacheOutcome::Hit(mut resp) =
             lscache::cache_lookup_fast_path(state, &ctx, &cc, inm)
         {
@@ -603,13 +739,22 @@ pub(crate) async fn fast_serve(
                 state.serve_config.bandwidth_limit,
                 &mut resp,
             );
+            // Same funnel as handle(): an Authorization request is never shared-cacheable (#414, #841).
+            mark_auth_sensitive(
+                req.headers().contains_key(http::header::AUTHORIZATION),
+                &ctx,
+                &mut resp,
+            );
             apply_response_transforms(state, &ctx, &mut resp).await;
+            if !state
+                .client_throttle
+                .allow_deferring_rejection(ctx.client_ip)
+            {
+                return bridge(state, FastBridge::Throttle); // over the per-IP rate: dispatch() renders the 429
+            }
             state
                 .telemetry
                 .record_cache_hit(peer_ip.is_loopback(), &ctx.vhost_name);
-            if !state.client_throttle.allow(ctx.client_ip) {
-                return None; // over the per-IP rate: dispatch() renders the 429
-            }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
     }
@@ -622,19 +767,18 @@ pub(crate) async fn fast_serve(
     // proxy/static <context>, a PHP/script suffix, an access deny, or a non-success
     // status (so a `.htaccess` ErrorDocument, possibly a .php subrequest, renders on
     // the tokio path). dispatch() itself is untouched (this is an additive uring path).
-    if host_foreign {
-        return None;
-    }
-    // Only an unchanged (no-op) rewrite stays on-core; any rewrite/redirect/status/
-    // forbidden/gone/proxy outcome bridges.
-    if !rewrite_unchanged {
-        return None;
-    }
-    if access_denied(&chain, &orig_rel, method.as_str(), &ctx) {
-        return None;
-    }
-    if matching_proxy_context(&ctx, &orig_path).is_some() {
-        return None;
+    if page_cache_branch
+        && let Some(why) = static_branch_bridge(
+            state,
+            &ctx,
+            &chain,
+            &orig_path,
+            method.as_str(),
+            host_foreign,
+            rewrite_unchanged,
+        )
+    {
+        return bridge(state, why);
     }
     // (#349) A matching static <context> no longer forces the bridge: mirror
     // dispatch's handling (DocRootOverride when the location differs from the
@@ -644,84 +788,117 @@ pub(crate) async fn fast_serve(
     // serve on-core. The post-handler `resolved_static_target_denied` net
     // still fail-closes an override root against accessDenyDir, exactly as on
     // the bridged path.
-    let (static_extra_headers, static_location, static_charset): (
-        Option<Vec<(String, String)>>,
-        Option<(std::path::PathBuf, String)>,
-        Option<String>,
-    ) = match matching_static_context(&ctx, &orig_path) {
-        Some(c) => (
-            Some(c.extra_headers.clone()),
-            c.location.clone().map(|loc| (loc, c.uri.clone())),
-            effective_static_charset(c),
-        ),
-        None => (None, None, None),
-    };
-    // A path that resolves to a script handler must NEVER be served by the static
-    // handler (source disclosure) — bridge it. `&chain` lets an `.htaccess`
-    // `SetHandler`/`AddHandler`/`AddType` force a non-PHP-suffixed file to script
-    // here too, so the on-core static fast path never serves its source.
-    let index_files = effective_index_files(state, &ctx, &chain);
-    let scripts_enabled = suffix_routing::vhost_scripts_enabled(state, &ctx);
-    if !scripts_enabled
-        && suffix_routing::path_may_resolve_to_script(state, &ctx, &orig_path, index_files, &chain)
-    {
-        return None;
-    }
-    if split_script_path(state, &ctx, &orig_path, index_files, &chain).is_some() {
-        return None;
-    }
+    let static_extra_headers: Option<Vec<(String, String)>> =
+        matching_static_context(&ctx, &orig_path)
+            .map(|_| static_context_extra_headers(&ctx, &orig_path));
     // Static. Serve via the shared static handler on a bodyless GET/HEAD clone (the
     // caller keeps the original request to bridge if we decline).
-    let mut sreq: Request = http::Request::new(hj_core::empty_incoming());
-    *sreq.method_mut() = method.clone();
-    *sreq.uri_mut() = req.uri().clone();
-    *sreq.headers_mut() = req.headers().clone();
-    if let Some(idx) = htaccess_index_files(&chain) {
-        sreq.extensions_mut()
-            .insert(hj_static::IndexFilesOverride(idx.to_vec()));
-    }
-    if let Some((loc, uri)) = static_location {
-        if loc != ctx.vhost.doc_root {
+    let build_sreq = |ctx: &ReqCtx, identity: bool| {
+        let mut sreq: Request = http::Request::new(hj_core::empty_incoming());
+        *sreq.method_mut() = method.clone();
+        *sreq.uri_mut() = req.uri().clone();
+        *sreq.headers_mut() = req.headers().clone();
+        if let Some(idx) = htaccess_index_files(&chain) {
             sreq.extensions_mut()
-                .insert(hj_static::DocRootOverride(loc, uri));
+                .insert(hj_static::IndexFilesOverride(idx.to_vec()));
         }
-    }
-    if let Some(charset) = static_charset {
-        sreq.extensions_mut()
-            .insert(hj_static::DefaultCharsetOverride(charset));
-    }
-    let mut resp = run_handler(&state.static_handler, &mut ctx, sreq).await;
-    if resolved_static_target_denied(&state.acl, &resp) {
-        return None;
-    }
+        apply_static_context_request(ctx, &orig_path, &mut sreq);
+        apply_content_type_override(&chain, &orig_path, &mut sreq);
+        if sub_filter_matches(ctx, &orig_path) {
+            strip_sub_filter_request(&mut sreq);
+        }
+        if identity {
+            sreq.extensions_mut()
+                .insert(hj_static::NoPrecompressedSibling);
+        }
+        sreq
+    };
+    let mut identity = false;
+    let mut resp = loop {
+        let sreq = build_sreq(&ctx, identity);
+        let resp = run_handler(&state.static_handler, &mut ctx, sreq).await;
+        let sibling = resp
+            .extensions()
+            .get::<hj_static::PrecompressedSiblingSelected>()
+            .is_some();
+        // The handler may open a file the prediction never judged (a symlinked
+        // precompressed sibling); dispatch() checks the opened inode, so must we.
+        // A DENIED sibling falls back to the identity file exactly as dispatch()
+        // does; one that only demands auth bridges (only dispatch() can tell
+        // whether the client's credentials admit it).
+        let denied = resolved_static_target_denied(&state.acl, &resp);
+        let policy = if denied {
+            None
+        } else {
+            scoped_auth::served_target_policy(
+                state,
+                &ctx,
+                &orig_path,
+                &target_policy.targets,
+                &resp,
+            )
+        };
+        if let Some(policy) = &policy {
+            memo_store_ok &= policy.memo_ok;
+            policy_deadline = policy_deadline.min(policy.until);
+        }
+        let denied = denied || policy.as_ref().is_some_and(|p| p.denied);
+        if denied && sibling && !identity {
+            identity = true;
+            continue;
+        }
+        if denied {
+            return bridge(state, FastBridge::StaticDenied);
+        }
+        if policy.is_some_and(|p| p.protected) {
+            return bridge(state, FastBridge::Auth);
+        }
+        break resp;
+    };
     if !matches!(resp.status().as_u16(), 200 | 206 | 304) {
-        return None; // 404/403/416 → bridge so the ErrorDocument renders on tokio
+        return bridge(state, FastBridge::StaticStatus); // 404/403/416 → the ErrorDocument renders on tokio
     }
     if resolved_static_target_is_script(state, &ctx, &orig_path, &chain, &resp) {
         // The shared static resolver selected the actual DirectoryIndex (or
         // direct/precompressed file). Bridge before buffering any bytes;
         // dispatch returns the fail-closed 503.
-        return None;
+        return bridge(state, FastBridge::Script);
     }
     if let Some(extra) = &static_extra_headers {
         apply_static_context_headers(extra, &mut resp);
     }
+    let index_basename = served_index_basename(&orig_path, &resp);
     // Promote the file body to in-memory ON-CORE (sync read; large/ranged → bridge),
     // BEFORE the transforms — the monoio writers have no on-core file streamer yet, and
     // CacheStaticTransform's own promotion uses tokio block_in_place (panics off a tokio
     // runtime). Small static files become Body::Full and serve on-core.
-    let mut resp = buffer_static_file(state, lscache::vhost_id_hash(&ctx.vhost_name), resp)?;
+    let Some(mut resp) = buffer_static_file(state, lscache::vhost_id_hash(&ctx.vhost_name), resp)
+    else {
+        return bridge(state, FastBridge::StaticUnbuffered);
+    };
     finalize_response(
         state,
         &mut ctx,
         req.headers(),
         &chain,
         &orig_rel,
+        index_basename.as_deref(),
         &orig_path,
         &orig_path,
         &mut resp,
     )
     .await;
+    // `Header set X-LiteSpeed-*` on a static file: a purge must run on every request,
+    // so it bridges to the full pipeline (a memo replay would skip it). The cache
+    // directives alone are stripped here: the static file is served from the static
+    // cache either way, and bridging every tagged asset (moontimenow tags them all)
+    // cost ~37% static throughput.
+    if lscache::has_control_header(resp.headers()) {
+        if lscache::has_purge_header(resp.headers()) {
+            return bridge(state, FastBridge::PurgeHeader);
+        }
+        lscache::strip_static_control_headers(resp.headers_mut());
+    }
     // (Tier 2) Stamp BEFORE the transform loop so SubFilterTransform sees the plan.
     stamp_sub_filter(&ctx, &orig_path, &mut resp);
     mark_auth_sensitive(
@@ -769,8 +946,11 @@ pub(crate) async fn fast_serve(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    if !state.client_throttle.allow(ctx.client_ip) {
-        return None; // over the per-IP rate: dispatch() renders the 429
+    if !state
+        .client_throttle
+        .allow_deferring_rejection(ctx.client_ip)
+    {
+        return bridge(state, FastBridge::Throttle); // over the per-IP rate: dispatch() renders the 429
     }
     stamp_bandwidth(
         &ctx,
@@ -895,11 +1075,52 @@ pub(crate) fn cookie_header_joined(headers: &http::HeaderMap) -> Option<String> 
     }
 }
 
+/// The on-core STATIC branch's own bridges, in order: a foreign host, a rewrite that
+/// changed the path (any rewrite/redirect/status/forbidden/gone/proxy outcome), a
+/// post-rewrite deny, a proxy `<context>`, or a path that resolves to a script handler
+/// — the static handler must NEVER serve one (source disclosure). `&chain` lets an
+/// `.htaccess` `SetHandler`/`AddHandler`/`AddType` force a non-PHP-suffixed file to
+/// script here too, so the on-core static fast path never serves its source.
+fn static_branch_bridge(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    chain: &[Arc<Htaccess>],
+    path: &str,
+    method: &str,
+    host_foreign: bool,
+    rewrite_unchanged: bool,
+) -> Option<FastBridge> {
+    if host_foreign {
+        return Some(FastBridge::HostForeign);
+    }
+    if !rewrite_unchanged {
+        return Some(FastBridge::Rewritten);
+    }
+    if access_denied(chain, path, method, ctx) {
+        return Some(FastBridge::AccessDenied);
+    }
+    if matching_proxy_context(ctx, path).is_some() {
+        return Some(FastBridge::ProxyContext);
+    }
+    let index_files = effective_index_files(state, ctx, chain);
+    if !suffix_routing::vhost_scripts_enabled(state, ctx)
+        && suffix_routing::path_may_resolve_to_script(state, ctx, path, index_files, chain)
+    {
+        return Some(FastBridge::Script);
+    }
+    if split_script_path(state, ctx, path, index_files, chain).is_some() {
+        return Some(FastBridge::Script);
+    }
+    None
+}
+
 /// dispatch()'s post-rewrite gates (step 4) for the on-core cache-hit branch: the
 /// post-rewrite `.htaccess` access decision (now seeing any `[E=]` env), `accessDenyDir`,
 /// and the resolved-script re-deny (PATH_INFO / DirectoryIndex, `<Files>` scoped to the
 /// file the request MAPS TO). `true` = dispatch() would 403 → the caller bridges so the
-/// tokio path renders it instead of a stale hit.
+/// tokio path renders it instead of a stale hit. `opened` is a script the caller
+/// already opened (the target policy's), reused when the split maps to it.
+#[allow(clippy::too_many_arguments)]
 fn fast_post_rewrite_bridges(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -908,8 +1129,9 @@ fn fast_post_rewrite_bridges(
     cur_rel: &str,
     method: &str,
     rewritten: bool,
+    opened: Option<&scoped_auth::OpenedScript>,
 ) -> bool {
-    if access_denied(chain, cur_rel, method, ctx)
+    if access_denied(chain, cur_path, method, ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, cur_rel)
     {
         return true;
@@ -925,9 +1147,7 @@ fn fast_post_rewrite_bridges(
         return true;
     }
     let script_split = split_script_path(state, ctx, cur_path, index_files, chain);
-    let alternate_static_root = matching_static_context(ctx, cur_path)
-        .and_then(|context| context.location.as_ref())
-        .is_some_and(|location| location != &ctx.vhost.doc_root);
+    let alternate_static_root = static_location_override(ctx, cur_path).is_some();
     if script_split.is_none()
         && (!suffix_routing::vhost_scripts_enabled(state, ctx) || alternate_static_root)
         && suffix_routing::path_may_resolve_to_script(state, ctx, cur_path, index_files, chain)
@@ -946,7 +1166,15 @@ fn fast_post_rewrite_bridges(
         if unusable_script_handler_for_script(ctx, &script_abs).is_some() {
             return true;
         }
-        let Some(target) = allowed_script_target(&state.acl, &script_abs) else {
+        let target = match opened.filter(|opened| opened.lexical == script_abs) {
+            Some(opened) => opened
+                .target
+                .as_deref()
+                .filter(|target| !state.acl.deny_dir_match(target))
+                .map(Cow::Borrowed),
+            None => allowed_script_target(&state.acl, &script_abs).map(Cow::Owned),
+        };
+        let Some(target) = target else {
             return true;
         };
         if rewritten && scoped_auth::resolved_target_has_auth(state, ctx, cur_path, &target) {
@@ -994,27 +1222,18 @@ fn record_fast_serve(
     let Some(log) = state.access_logger_for(&ctx.vhost_name) else {
         return resp;
     };
-    let vhost_log_headers = state
-        .vhost_access_logs
-        .get(&ctx.vhost_name)
-        .map(|v| v.log_headers)
-        .unwrap_or(0);
-    // (#349) Common fast-path case (no logHeaders continuation, known body
-    // length): render the line on-core from borrowed request data into this
-    // thread's chunk — no per-line Strings, no per-line channel send. The
-    // chunk path measured ~11% throughput hidden in per-request logging.
-    if vhost_log_headers == 0 {
+    // (#349) Common fast-path case (known body length): render the line on-core
+    // from borrowed request data into this thread's chunk — no per-line Strings,
+    // no per-line channel send. The chunk path measured ~11% throughput hidden
+    // in per-request logging.
+    {
         if let Some(body_bytes) = resp.body().content_length() {
-            let referer = req
-                .headers()
-                .get(http::header::REFERER)
-                .and_then(|v| v.to_str().ok());
-            let user_agent = req
-                .headers()
-                .get(http::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok());
+            let header = |name| req.headers().get(name).map(http::HeaderValue::as_bytes);
+            let referer = header(http::header::REFERER);
+            let user_agent = header(http::header::USER_AGENT);
+            let host = header(http::header::HOST);
             chunk_access_line(log, |buf, format| {
-                hj_log::render_access_line_into(
+                hj_log::render_access_line_with_host_into(
                     buf,
                     format,
                     ctx.client_ip,
@@ -1027,6 +1246,8 @@ fn record_fast_serve(
                     body_bytes,
                     referer,
                     user_agent,
+                    host,
+                    ctx.get_env(hj_lsapi::cgi::AUTH_USER_ENV),
                     Some(&ctx.request_id as &dyn std::fmt::Display),
                     ctx.peer_unix,
                 );
@@ -1050,77 +1271,65 @@ fn record_fast_serve(
         protocol: proto.as_str(),
         status,
         bytes: 0,
-        referer: header_str(req, http::header::REFERER),
-        user_agent: header_str(req, http::header::USER_AGENT),
-        host: header_str(req, http::header::HOST),
-        remote_user: None,
+        referer: header_bytes(req, http::header::REFERER),
+        user_agent: header_bytes(req, http::header::USER_AGENT),
+        host: header_bytes(req, http::header::HOST),
+        remote_user: log_remote_user(ctx),
         request_id: Some(ctx.request_id.to_string()),
         peer_unix: ctx.peer_unix,
     };
-    // (#248 + #261) LSWS `logHeaders`: a vhost that opts in gets its request headers
-    // as a redacted continuation line carried in the SAME channel message as the
-    // record (can never mis-align), with credential-class values hashed.
-    let headers_extra = (vhost_log_headers != 0).then(|| render_request_headers(req));
-    log_access(log, resp, record, headers_extra)
+    // LSWS `logHeaders` selects the Referer / User-Agent / Host fields of this line
+    // (the vhost logger's format), never a dump of the request headers (#825).
+    log_access(log, resp, record, None)
 }
 
-/// Request headers whose VALUES are credentials — captured only as a salted-length +
-/// short hash so correlation survives but a reader of the log file never sees a live
-/// session token (security #261: the vhost log is readable by the same uid PHP runs as).
-fn header_value_is_credential(name: &str) -> bool {
-    matches!(
-        name,
-        "cookie" | "authorization" | "proxy-authorization" | "x-wf-capsule"
-    )
-}
-
-/// (#248) Render the request's headers for the per-vhost `logHeaders` line: one
-/// line, CRLF/NUL-escaped (the access file is line-oriented — raw CR/LF would let
-/// a client forge extra "records"), capped at 4 KiB. Credential-class values are
-/// replaced by `<len>:<sha256[:12]>` (see [`header_value_is_credential`]).
-fn render_request_headers(req: &hj_core::Request) -> String {
-    use std::fmt::Write as _;
-    const CAP: usize = 4 * 1024;
-    let mut line = String::with_capacity(256);
-    line.push_str("+headers ");
-    for (n, v) in req.headers() {
-        if line.len() >= CAP {
-            break;
-        }
-        let ok_name = n
-            .as_str()
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
-        if !ok_name {
-            continue;
-        }
-        if line.len() + n.as_str().len() + v.len() + 2 > CAP {
-            break;
-        }
-        line.push_str(n.as_str());
-        line.push('=');
-        if header_value_is_credential(n.as_str()) {
-            // <len>:<first 12 hex of sha256> — enough to correlate identical
-            // tokens across lines, useless for replay.
-            let digest = <sha2::Sha256 as sha2::Digest>::digest(v.as_bytes());
-            let mut hex = String::with_capacity(24);
-            for b in &digest[..6] {
-                let _ = write!(hex, "{b:02x}");
-            }
-            let _ = write!(line, "{}:{hex}", v.len());
-        } else {
-            for &b in v.as_bytes() {
-                match b {
-                    b'\r' => line.push_str("%0D"),
-                    b'\n' => line.push_str("%0A"),
-                    0..=0x1F | 0x7F => {}
-                    _ => line.push(b as char),
-                }
-            }
-        }
-        line.push(';');
+/// Count, time and access-log a response produced before vhost resolution (no vhost
+/// matched, a mapped-but-unloaded vhost, the loopback purge/ready endpoints) on the
+/// UNIFIED log, like the mTLS-bounce path (#916). OLS logs no-vhost requests to the
+/// server access log. `peer_ip` is logged because trust has not been resolved yet; a
+/// fresh request id keeps the line joinable. The response itself is unchanged.
+fn record_unrouted(
+    state: &Arc<ServerState>,
+    proto: Proto,
+    peer_ip: IpAddr,
+    peer_unix: bool,
+    req: &Request,
+    req_start: std::time::Instant,
+    mut resp: Response,
+) -> Response {
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.telemetry.record_request(
+        proto,
+        resp.status().as_u16(),
+        req_start.elapsed(),
+        state.telemetry.vhost_idx(""),
+    );
+    if let Some(log) = &state.access_log {
+        let log_uri = match req.uri().query() {
+            Some(q) => format!("{}?{}", req.uri().path(), q),
+            None => req.uri().path().to_string(),
+        };
+        let record = hj_log::AccessRecord {
+            client_ip: peer_ip,
+            ts: std::time::SystemTime::now(),
+            method: method_static(req.method()),
+            uri: log_uri,
+            protocol: proto.as_str(),
+            status: resp.status().as_u16(),
+            bytes: 0, // filled with the REAL bytes by log_access
+            referer: header_bytes(req, http::header::REFERER),
+            user_agent: header_bytes(req, http::header::USER_AGENT),
+            host: header_bytes(req, http::header::HOST),
+            remote_user: None,
+            request_id: Some(hj_core::reqid::next().to_string()),
+            peer_unix,
+        };
+        resp = log_access(log, resp, record, None);
     }
-    line
+    resp
 }
 
 /// Turn a static `Body::File` response into an in-memory `Body::Full` on the calling
@@ -1367,7 +1576,7 @@ async fn handle_inner(
                 bytes: 0,
                 referer: None,
                 user_agent: None,
-                host: header_str(&req, http::header::HOST),
+                host: header_bytes(&req, http::header::HOST),
                 remote_user: None,
                 request_id: Some(hj_core::reqid::next().to_string()),
                 peer_unix,
@@ -1392,7 +1601,7 @@ async fn handle_inner(
     // (incl. CF-sourced probes) falls through to normal handling.
     if let Some(pp) = state.peer_purge.as_ref() {
         if let Some(resp) = pp.handle_inbound(&req, peer_ip, &state) {
-            return resp;
+            return record_unrouted(&state, proto, peer_ip, peer_unix, &req, req_start, resp);
         }
     }
 
@@ -1426,9 +1635,11 @@ async fn handle_inner(
                     listener,
                     "vhost is mapped but its config file did not load — serving 503 (misconfigured), not 404"
                 );
-                return error_page(StatusCode::SERVICE_UNAVAILABLE);
+                let resp = error_page(StatusCode::SERVICE_UNAVAILABLE);
+                return record_unrouted(&state, proto, peer_ip, peer_unix, &req, req_start, resp);
             }
-            return error_page(StatusCode::NOT_FOUND);
+            let resp = error_page(StatusCode::NOT_FOUND);
+            return record_unrouted(&state, proto, peer_ip, peer_unix, &req, req_start, resp);
         }
     };
 
@@ -1499,9 +1710,9 @@ async fn handle_inner(
                     protocol: proto.as_str(),
                     status: resp.status().as_u16(),
                     bytes: 0, // filled with the REAL bytes by log_access
-                    referer: header_str(&req, http::header::REFERER),
-                    user_agent: header_str(&req, http::header::USER_AGENT),
-                    host: header_str(&req, http::header::HOST),
+                    referer: header_bytes(&req, http::header::REFERER),
+                    user_agent: header_bytes(&req, http::header::USER_AGENT),
+                    host: header_bytes(&req, http::header::HOST),
                     remote_user: None,
                     // No `ctx` yet (bounced before trust resolution): mint a fresh id so
                     // even a :80 mTLS-bounce probe is joinable across the logs.
@@ -1522,6 +1733,8 @@ async fn handle_inner(
             );
             return resp;
         }
+        // The cleartext ACME exemption serves a token file and nothing else.
+        req.extensions_mut().insert(AcmePlaintextOnly);
     }
 
     // ---- Access control + trusted-proxy client IP ------------------------
@@ -1549,9 +1762,9 @@ async fn handle_inner(
         Some(q) => format!("{}?{}", req.uri().path(), q),
         None => req.uri().path().to_string(),
     };
-    let referer = header_str(&req, http::header::REFERER);
-    let user_agent = header_str(&req, http::header::USER_AGENT);
-    let host_hdr = header_str(&req, http::header::HOST);
+    let referer = header_bytes(&req, http::header::REFERER);
+    let user_agent = header_bytes(&req, http::header::USER_AGENT);
+    let host_hdr = header_bytes(&req, http::header::HOST);
 
     let mut ctx = ReqCtx {
         server: state.server.clone(),
@@ -1596,8 +1809,19 @@ async fn handle_inner(
     let bw_path = (has_bandwidth_context(&ctx.vhost) || has_sub_filter_context(&ctx.vhost))
         .then(|| decode_request_path(req.uri().path()).map(|p| normalized_request_path(&p)))
         .flatten();
+    if let Some(p) = &bw_path
+        && sub_filter_matches(&ctx, p)
+    {
+        // Like nginx sub_filter: a filtered body is a whole new entity, so a
+        // byte range of the source file must never be served in its place.
+        strip_sub_filter_request(&mut req);
+    }
 
-    let mut resp = if !state.acl.check_peer(peer_ip).is_allowed() {
+    // OLS `processNewReqData`: a disabled/suspended vhost answers 403 to every
+    // request before any handler or the page cache runs (#1000).
+    let mut resp = if ctx.vhost.disabled {
+        error_page(StatusCode::FORBIDDEN)
+    } else if !state.acl.check_client(peer_ip, client_ip).is_allowed() {
         error_page(StatusCode::FORBIDDEN)
     } else if !state.client_throttle.allow(client_ip) {
         error_page(StatusCode::TOO_MANY_REQUESTS)
@@ -1638,12 +1862,19 @@ async fn handle_inner(
         }
     };
 
+    // Terminals that skip `cache_store` (generated error pages, redirects, extension
+    // responses) still owe their purges and must never egress the control headers.
+    lscache::settle_control_headers(&state, resp.headers_mut());
+
     if let Some(p) = &bw_path {
         stamp_bandwidth(&ctx, p, state.serve_config.bandwidth_limit, &mut resp);
         stamp_sub_filter(&ctx, p, &mut resp);
     }
 
     mark_auth_sensitive(has_authorization, &ctx, &mut resp);
+    if log_method == "HEAD" {
+        resp.extensions_mut().insert(hj_compress::HeadResponse);
+    }
     // ---- Response-transform pipeline (the post-handler stage) --------------
     // Runs ServerState::transforms in order: cache-small-static (so gzip can compress it)
     // -> expires -> compress -> deny-CDN-cache-on-redirects (the "Too Many Redirects" loop
@@ -1723,7 +1954,7 @@ async fn handle_inner(
             referer,
             user_agent,
             host: host_hdr,
-            remote_user: None,
+            remote_user: log_remote_user(&ctx),
             request_id: Some(ctx.request_id.to_string()),
             peer_unix: ctx.peer_unix,
         };
@@ -1767,6 +1998,35 @@ thread_local! {
     /// by size/age here and by the per-worker ticker in `uring`.
     static ACCESS_CHUNKS: std::cell::RefCell<rustc_hash::FxHashMap<usize, PendingChunk>> =
         std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    /// Flush tickers of this thread parked until a chunk starts (see [`access_chunk_started`]).
+    static ACCESS_CHUNK_TICKERS: std::cell::RefCell<Vec<std::task::Waker>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Resolves once this thread holds an unflushed access-line chunk. The per-worker flush
+/// ticker waits on this instead of waking every 250 ms, so an idle serving core takes
+/// no timer wake-ups at all.
+pub(crate) fn access_chunk_pending() -> impl std::future::Future<Output = ()> {
+    std::future::poll_fn(|cx| {
+        if ACCESS_CHUNKS.with(|c| c.borrow().values().any(|e| e.lines > 0)) {
+            return std::task::Poll::Ready(());
+        }
+        ACCESS_CHUNK_TICKERS.with(|t| {
+            let mut t = t.borrow_mut();
+            if !t.iter().any(|w| w.will_wake(cx.waker())) {
+                t.push(cx.waker().clone());
+            }
+        });
+        std::task::Poll::Pending
+    })
+}
+
+fn access_chunk_started() {
+    ACCESS_CHUNK_TICKERS.with(|t| {
+        for waker in t.borrow_mut().drain(..) {
+            waker.wake();
+        }
+    });
 }
 
 fn chunk_access_line(
@@ -1782,7 +2042,8 @@ fn chunk_access_line(
             lines: 0,
             first: std::time::Instant::now(),
         });
-        if entry.lines == 0 {
+        let started = entry.lines == 0;
+        if started {
             entry.first = std::time::Instant::now();
         }
         render(&mut entry.buf, log.format());
@@ -1793,6 +2054,8 @@ fn chunk_access_line(
             let buf = std::mem::take(&mut entry.buf);
             let lines = std::mem::replace(&mut entry.lines, 0);
             entry.logger.log_chunk(buf, lines);
+        } else if started {
+            access_chunk_started();
         }
     });
 }
@@ -1905,6 +2168,16 @@ fn has_sub_filter_context(vhost: &hj_core::config::VHostConfig) -> bool {
         .contexts
         .iter()
         .any(|c| c.enabled && c.sub_filter.as_ref().is_some_and(|s| s.is_active()))
+}
+
+/// Serve a sub_filter path as one complete identity entity: no source byte
+/// ranges and no precompressed sibling, both of which bypass the filter.
+fn strip_sub_filter_request(req: &mut Request) {
+    let h = req.headers_mut();
+    h.remove(http::header::RANGE);
+    h.remove(http::header::IF_RANGE);
+    req.extensions_mut()
+        .insert(hj_static::NoPrecompressedSibling);
 }
 
 fn sub_filter_matches(ctx: &ReqCtx, path: &str) -> bool {
@@ -2063,9 +2336,60 @@ impl hj_core::ResponseTransform for SubFilterTransform {
                     }
                 }
             }
+            Body::Empty => head_sub_filter(&plan, resp),
             other => *resp.body_mut() = other,
         }
     }
+}
+
+/// A bodyless 200 that still declares a length is a HEAD: advertise what the
+/// matching GET would send, from the file the static resolver selected.
+fn head_sub_filter(plan: &hj_core::config::SubFilterConfig, resp: &mut Response) {
+    let Some(declared) = resp
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|len| *len > 0 && *len <= plan.max_body)
+    else {
+        return;
+    };
+    let Some(target) = resp.extensions().get::<hj_static::ResolvedTargetPath>() else {
+        // Not a static representation (a backend HEAD): its GET body may be
+        // filtered, so never hand out the unfiltered validators.
+        let h = resp.headers_mut();
+        h.remove(ETAG);
+        if !plan.keep_last_modified {
+            h.remove(LAST_MODIFIED);
+        }
+        return;
+    };
+    let Ok(bytes) = read_regular_file_exact(&target.0, declared) else {
+        return; // the GET fails the same read and passes through unfiltered
+    };
+    let filtered = apply_sub_filter(plan, bytes);
+    finalize_filtered(resp, plan, filtered.len());
+}
+
+/// Read a regular file of exactly `len` bytes without blocking on a planted FIFO.
+fn read_regular_file_exact(path: &Path, len: u64) -> std::io::Result<bytes::Bytes> {
+    let file = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let meta = rustix::fs::fstat(&file).map_err(std::io::Error::from)?;
+    const S_IFREG: u32 = 0o100000;
+    if meta.st_mode & 0o170000 != S_IFREG || u64::try_from(meta.st_size).ok() != Some(len) {
+        return Err(std::io::Error::from(rustix::io::Errno::NXIO));
+    }
+    let file = std::fs::File::from(file);
+    let size = usize::try_from(len).map_err(|_| std::io::Error::from(rustix::io::Errno::FBIG))?;
+    let mut bytes = vec![0; size];
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(&mut bytes, 0)?;
+    Ok(bytes.into())
 }
 
 /// Read the exact representation selected by the static/cache layer. Cached
@@ -2193,6 +2517,7 @@ fn finalize_filtered(resp: &mut Response, plan: &hj_core::config::SubFilterConfi
     if !plan.keep_last_modified {
         h.remove(LAST_MODIFIED);
     }
+    h.remove(http::header::ACCEPT_RANGES);
     if let Ok(v) = http::HeaderValue::from_str(&len.to_string()) {
         h.insert(CONTENT_LENGTH, v);
     }
@@ -2366,6 +2691,40 @@ fn rewrite_proxy_target_refused(target: &ProxyTarget) -> Option<String> {
         return Some("unix-socket transports are not allowed in [P] targets".into());
     }
     None
+}
+
+/// OLS `encodeReqLine`: a request internally rewritten into a proxy context (or
+/// websocket map) forwards the REWRITTEN path and query, re-encoded from the canonical
+/// decoded path. An unrewritten request keeps the client's raw request target.
+fn forward_rewritten_uri(
+    req: &mut Request,
+    rewritten: bool,
+    orig_path: &str,
+    orig_query: &str,
+    cur_path: &str,
+    cur_query: &str,
+) -> Result<(), StatusCode> {
+    if !rewritten || (cur_path == orig_path && cur_query == orig_query) {
+        return Ok(());
+    }
+    let encoded = percent_encode_path(cur_path);
+    let pq = if cur_query.is_empty() {
+        encoded
+    } else {
+        format!("{encoded}?{cur_query}")
+    };
+    let mut parts = req.uri().clone().into_parts();
+    match pq.parse::<http::uri::PathAndQuery>() {
+        Ok(pq) => parts.path_and_query = Some(pq),
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    }
+    match http::Uri::from_parts(parts) {
+        Ok(uri) => {
+            *req.uri_mut() = uri;
+            Ok(())
+        }
+        Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
 }
 
 /// The address screen for a resolved `[P]` authority: loopback, unspecified,
@@ -2976,9 +3335,21 @@ async fn dispatch(
     // the variables. HTTPS must be seeded first so `Header ... env=HTTPS` (HSTS)
     // and `%{ENV:HTTPS}` observe it, exactly as Apache/OLS set it. ----------------
     seed_server_env(ctx);
-    if let Err(reason) = apply_set_env(ctx, &chain, &req, &orig_path, &orig_query) {
+    let set_env_basename = set_env_scope_basename(state, ctx, &orig_path, &chain);
+    if let Err(reason) = apply_set_env_scoped(
+        ctx,
+        &chain,
+        &req,
+        &orig_path,
+        &orig_query,
+        set_env_basename.as_deref(),
+    ) {
         tracing::error!(request_id = %ctx.request_id, reason, "SetEnvIf evaluation failed closed");
         return error_page(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    if req.extensions().get::<AcmePlaintextOnly>().is_some() {
+        return acme_plaintext_static(state, ctx, &chain, &orig_path, req).await;
     }
 
     // ---- 2b. Access control on the ORIGINAL request path, BEFORE rewrite ---
@@ -2990,7 +3361,7 @@ async fn dispatch(
     // `[P]` rule could proxy a denied path. The post-rewrite checks below still
     // catch a rewrite INTO a denied path; this adds the pre-rewrite guarantee.
     let orig_rel = resolved_rel_path(&orig_path);
-    if access_denied(&chain, &orig_rel, req.method().as_str(), ctx)
+    if access_denied(&chain, &orig_path, req.method().as_str(), ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
     {
         return error_doc_or_page(
@@ -2998,6 +3369,7 @@ async fn dispatch(
             ctx,
             req.headers(),
             &chain,
+            &orig_path,
             &orig_path,
             StatusCode::FORBIDDEN,
         )
@@ -3017,12 +3389,21 @@ async fn dispatch(
     )
     .await
     {
-        return resp;
+        return response_util::auth_refusal(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &orig_path,
+            &orig_path,
+            resp,
+        )
+        .await;
     }
     let original_indexes = effective_index_files(state, ctx, &chain);
     let original_script_split = split_script_path(state, ctx, &orig_path, original_indexes, &chain);
     let scripts_enabled = suffix_routing::vhost_scripts_enabled(state, ctx);
-    let original_target = scripts_enabled
+    let mut original_target = scripts_enabled
         .then(|| {
             original_script_split
                 .as_ref()
@@ -3048,7 +3429,16 @@ async fn dispatch(
     )
     .await
     {
-        return resp;
+        return response_util::auth_refusal(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &orig_path,
+            &orig_path,
+            resp,
+        )
+        .await;
     }
 
     // ---- 3. Rewrite -------------------------------------------------------
@@ -3056,14 +3446,61 @@ async fn dispatch(
         .telemetry
         .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE)
         .then(std::time::Instant::now);
-    let rw_result = run_rewrite(state, ctx, &req, &chain_with_dirs, &cur_path, &cur_query);
+    let mut rewrite_trace = RewriteTrace::default();
+    let mut rw_result = run_rewrite_traced(
+        state,
+        ctx,
+        &req,
+        &chain_with_dirs,
+        &cur_path,
+        &cur_query,
+        &mut rewrite_trace,
+    );
     if let Some(t) = _rt {
         state.telemetry.shard().phase_rewrite.record(t.elapsed());
     }
+    // (#836) Each move into a different chain is an internal redirect (Apache/OLS):
+    // the hop URI passes that chain's access phase before the outcome its rules
+    // produced is honoured. Fail closed, rendered with the hop's chain. The final
+    // rewritten path is still checked below like any rewrite target.
+    // A rewrite `[E=Cache-Vary:…]` makes this request vary per URL (see lscache).
+    let mut cache_vary_env = false;
+    let hop_render: Option<(Vec<Arc<Htaccess>>, &str)> = match rewrite_trace.hops.last() {
+        None => None,
+        Some(last) => {
+            cache_vary_env |= merge_rewrite_env(ctx, rw_result.take_env());
+            for hop in &rewrite_trace.hops {
+                let hop_chain: Vec<Arc<Htaccess>> =
+                    hop.chain.iter().map(|(_, h)| h.clone()).collect();
+                if let Err(resp) = enforce_hop_access(
+                    state,
+                    ctx,
+                    &mut req,
+                    &hop_chain,
+                    &hop.path,
+                    &orig_path,
+                    &mut authenticated_realms,
+                )
+                .await
+                {
+                    return resp;
+                }
+            }
+            Some((
+                last.chain.iter().map(|(_, h)| h.clone()).collect(),
+                last.path.as_str(),
+            ))
+        }
+    };
+    // A terminal outcome is rendered with the chain (and path) whose rules produced it.
+    let (outcome_chain, outcome_path): (&[Arc<Htaccess>], &str) = match &hop_render {
+        Some((hop_chain, hop_path)) => (hop_chain, hop_path),
+        None => (&chain, &orig_path),
+    };
     // A terminal `[P]` proxy target is DEFERRED to the dispatch site after the cache context
     // (cc) is built (below) so a cacheable proxied response can participate in the origin page
     // cache, like the proxy-<context>/LSAPI/static paths; `None` for every other outcome.
-    let mut proxy_target: Option<String> = None;
+    let mut proxy_target: Option<(String, Option<String>)> = None;
     match rw_result {
         RwResult::Failed { reason } => {
             tracing::error!(request_id = %ctx.request_id, reason, "rewrite evaluation failed closed");
@@ -3075,18 +3512,23 @@ async fn dispatch(
                 state,
                 ctx,
                 req.headers(),
-                &chain,
+                outcome_chain,
+                outcome_path,
                 &orig_path,
                 StatusCode::BAD_REQUEST,
             )
             .await;
         }
-        RwResult::Proxy { target_url, env } => {
+        RwResult::Proxy {
+            target_url,
+            proxy_host,
+            env,
+        } => {
             // Merge the rewrite chain's env (incl. preceding `[E=]` rulesets) into ctx.env so
             // env-gated `Header ... env=` directives fire on the proxied response, and so
             // `[E=no-cache]` is visible to the page-cache lookup at the deferred dispatch below.
-            merge_rewrite_env(ctx, env);
-            proxy_target = Some(target_url);
+            cache_vary_env |= merge_rewrite_env(ctx, env);
+            proxy_target = Some((target_url, proxy_host));
         }
         RwResult::Redirect {
             code,
@@ -3097,8 +3539,8 @@ async fn dispatch(
             // (#11) `Header always set` applies to a rewrite-generated 3xx too (Apache
             // scopes `always` to redirects — directives.rs), matching the Status arm.
             let mut resp = redirect(code, &location);
-            let rel = resolved_rel_path(&cur_path);
-            apply_response_headers_for_request(ctx, &chain, &rel, &orig_path, &mut resp);
+            let rel = resolved_rel_path(outcome_path);
+            apply_response_headers_for_request(ctx, outcome_chain, &rel, &orig_path, &mut resp);
             return resp;
         }
         RwResult::Status { code, env } => {
@@ -3106,15 +3548,24 @@ async fn dispatch(
             // applying any [E=...] / Header set directives, and NO Location or
             // "moved" body. The CORS preflight rule is the live example.
             merge_rewrite_env(ctx, env);
-            let rel = resolved_rel_path(&cur_path);
+            let rel = resolved_rel_path(outcome_path);
             // Apache routes a 4xx/5xx `[R=]` through `ap_die`, so ErrorDocument applies.
-            let mut resp = match StatusCode::from_u16(code) {
-                Ok(status) if code >= 400 => {
-                    error_doc_or_page(state, ctx, req.headers(), &chain, &cur_path, status).await
-                }
-                _ => status_response(code),
-            };
-            apply_response_headers_for_request(ctx, &chain, &rel, &orig_path, &mut resp);
+            if let Ok(status) = StatusCode::from_u16(code)
+                && code >= 400
+            {
+                return error_doc_or_page(
+                    state,
+                    ctx,
+                    req.headers(),
+                    outcome_chain,
+                    outcome_path,
+                    &orig_path,
+                    status,
+                )
+                .await;
+            }
+            let mut resp = status_response(code);
+            apply_response_headers_for_request(ctx, outcome_chain, &rel, &orig_path, &mut resp);
             return resp;
         }
         RwResult::Forbidden => {
@@ -3122,8 +3573,9 @@ async fn dispatch(
                 state,
                 ctx,
                 req.headers(),
-                &chain,
-                &cur_path,
+                outcome_chain,
+                outcome_path,
+                &orig_path,
                 StatusCode::FORBIDDEN,
             )
             .await;
@@ -3133,8 +3585,9 @@ async fn dispatch(
                 state,
                 ctx,
                 req.headers(),
-                &chain,
-                &cur_path,
+                outcome_chain,
+                outcome_path,
+                &orig_path,
                 StatusCode::GONE,
             )
             .await;
@@ -3144,10 +3597,10 @@ async fn dispatch(
             // `None` = the rewrite left no query (e.g. `[QSD]`) → empty, not the original.
             cur_query = Cow::Owned(query.unwrap_or_default());
             rewritten = true;
-            merge_rewrite_env(ctx, env);
+            cache_vary_env |= merge_rewrite_env(ctx, env);
         }
         RwResult::Unchanged { env } => {
-            merge_rewrite_env(ctx, env);
+            cache_vary_env |= merge_rewrite_env(ctx, env);
         }
     }
 
@@ -3208,13 +3661,14 @@ async fn dispatch(
     // ---- 4. ACCESS enforcement (#1): a denied path is a 403 BEFORE any
     // terminal handler (proxy / LSAPI / static). Fail-safe: any matching
     // `denied` section anywhere in the chain wins. -------------------------
-    if access_denied(&chain, &rel_path, req.method().as_str(), ctx) {
+    if access_denied(&chain, &cur_path, req.method().as_str(), ctx) {
         return error_doc_or_page(
             state,
             ctx,
             req.headers(),
             &chain,
             &cur_path,
+            &orig_path,
             StatusCode::FORBIDDEN,
         )
         .await;
@@ -3235,7 +3689,30 @@ async fn dispatch(
             req.headers(),
             &chain,
             &cur_path,
+            &orig_path,
             StatusCode::FORBIDDEN,
+        )
+        .await;
+    }
+    if context_slash_redirect(&ctx.vhost.contexts, &cur_path) {
+        let mut location = percent_encode_path(&format!("{cur_path}/"));
+        if !cur_query.is_empty() {
+            location.push('?');
+            location.push_str(&cur_query);
+        }
+        let mut resp = redirect(301, &location);
+        apply_response_headers_for_request(ctx, &chain, &rel_path, &orig_path, &mut resp);
+        return resp;
+    }
+    if let Some(status) = context_refusal(&ctx.vhost.contexts, &cur_path) {
+        return error_doc_or_page(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &cur_path,
+            &orig_path,
+            status,
         )
         .await;
     }
@@ -3269,9 +3746,7 @@ async fn dispatch(
         index_files,
         &chain,
     );
-    let alternate_static_root = matching_static_context(ctx, &cur_path)
-        .and_then(|context| context.location.as_ref())
-        .is_some_and(|location| location != &ctx.vhost.doc_root);
+    let alternate_static_root = static_location_override(ctx, &cur_path).is_some();
     let unresolved_script_candidate = script_split.is_none()
         && (!scripts_enabled || alternate_static_root)
         && suffix_routing::path_may_resolve_to_script(state, ctx, &cur_path, index_files, &chain);
@@ -3282,14 +3757,23 @@ async fn dispatch(
     {
         // `accessDenyDir` is a filesystem-target policy. The lexical request-path check above
         // cannot see a PHP symlink whose target is inside a denied tree, so resolve through an
-        // opened descriptor and retain that exact target as lsphp's SCRIPT_FILENAME.
-        let Some(target) = allowed_script_target(&state.acl, script_abs) else {
+        // opened descriptor and retain that exact target as lsphp's SCRIPT_FILENAME. An
+        // unrewritten request keeps the script the source checks opened and authorized.
+        let target = if rewritten {
+            allowed_script_target(&state.acl, script_abs)
+        } else {
+            original_target
+                .take()
+                .filter(|target| !state.acl.deny_dir_match(target))
+        };
+        let Some(target) = target else {
             return error_doc_or_page(
                 state,
                 ctx,
                 req.headers(),
                 &chain,
                 &cur_path,
+                &orig_path,
                 StatusCode::FORBIDDEN,
             )
             .await;
@@ -3325,6 +3809,7 @@ async fn dispatch(
                     req.headers(),
                     &chain,
                     &cur_path,
+                    &orig_path,
                     StatusCode::FORBIDDEN,
                 )
                 .await;
@@ -3350,7 +3835,16 @@ async fn dispatch(
     )
     .await
     {
-        return resp;
+        return response_util::auth_refusal(
+            state,
+            ctx,
+            req.headers(),
+            &chain,
+            &cur_path,
+            &orig_path,
+            resp,
+        )
+        .await;
     }
 
     // ---- 4c. Origin full-page cache lookup (LSCache equivalent) ----------
@@ -3370,14 +3864,32 @@ async fn dispatch(
         && !unresolved_script_candidate
         && !precompressed_script_candidate
         && lscache::raw_path_is_cache_canonical(req.uri().path(), &orig_path)
+        && lscache::raw_host_is_cache_canonical(&req, ctx.is_tls)
         // A handshake belongs to the upgrade relay (OLS routes it before cache), and a
         // stale hit's revalidation would dial the backend replaying the Upgrade headers.
-        && !is_websocket_upgrade(req.headers());
+        && !is_websocket_upgrade(req.headers())
+        // (#857) A rule or SetEnvIf on an input outside the key (client address,
+        // port, protocol, time, env) shapes the response: neither serve nor store.
+        // Covers the request's chain, every chain a rewrite ran (#826) and the
+        // reloaded destination chain whose headers finalize the response.
+        && !rewrite_glue::page_cache_unkeyed(
+            state,
+            ctx,
+            chain_with_dirs
+                .iter()
+                .chain(rewrite_trace.extra.iter())
+                .map(|(_, h)| &**h)
+                .chain(chain.iter().map(|h| &**h)),
+        );
+    // (#983) Only GET/HEAD ever read or populate an entry, so only they need the key
+    // inputs below. Every other method keeps `cc.enabled = cache_on`: its response still
+    // executes purges and is classified in the store, and its lookup records the bypass.
+    let cache_keyed = cache_on && matches!(*req.method(), http::Method::GET | http::Method::HEAD);
     let cache_method = req.method().clone();
     // Reuse the host already computed in `handle()` (B4) instead of recomputing the identical
     // value; dropped unused when the cache is off (cache_host stays empty as before).
     let cache_host = if cache_on { req_host } else { String::new() };
-    let cache_cookie = if cache_on {
+    let cache_cookie = if cache_keyed {
         cookie_header_joined(req.headers())
     } else {
         None
@@ -3401,9 +3913,16 @@ async fn dispatch(
     // the raw Host here would instead make each distinct attacker-chosen Host MISS the
     // shared entry, re-render, and overwrite (a Host cache-buster + a flood of false
     // collision-guard warnings). The vhost name still refuses a genuine cross-vhost key
-    // collision (same path routed to a different vhost on a shared cache).
-    let cache_identity = if cache_on {
-        cache_identity_for(ctx.is_tls, &ctx.vhost_name, &orig_path)
+    // collision (same path routed to a different vhost on a shared cache). An EXACT
+    // vhostMap alias is the one bounded exception (#938): the backend renders the raw Host,
+    // so the alias is folded into both the key and this identity.
+    let cache_identity = if cache_keyed {
+        cache_identity_for(
+            ctx.is_tls,
+            &ctx.vhost_name,
+            lscache::cache_alias_host(&ctx.vhost_name, &cache_host, host_foreign),
+            &orig_path,
+        )
     } else {
         String::new()
     };
@@ -3420,7 +3939,7 @@ async fn dispatch(
     // stays cacheable while an unconfigured `www.` does not.
     let cache_host_foreign = cache_on && host_foreign;
     let cache_has_range = cache_on && req.headers().contains_key(http::header::RANGE);
-    let cache_render_epoch = if cache_on {
+    let cache_render_epoch = if cache_keyed {
         state
             .page_cache
             .as_ref()
@@ -3429,7 +3948,7 @@ async fn dispatch(
     } else {
         0
     };
-    let _cache_render_guard = if cache_on {
+    let _cache_render_guard = if cache_keyed {
         state
             .page_cache
             .as_ref()
@@ -3440,7 +3959,7 @@ async fn dispatch(
     // (#275) The public vary discriminant, computed ONCE for the lookup + all
     // store sites (build_cache_key/capsule_key otherwise re-split the Cookie
     // header per call).
-    let cache_vary = if cache_on {
+    let cache_vary = if cache_keyed {
         state
             .page_cache
             .as_ref()
@@ -3457,24 +3976,34 @@ async fn dispatch(
     };
     // Built once, threaded unchanged to the lookup + all three store sites so their
     // keys + identity guard can never drift apart (see lscache::CacheCtx).
-    let origin_vary = if cache_on {
+    let origin_vary = if cache_keyed {
         req.headers()
             .get(http::header::ORIGIN)
             .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
     } else {
         None
     };
-    // From the chain whose conds actually ran (`chain` may be the reloaded
-    // destination chain by now) plus the vhost's inline rules.
-    let ua_class = if cache_on {
-        rewrite_glue::page_cache_ua_class(state, ctx, &chain_with_dirs, req.headers())
+    let (ua_class, header_vary) = if cache_keyed {
+        // From every chain whose conds actually ran (the request's chain plus any
+        // destination chain a cross-directory rewrite ran, #826) plus the vhost's
+        // inline rules.
+        let vary_chain: Cow<'_, [(PathBuf, Arc<Htaccess>)]> = if rewrite_trace.extra.is_empty() {
+            Cow::Borrowed(&chain_with_dirs)
+        } else {
+            Cow::Owned(
+                chain_with_dirs
+                    .iter()
+                    .chain(rewrite_trace.extra.iter())
+                    .cloned()
+                    .collect(),
+            )
+        };
+        (
+            rewrite_glue::page_cache_ua_class(state, ctx, &vary_chain, req.headers()),
+            rewrite_glue::page_cache_header_vary(state, ctx, &vary_chain, req.headers()),
+        )
     } else {
-        None
-    };
-    let header_vary = if cache_on {
-        rewrite_glue::page_cache_header_vary(state, ctx, &chain_with_dirs, req.headers())
-    } else {
-        None
+        (None, None)
     };
     let cc = lscache::CacheCtx {
         enabled: cache_on,
@@ -3488,10 +4017,11 @@ async fn dispatch(
         render_epoch: cache_render_epoch,
         has_range: cache_has_range,
         host_foreign: cache_host_foreign,
-        vary_value: (cache_on && state.page_cache.is_some()).then_some(cache_vary.as_str()),
+        vary_value: (cache_keyed && state.page_cache.is_some()).then_some(cache_vary.as_str()),
         origin: origin_vary.as_deref(),
         ua_class: ua_class.as_deref(),
         header_vary: header_vary.as_deref(),
+        env_vary: cache_vary_env,
     };
 
     // ---- 4d. Deferred terminal `[P]` proxy, with page-cache participation ------------
@@ -3501,9 +4031,13 @@ async fn dispatch(
     // 206- / self-redirect-guarded and no-ops for a non-cacheable response (today's Monit
     // `[P]` is non-cacheable, so this is inert for it). No single-flight: the `[P]` path is
     // low-volume; add it if a high-traffic cacheable `[P]` ever appears.
-    if let Some(target_url) = proxy_target {
+    if let Some((target_url, proxy_host)) = proxy_target {
         let is_refresh_p = req.extensions().get::<RefreshMode>().is_some();
-        if cache_on && !cache_has_range && !is_refresh_p {
+        // OLS hands a ws/wss `[P]` target of an upgrade request to its WebSocket
+        // handler; that relay is never a cacheable response.
+        let ws_relay = is_websocket_upgrade(req.headers())
+            && ProxyTarget::parse_url(&target_url).is_ok_and(|t| t.is_websocket());
+        if cache_on && !cache_has_range && !is_refresh_p && !ws_relay {
             let inm = req
                 .headers()
                 .get(http::header::IF_NONE_MATCH)
@@ -3517,8 +4051,13 @@ async fn dispatch(
                 return hit;
             }
         }
-        // (#11) `.htaccess` `Header always set` (HSTS/CSP/CORS/...) applies to a [P] response.
-        let rel = resolved_rel_path(&cur_path);
+        // (#11) `.htaccess` `Header always set` (HSTS/CSP/CORS/...) applies to a [P] response,
+        // from the chain whose rule produced it (#836).
+        let (header_chain, header_path): (&[Arc<Htaccess>], &str) = match &hop_render {
+            Some((hop_chain, hop_path)) => (hop_chain, hop_path),
+            None => (&chain, &cur_path),
+        };
+        let rel = resolved_rel_path(header_path);
         let mut resp = match ProxyTarget::parse_url(&target_url) {
             Ok(target) if rewrite_proxy_target_refused(&target).is_some() => {
                 tracing::warn!(request_id = %ctx.request_id, target = %target_url, "[P] target refused: unix transports are reserved for operator config");
@@ -3531,6 +4070,16 @@ async fn dispatch(
                         tracing::warn!(request_id = %ctx.request_id, target = %target_url, why = %why, "[P] target refused");
                         return error_page(StatusCode::FORBIDDEN);
                     }
+                }
+                // After the pin: Proxy-Host renames the Host/SNI, never the dialed address.
+                if let Some(host) = proxy_host.as_deref()
+                    && let Err(e) = target.override_host(host)
+                {
+                    tracing::warn!(request_id = %ctx.request_id, target = %target_url, error = %e, "[P] Proxy-Host refused -> 502");
+                    return error_page(StatusCode::BAD_GATEWAY);
+                }
+                if ws_relay {
+                    return proxy_websocket(state, ctx, req, target).await;
                 }
                 let h = ProxyHandler {
                     proxy: state.proxy.clone(),
@@ -3551,7 +4100,7 @@ async fn dispatch(
                 error_page(StatusCode::BAD_GATEWAY)
             }
         };
-        apply_response_headers_for_request(ctx, &chain, &rel, &orig_path, &mut resp);
+        apply_response_headers_for_request(ctx, header_chain, &rel, &orig_path, &mut resp);
         // Upstream LSCache controls were removed by hj-proxy. Trusted local
         // Header directives are applied above and must still execute purges and
         // be stripped even when this route has lookup/storage disabled.
@@ -3598,12 +4147,15 @@ async fn dispatch(
             .telemetry
             .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE)
             .then(std::time::Instant::now);
-        // (#320) Evaluate the shared cache gates ONCE for both sequential lookups.
+        // (#320) Evaluate the shared cache gates ONCE for both sequential lookups. An unkeyed
+        // method skips both: `cache_lookup` bypasses it before reading a gate, and the capsule
+        // probe would only count it as a member `not_allowed` miss (#983).
         let shared_gates = state
             .page_cache
             .as_ref()
+            .filter(|_| cache_keyed)
             .map(|store| lscache::compute_shared_gates(ctx, &cc, store));
-        if !is_refresh {
+        if cache_keyed && !is_refresh {
             match lscache::capsule_lookup(state, ctx, &cc, inm, shared_gates.as_ref()) {
                 lscache::CacheOutcome::Hit(hit) => {
                     state
@@ -3736,6 +4288,16 @@ async fn dispatch(
             .max_by_key(|w| w.uri.len())
         {
             let target = ProxyTarget::from_websocket_map(ws).in_scope(&ctx.vhost_name);
+            if let Err(status) = forward_rewritten_uri(
+                &mut req,
+                rewritten,
+                &orig_path,
+                &orig_query,
+                &cur_path,
+                &cur_query,
+            ) {
+                return error_page(status);
+            }
             return proxy_websocket(state, ctx, req, target).await;
         }
     }
@@ -3769,6 +4331,16 @@ async fn dispatch(
         // (#3) Per-vhost <extProcessorList> takes precedence over the global map
         // so e.g. status.forum.example's `stats_api` resolves locally.
         if let Some(target) = resolve_proxy_target(state, ctx, &handler) {
+            if let Err(status) = forward_rewritten_uri(
+                &mut req,
+                rewritten,
+                &orig_path,
+                &orig_query,
+                &cur_path,
+                &cur_query,
+            ) {
+                return error_page(status);
+            }
             let h = ProxyHandler {
                 proxy: state.proxy.clone(),
                 telemetry: state.telemetry.clone(),
@@ -3924,9 +4496,10 @@ async fn dispatch(
             let script_basename = script_abs
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or("");
+                .unwrap_or("")
+                .to_owned();
             let special_env: Vec<(SpecialEnvType, String, String)> =
-                hj_rewrite::php_directives(&chain, &script_name, script_basename)
+                hj_rewrite::php_directives(&chain, &script_name, &script_basename)
                     .into_iter()
                     .map(|d| {
                         let ty = if d.admin {
@@ -4109,6 +4682,7 @@ async fn dispatch(
                 &req_head.headers,
                 &chain,
                 &rel_path,
+                Some(script_basename.as_str()),
                 &orig_path,
                 &cur_path,
                 &mut resp,
@@ -4136,34 +4710,17 @@ async fn dispatch(
     // (#9b) Honor a matching static <context> location override + extraHeaders
     // (the mcp.forum.example hybrid docroot). Capture both as owned data BEFORE
     // the `&mut ctx` borrow needed to serve the file (the context borrows ctx).
-    let (static_extra_headers, static_location, static_charset): (
-        Option<Vec<(String, String)>>,
-        Option<(PathBuf, String)>,
-        Option<String>,
-    ) = match matching_static_context(ctx, &cur_path) {
-        Some(c) => (
-            Some(c.extra_headers.clone()),
-            c.location.clone().map(|loc| (loc, c.uri.clone())),
-            effective_static_charset(c),
-        ),
-        None => (None, None, None),
-    };
-    // The location override only takes effect when it actually differs from the
-    // vhost docroot; pinned via the DocRootOverride extension the static handler reads.
-    if let Some((loc, uri)) = static_location {
-        if loc != ctx.vhost.doc_root {
-            req.extensions_mut()
-                .insert(hj_static::DocRootOverride(loc, uri));
-        }
-    }
-    if let Some(charset) = static_charset {
-        req.extensions_mut()
-            .insert(hj_static::DefaultCharsetOverride(charset));
-    }
+    let static_extra_headers: Option<Vec<(String, String)>> =
+        matching_static_context(ctx, &cur_path)
+            .map(|_| static_context_extra_headers(ctx, &cur_path));
+    // The location mapping and inherited charset ride request extensions the
+    // static handler reads.
+    apply_static_context_request(ctx, &cur_path, &mut req);
     if let Some(index_files) = htaccess_index_files(&chain) {
         req.extensions_mut()
             .insert(hj_static::IndexFilesOverride(index_files.to_vec()));
     }
+    apply_content_type_override(&chain, &cur_path, &mut req);
 
     // Static: if a rewrite changed the path, serve the rewritten file. `cur_path` is
     // canonical (decoded once and normalized by `run_rewrite`) and the terminal
@@ -4184,6 +4741,7 @@ async fn dispatch(
                     req.headers(),
                     &chain,
                     &orig_path,
+                    &orig_path,
                     StatusCode::BAD_REQUEST,
                 )
                 .await;
@@ -4197,38 +4755,67 @@ async fn dispatch(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // Static dispatch borrows the request, retaining its headers for final-target
     // auth and ErrorDocument policy without a per-request HeaderMap clone.
-    let mut resp = run_borrowed_handler(&state.static_handler, ctx, &mut req).await;
-    // StaticFiles never consumes a request body. Drop it as soon as its response
-    // head is ready so target auth or a script ErrorDocument cannot retain an
-    // attacker-supplied GET body while awaiting backend work.
-    if req.body().size_hint().upper() != Some(0) {
-        *req.body_mut() = hj_core::empty_incoming();
-    }
-    if htaccess_enabled && let Some(target) = scoped_auth::served_target(&resp) {
-        if let Err(auth_resp) = scoped_auth::enforce_target(
-            state,
-            ctx,
-            req.headers(),
-            &target,
-            &orig_path,
-            &mut authenticated_realms,
-        )
-        .await
-        {
-            return auth_resp;
+    let mut resp = loop {
+        let resp = run_borrowed_handler(&state.static_handler, ctx, &mut req).await;
+        // StaticFiles never consumes a request body. Drop it as soon as its response
+        // head is ready so target auth or a script ErrorDocument cannot retain an
+        // attacker-supplied GET body while awaiting backend work.
+        if req.body().size_hint().upper() != Some(0) {
+            *req.body_mut() = hj_core::empty_incoming();
         }
-    }
-    if resolved_static_target_denied(&state.acl, &resp) {
-        return error_doc_or_page(
-            state,
-            ctx,
-            req.headers(),
-            &chain,
-            &cur_path,
-            StatusCode::FORBIDDEN,
-        )
-        .await;
-    }
+        // A refusal caused only by a substituted precompressed sibling must not
+        // refuse the requested file: re-serve identity, judged on its own rules.
+        let sibling = resp
+            .extensions()
+            .get::<hj_static::PrecompressedSiblingSelected>()
+            .is_some();
+        if htaccess_enabled && let Some(target) = scoped_auth::served_target(&resp) {
+            if let Err(auth_resp) = scoped_auth::enforce_target(
+                state,
+                ctx,
+                req.headers(),
+                &target,
+                &orig_path,
+                &mut authenticated_realms,
+            )
+            .await
+            {
+                if sibling {
+                    req.extensions_mut()
+                        .insert(hj_static::NoPrecompressedSibling);
+                    continue;
+                }
+                return response_util::auth_refusal(
+                    state,
+                    ctx,
+                    req.headers(),
+                    &chain,
+                    &cur_path,
+                    &orig_path,
+                    auth_resp,
+                )
+                .await;
+            }
+        }
+        if resolved_static_target_denied(&state.acl, &resp) {
+            if sibling {
+                req.extensions_mut()
+                    .insert(hj_static::NoPrecompressedSibling);
+                continue;
+            }
+            return error_doc_or_page(
+                state,
+                ctx,
+                req.headers(),
+                &chain,
+                &cur_path,
+                &orig_path,
+                StatusCode::FORBIDDEN,
+            )
+            .await;
+        }
+        break resp;
+    };
     if matches!(resp.status().as_u16(), 200 | 206 | 304)
         && resolved_static_target_is_script(state, ctx, &cur_path, &chain, &resp)
     {
@@ -4251,12 +4838,14 @@ async fn dispatch(
     if let Some(extra) = static_extra_headers {
         apply_static_context_headers(&extra, &mut resp);
     }
+    let index_basename = served_index_basename(&cur_path, &resp);
     finalize_response(
         state,
         ctx,
         req.headers(),
         &chain,
         &rel_path,
+        index_basename.as_deref(),
         &orig_path,
         &cur_path,
         &mut resp,
@@ -4325,18 +4914,40 @@ fn opened_target_path(path: &Path) -> std::io::Result<PathBuf> {
     // (.htaccess-derived script target), so a planted FIFO must fail fast here
     // instead of parking the executor thread inside open(2) — same treatment as
     // hj-static's open_beneath.
-    let file = rustix::fs::open(
-        path,
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let meta = rustix::fs::fstat(&file).map_err(std::io::Error::from)?;
-    // S_IFMT type bits: 0100000 = regular file (Linux).
-    const S_IFREG: u32 = 0o100000;
-    if meta.st_mode & 0o170000 != S_IFREG {
-        return Err(std::io::Error::from(rustix::io::Errno::NXIO));
+    // A trailing `/` makes the kernel require a directory, which the regular-file check
+    // below refuses: no open of such a candidate can succeed, so skip the syscall.
+    if std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).ends_with(b"/") {
+        return Err(std::io::Error::from(rustix::io::Errno::NOTDIR));
     }
+    let flags =
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NONBLOCK;
+    // An absolute, `..`-free path that opens with RESOLVE_NO_SYMLINKS crossed no symlink
+    // anywhere, so its normalized lexical form IS the canonical path of the opened inode —
+    // the /proc/self/fd readlink below would only repeat it. ENOENT/ENOTDIR are final: the
+    // walk failed at a component every earlier one of which was a real directory, exactly
+    // as a following open would. Anything else (ELOOP = a symlink, ENOSYS, …) takes the
+    // original path unchanged.
+    if let Some(lexical) = hj_static::symlink_free_candidate(path) {
+        match rustix::fs::openat2(
+            rustix::fs::CWD,
+            path,
+            flags,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::NO_SYMLINKS,
+        ) {
+            Ok(file) => {
+                require_regular_file(&file)?;
+                return Ok(lexical);
+            }
+            Err(e) if e == rustix::io::Errno::NOENT || e == rustix::io::Errno::NOTDIR => {
+                return Err(std::io::Error::from(e));
+            }
+            Err(_) => {}
+        }
+    }
+    let file =
+        rustix::fs::open(path, flags, rustix::fs::Mode::empty()).map_err(std::io::Error::from)?;
+    require_regular_file(&file)?;
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -4348,13 +4959,14 @@ fn opened_target_path(path: &Path) -> std::io::Result<PathBuf> {
     path.canonicalize()
 }
 
-fn effective_static_charset(context: &hj_core::config::Context) -> Option<String> {
-    context.add_default_charset.then(|| {
-        context
-            .charset
-            .clone()
-            .unwrap_or_else(|| "UTF-8".to_string())
-    })
+fn require_regular_file(file: &rustix::fd::OwnedFd) -> std::io::Result<()> {
+    let meta = rustix::fs::fstat(file).map_err(std::io::Error::from)?;
+    // S_IFMT type bits: 0100000 = regular file (Linux).
+    const S_IFREG: u32 = 0o100000;
+    if meta.st_mode & 0o170000 != S_IFREG {
+        return Err(std::io::Error::from(rustix::io::Errno::NXIO));
+    }
+    Ok(())
 }
 
 /// Post-dispatch transforms shared by the terminal handlers: apply the
@@ -4370,12 +4982,113 @@ async fn finalize_response(
     request_headers: &http::HeaderMap,
     chain: &[Arc<Htaccess>],
     rel_path: &str,
+    target_basename: Option<&str>,
     request_path: &str,
     cur_path: &str,
     resp: &mut Response,
 ) {
-    apply_response_headers_for_request(ctx, chain, rel_path, request_path, resp);
+    // Header ops run after the ErrorDocument so a replacement page keeps the
+    // `always` headers of the error it stands in for.
+    let status = resp.status();
     apply_error_document(state, ctx, request_headers, chain, cur_path, resp).await;
+    response_util::apply_error_response_headers(
+        ctx,
+        chain,
+        rel_path,
+        target_basename,
+        request_path,
+        status,
+        resp,
+    );
+}
+
+/// The basename `<Files*>` sections match for a static response to a
+/// directory request: the `DirectoryIndex` file the resolver selected (its
+/// lexical name; a precompressed sibling maps back to its primary). `None` for
+/// any other request, whose own basename is already the served file.
+fn served_index_basename(request_path: &str, resp: &Response) -> Option<String> {
+    if !suffix_routing::directory_like(request_path) {
+        return None;
+    }
+    let target = match resp.extensions().get::<hj_static::LexicalTargetPath>() {
+        Some(lexical) => lexical.0.as_path(),
+        None => resp
+            .extensions()
+            .get::<hj_static::ResolvedTargetPath>()?
+            .0
+            .as_path(),
+    };
+    let name = target.file_name()?.to_str()?;
+    let name = if resp.headers().contains_key(CONTENT_ENCODING) {
+        name.strip_suffix(".br")
+            .or_else(|| name.strip_suffix(".gz"))
+            .unwrap_or(name)
+    } else {
+        name
+    };
+    Some(name.to_owned())
+}
+
+/// The basename `<Files*>`-scoped `SetEnv`/`SetEnvIf` match for `path`, judged
+/// before the rewrite like Apache's header-parser phase: the script a
+/// `PATH_INFO` or `DirectoryIndex` request maps to, else the first existing
+/// `DirectoryIndex` file of a directory request. Computed only when some chain
+/// file carries such a scoped directive.
+fn set_env_scope_basename(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    chain: &[Arc<Htaccess>],
+) -> Option<String> {
+    if !chain.iter().any(|ht| ht.has_scoped_set_env) {
+        return None;
+    }
+    let index_files = effective_index_files(state, ctx, chain);
+    if let Some((script, _, _)) = split_script_path(state, ctx, path, index_files, chain) {
+        return script.file_name()?.to_str().map(str::to_owned);
+    }
+    if !suffix_routing::directory_like(path) {
+        return None;
+    }
+    let dir = ctx.vhost.doc_root.join(path.trim_start_matches('/'));
+    index_files
+        .iter()
+        .find(|index| {
+            hj_static::safe_index_name(index)
+                && state
+                    .stat_cache
+                    .tests(&dir.join(index.as_str()))
+                    .is_some_and(|tests| tests.is_file)
+        })
+        .cloned()
+}
+
+/// Attach the chain's `.htaccess` `AddType`/`ForceType` MIME mapping for the
+/// static file `request_path` names (or, for a directory, the index file the
+/// resolver will select). Inert unless some chain file maps a MIME type.
+fn apply_content_type_override(chain: &[Arc<Htaccess>], request_path: &str, req: &mut Request) {
+    if !chain.iter().any(|ht| ht.has_type_override) {
+        return;
+    }
+    let rel = resolved_rel_path(request_path);
+    let mapping = if suffix_routing::directory_like(request_path) {
+        let chain = chain.to_vec();
+        let dir = rel.trim_end_matches('/').to_owned();
+        hj_static::ContentTypeOverride::ByName(Arc::new(move |basename: &str| {
+            hj_rewrite::content_type_override(
+                chain.iter().map(AsRef::as_ref),
+                &format!("{dir}/{basename}"),
+                basename,
+            )
+        }))
+    } else {
+        let basename = rel.rsplit('/').next().unwrap_or("");
+        match hj_rewrite::content_type_override(chain.iter().map(AsRef::as_ref), &rel, basename) {
+            Some(mime) => hj_static::ContentTypeOverride::Fixed(mime),
+            None => return,
+        }
+    };
+    req.extensions_mut().insert(mapping);
 }
 
 /// (#9a/#505) Build the effective executable-suffix set for a vhost. Per-suffix
@@ -4727,6 +5440,74 @@ fn finish_handler_result(
     }
 }
 
+/// Request marker: a cleartext request admitted only by the ACME http-01
+/// exemption to an mTLS-required vhost. dispatch() serves it as a static token
+/// file, never through rewrite, a script backend, a proxy, or the page cache.
+#[derive(Clone, Copy)]
+struct AcmePlaintextOnly;
+
+/// Serve an [`AcmePlaintextOnly`] request: the path's own access and auth
+/// policy still apply, and every refusal is a bare page (an ErrorDocument may
+/// itself be a script).
+async fn acme_plaintext_static(
+    state: &Arc<ServerState>,
+    ctx: &mut ReqCtx,
+    chain: &[Arc<Htaccess>],
+    orig_path: &str,
+    req: Request,
+) -> Response {
+    let rel = resolved_rel_path(orig_path);
+    if access_denied(chain, orig_path, req.method().as_str(), ctx)
+        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &rel)
+    {
+        return error_page(StatusCode::FORBIDDEN);
+    }
+    let mut authenticated = Vec::new();
+    if let Err(resp) = scoped_auth::enforce_chain(
+        ctx,
+        req.headers(),
+        chain,
+        &rel,
+        orig_path,
+        &mut authenticated,
+    )
+    .await
+    {
+        return resp;
+    }
+    let mut sreq: Request = http::Request::new(hj_core::empty_incoming());
+    *sreq.method_mut() = req.method().clone();
+    *sreq.uri_mut() = req.uri().clone();
+    *sreq.headers_mut() = req.headers().clone();
+    drop(req);
+    let mut resp = run_borrowed_handler(&state.static_handler, ctx, &mut sreq).await;
+    if !matches!(resp.status().as_u16(), 200 | 206 | 304) {
+        return error_page(resp.status());
+    }
+    if resolved_static_target_denied(&state.acl, &resp) {
+        return error_page(StatusCode::FORBIDDEN);
+    }
+    if resolved_static_target_is_script(state, ctx, orig_path, chain, &resp) {
+        return error_page(StatusCode::NOT_FOUND);
+    }
+    if let Some(target) = scoped_auth::served_target(&resp) {
+        if let Err(denied) = scoped_auth::enforce_target(
+            state,
+            ctx,
+            sreq.headers(),
+            &target,
+            orig_path,
+            &mut authenticated,
+        )
+        .await
+        {
+            return denied;
+        }
+    }
+    apply_response_headers_for_request(ctx, chain, &rel, orig_path, &mut resp);
+    resp
+}
+
 /// (#2) Decide the HTTPS redirect target for a plaintext request to an
 /// mTLS-required vhost. Returns `None` for the ACME http-01 challenge path (which
 /// must stay reachable over plaintext for certificate issuance), otherwise the
@@ -4741,6 +5522,14 @@ fn mtls_https_redirect_target(host: &str, path: &str, query: Option<&str>) -> Op
     if acme_challenge_token(path).is_some() {
         return None;
     }
+    // `host_without_port` unbrackets an IPv6 literal; a URL authority needs it back (#939).
+    let bracketed;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        bracketed = format!("[{host}]");
+        bracketed.as_str()
+    } else {
+        host
+    };
     Some(match query {
         Some(q) if !q.is_empty() => format!("https://{host}{path}?{q}"),
         _ => format!("https://{host}{path}"),
@@ -4894,23 +5683,82 @@ fn cache_optimizer_allows_redirect_cdn_cache(label: &str) -> bool {
         .is_some_and(|code| matches!(code, "301" | "308"))
 }
 
+/// (#836) The access phase of one internal-redirect hop: `hop_path` against the
+/// chain that hop entered — `Require`/`<Limit>`/`<Files>` denies, `accessDenyDir`,
+/// the context body cap and the chain's Basic-auth realm. `Err` carries the refusal,
+/// rendered with the hop's chain (ErrorDocument + `Header always`).
+async fn enforce_hop_access(
+    state: &Arc<ServerState>,
+    ctx: &mut ReqCtx,
+    req: &mut Request,
+    hop_chain: &[Arc<Htaccess>],
+    hop_path: &str,
+    orig_path: &str,
+    authenticated_realms: &mut Vec<hj_rewrite::AuthRealm>,
+) -> Result<(), Response> {
+    let hop_rel = resolved_rel_path(hop_path);
+    if access_denied(hop_chain, hop_path, req.method().as_str(), ctx)
+        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &hop_rel)
+    {
+        return Err(error_doc_or_page(
+            state,
+            ctx,
+            req.headers(),
+            hop_chain,
+            hop_path,
+            orig_path,
+            StatusCode::FORBIDDEN,
+        )
+        .await);
+    }
+    if let Err(status) = enforce_context_body_limit(
+        ctx,
+        hop_path,
+        state.serve_config.max_req_body_size as u64,
+        req,
+    )
+    .await
+    {
+        return Err(error_page(status));
+    }
+    if let Err(resp) = scoped_auth::enforce_chain(
+        ctx,
+        req.headers(),
+        hop_chain,
+        &hop_rel,
+        hop_path,
+        authenticated_realms,
+    )
+    .await
+    {
+        return Err(response_util::auth_refusal(
+            state,
+            ctx,
+            req.headers(),
+            hop_chain,
+            hop_path,
+            orig_path,
+            resp,
+        )
+        .await);
+    }
+    Ok(())
+}
+
 /// Merge rewrite-chain `[E=…]` sets into `ctx.env`. Names under the internal
 /// `HJ_` prefix are reserved for request-identity plumbing (e.g.
 /// `HJ_CACHE_REFRESH`) that a config rule must never be able to overwrite.
 /// Reserved keys are skipped with a warning instead of poisoning the
 /// pipeline's view of the request.
-fn merge_rewrite_env(ctx: &mut ReqCtx, env: Vec<(String, String)>) {
+/// Returns whether the env asked for a per-URL cache vary (`[E=Cache-Vary:…]` or
+/// `[E=Cache-Control:vary=…]`), so the page cache scans `ctx.env` for it only then.
+fn merge_rewrite_env(ctx: &mut ReqCtx, env: Vec<(String, String)>) -> bool {
+    let mut cache_vary = false;
     for (k, v) in env {
-        if !htaccess_apply::env_key_allowed(&k) {
-            tracing::warn!(
-                request_id = %ctx.request_id,
-                key = %k,
-                "rewrite [E=] targets the reserved HJ_ env prefix; ignored"
-            );
-            continue;
-        }
-        ctx.set_env(k, v);
+        cache_vary |= lscache::is_cache_vary_env(&k, &v);
+        htaccess_apply::apply_env_assignment(ctx, k, v, "rewrite [E=]");
     }
+    cache_vary
 }
 
 /// Stash the request identity the redirect-decache transform needs (it only
@@ -5088,6 +5936,28 @@ pub(super) fn maybe_cache_static(
     if resp.headers().contains_key("x-litespeed-cache") {
         return;
     }
+    // A bodyless static HEAD/304 describes the GET this function would buffer
+    // (and so compression would encode) only within the object cap.
+    // sub_filter buffers its own GET body (up to its max_body) and so also
+    // reaches compression above the cap (#788).
+    if matches!(resp.body(), Body::Empty)
+        && resp
+            .extensions()
+            .get::<hj_compress::StaticIdentityLength>()
+            .is_some_and(|l| {
+                l.0 > static_cache.config().max_static_obj_bytes
+                    && !resp
+                        .extensions()
+                        .get::<SubFilterPlan>()
+                        .is_some_and(|plan| {
+                            l.0 <= plan.0.max_body && SubFilterTransform::eligible(&plan.0, resp)
+                        })
+            })
+    {
+        resp.extensions_mut()
+            .remove::<hj_compress::StaticIdentityLength>();
+        return;
+    }
     // A ranged (206) response keeps its Body::File but gets the cache's bytes
     // ATTACHED via the FileBody.cached seam — every transport already slices
     // cached bytes by the range, so a range over a hot cached file serves with
@@ -5229,11 +6099,16 @@ fn header_value_string(headers: &http::HeaderMap, name: http::header::HeaderName
         .to_string()
 }
 
-fn header_str(req: &Request, name: http::header::HeaderName) -> Option<String> {
-    req.headers()
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
+/// Raw header bytes for the access log: hj-log escapes non-ASCII as `\xNN`, so a
+/// UTF-8 or obs-text value is logged instead of collapsing to `-` (#914).
+fn header_bytes(req: &Request, name: http::header::HeaderName) -> Option<Vec<u8>> {
+    req.headers().get(name).map(|v| v.as_bytes().to_vec())
+}
+
+/// The `%u` field: only the user the pipeline VERIFIED against a Basic-auth realm
+/// (the same marker `mark_auth_sensitive` reads), never a client-asserted value (#913).
+fn log_remote_user(ctx: &ReqCtx) -> Option<String> {
+    ctx.get_env(hj_lsapi::cgi::AUTH_USER_ENV).map(str::to_owned)
 }
 
 /// The request method as a `&'static str` for the access log, with no allocation for the
@@ -5261,7 +6136,7 @@ fn unix_now() -> i64 {
 }
 
 /// Apply `expiresByType` Cache-Control/Expires headers to cacheable static
-/// responses (200/206 with a content-type, no existing cache-expiry headers).
+/// responses (200/206/304 with a content-type, no existing cache-expiry headers).
 #[derive(Clone, Copy)]
 struct AuthSensitiveResponse;
 
@@ -5275,8 +6150,12 @@ fn mark_auth_sensitive(has_authorization: bool, ctx: &ReqCtx, resp: &mut Respons
 }
 
 pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp: &mut Response) {
-    let status = resp.status();
-    if status != StatusCode::OK && status != StatusCode::PARTIAL_CONTENT {
+    // RFC 9110 §15.4.5: a 304 carries the Cache-Control/Expires its 200 would
+    // (the static 304 keeps the Content-Type and Last-Modified the rule reads).
+    if !matches!(
+        resp.status(),
+        StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::NOT_MODIFIED
+    ) {
         return;
     }
     if resp.headers().contains_key(http::header::CACHE_CONTROL)
@@ -5515,6 +6394,133 @@ fn error_page(status: StatusCode) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-worker flush ticker parks on `access_chunk_pending` and must be woken by the
+    /// first line of a chunk — and only then — or an idle core would either take timer
+    /// wake-ups forever or strand a partial chunk.
+    #[tokio::test]
+    async fn chunk_ticker_parks_until_a_chunk_starts() {
+        struct Count(std::sync::atomic::AtomicUsize);
+        impl std::task::Wake for Count {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("hj-chunk-ticker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = Arc::new(hj_log::AccessLogger::spawn(
+            dir.join("access.log"),
+            hj_log::LogFormat::Common,
+            0,
+            0,
+            false,
+        ));
+        let count = Arc::new(Count(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(count.clone());
+        let mut cx = std::task::Context::from_waker(&waker);
+        let poll = |cx: &mut std::task::Context<'_>| {
+            let mut fut = std::pin::pin!(access_chunk_pending());
+            fut.as_mut().poll(cx).is_ready()
+        };
+        assert!(!poll(&mut cx), "no chunk: the ticker parks");
+        assert!(!poll(&mut cx), "re-polling does not double-register");
+        chunk_access_line(&log, |buf, _| buf.extend_from_slice(b"first\n"));
+        assert_eq!(
+            count.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first line wakes once"
+        );
+        chunk_access_line(&log, |buf, _| buf.extend_from_slice(b"second\n"));
+        assert_eq!(
+            count.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "later lines do not"
+        );
+        assert!(poll(&mut cx), "a pending chunk resolves the wait");
+        flush_access_chunks();
+        assert!(!poll(&mut cx), "after the flush the ticker parks again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The RESOLVE_NO_SYMLINKS fast path must name exactly the inode the slow
+    /// (open + /proc/self/fd readlink) path names, for every shape it accepts or declines.
+    #[test]
+    fn opened_target_path_matches_canonicalize_with_and_without_symlinks() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("hj-opened-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        std::fs::write(root.join("real/sub/index.php"), b"<?php").unwrap();
+        std::os::unix::fs::symlink(root.join("real/sub/index.php"), root.join("file-link.php"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("dir-link")).unwrap();
+        let fifo = root.join("pipe.php");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+
+        let canonical = root.join("real/sub/index.php");
+        for p in [
+            root.join("real/sub/index.php"),
+            PathBuf::from(format!("{}//real/./sub//index.php", root.display())),
+            root.join("file-link.php"),
+            root.join("dir-link/sub/index.php"),
+        ] {
+            assert_eq!(
+                opened_target_path(&p).unwrap(),
+                canonical,
+                "{}",
+                p.display()
+            );
+            assert_eq!(p.canonicalize().unwrap(), canonical);
+        }
+        // `..` declines the fast path; the resolving walk still names the target.
+        let dotdot = root.join("real/sub/../sub/index.php");
+        assert_eq!(opened_target_path(&dotdot).unwrap(), canonical);
+        assert!(hj_static::symlink_free_candidate(&dotdot).is_none());
+        // A FIFO is refused without blocking; a missing target is NotFound.
+        assert_eq!(
+            opened_target_path(&fifo).unwrap_err().raw_os_error(),
+            Some(rustix::io::Errno::NXIO.raw_os_error())
+        );
+        assert_eq!(
+            opened_target_path(&root.join("real/missing.php"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            opened_target_path(&root.join("real/sub/index.php/x"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        // A `/`-terminated candidate (a file, a directory, a missing name, or a
+        // symlink to either) can never open as a regular file.
+        for p in [
+            "real/sub/index.php/",
+            "real/sub/",
+            "real/missing/",
+            "dir-link/",
+        ] {
+            let p = PathBuf::from(format!("{}/{p}", root.display()));
+            assert!(opened_target_path(&p).is_err(), "{}", p.display());
+            let opens_as_file =
+                rustix::fs::open(&p, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty())
+                    .ok()
+                    .and_then(|fd| rustix::fs::fstat(&fd).ok())
+                    .is_some_and(|st| rustix::fs::FileType::from_raw_mode(st.st_mode).is_file());
+            assert!(!opens_as_file, "{}", p.display());
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn http10_requests_report_http10() {
@@ -5771,34 +6777,6 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    #[test]
-    fn static_context_charset_defaults_and_customizes() {
-        use hj_core::config::{Context, ContextKind};
-        let mut context = Context {
-            cache_policy: None,
-            max_body_override: None,
-            bandwidth_limit: 0,
-            timeout_override: None,
-            sub_filter: None,
-            kind: ContextKind::Static,
-            uri: "/assets".into(),
-            location: None,
-            handler: None,
-            enabled: true,
-            extra_headers: vec![],
-            add_default_charset: false,
-            charset: None,
-        };
-        assert_eq!(effective_static_charset(&context), None);
-        context.add_default_charset = true;
-        assert_eq!(effective_static_charset(&context).as_deref(), Some("UTF-8"));
-        context.charset = Some("ISO-8859-1".into());
-        assert_eq!(
-            effective_static_charset(&context).as_deref(),
-            Some("ISO-8859-1")
-        );
-    }
-
     fn resource_context(
         uri: &str,
         enabled: bool,
@@ -5811,8 +6789,9 @@ mod tests {
             location: None,
             handler: Some("app".into()),
             enabled,
+            allow_browse: true,
             extra_headers: vec![],
-            add_default_charset: false,
+            add_default_charset: None,
             charset: None,
             cache_policy: None,
             max_body_override,
@@ -6163,6 +7142,25 @@ mod tests {
         );
     }
 
+    /// Regression (#939): an IPv6-literal Host reaches here unbracketed (`host_without_port`);
+    /// the Location must re-bracket it or `https://2001:db8::1/x` is unparseable.
+    #[test]
+    fn mtls_redirect_rebrackets_an_ipv6_literal_host() {
+        let host = hj_core::host_without_port("[2001:db8::1]:80");
+        let target = mtls_https_redirect_target(&host, "/index.html", Some("a=1")).unwrap();
+        assert_eq!(target, "https://[2001:db8::1]/index.html?a=1");
+        let uri: http::Uri = target.parse().expect("Location must be a valid URI");
+        assert_eq!(uri.host(), Some("[2001:db8::1]"));
+        assert_eq!(
+            mtls_https_redirect_target("[::1]", "/", None).as_deref(),
+            Some("https://[::1]/")
+        );
+        assert_eq!(
+            mtls_https_redirect_target("192.0.2.1", "/", None).as_deref(),
+            Some("https://192.0.2.1/")
+        );
+    }
+
     #[test]
     fn mtls_acme_exemption_confined_to_normalized_single_token() {
         // (security #259) The exemption is decided on the NORMALIZED path with a strict
@@ -6184,39 +7182,6 @@ mod tests {
         }
         // Legit tokens still exempt.
         assert!(acme_challenge_token("/.well-known/acme-challenge/t0kEn-_9").is_some());
-    }
-
-    #[test]
-    fn logheaders_redacts_credential_values() {
-        // (security #261) Credential-class header VALUES must never reach the log
-        // file verbatim — only <len>:<sha256[:12]>. Ordinary headers stay intact.
-        let req = http::Request::builder()
-            .method("GET")
-            .uri("/")
-            .header("cookie", "xf_session=SECRETTOKEN123; xf_user=7")
-            .header("authorization", "Bearer sk-supersecret")
-            .header("user-agent", "TestAgent/1.0")
-            .body(hj_core::empty_incoming())
-            .unwrap();
-        let line = render_request_headers(&req);
-        assert!(
-            !line.contains("SECRETTOKEN123"),
-            "raw cookie leaked: {line}"
-        );
-        assert!(!line.contains("sk-supersecret"), "raw authorization leaked");
-        assert!(line.contains("user-agent=TestAgent/1.0"), "{line}");
-        let cookie_val = "xf_session=SECRETTOKEN123; xf_user=7";
-        assert!(
-            line.contains(&format!("cookie={}:", cookie_val.len())),
-            "cookie value must be replaced by len:hash, got {line}"
-        );
-        let authz = line.split("authorization=").nth(1).unwrap_or("");
-        let hex = authz.split(';').next().unwrap_or("").split(':').nth(1);
-        assert_eq!(
-            hex.map(|h| h.len()),
-            Some(12),
-            "hash truncated to 12 hex chars"
-        );
     }
 
     #[test]
@@ -6601,6 +7566,23 @@ mod tests {
         assert_eq!(ctx.get_env("no-cache"), Some("1"));
         assert_eq!(ctx.get_env("HJ_REQUEST_PATH_QUERY"), Some("/real"));
         assert_eq!(ctx.get_env("HJ_ANYTHING"), None);
+    }
+
+    #[test]
+    fn rewrite_env_merge_applies_bang_unsets() {
+        let mut ctx = bare_ctx_for_headers();
+        ctx.set_env("HJ_REQUEST_PATH_QUERY", "/real".to_string());
+        ctx.set_env("ok", "1".to_string());
+        merge_rewrite_env(
+            &mut ctx,
+            vec![
+                ("!ok".into(), String::new()),
+                ("!HJ_REQUEST_PATH_QUERY".into(), String::new()),
+            ],
+        );
+        assert_eq!(ctx.get_env("ok"), None);
+        assert_eq!(ctx.get_env("!ok"), None);
+        assert_eq!(ctx.get_env("HJ_REQUEST_PATH_QUERY"), Some("/real"));
     }
 
     #[test]

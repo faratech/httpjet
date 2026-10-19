@@ -5,6 +5,8 @@
 //! These are pure state structs shared by the connection loop in [`super`] and the
 //! receive/send halves; their fields are `pub(super)` so all three can read/write them.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use rustc_hash::FxHashSet;
 
@@ -55,11 +57,15 @@ pub(super) struct Recv {
     /// the peer's. A later frame on one of these is the §5.1 close race and stays a
     /// per-stream STREAM_CLOSED; a reused id NOT recorded here was closed cleanly or
     /// never opened, which is the §5.1.1 connection error. Unlike `cancelled` (which is
-    /// consumed as aborted handlers drain), entries are never removed — a reset id is
-    /// illegal forever, we just answer it at stream scope. Bounded like `cancelled`
-    /// (cap = max_concurrent * 2); at the cap new ids are skipped — fail closed: an
-    /// unrecorded reset degrades a later race to GOAWAY rather than growing unbounded.
-    pub(super) reset_ids: FxHashSet<u32>,
+    /// consumed as aborted handlers drain), entries leave only by age. Bounded like
+    /// `cancelled` (cap = max_concurrent * 2) to the most recent resets, the ones a late
+    /// frame can still be racing; an evicted id fails closed — a later race on it
+    /// degrades to GOAWAY rather than the set growing unbounded.
+    pub(super) reset_ids: RecentIds,
+    /// The subset of `reset_ids` WE reset: §5.1 says frames on those are ignored
+    /// (#877), while a frame after the PEER's own RST_STREAM is still STREAM_CLOSED.
+    /// Bounded like `reset_ids`; an evicted id just gets the RST answer.
+    pub(super) sent_reset_ids: RecentIds,
     /// Our advertised SETTINGS_MAX_CONCURRENT_STREAMS (§5.1.2).
     pub(super) max_concurrent: usize,
     /// Connection-level RECEIVE flow-control window (§6.9): credit we have granted the peer for
@@ -80,7 +86,7 @@ pub(super) struct Recv {
     /// decremented when a stream's body is dispatched (complete) or its stream is removed.
     pub(super) total_buffered: usize,
     /// Per-stream buffered-request-body cap (LiteSpeed `maxReqBodySize`, from `Config`). An
-    /// over-cap stream is RST'd (REFUSED_STREAM).
+    /// over-cap stream is answered 413 (#1014).
     pub(super) max_request_body: usize,
     /// Per-connection SUM cap = `4 × max_request_body`; over it ⇒ GOAWAY(ENHANCE_YOUR_CALM).
     pub(super) per_conn_request_body: usize,
@@ -106,13 +112,13 @@ impl Recv {
         id
     }
 
-    /// Remember a stream WE reset so a late HEADERS on it (trailers racing our
+    /// Remember a reset stream so a late HEADERS on it (trailers racing the
     /// RST_STREAM) is the tolerated §5.1 close race rather than §5.1.1 id reuse.
-    /// Past the cap the id is not recorded, failing closed into a connection error.
+    /// Only the most recent resets are kept; an evicted id fails closed into a
+    /// connection error.
     pub(super) fn note_reset(&mut self, sid: u32) {
-        if self.reset_ids.len() < self.max_concurrent.saturating_mul(2) {
-            self.reset_ids.insert(sid);
-        }
+        self.reset_ids
+            .insert(sid, self.max_concurrent.saturating_mul(2));
     }
 
     /// Stop counting `n` bytes against the connection's unfinished-body limit.
@@ -134,6 +140,55 @@ impl Recv {
             self.buffer_sub(s.body.len());
         }
         self.note_reset(sid);
+        self.sent_reset_ids
+            .insert(sid, self.max_concurrent.saturating_mul(2));
+    }
+
+    /// Body-deadline teardown of `sid`. Returns whether to emit RST_STREAM now.
+    /// A trailer block still open on `sid` must keep being decoded to stay in
+    /// HPACK sync, and its CONTINUATIONs must not read as a connection error,
+    /// so the block switches to discard mode and resets at END_HEADERS.
+    pub(super) fn expire_receiving(
+        &mut self,
+        streams: &mut rustc_hash::FxHashMap<u32, StreamState>,
+        sid: u32,
+    ) -> bool {
+        let open_block = self.open_header_block == Some(sid) && !self.discarding_header_block;
+        if open_block && let Some(st) = streams.get_mut(&sid) {
+            self.discard_header_block = std::mem::take(&mut st.header_block);
+            self.discarding_header_block = true;
+            self.discard_rst_code = crate::frame::error_code::CANCEL;
+        }
+        self.teardown_receiving(streams, sid);
+        !open_block
+    }
+}
+
+/// A bounded set of the most recently recorded stream ids: at the cap the oldest
+/// entry is evicted, so a long-lived connection keeps tracking its newest resets.
+#[derive(Default)]
+pub(super) struct RecentIds {
+    ids: FxHashSet<u32>,
+    order: VecDeque<u32>,
+}
+
+impl RecentIds {
+    pub(super) fn contains(&self, sid: u32) -> bool {
+        self.ids.contains(&sid)
+    }
+
+    pub(super) fn insert(&mut self, sid: u32, cap: usize) {
+        if cap == 0 || self.ids.contains(&sid) {
+            return;
+        }
+        while self.order.len() >= cap {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.ids.remove(&oldest);
+        }
+        self.ids.insert(sid);
+        self.order.push_back(sid);
     }
 }
 
@@ -167,8 +222,9 @@ pub(super) struct StreamState {
     /// (§8.1.2.6). `Some(None)` would be a parse error; we store the parsed value or flag
     /// malformed at decode time.
     pub(super) content_length: Option<u64>,
-    /// Absolute deadline for completing the request body after the initial
-    /// header block. Other active streams and control frames must not extend it.
+    /// Deadline for completing the request body after the initial header block. Only
+    /// this stream's own DATA extends it (`advance_body_deadlines`, #1035); other active
+    /// streams and control frames must not.
     pub(super) body_deadline: Option<tokio::time::Instant>,
     /// Per-stream RECEIVE flow-control window (§6.9): credit granted to the peer for DATA on this
     /// stream. Initialized to our SETTINGS_INITIAL_WINDOW_SIZE when the stream opens (default 0
@@ -194,8 +250,9 @@ pub(super) struct OutStream {
     pub(super) done: bool,
     /// Per-stream send window (RFC 7540 §6.9): bytes the peer will accept right now.
     pub(super) window: i64,
-    /// Cancels an in-flight body pull when the peer resets this stream.
-    pub(super) cancel: tokio_util::sync::CancellationToken,
+    /// Cancels an in-flight body pull when the peer resets this stream. Created by the
+    /// first pull, so in-memory bodies (which never pull) never allocate one.
+    pub(super) cancel: Option<tokio_util::sync::CancellationToken>,
     /// Send-stall clock while this response has bytes waiting on flow-control credit.
     pub(super) stall: Option<SendStall>,
     /// Already counted as flow-control blocked; cleared by the next DATA frame it sends.
@@ -212,6 +269,8 @@ pub(super) struct SendStall {
 
 impl Drop for OutStream {
     fn drop(&mut self) {
-        self.cancel.cancel();
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
     }
 }

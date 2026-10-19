@@ -14,7 +14,7 @@
 //! by design — the bound errs tight, never loose.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Default server-wide budget for buffered bodies: generous against real
 /// chunked-upload traffic, hard against memory-exhaustion floods.
@@ -25,6 +25,11 @@ pub struct BodyBufferBudget {
     max_bytes: u64,
     in_flight: AtomicU64,
     rejected: AtomicU64,
+    waiters: AtomicUsize,
+    /// One waiter at a time holds the turn and watches `released`; the rest queue
+    /// here in arrival order, so a release wakes one task instead of every waiter.
+    turn: tokio::sync::Semaphore,
+    released: tokio::sync::Notify,
 }
 
 impl BodyBufferBudget {
@@ -33,25 +38,67 @@ impl BodyBufferBudget {
             max_bytes,
             in_flight: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
+            turn: tokio::sync::Semaphore::new(1),
+            released: tokio::sync::Notify::new(),
         }
     }
 
     /// Reserve `n` more bytes if the budget allows; false when exhausted.
     pub fn try_acquire(&self, n: u64) -> bool {
+        if self.reserve(n) {
+            return true;
+        }
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    /// Reserve `n` bytes, waiting for other reservations to release instead of
+    /// refusing. Waiting is back-pressure, not a refusal, so it never counts
+    /// toward [`Self::rejected`]; only an `n` that can never fit is refused.
+    /// Waiters are served first-come first-served: a newcomer queues behind any
+    /// earlier waiter even when its own `n` would fit (non-waiting
+    /// [`Self::try_acquire`] callers are unaffected).
+    /// Cancel-safe: dropping the future reserves nothing and passes its turn on.
+    pub async fn acquire_wait(&self, n: u64) -> bool {
+        if self.max_bytes != 0 && n > self.max_bytes {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if self.waiters.load(Ordering::SeqCst) == 0 && self.reserve(n) {
+            return true;
+        }
+        let _waiter = Waiter::register(&self.waiters);
+        // The semaphore is never closed; were it, waiting without the turn is
+        // still correct, merely unordered.
+        let _turn = self.turn.acquire().await;
+        loop {
+            // Created before the re-check, so a release that the re-check misses
+            // still wakes it (`notify_waiters` reaches every existing `Notified`).
+            let released = self.released.notified();
+            if self.reserve(n) {
+                return true;
+            }
+            released.await;
+        }
+    }
+
+    // SeqCst on `in_flight` and `waiters` on both sides: a waiter that registers
+    // and then re-checks either sees the release or is counted by its notify.
+    fn reserve(&self, n: u64) -> bool {
         if self.max_bytes == 0 {
             return true; // 0 = accounting disabled
         }
-        let mut cur = self.in_flight.load(Ordering::Relaxed);
+        let mut cur = self.in_flight.load(Ordering::SeqCst);
         loop {
             if cur.saturating_add(n) > self.max_bytes {
-                self.rejected.fetch_add(1, Ordering::Relaxed);
                 return false;
             }
             match self.in_flight.compare_exchange_weak(
                 cur,
                 cur + n,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             ) {
                 Ok(_) => return true,
                 Err(c) => cur = c,
@@ -63,8 +110,11 @@ impl BodyBufferBudget {
         if self.max_bytes == 0 || n == 0 {
             return;
         }
-        let prev = self.in_flight.fetch_sub(n, Ordering::AcqRel);
+        let prev = self.in_flight.fetch_sub(n, Ordering::SeqCst);
         debug_assert!(prev >= n, "body-budget underflow");
+        if self.waiters.load(Ordering::SeqCst) != 0 {
+            self.released.notify_waiters();
+        }
     }
 
     /// Bytes currently reserved by live buffered bodies.
@@ -104,6 +154,21 @@ impl BodyBufferLease {
         true
     }
 
+    /// [`BodyBufferBudget::acquire_wait`] onto this lease; false (no change)
+    /// only when `n` exceeds the whole budget.
+    pub async fn reserve_wait(&mut self, n: u64) -> bool {
+        if !self.budget.acquire_wait(n).await {
+            return false;
+        }
+        self.held += n;
+        true
+    }
+
+    /// Bytes this lease currently holds.
+    pub fn held(&self) -> u64 {
+        self.held
+    }
+
     /// Give back `n` bytes reserved on this lease (a transient raw copy that
     /// was drained, so the ledger tracks only the copy that lives on). Clamped
     /// to what is held so a bookkeeping bug cannot underflow the server-wide
@@ -137,6 +202,21 @@ impl BodyBufferLease {
 impl Drop for BodyBufferLease {
     fn drop(&mut self) {
         self.budget.release(self.held);
+    }
+}
+
+struct Waiter<'a>(&'a AtomicUsize);
+
+impl<'a> Waiter<'a> {
+    fn register(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::SeqCst);
+        Self(waiters)
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -192,6 +272,296 @@ mod tests {
         assert_eq!(budget.capacity(), 12);
         drop(alias);
         assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn waiting_reserve_wakes_on_release_without_counting_rejections() {
+        let budget = Arc::new(BodyBufferBudget::new(10));
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(10));
+        let waiter = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                let mut lease = BodyBufferLease::new(budget);
+                assert!(lease.reserve_wait(4).await);
+                lease
+            }
+        });
+        while budget.waiters.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiter.is_finished());
+        hog.release(6);
+        let lease = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("a release must wake the waiter")
+            .unwrap();
+        assert_eq!(budget.in_flight(), 8);
+        assert_eq!(budget.rejected(), 0, "a wait is not a refusal");
+        assert_eq!(budget.waiters.load(Ordering::SeqCst), 0);
+        drop((hog, lease));
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_reserves_nothing_and_deregisters() {
+        let budget = Arc::new(BodyBufferBudget::new(4));
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(4));
+        let mut lease = BodyBufferLease::new(budget.clone());
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(20), lease.reserve_wait(1)).await;
+        assert!(waited.is_err());
+        assert_eq!(budget.waiters.load(Ordering::SeqCst), 0);
+        drop(hog);
+        drop(lease);
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(budget.rejected(), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_wait_is_refused_at_once() {
+        let budget = Arc::new(BodyBufferBudget::new(4));
+        let mut lease = BodyBufferLease::new(budget.clone());
+        assert!(!lease.reserve_wait(5).await);
+        assert_eq!(budget.rejected(), 1);
+        assert!(lease.reserve_wait(4).await);
+        assert_eq!(budget.in_flight(), 4);
+        let unlimited = Arc::new(BodyBufferBudget::new(0));
+        assert!(BodyBufferLease::new(unlimited).reserve_wait(u64::MAX).await);
+    }
+
+    async fn settle() {
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn spawn_wait(
+        budget: &Arc<BodyBufferBudget>,
+        n: u64,
+        order: &Arc<std::sync::Mutex<Vec<u64>>>,
+        id: u64,
+    ) -> tokio::task::JoinHandle<BodyBufferLease> {
+        let budget = budget.clone();
+        let order = order.clone();
+        tokio::spawn(async move {
+            let mut lease = BodyBufferLease::new(budget);
+            assert!(lease.reserve_wait(n).await);
+            order.lock().unwrap().push(id);
+            lease
+        })
+    }
+
+    async fn wait_for_waiters(budget: &BodyBufferBudget, n: usize) {
+        while budget.waiters.load(Ordering::SeqCst) != n {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn waiters_are_served_in_arrival_order() {
+        let budget = Arc::new(BodyBufferBudget::new(10));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(10));
+        let first = spawn_wait(&budget, 6, &order, 1);
+        wait_for_waiters(&budget, 1).await;
+        let second = spawn_wait(&budget, 2, &order, 2);
+        wait_for_waiters(&budget, 2).await;
+
+        hog.release(4);
+        settle().await;
+        assert!(
+            order.lock().unwrap().is_empty(),
+            "a later waiter that fits must not overtake an earlier one"
+        );
+        hog.release(2);
+        let first = first.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), [1]);
+        assert!(!second.is_finished());
+        hog.release(2);
+        let second = second.await.unwrap();
+        assert_eq!(*order.lock().unwrap(), [1, 2]);
+        assert_eq!(budget.in_flight(), 10);
+        assert_eq!(budget.rejected(), 0);
+        drop((hog, first, second));
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(budget.waiters.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_waiting_reserve_does_not_overtake_but_try_acquire_still_admits() {
+        let budget = Arc::new(BodyBufferBudget::new(10));
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(8));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let head = spawn_wait(&budget, 4, &order, 1);
+        wait_for_waiters(&budget, 1).await;
+        let mut newcomer = BodyBufferLease::new(budget.clone());
+        let queued = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            newcomer.reserve_wait(1),
+        )
+        .await;
+        assert!(queued.is_err(), "a newcomer waits behind the queued head");
+        assert_eq!(budget.waiters.load(Ordering::SeqCst), 1);
+        assert!(
+            budget.try_acquire(2),
+            "a refusing reservation is not queued"
+        );
+        budget.release(2);
+        drop(hog);
+        let head = head.await.unwrap();
+        drop((head, newcomer));
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(budget.rejected(), 0);
+    }
+
+    struct CountPolls<F> {
+        inner: std::pin::Pin<Box<F>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    impl<F: std::future::Future> std::future::Future for CountPolls<F> {
+        type Output = F::Output;
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<F::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            self.inner.as_mut().poll(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_release_wakes_one_waiter_not_the_herd() {
+        const WAITERS: u64 = 16;
+        let budget = Arc::new(BodyBufferBudget::new(64));
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(64));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for id in 0..WAITERS {
+            let budget = budget.clone();
+            let order = order.clone();
+            tasks.push(tokio::spawn(CountPolls {
+                inner: Box::pin(async move {
+                    let mut lease = BodyBufferLease::new(budget);
+                    assert!(lease.reserve_wait(4).await);
+                    order.lock().unwrap().push(id);
+                    lease
+                }),
+                polls: polls.clone(),
+            }));
+        }
+        wait_for_waiters(&budget, WAITERS as usize).await;
+        settle().await;
+        let parked = polls.load(Ordering::SeqCst);
+        for _ in 0..3 {
+            hog.release(1);
+            settle().await;
+        }
+        assert!(
+            polls.load(Ordering::SeqCst) - parked <= 3,
+            "releases too small for the head must wake only the head, not all {WAITERS} waiters"
+        );
+        hog.release(61);
+        let mut leases = Vec::new();
+        for task in tasks {
+            leases.push(task.await.unwrap());
+        }
+        assert_eq!(*order.lock().unwrap(), (0..WAITERS).collect::<Vec<_>>());
+        assert_eq!(budget.in_flight(), 64);
+        drop(leases);
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(budget.waiters.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_head_passes_its_wakeup_to_the_next_waiter() {
+        let budget = Arc::new(BodyBufferBudget::new(10));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(10));
+        let head = spawn_wait(&budget, 6, &order, 1);
+        wait_for_waiters(&budget, 1).await;
+        let next = spawn_wait(&budget, 4, &order, 2);
+        wait_for_waiters(&budget, 2).await;
+        // The release wakes the head; it is cancelled before it can run.
+        hog.release(6);
+        head.abort();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), next)
+            .await
+            .expect("the cancelled head's wakeup must reach the next waiter")
+            .unwrap();
+        assert!(head.await.unwrap_err().is_cancelled());
+        assert_eq!(*order.lock().unwrap(), [2]);
+        assert_eq!(budget.in_flight(), 8);
+        assert_eq!(budget.waiters.load(Ordering::SeqCst), 0);
+        drop((hog, next));
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_queued_waiter_does_not_block_those_behind_it() {
+        let budget = Arc::new(BodyBufferBudget::new(10));
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(10));
+        let head = spawn_wait(&budget, 6, &order, 1);
+        wait_for_waiters(&budget, 1).await;
+        let cancelled = spawn_wait(&budget, 6, &order, 2);
+        wait_for_waiters(&budget, 2).await;
+        let tail = spawn_wait(&budget, 4, &order, 3);
+        wait_for_waiters(&budget, 3).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        wait_for_waiters(&budget, 2).await;
+        hog.release(10);
+        let head = head.await.unwrap();
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(5), tail)
+            .await
+            .expect("the turn skips a cancelled waiter")
+            .unwrap();
+        assert_eq!(*order.lock().unwrap(), [1, 3]);
+        assert_eq!(budget.in_flight(), 10);
+        drop((hog, head, tail));
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(budget.rejected(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contended_waiters_never_lose_a_wakeup() {
+        const TASKS: u64 = 32;
+        const ROUNDS: u64 = 200;
+        let budget = Arc::new(BodyBufferBudget::new(16));
+        let mut tasks = Vec::new();
+        for id in 0..TASKS {
+            let budget = budget.clone();
+            tasks.push(tokio::spawn(async move {
+                for round in 0..ROUNDS {
+                    let n = 1 + (id + round) % 16;
+                    let mut lease = BodyBufferLease::new(budget.clone());
+                    assert!(lease.reserve_wait(n).await);
+                    if round % 3 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    drop(lease);
+                }
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await
+        .expect("every waiter must eventually be woken");
+        assert_eq!(budget.in_flight(), 0);
+        assert_eq!(budget.waiters.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.rejected(), 0);
     }
 
     #[test]

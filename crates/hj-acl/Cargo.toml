@@ -14,4 +14,3 @@ http = { workspace = true }
 ipnet = { workspace = true }
 parking_lot = { workspace = true }
 globset = { workspace = true }
-tracing = { workspace = true }

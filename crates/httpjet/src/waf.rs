@@ -121,7 +121,9 @@ impl Sidecar {
         // exchange. The old shape swapped the body out inside the timed
         // block, so a timeout mid-collect dropped the partially-read body
         // and fail-open dispatch forwarded an EMPTY body downstream.
-        let body_hex = if include_body {
+        // Only the raw bytes are kept here (shared with the restored body); the
+        // hex copy is made once the permit and byte lease are held.
+        let body_raw = if include_body {
             let incoming = std::mem::replace(req.body_mut(), hj_core::empty_incoming());
             let bytes = incoming
                 .collect()
@@ -132,7 +134,7 @@ impl Sidecar {
                 .map_err(|never| match never {})
                 .map_err(|error| Box::new(error) as BoxError)
                 .boxed();
-            Some(hex(&bytes))
+            Some(bytes)
         } else {
             None
         };
@@ -153,7 +155,7 @@ impl Sidecar {
                 .acquire_many_owned(charge)
                 .await
                 .map_err(|_| InspectError::Capacity)?;
-            let body = body_hex;
+            let body = body_raw.as_deref().map(hex);
             let headers: Vec<EncodedHeader<'_>> = req
                 .headers()
                 .iter()
@@ -282,7 +284,14 @@ struct EncodedHeader<'a> {
     value_hex: String,
 }
 
+#[cfg(test)]
+thread_local! {
+    static HEX_INPUT_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn hex(bytes: &[u8]) -> String {
+    #[cfg(test)]
+    HEX_INPUT_BYTES.with(|count| count.set(count.get() + bytes.len()));
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
     for byte in bytes {
@@ -313,10 +322,19 @@ async fn read_verdict(stream: &mut tokio::net::TcpStream) -> Result<Verdict, Ins
     let mut lines = text.split("\r\n");
     let status = lines
         .next()
-        .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+        .and_then(|line| {
+            line.strip_prefix("HTTP/1.1 ")
+                .or_else(|| line.strip_prefix("HTTP/1.0 "))
+        })
         .and_then(|line| line.split(' ').next())
         .and_then(|code| code.parse::<u16>().ok())
         .ok_or(InspectError::Protocol)?;
+    // A parsed block is a block whatever body or framing follows (the connection is
+    // close-delimited): it must never become a sidecar failure that fail-open allows
+    // (#934). An allow keeps the strict bodiless framing below.
+    if status == 403 {
+        return Ok(Verdict::Block);
+    }
     let mut content_length = None;
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').ok_or(InspectError::Protocol)?;
@@ -425,6 +443,47 @@ mod tests {
             .unwrap()
     }
 
+    /// Regression (#934): a block with a body, chunked framing or an HTTP/1.0
+    /// status line is still a block, never a sidecar failure.
+    #[tokio::test]
+    async fn framed_or_http10_block_is_still_a_block() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for reply in [
+            &b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden"[..],
+            b"HTTP/1.1 403 Forbidden\r\nTransfer-Encoding: chunked\r\n\r\n9\r\nForbidden\r\n0\r\n\r\n",
+            b"HTTP/1.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stub = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 4096];
+                while let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_millis(100), sock.read(&mut buf)).await
+                {
+                    if n == 0 {
+                        break;
+                    }
+                }
+                sock.write_all(reply).await.unwrap();
+            });
+            let sidecar = Sidecar::new(
+                addr,
+                "/inspect".into(),
+                Duration::from_secs(2),
+                1024,
+                2,
+                FailurePolicy::Open,
+            )
+            .unwrap();
+            let ctx = context();
+            let mut req = request(5);
+            let result = sidecar.inspect(&ctx, &mut req, "/inspect", true).await;
+            assert!(matches!(result, Ok(Verdict::Block)), "{result:?}");
+            stub.await.unwrap();
+        }
+    }
+
     /// Regression (#582): a sidecar timeout must leave the original request
     /// body in `req` — fail-open dispatch forwards whatever body remains.
     #[tokio::test]
@@ -452,6 +511,29 @@ mod tests {
         let bytes = req.body_mut().collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 5, "original body must survive the timeout");
         stall.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn body_is_not_hex_encoded_while_waiting_for_a_permit() {
+        let sidecar = Sidecar::new(
+            "127.0.0.1:19092".parse().unwrap(),
+            "/inspect".into(),
+            Duration::from_millis(50),
+            MAX_INSPECT_BODY,
+            1,
+            FailurePolicy::Closed,
+        )
+        .unwrap();
+        let held = sidecar.concurrency.clone().acquire_owned().await.unwrap();
+        let ctx = context();
+        let mut req = request(64 * 1024);
+        HEX_INPUT_BYTES.with(|count| count.set(0));
+        let result = sidecar.inspect(&ctx, &mut req, "/inspect", true).await;
+        assert!(matches!(result, Err(InspectError::Timeout)), "{result:?}");
+        assert_eq!(HEX_INPUT_BYTES.with(std::cell::Cell::get), 0);
+        drop(held);
+        let bytes = req.body_mut().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 64 * 1024);
     }
 
     #[test]

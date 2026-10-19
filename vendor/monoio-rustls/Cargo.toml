@@ -37,12 +37,6 @@ repository = "https://github.com/monoio-rs/monoio-tls"
 name = "monoio_rustls"
 path = "src/lib.rs"
 
-[[example]]
-name = "connect"
-path = "examples/connect.rs"
-
-[dependencies.bytes]
-version = "1"
 
 [dependencies.monoio]
 version = "0.2.0"
@@ -57,12 +51,6 @@ default-features = false
 
 [dependencies.thiserror]
 version = "2"
-
-[dev-dependencies.monoio]
-version = "0.2.0"
-
-[dev-dependencies.webpki-roots]
-version = "~0.26.1"
 
 [features]
 default = [

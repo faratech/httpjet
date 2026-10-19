@@ -23,7 +23,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,6 +60,23 @@ pub struct PoolStats {
     pub eagain_retries: u64,
     pub eagain_terminal_exhaustions: u64,
     pub unread_body_drops: u64,
+    /// Connections closed after a clean response because they carried request
+    /// body bytes (never re-pooled, #833).
+    pub body_conn_closes: u64,
+    /// Response bodies returned whole (`Body::Full`), `inline_tail_drains` included.
+    pub inline_bodies: u64,
+    /// Inline bodies returned before RESP_END; a tail task settled the socket.
+    pub inline_tail_drains: u64,
+    /// Response bodies streamed through the body pump.
+    pub streamed_bodies: u64,
+}
+
+/// How the handler delivered a response body, for [`PoolStats`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ResponseBodyPath {
+    Inline,
+    InlineTail,
+    Streamed,
 }
 
 #[derive(Default)]
@@ -76,6 +93,10 @@ struct PoolCounters {
     eagain_retries: AtomicU64,
     eagain_terminal_exhaustions: AtomicU64,
     unread_body_drops: AtomicU64,
+    body_conn_closes: AtomicU64,
+    inline_bodies: AtomicU64,
+    inline_tail_drains: AtomicU64,
+    streamed_bodies: AtomicU64,
 }
 
 impl PoolCounters {
@@ -90,6 +111,10 @@ impl PoolCounters {
             eagain_retries: self.eagain_retries.load(Ordering::Relaxed),
             eagain_terminal_exhaustions: self.eagain_terminal_exhaustions.load(Ordering::Relaxed),
             unread_body_drops: self.unread_body_drops.load(Ordering::Relaxed),
+            body_conn_closes: self.body_conn_closes.load(Ordering::Relaxed),
+            inline_bodies: self.inline_bodies.load(Ordering::Relaxed),
+            inline_tail_drains: self.inline_tail_drains.load(Ordering::Relaxed),
+            streamed_bodies: self.streamed_bodies.load(Ordering::Relaxed),
         }
     }
 }
@@ -119,36 +144,28 @@ impl ExternalGenerationSnapshot {
     }
 }
 
-/// The generation state is a trust anchor (epoch + promoted-family marker):
-/// in a group/other-writable directory any local user could pre-create or swap
-/// the file and force spurious pool-invalidation churn. Same stance as
-/// `validate_chroot_target` (0o022 = group-write | other-write); the default
-/// sibling-of-socket path would otherwise land beside a /tmp socket.
+/// The generation state is a trust anchor (epoch + promoted-family marker): a
+/// directory another account owns or can write lets it pre-create or swap the
+/// file (or plant a link that a root writer would chmod and resize) and force
+/// spurious pool-invalidation churn. The default sibling-of-socket path would
+/// otherwise land beside a /tmp socket.
 fn validate_generation_dir(path: &Path) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let md = std::fs::metadata(dir).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("lsphp generation dir {} stat failed: {e}", dir.display()),
-        )
-    })?;
-    if !md.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("lsphp generation dir {} is not a directory", dir.display()),
-        ));
-    }
-    if md.mode() & 0o022 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "lsphp generation dir {} is group/other-writable (mode {:o}); a local user could forge the generation state — move the file to a root-owned directory (e.g. {DEFAULT_EXTERNAL_GENERATION_PATH})",
-                dir.display(),
-                md.mode() & 0o7777
-            ),
-        ));
-    }
-    Ok(())
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    crate::supervisor::validate_operator_dir(dir, "lsphp generation dir").map_err(|e| {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "{e} — move the generation file to a root-owned directory (e.g. {DEFAULT_EXTERNAL_GENERATION_PATH})"
+                ),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// Read-only view of the process-independent lsphp generation counter.
@@ -162,12 +179,32 @@ pub struct ExternalGeneration {
     /// retirement is current only they are stale: the successor supervisor's
     /// workers answer queued dials before it publishes their family.
     seen_families: [AtomicU64; 2],
+    opened: Instant,
+    /// Nanoseconds after `opened` at which this reader last saw one published
+    /// family replace another; [`NEVER_REPLACED`] until then.
+    family_replaced_at: AtomicU64,
+}
+
+const NEVER_REPLACED: u64 = u64::MAX;
+
+/// How long after observing a family replacement worker identity can matter.
+/// Twice the supervisor's bound, so a supervisor build with longer drain
+/// timeouts than this reader's is still covered.
+const STALE_FAMILY_WINDOW: Duration =
+    Duration::from_secs(2 * crate::supervisor::REPLACED_FAMILY_LIFETIME.as_secs());
+
+fn within_stale_family_window(replaced_at: u64, now: u64) -> bool {
+    replaced_at != NEVER_REPLACED
+        && u128::from(now.saturating_sub(replaced_at)) < STALE_FAMILY_WINDOW.as_nanos()
 }
 
 impl ExternalGeneration {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         validate_generation_dir(path.as_ref())?;
-        let file = File::open(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
         validate_generation_file(&file)?;
         // SAFETY: the file length and alignment are validated; an mmap starts at
         // page alignment, which is stricter than AtomicU64's alignment. Writers
@@ -180,6 +217,8 @@ impl ExternalGeneration {
         let generation = Self {
             map,
             seen_families: [AtomicU64::new(0), AtomicU64::new(0)],
+            opened: Instant::now(),
+            family_replaced_at: AtomicU64::new(NEVER_REPLACED),
         };
         generation.snapshot();
         Ok(generation)
@@ -194,15 +233,41 @@ impl ExternalGeneration {
         let family = snapshot.marker_fingerprint;
         if family > RETIRED_MARKER_FINGERPRINT {
             let latest = self.seen_families[0].load(Ordering::Acquire);
-            if latest != family
-                && self.seen_families[0]
+            if latest != family {
+                // Before the CAS: a reader that sees the new family must also see
+                // the replacement time, or it could skip a needed attribution.
+                if latest != 0 {
+                    self.family_replaced_at
+                        .store(self.nanos_since_open(), Ordering::Release);
+                }
+                if self.seen_families[0]
                     .compare_exchange(latest, family, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
-            {
-                self.seen_families[1].store(latest, Ordering::Release);
+                {
+                    self.seen_families[1].store(latest, Ordering::Release);
+                }
             }
         }
         snapshot
+    }
+
+    fn nanos_since_open(&self) -> u64 {
+        u64::try_from(self.opened.elapsed().as_nanos()).unwrap_or(NEVER_REPLACED - 1)
+    }
+
+    /// Whether a worker's identity can change a re-pool or retirement decision:
+    /// while a stop's retirement is current, or soon after this reader saw a
+    /// family replaced. Only a family this reader saw replaced is ever
+    /// superseded, and the supervisor ends such a family within
+    /// [`crate::supervisor::REPLACED_FAMILY_LIFETIME`] of publishing its
+    /// successor; outside both no reachable worker can be stale.
+    fn worker_identity_matters(&self) -> bool {
+        if self.snapshot().is_retired() {
+            return true;
+        }
+        let replaced_at = self.family_replaced_at.load(Ordering::Acquire);
+        replaced_at != NEVER_REPLACED
+            && within_stale_family_window(replaced_at, self.nanos_since_open())
     }
 
     fn worker_is_stale(&self, worker_family: u64) -> bool {
@@ -213,7 +278,24 @@ impl ExternalGeneration {
                 .iter()
                 .any(|family| family.load(Ordering::Acquire) == worker_family);
         }
-        current.marker_fingerprint != 0 && worker_family != current.marker_fingerprint
+        // Outside retirement only a family this reader saw published and then
+        // replaced is stale: a reload candidate's workers answer (and may carry a
+        // body, whose close retires stale workers) before their family publishes (#862).
+        self.worker_is_superseded(worker_family)
+    }
+
+    /// Stale only for a family this reader saw published and then replaced. A
+    /// reload candidate answers web dials before its family is published, so an
+    /// unseen family is never treated as superseded.
+    fn worker_is_superseded(&self, worker_family: u64) -> bool {
+        let current = self.snapshot();
+        !current.is_retired()
+            && current.marker_fingerprint != 0
+            && worker_family != current.marker_fingerprint
+            && self
+                .seen_families
+                .iter()
+                .any(|family| family.load(Ordering::Acquire) == worker_family)
     }
 }
 
@@ -238,6 +320,7 @@ impl ExternalGenerationWriter {
             .create(true)
             .truncate(false)
             .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
         let len = file.metadata()?.len();
@@ -1057,6 +1140,20 @@ impl LsapiPool {
         self.counters.snapshot()
     }
 
+    pub(crate) fn note_response_body(&self, path: ResponseBodyPath) {
+        let counter = match path {
+            ResponseBodyPath::Inline => &self.counters.inline_bodies,
+            ResponseBodyPath::InlineTail => {
+                self.counters
+                    .inline_tail_drains
+                    .fetch_add(1, Ordering::Relaxed);
+                &self.counters.inline_bodies
+            }
+            ResponseBodyPath::Streamed => &self.counters.streamed_bodies,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Connections checked out right now (held semaphore permits).
     pub fn inflight(&self) -> u64 {
         self.max_conns.saturating_sub(self.sem.available_permits()) as u64
@@ -1104,7 +1201,7 @@ impl LsapiPool {
                 idle.drain(..).collect::<Vec<_>>()
             };
             let dropped = stale.len();
-            discard_stale_entries(stale, self.external_generation.as_deref(), &self.counters);
+            discard_stale_entries(stale, self.external_generation.as_ref(), &self.counters);
             self.counters
                 .generation_advances
                 .fetch_add(1, Ordering::Relaxed);
@@ -1124,7 +1221,7 @@ impl LsapiPool {
         refresh_generation(
             &self.idle,
             &self.generation,
-            self.external_generation.as_deref(),
+            self.external_generation.as_ref(),
             &self.counters,
         )
     }
@@ -1156,7 +1253,7 @@ impl LsapiPool {
         self.counters
             .stale_idle_drops
             .fetch_add(stale.len() as u64, Ordering::Relaxed);
-        discard_stale_entries(stale, self.external_generation.as_deref(), &self.counters);
+        discard_stale_entries(stale, self.external_generation.as_ref(), &self.counters);
     }
 
     /// Acquire a connection, reusing a still-fresh idle one or dialing a new
@@ -1239,7 +1336,7 @@ impl LsapiPool {
             .fetch_add(wrong_generation.len() as u64, Ordering::Relaxed);
         discard_stale_entries(
             wrong_generation,
-            self.external_generation.as_deref(),
+            self.external_generation.as_ref(),
             &self.counters,
         );
         if let Some(entry) = reused {
@@ -1247,7 +1344,11 @@ impl LsapiPool {
                 self.counters
                     .stale_idle_drops
                     .fetch_add(1, Ordering::Relaxed);
-                discard_stale_entry(entry, self.external_generation.as_deref(), &self.counters);
+                discard_stale_entries(
+                    vec![entry],
+                    self.external_generation.as_ref(),
+                    &self.counters,
+                );
             } else {
                 // A healthy reused socket proves the backend is reachable. If the breaker
                 // is open (this request is its half-open trial), that closes it — the
@@ -1417,8 +1518,8 @@ fn is_socket_healthy(stream: &UnixStream) -> bool {
 fn refresh_generation(
     idle: &Arc<Mutex<VecDeque<IdleEntry>>>,
     generation: &Arc<AtomicU64>,
-    external: Option<&ExternalGeneration>,
-    counters: &PoolCounters,
+    external: Option<&Arc<ExternalGeneration>>,
+    counters: &Arc<PoolCounters>,
 ) -> u64 {
     let Some(external) = external else {
         return generation.load(Ordering::Acquire);
@@ -1500,17 +1601,26 @@ fn attempt_worker_attribution(
 fn repool_if_current(
     idle: &Arc<Mutex<VecDeque<IdleEntry>>>,
     generation: &Arc<AtomicU64>,
-    external_generation: Option<&ExternalGeneration>,
+    external_generation: Option<&Arc<ExternalGeneration>>,
     counters: &Arc<PoolCounters>,
     acquire_gen: u64,
     stream: UnixStream,
     mut worker: Option<WorkerRetirement>,
     worker_pid_hint: Option<u32>,
 ) {
-    if worker.is_none() && external_generation.is_some() {
+    // Attribution can walk all of /proc on this (response) path, so it runs
+    // only while a worker could be stale (#1019).
+    if worker.is_none()
+        && external_generation.is_some_and(|external| external.worker_identity_matters())
+    {
         worker = attempt_worker_attribution(&stream, worker_pid_hint, counters);
     }
-    if refresh_generation(idle, generation, external_generation, counters) == acquire_gen
+    let superseded_worker = match (external_generation, worker.as_ref()) {
+        (Some(external), Some(worker)) => external.worker_is_superseded(worker.marker_fingerprint),
+        _ => false,
+    };
+    if !superseded_worker
+        && refresh_generation(idle, generation, external_generation, counters) == acquire_gen
         && !external_generation.is_some_and(|external| external.snapshot().is_retired())
     {
         idle.lock().push_back(IdleEntry {
@@ -1609,7 +1719,8 @@ impl PooledConn {
                 worker: self.worker.take(),
                 worker_pid_hint: self.worker_pid_hint.take(),
                 poisoned: false,
-                expect_drained: false,
+                carried_body: false,
+                preread_body: false,
             }),
             idle: self.idle.clone(),
             generation: self.generation.clone(),
@@ -1629,7 +1740,7 @@ impl Drop for PooledConn {
                 repool_if_current(
                     &self.idle,
                     &self.generation,
-                    self.external_generation.as_deref(),
+                    self.external_generation.as_ref(),
                     &self.counters,
                     self.acquire_gen,
                     stream,
@@ -1649,7 +1760,8 @@ struct ReturnSlot {
     worker: Option<WorkerRetirement>,
     worker_pid_hint: Option<u32>,
     poisoned: bool,
-    expect_drained: bool,
+    carried_body: bool,
+    preread_body: bool,
 }
 
 /// Re-pools a split connection once both halves are returned cleanly.
@@ -1712,16 +1824,26 @@ impl ReturnGuard {
         self.slot.lock().poisoned = true;
     }
 
-    /// A request body was written on this connection: re-pool it only if lsphp
-    /// dequeued every byte we sent.
+    /// A request body was written on this connection: it is closed, never
+    /// re-pooled, once the response ends (#833).
     ///
     /// lsphp neither drains an unread request body at `LSAPI_Finish_r` nor
     /// discards it before the next `readReq`; PHP's own deactivate-time drain is
     /// skipped once a script opens `php://input`. A script that reads the body
-    /// partially would leave client bytes in the socket that lsphp parses as the
-    /// next BEGIN_REQUEST, so keep-alive framing must not depend on the app.
-    pub fn expect_body_drained(&self) {
-        self.slot.lock().expect_drained = true;
+    /// partially leaves client bytes that lsphp parses as the next BEGIN_REQUEST
+    /// right after RESP_END. That read dequeues them, so an unsent-bytes check
+    /// cannot see it, and the smuggled request's response would reach whichever
+    /// request reuses the socket. Closing it bounds the smuggled response to a
+    /// socket nobody reads; it cannot stop lsphp from executing it.
+    pub fn mark_carried_body(&self) {
+        self.slot.lock().carried_body = true;
+    }
+
+    /// The request carried a body PHP reads in full before the script runs (a
+    /// small POST): the socket may be re-pooled, but only once the kernel shows
+    /// lsphp dequeued every byte we wrote (#596/#833).
+    pub fn mark_preread_body(&self) {
+        self.slot.lock().preread_body = true;
     }
 }
 
@@ -1752,30 +1874,45 @@ impl Drop for ReturnGuard {
                 slot.write.take(),
                 slot.worker.take(),
                 slot.worker_pid_hint.take(),
-                slot.expect_drained,
+                slot.carried_body,
+                slot.preread_body,
             )
         };
 
         // A missing half means that side did not finish cleanly; we then drop both.
-        if let (Some(read), Some(write), worker, worker_pid_hint, expect_drained) = halves {
+        if let (Some(read), Some(write), worker, worker_pid_hint, carried_body, preread_body) =
+            halves
+        {
             // Both directions completed cleanly: re-pool the recovered socket IFF
             // the generation has not advanced (worker not restarted). Halves not
             // from the same socket (reunite Err) should be impossible here.
             if let Ok(stream) = read.reunite(write) {
-                if expect_drained && unix_unsent_bytes(&stream) != Some(0) {
+                let unread =
+                    (carried_body || preread_body) && unix_unsent_bytes(&stream) != Some(0);
+                if carried_body || unread {
+                    if unread {
+                        self.counters
+                            .unread_body_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            target: "hj_lsapi",
+                            "lsphp left part of the request body unread"
+                        );
+                    }
                     self.counters
-                        .unread_body_drops
+                        .body_conn_closes
                         .fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        target: "hj_lsapi",
-                        "lsphp left part of the request body unread; closing the connection instead of re-pooling"
-                    );
+                    if let (Some(external), Some(worker)) =
+                        (self.external_generation.as_deref(), worker.as_ref())
+                    {
+                        worker.retire_if_stale(external, &self.counters);
+                    }
                     return;
                 }
                 repool_if_current(
                     &self.idle,
                     &self.generation,
-                    self.external_generation.as_deref(),
+                    self.external_generation.as_ref(),
                     &self.counters,
                     self.acquire_gen,
                     stream,
@@ -1787,25 +1924,54 @@ impl Drop for ReturnGuard {
     }
 }
 
+/// Close stale idle entries, first retiring any old-family worker behind one.
+///
+/// Entries pooled while no worker could be stale were never attributed, so a
+/// family replacement can find many at once. Their attribution then runs on
+/// the blocking pool instead of the request that observed the replacement;
+/// each socket stays open until its worker is signalled, so the worker cannot
+/// return to `accept` first.
 fn discard_stale_entries(
     entries: Vec<IdleEntry>,
-    external_generation: Option<&ExternalGeneration>,
-    counters: &PoolCounters,
+    external_generation: Option<&Arc<ExternalGeneration>>,
+    counters: &Arc<PoolCounters>,
 ) {
-    for entry in entries {
-        discard_stale_entry(entry, external_generation, counters);
+    let Some(external) = external_generation else {
+        return;
+    };
+    if entries.is_empty() {
+        return;
+    }
+    let attribute =
+        entries.iter().any(|entry| entry.worker.is_none()) && external.worker_identity_matters();
+    if !attribute {
+        for entry in entries {
+            discard_stale_entry(entry, external, counters, false);
+        }
+        return;
+    }
+    let (external, counters) = (external.clone(), counters.clone());
+    let discard = move || {
+        for entry in entries {
+            discard_stale_entry(entry, &external, &counters, true);
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(discard)),
+        Err(_) => discard(),
     }
 }
 
 fn discard_stale_entry(
     mut entry: IdleEntry,
-    external_generation: Option<&ExternalGeneration>,
+    external: &ExternalGeneration,
     counters: &PoolCounters,
+    attribute: bool,
 ) {
-    if entry.worker.is_none() && external_generation.is_some() {
+    if attribute && entry.worker.is_none() {
         entry.worker = attempt_worker_attribution(&entry.stream, entry.worker_pid_hint, counters);
     }
-    if let (Some(external), Some(worker)) = (external_generation, entry.worker.as_ref()) {
+    if let Some(worker) = entry.worker.as_ref() {
         worker.retire_if_stale(external, counters);
     }
     drop(entry);
@@ -1871,6 +2037,74 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         ExternalGenerationWriter::open_or_create(&path).expect("private dir is accepted");
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn generation_dir_owned_by_another_uid_is_refused() {
+        if !rustix::process::geteuid().is_root() {
+            eprintln!("skipping: chown to another uid needs root");
+            return;
+        }
+        let path = tmp_generation("foreign-owner");
+        let dir = path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).unwrap();
+
+        let err = match ExternalGenerationWriter::open_or_create(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a foreign-owned parent must refuse open_or_create"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("owned by uid 65534"), "{err}");
+        assert!(std::fs::symlink_metadata(&path).is_err(), "nothing created");
+        let err = match ExternalGeneration::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a foreign-owned parent must refuse open"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // The production shape: a root-owned 0755 directory.
+        std::os::unix::fs::chown(&dir, Some(0), Some(0)).unwrap();
+        ExternalGenerationWriter::open_or_create(&path).expect("root-owned 0755 dir");
+        ExternalGeneration::open(&path).expect("root-owned 0755 dir");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn symlinked_generation_path_is_refused_and_target_untouched() {
+        let path = tmp_generation("link");
+        let dir = path.parent().unwrap().to_path_buf();
+        let target = dir.join("victim");
+        std::fs::write(&target, b"victim").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let err = match ExternalGenerationWriter::open_or_create(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a symlinked generation path must refuse open_or_create"),
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        let meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o600, "never chmodded");
+
+        // A link to a well-formed state file is refused by the reader too.
+        let real = dir.join("real.generation");
+        ExternalGenerationWriter::open_or_create(&real).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+        let err = match ExternalGeneration::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a symlinked generation path must refuse open"),
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+        let missing = dir.join("missing");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+        assert!(ExternalGenerationWriter::open_or_create(&path).is_err());
+        assert!(!missing.exists(), "O_CREAT must not create a link's target");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2081,6 +2315,10 @@ mod tests {
         let c = generation_marker_fingerprint("family-c");
         assert!(reader.worker_is_stale(a));
         assert!(!reader.worker_is_stale(b));
+        assert!(
+            !reader.worker_is_stale(c),
+            "an unpublished reload candidate is not stale (#862)"
+        );
 
         writer.retire_all();
         assert!(reader.worker_is_stale(a), "a still-draining reload family");
@@ -2174,11 +2412,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn superseded_family_worker_is_retired_not_repooled() {
+        let Ok(python) = std::fs::canonicalize("/usr/bin/python3") else {
+            return;
+        };
+        let generation_path = tmp_generation("superseded-worker");
+        let dir = generation_path.parent().unwrap().to_path_buf();
+        let fake = dir.join("lsphp");
+        std::fs::copy(&python, &fake).unwrap();
+        let socket_path = dir.join("php.sock");
+        let writer = ExternalGenerationWriter::open_or_create(&generation_path).unwrap();
+        writer.advance_with_marker(1, "family-a");
+        let script = format!(
+            "import socket\ns=socket.socket(socket.AF_UNIX)\ns.bind({:?})\ns.listen(16)\nheld=[]\nwhile True:\n    c,_=s.accept(); held.append(c)\n",
+            socket_path.to_str().unwrap()
+        );
+        let mut child = std::process::Command::new(&fake)
+            .arg("-c")
+            .arg(&script)
+            .env("LSAPI_Z_HTTPJET_GENERATION_MARKER", "family-a")
+            .spawn()
+            .unwrap();
+        for _ in 0..250 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pool = LsapiPool::new(&socket_path, 4, Duration::from_secs(2))
+            .external_generation_file(&generation_path)
+            .unwrap();
+        writer.advance_with_marker(1, "family-b");
+        let _ = pool.generation();
+
+        let conn = pool.acquire().await.unwrap();
+        assert!(!conn.is_reused());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(conn);
+        let stats = pool.stats();
+        let idle = pool.idle_count();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(stats.worker_attribution_failures, 0, "{stats:?}");
+        assert_eq!(idle, 0, "an old-family worker must not be re-pooled");
+        assert_eq!(stats.stale_checked_out_drops, 1, "{stats:?}");
+        assert_eq!(stats.stale_worker_retire_signals, 1, "{stats:?}");
+    }
+
+    #[test]
+    fn unpublished_candidate_family_is_not_superseded() {
+        let path = tmp_generation("unpublished-candidate");
+        let writer = ExternalGenerationWriter::open_or_create(&path).unwrap();
+        writer.advance_with_marker(1, "family-a");
+        let reader = ExternalGeneration::open(&path).unwrap();
+        let a = generation_marker_fingerprint("family-a");
+        let b = generation_marker_fingerprint("family-b");
+        assert!(!reader.worker_is_superseded(a));
+        assert!(
+            !reader.worker_is_superseded(b),
+            "candidate before promotion"
+        );
+        writer.advance_with_marker(1, "family-b");
+        assert!(reader.worker_is_superseded(a));
+        assert!(!reader.worker_is_superseded(b));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn attribution_backoff_caps_consecutive_capture_failures() {
         let socket_path = tmp_sock("attribution-backoff");
         let generation_path = tmp_generation("attribution-backoff");
         let writer = ExternalGenerationWriter::open_or_create(&generation_path).unwrap();
-        writer.publish(1);
+        writer.advance_with_marker(1, "family-a");
 
         // The accepting peer is this test process, not an lsphp worker, so
         // every capture attempt fails with NotFound.
@@ -2191,6 +2498,9 @@ mod tests {
         let pool = LsapiPool::new(&socket_path, 1, Duration::from_secs(2))
             .external_generation_file(&generation_path)
             .unwrap();
+        // Attribution only runs once this reader has seen a family replaced.
+        writer.advance_with_marker(1, "family-b");
+        assert_eq!(pool.generation(), 2);
 
         for _ in 0..(ATTRIBUTION_BACKOFF_LIMIT + 4) {
             let conn = pool.acquire().await.unwrap();
@@ -2204,19 +2514,157 @@ mod tests {
         );
 
         // A generation advance re-arms attribution: teardown of the now-stale
-        // idle entry attempts one more capture.
+        // idle entry attempts one more capture (on the blocking pool).
         writer.advance(1);
-        assert_eq!(pool.generation(), 2);
-        assert_eq!(
-            pool.stats().worker_attribution_failures,
-            ATTRIBUTION_BACKOFF_LIMIT + 1,
-            "a new epoch must re-arm worker attribution"
-        );
+        assert_eq!(pool.generation(), 3);
+        wait_for_stat(&pool, "re-armed attribution", |stats| {
+            stats.worker_attribution_failures == ATTRIBUTION_BACKOFF_LIMIT + 1
+        })
+        .await;
 
         server.abort();
         let _ = server.await;
         let _ = std::fs::remove_file(socket_path);
         let _ = std::fs::remove_file(generation_path);
+    }
+
+    async fn wait_for_stat(pool: &LsapiPool, what: &str, done: impl Fn(PoolStats) -> bool) {
+        for _ in 0..500 {
+            if done(pool.stats()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{what}: {:?}", pool.stats());
+    }
+
+    #[test]
+    fn stale_family_window_spans_the_supervisor_drain_bound() {
+        let window = u64::try_from(STALE_FAMILY_WINDOW.as_nanos()).unwrap();
+        assert!(STALE_FAMILY_WINDOW >= crate::supervisor::REPLACED_FAMILY_LIFETIME);
+        assert!(!within_stale_family_window(NEVER_REPLACED, 0));
+        assert!(!within_stale_family_window(NEVER_REPLACED, u64::MAX));
+        assert!(within_stale_family_window(10, 10));
+        assert!(within_stale_family_window(10, 10 + window - 1));
+        assert!(!within_stale_family_window(10, 10 + window));
+    }
+
+    /// #1019: re-pooling walks /proc for the worker's identity only while a
+    /// worker could belong to a superseded family, not in steady state.
+    #[tokio::test]
+    async fn worker_attribution_runs_only_after_a_family_replacement() {
+        let socket_path = tmp_sock("attribution-window");
+        let generation_path = tmp_generation("attribution-window");
+        let writer = ExternalGenerationWriter::open_or_create(&generation_path).unwrap();
+        writer.advance_with_marker(1, "family-a");
+        // The peer is this test process, so every capture attempt is counted
+        // as a failure: the counter counts attempts.
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                held.push(stream);
+            }
+        });
+        let pool = LsapiPool::new(&socket_path, 1, Duration::from_secs(2))
+            .external_generation_file(&generation_path)
+            .unwrap();
+
+        for _ in 0..3 {
+            drop(pool.acquire().await.unwrap());
+        }
+        assert_eq!(pool.idle_count(), 1);
+        assert_eq!(
+            pool.stats().worker_attribution_failures,
+            0,
+            "steady-state re-pools must not attribute"
+        );
+
+        writer.advance_with_marker(1, "family-b");
+        drop(pool.acquire().await.unwrap());
+        assert_eq!(pool.idle_count(), 1);
+        // The re-pool attributes inline; the replaced idle entry's teardown
+        // attributes on the blocking pool.
+        assert!(pool.stats().worker_attribution_failures >= 1);
+        wait_for_stat(&pool, "both attributions", |stats| {
+            stats.worker_attribution_failures == 2
+        })
+        .await;
+
+        server.abort();
+        let _ = server.await;
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(generation_path);
+    }
+
+    /// #1019: an idle socket pooled in steady state carries no worker identity;
+    /// when its family is replaced its worker is still attributed and retired
+    /// before the socket closes, so it cannot go back to `accept`.
+    #[tokio::test]
+    async fn unattributed_idle_worker_is_retired_when_its_family_is_replaced() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let Ok(python) = std::fs::canonicalize("/usr/bin/python3") else {
+            return;
+        };
+        let generation_path = tmp_generation("idle-family-replaced");
+        let dir = generation_path.parent().unwrap().to_path_buf();
+        let fake = dir.join("lsphp");
+        std::fs::copy(&python, &fake).unwrap();
+        let socket_path = dir.join("php.sock");
+        let writer = ExternalGenerationWriter::open_or_create(&generation_path).unwrap();
+        writer.advance_with_marker(1, "family-a");
+        let script = format!(
+            "import socket\ns=socket.socket(socket.AF_UNIX)\ns.bind({:?})\ns.listen(16)\nheld=[]\nwhile True:\n    c,_=s.accept(); held.append(c)\n",
+            socket_path.to_str().unwrap()
+        );
+        let mut child = std::process::Command::new(&fake)
+            .arg("-c")
+            .arg(&script)
+            .env("LSAPI_Z_HTTPJET_GENERATION_MARKER", "family-a")
+            .spawn()
+            .unwrap();
+        for _ in 0..250 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let pool = LsapiPool::new(&socket_path, 4, Duration::from_secs(2))
+            .external_generation_file(&generation_path)
+            .unwrap();
+
+        let conn = pool.acquire().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(conn);
+        assert_eq!(pool.idle_count(), 1);
+
+        writer.advance_with_marker(1, "family-b");
+        let _ = pool.generation();
+        assert_eq!(pool.idle_count(), 0);
+        let mut status = None;
+        for _ in 0..500 {
+            status = child.try_wait().unwrap();
+            if status.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let stats = pool.stats();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(stats.worker_attribution_failures, 0, "{stats:?}");
+        assert_eq!(stats.stale_worker_retire_signals, 1, "{stats:?}");
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(libc::SIGUSR1),
+            "the old-family worker must be retired"
+        );
     }
 
     #[tokio::test]

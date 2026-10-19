@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 #[cfg(test)]
 use std::os::unix::net::UnixListener as StdUnixListener;
@@ -25,7 +25,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
@@ -53,11 +53,185 @@ fn validate_chroot(chroot_requested: bool, pinned: bool, has_target: bool) -> io
     Ok(())
 }
 
+struct SpawnJob {
+    cmd: Command,
+    runtime: tokio::runtime::Handle,
+    reply: std::sync::mpsc::SyncSender<io::Result<Child>>,
+}
+
+/// Fork every lsphp master from one thread that lives for the whole process.
+///
+/// `PR_SET_PDEATHSIG` fires when the forking THREAD exits, not the process. A
+/// tokio worker that forks and later hands its core off via `block_in_place`
+/// retires to the blocking pool and exits after `thread_keep_alive`, which
+/// would SIGTERM a perfectly healthy master. The child's post-prctl
+/// `getppid()` recheck still compares against the process id.
+fn spawn_on_spawner_thread(cmd: Command) -> io::Result<Child> {
+    static SPAWNER: OnceLock<Result<std::sync::mpsc::Sender<SpawnJob>, String>> = OnceLock::new();
+    let spawner = SPAWNER
+        .get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<SpawnJob>();
+            std::thread::Builder::new()
+                .name("hj-lsphp-spawn".into())
+                .spawn(move || {
+                    for mut job in rx {
+                        // tokio::process registers the child with the caller's
+                        // runtime (reaper, kill_on_drop), so enter it for the spawn.
+                        let _guard = job.runtime.enter();
+                        let _ = job.reply.send(spawn_owned_child(&mut job.cmd));
+                    }
+                })
+                .map(|_| tx)
+                .map_err(|e| e.to_string())
+        })
+        .as_ref()
+        .map_err(|e| io::Error::other(format!("cannot start the lsphp spawner thread: {e}")))?;
+    let (reply, result) = std::sync::mpsc::sync_channel(1);
+    let job = SpawnJob {
+        cmd,
+        runtime: tokio::runtime::Handle::try_current().map_err(io::Error::other)?,
+        reply,
+    };
+    spawner
+        .send(job)
+        .map_err(|_| io::Error::other("lsphp spawner thread is gone"))?;
+    // Blocking like the direct `spawn()` it replaces (one fork+exec), and with
+    // no await point a cancelled caller cannot strand an unowned child.
+    result
+        .recv()
+        .map_err(|_| io::Error::other("lsphp spawner thread dropped the request"))?
+}
+
+/// A direct child whose exit status belongs to a [`Child`] handle, identified
+/// by pid + start time so a reused pid is never mistaken for it.
+struct OwnedChild {
+    pid: u32,
+    start_time: Option<u64>,
+}
+
+impl OwnedChild {
+    fn is(&self, pid: u32, start_time: u64) -> bool {
+        self.pid == pid && self.start_time.is_none_or(|start| start == start_time)
+    }
+
+    fn exists(&self) -> bool {
+        proc_details(self.pid).is_some_and(|details| self.is(self.pid, details.start_time))
+    }
+}
+
+/// Process-wide: every supervisor's subreaper pass consults it, so one pool's
+/// pass never consumes another pool's master.
+static OWNED_CHILDREN: Mutex<Vec<OwnedChild>> = Mutex::new(Vec::new());
+
+/// Spawn a direct child whose exit status is reserved for the returned handle:
+/// [`LsphpSupervisor::poll_liveness`]'s reap of adopted zombies skips it until
+/// its owner has reaped it. The registry lock is held across the fork, so the
+/// child can never be reaped before it is registered.
+pub fn spawn_owned_child(cmd: &mut Command) -> io::Result<Child> {
+    let mut owned = OWNED_CHILDREN.lock();
+    let child = cmd.spawn()?;
+    owned.retain(OwnedChild::exists);
+    if let Some(pid) = child.id() {
+        owned.push(OwnedChild {
+            pid,
+            start_time: proc_details(pid).map(|details| details.start_time),
+        });
+    }
+    Ok(child)
+}
+
 fn set_no_new_privileges() -> io::Result<()> {
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// Mark every descriptor >= 3 close-on-exec in a forked child, so lsphp
+/// inherits only fd 0 (its listen socket) and stdio. Anything else open in
+/// httpjet without CLOEXEC — e.g. socket-activation listeners not yet adopted —
+/// would otherwise let PHP `accept()` the web tier's connections. CLOEXEC
+/// rather than close: std's exec-error pipe lives at fd >= 3 and must stay
+/// open until `execve`. Async-signal-safe: raw syscalls only, no allocation.
+fn cloexec_fds_from_3() {
+    // SAFETY: `close_range` takes no memory arguments; with CLOSE_RANGE_CLOEXEC
+    // it only flips descriptor flags and never closes anything.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if rc == 0 {
+        return;
+    }
+    // Pre-5.11 kernel (ENOSYS, or EINVAL for the flag): walk the table.
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable rlimit for the duration of the call.
+    let max = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 {
+        lim.rlim_cur.min(1 << 20) as libc::c_int
+    } else {
+        1024
+    };
+    for fd in 3..max {
+        // SAFETY: F_GETFD/F_SETFD on an arbitrary integer only fail with EBADF.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+}
+
+/// lsphp's stderr. A non-terminal (prod: the unit's log file) is inherited
+/// unchanged. A terminal is never handed to PHP: even outside its session, PHP
+/// code holding the descriptor (e.g. `opcache.preload`) could read the
+/// operator's keystrokes or write escape sequences to it, so lsphp gets a pipe
+/// whose lines are forwarded through tracing instead.
+fn lsphp_stderr(supervisor_stderr_is_terminal: bool) -> Stdio {
+    if supervisor_stderr_is_terminal {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    }
+}
+
+const LSPHP_STDERR_LINE_MAX: u64 = 8 * 1024;
+
+/// Read lsphp's stderr pipe until every writer (master, workers, PHP's own
+/// children) has closed it, passing each line to `emit`. Lines longer than
+/// [`LSPHP_STDERR_LINE_MAX`] are emitted in pieces.
+async fn forward_lsphp_stderr<R>(reader: R, mut emit: impl FnMut(&[u8]))
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match (&mut reader)
+            .take(LSPHP_STDERR_LINE_MAX)
+            .read_until(b'\n', &mut line)
+            .await
+        {
+            Ok(0) => return,
+            Ok(_) => {
+                let text = line.strip_suffix(b"\n").unwrap_or(&line);
+                let text = text.strip_suffix(b"\r").unwrap_or(text);
+                if !text.is_empty() {
+                    emit(text);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
     }
 }
 
@@ -101,6 +275,11 @@ const FORCE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// cannot be blocked and the stopped master cannot fork). Keeps a pathological
 /// process state from pinning the lifecycle lock past systemd's stop timeout.
 const QUIESCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on how long a replaced worker family can keep running after its
+/// successor is published: quiesce, the grace wait, then forced cleanup.
+pub(crate) const REPLACED_FAMILY_LIFETIME: Duration = Duration::from_secs(
+    QUIESCE_TIMEOUT.as_secs() + GRACE_TIMEOUT.as_secs() + FORCE_CLEANUP_TIMEOUT.as_secs(),
+);
 const MIN_SUPERVISED_CHILDREN: u32 = 2;
 const GENERATION_MARKER_ENV: &str = "LSAPI_Z_HTTPJET_GENERATION_MARKER";
 
@@ -529,8 +708,7 @@ impl LsphpSupervisor {
         let Ok(_lifecycle) = self.lifecycle.try_lock() else {
             return self.inner.lock().state;
         };
-        let protected_child = self.inner.lock().child.as_ref().and_then(Child::id);
-        match reap_adopted_curl_zombies(protected_child) {
+        match reap_adopted_zombies() {
             Ok(0) => {}
             Ok(reaped) => {
                 tracing::debug!(
@@ -696,7 +874,7 @@ impl LsphpSupervisor {
         let mut cmd = Command::new(&self.cfg.command);
         cmd.stdin(Stdio::null()) // replaced by our dup2 in pre_exec
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(lsphp_stderr(io::stderr().is_terminal()))
             // (L1) Reap the child on Drop: the supervisor's `Drop` `start_kill()`s but never
             // waits, so without this a kill_on_drop'd tokio child would zombie until the tokio
             // reaper notices. `kill_on_drop` registers it with the runtime reaper so the SIGKILL
@@ -786,9 +964,9 @@ impl LsphpSupervisor {
         // Empty (the default jail) => no unshare at all (today's behavior).
         let ns_flags = self.cfg.jail.namespaces;
         // SAFETY: the closure runs in the freshly-forked child before exec. It
-        // only calls async-signal-safe-ish syscalls (dup2/unshare/setgroups/
-        // setgid/chroot/chdir/setuid/setrlimit). No heap allocation, no locks, no
-        // name resolution. The closure captures `raw_listen_fd` (a plain RawFd),
+        // only calls async-signal-safe-ish syscalls (setsid/dup2/unshare/
+        // setgroups/setgid/chroot/chdir/setuid/setrlimit). No heap allocation,
+        // no locks, no name resolution. The closure captures `raw_listen_fd` (a plain RawFd),
         // not the OwnedFd itself; `listen_fd` lives in this OUTER scope and stays
         // open across the spawn, only dropped at the explicit `drop(listen_fd)`
         // below — so the fd `raw_listen_fd` names is valid when the child dup2s
@@ -815,6 +993,14 @@ impl LsphpSupervisor {
                     // the only correct way to leave a forked child here.
                     libc::_exit(1);
                 }
+                // --- Step 1b: leave the supervisor's session and with it any
+                // controlling terminal, before PHP runs (opcache.preload runs
+                // in the master, whose own later setsid fails with EPERM after
+                // its setpgid). A fresh fork is never a group leader, so this
+                // cannot fail; checked anyway so a failure never runs PHP
+                // attached to root's terminal.
+                rustix::process::setsid()
+                    .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))?;
                 // --- Step 2: hand the listen socket to lsphp on fd 0
                 // (LSAPI_SOCK_FILENO). dup2 clears O_CLOEXEC, so it survives exec.
                 let borrowed = std::os::fd::BorrowedFd::borrow_raw(raw_listen_fd);
@@ -896,11 +1082,23 @@ impl LsphpSupervisor {
                 // Complete all privileged setup first; normal PHP file access is
                 // unchanged, while set-id/capability gains at exec are prohibited.
                 set_no_new_privileges()?;
+                // --- Step 9: last, after fchdir(chroot fd): only fd 0 and stdio
+                // survive the exec.
+                cloexec_fds_from_3();
                 Ok(())
             });
         }
 
-        let child = cmd.spawn()?;
+        let mut child = spawn_on_spawner_thread(cmd)?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(forward_lsphp_stderr(stderr, |line| {
+                tracing::warn!(
+                    target: "hj_lsapi::lsphp_stderr",
+                    "{}",
+                    String::from_utf8_lossy(line)
+                );
+            }));
+        }
         drop(chroot_pin);
         let mut candidate = ReadyChild::new(&self.inner, child, marker);
         // Drop our copy of the listen fd; the child has its dup on fd 0.
@@ -1914,20 +2112,29 @@ fn open_pidfd(pid: u32) -> io::Result<Option<OwnedFd>> {
     }
 }
 
-/// Reap exited curl subprocesses orphaned into this process by child-subreaper
-/// mode. PHP handlers deliberately use `exec("curl ... &")`; after their
-/// intermediate shell exits, Linux reparents curl to the nearest subreaper. It
-/// must be waited here when it later exits or it remains a zombie for the
-/// lifetime of the persistent pool.
+/// Reap exited background processes orphaned into this process by
+/// child-subreaper mode. PHP starts them with `exec("curl ... &")`,
+/// `nohup php ... &` or `(...) &`; once the intermediate shell exits, Linux
+/// reparents them to the nearest subreaper, and each must be waited here or
+/// it stays a zombie for the life of the persistent pool, counting against
+/// the pool user's process limit.
 ///
-/// The caller holds the supervisor lifecycle lock, so candidates and draining
-/// generations cannot race this scan. `protected_child` is the live master owned
-/// by Tokio's [`Child`] handle; never consume its exit status here. Restricting
-/// this to the proven curl caller also prevents one pool monitor from consuming
-/// the exit status of a child owned by a different supervisor in the same
-/// process.
-fn reap_adopted_curl_zombies(protected_child: Option<u32>) -> io::Result<usize> {
+/// Two guards keep this from consuming an exit status someone else waits on:
+/// a zombie registered by [`spawn_owned_child`] (every supervisor's masters,
+/// in any pool of this process) is skipped, and so is one in this process's
+/// own session. `fork` inherits the session, and PHP only runs in prefork
+/// workers (supervision keeps `MIN_SUPERVISED_CHILDREN`), each of which calls
+/// `setsid`; so a child left in our session is one this process forked
+/// directly (a `std`/tokio `Command`), never a PHP orphan.
+fn reap_adopted_zombies() -> io::Result<usize> {
     let self_pid = std::process::id();
+    // A spawn holds the registry across fork + registration; reap next tick.
+    let Some(owned) = OWNED_CHILDREN.try_lock() else {
+        return Ok(0);
+    };
+    let Some(self_session) = proc_session(self_pid) else {
+        return Ok(0);
+    };
     let mut reaped = 0;
     let mut children = Vec::new();
     for task in std::fs::read_dir(format!("/proc/{self_pid}/task"))?.flatten() {
@@ -1940,28 +2147,27 @@ fn reap_adopted_curl_zombies(protected_child: Option<u32>) -> io::Result<usize> 
         );
     }
     for pid in children {
-        if Some(pid) == protected_child {
-            continue;
-        }
         let Some(details) = proc_details(pid) else {
             continue;
         };
-        if details.parent != self_pid || details.state != b'Z' {
-            continue;
-        }
-        if !std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .is_ok_and(|comm| comm.trim() == "curl")
+        if details.parent != self_pid
+            || details.state != b'Z'
+            || details.session == self_session
+            || owned.iter().any(|child| child.is(pid, details.start_time))
         {
             continue;
         }
         let Some(pidfd) = open_pidfd(pid)? else {
             continue;
         };
-        // Revalidate after pidfd_open. A zombie cannot be numerically reused
-        // before it is reaped, and the pidfd pins that exact process object.
-        if !proc_details(pid)
-            .is_some_and(|current| current.parent == self_pid && current.state == b'Z')
-        {
+        // Revalidate after pidfd_open: the zombie seen above may have been
+        // reaped and its pid reused in between; the pidfd pins whatever holds
+        // the pid now, so it must still be that same zombie.
+        if !proc_details(pid).is_some_and(|current| {
+            current.parent == self_pid
+                && current.state == b'Z'
+                && current.start_time == details.start_time
+        }) {
             continue;
         }
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -2076,6 +2282,52 @@ impl Drop for BoundSocketPath {
     }
 }
 
+/// Root or this process's effective uid: the only directory owners that cannot
+/// swap the entries a (possibly root) supervisor creates, maps or chmods by name.
+pub(crate) fn is_operator_uid(uid: u32) -> bool {
+    uid == 0 || uid == rustix::process::geteuid().as_raw()
+}
+
+/// Refuse a state directory that another account could repopulate: it must be a
+/// directory owned by root or the effective uid, with no group or other write bit.
+pub fn validate_operator_dir(dir: &Path, what: &str) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::metadata(dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("{what} {} stat failed: {e}", dir.display()),
+        )
+    })?;
+    if !md.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{what} {} is not a directory", dir.display()),
+        ));
+    }
+    if !is_operator_uid(md.uid()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{what} {} is owned by uid {}, neither root nor this process's uid {}; its owner could replace entries in it",
+                dir.display(),
+                md.uid(),
+                rustix::process::geteuid().as_raw()
+            ),
+        ));
+    }
+    if md.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{what} {} is group/other-writable (mode {:o}); a local user could replace entries in it",
+                dir.display(),
+                md.mode() & 0o7777
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn bind_private_socket(path: &Path, backlog: i32) -> io::Result<(OwnedFd, BoundSocketPath)> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -2091,7 +2343,7 @@ fn bind_private_socket(path: &Path, backlog: i32) -> io::Result<(OwnedFd, BoundS
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(parent)?;
     let metadata = directory.metadata()?;
-    if ![0, rustix::process::geteuid().as_raw()].contains(&metadata.uid())
+    if !is_operator_uid(metadata.uid())
         || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
     {
         return Err(io::Error::new(
@@ -2992,6 +3244,31 @@ mod tests {
     }
 
     #[test]
+    fn child_exec_inherits_no_descriptor_above_stdio() {
+        use std::os::unix::process::CommandExt;
+        // A non-CLOEXEC descriptor, like an unadopted socket-activation listener.
+        let fd = unsafe { libc::fcntl(0, libc::F_DUPFD, 700) };
+        assert!(fd >= 700);
+        let probe = format!("[ -e /proc/self/fd/{fd} ]");
+        let leaked = std::process::Command::new("/bin/sh")
+            .args(["-c", &probe])
+            .status()
+            .unwrap();
+        assert!(leaked.success(), "control: the fd is inherited by default");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", &probe]);
+        unsafe {
+            command.pre_exec(|| {
+                cloexec_fds_from_3();
+                Ok(())
+            });
+        }
+        let status = command.status().unwrap();
+        unsafe { libc::close(fd) };
+        assert!(!status.success(), "fd {fd} survived exec");
+    }
+
+    #[test]
     fn child_exec_cannot_gain_new_privileges() {
         use std::os::unix::process::CommandExt;
         let mut command = std::process::Command::new("/bin/cat");
@@ -3039,13 +3316,20 @@ mod tests {
         assert!(reject_file_capabilities(&file).is_err());
     }
 
-    fn write_fake_lsapi_master(tag: &str, fail_after_first: bool) -> (PathBuf, PathBuf) {
-        let base = std::env::temp_dir().join(format!(
+    /// lsphp ignores its own `setsid`'s EPERM; so does the fake, now that the
+    /// supervisor's pre_exec already made it a session leader.
+    const FAKE_MASTER_SETSID: &str = "try:\n    os.setsid()\nexcept PermissionError:\n    pass\n";
+
+    fn fake_master_base(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
             "hj-lsapi-{tag}-{}-{}",
             std::process::id(),
             rand_suffix()
-        ));
-        let program = base.with_extension("py");
+        ))
+    }
+
+    fn write_fake_lsapi_master(tag: &str, fail_after_first: bool) -> (PathBuf, PathBuf) {
+        let base = fake_master_base(tag);
         let counter = base.with_extension("count");
         let gate = if fail_after_first {
             format!(
@@ -3062,6 +3346,42 @@ with open({counter:?}, "r") as count:
         } else {
             String::new()
         };
+        let program = write_lsapi_master_program(&base, &format!("{gate}\n{FAKE_MASTER_SETSID}"));
+        (program, counter)
+    }
+
+    /// A fake master that does NOT call `setsid` itself, so its session is the
+    /// one the supervisor gave it. Before serving it records
+    /// `pid sid isatty(1) isatty(2) errno-of-open("/dev/tty")` (0 = opened)
+    /// and writes `stderr_line`, if any, to its stderr.
+    fn write_probe_lsapi_master(tag: &str, stderr_line: Option<&str>) -> (PathBuf, PathBuf) {
+        let base = fake_master_base(tag);
+        let probe = base.with_extension("probe");
+        let staged = base.with_extension("probe-tmp");
+        let stderr = stderr_line
+            .map(|line| format!("sys.stderr.write({line:?} + \"\\n\")\nsys.stderr.flush()\n"))
+            .unwrap_or_default();
+        let prelude = format!(
+            r#"
+def tty_errno():
+    try:
+        os.close(os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY))
+    except OSError as error:
+        return error.errno
+    return 0
+
+with open({staged:?}, "w") as output:
+    output.write("%d %d %d %d %d" % (os.getpid(), os.getsid(0), os.isatty(1), os.isatty(2), tty_errno()))
+os.rename({staged:?}, {probe:?})
+{stderr}
+"#
+        );
+        let program = write_lsapi_master_program(&base, &prelude);
+        (program, probe)
+    }
+
+    fn write_lsapi_master_program(base: &Path, prelude: &str) -> PathBuf {
+        let program = base.with_extension("py");
         let source = format!(
             r#"#!/usr/bin/python3
 import os
@@ -3070,9 +3390,7 @@ import socket
 import struct
 import sys
 
-{gate}
-
-os.setsid()
+{prelude}
 
 def stop(_signal, _frame):
     sys.exit(0)
@@ -3112,7 +3430,7 @@ while True:
         let mut permissions = std::fs::metadata(&program).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&program, permissions).unwrap();
-        (program, counter)
+        program
     }
 
     fn write_hanging_lsapi_master(tag: &str) -> (PathBuf, PathBuf) {
@@ -3129,7 +3447,10 @@ import os
 import socket
 import time
 
-os.setsid()
+try:
+    os.setsid()
+except PermissionError:
+    pass
 listener = socket.socket(fileno=0)
 stream, _ = listener.accept()
 with open({accepted:?}, "w") as output:
@@ -3514,6 +3835,312 @@ while True:
         let _ = std::fs::remove_file(counter);
     }
 
+    /// #782: PR_SET_PDEATHSIG is thread-scoped. A master forked from a tokio
+    /// worker that then retires (block_in_place + thread_keep_alive) must not be
+    /// SIGTERMed by the kernel.
+    #[test]
+    fn master_survives_retirement_of_the_spawning_worker_thread() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_keep_alive(Duration::from_secs(1))
+            .enable_all()
+            .build()
+            .unwrap();
+        let (program, counter) = write_fake_lsapi_master("pdeath", false);
+        let socket = probe_socket("pdeath");
+        let _ = std::fs::remove_file(&socket);
+        let listener = StdUnixListener::bind(&socket).unwrap();
+        rustix::net::listen(&listener, 128).unwrap();
+        let supervisor = Arc::new(
+            LsphpSupervisor::new(fake_supervisor_config(program.clone(), &socket))
+                .with_listen_fd(listener.into()),
+        );
+        let sup = supervisor.clone();
+        let pid = rt.block_on(async move {
+            tokio::spawn(async move {
+                sup.start().await.expect("start");
+                let pid = sup.worker_pid().unwrap();
+                // The worker hands its core off and later exits as an idle
+                // blocking-pool thread, as the page-cache store path does.
+                tokio::task::block_in_place(|| std::thread::sleep(Duration::from_secs(2)));
+                pid
+            })
+            .await
+            .unwrap()
+        });
+        // Past the retired thread's 1 s keep-alive.
+        rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+        let alive = matches!(proc_state(pid), Some(s) if s != b'Z');
+        let _ = rt.block_on(supervisor.drain());
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(program);
+        let _ = std::fs::remove_file(counter);
+        assert!(
+            alive,
+            "lsphp master {pid} died although nothing asked it to stop"
+        );
+    }
+
+    fn fd2_identity(pid: &str) -> std::fs::Metadata {
+        std::fs::metadata(format!("/proc/{pid}/fd/2")).unwrap()
+    }
+
+    /// Regression (#1078): lsphp's master starts in its own session, never the
+    /// supervisor's (and so never on its controlling terminal), and a
+    /// non-terminal stderr is still the supervisor's own open file.
+    #[tokio::test]
+    async fn lsphp_master_runs_in_its_own_session() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let (program, probe) = write_probe_lsapi_master("own-session", None);
+        let socket = probe_socket("own-session");
+        let _ = std::fs::remove_file(&socket);
+        let listener = StdUnixListener::bind(&socket).unwrap();
+        rustix::net::listen(&listener, 128).unwrap();
+        let supervisor = LsphpSupervisor::new(fake_supervisor_config(program.clone(), &socket))
+            .with_listen_fd(listener.into());
+        supervisor.start().await.expect("start");
+        let master = supervisor.worker_pid().unwrap();
+        let report = std::fs::read_to_string(&probe).unwrap();
+        let theirs = fd2_identity(&master.to_string());
+        let ours = fd2_identity("self");
+        let our_session = proc_session(std::process::id()).unwrap();
+        let master_session = proc_session(master);
+        let _ = supervisor.drain().await;
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(program);
+        let _ = std::fs::remove_file(probe);
+
+        let fields: Vec<u32> = report
+            .split_ascii_whitespace()
+            .map(|field| field.parse().unwrap())
+            .collect();
+        assert_eq!(fields[0], master, "{report}");
+        assert_eq!(fields[1], master, "the master must lead its own session");
+        assert_eq!(master_session, Some(master), "/proc stat session field");
+        assert_ne!(master_session, Some(our_session));
+        if io::stderr().is_terminal() {
+            assert!(theirs.file_type().is_fifo());
+        } else {
+            assert_eq!(
+                (theirs.dev(), theirs.ino()),
+                (ours.dev(), ours.ino()),
+                "a non-terminal stderr must be inherited unchanged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lsphp_stderr_forwarder_splits_and_caps_lines() {
+        let cap = LSPHP_STDERR_LINE_MAX as usize;
+        let mut input = b"first\r\n\nsecond\n".to_vec();
+        input.extend(std::iter::repeat_n(b'x', cap + 10));
+        input.extend_from_slice(b"\ntail");
+        let mut lines = Vec::new();
+        forward_lsphp_stderr(&input[..], |line| lines.push(line.to_vec())).await;
+        assert_eq!(
+            lines,
+            vec![
+                b"first".to_vec(),
+                b"second".to_vec(),
+                vec![b'x'; cap],
+                vec![b'x'; 10],
+                b"tail".to_vec(),
+            ]
+        );
+    }
+
+    const PTY_PROBE_ENV: &str = "HJ_LSAPI_PTY_PROBE";
+    const LSPHP_STDERR_PROBE: &str = "hj-lsphp-stderr-probe";
+
+    fn open_pty() -> Option<(OwnedFd, OwnedFd)> {
+        // SAFETY: each call only takes the descriptor and the local name
+        // buffer; every returned descriptor is owned exactly once.
+        unsafe {
+            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC);
+            if master < 0 {
+                return None;
+            }
+            let master = OwnedFd::from_raw_fd(master);
+            if libc::grantpt(master.as_raw_fd()) != 0 || libc::unlockpt(master.as_raw_fd()) != 0 {
+                return None;
+            }
+            let mut name = [0 as libc::c_char; 128];
+            if libc::ptsname_r(master.as_raw_fd(), name.as_mut_ptr(), name.len()) != 0 {
+                return None;
+            }
+            let slave = libc::open(
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+            );
+            (slave >= 0).then(|| (master, OwnedFd::from_raw_fd(slave)))
+        }
+    }
+
+    /// Regression (#1078): a supervisor started from a terminal (root's SSH
+    /// session) hands lsphp neither that terminal as stderr nor a controlling
+    /// terminal, and nothing lsphp writes reaches the terminal.
+    #[test]
+    fn lsphp_spawned_from_a_terminal_cannot_reach_it() {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        let Some((terminal, slave)) = open_pty() else {
+            eprintln!("skipping: no pseudo-terminal available");
+            return;
+        };
+        let probe = std::env::temp_dir().join(format!(
+            "hj-lsapi-pty-{}-{}.report",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "supervisor::tests::pty_probe_helper",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PTY_PROBE_ENV, &probe)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        // SAFETY: setsid and ioctl are async-signal-safe and allocation-free.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // The helper leads its own session, so another test's subreaper pass
+        // in this binary would reap it unless it is registered as owned, as
+        // spawn_owned_child does for lsphp masters (held across the fork).
+        let mut helper = {
+            let mut owned = OWNED_CHILDREN.lock();
+            let helper = command.spawn().unwrap();
+            owned.push(OwnedChild {
+                pid: helper.id(),
+                start_time: proc_details(helper.id()).map(|details| details.start_time),
+            });
+            helper
+        };
+        drop(command);
+        let (transcript_tx, transcript_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut terminal = std::fs::File::from(terminal);
+            let mut transcript = Vec::new();
+            let mut buf = [0u8; 4096];
+            // EIO once the last slave descriptor closes.
+            while let Ok(n @ 1..) = terminal.read(&mut buf) {
+                transcript.extend_from_slice(&buf[..n]);
+            }
+            let _ = transcript_tx.send(transcript);
+        });
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = helper.kill();
+                let _ = helper.wait();
+                panic!("pty helper did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let transcript = transcript_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("something still holds the terminal open after the helper exited");
+        let transcript = String::from_utf8_lossy(&transcript);
+        let report = std::fs::read_to_string(&probe);
+        let _ = std::fs::remove_file(&probe);
+        assert!(status.success(), "{status}: {transcript}");
+        let report = report.unwrap_or_else(|error| panic!("no report ({error}): {transcript}"));
+        let fields: Vec<i64> = report
+            .split_ascii_whitespace()
+            .map(|field| field.parse().unwrap())
+            .collect();
+        let [
+            pid,
+            sid,
+            stdout_tty,
+            stderr_tty,
+            tty_errno,
+            helper_sid,
+            stderr_fifo,
+        ] = fields[..]
+        else {
+            panic!("malformed report {report:?}");
+        };
+        assert_eq!(sid, pid, "lsphp master must lead its own session");
+        assert_ne!(
+            sid, helper_sid,
+            "lsphp master stayed in the terminal's session"
+        );
+        assert_eq!(stdout_tty, 0, "lsphp stdout is a terminal");
+        assert_eq!(stderr_tty, 0, "lsphp stderr is a terminal");
+        assert_eq!(
+            stderr_fifo, 1,
+            "a terminal stderr must become the forwarding pipe"
+        );
+        assert_eq!(
+            tty_errno,
+            i64::from(libc::ENXIO),
+            "lsphp could open /dev/tty"
+        );
+        assert!(
+            !transcript.contains(LSPHP_STDERR_PROBE),
+            "lsphp wrote to the terminal: {transcript}"
+        );
+    }
+
+    #[test]
+    #[ignore = "driven under a pty by lsphp_spawned_from_a_terminal_cannot_reach_it"]
+    fn pty_probe_helper() {
+        use std::os::unix::fs::FileTypeExt;
+        let Some(report_path) = std::env::var_os(PTY_PROBE_ENV) else {
+            return;
+        };
+        assert!(io::stderr().is_terminal(), "helper stderr is not the pty");
+        assert!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/tty")
+                .is_ok(),
+            "helper has no controlling terminal"
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (program, probe) = write_probe_lsapi_master("pty", Some(LSPHP_STDERR_PROBE));
+            let socket = probe_socket("pty");
+            let _ = std::fs::remove_file(&socket);
+            let listener = StdUnixListener::bind(&socket).unwrap();
+            rustix::net::listen(&listener, 128).unwrap();
+            let supervisor = LsphpSupervisor::new(fake_supervisor_config(program.clone(), &socket))
+                .with_listen_fd(listener.into());
+            supervisor.start().await.expect("start");
+            let master = supervisor.worker_pid().unwrap();
+            let lsphp = std::fs::read_to_string(&probe).unwrap();
+            let stderr_fifo = fd2_identity(&master.to_string()).file_type().is_fifo();
+            let helper_sid = proc_session(std::process::id()).unwrap();
+            let _ = supervisor.drain().await;
+            let _ = std::fs::remove_file(socket);
+            let _ = std::fs::remove_file(program);
+            let _ = std::fs::remove_file(probe);
+            std::fs::write(
+                report_path,
+                format!("{lsphp} {helper_sid} {}", u8::from(stderr_fifo)),
+            )
+            .unwrap();
+        });
+    }
+
     #[tokio::test]
     async fn retired_marker_is_queued_if_cleanup_future_is_cancelled() {
         let supervisor = Arc::new(LsphpSupervisor::new(SupervisorConfig::from_php_config(
@@ -3836,7 +4463,9 @@ while True:
         let listener = StdUnixListener::bind(&socket).unwrap();
         rustix::net::listen(&listener, 128).unwrap();
         let mut config = fake_supervisor_config(program.clone(), &socket);
-        config.start_timeout = Duration::from_millis(250);
+        // Generous: the healthy first generation must become ready even on a loaded
+        // box; the failing candidate exits early and is reported once this elapses.
+        config.start_timeout = Duration::from_secs(2);
         let supervisor = LsphpSupervisor::new(config).with_listen_fd(listener.into());
 
         supervisor.start().await.expect("first fake generation");

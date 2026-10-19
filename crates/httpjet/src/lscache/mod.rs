@@ -352,6 +352,76 @@ fn is_control_header(name: &HeaderName) -> bool {
     )
 }
 
+/// Whether `headers` carries any internal control header (see [`is_control_header`]).
+pub(crate) fn has_control_header(headers: &HeaderMap) -> bool {
+    [
+        HDR_CACHE_CONTROL,
+        HDR_TAG,
+        HDR_VARY,
+        HDR_PURGE,
+        HDR_XF_CAPSULE,
+        HDR_XF_CAPSULE_TAGS,
+    ]
+    .iter()
+    .any(|h| headers.contains_key(*h))
+}
+
+/// Execute every `X-LiteSpeed-Purge` directive in `headers` against `store`.
+fn execute_purges(store: &hj_pagecache::PageStore, headers: &HeaderMap) {
+    for p in headers
+        .get_all(HDR_PURGE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+    {
+        match parse_purge(p) {
+            Purge::All => store.purge_all(),
+            Purge::Tags(tags) => {
+                let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                store.purge_tags(&refs);
+            }
+        }
+    }
+}
+
+/// Terminal-response funnel for paths that never reach [`cache_store`] (generated
+/// error pages, redirects, extension responses): execute the purges a backend or a
+/// `Header always set` emitted, then strip every internal control header. Strip
+/// happens with or without a page cache; it is idempotent, and a response that went
+/// through `cache_store` carries nothing left to act on.
+/// Whether `headers` carry an `X-LiteSpeed-Purge` directive.
+pub(crate) fn has_purge_header(headers: &HeaderMap) -> bool {
+    headers.contains_key(HDR_PURGE)
+}
+
+/// Strip the control headers from an on-core static response that carries no purge.
+pub(crate) fn strip_static_control_headers(headers: &mut HeaderMap) {
+    strip_control_headers(headers);
+}
+
+pub(crate) fn settle_control_headers(state: &ServerState, headers: &mut HeaderMap) {
+    if !has_control_header(headers) {
+        return;
+    }
+    if let Some(store) = state.page_cache.as_ref() {
+        execute_purges(store, headers);
+    }
+    // The capsule status marker shares the control header's name: a capsule hit's
+    // `hit…` stamp is egress (the deploy capsule gate reads it), not a directive (#932).
+    let status = headers
+        .get(HDR_XF_CAPSULE_STATUS)
+        .filter(|v| is_capsule_status_marker(v.as_bytes()))
+        .cloned();
+    strip_control_headers(headers);
+    if let Some(status) = status {
+        headers.insert(HDR_XF_CAPSULE_STATUS, status);
+    }
+}
+
+/// A value `mark_capsule` stamps: `hit` or `hit,<qualifier>`.
+fn is_capsule_status_marker(value: &[u8]) -> bool {
+    value == b"hit" || value.starts_with(b"hit,")
+}
+
 /// Remove the internal `X-LiteSpeed-*` control headers so they never reach the
 /// client / Cloudflare. (`Cache-Control` / `CDN-Cache-Control` are NOT touched —
 /// Cloudflare needs them.)
@@ -415,6 +485,10 @@ pub struct CacheCtx<'a> {
     /// Referer, X-*, plus Origin from inline/pre-rewrite sources), computed by
     /// `rewrite_glue::page_cache_header_vary`; `None` keeps the historic key.
     pub header_vary: Option<&'a str>,
+    /// A rewrite `[E=Cache-Vary:…]` / `[E=Cache-Control:vary=…]` ran for this request
+    /// ([`is_cache_vary_env`], recorded where the env was merged). Only then is `ctx.env`
+    /// scanned for per-URL vary names.
+    pub env_vary: bool,
 }
 
 /// Try to look the request up in the page cache. `Some(resp)` ⇒ serve the hit
@@ -455,7 +529,11 @@ fn strip_shared_cdn_cache_directives(headers: &mut http::HeaderMap) {
 }
 
 fn egress_ae<'a>(state: &ServerState, ctx: &'a ReqCtx) -> &'a str {
-    if state.compress.cf_send_zstd() && ctx.trusted_proxy {
+    // A non-empty AE that accepts no coding (an empty one takes the brotli fill
+    // default): a `no-gzip` hit is served identity, never a stored variant.
+    if hj_compress::no_gzip(ctx) {
+        "identity"
+    } else if state.compress.cf_send_zstd() && ctx.trusted_proxy {
         "zstd"
     } else {
         ctx.get_env(ACCEPT_ENCODING_ENV).unwrap_or("")
@@ -534,7 +612,6 @@ fn lookup(
     let &CacheCtx {
         method,
         host,
-        identity,
         req_path,
         req_query,
         chain,
@@ -607,8 +684,19 @@ fn lookup(
         return CacheOutcome::Bypass;
     }
 
+    // The historic key path; only a URL that may vary (lock-free pre-filter) is extended.
     let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
     let key_hash = hash_key(&key);
+    let resolved_identity: Cow<'_, str>;
+    let (key, key_hash, identity, varied_base) = if !url_vary_may_apply(cc, store, key_hash) {
+        (key, key_hash, cc.identity, None)
+    } else {
+        let Some(r) = resolve_url_vary(ctx, cc, store, &route, key, key_hash) else {
+            return CacheOutcome::Bypass;
+        };
+        resolved_identity = r.identity;
+        (r.key, r.key_hash, &*resolved_identity, r.varied_base)
+    };
     // (W-TinyLFU) Record this cacheable lookup in the admission sketch — true access frequency
     // (hit OR miss), so the store-admission gate can reject one-hit-wonders. Cheap atomic bumps.
     // The fast path records only the hits it serves (see `LookupMode`).
@@ -626,6 +714,13 @@ fn lookup(
         LookupMode::Full => store.get_entry_hashed(key_hash, &key, identity, now),
         LookupMode::FastPath => store.get_entry_hashed_uncounted(key_hash, &key, identity, now),
     };
+    if let (
+        Some(base_hash),
+        hj_pagecache::EntryState::Fresh(_) | hj_pagecache::EntryState::Stale(_),
+    ) = (varied_base, &probed)
+    {
+        store.url_vary_touch(base_hash, key_hash);
+    }
     let mut entry = match probed {
         hj_pagecache::EntryState::Fresh(e) => e,
         // Dispatch serves the stale body and spawns the refresh; don't build it twice.
@@ -642,7 +737,9 @@ fn lookup(
             if entry_is_self_redirect(&e, ctx.is_tls, host, req_path, req_query) {
                 return CacheOutcome::Miss(key_hash);
             }
-            if !entry_scope_matches_route(&e, &route) {
+            // A private page is re-rendered, never served stale: the stale egress
+            // below is public (#1016).
+            if !matches!(route, PrivateRoute::Public) || !entry_scope_matches_route(&e, &route) {
                 return CacheOutcome::Miss(key_hash);
             }
             // Serve the stale body immediately; the caller spawns ONE background refresh
@@ -709,7 +806,14 @@ fn lookup(
         (200..300).contains(&entry.status),
     ) {
         if hit::if_none_match_matches(inm, etag) {
-            let mut resp = hit::not_modified(&entry, etag, now);
+            let mut resp = hit::not_modified(
+                &entry,
+                etag,
+                now,
+                inm,
+                AcceptEncoding::parse(egress_ae(state, ctx)),
+                &state.compress,
+            );
             // Apply the SAME private-tier guarantees as the 200 hit below: a private-routed
             // 304 must match its owner (else degrade to a miss, never cross-serve), and must
             // NEVER advertise a shared-cacheable Cache-Control — force `private, no-store` so
@@ -718,10 +822,7 @@ fn lookup(
                 if entry.scope != (hj_pagecache::PageScope::Private { owner_hash: *owner }) {
                     return CacheOutcome::Miss(key_hash);
                 }
-                resp.headers_mut().insert(
-                    http::header::CACHE_CONTROL,
-                    HeaderValue::from_static("private, no-store"),
-                );
+                force_cache_control(resp.headers_mut(), "private, no-store");
                 strip_shared_cdn_cache_directives(resp.headers_mut());
             }
             maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
@@ -738,6 +839,7 @@ fn lookup(
     // re-insert sets `variants_filled`) and only when a variant could actually help.
     let capsule_shell = capsule_entry_shell_capable(&entry);
     if !entry.variants_filled
+        && !hj_compress::no_gzip(ctx)
         && hit::eligible_for_variants(
             state,
             &entry.headers,
@@ -787,10 +889,7 @@ fn lookup(
                 // stored Cache-Control, so a missing/`public` header on a private page can't
                 // leak one member's rendered HTML cross-user. httpjet's own origin private
                 // tier is driven by X-LiteSpeed-Cache-Control, independent of this header.
-                resp.headers_mut().insert(
-                    http::header::CACHE_CONTROL,
-                    HeaderValue::from_static("private, no-store"),
-                );
+                force_cache_control(resp.headers_mut(), "private, no-store");
                 strip_shared_cdn_cache_directives(resp.headers_mut());
             }
             // Pin/open the selected stored body before a background recompress can
@@ -833,8 +932,15 @@ fn matching_dict(state: &ServerState, dict_gen: u32) -> Option<&hj_compress::Pag
         .map(|d| d.as_ref())
 }
 
-fn stored_file_body(store: &hj_pagecache::PageStore, entry: &CachedResponse) -> Option<FileBody> {
-    let f = store.body_file(entry)?;
+fn stored_file_body(
+    store: &hj_pagecache::PageStore,
+    entry: &CachedResponse,
+    deferred: Option<&hj_pagecache::BodyReadFailures>,
+) -> Option<FileBody> {
+    let f = match deferred {
+        Some(failures) => store.body_file_deferred(entry, failures)?,
+        None => store.body_file(entry)?,
+    };
     if f.body_len == 0 {
         return None;
     }
@@ -869,29 +975,38 @@ fn build_hit_response_with_successor_retry(
     // The caller already validated its lookup snapshot. Borrow it directly: an
     // Arc bump and a second dict/redirect/scope pass on every hit buy nothing.
     let candidate = entry.as_ref();
+    // A swap that retired this snapshot's file reads as a missing body here; only
+    // the successor outcome below tells it apart from a genuinely lost body.
+    let snapshot_failures = hj_pagecache::BodyReadFailures::default();
     if let Some(response) = hit::build_hit_response(
         candidate,
         now,
         accept_encoding,
+        &state.compress,
         is_head,
         matching_dict(state, candidate.dict_gen),
         Some(store),
-        || store.body_bytes(candidate),
-        || stored_file_body(store, candidate),
+        || store.body_bytes_deferred(candidate, &snapshot_failures),
+        || stored_file_body(store, candidate, Some(&snapshot_failures)),
     ) {
+        store.settle_body_read_failures(snapshot_failures, false);
         return Some(response);
     }
 
     // Remove a genuinely broken current version, but never a replacement
     // published after this request obtained its snapshot.
     if store.invalidate_entry_if_current(key, entry) {
+        store.settle_body_read_failures(snapshot_failures, false);
         return None;
     }
     let successor = match store.get_entry_uncounted(key, identity, now) {
         hj_pagecache::EntryState::Fresh(next)
         | hj_pagecache::EntryState::Stale(next)
         | hj_pagecache::EntryState::ErrorOnly(next) => next,
-        hj_pagecache::EntryState::Miss => return None,
+        hj_pagecache::EntryState::Miss => {
+            store.settle_body_read_failures(snapshot_failures, false);
+            return None;
+        }
     };
     // A recompress/variant enrichment preserves the logical version. Do not
     // silently switch this request to an unrelated re-render of the same key.
@@ -899,6 +1014,7 @@ fn build_hit_response_with_successor_retry(
         || successor.stored_at != entry.stored_at
         || !valid(&successor)
     {
+        store.settle_body_read_failures(snapshot_failures, false);
         return None;
     }
     *entry = successor;
@@ -908,12 +1024,14 @@ fn build_hit_response_with_successor_retry(
         candidate,
         now,
         accept_encoding,
+        &state.compress,
         is_head,
         matching_dict(state, candidate.dict_gen),
         Some(store),
         || store.body_bytes(candidate),
-        || stored_file_body(store, candidate),
+        || stored_file_body(store, candidate, None),
     );
+    store.settle_body_read_failures(snapshot_failures, response.is_some());
     if response.is_none() {
         // The successor itself failed to resolve. Retire it only if this exact
         // snapshot is still current; another enrichment remains untouched.
@@ -1392,11 +1510,27 @@ fn entry_is_self_redirect(
 /// header strip a stale serve would pin stale content at the CF edge for up to the 7-day
 /// s-maxage — the exact CF-poison class the origin cache must never create. The egress
 /// strip beats the internal key for CF (see the cross-scheme-redirect-cf-cache-loop memory).
+/// Replace a hit's Cache-Control with `value`, keeping a stored `no-transform`:
+/// the compress transform reads it from the egress headers, so dropping it would
+/// encode a page the app forbade transforming (#811).
+fn force_cache_control(headers: &mut HeaderMap, value: &'static str) {
+    let no_transform = headers
+        .get_all(http::header::CACHE_CONTROL)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|d| d.trim().eq_ignore_ascii_case("no-transform"));
+    let v = if no_transform {
+        HeaderValue::from_str(&format!("{value}, no-transform"))
+            .unwrap_or_else(|_| HeaderValue::from_static(value))
+    } else {
+        HeaderValue::from_static(value)
+    };
+    headers.insert(http::header::CACHE_CONTROL, v);
+}
+
 fn apply_stale_cf_egress(headers: &mut HeaderMap) {
-    headers.insert(
-        http::header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=30, must-revalidate"),
-    );
+    force_cache_control(headers, "public, max-age=30, must-revalidate");
     // Reset Age to 0. `build_hit_response` stamped `Age: <entry age>`, which on a STALE
     // entry is >= the app TTL (300s..7200s). A conforming cache (RFC 9111 §4.2.3, and CF)
     // seeds current_age from Age, so `max-age=30` minus a 7200s Age arrives ALREADY EXPIRED
@@ -1417,6 +1551,8 @@ fn apply_stale_cf_egress(headers: &mut HeaderMap) {
 /// Build THE page-cache key for a request — the single definition shared by [`cache_lookup`],
 /// [`cache_store`], and [`stale_if_error_fallback`], which MUST agree byte-for-byte: a lookup/store
 /// key divergence is the cache-poisoning failure class, so every key-component change happens HERE.
+/// (This is the BASE key; per-URL cookie vary extends it only in [`resolved_cache_key`] (readers)
+/// and `store_cache_key` (writers), which share one suffix builder.)
 ///
 /// Components and why:
 /// - Scheme (`ctx.is_tls`): XenForo emits a scheme-conditional canonical 301 (HTTP→HTTPS) marked
@@ -1440,6 +1576,26 @@ fn is_capsule_reserved_path(path: &str) -> bool {
     path.starts_with(CAPSULE_KEY_PREFIX)
 }
 
+/// (#938) The request host when it is an EXACT vhostMap alias of the resolved vhost (not the
+/// vhost's own name, not wildcard-routed): the backend renders the raw Host into og:url /
+/// canonical links, so each alias needs its own entry — OLS LSCache hashes the Host. The alias
+/// set is bounded by the configuration (a wildcard-routed host is foreign and never cached), so
+/// this cannot reopen the #5 Host-cycling eviction. `None` for the canonical host, whose key and
+/// identity bytes must not change (persisted file-tier entries stay valid across a deploy).
+pub(crate) fn cache_alias_host<'a>(
+    vhost_name: &str,
+    host: &'a str,
+    host_foreign: bool,
+) -> Option<&'a str> {
+    (!host_foreign && !host.is_empty() && !host.eq_ignore_ascii_case(vhost_name)).then_some(host)
+}
+
+fn key_host(ctx: &ReqCtx, cc: &CacheCtx<'_>) -> String {
+    cache_alias_host(&ctx.vhost_name, cc.host, cc.host_foreign)
+        .unwrap_or(&ctx.vhost_name)
+        .to_ascii_lowercase()
+}
+
 pub(crate) fn build_cache_key(
     ctx: &ReqCtx,
     cc: &CacheCtx<'_>,
@@ -1454,7 +1610,7 @@ pub(crate) fn build_cache_key(
     let mut key = public_with_vary(
         vhost_id_hash(&ctx.vhost_name),
         ctx.is_tls,
-        ctx.vhost_name.to_ascii_lowercase(),
+        key_host(ctx, cc),
         cc.req_path,
         normalized_query_for(cc.chain, cc.req_query),
         vary_value,
@@ -1503,6 +1659,283 @@ fn request_vary_suffix(cc: &CacheCtx<'_>) -> String {
     suffix
 }
 
+/// Cookie names the rewrite env asks this request to vary on, as OpenLiteSpeed's cache
+/// module reads them: `[E=Cache-Vary:a,b]` (env `cache-vary`, any case) and
+/// `[E=Cache-Control:vary=a,b]`. Each item may carry a `cookie=` prefix.
+fn env_vary_names<'c>(ctx: &'c ReqCtx, cc: &CacheCtx<'_>) -> Vec<&'c str> {
+    let mut out = Vec::new();
+    if !cc.env_vary {
+        return out;
+    }
+    for (k, v) in &ctx.env {
+        let Some(list) = env_vary_list(k, v) else {
+            continue;
+        };
+        for item in list.split(',') {
+            let item = item.trim();
+            let item = strip_ascii_prefix(item, "cookie=").unwrap_or(item).trim();
+            if !item.is_empty() {
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+/// The cookie list of an env assignment that requests a per-URL cache vary.
+fn env_vary_list<'v>(key: &str, value: &'v str) -> Option<&'v str> {
+    if key.eq_ignore_ascii_case("cache-vary") {
+        Some(value)
+    } else if key.eq_ignore_ascii_case("cache-control") || key.eq_ignore_ascii_case("cache-ctrl") {
+        strip_ascii_prefix(value, "vary=")
+    } else {
+        None
+    }
+}
+
+/// Whether an env assignment requests a per-URL cache vary (OLS `cache-vary`, or
+/// `cache-control: vary=`). The pipeline records it into [`CacheCtx::env_vary`].
+pub(crate) fn is_cache_vary_env(key: &str, value: &str) -> bool {
+    env_vary_list(key, value).is_some()
+}
+
+/// A key extended by per-URL cookie vary, with the identity guard extended to match.
+pub(crate) struct ResolvedKey<'a> {
+    pub key: hj_pagecache::PageCacheKey,
+    /// `hash_key(&key)`.
+    pub key_hash: u64,
+    pub identity: Cow<'a, str>,
+    /// `Some(base hash)` when `key` is a per-URL variant of that base key.
+    pub varied_base: Option<u64>,
+}
+
+impl<'a> ResolvedKey<'a> {
+    fn unvaried(key: hj_pagecache::PageCacheKey, key_hash: u64, identity: &'a str) -> Self {
+        ResolvedKey {
+            key,
+            key_hash,
+            identity: Cow::Borrowed(identity),
+            varied_base: None,
+        }
+    }
+}
+
+/// `base` (hashed `base_hash`) extended by the request's values of `names`.
+fn extend_resolved<'a>(
+    base: hj_pagecache::PageCacheKey,
+    base_hash: u64,
+    identity: &'a str,
+    cookie: Option<&str>,
+    names: &[String],
+) -> Option<ResolvedKey<'a>> {
+    if names.is_empty() {
+        return Some(ResolvedKey::unvaried(base, base_hash, identity));
+    }
+    let suffix = hj_pagecache::urlvary::suffix(cookie, names)?;
+    let key = hj_pagecache::urlvary::extend(&base, &suffix);
+    Some(ResolvedKey {
+        key_hash: hash_key(&key),
+        key,
+        identity: Cow::Owned(format!("{identity}{suffix}")),
+        varied_base: Some(base_hash),
+    })
+}
+
+/// THE lookup key: the base key ([`build_cache_key`] under the configuration generation),
+/// extended by the cookies this URL varies on — the spec a cacheable response recorded
+/// (`X-LiteSpeed-Vary: cookie=…` outside the global set) plus the rewrite env's
+/// `Cache-Vary`. Every reader (dispatch, the on-core fast path, single-flight followers,
+/// stale-while-revalidate, stale-if-error) goes through here, so they all agree. A URL with
+/// no per-URL vary gets the base key and identity unchanged. `None` ⇒ the request cannot be
+/// keyed (a vary cookie value too long, or a private route asked to vary): bypass.
+///
+/// The private tier and the capsule tier never hold per-URL variants: a private store of a
+/// response declaring extra cookie vary is refused, so a private lookup ignores the spec.
+pub(crate) fn resolved_cache_key<'a>(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'a>,
+    store: &hj_pagecache::PageStore,
+    route: &PrivateRoute,
+) -> Option<ResolvedKey<'a>> {
+    let base = configuration_key(state, build_cache_key(ctx, cc, store, route));
+    let base_hash = hash_key(&base);
+    resolve_url_vary(ctx, cc, store, route, base, base_hash)
+}
+
+/// [`resolved_cache_key`] given the already-built base key: the lookup builds the base key
+/// exactly as before and calls this only when [`url_vary_may_apply`] says it may vary.
+#[cold]
+fn resolve_url_vary<'a>(
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'a>,
+    store: &hj_pagecache::PageStore,
+    route: &PrivateRoute,
+    base: hj_pagecache::PageCacheKey,
+    base_hash: u64,
+) -> Option<ResolvedKey<'a>> {
+    let env = env_vary_names(ctx, cc);
+    let spec = match route {
+        PrivateRoute::Public => store.url_vary_names(&base, base_hash),
+        _ => None,
+    };
+    if spec.is_none() && env.is_empty() {
+        return Some(ResolvedKey::unvaried(base, base_hash, cc.identity));
+    }
+    let names = hj_pagecache::urlvary::normalize_names(
+        spec.iter()
+            .flat_map(|s| s.iter().map(String::as_str))
+            .chain(env.iter().copied()),
+        &store.config().vary_cookies,
+    )?;
+    if !names.is_empty() && !matches!(route, PrivateRoute::Public) {
+        return None;
+    }
+    extend_resolved(base, base_hash, cc.identity, cc.cookie, &names)
+}
+
+/// Lock-free: `false` ⇒ the base key `base_hash` is final (no spec can exist for it and no
+/// rewrite env asked to vary), so the caller keeps the historic key path.
+#[inline]
+fn url_vary_may_apply(cc: &CacheCtx<'_>, store: &hj_pagecache::PageStore, base_hash: u64) -> bool {
+    cc.env_vary || store.url_vary_may_have(base_hash)
+}
+
+/// Whether this request's URL varies per-URL (a recorded spec for its public base key, or
+/// the rewrite env's `Cache-Vary`). Only the capsule tier asks: it holds no variants.
+fn url_vary_applies(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'_>,
+    store: &hj_pagecache::PageStore,
+) -> bool {
+    if cc.env_vary
+        && !hj_pagecache::urlvary::normalize_names(
+            env_vary_names(ctx, cc),
+            &store.config().vary_cookies,
+        )
+        .is_some_and(|n| n.is_empty())
+    {
+        return true;
+    }
+    if !store.url_vary_active() {
+        return false;
+    }
+    // Every key family below carries this vhost id + path: one atomic load answers the
+    // common case without building a key.
+    if !store.url_vary_may_vary_path(vhost_id_hash(&ctx.vhost_name), cc.req_path) {
+        return false;
+    }
+    [
+        build_cache_key(ctx, cc, store, &PrivateRoute::Public),
+        capsule_public_fallback_key(ctx, cc, store),
+    ]
+    .into_iter()
+    .map(|k| configuration_key(state, k))
+    .any(|base| store.url_vary_names(&base, hash_key(&base)).is_some())
+}
+
+/// The cookie vary a response (plus the rewrite env) declares for a store.
+enum DeclaredVary {
+    /// Every dimension is a cookie we can key; the per-URL names outside the global set
+    /// (sorted; empty = only global cookies, the historic case).
+    Names(Vec<String>),
+    /// A non-cookie dimension, a malformed name, or too many names: never store publicly.
+    /// `extra_cookie` = a cookie outside the global set was named.
+    Unsupported { extra_cookie: bool },
+}
+
+impl DeclaredVary {
+    fn global_only(&self) -> bool {
+        matches!(self, DeclaredVary::Names(n) if n.is_empty())
+    }
+}
+
+/// Every `X-LiteSpeed-Vary` line must be all cookie-vary (a backend may emit several; any
+/// other dimension would under-key the entry). `env` = [`env_vary_names`].
+fn declared_vary(env: Vec<&str>, headers: &HeaderMap, global: &[String]) -> DeclaredVary {
+    let mut lines = headers.get_all(HDR_VARY).iter().peekable();
+    if env.is_empty() && lines.peek().is_none() {
+        return DeclaredVary::Names(Vec::new());
+    }
+    let mut all_cookie = true;
+    let mut names: Vec<String> = env.iter().map(|s| s.to_string()).collect();
+    for line in lines {
+        // A non-UTF-8 line was skipped by the historic gate too (`filter_map(to_str)`).
+        let Ok(v) = line.to_str() else { continue };
+        let (n, cookie_only) = parse_vary(v);
+        all_cookie &= cookie_only;
+        names.extend(n);
+    }
+    let extra_cookie = names.iter().any(|n| !global.iter().any(|g| g == n));
+    if !all_cookie {
+        return DeclaredVary::Unsupported { extra_cookie };
+    }
+    match hj_pagecache::urlvary::normalize_names(names.iter().map(String::as_str), global) {
+        Some(n) => DeclaredVary::Names(n),
+        None => DeclaredVary::Unsupported { extra_cookie },
+    }
+}
+
+/// The per-URL vary bookkeeping a public store commits with its entry.
+struct UrlVaryCommit {
+    base: hj_pagecache::PageCacheKey,
+    base_hash: u64,
+    names: Vec<String>,
+}
+
+struct StoreKey {
+    key: hj_pagecache::PageCacheKey,
+    key_hash: u64,
+    identity: String,
+    url_vary: Option<UrlVaryCommit>,
+}
+
+/// THE store key for a response that declared `names` (see [`declared_vary`]); `None` ⇒ the
+/// request's vary cookie value cannot be keyed exactly, so nothing is stored.
+fn store_cache_key(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'_>,
+    store: &hj_pagecache::PageStore,
+    route: &PrivateRoute,
+    names: &[String],
+) -> Option<StoreKey> {
+    let base = configuration_key(state, build_cache_key(ctx, cc, store, route));
+    let base_hash = hash_key(&base);
+    if !matches!(route, PrivateRoute::Public)
+        || (names.is_empty() && !store.url_vary_may_have(base_hash))
+    {
+        return Some(StoreKey {
+            key: base,
+            key_hash: base_hash,
+            identity: cc.identity.to_string(),
+            url_vary: None,
+        });
+    }
+    let resolved = extend_resolved(base.clone(), base_hash, cc.identity, cc.cookie, names)?;
+    let key_hash = resolved.key_hash;
+    if !names.is_empty() {
+        // The request that discovers (or changes) a URL's vary looked up a different key;
+        // carry its admission sighting over so the variant is admitted on the same schedule
+        // as any other URL rather than one render later.
+        let looked_up = resolved_cache_key(state, ctx, cc, store, route).map(|r| r.key_hash);
+        if looked_up != Some(key_hash) {
+            state.page_cache_admission.record(key_hash);
+        }
+    }
+    Some(StoreKey {
+        identity: resolved.identity.into_owned(),
+        key: resolved.key,
+        key_hash,
+        url_vary: Some(UrlVaryCommit {
+            base,
+            base_hash,
+            names: names.to_vec(),
+        }),
+    })
+}
+
 fn configuration_key(
     state: &ServerState,
     mut key: hj_pagecache::PageCacheKey,
@@ -1516,11 +1949,19 @@ fn configuration_key(
     key
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Dedicated capsule keys `capsule_key` built on this thread.
+    static CAPSULE_KEY_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn capsule_key(
     ctx: &ReqCtx,
     cc: &CacheCtx<'_>,
     store: &hj_pagecache::PageStore,
 ) -> hj_pagecache::PageCacheKey {
+    #[cfg(test)]
+    CAPSULE_KEY_BUILDS.with(|n| n.set(n.get() + 1));
     let path = if cc.req_path == "/" {
         format!("{CAPSULE_KEY_PREFIX}/")
     } else {
@@ -1529,7 +1970,7 @@ fn capsule_key(
     public_with_vary(
         vhost_id_hash(&ctx.vhost_name),
         ctx.is_tls,
-        ctx.vhost_name.to_ascii_lowercase(),
+        key_host(ctx, cc),
         path,
         normalized_query_for(cc.chain, cc.req_query),
         format!(
@@ -1562,7 +2003,7 @@ fn capsule_public_fallback_key(
     public_with_vary(
         vhost_id_hash(&ctx.vhost_name),
         ctx.is_tls,
-        ctx.vhost_name.to_ascii_lowercase(),
+        key_host(ctx, cc),
         cc.req_path,
         normalized_query_for(cc.chain, cc.req_query),
         format!(
@@ -1759,8 +2200,9 @@ fn capsule_member_lookup_allowed(
     state: &ServerState,
     cc: &CacheCtx<'_>,
     store: &hj_pagecache::PageStore,
+    member: bool,
 ) -> bool {
-    if !capsule_member_candidate(cc.cookie, store) {
+    if !member {
         return true;
     }
 
@@ -1798,6 +2240,7 @@ fn capsule_lookup_allowed(
     cc: &CacheCtx<'_>,
     store: &hj_pagecache::PageStore,
     gates: Option<&SharedCacheGates>,
+    member: bool,
 ) -> bool {
     state.xf_capsule.enabled
         && !is_capsule_reserved_path(cc.req_path)
@@ -1817,7 +2260,7 @@ fn capsule_lookup_allowed(
         && capsule_vhost_allowed(state, ctx)
         && capsule_path_allowed(state, cc.req_path, cc.req_query)
         && capsule_cookie_safe(cc.cookie)
-        && capsule_member_lookup_allowed(state, cc, store)
+        && capsule_member_lookup_allowed(state, cc, store, member)
         && gates
             .map(|g| g.chain_cacheable)
             .unwrap_or_else(|| {
@@ -1965,21 +2408,41 @@ fn stored_headers_from(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
     stored_headers
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Body hashes `ensure_stored_etag` computed on this thread.
+    static STORED_ETAG_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Only a 2xx gets a synthesized validator: a body hash says nothing about a redirect's
 /// Location, so every empty-body 301 would share one ETag (#658).
 fn ensure_stored_etag(status: u16, headers: &mut Vec<(HeaderName, HeaderValue)>, bytes: &Bytes) {
     if (200..300).contains(&status) && !headers.iter().any(|(k, _)| k == ETAG) {
+        #[cfg(test)]
+        STORED_ETAG_HASHES.with(|n| n.set(n.get() + 1));
         if let Ok(v) = HeaderValue::from_str(&hit::weak_etag(bytes)) {
             headers.push((ETAG, v));
         }
     }
 }
 
+/// The stored copy of a buffered miss's headers with its validator, and that validator.
+fn stored_headers_with_etag(
+    status: u16,
+    headers: &HeaderMap,
+    bytes: &Bytes,
+) -> (Vec<(HeaderName, HeaderValue)>, Option<HeaderValue>) {
+    let mut stored = stored_headers_from(headers);
+    ensure_stored_etag(status, &mut stored, bytes);
+    let etag = stored
+        .iter()
+        .find(|(name, _)| name == ETAG)
+        .map(|(_, value)| value.clone());
+    (stored, etag)
+}
+
 fn apply_capsule_member_egress(headers: &mut HeaderMap) {
-    headers.insert(
-        http::header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
-    );
+    force_cache_control(headers, "private, no-store");
     headers.remove(HeaderName::from_static("cloudflare-cdn-cache-control"));
     headers.remove(HeaderName::from_static("cdn-cache-control"));
     headers.remove(http::header::EXPIRES);
@@ -2137,7 +2600,14 @@ fn capsule_public_fallback_lookup(
         (200..300).contains(&entry.status),
     ) {
         if hit::if_none_match_matches(inm, etag) {
-            let mut resp = hit::not_modified(&entry, etag, now);
+            let mut resp = hit::not_modified(
+                &entry,
+                etag,
+                now,
+                inm,
+                AcceptEncoding::parse(egress_ae(state, ctx)),
+                &state.compress,
+            );
             mark_capsule(
                 resp.headers_mut(),
                 if stale {
@@ -2185,6 +2655,7 @@ fn capsule_public_fallback_lookup(
     // which only fills on the Fresh arm.
     if !stale
         && !entry.variants_filled
+        && !hj_compress::no_gzip(ctx)
         && hit::eligible_for_variants(
             state,
             &entry.headers,
@@ -2313,28 +2784,33 @@ pub fn capsule_lookup(
     let Some(store) = state.page_cache.as_ref() else {
         return CacheOutcome::Bypass;
     };
-    if !capsule_lookup_allowed(state, ctx, cc, store, gates) {
-        if capsule_member_candidate(cc.cookie, store)
-            || cookie_value(cc.cookie, CAPSULE_MEMBER_COOKIE) == Some("1")
-        {
+    let member = capsule_member_candidate(cc.cookie, store);
+    if !capsule_lookup_allowed(state, ctx, cc, store, gates, member) {
+        if member || cookie_value(cc.cookie, CAPSULE_MEMBER_COOKIE) == Some("1") {
             record_capsule_miss(state, "not_allowed");
         }
         return CacheOutcome::Bypass;
     }
 
+    // The capsule tier never holds per-URL variants (a response varying on a cookie outside
+    // the global set is not capsule-stored), so a URL that varies is served by `cache_lookup`.
+    if url_vary_applies(state, ctx, cc, store) {
+        return CacheOutcome::Bypass;
+    }
     // (2026-10-04) Guests never probe the dedicated key: their page is the PUBLIC entry that
     // `cache_lookup` serves next, so the extra probe (39k "dedicated misses" per 2.5 h) bought
     // nothing. Members fall straight through to the shell-capable public entry unless dedicated
     // stores are enabled (`--xf-capsule-dedicated-store`).
-    if !capsule_member_candidate(cc.cookie, store) {
+    if !member {
         return CacheOutcome::Bypass;
+    }
+    let now = Instant::now();
+    if !state.xf_capsule.dedicated_store {
+        // No dedicated key exists to report; dispatch ignores a capsule miss's hash (#984).
+        return capsule_public_fallback_lookup(state, ctx, cc, store, now, 0, if_none_match);
     }
     let key = configuration_key(state, capsule_key(ctx, cc, store));
     let key_hash = hash_key(&key);
-    let now = Instant::now();
-    if !state.xf_capsule.dedicated_store {
-        return capsule_public_fallback_lookup(state, ctx, cc, store, now, key_hash, if_none_match);
-    }
     let mut entry = match store.get_entry_uncounted(&key, cc.identity, now) {
         hj_pagecache::EntryState::Fresh(e) => e,
         hj_pagecache::EntryState::Stale(mut e) => {
@@ -2365,7 +2841,7 @@ pub fn capsule_lookup(
             // (defense-in-depth) Never hand a member a non-Public dedicated entry. The dedicated
             // key is namespaced (capsule_key = prefix+path) and stored Public-scoped, so this can
             // only fire on a slot collision/corruption — degrade to the public-fallback miss path.
-            if capsule_member_candidate(cc.cookie, store) && !matches!(e.scope, PageScope::Public) {
+            if member && !matches!(e.scope, PageScope::Public) {
                 record_capsule_miss(state, "dedicated_miss");
                 return capsule_public_fallback_lookup(
                     state,
@@ -2395,8 +2871,7 @@ pub fn capsule_lookup(
                             cc.req_path,
                             cc.req_query,
                         )
-                        && (!capsule_member_candidate(cc.cookie, store)
-                            || matches!(candidate.scope, PageScope::Public))
+                        && (!member || matches!(candidate.scope, PageScope::Public))
                 },
             ) else {
                 record_capsule_miss(state, "dedicated_miss");
@@ -2415,7 +2890,6 @@ pub fn capsule_lookup(
             mark_capsule(resp.headers_mut(), "hit,stale");
             mark_hot_path(resp.headers_mut(), "l2-stale");
             let age_secs = mark_shell_age(resp.headers_mut(), &e, now);
-            let member = capsule_member_candidate(cc.cookie, store);
             if member {
                 apply_capsule_member_egress(resp.headers_mut());
             }
@@ -2446,7 +2920,7 @@ pub fn capsule_lookup(
     }
     // (defense-in-depth) A member must never be handed a non-Public dedicated entry (see the
     // Stale arm above) — degrade to the public-fallback miss path if scope is ever not Public.
-    if capsule_member_candidate(cc.cookie, store) && !matches!(entry.scope, PageScope::Public) {
+    if member && !matches!(entry.scope, PageScope::Public) {
         record_capsule_miss(state, "dedicated_miss");
         return capsule_public_fallback_lookup(state, ctx, cc, store, now, key_hash, if_none_match);
     }
@@ -2457,11 +2931,17 @@ pub fn capsule_lookup(
         (200..300).contains(&entry.status),
     ) {
         if hit::if_none_match_matches(inm, etag) {
-            let mut resp = hit::not_modified(&entry, etag, now);
+            let mut resp = hit::not_modified(
+                &entry,
+                etag,
+                now,
+                inm,
+                AcceptEncoding::parse(egress_ae(state, ctx)),
+                &state.compress,
+            );
             mark_capsule(resp.headers_mut(), "hit");
             mark_hot_path(resp.headers_mut(), "l1-fresh");
             let age_secs = mark_shell_age(resp.headers_mut(), &entry, now);
-            let member = capsule_member_candidate(cc.cookie, store);
             if member {
                 apply_capsule_member_egress(resp.headers_mut());
             }
@@ -2473,6 +2953,7 @@ pub fn capsule_lookup(
     let accept_encoding = AcceptEncoding::parse(egress_ae(state, ctx));
     let capsule_shell = capsule_entry_shell_capable(&entry);
     if !entry.variants_filled
+        && !hj_compress::no_gzip(ctx)
         && hit::eligible_for_variants(
             state,
             &entry.headers,
@@ -2508,8 +2989,7 @@ pub fn capsule_lookup(
                     cc.req_path,
                     cc.req_query,
                 )
-                && (!capsule_member_candidate(cc.cookie, store)
-                    || matches!(candidate.scope, PageScope::Public))
+                && (!member || matches!(candidate.scope, PageScope::Public))
         },
     ) {
         Some(mut resp) => {
@@ -2517,7 +2997,6 @@ pub fn capsule_lookup(
             mark_capsule(resp.headers_mut(), "hit");
             mark_hot_path(resp.headers_mut(), "l1-fresh");
             let age_secs = mark_shell_age(resp.headers_mut(), &entry, now);
-            let member = capsule_member_candidate(cc.cookie, store);
             if member {
                 apply_capsule_member_egress(resp.headers_mut());
             }
@@ -2554,7 +3033,6 @@ fn stale_if_error_fallback(
     let &CacheCtx {
         method,
         host,
-        identity,
         req_path,
         req_query,
         chain,
@@ -2576,7 +3054,8 @@ fn stale_if_error_fallback(
     {
         return None;
     }
-    let key = configuration_key(state, build_cache_key(ctx, cc, store, route));
+    let ResolvedKey { key, identity, .. } = resolved_cache_key(state, ctx, cc, store, route)?;
+    let identity: &str = &identity;
     let now = Instant::now();
     let mut entry = match store.get_entry(&key, identity, now) {
         hj_pagecache::EntryState::Fresh(e)
@@ -2584,6 +3063,11 @@ fn stale_if_error_fallback(
         | hj_pagecache::EntryState::ErrorOnly(e) => e,
         hj_pagecache::EntryState::Miss => return None,
     };
+    // A fresh opt-in 404/410 stored while this render failed must never stand in
+    // for the 5xx (#783).
+    if entry.status >= 400 {
+        return None;
+    }
     if entry.dict_gen != 0 && matching_dict(state, entry.dict_gen).is_none() {
         return None;
     }
@@ -2791,6 +3275,27 @@ fn escaped_byte_at(raw: &[u8], i: usize) -> Option<u8> {
     }
 }
 
+/// Entries are keyed by the normalized host (no port, no trailing dot, lowercase), but
+/// the backend renders with the RAW Host (`HTTP_HOST`/`SERVER_NAME`, XenForo's og:url),
+/// so only the canonical spelling — optionally with the scheme's default port — may
+/// read or populate an entry; `x.com:1234` or `X.COM.` would poison `x.com` (#840).
+pub(crate) fn raw_host_is_cache_canonical(req: &Request, is_tls: bool) -> bool {
+    let raw = match req.headers().get(http::header::HOST) {
+        Some(v) => match v.to_str() {
+            Ok(s) => s,
+            Err(_) => return false,
+        },
+        None => match req.uri().authority() {
+            Some(a) => a.as_str(),
+            None => return true,
+        },
+    };
+    let canonical = hj_core::host_without_port(raw);
+    let default_port = if is_tls { ":443" } else { ":80" };
+    raw.strip_prefix(canonical.as_str())
+        .is_some_and(|rest| rest.is_empty() || rest == default_port)
+}
+
 /// Entries are keyed and identified by the decoded, dot-normalized path, but the backend
 /// routes the RAW `REQUEST_URI`. Only the one raw spelling that canonically encodes that path
 /// (modulo hex case) may read or populate an entry. Any other
@@ -2972,6 +3477,8 @@ pub async fn cache_store_leading(
         ..
     } = cc;
     let Some(store) = state.page_cache.as_ref() else {
+        let mut resp = resp;
+        strip_control_headers(resp.headers_mut());
         return resp;
     };
 
@@ -2979,22 +3486,9 @@ pub async fn cache_store_leading(
 
     // 1. Purge (acted on regardless of this response's own cacheability — a
     //    write request returns a purge directive for the content it changed).
-    //    A backend may emit MORE THAN ONE `X-LiteSpeed-Purge`; execute and forward
-    //    every one so no invalidation is dropped.
-    for p in parts
-        .headers
-        .get_all(HDR_PURGE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-    {
-        match parse_purge(p) {
-            Purge::All => store.purge_all(),
-            Purge::Tags(tags) => {
-                let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-                store.purge_tags(&refs);
-            }
-        }
-    }
+    //    A backend may emit MORE THAN ONE `X-LiteSpeed-Purge`; execute every one
+    //    so no invalidation is dropped.
+    execute_purges(store, &parts.headers);
 
     // Keep the request-side route decision authoritative on the store side too.
     // Purges above remain response side-effects even when this response itself
@@ -3034,7 +3528,13 @@ pub async fn cache_store_leading(
     // cache_lookup — otherwise a caching-disabled vhost fills the shared store with
     // dead entries that evict another vhost's live ones.
     let vhost_caches = vhost_allows_public(ctx, store, req_path);
-    let route = private_route(state, ctx, store, cc, false);
+    // Only a GET stores and only a GET/HEAD falls back to a stale entry; any other method
+    // needs no route (#983).
+    let route = if *method == Method::GET || *method == Method::HEAD {
+        private_route(state, ctx, store, cc, false)
+    } else {
+        PrivateRoute::Bypass
+    };
     // Conditions EVERY stored entry must meet, public or private:
     let base_eligible =
         // Never store a Partial Content (206) / ranged response as if it were the full body —
@@ -3074,14 +3574,28 @@ pub async fn cache_store_leading(
         // (capsule key-space guard, #95) Never store under the synthetic capsule prefix path;
         // its public key would collide with a dedicated capsule entry's slot (see cache_lookup).
         && !is_capsule_reserved_path(req_path);
+    // `X-LiteSpeed-Vary` cookies outside the global set (and the rewrite env's
+    // `Cache-Vary`) make this URL vary on them: the public entry is stored under the
+    // extended key (see `store_cache_key`). Any other vary dimension still refuses.
+    let declared = declared_vary(env_vary_names(ctx, cc), &parts.headers, &cfg.vary_cookies);
     let eligible = base_eligible
         // A private-routed (logged-in) request must never POPULATE the public
         // tier either — even if the app marked the render public, a logged-in
         // page may embed user state. Conservative by construction.
         && matches!(route, PrivateRoute::Public)
         && vhost_caches
-        && vary_supported(&parts.headers, &cfg.vary_cookies)
+        && matches!(declared, DeclaredVary::Names(_))
         && !sets_private_cookie(&parts.headers, &cfg.private_cookies);
+    // The private tier keys by session and never holds per-URL variants: a response
+    // varying on a cookie outside the global set is not stored privately.
+    let private_vary_ok = match &declared {
+        DeclaredVary::Names(n) => n.is_empty(),
+        DeclaredVary::Unsupported { extra_cookie } => !extra_cookie,
+    };
+    let url_vary_names: &[String] = match &declared {
+        DeclaredVary::Names(n) if eligible => n,
+        _ => &[],
+    };
 
     let (ttl_secs, mut stale_secs, sie_secs, scope) = match (&disposition, &route) {
         (
@@ -3103,7 +3617,7 @@ pub async fn cache_store_leading(
         // X-LiteSpeed-Vary/style-vary is subsumed by the per-session owner key.
         // No SWR/SIE windows: a private page is re-rendered, never served stale.
         (Disposition::StorePrivate { ttl_secs }, PrivateRoute::Private { owner, .. })
-            if base_eligible =>
+            if base_eligible && private_vary_ok =>
         {
             (*ttl_secs, 0, 0, PageScope::Private { owner_hash: *owner })
         }
@@ -3122,6 +3636,13 @@ pub async fn cache_store_leading(
             return Response::from_parts(parts, body);
         }
     };
+    // The filling miss of a private entry gets the same shared-cache lockout as
+    // its hits, or the first render reaches the CDN with the app's public
+    // Cache-Control (#883).
+    if matches!(scope, PageScope::Private { .. }) {
+        force_cache_control(&mut parts.headers, "private, no-store");
+        strip_shared_cdn_cache_directives(&mut parts.headers);
+    }
 
     // 3. Extract tags BEFORE stripping, then buffer the (uncompressed) body. Union the tags
     //    across EVERY `X-LiteSpeed-Tag` line (a backend may split them across headers).
@@ -3135,7 +3656,7 @@ pub async fn cache_store_leading(
         .collect();
     let capsule_control = if base_eligible
         && capsule_store_allowed(state, ctx, cc, store, status)
-        && vary_supported(&parts.headers, &cfg.vary_cookies)
+        && declared.global_only()
         && !sets_private_cookie(&parts.headers, &cfg.private_cookies)
     {
         let fallback_ttl_secs = match &disposition {
@@ -3181,6 +3702,13 @@ pub async fn cache_store_leading(
         strip_control_headers(&mut parts.headers);
         return Response::from_parts(parts, body);
     }
+    // (#949) A feed the backend asked not to buffer (`X-Accel-Buffering: no`) reaches
+    // the client as it is produced; collecting it here to store it would hold every
+    // byte until the backend finishes. Serve it through, uncached.
+    if matches!(body, Body::Stream(_)) && accel_buffering_off(&parts.headers) {
+        strip_control_headers(&mut parts.headers);
+        return Response::from_parts(parts, body);
+    }
 
     // Progressive template output (no Content-Length) reaches the client as the backend
     // writes it; the body is stored when the backend finishes. Framed (Content-Length) PHP
@@ -3199,16 +3727,25 @@ pub async fn cache_store_leading(
         let Body::Stream(inner) = body else {
             unreachable!("matched a stream body above");
         };
+        let Some(StoreKey {
+            key,
+            key_hash,
+            identity,
+            url_vary,
+        }) = store_cache_key(state, ctx, cc, store, &route, url_vary_names)
+        else {
+            strip_control_headers(&mut parts.headers);
+            return Response::from_parts(parts, Body::Stream(inner));
+        };
         parts.headers.remove(CONTENT_ENCODING);
-        let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
         let commit = FillCommit {
             state: state.clone(),
             entry: PendingEntry {
-                key_hash: hash_key(&key),
+                key_hash,
                 key,
-                identity: identity.to_string(),
+                identity,
+                url_vary,
                 status,
-                headers: stored_headers_from(&parts.headers),
                 tags,
                 scope,
                 ttl: Duration::from_secs(ttl_secs as u64),
@@ -3216,6 +3753,7 @@ pub async fn cache_store_leading(
                 sie: Duration::from_secs(sie_secs as u64),
                 render_epoch,
             },
+            headers: stored_headers_from(&parts.headers),
             content_type: parts
                 .headers
                 .get(CONTENT_TYPE)
@@ -3224,6 +3762,7 @@ pub async fn cache_store_leading(
                 .to_string(),
             vhost_name: ctx.vhost_name.to_string(),
             leader: leader.take(),
+            _render: store.begin_render(render_epoch),
         };
         strip_control_headers(&mut parts.headers);
         parts.headers.remove(TRANSFER_ENCODING);
@@ -3274,6 +3813,9 @@ pub async fn cache_store_leading(
             strip_control_headers(&mut parts.headers);
             // A genuine backend STREAM error mid-flight; the body is unrecoverable.
             tracing::warn!(path = %req_path, "page-cache: backend stream error while buffering");
+            if let Some(stale) = stale_if_error_fallback(state, ctx, cc, store, &route, 502) {
+                return stale;
+            }
             return error_502();
         }
     };
@@ -3356,15 +3898,13 @@ pub async fn cache_store_leading(
             .telemetry
             .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE)
             .then(Instant::now);
-        let mut stored_headers = stored_headers_from(&parts.headers);
         // Synthesize a weak validator when the backend gave none (XenForo pages usually
         // don't), so CF can revalidate a stale-but-cacheable page with a conditional GET and
         // get a 304 (headers only) instead of re-pulling the whole body. Served on every hit.
-        ensure_stored_etag(parts.status.as_u16(), &mut stored_headers, &bytes);
-        let stored_etag = stored_headers
-            .iter()
-            .find(|(name, _)| name == ETAG)
-            .map(|(_, value)| value.clone());
+        // Built only for an entry that is actually stored: eagerly for the unadmitted
+        // dedicated capsule entry, else once the public entry passes admission (#985).
+        let mut stored_etag: Option<HeaderValue> = None;
+        let mut eager_headers: Option<Vec<(HeaderName, HeaderValue)>> = None;
         let mut finalize_targets = Vec::with_capacity(2);
         if let (Some(control), true) = (capsule_control, state.xf_capsule.dedicated_store) {
             // (#99) The dedicated capsule entry is stored WITHOUT the W-TinyLFU `admitted` gate
@@ -3375,6 +3915,8 @@ pub async fn cache_store_leading(
             // gating the shell store on that guest-only frequency would defeat the capsule exactly
             // for guest-rare-but-member-popular URLs. Eager storage is bounded (the `x-wf-capsule`
             // header is backend-controlled) and capped by the page store.
+            let (stored_headers, etag) = stored_headers_with_etag(status, &parts.headers, &bytes);
+            stored_etag = etag;
             let key = configuration_key(state, capsule_key(ctx, cc, store));
             let stored_at = Instant::now();
             let stored_identity = identity.to_string();
@@ -3418,6 +3960,7 @@ pub async fn cache_store_leading(
                     stored_at,
                 });
             }
+            eager_headers = Some(stored_headers);
         }
         if capsule_control.is_some() {
             // (#94) Tag the public-shell entry with BOTH capsule tags, matching the dedicated
@@ -3433,21 +3976,35 @@ pub async fn cache_store_leading(
         // bounded to the finite set of configured vhosts (no Host-header key inflation).
         // The PageScope owner equals the route owner by construction (the eligibility
         // match binds them from the same PrivateRoute), so the shared builder covers it.
-        let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
-        let entry = PendingEntry {
-            key_hash: hash_key(&key),
-            key,
-            identity: identity.to_string(),
-            status,
-            headers: stored_headers,
-            tags,
-            scope,
-            ttl: Duration::from_secs(ttl_secs as u64),
-            swr: Duration::from_secs(stale_secs as u64),
-            sie: Duration::from_secs(sie_secs as u64),
-            render_epoch,
-        };
-        finalize_targets.extend(store_admitted(state, store, entry, &bytes));
+        let entry = store_cache_key(state, ctx, cc, store, &route, url_vary_names).map(
+            |StoreKey {
+                 key,
+                 key_hash,
+                 identity,
+                 url_vary,
+             }| PendingEntry {
+                key_hash,
+                key,
+                identity,
+                url_vary,
+                status,
+                tags,
+                scope,
+                ttl: Duration::from_secs(ttl_secs as u64),
+                swr: Duration::from_secs(stale_secs as u64),
+                sie: Duration::from_secs(sie_secs as u64),
+                render_epoch,
+            },
+        );
+        if let Some(entry) = entry {
+            finalize_targets.extend(store_admitted(state, store, entry, &bytes, || {
+                eager_headers.unwrap_or_else(|| {
+                    let (headers, etag) = stored_headers_with_etag(status, &parts.headers, &bytes);
+                    stored_etag = etag;
+                    headers
+                })
+            }));
+        }
         if let Some(started) = store_timer {
             state
                 .telemetry
@@ -3514,8 +4071,8 @@ fn is_xf_error_body(status: u16, content_type: &str, body: &[u8]) -> bool {
     }
     const SCAN: usize = 8192;
     const MARKER: &[u8] = b"data-template=\"error\"";
-    let head = &body[..body.len().min(SCAN)];
-    head.windows(MARKER.len()).any(|w| w == MARKER)
+    let head = body.get(..SCAN).unwrap_or(body);
+    memchr::memmem::find(head, MARKER).is_some()
 }
 
 /// A fully received miss, keyed and classified, ready for the admission check and store.
@@ -3523,8 +4080,8 @@ struct PendingEntry {
     key: hj_pagecache::PageCacheKey,
     key_hash: u64,
     identity: String,
+    url_vary: Option<UrlVaryCommit>,
     status: u16,
-    headers: Vec<(HeaderName, HeaderValue)>,
     tags: Vec<Arc<str>>,
     scope: PageScope,
     ttl: Duration,
@@ -3533,12 +4090,14 @@ struct PendingEntry {
     render_epoch: u64,
 }
 
-/// Admit and store `entry` with `bytes` as its body; the finalize target when it was stored.
+/// Admit and store `entry` with `bytes` as its body and `headers()` as its stored headers
+/// (built only once the entry is admitted); the finalize target when it was stored.
 fn store_admitted(
     state: &Arc<ServerState>,
     store: &hj_pagecache::PageStore,
     entry: PendingEntry,
     bytes: &Bytes,
+    headers: impl FnOnce() -> Vec<(HeaderName, HeaderValue)>,
 ) -> Option<FinalizeTarget> {
     // (W-TinyLFU admission) Spend RAM (store) + CPU (precompress) only on keys that show
     // REUSE. The frequency sketch is recorded on every cacheable lookup; admit when the
@@ -3548,6 +4107,18 @@ fn store_admitted(
     // Private entries skip the W-TinyLFU frequency bar: per-session keys are
     // near-unique so the sketch never accumulates reuse for them, and the
     // whole point is serving the SAME session's next request.
+    // (per-URL vary) The vary decision acts BEFORE admission where it only retires: a
+    // response that stopped varying drops the spec and its variants, and one that varies on
+    // a non-global cookie retires the un-varied base entry it supersedes — whatever happens
+    // to this variant below. The spec itself is recorded only for an admitted variant, so
+    // one-hit renders (cache-buster queries) cannot grow the spec map.
+    if let Some(uv) = &entry.url_vary {
+        if uv.names.is_empty() {
+            store.url_vary_drop(&uv.base, uv.base_hash);
+        } else {
+            store.invalidate_key(&uv.base);
+        }
+    }
     let is_private = matches!(entry.scope, PageScope::Private { .. });
     let admitted = is_private
         || state.page_cache_admission.estimate(entry.key_hash)
@@ -3556,6 +4127,17 @@ fn store_admitted(
     if !admitted {
         return None;
     }
+    if let Some(uv) = &entry.url_vary
+        && !uv.names.is_empty()
+        && !store.url_vary_prepare(&uv.base, uv.base_hash, &uv.names, entry.key_hash)
+    {
+        state
+            .metrics
+            .pagecache_url_vary_refused
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    }
+    let headers = headers();
     // (PC2-lazy) Store the entry IDENTITY-ONLY (no precompressed serve variant) — variant
     // precompression is deferred to the first cache HIT (`spawn_variant_fill`), so that CPU
     // is spent only on entries proven hot by being SERVED. Dictionary compression is NOT
@@ -3568,7 +4150,7 @@ fn store_admitted(
         CachedResponse {
             status: entry.status,
             identity: entry.identity.clone(),
-            headers: entry.headers,
+            headers,
             body: PageBody::InMem(bytes.clone()),
             variants: Vec::new(),
             // Private entries never get the lazy variant fill: per-session
@@ -3586,6 +4168,13 @@ fn store_admitted(
         },
         entry.render_epoch,
     );
+    if stored
+        && let Some(uv) = &entry.url_vary
+        && !store.url_vary_confirm(&uv.base, uv.base_hash, &uv.names, entry.key_hash)
+    {
+        store.invalidate_key(&entry.key);
+        return None;
+    }
     stored.then(|| FinalizeTarget {
         key: entry.key,
         key_hash: entry.key_hash,
@@ -3598,10 +4187,17 @@ fn store_admitted(
 struct FillCommit {
     state: Arc<ServerState>,
     entry: PendingEntry,
+    /// The stored headers, snapshotted before the head went to the client; the validator
+    /// is added only if the finished body is admitted.
+    headers: Vec<(HeaderName, HeaderValue)>,
     content_type: String,
     vhost_name: String,
     /// Held until the store is done, so single-flight followers wake to a hit.
     leader: Option<InflightLeader>,
+    /// dispatch()'s render guard drops when the head is returned, but the store
+    /// still vetoes on `render_epoch`: maintenance must keep every tag-purge
+    /// stamp newer than it until the streamed body is stored or abandoned.
+    _render: hj_pagecache::store::RenderEpochGuard,
 }
 
 impl FillCommit {
@@ -3619,10 +4215,12 @@ impl FillCommit {
     fn store(self, bytes: Bytes) {
         let FillCommit {
             state,
-            mut entry,
+            entry,
+            headers,
             content_type,
             vhost_name,
             leader,
+            _render,
         } = self;
         if let Some(store) = state.page_cache.as_ref() {
             if (bytes.is_empty() && hit::body_required(entry.status))
@@ -3634,8 +4232,12 @@ impl FillCommit {
                     "page-cache: refusing to store empty/error streamed body"
                 );
             } else {
-                ensure_stored_etag(entry.status, &mut entry.headers, &bytes);
-                if let Some(target) = store_admitted(&state, store, entry, &bytes) {
+                let status = entry.status;
+                if let Some(target) = store_admitted(&state, store, entry, &bytes, || {
+                    let mut headers = headers;
+                    ensure_stored_etag(status, &mut headers, &bytes);
+                    headers
+                }) {
                     state
                         .metrics
                         .pagecache_stream_fill_stores
@@ -3710,27 +4312,18 @@ impl http_body::Body for StreamFill {
     }
 }
 
+fn accel_buffering_off(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("x-accel-buffering")
+        .iter()
+        .any(|v| v.as_bytes().trim_ascii().eq_ignore_ascii_case(b"no"))
+}
+
 fn is_event_stream(content_type: &str) -> bool {
     content_type
         .split(';')
         .next()
         .is_some_and(|base| base.trim().eq_ignore_ascii_case("text/event-stream"))
-}
-
-/// A public response is storable only if EVERY declared `X-LiteSpeed-Vary` line is all
-/// cookie-vary and every named cookie is in the supported (configured) set. A backend may
-/// emit more than one `X-LiteSpeed-Vary`; all must be supported, since any unsupported vary
-/// dimension means we'd under-key the entry and risk serving the wrong variant. Absent vary
-/// ⇒ supported (no vary).
-fn vary_supported(headers: &HeaderMap, allowed: &[String]) -> bool {
-    headers
-        .get_all(HDR_VARY)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .all(|v| {
-            let (names, all_cookie) = parse_vary(v);
-            all_cookie && names.iter().all(|n| allowed.iter().any(|a| a == n))
-        })
 }
 
 /// A standard HTTP `Vary` response header is honored only if its sole dimension is
@@ -3953,6 +4546,7 @@ mod tests {
                     origin: origin.map(|s| s.as_str()),
                     ua_class: None,
                     header_vary: None,
+                    env_vary: false,
                 };
                 build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public)
             };
@@ -4205,6 +4799,7 @@ mod tests {
                 origin: None,
                 ua_class: ua_class.map(|s| s.as_str()),
                 header_vary: None,
+                env_vary: false,
             };
             build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public)
         };
@@ -4553,9 +5148,20 @@ mod tests {
         ]
     }
 
+    fn declared(h: &HeaderMap) -> DeclaredVary {
+        declared_vary(Vec::new(), h, &style_set())
+    }
+
+    fn names(d: DeclaredVary) -> Option<Vec<String>> {
+        match d {
+            DeclaredVary::Names(n) => Some(n),
+            DeclaredVary::Unsupported { .. } => None,
+        }
+    }
+
     #[test]
-    fn vary_supported_requires_all_repeated_lines() {
-        // Two X-LiteSpeed-Vary lines, both supported -> storable.
+    fn declared_vary_unions_all_repeated_lines() {
+        // Two X-LiteSpeed-Vary lines, both in the global set -> the historic global-only case.
         let mut h = HeaderMap::new();
         h.append(
             HeaderName::from_static("x-litespeed-vary"),
@@ -4565,39 +5171,63 @@ mod tests {
             HeaderName::from_static("x-litespeed-vary"),
             HeaderValue::from_static("cookie=xf_language_id"),
         );
-        assert!(vary_supported(&h, &style_set()));
-        // Add a third, unsupported line -> NOT storable (would under-key the entry).
+        assert!(declared(&h).global_only());
+        // A third line naming a cookie outside the set makes the URL vary on it.
         h.append(
             HeaderName::from_static("x-litespeed-vary"),
             HeaderValue::from_static("cookie=xf_user"),
         );
-        assert!(!vary_supported(&h, &style_set()));
+        assert_eq!(names(declared(&h)), Some(vec!["xf_user".to_string()]));
     }
 
     #[test]
-    fn vary_absent_is_supported() {
-        assert!(vary_supported(&HeaderMap::new(), &style_set()));
+    fn vary_absent_is_global_only() {
+        assert!(declared(&HeaderMap::new()).global_only());
     }
 
     #[test]
-    fn vary_cookie_subset_supported() {
+    fn vary_cookie_subset_is_global_only() {
         let h = hdrs(&[(
             "x-litespeed-vary",
             "cookie=xf_style_variation, cookie=xf_style_id, cookie=xf_language_id",
         )]);
-        assert!(vary_supported(&h, &style_set()));
+        assert!(declared(&h).global_only());
     }
 
     #[test]
-    fn vary_unknown_cookie_unsupported() {
-        let h = hdrs(&[("x-litespeed-vary", "cookie=xf_user")]);
-        assert!(!vary_supported(&h, &style_set()));
+    fn vary_unknown_cookie_is_a_per_url_dimension() {
+        let h = hdrs(&[("x-litespeed-vary", "cookie=tz_date,cookie=xf_style_id")]);
+        assert_eq!(names(declared(&h)), Some(vec!["tz_date".to_string()]));
+        // The rewrite env's Cache-Vary joins the response's names.
+        assert_eq!(
+            names(declared_vary(vec!["a_b", "tz_date"], &h, &style_set())),
+            Some(vec!["a_b".to_string(), "tz_date".to_string()])
+        );
     }
 
     #[test]
-    fn vary_non_cookie_unsupported() {
-        let h = hdrs(&[("x-litespeed-vary", "cookie=xf_style_id, ismobile")]);
-        assert!(!vary_supported(&h, &style_set()));
+    fn vary_non_cookie_or_malformed_is_unsupported() {
+        for v in [
+            "cookie=xf_style_id, ismobile",
+            "cookie=bad name",
+            "cookie=a,cookie=b,cookie=c,cookie=d,cookie=e",
+        ] {
+            let h = hdrs(&[("x-litespeed-vary", v)]);
+            assert!(names(declared(&h)).is_none(), "{v}");
+        }
+        assert!(matches!(
+            declared(&hdrs(&[(
+                "x-litespeed-vary",
+                "cookie=xf_style_id, ismobile"
+            )])),
+            DeclaredVary::Unsupported {
+                extra_cookie: false
+            }
+        ));
+        assert!(matches!(
+            declared(&hdrs(&[("x-litespeed-vary", "cookie=tz_date, ismobile")])),
+            DeclaredVary::Unsupported { extra_cookie: true }
+        ));
     }
 
     #[test]
@@ -4666,6 +5296,42 @@ mod tests {
         let mut body = vec![b' '; 9000];
         body.extend_from_slice(br#"data-template="error""#);
         assert!(!is_xf_error_page(200, &html, &body));
+    }
+
+    /// #985: the substring search answers exactly what the former `windows` scan did,
+    /// including a marker that ends on, or straddles, the 8 KiB scan boundary.
+    #[test]
+    fn xf_error_marker_scan_matches_the_window_scan_at_the_boundary() {
+        const MARKER: &[u8] = br#"data-template="error""#;
+        fn window_scan(body: &[u8]) -> bool {
+            let head = &body[..body.len().min(8192)];
+            head.windows(MARKER.len()).any(|w| w == MARKER)
+        }
+        let check = |body: &[u8]| {
+            assert_eq!(
+                is_xf_error_body(200, "text/html", body),
+                window_scan(body),
+                "len {}",
+                body.len()
+            );
+        };
+        check(b"");
+        check(&MARKER[..MARKER.len() - 1]);
+        check(MARKER);
+        for at in (8192 - MARKER.len() - 3)..=8192 {
+            for tail in [0usize, 1, 64] {
+                let mut body = vec![b' '; at];
+                body.extend_from_slice(MARKER);
+                body.extend(std::iter::repeat_n(b' ', tail));
+                check(&body);
+            }
+        }
+        let mut ends_on_boundary = vec![b' '; 8192 - MARKER.len()];
+        ends_on_boundary.extend_from_slice(MARKER);
+        assert!(is_xf_error_body(200, "text/html", &ends_on_boundary));
+        let mut straddles = vec![b' '; 8192 - MARKER.len() + 1];
+        straddles.extend_from_slice(MARKER);
+        assert!(!is_xf_error_body(200, "text/html", &straddles));
     }
 
     #[test]
@@ -4782,6 +5448,102 @@ mod tests {
         );
     }
 
+    /// Every key family (public, private, capsule, capsule fallback) for one request.
+    fn all_keys_for(
+        ctx: &ReqCtx,
+        store: &hj_pagecache::PageStore,
+        host: &str,
+        host_foreign: bool,
+        ua_class: Option<&str>,
+    ) -> Vec<hj_pagecache::PageCacheKey> {
+        let cc = CacheCtx {
+            enabled: true,
+            method: &Method::GET,
+            host,
+            cookie: Some("xf_style_id=3"),
+            identity: "i",
+            req_path: "/threads/a.1/",
+            req_query: "page=2",
+            chain: &[],
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            vary_value: None,
+            host_foreign,
+            origin: None,
+            ua_class,
+            header_vary: None,
+            env_vary: false,
+        };
+        vec![
+            build_cache_key(ctx, &cc, store, &PrivateRoute::Public),
+            build_cache_key(
+                ctx,
+                &cc,
+                store,
+                &PrivateRoute::Private {
+                    owner: 0x1234_5678_9abc_def0,
+                    owner2: "o2".into(),
+                },
+            ),
+            capsule_key(ctx, &cc, store),
+            capsule_public_fallback_key(ctx, &cc, store),
+        ]
+    }
+
+    fn render_keys(keys: &[hj_pagecache::PageCacheKey]) -> String {
+        keys.iter()
+            .map(|k| format!("{:016x}:{k:?}", hash_key(k)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// (#938) Exact-alias hosts get their own key, but a request whose normalized Host IS the
+    /// canonical vhost name (and a foreign wildcard-routed host) must keep the pre-#938 key
+    /// byte-for-byte, so persisted file-tier, capsule and private entries stay valid across
+    /// the deploy. The golden values were captured from the code BEFORE the alias fold.
+    #[tokio::test]
+    async fn canonical_host_cache_keys_are_byte_stable_across_the_alias_fold() {
+        let (_state, ctx, store) = cache_test_ctx();
+        assert_eq!(ctx.vhost_name, "forum.example");
+        const PLAIN: &str = concat!(
+            "5cbdff93fdbff4ab:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"\", private_owner: 0 }\n",
+            "fdcf0b5044494e02:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"o2\", private_owner: 1311768467463790320 }\n",
+            "fe8f818eed53c4e3:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/__hj_xf_capsule/account-nav-v1/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"\", private_owner: 0 }\n",
+            "5cbdff93fdbff4ab:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"\", private_owner: 0 }",
+        );
+        const UA: &str = concat!(
+            "af6a556163fd350c:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"\\0ua:bot\", private_owner: 0 }\n",
+            "7f7b01fd90c26d57:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"o2\\0ua:bot\", private_owner: 1311768467463790320 }\n",
+            "9a619d26d838d654:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/__hj_xf_capsule/account-nav-v1/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"\\0ua:bot\", private_owner: 0 }\n",
+            "af6a556163fd350c:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"\\0ua:bot\", private_owner: 0 }",
+        );
+        for host in ["forum.example", "Forum.Example"] {
+            assert_eq!(
+                render_keys(&all_keys_for(&ctx, &store, host, false, None)),
+                PLAIN
+            );
+            assert_eq!(
+                render_keys(&all_keys_for(&ctx, &store, host, false, Some("bot"))),
+                UA
+            );
+        }
+        // A foreign (wildcard-routed) host never reads or writes, but its key must not move.
+        assert_eq!(
+            render_keys(&all_keys_for(&ctx, &store, "www.forum.example", true, None)),
+            PLAIN
+        );
+        // An exact alias gets its own key in every family: same vhost id, alias host.
+        let alias = all_keys_for(&ctx, &store, "alias.example", false, None);
+        let canonical = all_keys_for(&ctx, &store, "forum.example", false, None);
+        for (a, c) in alias.iter().zip(&canonical) {
+            assert_ne!(a, c);
+            assert_ne!(hash_key(a), hash_key(c));
+            assert_eq!(a.vhost_id, c.vhost_id);
+            assert_eq!(a.host, "alias.example");
+            assert_eq!((&a.path, &a.vary_value), (&c.path, &c.vary_value));
+        }
+    }
+
     fn cache_test_ctx() -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
         cache_test_ctx_with_capsule(crate::state::XfCapsuleConfig::disabled())
     }
@@ -4820,6 +5582,7 @@ mod tests {
                     origin: None,
                     ua_class: None,
                     header_vary: None,
+                    env_vary: false,
                 };
                 let _ = cache_lookup(&state, &ctx, &cc, None, false, None);
                 let mut resp = http::Response::builder()
@@ -4917,6 +5680,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
         };
         // The lookup that precedes a real render records the admission sighting.
         assert!(matches!(
@@ -4960,6 +5724,209 @@ mod tests {
         )
         .await;
         assert!(not_stored.headers().get(ETAG).is_none());
+    }
+
+    fn stored_etag_hashes() -> usize {
+        STORED_ETAG_HASHES.with(|n| n.get())
+    }
+
+    fn opted_in_page(body: &'static [u8]) -> Response {
+        http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .body(Body::Full(Bytes::from_static(body)))
+            .unwrap()
+    }
+
+    /// #985: a buffered miss the admission sketch rejects hashes no validator and carries
+    /// none; once admitted it hashes once, and the fill, the hit and the body hash agree.
+    #[tokio::test]
+    async fn buffered_store_hashes_the_validator_only_when_admitted() {
+        let (state, ctx, store) = cache_test_ctx();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/admit";
+        let cc = page_cc(&method, "/admit", identity, store.purge_epoch());
+
+        let before = stored_etag_hashes();
+        let rejected = cache_store(&state, &ctx, &cc, opted_in_page(b"<p>page</p>")).await;
+        assert_eq!(
+            stored_etag_hashes(),
+            before,
+            "a rejected miss hashes nothing"
+        );
+        assert!(rejected.headers().get(ETAG).is_none());
+        assert_eq!(rejected.headers().get(HDR_CACHE_STATUS).unwrap(), "miss");
+        assert_eq!(store.entry_count(), 0);
+
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        let fill = cache_store(&state, &ctx, &cc, opted_in_page(b"<p>page</p>")).await;
+        assert_eq!(stored_etag_hashes(), before + 1);
+        let fill_etag = fill
+            .headers()
+            .get(ETAG)
+            .cloned()
+            .expect("admitted fill ETag");
+        assert_eq!(fill_etag, hit::weak_etag(b"<p>page</p>").as_str());
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("the admitted miss was stored");
+        };
+        assert_eq!(hit.headers().get(ETAG), Some(&fill_etag));
+    }
+
+    /// #983: a member POST takes no private route on the store side, yet its purge still
+    /// drops the member's private entry and its response is otherwise passed through.
+    #[tokio::test]
+    async fn member_post_store_purges_without_a_private_route() {
+        let (state, mut ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                cfg.private_enabled = true;
+            });
+        ctx.vhost = Arc::new(hj_core::config::VHostConfig {
+            cache_policy: Some(hj_core::config::VhostCachePolicy {
+                enable_cache: true,
+                enable_public: true,
+                enable_private: true,
+            }),
+            ..Default::default()
+        });
+        let member = Some("xf_user=1; xf_session=sessAAAA");
+        let identity = "https\nforum.example\n/threads/p.1/";
+        let get = Method::GET;
+        let get_cc = CacheCtx {
+            cookie: member,
+            ..page_cc(&get, "/threads/p.1/", identity, store.purge_epoch())
+        };
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &get_cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        let fill = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html")
+            .header(HDR_CACHE_CONTROL, "private,max-age=60")
+            .header(HDR_TAG, "T1")
+            .body(Body::Full(Bytes::from_static(b"<p>member</p>")))
+            .unwrap();
+        let _ = cache_store(&state, &ctx, &get_cc, fill).await;
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &get_cc, None, false, None),
+            CacheOutcome::Hit(_)
+        ));
+
+        let post = Method::POST;
+        let post_cc = CacheCtx {
+            method: &post,
+            ..get_cc
+        };
+        let resp = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html")
+            .header(http::header::CACHE_CONTROL, "public, max-age=60")
+            .header(HDR_CACHE_CONTROL, "private,max-age=60")
+            .header(HDR_PURGE, "tag=T1")
+            .body(Body::Full(Bytes::from_static(b"<p>saved</p>")))
+            .unwrap();
+        let resp = cache_store(&state, &ctx, &post_cc, resp).await;
+        assert_eq!(
+            resp.headers().get(http::header::CACHE_CONTROL).unwrap(),
+            "public, max-age=60"
+        );
+        for name in [HDR_CACHE_CONTROL, HDR_PURGE, "x-litespeed-cache"] {
+            assert!(!resp.headers().contains_key(name), "{name}");
+        }
+        assert!(matches!(resp.into_body(), Body::Full(b) if &b[..] == b"<p>saved</p>"));
+        assert_eq!(
+            store.entry_count(),
+            0,
+            "the purge dropped the private entry"
+        );
+    }
+
+    /// #985: the streamed store adds its validator only after admission too, and the
+    /// admitted entry's ETag is still the hash of the whole streamed body.
+    #[tokio::test]
+    async fn streamed_store_hashes_the_validator_only_when_admitted() {
+        let (state, ctx, store) = stream_fill_ctx();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/stream-admit".to_string();
+        let cc = page_cc(&method, "/stream-admit", &identity, store.purge_epoch());
+        let before = stored_etag_hashes();
+
+        for admitted in [false, true] {
+            // The uncounted probe leaves the sketch empty, so the first fill is rejected.
+            let probe = if admitted {
+                cache_lookup(&state, &ctx, &cc, None, false, None)
+            } else {
+                cache_lookup_fast_path(&state, &ctx, &cc, None)
+            };
+            let CacheOutcome::Miss(key_hash) = probe else {
+                panic!("admitted={admitted}: misses");
+            };
+            let Enter::Leader(guard) = state.page_cache_inflight.enter(key_hash) else {
+                panic!("admitted={admitted}: leads");
+            };
+            let (feed, resp) = fed_page(None);
+            let resp = cache_store_leading(&state, &ctx, &cc, resp, &mut Some(guard)).await;
+            let Body::Stream(mut body) = resp.into_body() else {
+                panic!("admitted={admitted}: streams");
+            };
+            let Enter::Follower(follower) = state.page_cache_inflight.enter(key_hash) else {
+                panic!("admitted={admitted}: still in flight");
+            };
+            feed.send(Ok(Bytes::from_static(b"<head>"))).unwrap();
+            feed.send(Ok(Bytes::from_static(b"<body>"))).unwrap();
+            drop(feed);
+            assert_eq!(next_data(&mut body).await.unwrap(), "<head>");
+            assert_eq!(next_data(&mut body).await.unwrap(), "<body>");
+            assert!(next_data(&mut body).await.is_none());
+            tokio::time::timeout(Duration::from_secs(5), follower.wait())
+                .await
+                .expect("the store attempt releases the leader");
+            assert_eq!(stored_etag_hashes(), before + usize::from(admitted));
+        }
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("the admitted stream was stored");
+        };
+        assert_eq!(
+            hit.headers().get(ETAG).unwrap(),
+            hit::weak_etag(b"<head><body>").as_str()
+        );
+    }
+
+    /// #985: a dedicated capsule shell is stored without the admission gate, so its validator
+    /// is still hashed eagerly; the fill carries it although the public mirror was rejected.
+    #[tokio::test]
+    async fn dedicated_capsule_store_keeps_its_eager_validator() {
+        let mut capsule = capsule_member_config();
+        capsule.dedicated_store = true;
+        let (state, ctx, store) = cache_test_ctx_with_capsule(capsule);
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/threads/eager.1/";
+        let cc = page_cc(&method, "/threads/eager.1/", identity, store.purge_epoch());
+        let before = stored_etag_hashes();
+        let mut resp = opted_in_page(b"<p>shell</p>");
+        resp.headers_mut().insert(
+            HDR_XF_CAPSULE,
+            HeaderValue::from_static("public-shell, hydrate=account-nav-v1, max-age=60"),
+        );
+        let fill = cache_store(&state, &ctx, &cc, resp).await;
+        assert_eq!(stored_etag_hashes(), before + 1);
+        assert_eq!(
+            state
+                .metrics
+                .xf_capsule_dedicated_stores
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(store.entry_count(), 1, "only the dedicated shell is stored");
+        assert_eq!(
+            fill.headers().get(ETAG).unwrap(),
+            hit::weak_etag(b"<p>shell</p>").as_str()
+        );
     }
 
     /// A backend body the test feeds frame by frame.
@@ -5022,6 +5989,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
         }
     }
 
@@ -5102,6 +6070,40 @@ mod tests {
         );
     }
 
+    /// Regression (#949): a cacheable streamed response sent with `X-Accel-Buffering: no`
+    /// is a live feed. The store must not collect it (that held every byte until the
+    /// backend finished): it passes through frame by frame and is never stored.
+    #[tokio::test]
+    async fn accel_buffering_off_stream_passes_through_uncached() {
+        let (state, ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |_| {});
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/feed".to_string();
+        let cc = page_cc(&method, "/feed", &identity, store.purge_epoch());
+        let (feed, mut resp) = fed_page(None);
+        resp.headers_mut()
+            .insert("x-accel-buffering", HeaderValue::from_static("no"));
+        let resp = cache_store(&state, &ctx, &cc, resp).await;
+        assert!(resp.headers().get(HDR_CACHE_CONTROL).is_none());
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("an unbuffered feed stays a stream");
+        };
+        feed.send(Ok(Bytes::from_static(b"line1\n"))).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), next_data(&mut body))
+                .await
+                .expect("the first frame arrives before the backend finishes")
+                .unwrap(),
+            "line1\n"
+        );
+        drop(feed);
+        assert!(next_data(&mut body).await.is_none());
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+    }
+
     /// A streamed miss that errors, is dropped by the client, or outgrows the object cap is
     /// never stored, and its leader is released so followers render for themselves.
     #[tokio::test]
@@ -5158,6 +6160,53 @@ mod tests {
                 .pagecache_stream_fill_stores
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
+        );
+    }
+
+    /// A tag purge that lands while a streamed miss is still being written vetoes its
+    /// store even after maintenance has pruned the purge stamp: the fill keeps its
+    /// render epoch active although dispatch()'s own guard is gone.
+    #[tokio::test]
+    async fn streamed_miss_purged_mid_stream_is_not_stored_after_maintenance() {
+        let (state, ctx, store) = stream_fill_ctx();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/purged".to_string();
+        let cc = page_cc(&method, "/purged", &identity, store.purge_epoch());
+        let CacheOutcome::Miss(key_hash) = cache_lookup(&state, &ctx, &cc, None, false, None)
+        else {
+            panic!("first request misses");
+        };
+        let Enter::Leader(guard) = state.page_cache_inflight.enter(key_hash) else {
+            panic!("first misser leads");
+        };
+        let (feed, mut resp) = fed_page(None);
+        resp.headers_mut()
+            .insert(HDR_TAG, HeaderValue::from_static("T1"));
+        let resp = cache_store_leading(&state, &ctx, &cc, resp, &mut Some(guard)).await;
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a no-Content-Length miss streams");
+        };
+        feed.send(Ok(Bytes::from_static(b"<pre-purge>"))).unwrap();
+        assert_eq!(next_data(&mut body).await.unwrap(), "<pre-purge>");
+        let Enter::Follower(follower) = state.page_cache_inflight.enter(key_hash) else {
+            panic!("the render is still in flight");
+        };
+
+        store.purge_tags(&["T1"]);
+        store.maintenance(Duration::from_secs(90));
+        store.maintenance(Duration::from_secs(90));
+
+        drop(feed);
+        assert!(next_data(&mut body).await.is_none());
+        tokio::time::timeout(Duration::from_secs(5), follower.wait())
+            .await
+            .expect("the leader is released after the store attempt");
+        assert!(
+            matches!(
+                cache_lookup(&state, &ctx, &cc, None, false, None),
+                CacheOutcome::Miss(_)
+            ),
+            "a body rendered before the purge must not be stored"
         );
     }
 
@@ -5244,6 +6293,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
         };
         let key = configuration_key(
             &state,
@@ -5307,6 +6357,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
         };
         let base = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
         let old_key = configuration_key(&old, base.clone());
@@ -5481,6 +6532,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         private_route(state, ctx, store, &cc, count)
@@ -5715,6 +6767,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -5788,6 +6841,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -5847,6 +6901,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -5921,6 +6976,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let public_key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -6128,6 +7184,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -6159,10 +7216,12 @@ mod tests {
             cookie: Some(member_cookie),
             ..guest_cc
         };
-        let hit = match capsule_lookup(&state, &ctx, &member_cc, None, None) {
+        let mut hit = match capsule_lookup(&state, &ctx, &member_cc, None, None) {
             CacheOutcome::Hit(hit) => hit,
             _ => panic!("expected capsule hit for member cookie"),
         };
+        // #932: the terminal control-header settle in `handle()` keeps the status marker.
+        settle_control_headers(&state, hit.headers_mut());
         // (2026-10-04) Served from the shell-capable PUBLIC entry (dedicated stores off).
         assert_eq!(
             hit.headers().get(HDR_XF_CAPSULE_STATUS).unwrap(),
@@ -6213,6 +7272,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -6270,6 +7330,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -6347,6 +7408,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -6425,6 +7487,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let key = capsule_public_fallback_key(&ctx, &member_cc, &store);
@@ -6501,6 +7564,7 @@ mod tests {
                 origin: None,
                 ua_class: None,
                 header_vary: None,
+                env_vary: false,
                 vary_value: None,
             };
             let public = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
@@ -6556,6 +7620,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         // Plant a PRIVATE entry directly at the dedicated capsule key, shell-tagged so the only
@@ -6622,6 +7687,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -6676,6 +7742,41 @@ mod tests {
         );
     }
 
+    /// #984: the dedicated capsule key is built only when dedicated stores are on; with them
+    /// off a member miss still falls back to the public shell and still counts as a miss.
+    #[tokio::test]
+    async fn capsule_member_miss_builds_the_dedicated_key_only_for_dedicated_stores() {
+        use std::sync::atomic::Ordering::Relaxed;
+        for dedicated_store in [false, true] {
+            let mut capsule = capsule_member_config();
+            capsule.dedicated_store = dedicated_store;
+            let (state, ctx, store) = cache_test_ctx_with_capsule(capsule);
+            let method = Method::GET;
+            let identity = "https\nforum.example\n/threads/none.1/";
+            let member_cc = CacheCtx {
+                cookie: Some("xf_user=1; xf_session=abc; xf_wf_capsule_member=1"),
+                ..page_cc(&method, "/threads/none.1/", identity, store.purge_epoch())
+            };
+            let before = CAPSULE_KEY_BUILDS.with(|n| n.get());
+            assert!(matches!(
+                capsule_lookup(&state, &ctx, &member_cc, None, None),
+                CacheOutcome::Miss(_)
+            ));
+            assert_eq!(
+                CAPSULE_KEY_BUILDS.with(|n| n.get()) - before,
+                usize::from(dedicated_store),
+                "dedicated_store={dedicated_store}"
+            );
+            let m = &state.metrics;
+            assert_eq!(
+                m.xf_capsule_misses_dedicated.load(Relaxed),
+                u64::from(dedicated_store)
+            );
+            assert_eq!(m.xf_capsule_misses_public_fallback.load(Relaxed), 1);
+            assert_eq!(m.xf_capsule_bypass_not_allowed.load(Relaxed), 0);
+        }
+    }
+
     #[tokio::test]
     async fn capsule_member_cookie_bypasses_without_member_opt_in() {
         let (state, ctx, store) = cache_test_ctx_with_capsule(crate::state::XfCapsuleConfig {
@@ -6707,6 +7808,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let resp = http::Response::builder()
@@ -6754,6 +7856,7 @@ mod tests {
             origin: None,
             ua_class: None,
             header_vary: None,
+            env_vary: false,
             vary_value: None,
         };
         let route = PrivateRoute::Public;
@@ -6791,6 +7894,160 @@ mod tests {
             stale_if_error_fallback(&state, &ctx, &ranged, &store, &route, 503).is_none(),
             "Range requests must not receive a full stale-if-error body"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_if_error_fallback_never_serves_a_fresh_error_entry() {
+        let (state, ctx, store) = cache_test_ctx();
+        let method = Method::GET;
+        let chain: Vec<Arc<Htaccess>> = Vec::new();
+        let cc = CacheCtx {
+            enabled: true,
+            method: &method,
+            host: "forum.example",
+            cookie: None,
+            identity: "forum.example\n/gone",
+            req_path: "/gone",
+            req_query: "",
+            chain: &chain,
+            render_epoch: store.purge_epoch(),
+            has_range: false,
+            host_foreign: false,
+            origin: None,
+            ua_class: None,
+            header_vary: None,
+            env_vary: false,
+            vary_value: None,
+        };
+        let route = PrivateRoute::Public;
+        let key = build_cache_key(&ctx, &cc, &store, &route);
+        assert!(store.store(
+            key,
+            CachedResponse {
+                status: 404,
+                identity: cc.identity.to_string(),
+                headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+                body: PageBody::InMem(Bytes::from_static(b"not found")),
+                variants: Vec::new(),
+                variants_filled: false,
+                dict_gen: 0,
+                tags: Vec::new(),
+                vary_cookie_name: String::new(),
+                vary_value: String::new(),
+                scope: PageScope::Public,
+                stored_at: Instant::now(),
+                ttl: Duration::from_secs(300),
+                swr: Duration::ZERO,
+                sie: Duration::ZERO,
+            }
+        ));
+        assert!(
+            stale_if_error_fallback(&state, &ctx, &cc, &store, &route, 503).is_none(),
+            "a cached 404 must not replace a backend 5xx"
+        );
+    }
+
+    fn retained_entry(identity: &str, scope: PageScope, swr: Duration) -> CachedResponse {
+        CachedResponse {
+            status: 200,
+            identity: identity.to_string(),
+            headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+            body: PageBody::InMem(Bytes::from_static(b"stale-body")),
+            variants: Vec::new(),
+            variants_filled: false,
+            dict_gen: 0,
+            tags: Vec::new(),
+            vary_cookie_name: String::new(),
+            vary_value: String::new(),
+            scope,
+            stored_at: Instant::now() - Duration::from_secs(5),
+            ttl: Duration::from_secs(1),
+            swr,
+            sie: Duration::from_secs(60),
+        }
+    }
+
+    /// Regression (#1016): a backend stream that fails while a cacheable miss is
+    /// buffered falls back to the retained stale public entry, like a 5xx render;
+    /// with nothing retained it is still a bare 502.
+    #[tokio::test]
+    async fn backend_stream_error_on_a_cacheable_miss_serves_stale_if_error() {
+        let (state, ctx, store) = cache_test_ctx();
+        let method = Method::GET;
+        for (path, retained) in [("/sie-stream", true), ("/no-stale", false)] {
+            let identity = format!("https\nforum.example\n{path}");
+            let cc = page_cc(&method, path, &identity, store.purge_epoch());
+            if retained {
+                let key = build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public);
+                let entry = retained_entry(&identity, PageScope::Public, Duration::ZERO);
+                assert!(store.store(key, entry));
+            }
+            let (feed, resp) = fed_page(None);
+            feed.send(Ok(Bytes::from_static(b"<p>partial"))).unwrap();
+            feed.send(Err("backend reset".into())).unwrap();
+            drop(feed);
+            let resp = cache_store(&state, &ctx, &cc, resp).await;
+            if retained {
+                assert_eq!(resp.status(), http::StatusCode::OK);
+                assert_eq!(
+                    resp.headers().get(HDR_CACHE_STATUS).unwrap(),
+                    "hit,stale-if-error"
+                );
+                assert!(matches!(resp.into_body(), Body::Full(b) if &b[..] == b"stale-body"));
+            } else {
+                assert_eq!(resp.status(), http::StatusCode::BAD_GATEWAY);
+            }
+        }
+    }
+
+    /// Regression (#1016): a stale PRIVATE entry is never served stale (that serve uses
+    /// the public stale egress); the member's lookup misses and re-renders. A stale
+    /// public entry still serves stale to a guest.
+    #[tokio::test]
+    async fn stale_private_entry_is_a_miss_not_a_stale_hit() {
+        let (state, mut ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                cfg.private_enabled = true;
+            });
+        ctx.vhost = Arc::new(hj_core::config::VHostConfig {
+            cache_policy: Some(hj_core::config::VhostCachePolicy {
+                enable_cache: true,
+                enable_public: true,
+                enable_private: true,
+            }),
+            ..Default::default()
+        });
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/threads/stale.1/";
+        let guest = page_cc(&method, "/threads/stale.1/", identity, store.purge_epoch());
+        let member = CacheCtx {
+            cookie: Some("xf_user=1; xf_session=sessSTALE"),
+            ..guest
+        };
+        let route = private_route(&state, &ctx, &store, &member, false);
+        let PrivateRoute::Private { owner, .. } = route else {
+            panic!("a member request takes the private route");
+        };
+        let key = build_cache_key(&ctx, &member, &store, &route);
+        let scope = PageScope::Private { owner_hash: owner };
+        let entry = retained_entry(identity, scope, Duration::from_secs(60));
+        assert!(store.store(key.clone(), entry));
+        assert!(matches!(
+            store.get_entry_uncounted(&key, identity, Instant::now()),
+            hj_pagecache::EntryState::Stale(_)
+        ));
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &member, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+
+        let public_key = build_cache_key(&ctx, &guest, &store, &PrivateRoute::Public);
+        let entry = retained_entry(identity, PageScope::Public, Duration::from_secs(60));
+        assert!(store.store(public_key, entry));
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &guest, None, false, None),
+            CacheOutcome::StaleHit(..)
+        ));
     }
 
     #[tokio::test]
@@ -6972,7 +8229,7 @@ mod tests {
             }
         ));
         let hit = store.lookup(&key, identity, Instant::now()).unwrap();
-        let file_body = stored_file_body(&store, &hit).expect("file-tier hit");
+        let file_body = stored_file_body(&store, &hit, None).expect("file-tier hit");
         let retired_path = file_body.path.clone();
 
         assert!(store.fill_recompress_disk(
@@ -7099,6 +8356,7 @@ mod tests {
         ));
         assert!(!retired_path.exists(), "old snapshot path was retired");
 
+        let before = store.stats();
         let successor_validations = std::cell::Cell::new(0usize);
         let response = build_hit_response_with_successor_retry(
             &state,
@@ -7120,6 +8378,15 @@ mod tests {
             1,
             "only the fetched successor needs validation"
         );
+        let after = store.stats();
+        assert_eq!(
+            after.disk_read_errors, before.disk_read_errors,
+            "a swap the successor recovered is not a read error (#997)"
+        );
+        assert_eq!(
+            after.disk_read_swap_retries,
+            before.disk_read_swap_retries + 1
+        );
         let (served, truncated) = crate::uring::bridge::buffer_body(response.into_body()).await;
         assert!(!truncated);
         assert_eq!(served, body);
@@ -7127,6 +8394,94 @@ mod tests {
         assert!(matches!(
             store.get_entry_uncounted(&key, identity, Instant::now()),
             hj_pagecache::EntryState::Fresh(_)
+        ));
+
+        drop(state);
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn lost_file_body_without_successor_counts_a_read_error_and_misses() {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("httpjet_lost_body_{n}"));
+        let mut cfg = hj_pagecache::StoreConfig::default();
+        cfg.store_path = Some(root.clone());
+        cfg.max_mem_bytes = 8 * 1024 * 1024;
+        cfg.max_disk_bytes = 8 * 1024 * 1024;
+        cfg.max_obj_bytes = 1024 * 1024;
+        let store = Arc::new(hj_pagecache::PageStore::new(cfg));
+        store.load_from_disk(|_| {});
+        let (base_state, _, _) = cache_test_ctx();
+        let state = ServerState::new(
+            base_state.server.clone(),
+            None,
+            None,
+            Some(store.clone()),
+            Arc::new(hj_compress::PageDictRegistry::new(
+                std::collections::HashMap::new(),
+                None,
+            )),
+            1,
+            crate::state::XfCapsuleConfig::disabled(),
+            None,
+            false,
+            None,
+            false,
+            crate::state::RewriteTuning::default(),
+        )
+        .unwrap();
+
+        let key = hj_pagecache::PageCacheKey::public(1, true, "example.com", "/lost", "");
+        let identity = "https\nexample.com\n/lost";
+        assert!(store.store(
+            key.clone(),
+            CachedResponse {
+                status: 200,
+                identity: identity.to_owned(),
+                headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                body: PageBody::InMem(Bytes::from(DICT_CORPUS.repeat(4))),
+                variants: Vec::new(),
+                variants_filled: false,
+                dict_gen: 0,
+                tags: Vec::new(),
+                vary_cookie_name: String::new(),
+                vary_value: String::new(),
+                scope: PageScope::Public,
+                stored_at: Instant::now(),
+                ttl: Duration::from_secs(60),
+                swr: Duration::ZERO,
+                sie: Duration::ZERO,
+            }
+        ));
+        let mut current = store.lookup(&key, identity, Instant::now()).unwrap();
+        match &current.body {
+            PageBody::File { path, .. } => std::fs::remove_file(path.as_ref()).unwrap(),
+            _ => panic!("file tier should offload the identity"),
+        }
+
+        let before = store.stats();
+        let response = build_hit_response_with_successor_retry(
+            &state,
+            &store,
+            &key,
+            identity,
+            &mut current,
+            Instant::now(),
+            AcceptEncoding::parse("gzip"),
+            false,
+            |_| true,
+        );
+        assert!(response.is_none(), "a lost body fails closed to a miss");
+        let after = store.stats();
+        assert_eq!(after.disk_read_errors, before.disk_read_errors + 1);
+        assert_eq!(after.disk_read_swap_retries, before.disk_read_swap_retries);
+        assert!(matches!(
+            store.get_entry_uncounted(&key, identity, Instant::now()),
+            hj_pagecache::EntryState::Miss
         ));
 
         drop(state);
@@ -7552,5 +8907,542 @@ mod tests {
                 "{l} from {path}"
             );
         }
+    }
+
+    #[test]
+    fn forced_cache_control_keeps_no_transform() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, No-Transform, max-age=60"),
+        );
+        apply_stale_cf_egress(&mut h);
+        assert_eq!(
+            h[http::header::CACHE_CONTROL],
+            "public, max-age=30, must-revalidate, no-transform"
+        );
+        let mut h = HeaderMap::new();
+        h.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public"),
+        );
+        apply_capsule_member_egress(&mut h);
+        assert_eq!(h[http::header::CACHE_CONTROL], "private, no-store");
+    }
+
+    #[test]
+    fn only_the_canonical_host_spelling_may_use_the_cache() {
+        let req = |host: &str| {
+            http::Request::builder()
+                .uri("/")
+                .header(http::header::HOST, host)
+                .body(hj_core::empty_incoming())
+                .unwrap()
+        };
+        for (host, tls) in [("x.test", true), ("x.test:443", true), ("x.test:80", false)] {
+            assert!(raw_host_is_cache_canonical(&req(host), tls), "{host}");
+        }
+        for (host, tls) in [
+            ("x.test:1234", true),
+            ("x.test:99999999", true),
+            ("X.TEST", true),
+            ("x.test.", true),
+            ("x.test.:443", true),
+            ("x.test:80", true),
+            ("x.test:443", false),
+        ] {
+            assert!(!raw_host_is_cache_canonical(&req(host), tls), "{host}");
+        }
+    }
+
+    // ---- per-URL (response-declared) cookie vary ----------------------------------------
+
+    fn uv_cc<'a>(
+        store: &hj_pagecache::PageStore,
+        path: &'a str,
+        identity: &'a str,
+        cookie: Option<&'a str>,
+    ) -> CacheCtx<'a> {
+        CacheCtx {
+            cookie,
+            ..page_cc(&Method::GET, path, identity, store.purge_epoch())
+        }
+    }
+
+    /// As the pipeline records it when merging the rewrite env.
+    fn uv_env_flag(ctx: &ReqCtx) -> bool {
+        ctx.env.iter().any(|(k, v)| is_cache_vary_env(k, v))
+    }
+
+    fn uv_identity(path: &str) -> String {
+        format!("https\nforum.example\n{path}")
+    }
+
+    /// Look `path` up with `cookie`; the served body on a hit.
+    async fn uv_get(
+        state: &Arc<ServerState>,
+        ctx: &ReqCtx,
+        path: &str,
+        cookie: Option<&str>,
+    ) -> Option<Bytes> {
+        let store = state.page_cache.clone().unwrap();
+        let identity = uv_identity(path);
+        let cc = CacheCtx {
+            env_vary: uv_env_flag(ctx),
+            ..uv_cc(&store, path, &identity, cookie)
+        };
+        match cache_lookup(state, ctx, &cc, None, false, None) {
+            CacheOutcome::Hit(resp) => {
+                assert_eq!(resp.headers()[HDR_CACHE_STATUS], "hit");
+                assert!(!resp.headers().contains_key(HDR_VARY));
+                Some(crate::uring::bridge::buffer_body(resp.into_body()).await.0)
+            }
+            _ => None,
+        }
+    }
+
+    /// A miss for `path` + `cookie` rendered as `body`, declaring `vary` / `tag`.
+    async fn uv_fill(
+        state: &Arc<ServerState>,
+        ctx: &ReqCtx,
+        path: &str,
+        cookie: Option<&str>,
+        vary: Option<&str>,
+        tag: Option<&str>,
+        body: &str,
+    ) {
+        let store = state.page_cache.clone().unwrap();
+        let identity = uv_identity(path);
+        let cc = CacheCtx {
+            env_vary: uv_env_flag(ctx),
+            ..uv_cc(&store, path, &identity, cookie)
+        };
+        let _ = cache_lookup(state, ctx, &cc, None, false, None);
+        let mut resp = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600");
+        if let Some(v) = vary {
+            resp = resp.header(HDR_VARY, v);
+        }
+        if let Some(t) = tag {
+            resp = resp.header(HDR_TAG, t);
+        }
+        let resp = resp
+            .body(Body::Full(Bytes::from(body.to_string())))
+            .unwrap();
+        let out = cache_store(state, ctx, &cc, resp).await;
+        assert!(
+            !out.headers().contains_key(HDR_VARY),
+            "control header leaked"
+        );
+    }
+
+    const TZ: Option<&str> = Some("cookie=tz_date");
+
+    #[tokio::test]
+    async fn per_url_vary_keeps_each_cookie_value_on_its_own_entry() {
+        let (state, ctx, store) = cache_test_ctx();
+        let d17 = Some("xf_csrf=a; tz_date=10-17");
+        let d18 = Some("tz_date=10-18");
+        uv_fill(&state, &ctx, "/", d17, TZ, None, "day 10-17").await;
+        assert_eq!(store.url_vary_spec_count(), 1);
+        assert_eq!(uv_get(&state, &ctx, "/", d17).await.unwrap(), "day 10-17");
+        assert_eq!(uv_get(&state, &ctx, "/", d18).await, None);
+        assert_eq!(uv_get(&state, &ctx, "/", None).await, None);
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=")).await, None);
+        uv_fill(&state, &ctx, "/", d18, TZ, None, "day 10-18").await;
+        uv_fill(&state, &ctx, "/", None, TZ, None, "no date").await;
+        for _ in 0..2 {
+            assert_eq!(uv_get(&state, &ctx, "/", d17).await.unwrap(), "day 10-17");
+            assert_eq!(uv_get(&state, &ctx, "/", d18).await.unwrap(), "day 10-18");
+            assert_eq!(uv_get(&state, &ctx, "/", None).await.unwrap(), "no date");
+            // Unrelated cookies do not split the absent-date entry.
+            assert_eq!(
+                uv_get(&state, &ctx, "/", Some("other=1")).await.unwrap(),
+                "no date"
+            );
+        }
+        // The cookieless on-core fast path resolves the same (absent-date) variant.
+        let identity = uv_identity("/");
+        let cc = uv_cc(&store, "/", &identity, None);
+        let CacheOutcome::Hit(hit) = cache_lookup_fast_path(&state, &ctx, &cc, None) else {
+            panic!("fast path missed the absent-date variant");
+        };
+        assert_eq!(
+            crate::uring::bridge::buffer_body(hit.into_body()).await.0,
+            "no date"
+        );
+        // A URL that never declares the extra vary shares one entry across tz_date values.
+        uv_fill(&state, &ctx, "/help/", d17, None, None, "help").await;
+        assert_eq!(uv_get(&state, &ctx, "/help/", d18).await.unwrap(), "help");
+        assert_eq!(uv_get(&state, &ctx, "/help/", None).await.unwrap(), "help");
+        assert_eq!(store.url_vary_spec_count(), 1);
+    }
+
+    /// The hard constraint: while other URLs carry per-URL specs, a URL that never declares
+    /// one keys, identifies and stores exactly as before (the golden key of
+    /// `canonical_host_cache_keys_are_byte_stable_across_the_alias_fold`).
+    #[tokio::test]
+    async fn non_varying_urls_keep_their_historic_key_and_identity_bytes() {
+        let (state, ctx, store) = cache_test_ctx();
+        const PLAIN: &str = "5cbdff93fdbff4ab:PageCacheKey { vhost_id: 3328770662, secure: true, host: \"forum.example\", path: \"/threads/a.1/\", normalized_query: \"page=2\", vary_value: \"\", private_owner: 0 }";
+        let cc = CacheCtx {
+            cookie: Some("xf_style_id=3; tz_date=10-17"),
+            req_query: "page=2",
+            ..page_cc(&Method::GET, "/threads/a.1/", "i", store.purge_epoch())
+        };
+        let check = |label: &str| {
+            let r = resolved_cache_key(&state, &ctx, &cc, &store, &PrivateRoute::Public).unwrap();
+            assert_eq!(render_keys(std::slice::from_ref(&r.key)), PLAIN, "{label}");
+            assert!(matches!(r.identity, Cow::Borrowed("i")), "{label}");
+            let sk =
+                store_cache_key(&state, &ctx, &cc, &store, &PrivateRoute::Public, &[]).unwrap();
+            assert_eq!(render_keys(std::slice::from_ref(&sk.key)), PLAIN, "{label}");
+            assert_eq!(sk.key_hash, hash_key(&sk.key));
+            assert_eq!(sk.identity, "i", "{label}");
+        };
+        check("no spec anywhere");
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, "d").await;
+        assert!(store.url_vary_active());
+        check("another URL carries a spec");
+        // The spec's own variant key is the base key plus the self-describing suffix.
+        let identity = uv_identity("/");
+        let vcc = uv_cc(&store, "/", &identity, Some("tz_date=10-17"));
+        let r = resolved_cache_key(&state, &ctx, &vcc, &store, &PrivateRoute::Public).unwrap();
+        assert_eq!(r.key.vary_value, "\0lsvary:tz_date=v:10-17");
+        assert_eq!(r.identity, format!("{identity}\0lsvary:tz_date=v:10-17"));
+    }
+
+    #[tokio::test]
+    async fn per_url_vary_variants_follow_tag_purge_and_purge_all() {
+        let (state, ctx, store) = cache_test_ctx();
+        for d in ["10-17", "10-18"] {
+            let c = format!("tz_date={d}");
+            uv_fill(&state, &ctx, "/", Some(&c), TZ, Some("home"), d).await;
+        }
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-17"))
+                .await
+                .unwrap(),
+            "10-17"
+        );
+        store.purge_tags(&["home"]);
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-17")).await, None);
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-18")).await, None);
+        // The spec survives a tag purge: the re-render is varied again.
+        uv_fill(
+            &state,
+            &ctx,
+            "/",
+            Some("tz_date=10-17"),
+            TZ,
+            Some("home"),
+            "again",
+        )
+        .await;
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-18")).await, None);
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-17"))
+                .await
+                .unwrap(),
+            "again"
+        );
+        store.purge_all();
+        assert_eq!(store.url_vary_spec_count(), 0);
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-17")).await, None);
+        assert_eq!(store.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn per_url_vary_cap_evicts_the_least_recently_used_variant() {
+        let (state, ctx, store) = cache_test_ctx();
+        let max = hj_pagecache::urlvary::MAX_VARIANTS;
+        for i in 0..max {
+            let c = format!("tz_date=v{i}");
+            uv_fill(&state, &ctx, "/", Some(&c), TZ, None, &format!("b{i}")).await;
+        }
+        assert_eq!(store.entry_count(), max as u64);
+        // Every variant but v0 is served after the fills, so v0 is least recently used.
+        // (A hit rewrites the last-use stamp at most once a second.)
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        for i in 1..max {
+            let c = format!("tz_date=v{i}");
+            assert!(uv_get(&state, &ctx, "/", Some(&c)).await.is_some());
+        }
+        uv_fill(&state, &ctx, "/", Some("tz_date=flood"), TZ, None, "x").await;
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=flood"))
+                .await
+                .unwrap(),
+            "x"
+        );
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=v0")).await, None);
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=v3")).await.unwrap(),
+            "b3"
+        );
+        assert_eq!(store.entry_count(), max as u64);
+        // A value too long to key is never stored.
+        let long = format!("tz_date={}", "z".repeat(200));
+        uv_fill(&state, &ctx, "/", Some(&long), TZ, None, "long").await;
+        assert_eq!(uv_get(&state, &ctx, "/", Some(&long)).await, None);
+        assert_eq!(store.entry_count(), max as u64);
+    }
+
+    /// A varying render the admission bar rejects records no spec (so one-hit cache-buster
+    /// renders cannot grow the spec map) but still retires the shared base entry it
+    /// supersedes; the next render is admitted as for any other URL.
+    #[tokio::test]
+    async fn rejected_variant_creates_no_spec_but_retires_the_base() {
+        let (state, ctx, store) = cache_test_ctx();
+        uv_fill(&state, &ctx, "/", None, None, None, "shared").await;
+        assert_eq!(uv_get(&state, &ctx, "/", None).await.unwrap(), "shared");
+        // > 256 KiB raises the admission bar to two sightings.
+        let big = "d".repeat(300 * 1024);
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, &big).await;
+        assert_eq!(
+            store.url_vary_spec_count(),
+            0,
+            "no spec without an admitted variant"
+        );
+        assert_eq!(store.url_vary_bytes(), 0);
+        assert_eq!(uv_get(&state, &ctx, "/", None).await, None, "base retired");
+        assert_eq!(store.entry_count(), 0);
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, &big).await;
+        assert_eq!(store.url_vary_spec_count(), 1);
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-17"))
+                .await
+                .unwrap(),
+            big.as_str()
+        );
+        assert_eq!(uv_get(&state, &ctx, "/", None).await, None);
+    }
+
+    /// With the spec map at its bound, a newly varying URL evicts the least recently touched
+    /// spec rather than being refused, and its shared base entry is retired either way.
+    #[tokio::test]
+    async fn full_spec_map_still_retires_the_base_and_admits_the_new_url() {
+        let (state, ctx, store) = cache_test_ctx();
+        uv_fill(&state, &ctx, "/", None, None, None, "shared").await;
+        let names = vec!["tz_date".to_string()];
+        for i in 0..hj_pagecache::urlvary::MAX_SPECS as u64 {
+            let b = hj_pagecache::PageCacheKey::public(1, true, "junk", format!("/j{i}"), "");
+            assert!(store.url_vary_prepare(&b, hash_key(&b), &names, i));
+        }
+        assert_eq!(
+            store.url_vary_spec_count(),
+            hj_pagecache::urlvary::MAX_SPECS
+        );
+        assert!(store.url_vary_bytes() <= hj_pagecache::urlvary::MAX_SPEC_BYTES);
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, "d17").await;
+        assert_eq!(uv_get(&state, &ctx, "/", None).await, None, "base retired");
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-17"))
+                .await
+                .unwrap(),
+            "d17"
+        );
+        assert_eq!(
+            store.url_vary_spec_count(),
+            hj_pagecache::urlvary::MAX_SPECS
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_response_without_vary_drops_the_spec_and_its_variants() {
+        let (state, ctx, store) = cache_test_ctx();
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, "d17").await;
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-18"), TZ, None, "d18").await;
+        // The app stops varying: the next render declares no vary.
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-19"), None, None, "same").await;
+        assert_eq!(store.url_vary_spec_count(), 0);
+        for c in [Some("tz_date=10-17"), Some("tz_date=10-18"), None] {
+            assert_eq!(uv_get(&state, &ctx, "/", c).await.unwrap(), "same", "{c:?}");
+        }
+        assert_eq!(store.entry_count(), 1);
+        // And back: declaring the vary again retires the shared entry.
+        uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, "d17").await;
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-18")).await, None);
+        assert_eq!(store.entry_count(), 1);
+        // A changed vary set retires the old variants.
+        uv_fill(
+            &state,
+            &ctx,
+            "/",
+            Some("tz_date=10-17; lang=fr"),
+            Some("cookie=lang"),
+            None,
+            "fr",
+        )
+        .await;
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-17")).await, None);
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-18; lang=fr"))
+                .await
+                .unwrap(),
+            "fr"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_env_cache_vary_keys_the_request_like_a_declared_vary() {
+        for (k, v) in [
+            ("Cache-Vary", "cookie=tz_date"),
+            ("cache-control", "vary=tz_date"),
+        ] {
+            let (state, mut ctx, _store) = cache_test_ctx();
+            ctx.env.push((k.into(), v.into()));
+            uv_fill(
+                &state,
+                &ctx,
+                "/env/",
+                Some("tz_date=10-17"),
+                None,
+                None,
+                "e17",
+            )
+            .await;
+            assert_eq!(
+                uv_get(&state, &ctx, "/env/", Some("tz_date=10-18")).await,
+                None,
+                "{k}"
+            );
+            uv_fill(
+                &state,
+                &ctx,
+                "/env/",
+                Some("tz_date=10-18"),
+                None,
+                None,
+                "e18",
+            )
+            .await;
+            assert_eq!(
+                uv_get(&state, &ctx, "/env/", Some("tz_date=10-17"))
+                    .await
+                    .unwrap(),
+                "e17"
+            );
+            assert_eq!(
+                uv_get(&state, &ctx, "/env/", Some("tz_date=10-18"))
+                    .await
+                    .unwrap(),
+                "e18"
+            );
+        }
+    }
+
+    fn uv_file_root(tag: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("hj-urlvary-{tag}-{}-{n}", std::process::id()))
+    }
+
+    fn uv_file_boot(
+        root: &std::path::Path,
+    ) -> (Arc<ServerState>, ReqCtx, Arc<hj_pagecache::PageStore>) {
+        let root = root.to_path_buf();
+        let (state, ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), move |cfg| {
+                cfg.store_path = Some(root);
+                cfg.max_mem_bytes = 8 * 1024 * 1024;
+                cfg.max_disk_bytes = 8 * 1024 * 1024;
+            });
+        store.load_from_disk(|_| {});
+        (state, ctx, store)
+    }
+
+    /// Persisted variants are self-describing: after a restart the boot scan rebuilds the
+    /// spec, every variant serves only its own cookie value, and the un-varied key stays empty.
+    #[tokio::test]
+    async fn per_url_vary_variants_restore_from_the_file_tier() {
+        let root = uv_file_root("restore");
+        {
+            let (state, ctx, store) = uv_file_boot(&root);
+            uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, "d17").await;
+            uv_fill(&state, &ctx, "/", Some("tz_date=10-18"), TZ, None, "d18").await;
+            uv_fill(&state, &ctx, "/", None, TZ, None, "none").await;
+            uv_fill(&state, &ctx, "/help/", None, None, None, "help").await;
+            assert_eq!(store.entry_count(), 4);
+        }
+        let (state, ctx, store) = uv_file_boot(&root);
+        assert_eq!(store.scan_loaded(), 4);
+        assert_eq!(store.url_vary_spec_count(), 1);
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-17"))
+                .await
+                .unwrap(),
+            "d17"
+        );
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-18"))
+                .await
+                .unwrap(),
+            "d18"
+        );
+        assert_eq!(uv_get(&state, &ctx, "/", None).await.unwrap(), "none");
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-19")).await, None);
+        assert_eq!(
+            uv_get(&state, &ctx, "/help/", Some("tz_date=10-19"))
+                .await
+                .unwrap(),
+            "help"
+        );
+        drop((state, store));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A restored un-varied entry older than the URL's variants is never served: the boot scan
+    /// keeps the newest vary decision for the base key.
+    #[tokio::test]
+    async fn boot_scan_prefers_the_newest_vary_decision() {
+        let root = uv_file_root("newest");
+        {
+            let (state, ctx, store) = uv_file_boot(&root);
+            uv_fill(
+                &state,
+                &ctx,
+                "/",
+                Some("tz_date=10-17"),
+                None,
+                None,
+                "old shared",
+            )
+            .await;
+            let identity = uv_identity("/");
+            let cc = uv_cc(&store, "/", &identity, None);
+            let base = resolved_cache_key(&state, &ctx, &cc, &store, &PrivateRoute::Public)
+                .unwrap()
+                .key;
+            let old = store.lookup(&base, &identity, Instant::now()).unwrap();
+            uv_fill(&state, &ctx, "/", Some("tz_date=10-17"), TZ, None, "d17").await;
+            assert!(store.lookup(&base, &identity, Instant::now()).is_none());
+            // Plant a stale un-varied base entry beside the newer variant, as a crash between
+            // the two decisions could leave behind (`store` skips the per-URL bookkeeping).
+            let mut replant = (*old).clone();
+            replant.body = PageBody::InMem(Bytes::from_static(b"old shared"));
+            replant.stored_at = Instant::now() - Duration::from_secs(1);
+            assert!(store.store(base, replant));
+        }
+        let (state, ctx, store) = uv_file_boot(&root);
+        assert_eq!(store.url_vary_spec_count(), 1);
+        assert_eq!(uv_get(&state, &ctx, "/", Some("tz_date=10-18")).await, None);
+        assert_eq!(uv_get(&state, &ctx, "/", None).await, None);
+        assert_eq!(
+            uv_get(&state, &ctx, "/", Some("tz_date=10-17"))
+                .await
+                .unwrap(),
+            "d17"
+        );
+        // The losing base entry was retired, not merely shadowed.
+        assert_eq!(store.entry_count(), 1);
+        drop((state, store));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

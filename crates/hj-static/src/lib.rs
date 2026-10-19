@@ -85,7 +85,7 @@ use hj_compress::{AcceptEncoding, Encoding};
 use hj_core::{Body, FileBody, Handler, HandlerError, ReqCtx};
 use rustix::fs::{Mode, OFlags, ResolveFlags};
 
-/// Default content type when the MIME map has no entry for the suffix.
+/// Last-resort content type when a configured type is not a valid header value.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
 // LiteSpeed `fileETag` bitmask bits (OLS `http/httpcontext.h`):
@@ -96,11 +96,16 @@ const ETAG_MTIME: u32 = 8;
 const ETAG_SIZE: u32 = 16;
 const ETAG_ALL: u32 = ETAG_INODE | ETAG_MTIME | ETAG_SIZE;
 
-/// Bounded caps for the per-file header caches. Inserts are cap-gated (mirroring
-/// `StatCache`/`HtaccessCache`): once full, cold entries simply aren't cached, so
-/// memory is bounded without an eviction sweep.
+/// Bounded caps for the per-file header caches. A full cache is cleared before
+/// the next insert (see [`admit`]), so memory stays bounded without a per-entry
+/// eviction policy and new file versions keep being cached.
 const META_CACHE_CAP: usize = 16_384;
 const CT_CACHE_CAP: usize = 1_024;
+
+/// How long a docroot that failed the symlink-free open keeps opening with a plain
+/// (symlink-following) `open`, and how many such docroots are remembered.
+const SYMLINKED_ROOT_TTL: Duration = Duration::from_secs(1);
+const SYMLINKED_ROOT_CAP: usize = 256;
 
 /// Path-resolution cache cap + freshness window. A successful directory→file
 /// resolution is memoized for this short window. A memo hit re-opens the final
@@ -162,13 +167,40 @@ struct HdrCache {
     /// entry for a collision guard (a hash clash degrades to a re-resolve, never
     /// wrong content). See [`RESOLVE_TTL`].
     resolve: DashMap<u64, Arc<ResolveEntry>>,
+    /// Docroot -> deadline of its "a symlink is on the path" verdict. See
+    /// [`StaticFiles::open_root`].
+    symlinked_roots: DashMap<PathBuf, Instant>,
     /// Approximate entry counts for the cap gates — `DashMap::len()` sweeps every
-    /// shard, and a full map paid that sweep on every uncached request. Entries
-    /// are never removed, so counters bumped on new-key insert are exact up to
-    /// insert races.
+    /// shard, and a full map paid that sweep on every uncached request. Bumped on
+    /// new-key insert and reset when a full map is cleared, so they are exact up
+    /// to insert races.
     meta_count: AtomicUsize,
     ct_count: AtomicUsize,
     resolve_count: AtomicUsize,
+    symlinked_roots_count: AtomicUsize,
+}
+
+/// Insert into a capped cache, clearing it first when it is full: a cache that
+/// stopped admitting at its cap left every later key uncached for the rest of
+/// the config generation.
+fn admit<K: Eq + Hash, V>(map: &DashMap<K, V>, count: &AtomicUsize, cap: usize, key: K, value: V) {
+    if count.load(Ordering::Relaxed) >= cap {
+        map.clear();
+        count.store(0, Ordering::Relaxed);
+    }
+    if map.insert(key, value).is_none() {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The document root, opened once per request: every beneath-root open of the
+/// request (target, directory index, memo re-open, precompressed siblings)
+/// resolves against this one descriptor.
+struct RootDir {
+    fd: OwnedFd,
+    /// The docroot path was opened with `RESOLVE_NO_SYMLINKS`, so it crossed no
+    /// symlink and its normalized lexical form names the opened directory.
+    symlink_free: bool,
 }
 
 /// A memoized successful path resolution and its freshness deadline. The stored
@@ -223,11 +255,13 @@ impl StaticFiles {
             last_modified,
             content_length,
         });
-        if self.hdr.meta_count.load(Ordering::Relaxed) < META_CACHE_CAP {
-            if self.hdr.meta.insert(key, built.clone()).is_none() {
-                self.hdr.meta_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        admit(
+            &self.hdr.meta,
+            &self.hdr.meta_count,
+            META_CACHE_CAP,
+            key,
+            built.clone(),
+        );
         built
     }
 
@@ -247,26 +281,17 @@ impl StaticFiles {
                 return v.clone();
             }
         }
-        let mime = ctx
-            .server
-            .mime
-            .content_type(ext)
-            .unwrap_or(DEFAULT_CONTENT_TYPE);
-        let hv = if let Some(charset) = default_charset {
-            let mut ct = mime.to_string();
-            if needs_charset(&ct) {
-                ct.push_str("; charset=");
-                ct.push_str(charset);
-            }
-            HeaderValue::from_str(&ct)
-        } else {
-            HeaderValue::from_str(mime)
-        }
-        .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_CONTENT_TYPE));
-        if charset_off && self.hdr.ct_count.load(Ordering::Relaxed) < CT_CACHE_CAP {
-            if self.hdr.ct.insert(ext.into(), hv.clone()).is_none() {
-                self.hdr.ct_count.fetch_add(1, Ordering::Relaxed);
-            }
+        let map = &ctx.server.mime;
+        let mime = map.content_type(ext).unwrap_or(map.default_type());
+        let hv = content_type_value(mime, default_charset);
+        if charset_off {
+            admit(
+                &self.hdr.ct,
+                &self.hdr.ct_count,
+                CT_CACHE_CAP,
+                ext.into(),
+                hv.clone(),
+            );
         }
         hv
     }
@@ -276,8 +301,10 @@ impl StaticFiles {
     /// skips directory/index discovery after a descriptor identity check. A
     /// changed identity or expired entry re-runs the safe resolver. Only `File` outcomes are cached;
     /// `DirectorySlash` (a redirect) and errors fall through.
+    #[allow(clippy::too_many_arguments)]
     fn resolve_cached(
         &self,
+        root: &RootDir,
         doc_root: &Path,
         rel: &Path,
         wants_dir: bool,
@@ -306,7 +333,7 @@ impl StaticFiles {
                     && e.root == doc_root
                     && e.rel == rel
                     && let Some((file, resolved_path)) =
-                        e.file.reopen_matching(doc_root, allow_symlink)
+                        e.file.reopen_matching(root, doc_root, allow_symlink)
                 {
                     let mut resolved = e.file.clone();
                     resolved.file = Some(file);
@@ -316,6 +343,7 @@ impl StaticFiles {
             }
         }
         let resolved = resolve_file(
+            root,
             doc_root,
             rel,
             wants_dir,
@@ -325,29 +353,97 @@ impl StaticFiles {
         )?;
         if allow_symlink {
             if let Resolved::File(ref f) = resolved {
-                // Cap-gated like the header caches, but always allow refreshing an
-                // existing (now-expired) key so a hot entry keeps its memo when full.
-                if self.hdr.resolve_count.load(Ordering::Relaxed) < RESOLVE_CACHE_CAP
-                    || self.hdr.resolve.contains_key(&key)
+                // Refreshing an existing (now-expired) key never needs room.
+                if self.hdr.resolve_count.load(Ordering::Relaxed) >= RESOLVE_CACHE_CAP
+                    && !self.hdr.resolve.contains_key(&key)
                 {
-                    let prev = self.hdr.resolve.insert(
-                        key,
-                        Arc::new(ResolveEntry {
-                            root: doc_root.to_path_buf(),
-                            rel: rel.to_path_buf(),
-                            wants_dir,
-                            allow_symlink,
-                            file: f.clone(),
-                            expires: now + RESOLVE_TTL,
-                        }),
-                    );
-                    if prev.is_none() {
-                        self.hdr.resolve_count.fetch_add(1, Ordering::Relaxed);
-                    }
+                    self.make_resolve_room(now);
+                }
+                let prev = self.hdr.resolve.insert(
+                    key,
+                    Arc::new(ResolveEntry {
+                        root: doc_root.to_path_buf(),
+                        rel: rel.to_path_buf(),
+                        wants_dir,
+                        allow_symlink,
+                        file: f.clone(),
+                        expires: now + RESOLVE_TTL,
+                    }),
+                );
+                if prev.is_none() {
+                    self.hdr.resolve_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         Ok(resolved)
+    }
+
+    /// Free the full resolve memo: expired entries can never serve again, so they
+    /// go first; when live entries still fill half of it (more distinct paths per
+    /// TTL than it holds), clear it so the next sweep is a cap's worth of inserts away.
+    fn make_resolve_room(&self, now: Instant) {
+        self.hdr.resolve.retain(|_, e| e.expires > now);
+        let mut live = self.hdr.resolve.len();
+        if live >= RESOLVE_CACHE_CAP / 2 {
+            self.hdr.resolve.clear();
+            live = 0;
+        }
+        self.hdr.resolve_count.store(live, Ordering::Relaxed);
+    }
+
+    /// Open `doc_root` with `RESOLVE_NO_SYMLINKS`, so a symlink-free docroot is
+    /// known to be one. A docroot with a symlink on its path (or a kernel without
+    /// `openat2`) falls back to the plain open every request used before, and is
+    /// remembered for [`SYMLINKED_ROOT_TTL`] so it does not also pay a failing
+    /// `openat2` each time.
+    fn open_root(&self, doc_root: &Path) -> io::Result<RootDir> {
+        let symlinked = self.hdr.symlinked_roots_count.load(Ordering::Relaxed) != 0
+            && self
+                .hdr
+                .symlinked_roots
+                .get(doc_root)
+                .is_some_and(|until| *until > Instant::now());
+        if !symlinked {
+            use rustix::io::Errno;
+            match rustix::fs::openat2(
+                rustix::fs::CWD,
+                doc_root,
+                ROOT_OFLAGS,
+                Mode::empty(),
+                ResolveFlags::NO_SYMLINKS,
+            ) {
+                Ok(fd) => {
+                    return Ok(RootDir {
+                        fd,
+                        symlink_free: true,
+                    });
+                }
+                // The walk stopped at a missing name or a non-directory, every
+                // earlier component a real directory: a following open fails alike.
+                Err(e) if e == Errno::NOENT || e == Errno::NOTDIR => {
+                    return Err(io::Error::from(e));
+                }
+                Err(e)
+                    if e == Errno::LOOP
+                        || e == Errno::XDEV
+                        || e == Errno::NOSYS
+                        || e == Errno::OPNOTSUPP =>
+                {
+                    admit(
+                        &self.hdr.symlinked_roots,
+                        &self.hdr.symlinked_roots_count,
+                        SYMLINKED_ROOT_CAP,
+                        doc_root.to_path_buf(),
+                        Instant::now() + SYMLINKED_ROOT_TTL,
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(RootDir {
+            fd: open_dir(doc_root)?,
+            symlink_free: false,
+        })
     }
 }
 
@@ -395,13 +491,13 @@ impl ResolvedFile {
     /// bytes from the replacement inode.
     fn reopen_matching(
         &self,
+        root: &RootDir,
         doc_root: &Path,
         allow_symlink: bool,
     ) -> Option<(std::fs::File, PathBuf)> {
         let rel = self.path.strip_prefix(doc_root).ok()?.to_string_lossy();
-        let root_fd = open_dir(doc_root).ok()?;
         let (fd, meta, followed_symlink) =
-            open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
+            open_beneath(&root.fd, rel.as_ref(), allow_symlink).ok()?;
         if !meta.is_file()
             || meta.len != self.len
             || meta.inode != self.inode
@@ -411,7 +507,7 @@ impl ResolvedFile {
             return None;
         }
         let resolved_path = if followed_symlink || self.resolved_path != self.path {
-            resolved_fd_path(&fd, &self.path).ok()?
+            opened_path(root, &fd, &self.path, followed_symlink).ok()?
         } else {
             self.path.clone()
         };
@@ -469,6 +565,23 @@ impl ResolvedFile {
     }
 }
 
+/// `mime` as a `Content-Type` value, with the configured default charset where
+/// [`needs_charset`] applies; an invalid value degrades to the default type.
+fn content_type_value(mime: &str, default_charset: Option<&str>) -> HeaderValue {
+    if let Some(charset) = default_charset {
+        let mut ct = mime.to_string();
+        // An explicit `.htaccess` type may already name its charset (#931).
+        if needs_charset(&ct) && !ct.to_ascii_lowercase().contains("charset=") {
+            ct.push_str("; charset=");
+            ct.push_str(charset);
+        }
+        HeaderValue::from_str(&ct)
+    } else {
+        HeaderValue::from_str(mime)
+    }
+    .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_CONTENT_TYPE))
+}
+
 /// Decide whether a charset suffix should be appended to `Content-Type`,
 /// mirroring OLS `HttpMime::needCharset`: `text/*` always, plus
 /// `application/{javascript,x-javascript,json}` (subtype matched
@@ -495,6 +608,28 @@ fn needs_charset(mime: &str) -> bool {
 /// Absence means `addDefaultCharset off`.
 #[derive(Clone)]
 pub struct DefaultCharsetOverride(pub String);
+
+/// Request extension carrying a per-directory MIME mapping (`.htaccess`
+/// `AddType`/`ForceType`) that outranks the server's suffix table for the
+/// selected file. `Fixed` applies to the requested file itself; `ByName` maps
+/// the basename the resolver selected (a `DirectoryIndex` file) and may decline.
+#[derive(Clone)]
+pub enum ContentTypeOverride {
+    Fixed(String),
+    ByName(Arc<dyn Fn(&str) -> Option<String> + Send + Sync>),
+}
+
+/// Request extension that disables precompressed-sibling selection: a body
+/// filter (sub_filter) must see the identity file, not encoded `.br`/`.gz` bytes.
+#[derive(Clone, Copy)]
+pub struct NoPrecompressedSibling;
+
+/// Response extension: the targets describe a precompressed `.br`/`.gz` sibling
+/// substituted for the requested file. A policy layer that refuses the sibling
+/// re-serves the request with [`NoPrecompressedSibling`] so the identity file
+/// is judged on its own rules instead of inheriting the sibling's refusal.
+#[derive(Clone, Copy, Debug)]
+pub struct PrecompressedSiblingSelected;
 
 /// Canonical filesystem target selected by the static resolver. The pipeline
 /// consumes this response extension for `accessDenyDir` parity.
@@ -542,15 +677,12 @@ impl StaticFiles {
     ) -> Result<Response<Body>, HandlerError> {
         // Only GET/HEAD are servable as static content. Anything else is the
         // pipeline's concern (e.g. POST to a script handler); we 405 here so a
-        // mistaken static route doesn't silently swallow the method.
+        // mistaken static route doesn't silently swallow the method. The 405 is
+        // decided AFTER resolution (#948): a path that does not exist (or is
+        // denied) answers 404/403 for every method, as LSWS does, so its
+        // ErrorDocument runs.
         let is_head = req.method() == Method::HEAD;
-        if !is_head && req.method() != Method::GET {
-            let mut resp =
-                hj_core::text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
-            resp.headers_mut()
-                .insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-            return Ok(resp);
-        }
+        let method_not_allowed = !is_head && req.method() != Method::GET;
 
         // A static <context> with a `location` differing from the vhost docroot
         // pins it here via the DocRootOverride extension (set by the pipeline);
@@ -582,7 +714,11 @@ impl StaticFiles {
         // for it (#285): with no deny rules the per-resolve /proc readlink is pure
         // waste on the uncached static path.
         let want_resolved = !ctx.server.security.access_deny_dir.is_empty();
+        let root = self
+            .open_root(&doc_root)
+            .map_err(|_| HandlerError::NotFound)?;
         let mut resolved = match self.resolve_cached(
+            &root,
             &doc_root,
             &rel,
             wants_dir,
@@ -590,6 +726,13 @@ impl StaticFiles {
             allow_symlink,
             want_resolved,
         )? {
+            Resolved::File(_) | Resolved::DirectorySlash(_) if method_not_allowed => {
+                let mut resp =
+                    hj_core::text_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
+                resp.headers_mut()
+                    .insert(http::header::ALLOW, HeaderValue::from_static("GET, HEAD"));
+                return Ok(resp);
+            }
             Resolved::File(f) => f,
             // DirectorySlash: the request maps to an existing directory but has
             // no trailing slash → 301 to the canonical slashed URL (Apache
@@ -617,7 +760,19 @@ impl StaticFiles {
             .extensions()
             .get::<DefaultCharsetOverride>()
             .map(|c| c.0.as_str());
-        let content_type = self.content_type_for(ctx, ext, default_charset);
+        let mime_override = match req.extensions().get::<ContentTypeOverride>() {
+            None => None,
+            Some(ContentTypeOverride::Fixed(mime)) => Some(mime.clone()),
+            Some(ContentTypeOverride::ByName(map)) => resolved
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| map(name)),
+        };
+        let content_type = match mime_override {
+            Some(mime) => content_type_value(&mime, default_charset),
+            None => self.content_type_for(ctx, ext, default_charset),
+        };
 
         // (Tier 2) Precompressed sibling serving (nginx gzip_static/brotli_static
         // parity): when the client accepts br/gzip and a `<file>.br`/`.gz`
@@ -629,7 +784,10 @@ impl StaticFiles {
         // marks the variant for caches. Ranged requests skip the swap (they
         // operate on the primary's bytes).
         let mut content_encoding: Option<Encoding> = None;
-        if !req.headers().contains_key(RANGE) {
+        // HEAD ignores Range (RFC 9110 §14.2), so it describes the GET's sibling (#789).
+        if (is_head || !req.headers().contains_key(RANGE))
+            && req.extensions().get::<NoPrecompressedSibling>().is_none()
+        {
             let accepts = req
                 .headers()
                 .get(ACCEPT_ENCODING)
@@ -641,18 +799,24 @@ impl StaticFiles {
                     continue;
                 }
                 if let Some(sibling) = resolve_precompressed_sibling(
+                    &root,
                     &doc_root,
                     &resolved.path,
                     ext_suffix,
                     allow_symlink,
                     want_resolved,
                 ) {
+                    // Judged only once a sibling exists: a `no-gzip` request gets identity.
+                    if hj_compress::no_gzip(ctx) {
+                        break;
+                    }
                     content_encoding = Some(enc);
                     resolved = sibling;
                     break;
                 }
             }
         }
+        drop(root);
         // These must be captured after precompressed selection: every response
         // extension and FileBody path has to identify the representation whose
         // metadata and pinned descriptor are being returned. Retain the lexical
@@ -680,6 +844,18 @@ impl StaticFiles {
             &resolved,
         );
         let etag_str = meta.etag.as_ref().and_then(|h| h.to_str().ok());
+        // RFC 9110 §8.8.2.1: Last-Modified must not be later than the response
+        // Date, so a future mtime is reported as the request time (Apache
+        // `ap_set_last_modified`). Only that rare case formats per request; the
+        // cached per-version value stays the plain mtime.
+        let now = ctx.request_time;
+        let clamped_last_modified;
+        let last_modified = if resolved.mtime > now {
+            clamped_last_modified = http_date_header(now);
+            clamped_last_modified.as_ref()
+        } else {
+            meta.last_modified.as_ref()
+        };
 
         // ---- Conditional requests (RFC 7232) -----------------------------
         let precondition_failed = if let Some(if_match) = req.headers().get(IF_MATCH) {
@@ -694,7 +870,12 @@ impl StaticFiles {
             *resp.status_mut() = StatusCode::PRECONDITION_FAILED;
             resp.headers_mut()
                 .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
-            return Ok(with_file_targets(resp, resolved_target, lexical_target));
+            return Ok(with_file_targets(
+                resp,
+                resolved_target,
+                lexical_target,
+                content_encoding.is_some(),
+            ));
         }
 
         // If-None-Match takes precedence over If-Modified-Since. The wildcard tests
@@ -703,7 +884,7 @@ impl StaticFiles {
             inm.to_str().is_ok_and(|s| s.trim() == "*")
                 || etag_str.is_some_and(|e| if_none_match_matches(inm.as_bytes(), e))
         } else if let Some(ims) = req.headers().get(IF_MODIFIED_SINCE) {
-            if_modified_since_not_modified(ims, resolved.mtime)
+            if_modified_since_not_modified(ims, resolved.mtime, now)
         } else {
             false
         };
@@ -725,15 +906,43 @@ impl StaticFiles {
                 h.insert(CONTENT_ENCODING, HeaderValue::from_static(enc.token()));
                 h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
             }
+            let mut encoded_variant = false;
             if let Some(ref e) = meta.etag {
-                h.insert(ETAG, e.clone());
+                // Like OLS `testMod`, echo the variant the client holds
+                // (`"<core>;gz"`): the compressed 200 it revalidates carried
+                // that tag, not the identity one.
+                let echoed = req
+                    .headers()
+                    .get(IF_NONE_MATCH)
+                    .and_then(|inm| inm.to_str().ok())
+                    .zip(etag_str)
+                    .and_then(|(inm, base)| hj_core::matched_etag_variant(inm, base))
+                    .and_then(|tok| HeaderValue::from_str(tok).ok());
+                encoded_variant = echoed
+                    .as_ref()
+                    .is_some_and(|tag| hj_compress::etag_variant(tag.as_bytes()).is_some());
+                h.insert(ETAG, echoed.unwrap_or_else(|| e.clone()));
             }
-            if let Some(lm) = &meta.last_modified {
+            if let Some(lm) = last_modified {
                 h.insert(LAST_MODIFIED, lm.clone());
             }
-            h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            // A cache merges a 304's headers into the stored response it validates
+            // (RFC 9111 §4.3.4): an encoded one must not gain the byte-range support
+            // its 200 withheld (#887), or a resume splices identity bytes into it.
+            if content_encoding.is_none() && !encoded_variant {
+                h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            }
             h.insert(CONTENT_TYPE, content_type.clone());
-            return Ok(with_file_targets(resp, resolved_target, lexical_target));
+            if content_encoding.is_none() {
+                resp.extensions_mut()
+                    .insert(hj_compress::StaticIdentityLength(resolved.len));
+            }
+            return Ok(with_file_targets(
+                resp,
+                resolved_target,
+                lexical_target,
+                content_encoding.is_some(),
+            ));
         }
 
         // ---- Range handling (RFC 7233) -----------------------------------
@@ -741,7 +950,7 @@ impl StaticFiles {
         // date If-Range can still match even without an ETag.
         let honor_range = match req.headers().get(IF_RANGE) {
             None => true,
-            Some(ir) => if_range_matches(ir, etag_str, resolved.mtime),
+            Some(ir) => if_range_matches(ir, etag_str, resolved.mtime, now),
         };
 
         let range = if !is_head && honor_range {
@@ -772,7 +981,7 @@ impl StaticFiles {
                     if let Some(ref e) = meta.etag {
                         h.insert(ETAG, e.clone());
                     }
-                    if let Some(lm) = &meta.last_modified {
+                    if let Some(lm) = last_modified {
                         h.insert(LAST_MODIFIED, lm.clone());
                     }
                     let clen = end - start + 1;
@@ -782,7 +991,12 @@ impl StaticFiles {
                         CONTENT_RANGE,
                         &format!("bytes {}-{}/{}", start, end, resolved.len),
                     );
-                    return Ok(with_file_targets(resp, resolved_target, lexical_target));
+                    return Ok(with_file_targets(
+                        resp,
+                        resolved_target,
+                        lexical_target,
+                        content_encoding.is_some(),
+                    ));
                 }
                 RangeOutcome::Unsatisfiable => {
                     let mut resp = hj_core::text_response(
@@ -792,7 +1006,12 @@ impl StaticFiles {
                     let h = resp.headers_mut();
                     insert_static(h, CONTENT_RANGE, &format!("bytes */{}", resolved.len));
                     h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-                    return Ok(with_file_targets(resp, resolved_target, lexical_target));
+                    return Ok(with_file_targets(
+                        resp,
+                        resolved_target,
+                        lexical_target,
+                        content_encoding.is_some(),
+                    ));
                 }
                 RangeOutcome::Multi(ranges) => {
                     let total: u64 = ranges.iter().map(|(s, e)| e - s + 1).sum();
@@ -822,11 +1041,16 @@ impl StaticFiles {
                         if let Some(ref e) = meta.etag {
                             h.insert(ETAG, e.clone());
                         }
-                        if let Some(lm) = &meta.last_modified {
+                        if let Some(lm) = last_modified {
                             h.insert(LAST_MODIFIED, lm.clone());
                         }
                         insert_static(h, CONTENT_LENGTH, &wire_len.to_string());
-                        return Ok(with_file_targets(resp, resolved_target, lexical_target));
+                        return Ok(with_file_targets(
+                            resp,
+                            resolved_target,
+                            lexical_target,
+                            content_encoding.is_some(),
+                        ));
                     }
                     // Over the materialization cap (or a failed part read): ignore
                     // Range and serve the full entity below — always RFC-permitted.
@@ -861,14 +1085,28 @@ impl StaticFiles {
             h.insert(VARY, HeaderValue::from_static("Accept-Encoding"));
         }
         h.insert(CONTENT_LENGTH, meta.content_length.clone());
-        if let Some(lm) = &meta.last_modified {
+        if let Some(lm) = last_modified {
             h.insert(LAST_MODIFIED, lm.clone());
         }
-        h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        // A Range request is served from the primary's identity bytes, so a sibling
+        // must not invite a resume of its encoded bytes (as the compress transform
+        // drops it for the same reason).
+        if content_encoding.is_none() {
+            h.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+        }
         if let Some(ref e) = meta.etag {
             h.insert(ETAG, e.clone());
         }
-        Ok(with_file_targets(resp, resolved_target, lexical_target))
+        if is_head && content_encoding.is_none() {
+            resp.extensions_mut()
+                .insert(hj_compress::StaticIdentityLength(resolved.len));
+        }
+        Ok(with_file_targets(
+            resp,
+            resolved_target,
+            lexical_target,
+            content_encoding.is_some(),
+        ))
     }
 }
 
@@ -892,10 +1130,14 @@ fn with_file_targets(
     mut resp: Response<Body>,
     resolved: PathBuf,
     lexical: Option<PathBuf>,
+    sibling: bool,
 ) -> Response<Body> {
     resp.extensions_mut().insert(ResolvedTargetPath(resolved));
     if let Some(path) = lexical {
         resp.extensions_mut().insert(LexicalTargetPath(path));
+    }
+    if sibling {
+        resp.extensions_mut().insert(PrecompressedSiblingSelected);
     }
     resp
 }
@@ -969,6 +1211,7 @@ enum Resolved {
 /// file. Returns a concrete regular file, a [`Resolved::DirectorySlash`] signal
 /// for a slashless directory, or an appropriate [`HandlerError`].
 fn resolve_file(
+    root: &RootDir,
     doc_root: &Path,
     rel: &Path,
     wants_dir: bool,
@@ -976,9 +1219,7 @@ fn resolve_file(
     allow_symlink: bool,
     want_resolved: bool,
 ) -> Result<Resolved, HandlerError> {
-    // Open the document root directory once; all lookups are beneath it.
-    let root_fd = open_dir(doc_root).map_err(|_| HandlerError::NotFound)?;
-
+    let root_fd = &root.fd;
     let rel_str = rel.to_string_lossy();
     let rel_open = if rel_str.is_empty() {
         "."
@@ -987,7 +1228,7 @@ fn resolve_file(
     };
 
     // First, stat the target itself (whether file or directory).
-    let (fd, stat, followed_symlink) = match open_beneath(&root_fd, rel_open, allow_symlink) {
+    let (fd, stat, followed_symlink) = match open_beneath(root_fd, rel_open, allow_symlink) {
         Ok(pair) => pair,
         Err(e) => return Err(map_open_err(e)),
     };
@@ -1004,7 +1245,7 @@ fn resolve_file(
         if !wants_dir {
             let lexical = doc_root.join(rel);
             let resolved = if want_resolved || followed_symlink {
-                resolved_fd_path(&fd, &lexical).map_err(map_open_err)?
+                opened_path(root, &fd, &lexical, followed_symlink).map_err(map_open_err)?
             } else {
                 // No deny rules and no symlink traversal => no canonical-path
                 // consumer; the lexical join is only a redirect-building hint.
@@ -1028,12 +1269,12 @@ fn resolve_file(
                 format!("{}/{}", rel_str.trim_end_matches('/'), idx)
             };
             if let Ok((cfd, cstat, followed_symlink)) =
-                open_beneath(&root_fd, &child_rel, allow_symlink)
+                open_beneath(root_fd, &child_rel, allow_symlink)
             {
                 if cstat.is_file() {
                     let abs = doc_root.join(&child_rel);
                     let resolved_path = if want_resolved || followed_symlink {
-                        resolved_fd_path(&cfd, &abs).map_err(map_open_err)?
+                        opened_path(root, &cfd, &abs, followed_symlink).map_err(map_open_err)?
                     } else {
                         // No deny rule or symlink traversal needs a canonical
                         // policy target. Transports still consume the pinned fd.
@@ -1067,7 +1308,7 @@ fn resolve_file(
 
     let abs = doc_root.join(rel);
     let resolved_path = if want_resolved || followed_symlink {
-        resolved_fd_path(&fd, &abs).map_err(map_open_err)?
+        opened_path(root, &fd, &abs, followed_symlink).map_err(map_open_err)?
     } else {
         // See above: without accessDenyDir or symlink traversal, no policy
         // consumer needs the canonical form.
@@ -1084,6 +1325,42 @@ fn resolve_file(
     }))
 }
 
+/// The canonical path of `fd`, opened as `lexical`. When neither the docroot nor
+/// the beneath-root walk crossed a symlink, the normalized lexical form IS the
+/// path the kernel would report, so the `/proc/self/fd` readlink is skipped.
+fn opened_path(
+    root: &RootDir,
+    fd: &OwnedFd,
+    lexical: &Path,
+    followed_symlink: bool,
+) -> io::Result<PathBuf> {
+    if root.symlink_free
+        && !followed_symlink
+        && let Some(path) = symlink_free_candidate(lexical)
+    {
+        return Ok(path);
+    }
+    resolved_fd_path(fd, lexical)
+}
+
+/// The normalized form of an absolute path with no `..` component (separators
+/// collapsed, `.` dropped), or `None` when only a resolving walk can name its
+/// canonical target. Opened without crossing a symlink, such a path's normalized
+/// form is the canonical path of the opened inode.
+pub fn symlink_free_candidate(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::RootDir => out.push("/"),
+            Component::Normal(seg) => out.push(seg),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    path.is_absolute().then_some(out)
+}
+
 fn resolved_fd_path(fd: &OwnedFd, _lexical: &Path) -> io::Result<PathBuf> {
     let proc_path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
     // The response serves this pinned descriptor, so policy must classify that
@@ -1097,6 +1374,7 @@ fn resolved_fd_path(fd: &OwnedFd, _lexical: &Path) -> io::Result<PathBuf> {
 /// as the primary request target. A missing or unusable representation is just
 /// a candidate miss, allowing the caller to try the next accepted encoding.
 fn resolve_precompressed_sibling(
+    root: &RootDir,
     doc_root: &Path,
     primary_path: &Path,
     suffix: &str,
@@ -1108,13 +1386,12 @@ fn resolve_precompressed_sibling(
     let sibling = PathBuf::from(sibling_os);
     let rel = sibling.strip_prefix(doc_root).ok()?;
     let rel = rel.to_string_lossy();
-    let root_fd = open_dir(doc_root).ok()?;
-    let (fd, stat, followed_symlink) = open_beneath(&root_fd, rel.as_ref(), allow_symlink).ok()?;
+    let (fd, stat, followed_symlink) = open_beneath(&root.fd, rel.as_ref(), allow_symlink).ok()?;
     if !stat.is_file() {
         return None;
     }
     let resolved_path = if want_resolved || followed_symlink {
-        resolved_fd_path(&fd, &sibling).ok()?
+        opened_path(root, &fd, &sibling, followed_symlink).ok()?
     } else {
         sibling.clone()
     };
@@ -1207,11 +1484,14 @@ impl MetaInfo {
     }
 }
 
+const ROOT_OFLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC);
+
 /// Open the document root as a directory fd.
 fn open_dir(path: &Path) -> io::Result<OwnedFd> {
-    let oflags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
     // CWD-relative open of an absolute path is fine here; this is the root.
-    rustix::fs::open(path, oflags, Mode::empty()).map_err(io::Error::from)
+    rustix::fs::open(path, ROOT_OFLAGS, Mode::empty()).map_err(io::Error::from)
 }
 
 /// Open `rel` beneath `root_fd`, returning the opened fd, its metadata, and
@@ -1310,9 +1590,13 @@ fn open_beneath(
     }
     // Real files must not carry NONBLOCK into serving (device/pipe semantics
     // leaking into the async file path); regular-file reads ignore the flag,
-    // but clear it anyway so the fd behaves exactly as before.
-    let fl = rustix::fs::fcntl_getfl(&file).map_err(io::Error::from)?;
-    rustix::fs::fcntl_setfl(&file, fl.difference(OFlags::NONBLOCK)).map_err(io::Error::from)?;
+    // but clear it anyway so the fd behaves exactly as before. F_SETFL replaces
+    // only the status flags, of which this open set NONBLOCK alone, so `oflags`
+    // stands in for an F_GETFL. A directory fd is never served.
+    if meta.is_file() {
+        rustix::fs::fcntl_setfl(&file, oflags.difference(OFlags::NONBLOCK))
+            .map_err(io::Error::from)?;
+    }
     let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
     let info = MetaInfo {
         len: meta.len(),
@@ -1628,7 +1912,12 @@ fn if_match_passes(value: &HeaderValue, etag: Option<&str>) -> bool {
         if tok == "*" {
             return true;
         }
-        if !tok.starts_with("W/") && etag == Some(tok) {
+        if tok.starts_with("W/") {
+            continue;
+        }
+        // The `;gz`/`;br`/`;zs` variant tag a compressed 200 carried is the same
+        // representation's strong validator (#844).
+        if etag.is_some_and(|e| e == tok || hj_core::matched_etag_variant(tok, e).is_some()) {
             return true;
         }
     }
@@ -1636,8 +1925,11 @@ fn if_match_passes(value: &HeaderValue, etag: Option<&str>) -> bool {
 }
 
 /// `If-Modified-Since`: returns true (304) if the entity has NOT been modified
-/// since the given date (mtime <= header date).
-fn if_modified_since_not_modified(value: &HeaderValue, mtime: SystemTime) -> bool {
+/// since the given date (mtime <= header date). A date later than `now` is
+/// invalid (RFC 9110 §13.1.3) and ignored, as Apache `ap_meets_conditions`
+/// does: otherwise a client clock (or a past future-mtime Last-Modified) ahead
+/// of the server would pin a 304 across later edits.
+fn if_modified_since_not_modified(value: &HeaderValue, mtime: SystemTime, now: SystemTime) -> bool {
     let Ok(s) = value.to_str() else {
         return false;
     };
@@ -1652,7 +1944,11 @@ fn if_modified_since_not_modified(value: &HeaderValue, mtime: SystemTime) -> boo
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    mtime_secs <= since_secs
+    let now_secs = now
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    since_secs <= now_secs && mtime_secs <= since_secs
 }
 
 /// `If-Unmodified-Since`: true when the entity has not changed since the date.
@@ -1676,8 +1972,15 @@ fn if_unmodified_since_passes(value: &HeaderValue, mtime: SystemTime) -> bool {
 
 /// `If-Range`: returns true if the validator (ETag or HTTP-date) still matches
 /// the current entity, meaning the `Range` should be honored. When the entity
-/// has no ETag (`fileETag` NONE), an ETag-form If-Range can never match.
-fn if_range_matches(value: &HeaderValue, etag: Option<&str>, mtime: SystemTime) -> bool {
+/// has no ETag (`fileETag` NONE), an ETag-form If-Range can never match. A
+/// future mtime is never a usable date validator (it was not the
+/// Last-Modified this server sent; see the request-time clamp).
+fn if_range_matches(
+    value: &HeaderValue,
+    etag: Option<&str>,
+    mtime: SystemTime,
+    now: SystemTime,
+) -> bool {
     let Ok(s) = value.to_str() else {
         return false;
     };
@@ -1693,7 +1996,7 @@ fn if_range_matches(value: &HeaderValue, etag: Option<&str>, mtime: SystemTime) 
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        mtime_secs == date_secs
+        mtime <= now && mtime_secs == date_secs
     } else {
         false
     }

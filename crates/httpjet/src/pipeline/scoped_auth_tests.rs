@@ -153,6 +153,30 @@ AuthUserFile users
     );
 }
 
+// #913: the access log's `%u` carries the VERIFIED Basic-auth user; a rejected
+// or absent credential logs `-`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn access_log_records_the_verified_auth_user() {
+    let root = fixture(
+        "auth_log_user",
+        "AuthType Basic\nAuthUserFile users\nRequire user Admin",
+    );
+    std::fs::write(root.join("secret-913.txt"), "s").unwrap();
+    let state = build_state_htaccess(root);
+    assert_eq!(status(&state, "/secret-913.txt?ok", Some(ADMIN)).await, 200);
+    assert_eq!(
+        status(&state, "/secret-913.txt?denied", Some(VISITOR)).await,
+        401
+    );
+    let ok = super::unified_access_line(&state, "/secret-913.txt?ok").await;
+    assert!(ok.contains("\"Admin\""), "{ok}");
+    let denied = super::unified_access_line(&state, "/secret-913.txt?denied").await;
+    assert!(!denied.contains("Visitor"), "{denied}");
+    if !denied.starts_with('{') {
+        assert!(denied.contains(" - - ["), "{denied}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_require_inherits_metadata_but_replaces_parent_valid_user() {
     let root = fixture(
@@ -275,6 +299,22 @@ async fn rewriting_out_of_or_into_a_protected_resource_keeps_both_checks() {
         assert_eq!(status(&state, path, Some(ADMIN)).await, 200, "{path}");
     }
     assert_eq!(status(&state, "/public.txt", None).await, 200);
+}
+
+/// (#986) A repeated resource check is skipped only while `ctx` is unchanged: once
+/// the first check authenticates, its `HJ_AUTH_USER` env is an input of the next
+/// identical check, which must still run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_resource_check_reruns_after_it_authenticates() {
+    let root = fixture(
+        "auth_repeat_after_login",
+        "AuthType Basic\nAuthUserFile users\n<Files target.php>\nRequire user Admin\n</Files>\nOrder allow,deny\nAllow from all\nDeny from env=HJ_AUTH_USER\nRewriteEngine On\nRewriteRule ^entry.txt$ target.php [L]\n",
+    );
+    std::fs::write(root.join("target.php"), b"<?php echo 'target';").unwrap();
+    let state = build_state_htaccess(root);
+    assert_eq!(status(&state, "/entry.txt", None).await, 401);
+    assert_eq!(status(&state, "/entry.txt", Some(VISITOR)).await, 401);
+    assert_eq!(status(&state, "/entry.txt", Some(ADMIN)).await, 403);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -420,8 +460,9 @@ async fn static_context_location_resolves_its_own_auth_chain() {
         location: Some(root.join("private")),
         handler: None,
         enabled: true,
+        allow_browse: true,
         extra_headers: vec![],
-        add_default_charset: false,
+        add_default_charset: None,
         charset: None,
     };
     let state = build_state_inner(root, vec![context], vec![], true, None, None, |_| {});
@@ -463,4 +504,24 @@ async fn auth_user_file_outside_docroot_is_a_500_not_an_oracle() {
             "{user_file}: a matching line must never authenticate"
         );
     }
+}
+
+/// (#864) A repeated Authorization must never verify one user while lsphp hands
+/// PHP another (it keeps the last value): refused outright.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_authorization_is_refused() {
+    let root = fixture(
+        "auth_repeated",
+        "AuthType Basic\nAuthUserFile users\nRequire valid-user\n",
+    );
+    std::fs::write(root.join("x.txt"), b"x").unwrap();
+    let state = build_state_htaccess(root.clone());
+    assert_eq!(status(&state, "/x.txt", Some(VISITOR)).await, 200);
+    for (first, second) in [(VISITOR, ADMIN), (VISITOR, "Basic QWRtaW46d3Jvbmc=")] {
+        let mut req = request("/x.txt", Some(first));
+        req.headers_mut()
+            .append(header::AUTHORIZATION, second.parse().unwrap());
+        assert_eq!(run(&state, req).await.status().as_u16(), 400);
+    }
+    std::fs::remove_dir_all(root).ok();
 }

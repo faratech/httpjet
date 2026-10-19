@@ -189,3 +189,36 @@ fn files_grant_never_opens_a_directory_deny() {
     assert_eq!(decide(src, "/backups/x.md", "GET"), AccessDecision::Denied);
     assert_eq!(decide(src, "/x.md", "GET"), AccessDecision::Denied);
 }
+
+#[test]
+fn grant_inside_an_unmodelled_container_does_not_widen() {
+    for src in [
+        "Require all denied\n<IfDefine FOO>\nRequire all granted\n</IfDefine>\n",
+        "Require all denied\n<LocationMatch \"^/public/\">\nRequire all granted\n</LocationMatch>\n",
+        "<Files *.php>\nRequire all denied\n</Files>\n<LocationMatch \"^/x\">\n<Files *.php>\nRequire all granted\n</Files>\n</LocationMatch>\n",
+    ] {
+        assert_eq!(
+            decide(src, "/secret/x.php", "GET"),
+            AccessDecision::Denied,
+            "{src}"
+        );
+    }
+}
+
+#[test]
+fn deny_inside_an_unmodelled_container_still_applies() {
+    let src = "<IfDefine FOO>\nRequire all denied\n</IfDefine>\n";
+    assert_eq!(decide(src, "/x", "GET"), AccessDecision::Denied);
+}
+
+#[test]
+fn legacy_access_inside_an_unmodelled_container_fails_closed() {
+    let src = "Order deny,allow\nDeny from all\n<IfDefine FOO>\nAllow from all\n</IfDefine>\n";
+    assert!(Htaccess::parse(src).is_err());
+}
+
+#[test]
+fn ifmodule_stays_transparent_for_grants() {
+    let src = "Require all denied\n<IfModule mod_authz_core.c>\nRequire all granted\n</IfModule>\n";
+    assert_eq!(decide(src, "/x", "GET"), AccessDecision::Granted);
+}

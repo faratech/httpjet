@@ -17,6 +17,16 @@ use hj_log::{AccessLogger, LogFormat};
 /// (Tier 2) Access-log format: `HTTPJET_ACCESS_LOG_FORMAT=json` selects one
 /// JSON object per line for log shippers; anything else is the Combined Log
 /// Format. Process-lifetime, read once per logger construction.
+/// A vhost access log's format: LiteSpeed `logHeaders` bit 1 appends the
+/// Referer, bit 2 the User-Agent, bit 4 (`LOG_VHOST`) the Host (OLS
+/// `AccessLog::log`); 3 is Combined, 7 CombinedHost.
+pub(crate) fn vhost_access_log_format(log_headers: u8) -> LogFormat {
+    match access_log_format() {
+        LogFormat::Combined => LogFormat::from_log_headers(log_headers),
+        other => other,
+    }
+}
+
 pub(crate) fn access_log_format() -> LogFormat {
     if std::env::var("HTTPJET_ACCESS_LOG_FORMAT").as_deref() == Ok("json") {
         LogFormat::Json
@@ -36,7 +46,7 @@ use crate::statcache::{DEFAULT_STAT_TTL, StatCache};
 /// Labels configured without a readable db, a malformed db, or a label the db
 /// does not know are HARD build errors: an inert or silently-partial geo ACL
 /// would admit denied regions instead of failing loudly.
-fn build_geo_rules(server: &ServerConfig) -> Result<hj_acl::GeoRules, String> {
+pub(crate) fn build_geo_rules(server: &ServerConfig) -> Result<hj_acl::GeoRules, String> {
     let sec = &server.security;
     let configured = !sec.geo_allow.is_empty()
         || !sec.geo_deny.is_empty()
@@ -120,12 +130,10 @@ fn build_syslog_tap(server: &ServerConfig) -> Option<hj_log::SyslogTap> {
     }
 }
 
-/// (#248) A vhost's own access logger plus its `logHeaders` bitmask.
+/// (#248) A vhost's own access logger; its format carries the `logHeaders` fields.
 #[derive(Clone)]
 pub struct VhostAccessLogger {
     pub logger: Arc<AccessLogger>,
-    /// Nonzero ⇒ request headers accompany each record (LSWS `logHeaders`).
-    pub log_headers: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -240,7 +248,9 @@ pub struct ServerState {
     /// IP allow/deny + trusted-proxy XFF resolution.
     pub acl: Arc<AccessControl>,
     /// Per-client-IP request throttle (Tier 1.1; disabled unless <perIpRate> > 0).
-    pub client_throttle: hj_acl::ClientThrottle,
+    /// Shared across reloads that keep the same limits, so a SIGHUP neither resets
+    /// per-IP windows nor runs the counters backwards (#933).
+    pub client_throttle: Arc<hj_acl::ClientThrottle>,
     /// (Tier 2) Resolved GeoIP/ASN rules (empty/inert unless <geoipDBFile> plus
     /// label lists are configured). Judged against the RESOLVED client IP.
     pub geo: Arc<hj_acl::GeoRules>,
@@ -408,6 +418,8 @@ pub struct Metrics {
     /// (#343 Step 1) Cookied GET/HEAD requests with NO member/session marker — the
     /// benign-cookie population an on-core fast-path extension could serve.
     pub fast_cookie_benign_only: Arc<AtomicU64>,
+    /// Why on-core `fast_serve` requests bridged to the tokio pipeline, per reason.
+    pub fast_bridge: Arc<crate::pipeline::fast_bridge::FastBridgeCounters>,
     /// TLS connections that completed a FULL handshake (rustls `HandshakeKind::Full`
     /// or `FullWithHelloRetryRequest`). Compared against `_resumed` to size the
     /// resumption win the client-verify `NoServerSessions` posture forfeits.
@@ -462,6 +474,9 @@ pub struct Metrics {
     /// (`--page-cache-stream-fill-vhosts`), and how many of those were stored at the end.
     pub pagecache_stream_fills: Arc<AtomicU64>,
     pub pagecache_stream_fill_stores: Arc<AtomicU64>,
+    /// Admitted variants the per-URL vary bookkeeping refused (base-hash collision, or the
+    /// spec map's bounds could make no room).
+    pub pagecache_url_vary_refused: Arc<AtomicU64>,
     /// Capsule hits served to a logged-in MEMBER request (member opt-in cookie present). Paired
     /// with `xf_capsule_hits_guest` this answers "are members actually hitting the capsule, or
     /// falling through to PHP?" — bumped at every capsule serve site alongside the per-source
@@ -681,8 +696,13 @@ fn build_config_derived(
                     Ok(rs) => {
                         inline_rules.insert(name.clone(), Arc::new(rs));
                     }
+                    // Dropping the whole ruleset would fail OPEN (its [F] denies and
+                    // [P] routes vanish silently); refuse the config instead, so a
+                    // reload keeps the previous state and `check` reports it (#754/#755).
                     Err(e) => {
-                        tracing::warn!(vhost = %name, error = %e, "failed to parse inline rewrite rules");
+                        return Err(format!(
+                            "vhost {name}: inline rewrite rules do not parse: {e}"
+                        ));
                     }
                 }
             }
@@ -746,6 +766,39 @@ fn build_config_derived(
         expires,
         mtls_required_vhosts,
     })
+}
+
+/// The config-derived construction `ServerState::new` performs, minus every
+/// side effect (no logger spawn, no socket, no connection): `check` runs it so the
+/// deploy gate refuses exactly the configs boot and SIGHUP refuse (#884).
+pub(crate) fn validate_serving_config(server: &Arc<ServerConfig>) -> Result<(), String> {
+    build_config_derived(server, false)?;
+    build_geo_rules(server)?;
+    let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(
+        hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
+    ));
+    configured_fastcgi_handlers(server, &budget)?;
+    Ok(())
+}
+
+/// Vhosts whose per-vhost `<logging>` access/error file spec differs between two
+/// configs. Those writers are process-lifetime, so a SIGHUP cannot apply the change.
+pub(crate) fn vhost_log_spec_changes(old: &ServerConfig, new: &ServerConfig) -> Vec<String> {
+    let spec = |cfg: &ServerConfig, name: &str| {
+        cfg.vhosts
+            .get(name)
+            .and_then(|decl| decl.config.as_deref())
+            .map(|vhost| (vhost.access_log_file.clone(), vhost.error_log_file.clone()))
+            .unwrap_or_default()
+    };
+    let mut names: Vec<&String> = old.vhosts.keys().chain(new.vhosts.keys()).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| spec(old, name) != spec(new, name))
+        .cloned()
+        .collect()
 }
 
 fn configured_proxy_targets(server: &ServerConfig) -> Vec<ProxyTarget> {
@@ -893,10 +946,13 @@ fn build_vhost_expires(server: &ServerConfig) -> HashMap<String, Arc<ExpiresRule
             server.expires.enabled
         };
         let rules = if enabled {
+            // Server rules first: the vhost's entries override them (last match wins).
             ExpiresRules::from_pairs(
-                ex.by_type
+                server
+                    .expires
+                    .by_type
                     .iter()
-                    .chain(server.expires.by_type.iter())
+                    .chain(ex.by_type.iter())
                     .map(|(t, v)| (t.clone(), v.clone())),
             )
         } else {
@@ -1005,6 +1061,20 @@ impl ServerState {
             let Some(cfg) = decl.config.as_deref() else {
                 continue;
             };
+            // (#248) The per-vhost error file (rolling writer reused for arbitrary
+            // error lines) is independent of whether an access file is declared.
+            if let Some(err) = cfg.error_log_file.as_ref() {
+                vhost_error_logs.insert(
+                    name.clone(),
+                    Arc::new(AccessLogger::spawn(
+                        &redirect_log_path(&err.path),
+                        crate::state::access_log_format(),
+                        err.rolling_bytes,
+                        err.keep_days,
+                        false,
+                    )),
+                );
+            }
             let Some(spec) = cfg.access_log_file.as_ref() else {
                 continue;
             };
@@ -1018,28 +1088,13 @@ impl ServerState {
                 VhostAccessLogger {
                     logger: Arc::new(AccessLogger::spawn(
                         &redirect_log_path(&spec.path),
-                        crate::state::access_log_format(),
+                        vhost_access_log_format(spec.log_headers),
                         spec.rolling_bytes,
                         spec.keep_days,
                         false,
                     )),
-                    log_headers: spec.log_headers,
                 },
             );
-            // (#248) The matching per-vhost error file (rolling writer reused for
-            // arbitrary error lines).
-            if let Some(err) = cfg.error_log_file.as_ref() {
-                vhost_error_logs.insert(
-                    name.clone(),
-                    Arc::new(AccessLogger::spawn(
-                        &redirect_log_path(&err.path),
-                        crate::state::access_log_format(),
-                        err.rolling_bytes,
-                        err.keep_days,
-                        false,
-                    )),
-                );
-            }
         }
 
         // Parse Alt-Svc once (unparseable degrades to none) and build the transform pipeline.
@@ -1121,7 +1176,7 @@ impl ServerState {
             ext_by_name: cd.ext_by_name,
             php_suffixes: cd.php_suffixes,
             acl: cd.acl,
-            client_throttle: cd.client_throttle,
+            client_throttle: Arc::new(cd.client_throttle),
             geo,
             compress: cd.compress,
             transforms,
@@ -1232,6 +1287,13 @@ impl ServerState {
         }
         let geo = Arc::new(build_geo_rules(&server)?);
         let fastcgi = configured_fastcgi_handlers(&server, &old.body_budget)?;
+        for vhost in vhost_log_spec_changes(&old.server, &server) {
+            tracing::warn!(
+                vhost = %vhost,
+                "SIGHUP: per-vhost <logging> access/error log changed but the log writers \
+                 are fixed at BOOT — RESTART httpjet to apply"
+            );
+        }
         Ok(Arc::new(ServerState {
             generation,
             trust_epoch: old.trust_epoch.clone(),
@@ -1253,7 +1315,12 @@ impl ServerState {
             ext_by_name: cd.ext_by_name,
             php_suffixes: cd.php_suffixes,
             acl: cd.acl,
-            client_throttle: cd.client_throttle,
+            client_throttle: if old.client_throttle.same_limits(&cd.client_throttle) {
+                old.client_throttle.clone()
+            } else {
+                cd.client_throttle.inherit_counters(&old.client_throttle);
+                Arc::new(cd.client_throttle)
+            },
             geo,
             compress: cd.compress,
             transforms,
@@ -1307,6 +1374,88 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    /// #807/#808 prod-safety: the live LiteSpeed config (when present on this
+    /// host) keeps its ACL verdicts: allow ALL plus trusted Cloudflare ranges.
+    #[test]
+    fn live_config_acl_and_contexts_are_unchanged() {
+        let root = Path::new("/usr/local/lsws");
+        if !root.join("conf/httpd_config.xml").is_file() {
+            return;
+        }
+        let cfg = hj_config::load(root).expect("the live config must load");
+        let acl = hj_acl::AccessControl::from_security(&cfg.security).unwrap();
+        for ip in [
+            "173.245.48.5",
+            "104.16.0.1",
+            "162.158.255.255",
+            "198.41.128.1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(acl.check_peer(ip).is_allowed(), "{ip}");
+            assert!(acl.is_trusted(ip), "{ip}");
+        }
+        let ranges: Vec<(u32, u32)> = cfg
+            .security
+            .access_control
+            .iter()
+            .filter(|r| r.trusted)
+            .map(|r| {
+                assert!(r.allow, "{}", r.spec);
+                let (addr, bits) = r.spec.split_once('/').unwrap();
+                let first = u32::from(addr.parse::<std::net::Ipv4Addr>().unwrap());
+                let bits: u32 = bits.parse().unwrap();
+                (first, first | (u32::MAX >> bits))
+            })
+            .collect();
+        for &(first, last) in &ranges {
+            for v4 in [first, first + (last - first) / 2, last] {
+                let v4 = std::net::Ipv4Addr::from(v4);
+                for ip in [
+                    std::net::IpAddr::V4(v4),
+                    std::net::IpAddr::V6(v4.to_ipv6_mapped()),
+                ] {
+                    assert!(acl.check_peer(ip).is_allowed(), "{ip}");
+                    assert!(acl.is_trusted(ip), "{ip}");
+                }
+            }
+            for outside in [first.wrapping_sub(1), last.wrapping_add(1)] {
+                let covered = ranges.iter().any(|&(f, l)| (f..=l).contains(&outside));
+                let ip = std::net::IpAddr::V4(outside.into());
+                assert!(acl.check_peer(ip).is_allowed(), "{ip}");
+                assert_eq!(acl.is_trusted(ip), covered, "{ip}");
+            }
+        }
+        let trusted_ranges = ranges.len();
+        assert!(trusted_ranges >= 15, "{trusted_ranges}");
+        for ip in [
+            "fe80::1",
+            "2606:4700::6810:1",
+            "::",
+            "::ffff:8.8.8.8",
+            "8.8.8.8",
+            "1.1.1.1",
+            "203.0.113.7",
+            "10.0.0.1",
+            "127.0.0.1",
+            "2001:db8::1",
+            "::1",
+        ] {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            assert!(acl.check_peer(ip).is_allowed(), "{ip}");
+            assert!(acl.check_client(ip, ip).is_allowed(), "{ip}");
+            assert!(!acl.is_trusted(ip), "{ip}");
+        }
+        for decl in cfg.vhosts.values() {
+            for c in decl.config.iter().flat_map(|v| v.contexts.iter()) {
+                assert!(
+                    matches!(c.kind, ContextKind::Static | ContextKind::Proxy) && c.allow_browse,
+                    "{}: {c:?}",
+                    decl.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn vhost_expires_inherits_enable_and_overrides_per_type() {
         let server = r#"<httpServerConfig><serverName>x</serverName>
@@ -1319,17 +1468,17 @@ mod tests {
         let docs = std::collections::BTreeMap::from([
             (
                 "off".to_string(),
-                "<virtualHostConfig><expires><enableExpires>0</enableExpires></expires></virtualHostConfig>"
+                "<virtualHostConfig><docRoot>$VH_ROOT</docRoot><expires><enableExpires>0</enableExpires></expires></virtualHostConfig>"
                     .to_string(),
             ),
             (
                 "typed".to_string(),
-                "<virtualHostConfig><expires><expiresByType>image/png=A60</expiresByType></expires></virtualHostConfig>"
+                "<virtualHostConfig><docRoot>$VH_ROOT</docRoot><expires><expiresByType>image/png=A60</expiresByType></expires></virtualHostConfig>"
                     .to_string(),
             ),
             (
                 "plain".to_string(),
-                "<virtualHostConfig></virtualHostConfig>".to_string(),
+                "<virtualHostConfig><docRoot>$VH_ROOT</docRoot></virtualHostConfig>".to_string(),
             ),
         ]);
         let cfg = hj_config::parse_bundle(Path::new("/tmp"), server, &docs, "").unwrap();
@@ -1348,6 +1497,78 @@ mod tests {
         assert_eq!(typed.lookup("text/css").unwrap().age_secs, 3600);
 
         assert!(!map.contains_key("plain"));
+    }
+
+    #[test]
+    fn vhost_log_headers_bit_four_logs_the_host_field() {
+        // LiteSpeed logHeaders: 1 Referer, 2 User-Agent, 4 Host (#825).
+        if std::env::var("HTTPJET_ACCESS_LOG_FORMAT").as_deref() == Ok("json") {
+            return;
+        }
+        // Prod's live configs use 3 and 7: those map to the unchanged formats.
+        assert_eq!(vhost_access_log_format(7), LogFormat::CombinedHost);
+        assert_eq!(vhost_access_log_format(3), LogFormat::Combined);
+        // #917: bits 1/2 are honoured like OLS (0 = common, no header fields).
+        assert_eq!(vhost_access_log_format(4), LogFormat::Headers(4));
+        assert_eq!(vhost_access_log_format(1), LogFormat::Headers(1));
+        assert_eq!(vhost_access_log_format(2), LogFormat::Headers(2));
+        assert_eq!(vhost_access_log_format(0), LogFormat::Common);
+    }
+
+    #[test]
+    fn unparsable_inline_rewrite_rules_refuse_the_config() {
+        // #754/#755: dropping the vhost's whole inline ruleset would silently lose
+        // its [F] denies, so the config is refused (a reload keeps the old state).
+        let server = r#"<httpServerConfig><serverName>x</serverName>
+<virtualHostList>
+<virtualHost><name>vh</name><vhRoot>/tmp/vh</vhRoot><configFile>/nonexistent/vh.xml</configFile></virtualHost>
+</virtualHostList></httpServerConfig>"#;
+        let rules = |extra: &str| {
+            format!(
+                "<virtualHostConfig><docRoot>$VH_ROOT</docRoot><rewrite><enable>1</enable><rules>RewriteEngine On\nRewriteRule ^/internal/ - [F]\n{extra}</rules></rewrite></virtualHostConfig>"
+            )
+        };
+        for (extra, ok) in [
+            ("", true),
+            (
+                "RewriteRule \\.phps$ - [T=application/x-httpd-php-source]",
+                false,
+            ),
+            // #1030: a map-driven deny would compare the literal `${...}` text.
+            (
+                "RewriteMap blocked txt:/etc/blocked.map\nRewriteCond ${blocked:%{REMOTE_ADDR}|ok} ^deny$\nRewriteRule .* - [F]",
+                false,
+            ),
+            (
+                "RewriteCond ${blocked:%{REMOTE_ADDR}|ok} ^deny$\nRewriteRule .* - [F]",
+                false,
+            ),
+        ] {
+            let docs = std::collections::BTreeMap::from([("vh".to_string(), rules(extra))]);
+            let cfg =
+                Arc::new(hj_config::parse_bundle(Path::new("/tmp"), server, &docs, "").unwrap());
+            assert_eq!(build_config_derived(&cfg, false).is_ok(), ok, "{extra}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vhost_error_log_opens_without_an_own_access_log() {
+        let root = temp_root("error-log-only");
+        let mut server = (*config(&root, vec![], vec![("site", processor("local", 8103))])).clone();
+        let vhost = server
+            .vhosts
+            .get_mut("site")
+            .and_then(|decl| decl.config.as_mut())
+            .unwrap();
+        Arc::make_mut(vhost).error_log_file = Some(hj_core::config::VhostLogFile {
+            path: root.join("logs/site_error.log"),
+            rolling_bytes: 0,
+            keep_days: 0,
+            log_headers: 0,
+        });
+        let state = state(Arc::new(server));
+        assert!(state.vhost_error_logger("site").is_some());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -1393,8 +1614,9 @@ mod tests {
             location: None,
             handler: handler.map(str::to_string),
             enabled,
+            allow_browse: true,
             extra_headers: Vec::new(),
-            add_default_charset: false,
+            add_default_charset: None,
             charset: None,
             cache_policy: None,
             max_body_override: None,
@@ -1883,6 +2105,34 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Regression (#933): a reload keeps the per-IP throttle (windows and counters)
+    /// when its limits are unchanged, and continues the counters when they change.
+    #[tokio::test]
+    async fn reload_keeps_client_throttle_state() {
+        let root = temp_root("throttle-reload");
+        let mut base = (*config(&root, Vec::new(), Vec::new())).clone();
+        base.tuning.per_ip_rate = 2;
+        base.tuning.per_ip_rate_window = std::time::Duration::from_secs(60);
+        let cfg = Arc::new(base);
+        let old = state(cfg.clone());
+        let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(old.client_throttle.allow(ip));
+        assert!(old.client_throttle.allow(ip));
+        assert!(!old.client_throttle.allow(ip));
+        let next = ServerState::reload(&old, cfg.clone()).unwrap();
+        assert!(
+            !next.client_throttle.allow(ip),
+            "window survives the reload"
+        );
+        assert_eq!(next.client_throttle.allowed_total(), 2);
+        let mut changed = (*cfg).clone();
+        changed.tuning.per_ip_rate = 5;
+        let third = ServerState::reload(&next, Arc::new(changed)).unwrap();
+        assert_eq!(third.client_throttle.allowed_total(), 2);
+        assert_eq!(third.client_throttle.rejected_total(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn reload_candidate_owns_fresh_rewrite_caches() {
         let root = temp_root("candidate-caches");
@@ -2342,5 +2592,84 @@ mod tests {
         assert_eq!(next.proxy.pool().len(), 2);
         assert!(Arc::ptr_eq(&upstream_a, &pooled(&next, &target_a)));
         assert!(Arc::ptr_eq(&upstream_b, &pooled(&next, &target_b)));
+    }
+
+    /// Regression (#884): `check` runs the FastCGI construction serve runs, so a
+    /// processor serve refuses fails the gate too.
+    #[test]
+    fn validate_serving_config_refuses_what_serve_refuses() {
+        let root = temp_root("validate-serving");
+        let fcgi = |name: &str| ExtProcessor {
+            kind: ExtKind::FastCgi,
+            ..processor(name, 9000)
+        };
+        assert!(validate_serving_config(&config(&root, vec![fcgi("ok")], Vec::new())).is_ok());
+
+        let zero = ExtProcessor {
+            max_conns: 0,
+            ..fcgi("zero")
+        };
+        assert!(validate_serving_config(&config(&root, vec![zero], Vec::new())).is_err());
+
+        let duplicate = config(&root, vec![fcgi("dup"), fcgi("dup")], Vec::new());
+        assert!(validate_serving_config(&duplicate).is_err());
+
+        let unsafe_env = ExtProcessor {
+            env: vec![("BAD NAME".into(), "x".into())],
+            ..fcgi("env")
+        };
+        assert!(validate_serving_config(&config(&root, vec![unsafe_env], Vec::new())).is_err());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression (#886): a per-vhost <logging> change is detected so SIGHUP can warn
+    /// that it only applies on restart.
+    #[test]
+    fn vhost_log_spec_changes_name_the_changed_vhosts() {
+        let root = temp_root("log-spec-changes");
+        let base = config(
+            &root,
+            Vec::new(),
+            vec![("a", processor("p", 1)), ("b", processor("q", 2))],
+        );
+        assert!(vhost_log_spec_changes(&base, &base).is_empty());
+
+        let with = |log: hj_core::config::VhostLogFile, error: bool| {
+            let mut server = (*base).clone();
+            let decl = server.vhosts.get_mut("b").unwrap();
+            let mut vhost = (**decl.config.as_ref().unwrap()).clone();
+            if error {
+                vhost.error_log_file = Some(log);
+            } else {
+                vhost.access_log_file = Some(log);
+            }
+            decl.config = Some(Arc::new(vhost));
+            server
+        };
+        let log = hj_core::config::VhostLogFile {
+            path: root.join("logs/b.access.log"),
+            rolling_bytes: 1,
+            keep_days: 1,
+            log_headers: 0,
+        };
+        let added = with(log.clone(), false);
+        assert_eq!(vhost_log_spec_changes(&base, &added), vec!["b".to_string()]);
+        assert_eq!(vhost_log_spec_changes(&added, &base), vec!["b".to_string()]);
+        let headers = with(
+            hj_core::config::VhostLogFile {
+                log_headers: 3,
+                ..log.clone()
+            },
+            false,
+        );
+        assert_eq!(
+            vhost_log_spec_changes(&added, &headers),
+            vec!["b".to_string()]
+        );
+        assert_eq!(
+            vhost_log_spec_changes(&base, &with(log, true)),
+            vec!["b".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

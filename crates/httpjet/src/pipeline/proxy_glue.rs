@@ -158,10 +158,28 @@ async fn proxy_websocket_inner(
     resp
 }
 
+/// After one direction of an upgraded relay reaches a clean EOF, the other direction
+/// keeps relaying (a WebSocket Close reply, a half-closed tunnel's tail) for at most
+/// this long, so a peer that never closes its half cannot pin the relay — and its
+/// maxConns permit — forever.
+pub(crate) const UPGRADE_HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn start_uring_upgrade_relay<U>(
     upstream: U,
     reservation: Option<hj_proxy::RequestReservation>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+) -> UringUpgradeIo
+where
+    U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    start_uring_upgrade_relay_with_drain(upstream, reservation, permit, UPGRADE_HALF_CLOSE_DRAIN)
+}
+
+fn start_uring_upgrade_relay_with_drain<U>(
+    upstream: U,
+    reservation: Option<hj_proxy::RequestReservation>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    drain: std::time::Duration,
 ) -> UringUpgradeIo
 where
     U: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -174,38 +192,59 @@ where
         let _reservation = reservation;
         let _permit = permit;
         let (mut reader, mut writer) = tokio::io::split(upstream);
-        let downstream_to_upstream = async {
+        // Each direction returns true on a clean EOF (half-close), false on an error.
+        // Like copy_bidirectional, a clean EOF shuts down the opposite write half and
+        // lets the other direction run on; an error ends the whole relay.
+        let downstream_to_upstream = async move {
             while let Some(bytes) = downstream_rx.recv().await {
                 if writer.write_all(&bytes).await.is_err() {
-                    break;
+                    return false;
                 }
             }
-            let _ = writer.shutdown().await;
+            writer.shutdown().await.is_ok()
         };
-        let upstream_to_downstream = async {
+        let upstream_to_downstream = async move {
             let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
+            let clean = loop {
+                // A client side that has gone entirely ends the drain at once.
+                let read = tokio::select! {
+                    read = reader.read(&mut buf) => read,
+                    _ = upstream_tx.closed() => break false,
+                };
+                match read {
+                    Ok(0) => break true,
                     Ok(n) => {
                         if upstream_tx
                             .send(Ok(bytes::Bytes::copy_from_slice(&buf[..n])))
                             .await
                             .is_err()
                         {
-                            break;
+                            break false;
                         }
                     }
                     Err(_) => {
                         let _ = upstream_tx.send(Err(())).await;
-                        break;
+                        break false;
                     }
                 }
-            }
+            };
+            // Dropping the sender is the client-side EOF signal.
+            drop(upstream_tx);
+            clean
         };
+        let mut downstream_to_upstream = std::pin::pin!(downstream_to_upstream);
+        let mut upstream_to_downstream = std::pin::pin!(upstream_to_downstream);
         tokio::select! {
-            _ = downstream_to_upstream => {}
-            _ = upstream_to_downstream => {}
+            clean = &mut downstream_to_upstream => {
+                if clean {
+                    let _ = tokio::time::timeout(drain, upstream_to_downstream).await;
+                }
+            }
+            clean = &mut upstream_to_downstream => {
+                if clean {
+                    let _ = tokio::time::timeout(drain, downstream_to_upstream).await;
+                }
+            }
         }
     });
     UringUpgradeIo {
@@ -284,8 +323,9 @@ mod tests {
             location: None,
             handler: handler.map(str::to_string),
             enabled,
+            allow_browse: true,
             extra_headers: Vec::new(),
-            add_default_charset: false,
+            add_default_charset: None,
             charset: None,
             cache_policy: None,
             max_body_override: None,
@@ -324,5 +364,74 @@ mod tests {
         upstream_peer.write_all(b"upstream-frame").await.unwrap();
         let received = io.from_upstream.recv().await.unwrap().unwrap();
         assert_eq!(&received[..], b"upstream-frame");
+    }
+
+    /// Regression (#805): a client half-close (FIN) must shut down the upstream write
+    /// half and keep relaying upstream->client until upstream EOF, so a WebSocket
+    /// server's Close reply sent after the client's FIN still reaches the client.
+    #[tokio::test]
+    async fn uring_upgrade_relay_drains_upstream_after_client_half_close() {
+        let (client, mut upstream_peer) = tokio::io::duplex(1024);
+        let UringUpgradeIo {
+            to_upstream,
+            mut from_upstream,
+        } = start_uring_upgrade_relay(client, None, None);
+
+        to_upstream
+            .send(bytes::Bytes::from_static(b"close-frame"))
+            .await
+            .unwrap();
+        drop(to_upstream);
+        let mut received = Vec::new();
+        upstream_peer.read_to_end(&mut received).await.unwrap();
+        assert_eq!(
+            &received, b"close-frame",
+            "client EOF reaches upstream as EOF"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        upstream_peer.write_all(b"close-reply").await.unwrap();
+        upstream_peer.shutdown().await.unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), from_upstream.recv())
+            .await
+            .expect("upstream reply after client half-close")
+            .expect("relay still open")
+            .unwrap();
+        assert_eq!(&reply[..], b"close-reply");
+        let end = tokio::time::timeout(std::time::Duration::from_secs(2), from_upstream.recv())
+            .await
+            .expect("upstream EOF ends the relay");
+        assert!(end.is_none(), "upstream EOF closes the client direction");
+    }
+
+    /// The drain after a half-close is bounded: an upstream that never closes its half
+    /// cannot hold the relay (and its maxConns permit) past the drain deadline.
+    #[tokio::test]
+    async fn uring_upgrade_relay_half_close_drain_is_bounded() {
+        let (client, upstream_peer) = tokio::io::duplex(1024);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().try_acquire_owned().unwrap();
+        let UringUpgradeIo {
+            to_upstream,
+            mut from_upstream,
+        } = start_uring_upgrade_relay_with_drain(
+            client,
+            None,
+            Some(permit),
+            std::time::Duration::from_millis(50),
+        );
+        drop(to_upstream);
+        let end = tokio::time::timeout(std::time::Duration::from_secs(2), from_upstream.recv())
+            .await
+            .expect("drain deadline ends the relay");
+        assert!(end.is_none());
+        for _ in 0..100 {
+            if semaphore.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(semaphore.available_permits(), 1, "maxConns permit released");
+        drop(upstream_peer);
     }
 }

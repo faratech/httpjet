@@ -294,7 +294,12 @@ impl Proxy {
             // the window. A trickling / never-terminating chunked upload then surfaces as a
             // body error here, `send_request` resolves, and the maxConns permit is released
             // — rather than the task awaiting the terminal chunk forever.
-            let (out_req2, eof_rx) = wrap_body_inactivity_timeout(out_req, BODY_INACTIVITY_TIMEOUT);
+            let (out_req2, eof_rx, progress) =
+                wrap_body_inactivity_timeout(out_req, BODY_INACTIVITY_TIMEOUT);
+            // The inactivity timer above only runs while hyper polls the body; a backend
+            // that stops reading leaves hyper parked on a full socket, so stalled upload
+            // progress is also judged independently of polling.
+            let upload_stall = BODY_INACTIVITY_TIMEOUT.max(response_head_timeout);
             // (#69) Once the upload reaches EOF, bound the wait for response HEADERS by
             // response_timeout. A slow-but-progressing upload is unaffected (the clock starts
             // only at EOF); but a backend that drains the body then never sends headers can no
@@ -314,6 +319,9 @@ impl Proxy {
                 },
                 _ = async move { let _ = eof_rx.await; tokio::time::sleep(response_head_timeout).await; } => {
                     return Err(ProxyError::ResponseTimeout.into());
+                }
+                _ = progress.stalled_for(upload_stall) => {
+                    return Err(ProxyError::BodyTimeout.into());
                 }
             }
         } else {
@@ -365,6 +373,18 @@ impl Proxy {
                 Err(_) => return Err(ProxyError::ResponseTimeout.into()),
             }
         };
+
+        // A 101 answers an upgrade this ordinary forward never requested (Upgrade is
+        // stripped above), and no downstream can relay it: H1 would write a bogus switch
+        // and H2/H3 cannot carry 101 at all. Fail as a bad gateway; the connection is
+        // in an unknown protocol state, so it is dropped rather than pooled.
+        if upstream_resp.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+            drop(upstream_resp);
+            drop(sender);
+            return Err(HandlerError::BadGateway(
+                "upstream sent 101 to a non-upgrade request".into(),
+            ));
+        }
 
         // An h2 sender becomes ready for another stream as soon as the peer permits it,
         // even while this response body remains open. `maxConns` is documented as an
@@ -619,6 +639,7 @@ impl Proxy {
         parts.uri = uri;
         ensure_host(&mut parts.headers, target, &target.authority);
         headers::rewrite_request_headers(&mut parts.headers, ctx, true);
+        apply_host_override(&mut parts.headers, target);
         // The handshake leg carries NO request body, so strip any framing headers — otherwise a
         // client that sent `Upgrade: websocket` together with a Content-Length (+ body) would
         // replay that declared length onto the empty handshake and the upstream would block waiting
@@ -755,6 +776,18 @@ fn ensure_host(headers: &mut http::HeaderMap, _target: &ProxyTarget, fallback_au
     }
 }
 
+/// OLS `[P,E=Proxy-Host:value]`: the upstream leg carries this `Host` instead of
+/// the client's (`X-Forwarded-Host` keeps the client's).
+fn apply_host_override(headers: &mut http::HeaderMap, target: &ProxyTarget) {
+    if let Some(v) = target
+        .host_override
+        .as_deref()
+        .and_then(|h| HeaderValue::from_str(h).ok())
+    {
+        headers.insert(HOST, v);
+    }
+}
+
 /// Rebuild the inbound request for the one bodyless retry from the pre-rewrite head
 /// snapshotted before the first attempt.
 ///
@@ -815,6 +848,7 @@ fn build_forward_request(
     // away and force the upstream fallback.
     headers::rewrite_request_headers(&mut parts.headers, ctx, keep_upgrade);
     ensure_host(&mut parts.headers, target, fallback_authority);
+    apply_host_override(&mut parts.headers, target);
     if target.http2 {
         // hyper's h2 client derives :scheme/:authority from the URI; a
         // path-only URI (correct origin-form for h1) is an invalid
@@ -874,6 +908,17 @@ fn into_streaming_response(
     // Run BEFORE sanitize (which strips TE), while we can still see that the upstream framed by
     // Transfer-Encoding and thus that any Content-Length it also sent is stale.
     drop_stale_content_length_on_te(&mut parts.headers);
+    // Judged on the upstream's own framing, before any later transform (compression)
+    // drops a Content-Length: a sized upstream body keeps the bridge's buffered path.
+    let unbuffered = !parts.headers.contains_key(http::header::CONTENT_LENGTH)
+        || parts
+            .headers
+            .get_all("x-accel-buffering")
+            .iter()
+            .any(|v| v.as_bytes().trim_ascii().eq_ignore_ascii_case(b"no"));
+    if unbuffered {
+        parts.extensions.insert(hj_core::ProxiedBody);
+    }
     headers::sanitize_response_headers(&mut parts.headers, false);
     let stream: StreamBody = box_incoming(incoming, completion);
     http::Response::from_parts(parts, Body::Stream(stream))
@@ -1027,11 +1072,60 @@ fn is_body_timeout(err: &hyper::Error) -> bool {
 fn wrap_body_inactivity_timeout(
     req: HttpRequest<StreamBody>,
     timeout: Duration,
-) -> (HttpRequest<StreamBody>, tokio::sync::oneshot::Receiver<()>) {
+) -> (
+    HttpRequest<StreamBody>,
+    tokio::sync::oneshot::Receiver<()>,
+    std::sync::Arc<UploadProgress>,
+) {
     let (parts, body) = req.into_parts();
     let (eof_tx, eof_rx) = tokio::sync::oneshot::channel();
-    let wrapped: StreamBody = InactivityBody::new(body, timeout, Some(eof_tx)).boxed();
-    (HttpRequest::from_parts(parts, wrapped), eof_rx)
+    let progress = std::sync::Arc::new(UploadProgress::new());
+    let wrapped: StreamBody =
+        InactivityBody::new(body, timeout, Some(eof_tx), Some(progress.clone())).boxed();
+    (HttpRequest::from_parts(parts, wrapped), eof_rx, progress)
+}
+
+/// Upload progress shared between [`InactivityBody`] and the forward path: the time
+/// of the last frame the upstream writer pulled, or [`UploadProgress::DONE`] once the
+/// body ended.
+struct UploadProgress {
+    base: tokio::time::Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+impl UploadProgress {
+    const DONE: u64 = u64::MAX;
+
+    fn new() -> Self {
+        UploadProgress {
+            base: tokio::time::Instant::now(),
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, done: bool) {
+        let value = if done {
+            Self::DONE
+        } else {
+            u64::try_from(self.base.elapsed().as_millis()).unwrap_or(Self::DONE - 1)
+        };
+        self.last_ms
+            .store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Resolves once no frame has been pulled for `window`; never after the body ended.
+    async fn stalled_for(&self, window: Duration) {
+        loop {
+            let last = self.last_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if last == Self::DONE {
+                return std::future::pending().await;
+            }
+            tokio::time::sleep_until(self.base + Duration::from_millis(last) + window).await;
+            if self.last_ms.load(std::sync::atomic::Ordering::Relaxed) == last {
+                return;
+            }
+        }
+    }
 }
 
 /// A request-body wrapper that fails the body if no frame is produced within `timeout`.
@@ -1046,6 +1140,7 @@ struct InactivityBody {
     // forward path can start a response-HEAD timeout for the wait that follows. `None` once
     // fired (or when no signal was requested).
     eof_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    progress: Option<std::sync::Arc<UploadProgress>>,
 }
 
 impl InactivityBody {
@@ -1053,12 +1148,14 @@ impl InactivityBody {
         inner: StreamBody,
         timeout: Duration,
         eof_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        progress: Option<std::sync::Arc<UploadProgress>>,
     ) -> Self {
         InactivityBody {
             inner,
             timeout,
             sleep: Box::pin(tokio::time::sleep(timeout)),
             eof_tx,
+            progress,
         }
     }
 }
@@ -1082,10 +1179,16 @@ impl HttpBody for InactivityBody {
                     .reset(tokio::time::Instant::now() + this.timeout);
                 // (#69) On terminal end (None) or error, signal the forward path that the
                 // upload is done so it can bound the remaining wait for response headers.
-                if matches!(opt, None | Some(Err(_))) {
+                // A sized body may report its end via is_end_stream() alone; the
+                // writer then never polls for the terminal `None`.
+                let done = matches!(opt, None | Some(Err(_))) || this.inner.is_end_stream();
+                if done {
                     if let Some(tx) = this.eof_tx.take() {
                         let _ = tx.send(());
                     }
+                }
+                if let Some(progress) = &this.progress {
+                    progress.record(done);
                 }
                 std::task::Poll::Ready(opt)
             }
@@ -1280,7 +1383,7 @@ mod tests {
             first: Some(Bytes::from_static(b"first")),
         }
         .boxed();
-        let mut wrapped = InactivityBody::new(inner, Duration::from_secs(5), None);
+        let mut wrapped = InactivityBody::new(inner, Duration::from_secs(5), None, None);
 
         // The first chunk passes straight through and resets the deadline.
         let f1 = std::future::poll_fn(|cx| std::pin::Pin::new(&mut wrapped).poll_frame(cx)).await;

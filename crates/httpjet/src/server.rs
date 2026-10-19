@@ -20,6 +20,33 @@ pub(crate) fn set_cloexec(fd: &impl std::os::fd::AsFd) -> io::Result<()> {
         .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
 }
 
+/// Systemd socket-activation fds addressed to THIS process (`LISTEN_PID` ==
+/// getpid), as the raw range `3..3 + LISTEN_FDS`.
+fn activation_fd_range() -> Option<std::ops::Range<i32>> {
+    let pid = std::env::var("LISTEN_PID").ok()?.parse::<u32>().ok()?;
+    let n = std::env::var("LISTEN_FDS").ok()?.parse::<i32>().ok()?;
+    (pid == std::process::id() && n > 0).then(|| 3..3i32.saturating_add(n))
+}
+
+/// Mark every inherited activation fd close-on-exec. Must run before anything
+/// forks/execs (the in-process lsphp pool): systemd passes them without
+/// CLOEXEC, and [`listeners_from_env`] adopts them only late in startup, so a
+/// child spawned in between would hold the public listeners and could
+/// `accept()` web connections (#945).
+pub(crate) fn cloexec_activation_fds() {
+    let Some(range) = activation_fd_range() else {
+        return;
+    };
+    for fd in range {
+        // SAFETY: borrowed only for the duration of the fcntl calls; ownership
+        // is taken later by `listeners_from_env`. A closed fd just fails EBADF.
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+        if let Err(error) = set_cloexec(&borrowed) {
+            tracing::warn!(fd, %error, "socket activation: could not set FD_CLOEXEC");
+        }
+    }
+}
+
 /// (OPS8) Listening sockets inherited from systemd socket activation
 /// (`httpjet.socket`), grouped by role. systemd owns these fds and holds them
 /// open ACROSS a `systemctl restart httpjet.service`, so the accept queue is
@@ -93,28 +120,19 @@ pub fn listeners_from_env(
     https_port: u16,
     uds_path: Option<&std::path::Path>,
 ) -> io::Result<Option<InheritedListeners>> {
-    let listen_pid = std::env::var("LISTEN_PID")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok());
-    let listen_fds = std::env::var("LISTEN_FDS")
-        .ok()
-        .and_then(|s| s.parse::<i32>().ok());
-    let (Some(pid), Some(n)) = (listen_pid, listen_fds) else {
-        return Ok(None);
-    };
     // The fds are ours only if LISTEN_PID matches; otherwise they were meant for a
     // different process. This function is called once, and spawned lsphp children use
     // `env_clear`, so retaining LISTEN_* avoids unsafe process-global environment mutation.
-    if pid != std::process::id() || n <= 0 {
+    let Some(range) = activation_fd_range() else {
         return Ok(None);
-    }
+    };
 
     let mut http = Vec::new();
     let mut https = Vec::new();
     let mut quic = Vec::new();
     let mut unix = Vec::new();
     // systemd passes activation fds starting at SD_LISTEN_FDS_START (3).
-    for fd in 3..(3 + n) {
+    for fd in range {
         // SAFETY: systemd handed us this fd; we take sole ownership for the
         // process lifetime (it lives until the listener/socket is dropped).
         let sock = unsafe { Socket::from_raw_fd(fd) };

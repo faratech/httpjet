@@ -114,7 +114,30 @@ pub(super) fn needs_bridged_decompression(
     enabled_content_coding(req.headers(), policy).is_some()
 }
 
-pub(super) fn finish_body(
+/// Decoded output may always grow to this size, whatever the compression ratio,
+/// so small legitimate bodies never meet the expansion rule below.
+const EXPANSION_FLOOR: usize = 1 << 20;
+/// Past the floor, output beyond this multiple of the encoded size takes the
+/// codec-cap outcome (forwarded undecoded), as reaching `MAX_DECODE` does. Real
+/// text/JSON uploads compress 3-20x; a run of zeros compresses ~1000x, so without
+/// this a 16 KiB body bought 16 MiB of inflate before the cap discarded it.
+const MAX_EXPANSION_RATIO: usize = 64;
+/// Encoded bodies up to this size first try a decode on the serving thread...
+const INLINE_MAX_ENCODED: usize = 16 * 1024;
+/// ...which stops at this much output and restarts on the blocking pool. The
+/// inline attempt therefore costs at most ~256 KiB of inflate (well under a
+/// millisecond), and the pool round trip is reserved for bodies that need it.
+const INLINE_MAX_DECODED: usize = 256 * 1024;
+
+/// Concurrent off-thread decodes. Half the cores leaves the rest for the
+/// serving threads; waiters hold only budget-charged encoded bodies.
+static DECODE_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        Arc::new(tokio::sync::Semaphore::new((cores / 2).max(1)))
+    });
+
+pub(super) async fn finish_body(
     headers: &mut HeaderMap,
     data: Vec<u8>,
     lease: Option<BodyBufferLease>,
@@ -133,7 +156,17 @@ pub(super) fn finish_body(
             lease.into_bytes(data)
         }
     };
-    decode_body(headers, encoded, budget, max_body, policy)
+    // Bodyless requests dominate GET traffic. Avoid even probing the header
+    // map for Content-Encoding when there is nothing a decoder could consume.
+    if encoded.is_empty() {
+        return Ok(encoded);
+    }
+    let Some(coding) = enabled_content_coding(headers, policy) else {
+        return Ok(encoded);
+    };
+    // Boxed so the decode/offload state never enlarges the connection future
+    // that every unencoded request runs through.
+    Box::pin(decode_body(headers, coding, encoded, budget, max_body)).await
 }
 
 /// Apply request-content decoding to a fully buffered bridged request.
@@ -149,19 +182,23 @@ pub(super) async fn finish_bridged_request(
 ) -> Result<hj_core::Request, StatusCode> {
     // The overwhelmingly common request has no supported Content-Encoding.
     // Preserve its body and parts verbatim instead of collecting, unboxing and
-    // rebuilding the request merely for decode_body() to return the same bytes.
-    // This also makes H1's second bridge-side pass free after finish_body()
-    // removed a coding decoded on the monoio intake path.
-    if !needs_bridged_decompression(&req, policy) {
+    // rebuilding the request merely to return the same bytes. This also makes
+    // H1's second bridge-side pass free after finish_body() removed a coding
+    // decoded on the monoio intake path.
+    let Some(coding) = enabled_content_coding(req.headers(), policy) else {
         return Ok(req);
-    }
+    };
     let (mut parts, body) = req.into_parts();
     let encoded = body
         .collect()
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?
         .to_bytes();
-    let decoded = decode_body(&mut parts.headers, encoded, budget, max_body, policy)?;
+    let decoded = if encoded.is_empty() {
+        encoded
+    } else {
+        decode_body(&mut parts.headers, coding, encoded, budget, max_body).await?
+    };
     let body = if decoded.is_empty() {
         hj_core::empty_incoming()
     } else {
@@ -172,30 +209,100 @@ pub(super) async fn finish_bridged_request(
     Ok(http::Request::from_parts(parts, body))
 }
 
-fn decode_body(
+/// Decode a non-empty body carrying an enabled coding. Small bodies try the
+/// bounded inline attempt; anything else (or anything that outgrows it) runs
+/// on the tokio blocking pool behind [`DECODE_SLOTS`], so neither a monoio
+/// core nor a pipeline worker ever inflates more than [`INLINE_MAX_DECODED`].
+async fn decode_body(
     headers: &mut HeaderMap,
+    coding: ContentCoding,
     encoded: Bytes,
     budget: &Arc<BodyBufferBudget>,
     max_body: usize,
-    policy: RequestDecompression,
 ) -> Result<Bytes, StatusCode> {
-    // Bodyless requests dominate GET traffic. Avoid even probing the header
-    // map for Content-Encoding when there is nothing a decoder could consume.
-    if encoded.is_empty() {
-        return Ok(encoded);
-    }
-    let Some(coding) = enabled_content_coding(headers, policy) else {
-        return Ok(encoded);
+    let inline = if encoded.len() <= INLINE_MAX_ENCODED {
+        decode_entity(coding, &encoded, budget, max_body, INLINE_MAX_DECODED)
+    } else {
+        DecodeOutcome::Deferred
     };
+    let outcome = match inline {
+        DecodeOutcome::Deferred => {
+            offload_decode(&DECODE_SLOTS, coding, encoded.clone(), budget, max_body).await
+        }
+        done => done,
+    };
+    match outcome {
+        DecodeOutcome::Decoded(decoded) => {
+            headers.insert(header::CONTENT_LENGTH, HeaderValue::from(decoded.len()));
+            headers.remove(header::CONTENT_ENCODING);
+            Ok(decoded)
+        }
+        // A full decode has no inline limit, so it never defers; were it to,
+        // forwarding the original representation is the fail-safe outcome.
+        DecodeOutcome::Undecoded | DecodeOutcome::Deferred => Ok(encoded),
+        DecodeOutcome::Refused(status) => Err(status),
+    }
+}
 
+async fn offload_decode(
+    slots: &Arc<tokio::sync::Semaphore>,
+    coding: ContentCoding,
+    encoded: Bytes,
+    budget: &Arc<BodyBufferBudget>,
+    max_body: usize,
+) -> DecodeOutcome {
+    let Some(runtime) = crate::lscache::pipeline_handle() else {
+        return decode_entity(coding, &encoded, budget, max_body, usize::MAX);
+    };
+    // The permit moves into the closure: a requester that disconnects while
+    // its decode runs still holds the slot until the work actually ends.
+    let Ok(permit) = slots.clone().acquire_owned().await else {
+        return DecodeOutcome::Refused(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let budget = budget.clone();
+    runtime
+        .spawn_blocking(move || {
+            let _permit = permit;
+            decode_entity(coding, &encoded, &budget, max_body, usize::MAX)
+        })
+        .await
+        .unwrap_or(DecodeOutcome::Refused(StatusCode::SERVICE_UNAVAILABLE))
+}
+
+#[derive(Debug)]
+enum DecodeOutcome {
+    Decoded(Bytes),
+    /// Malformed, or past a server decode ceiling: forward the original bytes
+    /// and Content-Encoding unchanged rather than silently truncating.
+    Undecoded,
+    Refused(StatusCode),
+    /// Only from an inline attempt: the output outgrew `inline_limit`.
+    Deferred,
+}
+
+fn decode_entity(
+    coding: ContentCoding,
+    encoded: &Bytes,
+    budget: &Arc<BodyBufferBudget>,
+    max_body: usize,
+    inline_limit: usize,
+) -> DecodeOutcome {
     // Charge the codec before constructing it. This makes concurrent decoder
     // windows participate in the same process-wide request-body ledger as the
     // encoded and decoded byte buffers.
     let mut workspace_lease = BodyBufferLease::new(budget.clone());
     if !workspace_lease.reserve(coding.workspace_charge()) {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
+        return DecodeOutcome::Refused(StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    let limits = DecodeLimits {
+        max_body,
+        expansion: encoded
+            .len()
+            .saturating_mul(MAX_EXPANSION_RATIO)
+            .max(EXPANSION_FLOOR),
+        inline: inline_limit,
+    };
     let mut decoded = Vec::new();
     let mut decoded_lease = BodyBufferLease::new(budget.clone());
     let mut chunk = [0; 8192];
@@ -209,7 +316,7 @@ fn decode_body(
                 &mut chunk,
                 &mut decoded,
                 &mut decoded_lease,
-                max_body,
+                limits,
             )
         }
         ContentCoding::Brotli => {
@@ -221,39 +328,43 @@ fn decode_body(
                 &mut chunk,
                 &mut decoded,
                 &mut decoded_lease,
-                max_body,
+                limits,
             )
         }
         ContentCoding::Zstd => {
             let mut decoder = match zstd::stream::read::Decoder::new(encoded.as_ref()) {
                 Ok(decoder) => decoder,
-                Err(_) => return Ok(encoded),
+                Err(_) => return DecodeOutcome::Undecoded,
             };
             // Refuse frames that ask the native decoder to allocate a window
             // beyond the amount charged above.
             if decoder.window_log_max(24).is_err() {
-                return Ok(encoded);
+                return DecodeOutcome::Undecoded;
             }
             decode_reader(
                 &mut decoder,
                 &mut chunk,
                 &mut decoded,
                 &mut decoded_lease,
-                max_body,
+                limits,
             )
         }
     };
 
     match result {
-        DecodeResult::Complete => {
-            headers.insert(header::CONTENT_LENGTH, HeaderValue::from(decoded.len()));
-            headers.remove(header::CONTENT_ENCODING);
-            Ok(decoded_lease.into_bytes(decoded))
-        }
-        DecodeResult::MalformedOrCodecCap => Ok(encoded),
-        DecodeResult::TooLarge => Err(StatusCode::PAYLOAD_TOO_LARGE),
-        DecodeResult::NoCapacity => Err(StatusCode::SERVICE_UNAVAILABLE),
+        DecodeResult::Complete => DecodeOutcome::Decoded(decoded_lease.into_bytes(decoded)),
+        DecodeResult::MalformedOrCodecCap => DecodeOutcome::Undecoded,
+        DecodeResult::TooLarge => DecodeOutcome::Refused(StatusCode::PAYLOAD_TOO_LARGE),
+        DecodeResult::NoCapacity => DecodeOutcome::Refused(StatusCode::SERVICE_UNAVAILABLE),
+        DecodeResult::InlineLimit => DecodeOutcome::Deferred,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DecodeLimits {
+    max_body: usize,
+    expansion: usize,
+    inline: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +373,7 @@ enum DecodeResult {
     MalformedOrCodecCap,
     TooLarge,
     NoCapacity,
+    InlineLimit,
 }
 
 fn decode_reader(
@@ -269,7 +381,7 @@ fn decode_reader(
     chunk: &mut [u8; 8192],
     decoded: &mut Vec<u8>,
     decoded_lease: &mut BodyBufferLease,
-    max_body: usize,
+    limits: DecodeLimits,
 ) -> DecodeResult {
     loop {
         let n = match decoder.read(chunk) {
@@ -280,14 +392,20 @@ fn decode_reader(
             return DecodeResult::Complete;
         }
         let size = decoded.len().saturating_add(n);
-        if size > max_body {
+        // Check order is fixed so an inline attempt that defers and the full
+        // decode that replaces it reach the same verdict on the same input.
+        if size > limits.max_body {
             return DecodeResult::TooLarge;
         }
         // Preserve the historical gzip codec-cap fallback: a valid compressed
         // representation that exceeds the server's decode ceiling is forwarded
-        // unchanged rather than silently truncated.
-        if size as u64 >= hj_compress::MAX_DECODE {
+        // unchanged rather than silently truncated. The expansion bound is the
+        // same ceiling, reached as soon as the ratio proves the body abusive.
+        if size as u64 >= hj_compress::MAX_DECODE || size > limits.expansion {
             return DecodeResult::MalformedOrCodecCap;
+        }
+        if size > limits.inline {
+            return DecodeResult::InlineLimit;
         }
         if !decoded_lease.reserve(n as u64) {
             return DecodeResult::NoCapacity;
@@ -329,8 +447,22 @@ mod tests {
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(data.len()));
         let mut lease = BodyBufferLease::new(budget.clone());
         assert!(lease.reserve(data.len() as u64));
-        let result = finish_body(&mut headers, data, Some(lease), budget, max, policy);
+        let result = block_on(finish_body(
+            &mut headers,
+            data,
+            Some(lease),
+            budget,
+            max,
+            policy,
+        ));
         (result, headers)
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(fut)
     }
 
     #[test]
@@ -608,17 +740,19 @@ mod tests {
                 header::CONTENT_ENCODING,
                 HeaderValue::from_str(value).unwrap(),
             );
-            let encoded = Bytes::copy_from_slice(&data);
-            let body = decode_body(
+            let mut lease = BodyBufferLease::new(budget.clone());
+            assert!(lease.reserve(data.len() as u64));
+            let body = block_on(finish_body(
                 &mut headers,
-                encoded,
+                data.clone(),
+                Some(lease),
                 &budget,
                 100_000,
                 RequestDecompression {
                     brotli: true,
                     zstd: true,
                 },
-            )
+            ))
             .unwrap();
             assert_eq!(body.as_ref(), data);
             assert_eq!(headers[header::CONTENT_ENCODING], value);
@@ -735,5 +869,200 @@ mod tests {
                 .unwrap();
             assert!(needs_bridged_decompression(&req, policy));
         }
+    }
+
+    fn gzip_fast(input: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(input).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Bytes a decoder hands back, so a test can bound the inflate work done.
+    struct Counting<R> {
+        inner: R,
+        produced: usize,
+    }
+    impl<R: Read> Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.produced += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn expansion_ratio_bails_out_long_before_the_decode_cap() {
+        // #837: ~8 KiB of gzip that inflates to 8 MiB used to cost the full
+        // 8 MiB (16 MiB for a larger bomb) before the cap discarded it.
+        let data = encode(ContentCoding::Gzip, &vec![0; 8 << 20]);
+        assert!(data.len() * MAX_EXPANSION_RATIO < EXPANSION_FLOOR);
+        let budget = Arc::new(BodyBufferBudget::new(64 * 1024 * 1024));
+        let mut lease = BodyBufferLease::new(budget.clone());
+        let mut decoded = Vec::new();
+        let mut decoder = Counting {
+            inner: flate2::read::MultiGzDecoder::new(data.as_slice()),
+            produced: 0,
+        };
+        let result = decode_reader(
+            &mut decoder,
+            &mut [0; 8192],
+            &mut decoded,
+            &mut lease,
+            DecodeLimits {
+                max_body: 100 << 20,
+                expansion: EXPANSION_FLOOR,
+                inline: usize::MAX,
+            },
+        );
+        assert_eq!(result, DecodeResult::MalformedOrCodecCap);
+        assert!(
+            decoder.produced <= EXPANSION_FLOOR + 8192,
+            "{}",
+            decoder.produced
+        );
+        drop((lease, decoded));
+
+        // End to end the bomb takes the codec-cap outcome: forwarded verbatim.
+        let (result, headers) = run(
+            ContentCoding::Gzip,
+            data.clone(),
+            &budget,
+            100 << 20,
+            RequestDecompression::default(),
+        );
+        let body = result.unwrap();
+        assert_eq!(body.as_ref(), data);
+        assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(budget.in_flight(), data.len() as u64);
+        drop(body);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[test]
+    fn expansion_bound_scales_with_the_encoded_size() {
+        // 3 MiB that compresses ~20x is past the floor but within the ratio.
+        let mut x = 0x9e37_79b9_u32;
+        let input: Vec<u8> = (0..3 << 20)
+            .map(|i| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                if i % 16 == 0 {
+                    b'a' + (x % 26) as u8
+                } else {
+                    b' '
+                }
+            })
+            .collect();
+        let data = encode(ContentCoding::Gzip, &input);
+        assert!(data.len() * MAX_EXPANSION_RATIO > input.len());
+        let budget = Arc::new(BodyBufferBudget::new(64 * 1024 * 1024));
+        let (result, headers) = run(
+            ContentCoding::Gzip,
+            data,
+            &budget,
+            100 << 20,
+            RequestDecompression::default(),
+        );
+        assert_eq!(result.unwrap().as_ref(), input);
+        assert_eq!(headers[header::CONTENT_LENGTH], input.len().to_string());
+        assert!(!headers.contains_key(header::CONTENT_ENCODING));
+    }
+
+    #[test]
+    fn decode_cap_still_forwards_the_original_representation() {
+        // Low-ratio input past MAX_DECODE: the expansion bound never trips, and
+        // the historical cap outcome (raw body, coding retained) is unchanged.
+        let mut x = 0x1234_5678_u32;
+        let input: Vec<u8> = (0..hj_compress::MAX_DECODE as usize + 4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        let data = gzip_fast(&input);
+        drop(input);
+        let budget = Arc::new(BodyBufferBudget::new(128 * 1024 * 1024));
+        let (result, headers) = run(
+            ContentCoding::Gzip,
+            data.clone(),
+            &budget,
+            100 << 20,
+            RequestDecompression::default(),
+        );
+        let body = result.unwrap();
+        assert_eq!(body.as_ref(), data);
+        assert_eq!(headers[header::CONTENT_ENCODING], "gzip");
+        assert_eq!(budget.in_flight(), data.len() as u64);
+    }
+
+    #[test]
+    fn small_body_that_outgrows_the_inline_attempt_is_decoded_off_thread() {
+        let input = vec![b'x'; 600 * 1024];
+        let data = encode(ContentCoding::Gzip, &input);
+        assert!(data.len() <= INLINE_MAX_ENCODED);
+        let budget = Arc::new(BodyBufferBudget::new(64 * 1024 * 1024));
+        let encoded = Bytes::from(data.clone());
+        assert!(matches!(
+            decode_entity(
+                ContentCoding::Gzip,
+                &encoded,
+                &budget,
+                1 << 20,
+                INLINE_MAX_DECODED
+            ),
+            DecodeOutcome::Deferred
+        ));
+        assert_eq!(budget.in_flight(), 0);
+        let (result, headers) = run(
+            ContentCoding::Gzip,
+            data,
+            &budget,
+            1 << 20,
+            RequestDecompression::default(),
+        );
+        let body = result.unwrap();
+        assert_eq!(body.as_ref(), input);
+        assert_eq!(headers[header::CONTENT_LENGTH], "614400");
+        assert_eq!(budget.in_flight(), input.len() as u64);
+        drop(body);
+        assert_eq!(budget.in_flight(), 0);
+        // A deferred decode reaches the inline verdicts too: 413 stays 413.
+        let (result, _) = run(
+            ContentCoding::Gzip,
+            encode(ContentCoding::Gzip, &input),
+            &budget,
+            300 * 1024,
+            RequestDecompression::default(),
+        );
+        assert_eq!(result.unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn offloaded_decodes_wait_for_a_free_slot() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.unwrap();
+        let budget = Arc::new(BodyBufferBudget::new(64 * 1024 * 1024));
+        let encoded = Bytes::from(encode(ContentCoding::Gzip, b"queued body"));
+        let fut = offload_decode(&slots, ContentCoding::Gzip, encoded, &budget, 4096);
+        let mut fut = std::pin::pin!(fut);
+        for _ in 0..20 {
+            let pending =
+                std::future::poll_fn(|cx| Poll::Ready(fut.as_mut().poll(cx).is_pending())).await;
+            assert!(pending, "decode ran without a slot");
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        match fut.await {
+            DecodeOutcome::Decoded(body) => assert_eq!(body.as_ref(), b"queued body"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(slots.available_permits(), 1);
     }
 }

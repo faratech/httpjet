@@ -39,7 +39,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,6 +66,13 @@ const MAX_VARIANTS: usize = 4;
 /// A vary header value longer than this never memoizes (the outcome cache's
 /// oversized-key discipline): the entry would be single-use and pin its bytes.
 const MAX_VARY_VALUE: usize = 1024;
+/// Expired store records reclaimed per probe/store at most, so a burst of
+/// distinct keys is freed a few buckets at a time on the serving core instead
+/// of waiting for a cap to clear the whole map.
+const RECLAIM_BATCH: usize = 8;
+/// The reclaim queue only outgrows the entry cap when stores replace live
+/// entries in place; past this it clears like the other caps.
+const MAX_QUEUED: usize = 2 * MAX_ENTRIES;
 
 /// Kill switch, default ON. `main` clears it for `--no-fast-memo` or env
 /// `HJ_FAST_MEMO=0` BEFORE any listener accepts, so a relaxed load is fine.
@@ -210,6 +217,54 @@ struct Memo {
     bytes: usize,
     /// Number of variants across `map` (the [`MAX_ENTRIES`] cap).
     count: usize,
+    /// `(expires, base-key hash)` per store, in store order. A record can
+    /// outlive its entry (replaced, drained, probed away); reclaiming it then
+    /// only drops whatever in that bucket has expired.
+    expiry: VecDeque<(Instant, u64)>,
+}
+
+impl Memo {
+    fn clear(&mut self) {
+        self.map.clear();
+        self.expiry.clear();
+        self.bytes = 0;
+        self.count = 0;
+    }
+
+    /// Drop bucket `h`'s expired variants; `true` while any variant is left.
+    fn drop_expired(&mut self, h: u64, now: Instant) -> bool {
+        let Memo {
+            map, bytes, count, ..
+        } = self;
+        let Some(bucket) = map.get_mut(&h) else {
+            return false;
+        };
+        bucket.retain(|e| {
+            let live = now < e.expires;
+            if !live {
+                *bytes -= e.body.len();
+                *count -= 1;
+            }
+            live
+        });
+        if bucket.is_empty() {
+            map.remove(&h);
+            return false;
+        }
+        true
+    }
+
+    fn reclaim_expired(&mut self, now: Instant) {
+        for _ in 0..RECLAIM_BATCH {
+            match self.expiry.front() {
+                Some(&(expires, h)) if expires <= now => {
+                    self.expiry.pop_front();
+                    self.drop_expired(h, now);
+                }
+                _ => return,
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -255,24 +310,12 @@ pub(super) fn probe(
     let h = key_hash(k);
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
-        let Memo { map, bytes, count } = &mut *m;
-        let empty = {
-            let bucket = map.get_mut(&h)?;
-            bucket.retain(|e| {
-                let live = now < e.expires;
-                if !live {
-                    *bytes -= e.body.len();
-                    *count -= 1;
-                }
-                live
-            });
-            bucket.is_empty()
-        };
-        if empty {
-            map.remove(&h);
+        m.reclaim_expired(now);
+        if !m.drop_expired(h, now) {
             return None;
         }
-        let e = map
+        let e = m
+            .map
             .get(&h)?
             .iter()
             .find(|e| matches(e, k) && e.vary.iter().all(|v| v.matches(req, ua_cache)))?;
@@ -332,12 +375,17 @@ pub(super) fn store_until(
     };
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
-        if m.count >= MAX_ENTRIES || m.bytes + entry.body.len() > MAX_BYTES {
-            m.map.clear();
-            m.bytes = 0;
-            m.count = 0;
+        m.reclaim_expired(now);
+        if m.count >= MAX_ENTRIES
+            || m.bytes + entry.body.len() > MAX_BYTES
+            || m.expiry.len() >= MAX_QUEUED
+        {
+            m.clear();
         }
-        let Memo { map, bytes, count } = &mut *m;
+        m.expiry.push_back((expires, h));
+        let Memo {
+            map, bytes, count, ..
+        } = &mut *m;
         let bucket = map.entry(h).or_default();
         if let Some(i) = bucket
             .iter()
@@ -639,6 +687,91 @@ mod tests {
             assert_eq!(m.bytes, MAX_BODY, "accounting reset with the clear");
             assert_eq!(m.count, 1);
         });
+    }
+
+    /// (count, bytes, buckets, queued reclaim records) of this thread's memo.
+    fn accounting() -> (usize, usize, usize, usize) {
+        MEMO.with(|m| {
+            let m = m.borrow();
+            (m.count, m.bytes, m.map.len(), m.expiry.len())
+        })
+    }
+
+    #[test]
+    fn a_store_past_the_ttl_reclaims_expired_entries() {
+        let t0 = Instant::now();
+        let dead = b"dead body";
+        for i in 0..RECLAIM_BATCH {
+            store(
+                &key(&format!("/burst/{i}"), b""),
+                Vec::new(),
+                &resp(dead),
+                t0,
+            );
+        }
+        let n = RECLAIM_BATCH;
+        assert_eq!(accounting(), (n, n * dead.len(), n, n));
+        let later = t0 + TTL + Duration::from_millis(1);
+        store(&key("/live", b""), Vec::new(), &resp(b"live"), later);
+        assert_eq!(
+            accounting(),
+            (1, 4, 1, 1),
+            "only the live entry stays accounted"
+        );
+        assert!(probe(&key("/live", b""), &req(&[]), &ua_cache(), later).is_some());
+    }
+
+    #[test]
+    fn reclaim_is_bounded_per_call_and_runs_on_probes() {
+        let t0 = Instant::now();
+        let n = 3 * RECLAIM_BATCH + 1;
+        for i in 0..n {
+            store(&key(&format!("/b/{i}"), b""), Vec::new(), &resp(b"x"), t0);
+        }
+        let r = req(&[]);
+        let c = ua_cache();
+        let later = t0 + TTL;
+        assert!(probe(&key("/absent", b""), &r, &c, later).is_none());
+        let left = n - RECLAIM_BATCH;
+        assert_eq!(accounting(), (left, left, left, left));
+        for _ in 0..3 {
+            assert!(probe(&key("/absent", b""), &r, &c, later).is_none());
+        }
+        assert_eq!(accounting(), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn reclaim_never_drops_a_live_entry() {
+        let t0 = Instant::now();
+        let r = req(&[]);
+        let c = ua_cache();
+        store(&key("/r", b""), Vec::new(), &resp(b"old"), t0);
+        let t1 = t0 + Duration::from_millis(600);
+        // Replaced in place: the first record now names a live successor.
+        store(&key("/r", b""), Vec::new(), &resp(b"new"), t1);
+        store(&key("/s", b""), Vec::new(), &resp(b"s"), t1);
+        let t2 = t0 + TTL + Duration::from_millis(1);
+        store(&key("/t", b""), Vec::new(), &resp(b"t"), t2);
+        assert_eq!(accounting(), (3, 5, 3, 3));
+        assert!(
+            matches!(probe(&key("/r", b""), &r, &c, t2).map(Response::into_body), Some(Body::Full(b)) if b.as_ref() == b"new")
+        );
+        assert!(probe(&key("/s", b""), &r, &c, t2).is_some());
+    }
+
+    #[test]
+    fn reclaim_queue_is_bounded() {
+        let t0 = Instant::now();
+        for _ in 0..MAX_QUEUED {
+            store(&key("/q", b""), Vec::new(), &resp(b"q"), t0);
+        }
+        assert_eq!(accounting(), (1, 1, 1, MAX_QUEUED));
+        store(&key("/q", b""), Vec::new(), &resp(b"q"), t0);
+        assert_eq!(
+            accounting(),
+            (1, 1, 1, 1),
+            "an overfull queue clears like the caps"
+        );
     }
 
     #[test]

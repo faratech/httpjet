@@ -37,13 +37,16 @@ impl Router {
             let mut exact = FxHashMap::default();
             let mut default = None;
             for m in &l.vhost_map {
-                for d in &m.domains {
-                    if d == "*" {
-                        default.get_or_insert_with(|| m.vhost.clone());
-                    } else {
-                        exact.insert(d.to_ascii_lowercase(), m.vhost.clone());
-                    }
+                if m.domains.iter().any(|d| d.trim() == "*") {
+                    default.get_or_insert_with(|| m.vhost.clone());
                 }
+            }
+            // OLS mapDomainList: port ignored, `www.` stripped for the key, first mapping of a
+            // key wins. The configured `www.` spelling stays an exact (cacheable) alias; an
+            // unconfigured `www.` only reaches the apex via the parent fallback (foreign).
+            for r in l.domain_routes().routes {
+                exact.entry(r.key).or_insert_with(|| r.vhost.clone());
+                exact.entry(r.literal).or_insert(r.vhost);
             }
             listeners.insert(l.name.clone(), ListenerRoutes { exact, default });
         }

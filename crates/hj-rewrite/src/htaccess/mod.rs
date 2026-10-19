@@ -25,12 +25,16 @@ use fancy_regex::Regex;
 use crate::rules::RuleSet;
 
 pub use cache::{CacheDirectives, CacheKeyModifier, cache_directives, chain_cacheable_for_default};
-pub use mod_access::{AccessOrder, AccessSubject, HostAccess, HostEntry};
+pub use mod_access::{AccessOrder, AccessSubject, HostAccess, HostEntry, LimitedAccess};
 #[allow(unused_imports)]
 // Public downstream API; this crate does not call the iterator itself.
-pub use php::{ResolvedPhp, php_directives, php_handler_forced, php_handler_forced_iter};
+pub use php::{
+    ResolvedPhp, content_type_override, default_charset, php_directives, php_handler_forced,
+    php_handler_forced_iter, set_env_assignments,
+};
 pub use scope_index::ScopeIndex;
 
+pub(crate) mod access_memo;
 pub(crate) use scope_index::{build_access_index, build_header_index};
 
 /// A header op recorded from `Header set/add/append/unset/merge ...`, together
@@ -46,6 +50,13 @@ pub(crate) struct HeaderDirective {
     pub(crate) name: String,
     /// The value (already de-quoted). Empty for `unset`.
     pub(crate) value: String,
+    /// `name` as a field name, built once; `None` when it is not a valid one.
+    pub(crate) field_name: Option<http::HeaderName>,
+    /// `value` as a field value, built once when it has no `%{VAR}` reference;
+    /// `None` when interpolated or not a valid one.
+    pub(crate) static_value: Option<http::HeaderValue>,
+    /// `value` references `%{VAR}`, so it is interpolated per response.
+    pub(crate) interpolated: bool,
     /// Optional `env=NAME` guard (or `env=!NAME` for negation).
     pub(crate) env: Option<EnvGuard>,
     /// Optional `expr=%{REQUEST_URI} =~|!~ ...` guard.
@@ -167,15 +178,34 @@ pub struct SetEnvIf {
     /// Attribute name (e.g. `Origin`, `Request_URI`, `Query_String`, or a
     /// header / `Remote_Addr`).
     pub(crate) attribute: String,
-    pub(crate) regex: Regex,
+    /// The attribute's resolution class, fixed at parse time.
+    pub(crate) attr: crate::directives::SetEnvAttr,
+    /// Compiled through the rewrite engine's PCRE path (#978): `\<`/`\>` are
+    /// literal brackets, and the linear-time engine runs whenever it can.
+    pub(crate) regex: crate::rules::CompiledRegex,
+    /// The pattern as written, with SetEnvIfNoCase's `(?i)`: the identity
+    /// [`SetEnvIf::reuse_prev`] compares.
+    pub(crate) regex_src: Box<str>,
     /// (#312) Literal prefix fast path: when the pattern is `^`-anchored and
     /// case-sensitive, the leading literal run (same extractor as RewriteRule's
     /// prefilter) lets evaluation skip the fancy_regex backtracker for subjects
     /// that cannot match. Empty = no fast path (fail open, always execute).
     pub(crate) literal_prefix: Box<[u8]>,
-    /// Variable to set and its value template (`$0`, `$1` allowed).
-    pub(crate) var: String,
-    pub(crate) value: String,
+    /// Variables to set with their value templates (`$0`, `$1` allowed), in order.
+    /// A `!VAR` assignment is kept as `("!VAR", "")`: it UNSETS `VAR` (see
+    /// [`EnvAssignment`](crate::EnvAssignment)).
+    pub(crate) assigns: Vec<(String, String)>,
+    /// The conjunction of every enclosing `<Files*>`/`<Directory*>`/`<If>` scope;
+    /// the directive runs only when ALL match (#781). Empty = directory-wide.
+    pub(crate) scopes: Vec<Scope>,
+    /// Some set (not `!VAR`) value expands `$N`, so a match must produce its
+    /// capture groups; otherwise a plain match test decides.
+    pub(crate) needs_caps: bool,
+    /// The previous directive tests the same subject (identical attribute,
+    /// pattern, prefix and scopes, and it assigns no variable the attribute's
+    /// env fallback could read) and this one needs no captures, so its match
+    /// result decides this one too (#977).
+    pub(crate) reuse_prev: bool,
 }
 
 /// Parse-time verdict on whether a finished STATIC response built under this
@@ -198,10 +228,21 @@ pub struct MemoClass {
     /// `(line, reason)` of the first few blocking directives; line 0 = the
     /// rewrite ruleset (which keeps no line numbers).
     pub blockers: Vec<(usize, &'static str)>,
+    /// (#857) `(line, reason)` of the first directive outside the rewrite ruleset
+    /// that reads a request input the origin page cache cannot key (a `SetEnvIf`
+    /// on client/server address or protocol). Its env output may steer the
+    /// rewrite, `Header … env=` and the backend, so a response built under this
+    /// file must not be shared. The ruleset's own reads are
+    /// [`RuleSet::page_cache_unkeyed`].
+    pub page_cache_unkeyed: Option<(usize, &'static str)>,
 }
 
 impl MemoClass {
     const MAX_BLOCKERS: usize = 8;
+
+    pub(crate) fn unkeyed(&mut self, line: usize, reason: &'static str) {
+        self.page_cache_unkeyed.get_or_insert((line, reason));
+    }
 
     pub(crate) fn block(&mut self, line: usize, reason: &'static str) {
         self.eligible = false;
@@ -256,9 +297,9 @@ pub(crate) struct PhpDirective {
     pub(crate) scopes: Vec<Scope>,
 }
 
-/// Which directive produced a [`PhpDirective`] — selects the permission level:
-/// `php_admin_*` is applied as `PHP_INI_SYSTEM` (can set any ini), the plain
-/// forms as `PHP_INI_PERDIR` (PHP itself refuses anything stronger).
+/// Which directive produced a [`PhpDirective`]:
+/// `php_admin_*` locks its setting name against a deeper plain form; every form
+/// reaches lsphp as `PHP_INI_PERDIR` (see `php_directives`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PhpDirectiveKind {
     Value,
@@ -268,7 +309,7 @@ pub(crate) enum PhpDirectiveKind {
 }
 
 impl PhpDirectiveKind {
-    /// True for the `php_admin_*` forms (PHP_INI_SYSTEM level).
+    /// True for the `php_admin_*` forms.
     pub fn is_admin(self) -> bool {
         matches!(
             self,
@@ -277,32 +318,75 @@ impl PhpDirectiveKind {
     }
 }
 
-/// A `SetHandler <handler>` directive. Apache/LiteSpeed: `SetHandler` forces the
-/// named handler on every file in scope regardless of extension. We only model
-/// whether the effective handler is PHP (`application/x-httpd-php`): `php == true`
-/// forces PHP routing; `php == false` (`None`/`default-handler`/anything else)
-/// records an explicit reset so a deeper `SetHandler none` can cancel a shallower
-/// `SetHandler application/x-httpd-php` or an [`AddPhpExt`]. Consulted ONLY to
-/// *add* PHP routing (never to strip extension-based PHP routing) — see
-/// [`php_handler_forced`](super::php::php_handler_forced).
+/// One handler/type-mapping directive (`SetHandler`, `ForceType`, `AddHandler`,
+/// `AddType`, `RemoveHandler`, `RemoveType`). Only whether the mapping selects PHP
+/// is modelled. Folded across the chain by
+/// [`php_handler_forced`](super::php::php_handler_forced), which can only ADD
+/// PHP routing to a file whose extension is not a configured script suffix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HandlerDirective {
+pub(crate) enum HandlerOpKind {
+    /// `SetHandler <h>`: `Some(is_php)`; `SetHandler None` clears an inherited
+    /// `SetHandler` so extension mappings apply again (Apache core semantics).
+    SetHandler(Option<bool>),
+    /// `ForceType <type>`; `ForceType None` (`None`) clears it.
+    ForceType(Option<TypeSpec>),
+    /// `AddHandler <h> <ext…>` (lowercased, leading dot stripped).
+    AddHandler { exts: Vec<String>, php: bool },
+    /// `AddType <type> <ext…>`.
+    AddType { exts: Vec<String>, ty: TypeSpec },
+    /// `RemoveHandler <ext…>`: drops an inherited `AddHandler` mapping.
+    RemoveHandler(Vec<String>),
+    /// `RemoveType <ext…>`: drops an inherited `AddType` mapping.
+    RemoveType(Vec<String>),
+}
+
+/// The MIME type named by `AddType`/`ForceType`, and whether it selects PHP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TypeSpec {
+    pub(crate) mime: String,
     pub(crate) php: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandlerOp {
+    pub(crate) kind: HandlerOpKind,
     /// The conjunction of every enclosing block's scope, outermost first; applies
     /// only when ALL match. Empty = directory-wide. Mirrors [`PhpDirective::scopes`].
     pub(crate) scopes: Vec<Scope>,
 }
 
-/// An `AddHandler application/x-httpd-php <ext…>` / `AddType application/x-httpd-php
-/// <ext…>` directive: the listed extensions (lowercased, leading dot stripped) are
-/// mapped to PHP for this directory (and below, since the chain includes parent
-/// `.htaccess` files). Only the PHP handler/type is recorded; non-PHP `AddType`
-/// (e.g. `AddType text/html .shtml`) is ignored. Additive only (see
-/// [`HandlerDirective`]).
+impl HandlerOp {
+    /// Whether this op can, on its own, select PHP for some file.
+    pub(crate) fn can_force_php(&self) -> bool {
+        match &self.kind {
+            HandlerOpKind::SetHandler(Some(php)) | HandlerOpKind::AddHandler { php, .. } => *php,
+            HandlerOpKind::ForceType(Some(ty)) | HandlerOpKind::AddType { ty, .. } => ty.php,
+            _ => false,
+        }
+    }
+
+    /// Whether this op can, on its own, give a static file a configured MIME type.
+    pub(crate) fn can_set_mime(&self) -> bool {
+        match &self.kind {
+            HandlerOpKind::ForceType(Some(ty)) | HandlerOpKind::AddType { ty, .. } => !ty.php,
+            _ => false,
+        }
+    }
+}
+
+/// `SetEnv VAR [value]` / `UnsetEnv VAR…` (mod_env), with its enclosing scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AddPhpExt {
-    pub(crate) exts: Vec<String>,
-    /// Enclosing-block scope conjunction (usually empty = directory-wide).
+pub(crate) struct EnvDirective {
+    /// `Some(value)` sets `name`; `None` unsets it.
+    pub(crate) name: String,
+    pub(crate) value: Option<String>,
+    pub(crate) scopes: Vec<Scope>,
+}
+
+/// `AddDefaultCharset On|Off|charset`, with its enclosing scope. `None` = Off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CharsetDirective {
+    pub(crate) charset: Option<String>,
     pub(crate) scopes: Vec<Scope>,
 }
 
@@ -387,10 +471,7 @@ impl AccessMatcher {
         let AccessMatcher::Method { methods, except } = self else {
             return None;
         };
-        let listed = methods
-            .iter()
-            .any(|m| m == method || (m == "GET" && method == "HEAD"));
-        Some(listed != *except)
+        Some(mod_access::method_listed(methods, method) != *except)
     }
 }
 
@@ -415,20 +496,38 @@ pub struct AccessRule {
 
 impl AccessRule {
     /// The verdict for a request this rule's scope matches.
-    pub fn denies(&self, subject: &AccessSubject<'_>) -> bool {
+    pub fn denies(&self, subject: &AccessSubject<'_>, method: &str) -> bool {
         match &self.host_access {
-            Some(ha) => !ha.permits(subject),
+            Some(ha) => !ha.permits_method(subject, method),
             None => self.denied,
         }
     }
 
-    pub(crate) fn matches(&self, rel_path: &str, basename: &str, method: &str) -> bool {
+    pub(crate) fn matches(
+        &self,
+        rel_path: &str,
+        request_path: &str,
+        basename: &str,
+        method: &str,
+    ) -> bool {
+        if self
+            .host_access
+            .as_ref()
+            .is_some_and(|ha| !ha.applies_to(method))
+        {
+            return false;
+        }
         // Fail CLOSED toward this rule's polarity on a regex match-time error (issue A6): for a
         // deny rule an un-evaluable matcher counts as matched (deny applies); for an allow rule
         // it counts as not matched (grant withheld).
         self.matchers.iter().all(|m| {
-            m.matches_method(method)
-                .unwrap_or_else(|| m.matches(rel_path, basename, self.denied))
+            m.matches_method(method).unwrap_or_else(|| {
+                let path = match m {
+                    AccessMatcher::IfUri { .. } | AccessMatcher::IfUriExpr(_) => request_path,
+                    _ => rel_path,
+                };
+                m.matches(path, basename, self.denied)
+            })
         })
     }
 
@@ -442,17 +541,41 @@ impl AccessRule {
             .any(|m| matches!(m, AccessMatcher::Path(_)))
     }
 
-    pub(crate) fn merge_phase(&self) -> u8 {
+    /// Whether matching this rule runs a regex (anything beyond a `<Limit>` method list).
+    pub(crate) fn has_path_matcher(&self) -> bool {
         self.matchers
             .iter()
-            .map(|m| match m {
-                AccessMatcher::Basename(_) => 1,
-                AccessMatcher::IfUri { .. } | AccessMatcher::IfUriExpr(_) => 2,
-                AccessMatcher::Path(_) | AccessMatcher::Method { .. } => 0,
-            })
-            .max()
-            .unwrap_or(0)
+            .any(|m| !matches!(m, AccessMatcher::Method { .. }))
     }
+
+    pub(crate) fn merge_phase(&self) -> u8 {
+        merge_phase(&self.matchers)
+    }
+}
+
+/// [`merge_phase`] for a directive's enclosing-scope conjunction.
+pub(crate) fn scope_merge_phase(scopes: &[Scope]) -> u8 {
+    scopes
+        .iter()
+        .map(|s| match s.kind {
+            ScopeKind::Files | ScopeKind::FilesMatch => 1,
+            ScopeKind::If => 2,
+            ScopeKind::Directory | ScopeKind::DirectoryMatch => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn merge_phase(matchers: &[AccessMatcher]) -> u8 {
+    matchers
+        .iter()
+        .map(|m| match m {
+            AccessMatcher::Basename(_) => 1,
+            AccessMatcher::IfUri { .. } | AccessMatcher::IfUriExpr(_) => 2,
+            AccessMatcher::Path(_) | AccessMatcher::Method { .. } => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// A parsed `.htaccess`: the rewrite engine plus recognized side directives.
@@ -475,8 +598,17 @@ pub struct Htaccess {
     /// Ordered, scoped auth configuration. Resolve across the full inherited
     /// chain with [`resolve_auth`] before credential verification.
     pub auth: Option<AuthPolicy>,
-    /// `SetEnvIf`/`SetEnvIfNoCase`.
+    /// `SetEnvIf`/`SetEnvIfNoCase`/`BrowserMatch`/`BrowserMatchNoCase`.
     pub set_env_if: Vec<SetEnvIf>,
+    /// True iff some `set_env_if` entry carries an enclosing scope, so the
+    /// caller must supply [`ReqAttrs::scope_path`](crate::ReqAttrs::scope_path).
+    pub has_scoped_set_env: bool,
+    /// Some `set_env_if` attribute reads the client/server address or the host,
+    /// so the caller must format them for [`ReqAttrs`](crate::ReqAttrs).
+    pub(crate) set_env_if_reads_conn: bool,
+    /// `eval_cookie_env(None)`: a pure function of the parsed rules, computed
+    /// once (`None` = not computed, evaluate live).
+    pub(crate) cookie_env_absent: Option<Result<Vec<(String, String)>, &'static str>>,
     /// `CacheLookup [public|private] on|off` — `Some(true/false)` if present in
     /// this directory's file (last one wins). Drives the origin page cache.
     pub(crate) cache_lookup: Option<bool>,
@@ -491,20 +623,28 @@ pub struct Htaccess {
     /// and passed to lsphp via the LSAPI special-env section.
     pub(crate) php_directives: Vec<PhpDirective>,
     /// `DirectoryIndex` names in source order for this directory. Empty means no
-    /// override; the caller falls back to vhost/server index files.
+    /// override unless [`Self::directory_index_disabled`] is set; consult
+    /// [`Htaccess::directory_index_override`].
     pub directory_index: Vec<String>,
-    /// `SetHandler <handler>` directives in source order (each carries its scope).
-    /// Folded across the chain by [`php_handler_forced`](super::php::php_handler_forced)
-    /// to decide whether a non-PHP-suffixed file is forced through lsphp.
-    pub(crate) set_handlers: Vec<HandlerDirective>,
-    /// `AddHandler`/`AddType application/x-httpd-php <ext…>` directives in source
-    /// order. Adds the listed extensions to PHP routing for this directory subtree.
-    pub(crate) add_php_exts: Vec<AddPhpExt>,
+    /// `DirectoryIndex disabled`: this directory searches no index at all, and
+    /// the parent/vhost list must not be used as a fallback.
+    pub directory_index_disabled: bool,
+    /// `SetHandler`/`ForceType`/`AddHandler`/`AddType`/`RemoveHandler`/`RemoveType`
+    /// in source order (each carries its scope). Folded across the chain by
+    /// [`php_handler_forced`](super::php::php_handler_forced).
+    pub(crate) handler_ops: Vec<HandlerOp>,
+    /// `SetEnv`/`UnsetEnv` in source order; applied before `SetEnvIf`.
+    pub(crate) set_env: Vec<EnvDirective>,
+    /// `AddDefaultCharset` in source order (each carries its scope).
+    pub(crate) default_charset: Vec<CharsetDirective>,
+    /// True iff some `handler_ops` entry names a non-PHP MIME type, so a static
+    /// response may need its `Content-Type` overridden.
+    pub has_type_override: bool,
     /// True iff `headers` is non-empty. Lets [`apply_response_headers`] skip the
     /// per-request `response_headers` call (and its `Vec` alloc) for chain
     /// entries (subdirectory `.htaccess` files) that carry no `Header` ops.
     pub has_resp_op: bool,
-    /// True iff `set_handlers`/`add_php_exts` is non-empty. The hot-path gate that
+    /// True iff some `handler_ops` entry can select PHP. The hot-path gate that
     /// keeps suffix routing byte-identical (and free of any scope-regex cost) for
     /// the overwhelmingly common case of no handler-override directive in the chain.
     pub has_handler_override: bool,
@@ -517,4 +657,52 @@ pub struct Htaccess {
     pub header_index: ScopeIndex,
     /// Parse-time `fast_memo` replay eligibility (see [`MemoClass`]).
     pub memo: MemoClass,
+    /// Which `access_rules` match a request, memoized for this parse (see [`access_memo`]).
+    pub(crate) access_memo: access_memo::AccessMatchMemo,
+    /// Some access rule has a path, basename or `<If>` matcher, so matching is worth
+    /// [`Self::access_memo`]; otherwise the scan is cheaper than the memo probe.
+    pub(crate) access_memo_useful: bool,
+}
+
+impl Htaccess {
+    /// Whether this file carries any `AddDefaultCharset`.
+    pub fn has_default_charset(&self) -> bool {
+        !self.default_charset.is_empty()
+    }
+
+    /// Whether this file carries any `SetEnv`/`UnsetEnv`.
+    pub fn has_set_env(&self) -> bool {
+        !self.set_env.is_empty()
+    }
+
+    /// This directory's `DirectoryIndex` override: `None` when the file sets none
+    /// (inherit from the parent directory or vhost), `Some(&[])` for
+    /// `DirectoryIndex disabled` (search nothing, inherit nothing).
+    pub fn directory_index_override(&self) -> Option<&[String]> {
+        (self.directory_index_disabled || !self.directory_index.is_empty())
+            .then_some(self.directory_index.as_slice())
+    }
+
+    /// (#857) Whether a response built under this file is a function of the
+    /// origin page-cache key plus its header vary. Access rules on client
+    /// address (`Allow from`/`Require ip`, `Deny from env=`) do not count: they
+    /// are judged per request before any cache hit is served.
+    pub fn page_cache_keyed(&self) -> bool {
+        self.memo.page_cache_unkeyed.is_none() && self.rules.page_cache_keyed()
+    }
+
+    /// The first unkeyed read behind a false [`Self::page_cache_keyed`], for
+    /// `httpjet check`.
+    pub fn page_cache_unkeyed_reason(&self) -> Option<String> {
+        if let Some((line, reason)) = self.memo.page_cache_unkeyed {
+            return Some(format!("{reason} at line {line}"));
+        }
+        if self.rules.page_cache_keyed() {
+            return None;
+        }
+        self.rules
+            .page_cache_unkeyed
+            .as_deref()
+            .map(|var| format!("rewrite reads %{{{var}}}"))
+    }
 }

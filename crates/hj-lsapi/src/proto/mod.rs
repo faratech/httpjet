@@ -123,8 +123,8 @@ mod builder;
 mod frame;
 
 pub use builder::{
-    SpecialEnvType, build_begin_request, build_begin_request_body, build_begin_request_framed,
-    build_begin_request_framed_into,
+    SpecialEnvType, WireHeader, build_begin_request, build_begin_request_body,
+    build_begin_request_framed, build_begin_request_framed_into,
 };
 pub use frame::{LsapiCodec, LsapiFrame, RespHeader, parse_resp_header};
 

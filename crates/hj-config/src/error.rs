@@ -19,6 +19,14 @@ pub enum ConfigError {
         value: String,
         reason: String,
     },
+    /// A vhost file lacks a directive the vhost cannot be configured without.
+    /// Like OLS, the load skips only that vhost.
+    #[error("missing <{directive}> in {path}: {reason}")]
+    MissingDirective {
+        path: PathBuf,
+        directive: &'static str,
+        reason: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;

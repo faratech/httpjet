@@ -82,3 +82,18 @@ fn huge_accepted_rules_render_a_bounded_coherent_header_pair() {
         );
     }
 }
+
+/// Regression (#943): a 304 gets the same generated pair its 200 would.
+#[test]
+fn not_modified_gets_the_generated_pair() {
+    let rules = hj_compress::ExpiresRules::from_pairs([("text/plain", "A604800")]);
+    let mut ok = response_with_content_type();
+    apply_expires(&rules, 1_700_000_000, &mut ok);
+    let mut not_modified = response_with_content_type();
+    *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+    apply_expires(&rules, 1_700_000_000, &mut not_modified);
+    for name in [http::header::CACHE_CONTROL, http::header::EXPIRES] {
+        assert_eq!(not_modified.headers().get(&name), ok.headers().get(&name));
+        assert!(ok.headers().contains_key(&name));
+    }
+}

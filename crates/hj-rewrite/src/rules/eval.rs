@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use regex_automata::PatternSet;
 
@@ -20,9 +21,9 @@ use super::*;
 ///
 /// Genuinely-unavailable variables resolve to the empty string (Apache also
 /// yields `""` when it cannot compute them): the time family (`%{TIME}`,
-/// `%{TIME_YEAR}`, `%{TIME_MON}`, ...), the subrequest lookups `%{LA-U:...}` /
-/// `%{LA-F:...}`, and the internal-map `%{...}` forms. They fall through to the
-/// env lookup below, which returns `""` for unknown names.
+/// `%{TIME_YEAR}`, `%{TIME_MON}`, ...) and the internal-map `%{...}` forms. They
+/// fall through to the env lookup below, which returns `""` for unknown names.
+/// (`%{LA-U:VAR}`/`%{LA-F:VAR}` were already reduced to `%{VAR}` at parse time.)
 /// Look up `name` in the borrowed env seed (the pipeline's key-deduped `ctx.env`).
 /// Exact-key match, equivalent to the former `BTreeMap::get` on the cloned seed.
 fn seed_get<'s>(input: &'s RewriteInput, name: &str) -> Option<&'s String> {
@@ -94,7 +95,8 @@ fn resolve_var_into(
         "REQUEST_SCHEME" => out.push_str(if input.https { "https" } else { "http" }),
         // %{REMOTE_ADDR}/%{SERVER_ADDR}/%{SERVER_NAME}/%{REMOTE_PORT}: supplied by
         // the pipeline from ReqCtx (client_ip/peer_*/local_addr). Unset -> "".
-        "REMOTE_ADDR" => out.push_str(&input.remote_addr),
+        // OLS resolves REMOTE_HOST to the client address (no reverse DNS).
+        "REMOTE_ADDR" | "REMOTE_HOST" => out.push_str(&input.remote_addr),
         "REMOTE_PORT" => {
             if let Some(p) = input.remote_port {
                 let _ = write!(out, "{p}");
@@ -133,6 +135,11 @@ fn resolve_var_into(
             out.push(' ');
             out.push_str(&input.protocol);
         }
+        _ if let Some(hdr) = super::parse::single_word_header_var(name) => {
+            if let Some(c) = input.get_header(hdr) {
+                out.push_str(&c);
+            }
+        }
         // Bare %{NAME} fallthrough — same overlay-then-seed lookup as %{ENV:NAME}.
         _ => {
             if let Some(v) = env
@@ -152,12 +159,139 @@ fn resolve_var_into(
 /// docroot separator and always inserts exactly one before `rel` (even when
 /// `rel` is empty, e.g. the `/` request) — but without the intermediate
 /// `PathBuf` + `String` allocation.
+///
+/// When the full path does not exist but a proper prefix is a regular file, the
+/// value stops at that file and the rest is PATH_INFO, as OLS `checkPathInfo`
+/// and Apache's directory walk resolve it: `/index.php/welcome` is `-f`, so an
+/// `index.php/$1` front controller does not re-wrap its own target (#881).
 fn push_request_filename(out: &mut String, input: &RewriteInput, cur_uri: &str) {
+    if !matches!(input.stat, StatSource::Live(_) | StatSource::LiveTests(_)) {
+        resolve_request_filename(out, input, cur_uri);
+        return;
+    }
+    let hit = FS_MEMO.with(|m| {
+        let m = m.borrow();
+        let hit = m.active && m.filename_valid && m.filename_uri == cur_uri;
+        if hit {
+            out.push_str(&m.filename);
+        }
+        hit
+    });
+    if hit {
+        return;
+    }
+    let start = out.len();
+    resolve_request_filename(out, input, cur_uri);
+    FS_MEMO.with(|m| {
+        let m = &mut *m.borrow_mut();
+        if m.active {
+            m.filename_uri.clear();
+            m.filename_uri.push_str(cur_uri);
+            m.filename.clear();
+            m.filename.push_str(out.get(start..).unwrap_or_default());
+            m.filename_valid = true;
+        }
+    });
+}
+
+fn resolve_request_filename(out: &mut String, input: &RewriteInput, cur_uri: &str) {
+    let start = out.len();
     let rel = cur_uri.trim_start_matches('/');
     let dr = input.docroot.to_string_lossy();
     out.push_str(dr.trim_end_matches('/'));
+    let base = out.len();
     out.push('/');
     out.push_str(rel);
+    if !matches!(input.stat, StatSource::Live(_) | StatSource::LiveTests(_)) {
+        return;
+    }
+    let path = &out[start..];
+    let base = base - start;
+    let mut end = path.trim_end_matches('/').len();
+    if end <= base {
+        return;
+    }
+    if let Some(is_file) = stat_is_file(input, &path[..end]) {
+        // `/index.php/` names the script with an empty PATH_INFO (OLS strips the
+        // trailing slashes before its stat), so `-f` holds.
+        if is_file {
+            out.truncate(start + end);
+        }
+        return;
+    }
+    // Bounded: a hostile URI of thousands of missing segments must not cost a
+    // stat per segment.
+    for _ in 0..MAX_PATH_INFO_WALK {
+        let Some(cut) = path[..end].rfind('/') else {
+            return;
+        };
+        end = path[..cut].trim_end_matches('/').len();
+        if end <= base {
+            return;
+        }
+        if let Some(is_file) = stat_is_file(input, &path[..end]) {
+            if is_file {
+                out.truncate(start + end);
+            }
+            return;
+        }
+    }
+}
+
+const MAX_PATH_INFO_WALK: usize = 32;
+
+std::thread_local! {
+    /// The last live `%{REQUEST_FILENAME}` expansion and file test of the
+    /// evaluation running on this thread: a front controller's `-f [OR] -l [OR] -d`
+    /// otherwise re-expands, re-walks PATH_INFO and re-stats one path per cond.
+    /// Buffers keep their capacity across evaluations.
+    static FS_MEMO: std::cell::RefCell<FsMemo> = std::cell::RefCell::new(FsMemo::default());
+}
+
+#[derive(Default)]
+struct FsMemo {
+    active: bool,
+    filename_valid: bool,
+    filename_uri: String,
+    filename: String,
+    test_valid: bool,
+    test_path: String,
+    test: Option<FileTests>,
+}
+
+impl FsMemo {
+    fn reset(&mut self, active: bool) {
+        self.active = active;
+        self.filename_valid = false;
+        self.test_valid = false;
+    }
+}
+
+/// Confines [`FS_MEMO`] to one `evaluate` call: its docroot and stat source are
+/// fixed for the call, and outside one the memo is bypassed.
+pub(super) struct FsMemoScope(());
+
+impl FsMemoScope {
+    pub(super) fn enter() -> Self {
+        FS_MEMO.with(|m| m.borrow_mut().reset(true));
+        FsMemoScope(())
+    }
+}
+
+impl Drop for FsMemoScope {
+    fn drop(&mut self) {
+        FS_MEMO.with(|m| m.borrow_mut().reset(false));
+    }
+}
+
+/// `Some(is_regular_file)` when `path` exists under a live stat source.
+fn stat_is_file(input: &RewriteInput, path: &str) -> Option<bool> {
+    let path = std::path::Path::new(path);
+    match &input.stat {
+        StatSource::Live(f) => f(path).map(|md| md.is_file()),
+        StatSource::LiveTests(f) => f(path).map(|t| t.is_file),
+        StatSource::Precomputed(_) | StatSource::None => None,
+    }
 }
 
 /// Expand `%{VAR}`, `$N` (rule backrefs), and `%N` (last-cond backrefs) inside a
@@ -181,6 +315,177 @@ fn expand(
     out
 }
 
+/// Per `%N` slot, the byte spans of the capture that came from the escaped working
+/// URI (see [`EvalState::uri_escaped`]); every other byte is literal.
+pub(super) type CondEscaped = Box<[Vec<Range<usize>>; 10]>;
+
+/// How backreferences are escaped while expanding a RewriteRule substitution.
+struct SubstEscape<'r> {
+    backref: Option<&'r BackrefEscape>,
+    allow_3f: bool,
+    /// Emit a literal `%` that an expansion carries into the path part as `%25`.
+    escape_pct: bool,
+    /// `$N` and the `%{VAR}`s that read the working URI are escaped already.
+    uri_escaped: bool,
+    cond_escaped: Option<&'r CondEscaped>,
+}
+
+/// What an expansion is for: a substitution escapes what it inserts; a condition
+/// test string expanded after a substitution records which bytes came from the
+/// escaped working URI, so its `%N` captures keep that provenance.
+enum Expansion<'a, 'r> {
+    Plain,
+    Subst(&'a SubstEscape<'r>),
+    TestString {
+        escaped: &'a mut Vec<Range<usize>>,
+        cond_escaped: Option<&'a CondEscaped>,
+    },
+}
+
+/// Where the bytes of an inserted value came from.
+#[derive(Clone, Copy)]
+enum Provenance<'a> {
+    Literal,
+    Escaped,
+    /// Literal except these escaped spans.
+    Spans(&'a [Range<usize>]),
+}
+
+impl Provenance<'_> {
+    fn literal_at(self, i: usize) -> bool {
+        match self {
+            Provenance::Literal => true,
+            Provenance::Escaped => false,
+            Provenance::Spans(spans) => !spans.iter().any(|r| r.contains(&i)),
+        }
+    }
+}
+
+/// The variables whose value is the working URI: escaped once a substitution ran.
+fn var_reads_working_uri(name: &str) -> bool {
+    matches!(name, "REQUEST_URI" | "REQUEST_FILENAME" | "SCRIPT_FILENAME")
+}
+
+/// Expand a substitution. Like OLS `appendSubst`, a value it inserts is literal
+/// text in the target, so in the path part a literal `%` becomes `%25`: the
+/// pipeline decodes the target once, which must yield the inserted bytes rather
+/// than decode a `%252e` request a second time into `.` (#1033). OLS decodes only
+/// the substitution's own text (here `%XX` survives `escape_subst` and that one
+/// decode) and `%{REQUEST_URI}`, whose source there is the raw request target;
+/// ours is the decoded path already (OLS also re-decodes its decoded URI after an
+/// internal redirect, the double decode this avoids). A `?` a `$N`/`%N` carries
+/// into the path part becomes `%3F` (unless `[UnsafeAllow3F]`; a decoded `%3F`
+/// must not split the target, CVE-2024-38474); one in a `%{VAR}` starts the
+/// query, as in OLS.
+fn expand_subst(
+    rule: &Rule,
+    input: &RewriteInput,
+    state: &EvalState,
+    rule_caps: &[Option<String>],
+    escape_pct: bool,
+) -> String {
+    let mut out = String::new();
+    let esc = SubstEscape {
+        backref: rule.flags.backref_escape.as_ref(),
+        allow_3f: rule.flags.allow_3f,
+        escape_pct,
+        uri_escaped: state.uri_escaped,
+        cond_escaped: state.last_cond_escaped.as_ref(),
+    };
+    expand_with(
+        &mut out,
+        &rule.subst,
+        input,
+        &state.uri,
+        &state.query,
+        &state.env,
+        rule_caps,
+        &state.last_cond_caps,
+        Expansion::Subst(&esc),
+    );
+    out
+}
+
+fn push_backref(out: &mut String, val: &str, e: &SubstEscape<'_>, from: Provenance<'_>) {
+    let mut in_path = !out.contains('?');
+    let escape_pct = e.escape_pct && !matches!(from, Provenance::Escaped);
+    if e.backref.is_none()
+        && (!in_path || !val.bytes().any(|b| b == b'?' || (escape_pct && b == b'%')))
+    {
+        out.push_str(val);
+        return;
+    }
+    // OLS runs escape_unsafe_3f AFTER the [B] family's escape_uri, so a [B=chars],
+    // [BCTLS] or [BNE=?] that leaves `?` literal must still not split the path (#753).
+    for (i, c) in val.char_indices() {
+        if let Some(b) = e.backref
+            && backref_escapes(b, c)
+        {
+            push_backref_escaped(out, c, b);
+            continue;
+        }
+        match c {
+            '?' if in_path && !e.allow_3f => out.push_str("%3F"),
+            '?' => {
+                in_path = false;
+                out.push('?');
+            }
+            '%' if in_path && escape_pct && from.literal_at(i) => out.push_str("%25"),
+            _ => out.push(c),
+        }
+    }
+}
+
+/// Escape the literal `%`s of the `%{VAR}` value that `out` holds from `start`, up
+/// to the end of the path part.
+fn escape_var_value(out: &mut String, start: usize) {
+    let Some(head) = out.get(..start) else {
+        return;
+    };
+    if head.contains('?') {
+        return;
+    }
+    let value = out.get(start..).unwrap_or_default();
+    let path_len = value.find('?').unwrap_or(value.len());
+    if !value.get(..path_len).unwrap_or_default().contains('%') {
+        return;
+    }
+    let value = out.split_off(start);
+    for (i, c) in value.char_indices() {
+        if c == '%' && i < path_len {
+            out.push_str("%25");
+        } else {
+            out.push(c);
+        }
+    }
+}
+
+/// OLS `escape_uri` for the `[B]` family: everything but alphanumerics and `_` is
+/// percent-encoded, a space becoming `+` unless `[BNP]`.
+fn backref_escapes(b: &BackrefEscape, c: char) -> bool {
+    let escape = if let Some(only) = &b.only {
+        only.contains(c)
+    } else if b.ctls_only {
+        c.is_control() || c == ' '
+    } else {
+        !(c.is_ascii_alphanumeric() || c == '_')
+    };
+    escape && !b.no_escape.contains(c)
+}
+
+fn push_backref_escaped(out: &mut String, c: char, b: &BackrefEscape) {
+    if c == ' ' && !b.no_plus {
+        out.push('+');
+        return;
+    }
+    let mut buf = [0u8; 4];
+    for byte in c.encode_utf8(&mut buf).bytes() {
+        out.push('%');
+        out.push(hex_upper(byte >> 4));
+        out.push(hex_upper(byte & 0xf));
+    }
+}
+
 /// `expand` into a caller-provided buffer (which the caller has cleared) — no allocation when the
 /// buffer already has capacity. Lets the per-cond expansions in `eval_one_cond` reuse one
 /// thread-local buffer across every cond + request instead of allocating a fresh `String` each time
@@ -194,6 +499,31 @@ fn expand_into(
     env: &BTreeMap<String, String>,
     rule_caps: &[Option<String>],
     cond_caps: &[Option<String>],
+) {
+    expand_with(
+        out,
+        template,
+        input,
+        cur_uri,
+        cur_query,
+        env,
+        rule_caps,
+        cond_caps,
+        Expansion::Plain,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expand_with(
+    out: &mut String,
+    template: &str,
+    input: &RewriteInput,
+    cur_uri: &str,
+    cur_query: &str,
+    env: &BTreeMap<String, String>,
+    rule_caps: &[Option<String>],
+    cond_caps: &[Option<String>],
+    mut mode: Expansion<'_, '_>,
 ) {
     // Byte-scan the template directly (no `Vec<char>` allocation). All the special
     // markers (`%`, `{`, `}`, `$`, `\`, digits) are ASCII, so byte positions are
@@ -213,7 +543,21 @@ fn expand_into(
                 // %{VAR}
                 if let Some(end) = find_byte(b, i + 2, b'}') {
                     let name = &template[i + 2..end];
+                    let start = out.len();
                     resolve_var_into(out, name, input, cur_uri, cur_query, env);
+                    match &mut mode {
+                        Expansion::Plain => {}
+                        Expansion::Subst(e) => {
+                            if e.escape_pct && !(e.uri_escaped && var_reads_working_uri(name)) {
+                                escape_var_value(out, start);
+                            }
+                        }
+                        Expansion::TestString { escaped, .. } => {
+                            if var_reads_working_uri(name) && out.len() > start {
+                                escaped.push(start..out.len());
+                            }
+                        }
+                    }
                     i = end + 1;
                     continue;
                 }
@@ -223,14 +567,50 @@ fn expand_into(
             b'%' if i + 1 < n && b[i + 1].is_ascii_digit() => {
                 let k = (b[i + 1] - b'0') as usize;
                 if let Some(Some(val)) = cond_caps.get(k) {
-                    out.push_str(val);
+                    match &mut mode {
+                        Expansion::Plain => out.push_str(val),
+                        Expansion::Subst(e) => {
+                            let from = e
+                                .cond_escaped
+                                .and_then(|c| c.get(k))
+                                .filter(|spans| !spans.is_empty())
+                                .map_or(Provenance::Literal, |spans| Provenance::Spans(spans));
+                            push_backref(out, val, e, from);
+                        }
+                        Expansion::TestString {
+                            escaped,
+                            cond_escaped,
+                        } => {
+                            let start = out.len();
+                            out.push_str(val);
+                            if let Some(spans) = cond_escaped.and_then(|c| c.get(k)) {
+                                escaped
+                                    .extend(spans.iter().map(|r| start + r.start..start + r.end));
+                            }
+                        }
+                    }
                 }
                 i += 2;
             }
             b'$' if i + 1 < n && b[i + 1].is_ascii_digit() => {
                 let k = (b[i + 1] - b'0') as usize;
                 if let Some(Some(val)) = rule_caps.get(k) {
-                    out.push_str(val);
+                    match &mut mode {
+                        Expansion::Plain => out.push_str(val),
+                        Expansion::Subst(e) => {
+                            let from = if e.uri_escaped {
+                                Provenance::Escaped
+                            } else {
+                                Provenance::Literal
+                            };
+                            push_backref(out, val, e, from);
+                        }
+                        Expansion::TestString { escaped, .. } => {
+                            let start = out.len();
+                            out.push_str(val);
+                            escaped.push(start..out.len());
+                        }
+                    }
                 }
                 i += 2;
             }
@@ -274,6 +654,10 @@ pub(super) struct EvalState {
     pub(super) env: BTreeMap<String, String>,
     /// Env keys set via `[E=...]`, recorded in insertion order for the outcome.
     pub(super) env_order: Vec<String>,
+    /// Keys of `env_order` whose latest `[E=]` was an `[E=!VAR]` unset. Their
+    /// `env` slot holds `""` so a later `%{ENV:VAR}` in this pass no longer sees
+    /// the request seed (unset and empty expand alike).
+    pub(super) env_unset: Vec<String>,
     /// Captures from the last successfully-matched condition (`%N`), slots 0..=9.
     /// A fixed stack array (not a `Vec`): rewrite captures are always exactly the
     /// 10 backref slots, so this removes a heap allocation per matched rule / cond
@@ -289,12 +673,17 @@ pub(super) struct EvalState {
     /// The working URI is an absolute URL from a substitution without `[R]`;
     /// `evaluate` promotes it to a 302 once the rule loop ends (#665).
     pub(super) pending_absolute: bool,
+    /// The working URI holds a substitution (URI-escaped, decoded once by the
+    /// pipeline) instead of the decoded request path: a value taken from it is
+    /// already escaped, so its `%` is not literal.
+    pub(super) uri_escaped: bool,
+    /// Escaped spans of `last_cond_caps` (`None`: every capture is literal).
+    pub(super) last_cond_escaped: Option<CondEscaped>,
     /// Count of `[N]`/`[next]` restarts so far. Lives here (not in `run_pass`) so
     /// the guard accumulates ACROSS passes: a `[N]` returns from `run_pass` to
     /// restart, so a per-call counter would reset to 0 every restart and never
     /// fire (the guard was dead). OLS aborts a ruleset after MAX_ITERATIONS `[N]`
-    /// jumps; restart-on-URI-change passes are bounded separately by `uri_restarts`
-    /// in [`super::evaluate`].
+    /// jumps.
     pub(super) next_loops: usize,
     /// Set when a successfully-compiled fancy regex fails at match time. The
     /// current rule becomes a terminal fail-closed outcome.
@@ -303,16 +692,39 @@ pub(super) struct EvalState {
 
 impl EvalState {
     fn record_env(&mut self, k: String, v: String) {
+        // `[E=!VAR]` unsets VAR (mod_rewrite; OLS `RequestVars::setEnv`, #780).
+        if let Some(name) = k.strip_prefix('!') {
+            if name.is_empty() {
+                return;
+            }
+            let name = name.to_string();
+            if !self.env_unset.contains(&name) {
+                self.env_unset.push(name.clone());
+            }
+            if !self.env_order.contains(&name) {
+                self.env_order.push(name.clone());
+            }
+            self.env.insert(name, String::new());
+            return;
+        }
+        self.env_unset.retain(|u| *u != k);
         if !self.env_order.contains(&k) {
             self.env_order.push(k.clone());
         }
         self.env.insert(k, v);
     }
 
+    /// The outcome's env list; an unset is reported as `("!VAR", "")`
+    /// ([`crate::EnvAssignment`]).
     pub(super) fn env_vec(&self) -> Vec<(String, String)> {
         self.env_order
             .iter()
-            .filter_map(|k| self.env.get(k).map(|v| (k.clone(), v.clone())))
+            .filter_map(|k| {
+                if self.env_unset.contains(k) {
+                    return Some((format!("!{k}"), String::new()));
+                }
+                self.env.get(k).map(|v| (k.clone(), v.clone()))
+            })
             .collect()
     }
 }
@@ -433,16 +845,20 @@ fn apply_rule(
     // fails. This is a pure reject: a `$N`-free cond yields the identical boolean
     // before or after `captures()` (same vars, same in-pass `%N` order), and conds
     // have no observable side effects (file stats are cached; `%N` caps are reset
-    // per-rule), so the screen returns `None` iff the real cond pass would. On a pass
-    // we fall through to the unchanged capture + cond path (the cheap re-eval is the
-    // rare case). Placed AFTER the literal_prefix reject so a prefix-rejected rule
-    // never pays a cond stat. Kills the per-request regex `captures()` on
-    // method/header-gated rules like `RewriteRule ^/(.*)$ … [P]` cond'd on
-    // `%{REQUEST_METHOD}`, which otherwise matches every URI and captures on every GET.
-    if !rule.conds_need_rule_caps && !rule.conds.is_empty() {
+    // per-rule), so the screen returns `None` iff the real cond pass would. A pass is
+    // final: nothing between here and the rule's effects touches the uri/query/env
+    // the conds read, so a re-run would recompute the same verdict and the same `%N`
+    // captures, which stay in `last_cond_caps`. Placed AFTER the literal_prefix reject
+    // so a prefix-rejected rule never pays a cond stat. Kills the per-request regex
+    // `captures()` on method/header-gated rules like `RewriteRule ^/(.*)$ … [P]`
+    // cond'd on `%{REQUEST_METHOD}`, which otherwise matches every URI and captures
+    // on every GET.
+    let prescreened = !rule.conds_need_rule_caps && !rule.conds.is_empty();
+    if prescreened {
         // Mirror the per-rule reset at the real cond loop below so a `%N` reference to
         // an unset slot expands empty (not a stale prior-rule value).
         state.last_cond_caps = empty_caps();
+        state.last_cond_escaped = None;
         if !eval_conditions(&rule.conds, input, state, &[]) {
             if state.regex_failed {
                 return Some(RuleApply::Terminal(RewriteOutcome::Failed {
@@ -461,7 +877,12 @@ fn apply_rule(
     // A recognized total-match pattern always matches the whole target, so skip
     // `captures()` (and the regex run) and synthesize the slots directly — provably
     // identical to running the regex (see `synthesize_total_caps`).
-    let rule_caps = match rule.match_total {
+    // `.` never matches a newline (a decoded `%0A`), so the whole-match shortcut
+    // only holds for a target without one; otherwise run the regex (#953).
+    let rule_caps = match rule
+        .match_total
+        .filter(|_| !match_target.as_bytes().contains(&b'\n'))
+    {
         Some(tm) => {
             if rule.needs_rule_caps {
                 synthesize_total_caps(match_target.as_ref(), tm)
@@ -496,20 +917,23 @@ fn apply_rule(
     // this rule*; a rule that references `%1` without a matching regex cond
     // sees an empty value, not the previous rule's captures. Mirror that by
     // clearing the recorded cond captures before evaluating this rule's conds.
-    state.last_cond_caps = empty_caps();
-
-    // Evaluate this rule's conditions.
-    if !eval_conditions(&rule.conds, input, state, &rule_caps) {
-        if state.regex_failed {
-            return Some(RuleApply::Terminal(RewriteOutcome::Failed {
-                env: state.env_vec(),
-                reason: "rewrite condition regex failed at match time",
-            }));
+    if !prescreened {
+        state.last_cond_caps = empty_caps();
+        state.last_cond_escaped = None;
+        if !eval_conditions(&rule.conds, input, state, &rule_caps) {
+            if state.regex_failed {
+                return Some(RuleApply::Terminal(RewriteOutcome::Failed {
+                    env: state.env_vec(),
+                    reason: "rewrite condition regex failed at match time",
+                }));
+            }
+            return None;
         }
-        return None;
     }
 
-    // Apply `[E=...]` env sets (always, even for `-` substitution).
+    // Apply `[E=...]` env sets (always, even for `-` substitution). On a `[P]` rule,
+    // OLS treats `E=Proxy-Host:value` as the upstream Host override, not an env var.
+    let mut proxy_host: Option<String> = None;
     for (k, v) in &rule.flags.env_sets {
         let key = expand(
             k,
@@ -529,6 +953,10 @@ fn apply_rule(
             &rule_caps,
             &state.last_cond_caps,
         );
+        if rule.flags.proxy && key.eq_ignore_ascii_case("Proxy-Host") {
+            proxy_host = Some(val);
+            continue;
+        }
         state.record_env(key, val);
     }
 
@@ -551,15 +979,15 @@ fn apply_rule(
     let mut subst_target: Option<String> = None;
 
     if !no_subst {
-        let expanded = expand(
-            &rule.subst,
-            input,
-            &state.uri,
-            &state.query,
-            &state.env,
-            &rule_caps,
-            &state.last_cond_caps,
-        );
+        // OLS builds every target from literal values; `[NE]` only leaves an
+        // external URL unescaped (a Location, the 302 an absolute target becomes,
+        // a `[P]` upstream), so there a value's `%` passes through verbatim.
+        let escape_pct =
+            !(rule.flags.noescape && (rule.flags.redirect.is_some() || rule.flags.proxy));
+        let mut expanded = expand_subst(rule, input, state, &rule_caps, escape_pct);
+        if escape_pct && rule.flags.noescape && is_absolute_uri(&expanded) {
+            expanded = expand_subst(rule, input, state, &rule_caps, false);
+        }
         // Apache percent-encodes the substitution by default; `[NE]`
         // (`noescape`) disables it. We escape the path portion (everything
         // before the first `?`) with the URI-path-safe set and the `?query`
@@ -586,6 +1014,7 @@ fn apply_rule(
         let target = apply_query_to_location(&target, effective_query, rule.flags.qsa, input);
         return Some(RuleApply::Terminal(RewriteOutcome::Proxy {
             target_url: target,
+            proxy_host,
             env: state.env_vec(),
         }));
     }
@@ -650,7 +1079,15 @@ fn apply_rule(
         let base_query = if rule.flags.qsd { "" } else { &state.query };
         let new_query = compute_query(q, base_query, rule.flags.qsa);
         state.uri = new_uri;
+        state.uri_escaped = true;
         state.query = new_query;
+        // OLS `processRule` records every substitution as REDIRECT_STATUS for the
+        // rules after it, which is what stops a Symfony-style
+        // `%{ENV:REDIRECT_STATUS} =""` guard re-matching its own target (#880).
+        // Overlay only: not part of the outcome env.
+        state
+            .env
+            .insert("REDIRECT_STATUS".to_string(), "200".to_string());
         // The URI changed, so the prefilter set (computed from the initial URI)
         // no longer applies — evaluate remaining rules in full.
         state.prefilter_valid = false;
@@ -817,104 +1254,158 @@ fn eval_one_cond(
     state: &mut EvalState,
     rule_caps: &[Option<String>],
 ) -> bool {
-    COND_SCRATCH.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        let (test, rhs_buf) = &mut *guard;
-        test.clear();
-        expand_into(
-            test,
-            &cond.test_string,
-            input,
-            &state.uri,
-            &state.query,
-            &state.env,
-            rule_caps,
-            &state.last_cond_caps,
-        );
+    COND_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut guard) => eval_one_cond_in(cond, input, state, rule_caps, &mut guard),
+        // A stat or header callback re-entered `evaluate` while this thread's scratch
+        // is in use: the nested condition gets its own buffers instead of a panic.
+        Err(_) => eval_one_cond_in(cond, input, state, rule_caps, &mut Default::default()),
+    })
+}
 
-        // %N captures are committed only if the condition ultimately PASSES (below):
-        // a NEGATED regex whose pattern happens to match makes the cond evaluate
-        // false, so it must not leak `%1`/`%2` to a later member of an `[OR]` group.
-        let mut pending_caps = None;
-        let result = match &cond.pattern {
-            CondPattern::Regex(re, _) => match re.captures_checked(test.as_str()) {
-                Ok(Some(c)) => {
-                    let mut caps = empty_caps();
-                    for (i, slot) in caps.iter_mut().enumerate() {
-                        *slot = c.get(i).map(|s| s.to_string());
-                    }
-                    pending_caps = Some(caps);
-                    true
-                }
-                Ok(None) => false,
-                Err(()) => {
-                    state.regex_failed = true;
-                    false
-                }
-            },
-            CondPattern::FileTest(kind) => file_test(input, test.as_str(), *kind),
-            CondPattern::Lexical(ord, rhs) => {
-                rhs_buf.clear();
-                expand_into(
-                    rhs_buf,
-                    rhs,
-                    input,
-                    &state.uri,
-                    &state.query,
-                    &state.env,
-                    rule_caps,
-                    &state.last_cond_caps,
-                );
-                // OLS compares with strcmp/strcasecmp (NC). Replicate the case folding so `[NC]`
-                // lexical comparisons match; the non-NC path compares the buffers directly (no copy).
-                let c = if cond.nocase {
-                    test.to_ascii_lowercase().cmp(&rhs_buf.to_ascii_lowercase())
-                } else {
-                    test.as_str().cmp(rhs_buf.as_str())
-                };
-                match ord {
-                    Ordering::Less => c == std::cmp::Ordering::Less,
-                    Ordering::Greater => c == std::cmp::Ordering::Greater,
-                    Ordering::Equal => c == std::cmp::Ordering::Equal,
-                    Ordering::LessEqual => c != std::cmp::Ordering::Greater,
-                    Ordering::GreaterEqual => c != std::cmp::Ordering::Less,
-                }
-            }
-            CondPattern::Numeric(op, rhs) => {
-                rhs_buf.clear();
-                expand_into(
-                    rhs_buf,
-                    rhs,
-                    input,
-                    &state.uri,
-                    &state.query,
-                    &state.env,
-                    rule_caps,
-                    &state.last_cond_caps,
-                );
-                // OLS uses strtoll (base 10), which parses a leading integer prefix
-                // and yields 0 for a non-numeric string.
-                let lhs = parse_leading_i64(test.as_str());
-                let rhs_num = parse_leading_i64(rhs_buf.as_str());
-                match op {
-                    NumOp::Eq => lhs == rhs_num,
-                    NumOp::Ne => lhs != rhs_num,
-                    NumOp::Gt => lhs > rhs_num,
-                    NumOp::Lt => lhs < rhs_num,
-                    NumOp::Ge => lhs >= rhs_num,
-                    NumOp::Le => lhs <= rhs_num,
-                }
-            }
-        };
+fn eval_one_cond_in(
+    cond: &Cond,
+    input: &RewriteInput,
+    state: &mut EvalState,
+    rule_caps: &[Option<String>],
+    scratch: &mut (String, String),
+) -> bool {
+    let (test, rhs_buf) = scratch;
+    test.clear();
+    let mut escaped = Vec::new();
+    let mode = if state.uri_escaped {
+        Expansion::TestString {
+            escaped: &mut escaped,
+            cond_escaped: state.last_cond_escaped.as_ref(),
+        }
+    } else {
+        Expansion::Plain
+    };
+    expand_with(
+        test,
+        &cond.test_string,
+        input,
+        &state.uri,
+        &state.query,
+        &state.env,
+        rule_caps,
+        &state.last_cond_caps,
+        mode,
+    );
 
-        let passed = result ^ cond.negate;
-        if passed {
-            if let Some(caps) = pending_caps {
-                state.last_cond_caps = caps;
+    // %N captures are committed only if the condition ultimately PASSES (below):
+    // a NEGATED regex whose pattern happens to match makes the cond evaluate
+    // false, so it must not leak `%1`/`%2` to a later member of an `[OR]` group.
+    let mut pending_caps = None;
+    let mut pending_escaped = None;
+    let result = match &cond.pattern {
+        CondPattern::Regex(re, _) => match re.captures_checked(test.as_str()) {
+            Ok(Some(c)) => {
+                let mut caps = empty_caps();
+                for (i, slot) in caps.iter_mut().enumerate() {
+                    *slot = c.get(i).map(|s| s.to_string());
+                }
+                if !escaped.is_empty() {
+                    pending_escaped = capture_escaped_spans(test, &c, &escaped);
+                }
+                pending_caps = Some(caps);
+                true
+            }
+            Ok(None) => false,
+            Err(()) => {
+                state.regex_failed = true;
+                false
+            }
+        },
+        CondPattern::FileTest(kind) => file_test(input, test.as_str(), *kind),
+        CondPattern::UrlAccess => true,
+        CondPattern::Lexical(ord, rhs) => {
+            rhs_buf.clear();
+            expand_into(
+                rhs_buf,
+                rhs,
+                input,
+                &state.uri,
+                &state.query,
+                &state.env,
+                rule_caps,
+                &state.last_cond_caps,
+            );
+            // OLS compares with strcmp/strcasecmp (NC). Replicate the case folding so `[NC]`
+            // lexical comparisons match; the non-NC path compares the buffers directly (no copy).
+            let c = if cond.nocase {
+                test.to_ascii_lowercase().cmp(&rhs_buf.to_ascii_lowercase())
+            } else {
+                test.as_str().cmp(rhs_buf.as_str())
+            };
+            match ord {
+                Ordering::Less => c == std::cmp::Ordering::Less,
+                Ordering::Greater => c == std::cmp::Ordering::Greater,
+                Ordering::Equal => c == std::cmp::Ordering::Equal,
+                Ordering::LessEqual => c != std::cmp::Ordering::Greater,
+                Ordering::GreaterEqual => c != std::cmp::Ordering::Less,
             }
         }
-        passed
-    })
+        CondPattern::Numeric(op, rhs) => {
+            rhs_buf.clear();
+            expand_into(
+                rhs_buf,
+                rhs,
+                input,
+                &state.uri,
+                &state.query,
+                &state.env,
+                rule_caps,
+                &state.last_cond_caps,
+            );
+            // OLS uses strtoll (base 10), which parses a leading integer prefix
+            // and yields 0 for a non-numeric string.
+            let lhs = parse_leading_i64(test.as_str());
+            let rhs_num = parse_leading_i64(rhs_buf.as_str());
+            match op {
+                NumOp::Eq => lhs == rhs_num,
+                NumOp::Ne => lhs != rhs_num,
+                NumOp::Gt => lhs > rhs_num,
+                NumOp::Lt => lhs < rhs_num,
+                NumOp::Ge => lhs >= rhs_num,
+                NumOp::Le => lhs <= rhs_num,
+            }
+        }
+    };
+
+    let passed = result ^ cond.negate;
+    if passed {
+        if let Some(caps) = pending_caps {
+            state.last_cond_caps = caps;
+            state.last_cond_escaped = pending_escaped;
+        }
+    }
+    passed
+}
+
+/// The escaped spans of each capture group, relative to the capture.
+fn capture_escaped_spans(
+    test: &str,
+    caps: &Caps<'_>,
+    escaped: &[Range<usize>],
+) -> Option<CondEscaped> {
+    let mut out: CondEscaped = Box::new(std::array::from_fn(|_| Vec::new()));
+    let mut any = false;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let Some(group) = caps.get(i) else {
+            continue;
+        };
+        // A group is a subslice of the test string, so its offset is the pointer distance.
+        let start = (group.as_ptr() as usize).wrapping_sub(test.as_ptr() as usize);
+        let end = start + group.len();
+        for r in escaped {
+            let (s, e) = (r.start.max(start), r.end.min(end));
+            if s < e {
+                slot.push(s - start..e - start);
+                any = true;
+            }
+        }
+    }
+    any.then_some(out)
 }
 
 /// Parse a leading base-10 integer the way C's `strtoll` does: skip leading
@@ -942,42 +1433,46 @@ fn parse_leading_i64(s: &str) -> i64 {
 
 /// Apply a `-f/-d/-l/-s/-x` test to `path`.
 fn file_test(input: &RewriteInput, path: &str, kind: FileTestKind) -> bool {
-    match &input.stat {
-        StatSource::Precomputed(t) => match kind {
-            FileTestKind::File => t.is_file,
-            FileTestKind::Dir => t.is_dir,
-            FileTestKind::Link => t.is_link,
-            FileTestKind::Size => t.is_nonempty,
-            FileTestKind::Exists => t.exists || t.is_file || t.is_dir,
-            FileTestKind::Exec => t.is_exec,
-        },
-        StatSource::Live(f) => match f(std::path::Path::new(path)) {
-            Some(md) => {
-                let t = FileTests::from_metadata(&md);
-                match kind {
-                    FileTestKind::File => t.is_file,
-                    FileTestKind::Dir => t.is_dir,
-                    FileTestKind::Link => t.is_link,
-                    FileTestKind::Size => t.is_nonempty,
-                    FileTestKind::Exists => true,
-                    FileTestKind::Exec => t.is_exec,
-                }
-            }
-            None => false,
-        },
-        StatSource::LiveTests(f) => match f(std::path::Path::new(path)) {
-            Some(t) => match kind {
-                FileTestKind::File => t.is_file,
-                FileTestKind::Dir => t.is_dir,
-                FileTestKind::Link => t.is_link,
-                FileTestKind::Size => t.is_nonempty,
-                FileTestKind::Exists => t.exists || t.is_file || t.is_dir,
-                FileTestKind::Exec => t.is_exec,
-            },
-            None => false,
-        },
-        StatSource::None => false,
+    let tests = match &input.stat {
+        StatSource::Precomputed(t) => Some(*t),
+        StatSource::Live(_) | StatSource::LiveTests(_) => memo_live_tests(input, path),
+        StatSource::None => None,
+    };
+    // A live `Metadata` hit derives `exists: true`, so `-e` holds for it as before.
+    tests.is_some_and(|t| match kind {
+        FileTestKind::File => t.is_file,
+        FileTestKind::Dir => t.is_dir,
+        FileTestKind::Link => t.is_link,
+        FileTestKind::Size => t.is_nonempty,
+        FileTestKind::Exists => t.exists || t.is_file || t.is_dir,
+        FileTestKind::Exec => t.is_exec,
+    })
+}
+
+fn memo_live_tests(input: &RewriteInput, path: &str) -> Option<FileTests> {
+    let hit = FS_MEMO.with(|m| {
+        let m = m.borrow();
+        (m.active && m.test_valid && m.test_path == path).then_some(m.test)
+    });
+    if let Some(tests) = hit {
+        return tests;
     }
+    let p = std::path::Path::new(path);
+    let tests = match &input.stat {
+        StatSource::Live(f) => f(p).map(|md| FileTests::from_metadata(&md)),
+        StatSource::LiveTests(f) => f(p),
+        StatSource::Precomputed(_) | StatSource::None => None,
+    };
+    FS_MEMO.with(|m| {
+        let m = &mut *m.borrow_mut();
+        if m.active {
+            m.test_path.clear();
+            m.test_path.push_str(path);
+            m.test = tests;
+            m.test_valid = true;
+        }
+    });
+    tests
 }
 
 /// Split a substitution into `(path, Option<query>)` on the first unescaped `?`.
@@ -1062,6 +1557,29 @@ fn has_scheme(s: &str) -> bool {
 fn escape_subst(subst: &str) -> String {
     let (path, query) = split_subst(subst);
     let mut out = String::with_capacity(subst.len());
+    // An absolute substitution's `scheme://authority` is not a path: escaping it
+    // turned an IPv6 literal's brackets into `%5B`/`%5D`, an unresolvable host.
+    // Escape only what the authority grammar forbids there and the path after it.
+    let path = match path.find("://").filter(|_| has_scheme(path)) {
+        Some(idx) => {
+            let auth_start = idx + 3;
+            let auth_end = path[auth_start..]
+                .find('/')
+                .map_or(path.len(), |i| auth_start + i);
+            out.push_str(&path[..auth_start]);
+            for b in path[auth_start..auth_end].bytes() {
+                if is_authority_safe(b) {
+                    out.push(b as char);
+                } else {
+                    out.push('%');
+                    out.push(hex_upper(b >> 4));
+                    out.push(hex_upper(b & 0xf));
+                }
+            }
+            &path[auth_end..]
+        }
+        None => path,
+    };
     let bytes = path.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1106,6 +1624,34 @@ fn escape_subst(subst: &str) -> String {
         }
     }
     out
+}
+
+/// RFC 3986 authority bytes: unreserved, sub-delims, `:` `@`, the IP-literal
+/// brackets and a `%` (pct-encoded / IPv6 zone).
+fn is_authority_safe(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'['
+                | b']'
+                | b'%'
+        )
 }
 
 /// Characters left verbatim in a rewrite-substitution's `?query` tail: RFC3986

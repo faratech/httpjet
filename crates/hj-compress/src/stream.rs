@@ -8,10 +8,10 @@
 //! [`FLUSH_THRESHOLD`] (#326) — closing a compression block per upstream frame
 //! wrecked the ratio and burned encoder CPU on small frames (a 4 KiB-framed
 //! render compressed ~30-80% larger than one flushed in 32 KiB batches). SSE
-//! (`text/event-stream`) is never compressed (`Compress::plan` refuses it), so
-//! this streaming encoder only ever handles bodies — large HTML/JSON renders,
-//! proxied downloads — that no client consumes block-by-block, making the
-//! bounded batching a pure win with no interactivity regression. On upstream
+//! (`text/event-stream`) is never compressed (`Compress::plan` refuses it). A
+//! proxied feed a client may read as it arrives (`hj_core::ProxiedBody`) also
+//! flushes whenever its upstream stalls ([`CompressStream::flush_when_idle`]);
+//! local renders batch with no interactivity cost. On upstream
 //! end-of-stream any buffered input is written and the encoder is *finished*
 //! (its trailer/epilogue emitted). The concatenation of all emitted chunks is
 //! a single, complete stream in the chosen coding.
@@ -34,7 +34,7 @@ use brotli::CompressorWriter as BrotliCompressor;
 use zstd::stream::raw::{Encoder as RawZstdEncoder, Operation};
 use zstd::stream::zio::Writer as ZioWriter;
 
-use crate::encoding::{Encoding, Levels};
+use crate::encoding::{Encoding, Levels, zstd_window_log};
 
 /// (#326) Accumulate this many bytes of upstream input before writing them into
 /// the encoder and flushing a block. Bounds both the compression-block size
@@ -89,10 +89,15 @@ fn take_zstd_stream_encoder(level: i32) -> io::Result<RawZstdEncoder<'static>> {
             .position(|(l, _)| *l == level)
             .map(|i| pool.swap_remove(i).1)
     };
-    match pooled {
-        Some(enc) => Ok(enc),
-        None => RawZstdEncoder::new(level),
+    if let Some(enc) = pooled {
+        return Ok(enc);
     }
+    let mut enc = RawZstdEncoder::new(level)?;
+    // Pooled per level and kept across `reinit`, so the cap is set once here.
+    if let Some(window_log) = zstd_window_log(level) {
+        enc.set_parameter(zstd::zstd_safe::CParameter::WindowLog(window_log))?;
+    }
+    Ok(enc)
 }
 
 /// Return a context whose frame finished cleanly; `reinit` resets the session and keeps the
@@ -185,6 +190,9 @@ pub struct CompressStream {
     /// Emit the first block as soon as the upstream stalls instead of waiting for a
     /// full batch (see [`CompressStream::flush_first_when_idle`]).
     flush_first_when_idle: bool,
+    /// Emit the pending block every time the upstream stalls (see
+    /// [`CompressStream::flush_when_idle`]).
+    flush_when_idle: bool,
 }
 
 impl CompressStream {
@@ -215,6 +223,7 @@ impl CompressStream {
             state: EncState::Active(encoder),
             pending_in: Vec::new(),
             flush_first_when_idle: false,
+            flush_when_idle: false,
         }
     }
 
@@ -223,6 +232,14 @@ impl CompressStream {
     /// so they go out when the upstream first stalls. Later blocks keep the batching.
     pub fn flush_first_when_idle(mut self) -> Self {
         self.flush_first_when_idle = true;
+        self
+    }
+
+    /// For a proxied feed (`hj_core::ProxiedBody`): a client may be consuming it as it
+    /// arrives, so whatever is pending goes out whenever the upstream stalls. A fast
+    /// upstream still batches, since nothing is pending-and-idle between its frames.
+    pub fn flush_when_idle(mut self) -> Self {
+        self.flush_when_idle = true;
         self
     }
 
@@ -246,7 +263,9 @@ impl Body for CompressStream {
                     // Pull the next upstream frame.
                     match Pin::new(&mut self.inner).poll_frame(cx) {
                         Poll::Pending => {
-                            if !self.flush_first_when_idle || self.pending_in.is_empty() {
+                            if !(self.flush_first_when_idle || self.flush_when_idle)
+                                || self.pending_in.is_empty()
+                            {
                                 return Poll::Pending;
                             }
                             let this = &mut *self;
@@ -317,8 +336,8 @@ impl Body for CompressStream {
                                 continue;
                             }
                             // (#326) Accumulate upstream frames; only compress + flush a block
-                            // once FLUSH_THRESHOLD is reached (or at EOF/trailers). SSE is never
-                            // routed here, so no client is waiting on a sub-threshold frame.
+                            // once FLUSH_THRESHOLD is reached, the upstream stalls on a
+                            // `flush_when_idle` feed, or at EOF/trailers. SSE is never routed here.
                             self.pending_in.extend_from_slice(&data);
                             if self.pending_in.len() < FLUSH_THRESHOLD {
                                 continue;
@@ -514,6 +533,57 @@ mod tests {
             "a reused context must not carry state between frames"
         );
         assert!(ZSTD_STREAM_POOL.lock().unwrap().len() <= ZSTD_STREAM_POOL_CAP);
+    }
+
+    async fn compress_zstd_at(level: i32, payload: &[u8]) -> Vec<u8> {
+        let levels = Levels {
+            zstd: level,
+            ..Levels::default()
+        };
+        let inner = into_stream_body(Full::new(Bytes::copy_from_slice(payload)));
+        CompressStream::new(inner, Encoding::Zstd, &levels)
+            .boxed_stream()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    /// Regression (#1020): a streamed frame has no content size, so levels 20-22
+    /// declared their full 32-128 MiB window, past RFC 9659's 8 MiB decoder limit.
+    #[tokio::test]
+    async fn ultra_zstd_stream_fits_the_http_window() {
+        let payload = b"<p>ultra level stream</p>".repeat(400);
+        for level in [20, 22, 22] {
+            let frame = compress_zstd_at(level, &payload).await;
+            let mut dec = zstd::stream::read::Decoder::new(&frame[..]).unwrap();
+            dec.window_log_max(23).unwrap();
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out)
+                .expect("frame fits an 8 MiB window");
+            assert_eq!(out, payload, "level {level}");
+        }
+    }
+
+    /// Through level 19 the streamed frame keeps zstd's own parameters: it is the
+    /// frame a fresh `zstd::stream::write::Encoder` writes for the same
+    /// write/flush/finish sequence.
+    #[tokio::test]
+    async fn zstd_stream_bytes_unchanged_through_level_19() {
+        use std::io::Write;
+        let payload = b"<div class=\"row\">unchanged frame</div>".repeat(300);
+        for level in [1, 3, 9, 19] {
+            let mut reference = zstd::stream::write::Encoder::new(Vec::new(), level).unwrap();
+            reference.write_all(&payload).unwrap();
+            reference.flush().unwrap();
+            let want = reference.finish().unwrap();
+            assert_eq!(
+                compress_zstd_at(level, &payload).await,
+                want,
+                "level {level}"
+            );
+        }
     }
 
     /// (#326) Many small upstream frames must (a) still round-trip exactly, and
@@ -741,6 +811,69 @@ mod tests {
             let expected: Vec<u8> = [first.as_ref(), rest.as_ref()].concat();
             assert_eq!(unzstd(&out), expected, "idle_flush={idle_flush}");
         }
+    }
+
+    /// An upstream that stalls between each of its frames.
+    struct StallBetween {
+        frames: Vec<Bytes>,
+        stalled: bool,
+    }
+
+    impl Body for StallBetween {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.frames.is_empty() {
+                return Poll::Ready(None);
+            }
+            if !self.stalled {
+                self.stalled = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.stalled = false;
+            Poll::Ready(Some(Ok(Frame::data(self.frames.remove(0)))))
+        }
+    }
+
+    /// Regression (#889): a proxied feed's small bursts each reach the client when
+    /// the upstream stalls, not batched until EOF.
+    #[test]
+    fn proxied_feed_flushes_every_burst_when_the_upstream_stalls() {
+        use std::task::Waker;
+        let lines: Vec<Bytes> = (0..3)
+            .map(|i| Bytes::from(format!("token line {i}\n")))
+            .collect();
+        let inner = into_stream_body(StallBetween {
+            frames: lines.clone(),
+            stalled: true,
+        });
+        let mut body = CompressStream::new(inner, Encoding::Gzip, &Levels::default())
+            .flush_when_idle()
+            .boxed_stream();
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut out = Vec::new();
+        let mut early_blocks = 0;
+        loop {
+            match Pin::new(&mut body).poll_frame(&mut cx) {
+                Poll::Ready(Some(Ok(f))) => {
+                    out.extend_from_slice(&f.into_data().unwrap());
+                    early_blocks += 1;
+                }
+                Poll::Ready(None) => break,
+                Poll::Ready(Some(Err(e))) => panic!("stream error: {e}"),
+                Poll::Pending => {}
+            }
+        }
+        assert!(early_blocks >= 3, "each burst flushed: {early_blocks}");
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(out.as_slice())
+            .read_to_end(&mut plain)
+            .unwrap();
+        assert_eq!(plain, lines.concat());
     }
 
     /// Minimal frame-stream helper to avoid pulling in `futures` as a dep.

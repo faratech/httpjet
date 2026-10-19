@@ -78,6 +78,28 @@ pub fn sanitize_h2_h3_body_headers(
 ) {
     if body_forbidden_status(status) || (!is_head && streaming_unknown_len) {
         headers.remove(CONTENT_LENGTH);
+        return;
+    }
+    // A backend may repeat Content-Length (RFC 9110 §8.6 lets a recipient accept
+    // identical copies); h2/h3 peers reject a repeated field, so emit one value, or
+    // none when the copies disagree (h2/h3 frame the body without it) (#858).
+    let all = headers.get_all(CONTENT_LENGTH);
+    let mut values = all.iter();
+    let Some(first) = values.next() else {
+        return;
+    };
+    let mut repeated = false;
+    let mut agree = true;
+    for v in values {
+        repeated = true;
+        agree &= v.as_bytes().trim_ascii() == first.as_bytes().trim_ascii();
+    }
+    if repeated {
+        let first = first.clone();
+        headers.remove(CONTENT_LENGTH);
+        if agree {
+            headers.insert(CONTENT_LENGTH, first);
+        }
     }
 }
 
@@ -294,6 +316,22 @@ pub fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
     })
 }
 
+/// The `If-None-Match` token that matched `etag` only through its variant slot
+/// (`"<core>;gz"` against `"<core>;;;"`), stripped of any weak prefix. A 304
+/// echoes it: the compressed 200 the client revalidates carried that tag.
+pub fn matched_etag_variant<'a>(inm: &'a str, etag: &str) -> Option<&'a str> {
+    let core = etag.strip_suffix(";;;\"")?;
+    inm.split(',')
+        .map(|tok| tok.trim().trim_start_matches("W/").trim())
+        .find(|tok| {
+            tok.len() == etag.len()
+                && *tok != etag
+                && tok.ends_with('"')
+                && tok.as_bytes()[tok.len() - 4] == b';'
+                && tok.starts_with(core)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,6 +484,24 @@ mod tests {
         h.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
         sanitize_h2_h3_body_headers(&mut h, false, StatusCode::OK, true);
         assert!(!h.contains_key(CONTENT_LENGTH));
+    }
+
+    #[test]
+    fn repeated_content_length_collapses_to_one_value() {
+        let mut h = HeaderMap::new();
+        h.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        h.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        sanitize_h2_h3_body_headers(&mut h, false, StatusCode::OK, false);
+        assert_eq!(h.get_all(CONTENT_LENGTH).iter().count(), 1);
+        assert_eq!(h[CONTENT_LENGTH], "5");
+        let mut h = HeaderMap::new();
+        h.append(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        h.append(CONTENT_LENGTH, HeaderValue::from_static("6"));
+        sanitize_h2_h3_body_headers(&mut h, false, StatusCode::OK, false);
+        assert!(
+            h.get(CONTENT_LENGTH).is_none(),
+            "conflicting copies are dropped"
+        );
     }
 
     #[test]

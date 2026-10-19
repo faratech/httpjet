@@ -83,6 +83,22 @@ impl Htaccess {
         method: &str,
         subject: &AccessSubject<'_>,
     ) -> AccessDecision {
+        self.access_decision_for_request(rel_path, rel_path, method, subject)
+    }
+
+    /// [`Htaccess::access_decision_for`] with a separate `request_path` for the
+    /// `<If "%{REQUEST_URI} …">` matchers: `REQUEST_URI` keeps its trailing `/`,
+    /// which `rel_path` (the `<Files*>`/`<Directory*>` subject) drops.
+    pub fn access_decision_for_request(
+        &self,
+        rel_path: &str,
+        request_path: &str,
+        method: &str,
+        subject: &AccessSubject<'_>,
+    ) -> AccessDecision {
+        if self.access_rules.is_empty() {
+            return AccessDecision::NoOpinion;
+        }
         let basename = basename(rel_path);
         let ext = ext_lower(basename);
         let mut decision = AccessDecision::NoOpinion;
@@ -97,13 +113,22 @@ impl Htaccess {
         // Source-order winner among directory-level (phase 0) rules, and whether it
         // is an httpjet `<Directory*>` deny.
         let mut directory_deny = false;
-        for i in self.access_index.candidates(basename, &ext) {
-            let rule = &self.access_rules[i];
+        let scan = || -> Vec<usize> {
+            self.access_index
+                .candidates(basename, &ext)
+                .filter(|&i| {
+                    self.access_rules
+                        .get(i)
+                        .is_some_and(|r| r.matches(rel_path, request_path, basename, method))
+                })
+                .collect()
+        };
+        let mut visit = |i: usize| {
+            let Some(rule) = self.access_rules.get(i) else {
+                return;
+            };
             let phase = rule.merge_phase();
-            if !rule.matches(rel_path, basename, method) {
-                continue;
-            }
-            let denies = rule.denies(subject);
+            let denies = rule.denies(subject, method);
             if phase == 0 {
                 directory_deny = denies && rule.is_directory_scoped();
             }
@@ -115,6 +140,25 @@ impl Htaccess {
                     AccessDecision::Granted
                 };
             }
+        };
+        // Which rules MATCH is a pure function of the paths and method, memoized per
+        // parsed file; the subject-dependent verdict is still evaluated on every call.
+        // Rules with nothing but `<Limit>` methods match in less than a memo probe.
+        let memo = self
+            .access_memo_useful
+            .then(|| {
+                self.access_memo.matched(
+                    rel_path,
+                    request_path,
+                    method,
+                    self.access_rules.len(),
+                    || scan(),
+                )
+            })
+            .flatten();
+        match memo {
+            Some(hit) => hit.iter().for_each(|&i| visit(usize::from(i))),
+            None => scan().into_iter().for_each(visit),
         }
         // A `<Files>`/`<If>` grant must not open a sensitive directory denied by a
         // `<Directory*>` matcher (no Apache .htaccess analogue; the live forum file
@@ -145,13 +189,16 @@ impl Htaccess {
 ///   `Header edit name regex repl` is rare in the live configs; the pipeline may
 ///   treat it as a no-op or implement the substitution.)
 ///
-/// `Merge` from Apache collapses to [`HeaderOp::Append`] (Apache de-duplicates;
-/// the caller may dedup if it wishes), and `echo`/`note` forms are dropped.
+/// * [`HeaderOp::Merge`] — like `Append`, but a no-op when `value` already is one
+///   of the existing comma-separated values (Apache `Header merge`).
+///
+/// `echo`/`note` forms are dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeaderOp {
     Set { name: String, value: String },
     Add { name: String, value: String },
     Append { name: String, value: String },
+    Merge { name: String, value: String },
     Unset { name: String },
     Edit { name: String, value: String },
 }
@@ -163,11 +210,58 @@ impl HeaderOp {
             HeaderOp::Set { name, .. }
             | HeaderOp::Add { name, .. }
             | HeaderOp::Append { name, .. }
+            | HeaderOp::Merge { name, .. }
             | HeaderOp::Unset { name }
             | HeaderOp::Edit { name, .. } => name,
         }
     }
 }
+
+/// The action of a [`PreparedHeaderOp`], with [`HeaderOp`]'s merge semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderOpKind {
+    Set,
+    Add,
+    Append,
+    Merge,
+    Unset,
+}
+
+/// A [`HeaderOp`] borrowing the field name and, for a value without `%{VAR}`, the
+/// field value built once at parse time. An op whose name is not a valid field
+/// name is never produced (applying it cannot change a response).
+#[derive(Debug, Clone)]
+pub struct PreparedHeaderOp<'a> {
+    pub kind: HeaderOpKind,
+    pub name: &'a http::HeaderName,
+    /// The interpolated value (empty for [`HeaderOpKind::Unset`]).
+    pub value: Cow<'a, str>,
+    /// `value` as a field value, when it is static and valid.
+    pub field_value: Option<&'a http::HeaderValue>,
+}
+
+impl HeaderAction {
+    fn op_kind(self) -> Option<HeaderOpKind> {
+        match self {
+            HeaderAction::Set => Some(HeaderOpKind::Set),
+            HeaderAction::Add => Some(HeaderOpKind::Add),
+            HeaderAction::Append => Some(HeaderOpKind::Append),
+            HeaderAction::Merge => Some(HeaderOpKind::Merge),
+            HeaderAction::Unset => Some(HeaderOpKind::Unset),
+            // `Header echo Foo` mirrors a *request* header into the response; it has
+            // no static value, so it is skipped (rare; not in the live config).
+            HeaderAction::Echo => None,
+        }
+    }
+}
+
+/// One staged op: merge phase, kind, the directive, its interpolated value.
+type StagedHeader<'a> = (
+    u8,
+    HeaderOpKind,
+    &'a crate::htaccess::HeaderDirective,
+    Cow<'a, str>,
+);
 
 impl Htaccess {
     /// Compute the ordered list of response-header mutations that apply to a
@@ -185,8 +279,9 @@ impl Htaccess {
     /// Only headers whose enclosing `<Files*>` / `<DirectoryMatch>` (and any
     /// `<If "%{REQUEST_URI} ...">`) scope matches `rel_path` are emitted; an
     /// unscoped (directory-wide) `Header` always applies. The returned ops carry
-    /// fully-interpolated values and are ordered as written in the file, so the
-    /// caller can fold them left-to-right over the header map.
+    /// fully-interpolated values in Apache merge order (see
+    /// [`chain_response_headers`]), so the caller can fold them left-to-right
+    /// over the header map.
     pub fn response_headers(
         &self,
         rel_path: &str,
@@ -203,15 +298,32 @@ impl Htaccess {
         status: u16,
         env: &[(String, String)],
     ) -> Vec<HeaderOp> {
-        let basename = basename(rel_path);
+        chain_response_headers(
+            std::iter::once(self),
+            rel_path,
+            None,
+            request_path,
+            status,
+            env,
+        )
+    }
+
+    /// Stage this file's matching ops in source order.
+    fn stage_response_headers<'a>(
+        &'a self,
+        rel_path: &str,
+        basename: &str,
+        request_path: &str,
+        status: u16,
+        env: &[(String, String)],
+        out: &mut Vec<StagedHeader<'a>>,
+    ) {
         let ext = ext_lower(basename);
         let success = (200..400).contains(&status);
-        let mut out = Vec::new();
 
         // `header_index` narrows the scan to directives whose scope could match
         // (superset filter); `scopes_match` below remains the arbiter, and
-        // candidates arrive in ascending source order so the ops fold left-to-right
-        // exactly as written.
+        // candidates arrive in ascending source order.
         for i in self.header_index.candidates(basename, &ext) {
             let h = &self.headers[i];
             // always vs onsuccess.
@@ -228,41 +340,142 @@ impl Htaccess {
                 continue;
             }
             // FilesMatch / DirectoryMatch / If scoping (conjunction of all
-            // enclosing blocks).
-            if !scopes_match(&h.scopes, rel_path, basename) {
+            // enclosing blocks). `<If>` tests `rel_path` too: Apache evaluates
+            // it for the internally redirected request, so a front controller's
+            // `<If>` sees the rewritten URI, not the original `request_path`.
+            if !scopes_match(&h.scopes, rel_path, rel_path, basename) {
                 continue;
             }
 
-            let name = h.name.clone();
-            match h.action {
-                HeaderAction::Unset => out.push(HeaderOp::Unset { name }),
-                HeaderAction::Set => out.push(HeaderOp::Set {
-                    name,
-                    value: interpolate_env(&h.value, env),
-                }),
-                HeaderAction::Add => out.push(HeaderOp::Add {
-                    name,
-                    value: interpolate_env(&h.value, env),
-                }),
-                HeaderAction::Append | HeaderAction::Merge => out.push(HeaderOp::Append {
-                    name,
-                    value: interpolate_env(&h.value, env),
-                }),
-                // `Header echo Foo` mirrors a *request* header into the response;
-                // it has no static value, so we skip it (rare; not in live cfg).
-                // (Apache `Header edit name re repl` is not emitted by the parser
-                // today; [`HeaderOp::Edit`] exists for API completeness so the
-                // integration layer can construct it directly if needed.)
-                HeaderAction::Echo => {}
-            }
+            // (Apache `Header edit name re repl` is not emitted by the parser today;
+            // [`HeaderOp::Edit`] exists for API completeness.)
+            let Some(kind) = h.action.op_kind() else {
+                continue;
+            };
+            let value = match kind {
+                HeaderOpKind::Unset => Cow::Borrowed(""),
+                _ if h.interpolated => Cow::Owned(interpolate_env(&h.value, env)),
+                _ => Cow::Borrowed(h.value.as_str()),
+            };
+            out.push((
+                crate::htaccess::scope_merge_phase(&h.scopes),
+                kind,
+                h,
+                value,
+            ));
         }
-        out
     }
 }
 
+/// Stage a chain's matching ops in Apache merge order (see [`chain_response_headers`]).
+fn stage_chain_headers<'a>(
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+    rel_path: &str,
+    target_basename: Option<&str>,
+    request_path: &str,
+    status: u16,
+    env: &[(String, String)],
+) -> Vec<StagedHeader<'a>> {
+    let basename = target_basename.unwrap_or_else(|| basename(rel_path));
+    let mut staged = Vec::new();
+    for ht in chain {
+        if ht.has_resp_op {
+            ht.stage_response_headers(rel_path, basename, request_path, status, env, &mut staged);
+        }
+    }
+    staged.sort_by_key(|(phase, ..)| *phase);
+    staged
+}
+
+/// The ordered `Header` mutations a `.htaccess` chain (document root → deepest)
+/// applies to a response, folded left-to-right by the caller.
+///
+/// Apache merges per-directory configuration as directory-level directives of
+/// every chain file first, then `<Files*>` sections, then `<If>` sections, so a
+/// `<Files>` op outranks a later top-level op (and a deeper file's top-level
+/// op) for the same header. Chain and source order are kept within a phase.
+///
+/// `<Files*>` sections match `target_basename` — the file the request maps to
+/// (the `DirectoryIndex` file served, or the script before `PATH_INFO`) — or,
+/// when `None`, the basename of `rel_path`. Other scopes see `rel_path`;
+/// `expr=` guards see `request_path`.
+pub fn chain_response_headers<'a>(
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+    rel_path: &str,
+    target_basename: Option<&str>,
+    request_path: &str,
+    status: u16,
+    env: &[(String, String)],
+) -> Vec<HeaderOp> {
+    stage_chain_headers(chain, rel_path, target_basename, request_path, status, env)
+        .into_iter()
+        .map(|(_, kind, h, value)| {
+            let name = h.name.clone();
+            let value = value.into_owned();
+            match kind {
+                HeaderOpKind::Set => HeaderOp::Set { name, value },
+                HeaderOpKind::Add => HeaderOp::Add { name, value },
+                HeaderOpKind::Append => HeaderOp::Append { name, value },
+                HeaderOpKind::Merge => HeaderOp::Merge { name, value },
+                HeaderOpKind::Unset => HeaderOp::Unset { name },
+            }
+        })
+        .collect()
+}
+
+/// [`chain_response_headers`] as [`PreparedHeaderOp`]s: the same ops in the same
+/// order, minus those whose name is not a valid field name, borrowing the names
+/// and static values the chain built at parse time.
+pub fn chain_prepared_headers<'a>(
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+    rel_path: &str,
+    target_basename: Option<&str>,
+    request_path: &str,
+    status: u16,
+    env: &[(String, String)],
+) -> Vec<PreparedHeaderOp<'a>> {
+    stage_chain_headers(chain, rel_path, target_basename, request_path, status, env)
+        .into_iter()
+        .filter_map(|(_, kind, h, value)| {
+            Some(PreparedHeaderOp {
+                kind,
+                name: h.field_name.as_ref()?,
+                value,
+                field_value: h.static_value.as_ref(),
+            })
+        })
+        .collect()
+}
+
+/// Request-plumbing names the pipeline keeps in the env (the negotiated
+/// Accept-Encoding, reserved `HJ_*`) are not part of the configured environment
+/// `Header` sees: Apache/OLS have no such variables, and a cached response would
+/// replay one client's value to every other (#842).
+fn header_env_hidden(name: &str) -> bool {
+    name.eq_ignore_ascii_case("HTTP_ACCEPT_ENCODING")
+        || name.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("HJ_"))
+}
+
+/// The env value `Header` sees for `name`: ASCII-case-insensitive like Apache's
+/// `subprocess_env` table, an exact-case entry preferred, plumbing hidden.
+fn header_env_value<'e>(env: &'e [(String, String)], name: &str) -> Option<&'e str> {
+    if header_env_hidden(name) {
+        return None;
+    }
+    let mut folded = None;
+    for (k, v) in env {
+        if k == name {
+            return Some(v);
+        }
+        if folded.is_none() && k.eq_ignore_ascii_case(name) && !header_env_hidden(k) {
+            folded = Some(v.as_str());
+        }
+    }
+    folded
+}
+
 fn env_guard_passes(g: &EnvGuard, env: &[(String, String)]) -> bool {
-    let present = env.iter().any(|(k, _)| k == &g.var);
-    present != g.negate
+    header_env_value(env, &g.var).is_some() != g.negate
 }
 
 fn uri_tests_match(tests: &[crate::htaccess::UriCond], path: &str, on_err: bool) -> bool {
@@ -280,15 +493,25 @@ fn uri_tests_match(tests: &[crate::htaccess::UriCond], path: &str, on_err: bool)
 /// scope must match (the AND that `record_access_rule` already applies to access
 /// rules), so an outer `<If>`/`<Directory>` guard around an inner `<Files>` is
 /// honored rather than silently dropped.
-pub(crate) fn scopes_match(scopes: &[Scope], rel_path: &str, basename: &str) -> bool {
-    scopes.iter().all(|s| scope_matches(s, rel_path, basename))
+///
+/// `<If "%{REQUEST_URI} …">` tests `request_path`, which keeps the trailing `/`
+/// that `rel_path` (the `<Directory*>` subject) drops (#979).
+pub(crate) fn scopes_match(
+    scopes: &[Scope],
+    rel_path: &str,
+    request_path: &str,
+    basename: &str,
+) -> bool {
+    scopes
+        .iter()
+        .all(|s| scope_matches(s, rel_path, request_path, basename))
 }
 
 /// Does a single scope match? A `<Files*>`/`<Directory*>` block whose pattern did
 /// not compile (`regex == None`) does NOT match (fail-closed — the directive does
 /// not apply rather than widening to the whole directory); an unmodellable `<If>`
 /// matches (lenient superset, as headers are not security-critical).
-fn scope_matches(scope: &Scope, rel_path: &str, basename: &str) -> bool {
+fn scope_matches(scope: &Scope, rel_path: &str, request_path: &str, basename: &str) -> bool {
     match scope.kind {
         ScopeKind::Files | ScopeKind::FilesMatch => scope
             .regex
@@ -304,7 +527,7 @@ fn scope_matches(scope: &Scope, rel_path: &str, basename: &str) -> bool {
         ScopeKind::If => scope
             .uri_expr
             .as_ref()
-            .map_or(true, |expr| expr.matches(rel_path, false)),
+            .map_or(true, |expr| expr.matches(request_path, false)),
     }
 }
 
@@ -338,11 +561,7 @@ fn interpolate_env(value: &str, env: &[(String, String)]) -> String {
                 {
                     after += 1;
                 }
-                let val = env
-                    .iter()
-                    .find(|(k, _)| k == name)
-                    .map(|(_, v)| v.as_str())
-                    .unwrap_or("");
+                let val = header_env_value(env, name).unwrap_or("");
                 out.push_str(val);
                 i = after;
                 continue;
@@ -374,31 +593,68 @@ fn utf8_len(first: u8) -> usize {
 pub enum ErrorDoc {
     /// `ErrorDocument 404 /404.php` — an internal path (served from docroot).
     Path(String),
-    /// `ErrorDocument 404 "Sorry, not here"` — an inline message (Apache marks
-    /// these with a leading quote that is stripped here).
+    /// `ErrorDocument 404 "Sorry, not here"` — an inline message (its quotes
+    /// are stripped here).
     Inline(String),
     /// `ErrorDocument 404 https://...` — an external redirect target.
     External(String),
+    /// `ErrorDocument 404 default` — the built-in page, overriding any
+    /// inherited document for that status.
+    Default,
 }
 
 impl ErrorDoc {
-    /// Classify a raw `ErrorDocument` target string the way Apache does:
-    /// a leading `"` => inline message; an absolute `http(s)://` (or `//`)
-    /// URL => external; otherwise a local path.
+    /// Classify a raw `ErrorDocument` target the way Apache's `set_error_document`
+    /// does, after its config tokenizer has unquoted the argument (`"…"` or
+    /// `'…'`): whitespace => message; a leading `/` => local path; an absolute
+    /// `scheme:` URL => external redirect; `default` => the built-in page;
+    /// anything else => message.
     pub fn classify(raw: &str) -> ErrorDoc {
-        if let Some(rest) = raw.strip_prefix('"') {
-            // Apache: a leading quote introduces a literal text message. The
-            // trailing quote (if any) is not required; strip a matching one.
-            let msg = rest.strip_suffix('"').unwrap_or(rest);
-            return ErrorDoc::Inline(msg.to_string());
-        }
-        let lower = raw.to_ascii_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") || raw.starts_with("//") {
-            ErrorDoc::External(raw.to_string())
+        let target = unquote_conf_word(raw);
+        if target.contains(char::is_whitespace) {
+            ErrorDoc::Inline(target)
+        } else if target.starts_with('/') {
+            ErrorDoc::Path(target)
+        } else if is_url(&target) {
+            ErrorDoc::External(target)
+        } else if target.eq_ignore_ascii_case("default") {
+            ErrorDoc::Default
         } else {
-            ErrorDoc::Path(raw.to_string())
+            ErrorDoc::Inline(target)
         }
     }
+}
+
+/// Apache `ap_getword_conf` for one argument: a leading `"` or `'` quotes up to
+/// the matching unescaped quote (or the end of the text), and a backslash before
+/// that quote character is dropped.
+fn unquote_conf_word(raw: &str) -> String {
+    let Some(quote) = raw.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+        return raw.to_string();
+    };
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw[1..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&quote) {
+            out.push(quote);
+            chars.next();
+        } else if c == quote {
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Apache `ap_is_url`: a non-empty `[A-Za-z0-9+.-]` scheme followed by `:`.
+fn is_url(target: &str) -> bool {
+    target.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'))
+    })
 }
 
 impl Htaccess {
@@ -427,12 +683,26 @@ pub struct ReqAttrs<'a> {
     pub protocol: &'a str,
     /// `Query_String` — query without leading `?`.
     pub query_string: &'a str,
-    /// `Remote_Addr` — client IP.
+    /// `Remote_Addr` — client IP. This and `server_addr`/`host` are only read
+    /// when [`Htaccess::set_env_if_reads_connection`].
     pub remote_addr: &'a str,
     /// `Server_Addr` — local bind address.
     pub server_addr: &'a str,
     /// `Host` (also matched by a literal `Host` attribute and `Server_Name`).
     pub host: &'a str,
+    /// The normalized docroot-relative path (leading `/`) that a scoped
+    /// `SetEnvIf`'s enclosing `<Files*>`/`<Directory*>` sections are matched
+    /// against, exactly as `Header` scopes are. Empty = `request_uri`.
+    /// Only read when [`Htaccess::has_scoped_set_env`].
+    pub scope_path: &'a str,
+    /// The slash-preserving normalized request path `<If "%{REQUEST_URI} …">`
+    /// sections test: `/dir/` keeps the `/` that `scope_path` drops (#979).
+    /// Empty = `scope_path`.
+    pub if_path: &'a str,
+    /// The basename `<Files*>` sections match: the file the request maps to
+    /// (the `DirectoryIndex` file, or the script before `PATH_INFO`). `None` =
+    /// the basename of the scope path.
+    pub scope_basename: Option<&'a str>,
     /// Lazy request-header source (e.g. `Origin`, `User-Agent`, `Referer`). A callback
     /// rather than a materialized map, so the caller pays nothing to snapshot the whole
     /// header set — `SetEnvIf` only ever looks up the specific names its rules reference.
@@ -440,35 +710,95 @@ pub struct ReqAttrs<'a> {
     /// callback itself matches names ASCII-case-insensitively. `None` ⇒ no headers (all
     /// header lookups miss); the specials above are always available.
     pub header_lookup: Option<HeaderLookup<'a>>,
+    /// The request env as it stands before this file's `SetEnvIf` run (server
+    /// variables and earlier chain files' assignments), matched
+    /// ASCII-case-insensitively like Apache's `subprocess_env` table. An
+    /// attribute that is neither a special nor a present header falls back to
+    /// it, after this file's own earlier assignments. `None` = empty env.
+    pub env_lookup: Option<HeaderLookup<'a>>,
+}
+
+/// How a `SetEnvIf` attribute resolves, fixed when the directive is parsed:
+/// one of mod_setenvif's specials, or a request header that falls back to the
+/// env variable of that name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetEnvAttr {
+    RequestUri,
+    Method,
+    Protocol,
+    QueryString,
+    /// `Remote_Addr`, and `Remote_Host`: the client's hostname, which without
+    /// reverse DNS (Apache `HostnameLookups Off`) is its address — never a header.
+    RemoteAddr,
+    ServerAddr,
+    /// `Host` and `Server_Name`.
+    Host,
+    Header,
+}
+
+impl SetEnvAttr {
+    pub(crate) fn classify(attribute: &str) -> SetEnvAttr {
+        let eq = |s: &str| attribute.eq_ignore_ascii_case(s);
+        if eq("request_uri") {
+            SetEnvAttr::RequestUri
+        } else if eq("request_method") {
+            SetEnvAttr::Method
+        } else if eq("request_protocol") {
+            SetEnvAttr::Protocol
+        } else if eq("query_string") {
+            SetEnvAttr::QueryString
+        } else if eq("remote_addr") || eq("remote_host") {
+            SetEnvAttr::RemoteAddr
+        } else if eq("server_addr") {
+            SetEnvAttr::ServerAddr
+        } else if eq("host") || eq("server_name") {
+            SetEnvAttr::Host
+        } else {
+            SetEnvAttr::Header
+        }
+    }
+
+    /// Reads a value the caller formats from the connection per request.
+    pub(crate) fn reads_connection(self) -> bool {
+        matches!(
+            self,
+            SetEnvAttr::RemoteAddr | SetEnvAttr::ServerAddr | SetEnvAttr::Host
+        )
+    }
 }
 
 impl<'a> ReqAttrs<'a> {
-    /// Resolve `SetEnvIf`'s first argument to the string to test. Returns `None`
-    /// for attributes we do not model (the directive is then skipped, matching
-    /// Apache testing an empty/absent value: a regex that requires content
-    /// simply won't match).
-    fn resolve(&self, attribute: &str) -> Option<Cow<'a, str>> {
-        // Compare case-insensitively against the modelled specials WITHOUT allocating a
-        // lowercased copy per SetEnvIf rule per request (L4). `lookup_header` is itself
-        // case-insensitive (and folds `_`→`-`), so the un-lowercased name resolves identically.
-        let eq = |s: &str| attribute.eq_ignore_ascii_case(s);
-        if eq("request_uri") {
-            Some(Cow::Borrowed(self.request_uri))
-        } else if eq("request_method") {
-            Some(Cow::Borrowed(self.method))
-        } else if eq("request_protocol") {
-            Some(Cow::Borrowed(self.protocol))
-        } else if eq("query_string") {
-            Some(Cow::Borrowed(self.query_string))
-        } else if eq("remote_addr") {
-            Some(Cow::Borrowed(self.remote_addr))
-        } else if eq("server_addr") {
-            Some(Cow::Borrowed(self.server_addr))
-        } else if eq("host") || eq("server_name") {
-            Some(Cow::Borrowed(self.host))
-        } else {
-            self.lookup_header(attribute).map(Cow::Owned)
+    /// mod_setenvif `match_headers`' second step: an attribute that is neither a
+    /// special nor a present header names an env variable. `pending` holds this
+    /// file's earlier assignments (in order, `!VAR` = unset), which shadow the
+    /// base env.
+    fn resolve_env(&self, attribute: &str, pending: &[(String, String)]) -> Option<String> {
+        for (key, value) in pending.iter().rev() {
+            match EnvAssignment::classify(key, value) {
+                EnvAssignment::Set { name, value } if name.eq_ignore_ascii_case(attribute) => {
+                    return Some(value.to_string());
+                }
+                EnvAssignment::Unset { name } if name.eq_ignore_ascii_case(attribute) => {
+                    return None;
+                }
+                _ => {}
+            }
         }
+        (self.env_lookup.as_ref()?.0)(attribute)
+    }
+
+    /// The value of a special attribute; `None` for a header attribute.
+    fn special(&self, attr: SetEnvAttr) -> Option<&'a str> {
+        Some(match attr {
+            SetEnvAttr::RequestUri => self.request_uri,
+            SetEnvAttr::Method => self.method,
+            SetEnvAttr::Protocol => self.protocol,
+            SetEnvAttr::QueryString => self.query_string,
+            SetEnvAttr::RemoteAddr => self.remote_addr,
+            SetEnvAttr::ServerAddr => self.server_addr,
+            SetEnvAttr::Host => self.host,
+            SetEnvAttr::Header => return None,
+        })
     }
 
     fn lookup_header(&self, want: &str) -> Option<String> {
@@ -489,15 +819,56 @@ impl<'a> ReqAttrs<'a> {
     }
 }
 
+/// Distinct header attributes one `eval_set_env` call remembers; more are
+/// looked up per directive, as before.
+const HEADER_CACHE_SLOTS: usize = 4;
+
+type HeaderCache<'r> = [Option<(&'r str, Option<String>)>; HEADER_CACHE_SLOTS];
+
+/// `attribute`'s request header, looked up once per evaluation: header values
+/// do not depend on the assignments made so far, so a Cookie read by several
+/// rules is copied once.
+fn cached_header<'h, 'r>(
+    cache: &'h mut HeaderCache<'r>,
+    attrs: &ReqAttrs<'_>,
+    attribute: &'r str,
+) -> Option<Cow<'h, str>> {
+    let slot = match cache
+        .iter()
+        .position(|slot| matches!(slot, Some((name, _)) if *name == attribute))
+    {
+        Some(i) => i,
+        None => {
+            let Some(free) = cache.iter().position(Option::is_none) else {
+                return attrs.lookup_header(attribute).map(Cow::Owned);
+            };
+            if let Some(entry) = cache.get_mut(free) {
+                *entry = Some((attribute, attrs.lookup_header(attribute)));
+            }
+            free
+        }
+    };
+    cache
+        .get(slot)
+        .and_then(Option::as_ref)
+        .and_then(|(_, value)| value.as_deref())
+        .map(Cow::Borrowed)
+}
+
 impl Htaccess {
     /// Evaluate all `SetEnvIf` / `SetEnvIfNoCase` directives against `attrs`,
     /// returning the `(VAR, value)` pairs to merge into the request env.
+    /// An attribute that is neither a special nor a present header is tested
+    /// against the env variable of that name ([`ReqAttrs::env_lookup`] shadowed
+    /// by this file's earlier assignments), as mod_setenvif does.
     ///
     /// Per Apache: the directive's value template may reference `$0`..`$9`
     /// (whole-match / capture groups of the matching regex). `SetEnvIf Foo re
     /// VAR` with no `=value` sets `VAR=1`; `VAR=val` sets the literal (after
-    /// backref expansion). `!VAR` (unset) is not modelled — it is rare and the
-    /// pipeline merges, so we only emit sets.
+    /// backref expansion). `!VAR` is emitted as `("!VAR", "")`, an UNSET of
+    /// `VAR` — decode with [`EnvAssignment::classify`]. A directive inside
+    /// `<Files*>`/`<Directory*>` runs only when its scopes match
+    /// [`ReqAttrs::scope_path`], inside `<If>` when [`ReqAttrs::if_path`] does.
     ///
     /// Directives are applied in source order; a later set for the same `VAR`
     /// overrides an earlier one (the caller should let later entries win, e.g.
@@ -507,58 +878,190 @@ impl Htaccess {
         attrs: &ReqAttrs<'_>,
     ) -> Result<Vec<(String, String)>, &'static str> {
         let mut out = Vec::new();
+        let scope_path = if attrs.scope_path.is_empty() {
+            attrs.request_uri
+        } else {
+            attrs.scope_path
+        };
+        let if_path = if attrs.if_path.is_empty() {
+            scope_path
+        } else {
+            attrs.if_path
+        };
+        let scope_basename = attrs.scope_basename.unwrap_or_else(|| basename(scope_path));
+        let mut headers: HeaderCache<'_> = Default::default();
+        // The previous directive's match result, for a `reuse_prev` directive.
+        let mut prev: Option<bool> = None;
         for s in &self.set_env_if {
-            let Some(subject) = attrs.resolve(&s.attribute) else {
+            if !s.scopes.is_empty() && !scopes_match(&s.scopes, scope_path, if_path, scope_basename)
+            {
+                prev = None;
                 continue;
-            };
-            if let Some(value) = eval_set_env_subject(s, subject.as_ref())? {
-                out.push((s.var.clone(), value));
             }
+            let matched = match prev {
+                Some(matched) if s.reuse_prev => {
+                    if matched {
+                        push_assignments(s, None, &mut out);
+                    }
+                    matched
+                }
+                _ => {
+                    if let Some(subject) = attrs.special(s.attr) {
+                        eval_set_env_subject(s, subject, &mut out)?
+                    } else if let Some(subject) = cached_header(&mut headers, attrs, &s.attribute) {
+                        eval_set_env_subject(s, &subject, &mut out)?
+                    } else if let Some(subject) = attrs.resolve_env(&s.attribute, &out) {
+                        eval_set_env_subject(s, &subject, &mut out)?
+                    } else {
+                        // mod_setenvif tests an absent field as "" so `^$` matches it.
+                        eval_set_env_subject(s, "", &mut out)?
+                    }
+                }
+            };
+            prev = Some(matched);
         }
         Ok(out)
+    }
+
+    /// Whether some `SetEnvIf` here reads `Remote_Addr`/`Remote_Host`/
+    /// `Server_Addr`/`Host`/`Server_Name`; otherwise those [`ReqAttrs`] fields
+    /// are never read and a caller need not format them.
+    pub fn set_env_if_reads_connection(&self) -> bool {
+        self.set_env_if_reads_conn
     }
 
     /// Cookie-dependent assignments in the same order and with the same
     /// capture expansion as `eval_set_env`. Cache keys can distinguish their
     /// effects without fragmenting on unrelated cookies in the same header.
+    /// Scoped rules are included regardless of path: a superset only adds key
+    /// discrimination, never merges two different effective envs.
     pub fn eval_cookie_env(
         &self,
         cookie: Option<&str>,
     ) -> Result<Vec<(String, String)>, &'static str> {
         let mut out = Vec::new();
-        let Some(cookie) = cookie else { return Ok(out) };
+        // An absent Cookie is tested as "", exactly as `eval_set_env` does.
+        let cookie = cookie.unwrap_or("");
+        let mut prev: Option<bool> = None;
         for rule in &self.set_env_if {
-            if rule.attribute.eq_ignore_ascii_case("cookie")
-                && let Some(value) = eval_set_env_subject(rule, cookie)?
-            {
-                out.push((rule.var.clone(), value));
+            if !rule.attribute.eq_ignore_ascii_case("cookie") {
+                prev = None;
+                continue;
             }
+            let matched = match prev {
+                Some(matched) if rule.reuse_prev => {
+                    if matched {
+                        push_assignments(rule, None, &mut out);
+                    }
+                    matched
+                }
+                _ => eval_set_env_subject(rule, cookie, &mut out)?,
+            };
+            prev = Some(matched);
         }
         Ok(out)
     }
+
+    /// [`Htaccess::eval_cookie_env`], borrowing the parse-time result when the
+    /// request carries no Cookie.
+    pub fn cookie_env(
+        &self,
+        cookie: Option<&str>,
+    ) -> Result<Cow<'_, [(String, String)]>, &'static str> {
+        match (cookie, &self.cookie_env_absent) {
+            (None, Some(absent)) => absent.as_deref().map(Cow::Borrowed).map_err(|e| *e),
+            _ => self.eval_cookie_env(cookie).map(Cow::Owned),
+        }
+    }
 }
 
+/// Test one directive against `subject`, appending its assignments on a match.
 fn eval_set_env_subject(
     rule: &crate::htaccess::SetEnvIf,
     subject: &str,
-) -> Result<Option<String>, &'static str> {
+    out: &mut Vec<(String, String)>,
+) -> Result<bool, &'static str> {
+    const FAILED: &str = "SetEnvIf regex failed at match time";
     // Keep the literal-prefix guard shared by normal evaluation and cache
     // discrimination, including the empty-prefix NoCase behavior.
     if !rule.literal_prefix.is_empty()
         && !subject.as_bytes().starts_with(rule.literal_prefix.as_ref())
     {
-        return Ok(None);
+        return Ok(false);
     }
-    match rule.regex.captures(subject) {
-        Ok(Some(caps)) => Ok(Some(expand_backrefs(&rule.value, &caps))),
-        Ok(None) => Ok(None),
-        Err(_) => Err("SetEnvIf regex failed at match time"),
+    if !rule.needs_caps {
+        let matched = rule.regex.is_match_checked(subject).map_err(|()| FAILED)?;
+        if matched {
+            push_assignments(rule, None, out);
+        }
+        return Ok(matched);
+    }
+    match rule.regex.captures_checked(subject) {
+        Ok(Some(caps)) => {
+            push_assignments(rule, Some(&caps), out);
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(()) => Err(FAILED),
+    }
+}
+
+/// Append a matched directive's assignments. Without `caps` the templates hold
+/// no `$` (`SetEnvIf::needs_caps`), so they are literal.
+fn push_assignments(
+    rule: &crate::htaccess::SetEnvIf,
+    caps: Option<&crate::rules::Caps<'_>>,
+    out: &mut Vec<(String, String)>,
+) {
+    for (var, value) in &rule.assigns {
+        let value = if var.starts_with('!') {
+            String::new()
+        } else if let Some(caps) = caps {
+            expand_backrefs(value, caps)
+        } else {
+            value.clone()
+        };
+        out.push((var.clone(), value));
+    }
+}
+
+/// One env mutation from `SetEnvIf` output or a rewrite outcome's `[E=]` list.
+/// Both use Apache's spelling (mod_setenvif `!VAR`, mod_rewrite `[E=!VAR]`; OLS
+/// `RequestVars::setEnv`): a key starting with `!` REMOVES the variable named by
+/// the rest of the key. Every consumer that merges those `(key, value)` lists
+/// into a request env must decode them through [`EnvAssignment::classify`]; a
+/// literal `!VAR` key would leave `VAR` set (#780).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvAssignment<'a> {
+    Set {
+        name: &'a str,
+        value: &'a str,
+    },
+    /// Remove `name` (a no-op when it is not set).
+    Unset {
+        name: &'a str,
+    },
+}
+
+impl<'a> EnvAssignment<'a> {
+    pub fn classify(key: &'a str, value: &'a str) -> EnvAssignment<'a> {
+        match key.strip_prefix('!') {
+            Some(name) => EnvAssignment::Unset { name },
+            None => EnvAssignment::Set { name: key, value },
+        }
+    }
+
+    /// The variable this assignment targets.
+    pub fn name(&self) -> &'a str {
+        match *self {
+            EnvAssignment::Set { name, .. } | EnvAssignment::Unset { name } => name,
+        }
     }
 }
 
 /// Expand `$0`..`$9` in a `SetEnvIf` value template from regex captures.
 /// Unknown / absent groups expand to empty. `$$` is a literal `$`.
-fn expand_backrefs(template: &str, caps: &fancy_regex::Captures<'_, str>) -> String {
+fn expand_backrefs(template: &str, caps: &crate::rules::Caps<'_>) -> String {
     if !template.contains('$') {
         return template.to_string();
     }
@@ -575,7 +1078,7 @@ fn expand_backrefs(template: &str, caps: &fancy_regex::Captures<'_, str>) -> Str
                     let idx = (*d as u8 - b'0') as usize;
                     chars.next();
                     if let Some(m) = caps.get(idx) {
-                        out.push_str(m.as_str());
+                        out.push_str(m);
                     }
                 }
                 _ => out.push('$'),
@@ -618,6 +1121,9 @@ fn ext_lower(basename: &str) -> std::borrow::Cow<'_, str> {
         _ => std::borrow::Cow::Borrowed(""),
     }
 }
+
+#[cfg(test)]
+mod set_env_tests;
 
 #[cfg(test)]
 mod directive_tests {
@@ -1154,15 +1660,21 @@ mod directive_tests {
 
     #[test]
     fn set_env_if_match_error_is_not_treated_as_non_match() {
-        let mut h = Htaccess::parse("SetEnvIf Request_URI x SAFE=1").unwrap();
-        let mut builder = fancy_regex::RegexBuilder::new(r"^(a+)+\1$");
-        builder.backtrack_limit(1);
-        h.set_env_if[0].regex = builder.build().unwrap();
-        let attrs = ReqAttrs {
-            request_uri: "aaaaaaaaaaaaaaaaX",
-            ..Default::default()
-        };
-        assert!(h.eval_set_env(&attrs).is_err());
+        // Both the plain match test and the capture path report the error (#977).
+        for text in [
+            "SetEnvIf Request_URI x SAFE=1",
+            "SetEnvIf Request_URI x SAFE=$0",
+        ] {
+            let mut h = Htaccess::parse(text).unwrap();
+            let mut builder = fancy_regex::RegexBuilder::new(r"^(a+)+\1$");
+            builder.backtrack_limit(1);
+            h.set_env_if[0].regex = crate::rules::CompiledRegex::Fancy(builder.build().unwrap());
+            let attrs = ReqAttrs {
+                request_uri: "aaaaaaaaaaaaaaaaX",
+                ..Default::default()
+            };
+            assert!(h.eval_set_env(&attrs).is_err(), "{text}");
+        }
     }
 
     #[test]
@@ -1249,6 +1761,201 @@ mod directive_tests {
         assert!(h.response_headers("/api/x.php", 200, &env_bad).is_empty());
     }
 
+    /// #907: `<Files*>` header scope matches the file the request maps to.
+    #[test]
+    fn files_scoped_header_matches_the_target_basename() {
+        let h = Htaccess::parse(
+            "<FilesMatch \"\\.html$\">\n  Header set X-Html 1\n</FilesMatch>\n\
+             <Files \"index.php\">\n  Header set X-Index 1\n</Files>",
+        )
+        .unwrap();
+        let names = |rel: &str, target: Option<&str>| -> Vec<String> {
+            chain_response_headers([&h], rel, target, rel, 200, &[])
+                .iter()
+                .map(|o| o.name().to_string())
+                .collect()
+        };
+        assert!(names("/", None).is_empty());
+        assert_eq!(names("/", Some("index.html")), vec!["X-Html"]);
+        assert_eq!(names("/docs", Some("index.html")), vec!["X-Html"]);
+        // PATH_INFO: the script basename, not the trailing segment.
+        assert!(names("/index.php/x", None).is_empty());
+        assert_eq!(names("/index.php/x", Some("index.php")), vec!["X-Index"]);
+    }
+
+    /// #907: a `<Files>`-scoped SetEnvIf matches `scope_basename` when given.
+    #[test]
+    fn files_scoped_set_env_if_matches_the_scope_basename() {
+        let h = Htaccess::parse("<Files \"index.html\">\n  SetEnvIf Request_URI . IDX=1\n</Files>")
+            .unwrap();
+        let attrs = ReqAttrs {
+            request_uri: "/",
+            scope_path: "/",
+            ..Default::default()
+        };
+        assert!(h.eval_set_env(&attrs).unwrap().is_empty());
+        let attrs = ReqAttrs {
+            scope_basename: Some("index.html"),
+            ..attrs
+        };
+        assert_eq!(
+            h.eval_set_env(&attrs).unwrap(),
+            vec![("IDX".to_string(), "1".to_string())]
+        );
+    }
+
+    /// #908: Apache unquotes the target, then classifies it.
+    #[test]
+    fn error_document_classification_unquotes_first() {
+        let cases = [
+            (
+                "\"/errors/404.html\"",
+                ErrorDoc::Path("/errors/404.html".into()),
+            ),
+            (
+                "'/errors/404.html'",
+                ErrorDoc::Path("/errors/404.html".into()),
+            ),
+            (
+                "/errors/404.html",
+                ErrorDoc::Path("/errors/404.html".into()),
+            ),
+            (
+                "\"https://e.example/404\"",
+                ErrorDoc::External("https://e.example/404".into()),
+            ),
+            (
+                "'https://e.example/404'",
+                ErrorDoc::External("https://e.example/404".into()),
+            ),
+            (
+                "http://e.example/x",
+                ErrorDoc::External("http://e.example/x".into()),
+            ),
+            ("\"Not here\"", ErrorDoc::Inline("Not here".into())),
+            ("'Not here'", ErrorDoc::Inline("Not here".into())),
+            ("\"Sorry\"", ErrorDoc::Inline("Sorry".into())),
+            ("Sorry", ErrorDoc::Inline("Sorry".into())),
+            ("\"Sorry", ErrorDoc::Inline("Sorry".into())),
+            (
+                "\"say \\\"hi\\\" there\"",
+                ErrorDoc::Inline("say \"hi\" there".into()),
+            ),
+            ("\"/a b.html\"", ErrorDoc::Inline("/a b.html".into())),
+            ("default", ErrorDoc::Default),
+            ("\"DEFAULT\"", ErrorDoc::Default),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(ErrorDoc::classify(raw), want, "{raw}");
+        }
+        let h = Htaccess::parse(
+            "ErrorDocument 404 \"/errors/404.html\"\n\
+             ErrorDocument 410 default\n\
+             ErrorDocument 401 https://e.example/login",
+        )
+        .unwrap();
+        assert_eq!(
+            h.error_document(404),
+            Some(&ErrorDoc::Path("/errors/404.html".into()))
+        );
+        assert_eq!(h.error_document(410), Some(&ErrorDoc::Default));
+        // Apache ignores a URL for 401 (the challenge would be lost).
+        assert_eq!(h.error_document(401), None);
+    }
+
+    /// #909: Apache merges directory-level ops, then `<Files*>`, then `<If>`.
+    #[test]
+    fn header_ops_apply_in_apache_merge_order() {
+        let h = Htaccess::parse(
+            "<If \"%{REQUEST_URI} =~ m#^/#\">\n  Header set X-Order if\n</If>\n\
+             <Files a.txt>\n  Header set X-Order files\n</Files>\n\
+             Header set X-Order dir\n\
+             Header add X-Seq one\n\
+             Header add X-Seq two",
+        )
+        .unwrap();
+        let ops = h.response_headers("/a.txt", 200, &[]);
+        let order: Vec<String> = ops
+            .iter()
+            .filter(|o| o.name() == "X-Order")
+            .map(|o| match o {
+                HeaderOp::Set { value, .. } => value.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(order, vec!["dir", "files", "if"]);
+        let seq: Vec<&HeaderOp> = ops.iter().filter(|o| o.name() == "X-Seq").collect();
+        assert_eq!(
+            seq,
+            vec![
+                &HeaderOp::Add {
+                    name: "X-Seq".into(),
+                    value: "one".into()
+                },
+                &HeaderOp::Add {
+                    name: "X-Seq".into(),
+                    value: "two".into()
+                },
+            ]
+        );
+        // Across the chain: a parent's `<Files>` op outranks a child's top level.
+        let parent =
+            Htaccess::parse("<Files a.txt>\n  Header set X-Order parent-files\n</Files>").unwrap();
+        let child = Htaccess::parse("Header set X-Order child-dir").unwrap();
+        let ops = chain_response_headers(
+            [&parent, &child],
+            "/sub/a.txt",
+            None,
+            "/sub/a.txt",
+            200,
+            &[],
+        );
+        assert_eq!(
+            ops.last(),
+            Some(&HeaderOp::Set {
+                name: "X-Order".into(),
+                value: "parent-files".into()
+            })
+        );
+    }
+
+    /// #910: `env=` guards and `%{VAR}e` match env names case-insensitively.
+    #[test]
+    fn header_env_names_match_case_insensitively() {
+        let h = Htaccess::parse(
+            "Header set X-Guard on env=LOWER\n\
+             Header set X-Neg on env=!LOWER\n\
+             Header set X-Val \"%{LOWER}e\"",
+        )
+        .unwrap();
+        let env = vec![("Lower".to_string(), "1".to_string())];
+        let ops = h.response_headers("/x", 200, &env);
+        assert!(ops.iter().any(|o| o.name() == "X-Guard"));
+        assert!(!ops.iter().any(|o| o.name() == "X-Neg"));
+        assert!(ops.contains(&HeaderOp::Set {
+            name: "X-Val".into(),
+            value: "1".into()
+        }));
+        // Exact case wins over a case-folded sibling.
+        let env = vec![
+            ("lower".to_string(), "folded".to_string()),
+            ("LOWER".to_string(), "exact".to_string()),
+        ];
+        assert_eq!(interpolate_env("%{LOWER}e", &env), "exact");
+        // Plumbing stays hidden however it is spelled.
+        let plumbing = vec![
+            ("HTTP_ACCEPT_ENCODING".to_string(), "gzip".to_string()),
+            ("HJ_X".to_string(), "1".to_string()),
+        ];
+        assert_eq!(
+            interpolate_env("[%{http_accept_encoding}e]", &plumbing),
+            "[]"
+        );
+        assert_eq!(interpolate_env("[%{hj_x}e]", &plumbing), "[]");
+        let g = Htaccess::parse("Header set X-P 1 env=hj_x").unwrap();
+        assert!(g.response_headers("/x", 200, &plumbing).is_empty());
+    }
+
     #[test]
     fn interpolate_env_e_qualifier_vs_literal_e() {
         let env = vec![("VAR".to_string(), "val".to_string())];
@@ -1264,5 +1971,15 @@ mod directive_tests {
         assert_eq!(interpolate_env("[%{MISSING}e]", &env), "[]");
         // A bare `%` not part of `%{...}` is passed through.
         assert_eq!(interpolate_env("100% %{VAR}", &env), "100% val");
+        // Pipeline plumbing never reaches Header values (#842).
+        let plumbing = vec![
+            ("HTTP_ACCEPT_ENCODING".to_string(), "gzip".to_string()),
+            ("HJ_X".to_string(), "1".to_string()),
+        ];
+        assert_eq!(
+            interpolate_env("[%{HTTP_ACCEPT_ENCODING}e]", &plumbing),
+            "[]"
+        );
+        assert_eq!(interpolate_env("[%{HJ_X}e]", &plumbing), "[]");
     }
 }

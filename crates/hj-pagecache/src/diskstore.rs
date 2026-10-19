@@ -205,6 +205,8 @@ pub struct DiskStore {
     /// Uniquifies the per-version filename. Re-seeded to max(seen)+1 by `scan`
     /// so a restart can never reuse a live file's name.
     seq: AtomicU64,
+    /// Leaf fanout chains a persist found removed (externally) and recreated.
+    fanout_recreations: AtomicU64,
 }
 
 fn rustix_io(error: rustix::io::Errno) -> io::Error {
@@ -319,11 +321,13 @@ static META_REWIND_PROBE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 static META_REWIND_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn prepare_dir_at(parent: &fs::File, name: &str, display: &Path) -> io::Result<fs::File> {
-    match rustix::fs::mkdirat(parent, name, rustix::fs::Mode::RWXU) {
-        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+/// Create-or-open one private fanout directory; `true` when this call created it.
+fn prepare_dir_at(parent: &fs::File, name: &str, display: &Path) -> io::Result<(fs::File, bool)> {
+    let created = match rustix::fs::mkdirat(parent, name, rustix::fs::Mode::RWXU) {
+        Ok(()) => true,
+        Err(rustix::io::Errno::EXIST) => false,
         Err(error) => return Err(rustix_io(error)),
-    }
+    };
     let file = open_dir_at(parent, name)?;
     let metadata = validate_owned_dir(&file, display)?;
     if metadata.mode() & 0o7777 != PRIVATE_DIR_MODE {
@@ -331,18 +335,18 @@ fn prepare_dir_at(parent: &fs::File, name: &str, display: &Path) -> io::Result<f
         PRIVATE_DIR_CHMOD_CALLS.with(|calls| calls.set(calls.get() + 1));
         file.set_permissions(fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
     }
-    Ok(file)
+    Ok((file, created))
 }
 
 fn prepare_fanout(root: &Path, root_fd: &fs::File) -> io::Result<()> {
     for h0 in 0..16 {
         let c0 = format!("{h0:x}");
         let p0 = root.join(&c0);
-        let d0 = prepare_dir_at(root_fd, &c0, &p0)?;
+        let (d0, _) = prepare_dir_at(root_fd, &c0, &p0)?;
         for h1 in 0..16 {
             let c1 = format!("{h1:x}");
             let p1 = p0.join(&c1);
-            let d1 = prepare_dir_at(&d0, &c1, &p1)?;
+            let (d1, _) = prepare_dir_at(&d0, &c1, &p1)?;
             for h2 in 0..16 {
                 let c2 = format!("{h2:x}");
                 prepare_dir_at(&d1, &c2, &p1.join(&c2))?;
@@ -432,11 +436,16 @@ impl DiskStore {
             live_tmp_files: Arc::new(Mutex::new(HashSet::new())),
             boot_scan_pending: AtomicBool::new(true),
             seq: AtomicU64::new(seed),
+            fanout_recreations: AtomicU64::new(0),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn fanout_recreations(&self) -> u64 {
+        self.fanout_recreations.load(Ordering::Relaxed)
     }
 
     fn display_dir(&self, hex: &str) -> PathBuf {
@@ -530,6 +539,34 @@ impl DiskStore {
         self.open_leaf_relative(Path::new(OsStr::from_bytes(&relative)))
     }
 
+    /// [`Self::open_leaf`] for a persist. The fanout is otherwise only built at
+    /// open, so a chain an external `/dev/shm` cleaner removed would fail every
+    /// later persist to it until restart: recreate it once, component by
+    /// component from the pinned root with the same no-follow walk, owner check
+    /// and private mode as [`prepare_fanout`]. A removed root stays fatal (the
+    /// pinned descriptor is never re-resolved by name).
+    fn open_leaf_for_write(&self, hex: &str) -> io::Result<fs::File> {
+        let error = match self.open_leaf(hex) {
+            Ok(leaf) => return Ok(leaf),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => error,
+            Err(error) => return Err(error),
+        };
+        let (Some(c0), Some(c1), Some(c2)) = (hex.get(0..1), hex.get(1..2), hex.get(2..3)) else {
+            return Err(error);
+        };
+        let p0 = self.root.join(c0);
+        let p1 = p0.join(c1);
+        let (d0, created0) = prepare_dir_at(&self.root_fd, c0, &p0)?;
+        let (d1, created1) = prepare_dir_at(&d0, c1, &p1)?;
+        let (leaf, created2) = prepare_dir_at(&d1, c2, &p1.join(c2))?;
+        if created0 || created1 || created2 {
+            self.fanout_recreations.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(dir = %self.display_dir(hex).display(),
+                "jetcache: fanout directory was removed externally — recreated");
+        }
+        Ok(leaf)
+    }
+
     fn prepare_container(
         &self,
         hex: String,
@@ -537,7 +574,7 @@ impl DiskStore {
         logical_total: u64,
         write: impl FnOnce(&mut fs::File) -> io::Result<()>,
     ) -> io::Result<PreparedEntry> {
-        let leaf = self.open_leaf(&hex)?;
+        let leaf = self.open_leaf_for_write(&hex)?;
         let dir = self.display_dir(&hex);
         let first_seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let tmp_name = format!("{hex}-{first_seq}{final_ext}.tmp");
@@ -2048,6 +2085,67 @@ mod tests {
             1,
             "only the insecure root should need a mode repair"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_recreates_an_externally_removed_fanout_chain() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("jetcache");
+        let ds = DiskStore::open(&root).unwrap();
+        let hex = format!("{:016x}", key_hash(&key()));
+        let top = root.join(&hex[0..1]);
+        fs::remove_dir_all(&top).unwrap();
+
+        let (path, _) = ds
+            .write_entry(&key(), &entry(PageScope::Public), 0, b"after wipe", 1)
+            .expect("persist recreates the removed fanout");
+        assert!(path.exists(), "persisted file published after the wipe");
+        assert_eq!(ds.fanout_recreations(), 1);
+        let mut directory = path.parent();
+        while let Some(dir) = directory {
+            if dir == root {
+                break;
+            }
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o7777,
+                PRIVATE_DIR_MODE,
+                "recreated {} keeps the private mode",
+                dir.display()
+            );
+            directory = dir.parent();
+        }
+
+        ds.write_entry(&key(), &entry(PageScope::Public), 0, b"again", 1)
+            .unwrap();
+        assert_eq!(
+            ds.fanout_recreations(),
+            1,
+            "an intact chain is not recounted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persist_never_recreates_through_a_planted_leaf_symlink() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("jetcache");
+        let outside = parent.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let ds = DiskStore::open(&root).unwrap();
+        let hex = format!("{:016x}", key_hash(&key()));
+        let leaf = root.join(&hex[0..1]).join(&hex[1..2]).join(&hex[2..3]);
+        fs::remove_dir(&leaf).unwrap();
+        std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+
+        assert!(
+            ds.write_entry(&key(), &entry(PageScope::Public), 0, b"x", 1)
+                .is_err()
+        );
+        assert_eq!(ds.fanout_recreations(), 0);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

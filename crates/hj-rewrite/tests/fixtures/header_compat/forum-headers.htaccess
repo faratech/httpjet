@@ -1,0 +1,171 @@
+# The Header directives (and their enclosing sections) of the live forum root
+# .htaccess, 2026-10-18. Rewrite/SetEnvIf/access lines are omitted: tests supply
+# the env those set.
+<IfModule mod_headers.c>
+    <Files "api-catalog">
+        Header set Content-Type "application/linkset+json"
+    </Files>
+    <Files "oauth-authorization-server">
+        Header set Content-Type "application/json"
+    </Files>
+    <Files "oauth-protected-resource">
+        Header set Content-Type "application/json"
+    </Files>
+    <Files "webmcp">
+        Header set Content-Type "application/json"
+    </Files>
+    <Files "mcp-server">
+        Header set Content-Type "application/json"
+    </Files>
+    <Files "auth.md">
+        Header set Content-Type "text/markdown; charset=utf-8"
+    </Files>
+    <FilesMatch "\.md$">
+        <If "%{REQUEST_URI} =~ m#^/\.well-known/agent-skills/#">
+            Header set Content-Type "text/markdown; charset=utf-8"
+        </If>
+    </FilesMatch>
+    <If "%{REQUEST_URI} =~ m#^/(index\.php)?$#">
+        Header add Link "</.well-known/api-catalog>; rel=\"api-catalog\", <https://search.windowsforum.com/api/openapi.json>; rel=\"service-desc\", <https://search.windowsforum.com/api/docs>; rel=\"service-doc\", </auth.md>; rel=\"describedby\"; type=\"text/markdown\", </.well-known/oauth-protected-resource>; rel=\"oauth-protected-resource\""
+    </If>
+</IfModule>
+
+<FilesMatch "^llms(-full)?\.txt$">
+    Header set Content-Type "text/plain; charset=utf-8"
+</FilesMatch>
+
+Header set X-Frame-Options "SAMEORIGIN"
+Header set X-Content-Type-Options "nosniff"
+Header set X-XSS-Protection "1; mode=block"
+Header set Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" env=HTTPS
+Header unset Server
+Header set Referrer-Policy "strict-origin-when-cross-origin"
+<If "%{REQUEST_URI} !~ m#^/proxy\.php(?:$|\?)#">
+    Header set Content-Security-Policy "base-uri 'self'; object-src 'none'; frame-ancestors 'self' https://adsense.google.com https://*.google.com https://googleads.g.doubleclick.net https://tpc.googlesyndication.com"
+</If>
+Header unset Feature-Policy
+Header set Origin-Agent-Cluster "?1"
+Header always add Origin-Trial "Ar+QwLa9zW+uszuYVB2VHuYZvqpLTsl2lvk3Q3M09i6l4COFc4ih7vLwpFiparKZmlNBkMNYsSOs36h6Up6RQgIAAABjeyJvcmlnaW4iOiJodHRwczovL3dpbmRvd3Nmb3J1bS5jb206NDQzIiwiZmVhdHVyZSI6IldlYk1DUCIsImV4cGlyeSI6MTc5NDg3MzYwMCwiaXNTdWJkb21haW4iOnRydWV9"
+Header always add Origin-Trial "A+aAW34W1V3M9lkWeICLL6CC8hBQb/ISZOoRKNdfCLM67upqvVk44S75S8l1NpOk+vVlenePFN1vHQPQTvM4JbYAAABjeyJvcmlnaW4iOiJodHRwczovL3dpbmRvd3Nmb3J1bS5jb206NDQzIiwiZmVhdHVyZSI6IldlYk1DUCIsImV4cGlyeSI6MTc5NDE1NzQyOCwiaXNTdWJkb21haW4iOnRydWV9"
+Header set Permissions-Policy "accelerometer=*, autoplay=*, encrypted-media=*, gyroscope=*, magnetometer=*, picture-in-picture=*, fullscreen=*, tools=(self)"
+Header unset ETag
+
+<IfModule mod_headers.c>
+    Header unset Link env=AMP_PAGE
+</IfModule>
+
+Header set Access-Control-Allow-Origin "%{ORIGIN_ALLOWED}e" env=ORIGIN_ALLOWED
+Header set Access-Control-Allow-Methods "GET, POST, OPTIONS"
+Header set Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With, X-AI-Token"
+Header set Access-Control-Allow-Credentials "true"
+Header set Access-Control-Max-Age "86400"
+Header unset Access-Control-Allow-Origin env=WF_CHAT_CORS_ENDPOINT
+Header always unset Access-Control-Allow-Origin env=WF_CHAT_CORS_ENDPOINT
+Header always set Access-Control-Allow-Origin "%{WF_CHAT_CORS_ORIGIN}e" env=WF_CHAT_CORS_ORIGIN
+
+<IfModule mod_headers.c>
+  Header set X-Robots-Tag "all, max-image-preview:large" env=KNOWN_CRAWLER
+  Header set X-Robots-Tag "noindex, follow" env=WF_NOINDEX_PATH
+  Header set X-Crawler-Detected "true" env=KNOWN_CRAWLER
+</IfModule>
+
+<FilesMatch "\.(js|css|jpg|jpeg|png|gif|svg|ico|woff|woff2|webp|avif)$">
+    Header set Cache-Control "public, max-age=31536000, stale-if-error=86400"
+</FilesMatch>
+<Files "service_worker.js">
+    Header set Cache-Control "max-age=600, must-revalidate"
+    Header set Cloudflare-CDN-Cache-Control "max-age=300"
+    Header set Service-Worker-Allowed "/"
+</Files>
+<FilesMatch "^sx2?(\.min)?\.js$">
+    Header set Cache-Control "public, max-age=3600"
+    Header set Cloudflare-CDN-Cache-Control "public, max-age=3600"
+</FilesMatch>
+<Files "cf-challenge.html">
+    Header set Cache-Control "no-store"
+</Files>
+<Files "css.php">
+    Header set Cloudflare-CDN-Cache-Control "public, max-age=31536000, stale-if-error=86400"
+</Files>
+
+<IfModule LiteSpeed>
+    <IfModule mod_headers.c>
+        Header always unset Link env=WF_BETA_CONTROL
+        Header always set Cache-Control "private, no-store, no-cache, must-revalidate, max-age=0, s-maxage=0" env=WF_BETA_CONTROL
+        Header always set Cloudflare-CDN-Cache-Control "no-store" env=WF_BETA_CONTROL
+        Header always set CDN-Cache-Control "no-store" env=WF_BETA_CONTROL
+        Header always set Surrogate-Control "no-store" env=WF_BETA_CONTROL
+        Header always set X-LiteSpeed-Cache-Control "no-cache" env=WF_BETA_CONTROL
+        Header always set X-Robots-Tag "noindex, nofollow" env=WF_BETA_CONTROL
+        Header always set Pragma "no-cache" env=WF_BETA_CONTROL
+        Header always set Expires "0" env=WF_BETA_CONTROL
+    </IfModule>
+    <IfModule mod_headers.c>
+        Header set X-LiteSpeed-Cache-Control "no-cache" env=no-cache
+        Header set Cache-Control "no-store, no-cache, private" env=no-cache
+        Header set X-LiteSpeed-Cache-Control "no-cache" env=no-cache-lsonly
+        Header set X-LiteSpeed-Cache-Control "public, max-age=86400" env=proxy-img-cache
+        Header set Cloudflare-CDN-Cache-Control "no-cache, no-store, private" env=no-cache-sso
+        Header set CDN-Cache-Control "no-cache, no-store" env=no-cache-sso
+        Header set Surrogate-Control "no-store" env=no-cache-sso
+        Header set X-Cache-Optimizer "no-cache-sso" env=no-cache-sso
+        Header set Cloudflare-CDN-Cache-Control "no-cache, no-store, private" env=no-cache-webmcp
+        Header set CDN-Cache-Control "no-cache, no-store" env=no-cache-webmcp
+        Header set Surrogate-Control "no-store" env=no-cache-webmcp
+        Header set X-Cache-Optimizer "no-cache-webmcp" env=no-cache-webmcp
+        Header set X-LiteSpeed-Cache-Control "public, max-age=14400" env=wf-unfurl-image
+    </IfModule>
+    <IfModule mod_headers.c>
+        Header set X-LiteSpeed-Cache-Control "no-cache" env=no-cache-vc
+        Header set Cache-Control "no-store, no-cache, private" env=no-cache-vc
+    </IfModule>
+    <IfModule mod_headers.c>
+        Header set X-LiteSpeed-Cache-Control "no-cache" env=no-cache-api
+        Header set Cache-Control "no-store, no-cache, private" env=no-cache-api
+    </IfModule>
+    <IfModule mod_headers.c>
+        Header set X-LiteSpeed-Cache-Control "no-cache" env=no-cache-wp
+        Header set Cache-Control "no-store, no-cache, private" env=no-cache-wp
+    </IfModule>
+    <IfModule mod_headers.c>
+        Header set Cache-Control "no-store, no-cache, must-revalidate, private" env=cache-bypass-misc
+        Header set X-LiteSpeed-Cache-Control "no-cache" env=cache-bypass-misc
+    </IfModule>
+</IfModule>
+
+<FilesMatch "\.(ico|pdf|flv|jpg|jpeg|png|gif|js|css|swf|webp|html)(\.gz)?(\?.*)?$">
+  <IfModule mod_headers.c>
+    Header set Link "<%{CANONICAL}e>; rel=\"canonical\""
+  </IfModule>
+</FilesMatch>
+
+<IfModule mod_headers.c>
+    Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0, proxy-revalidate, private" env=NO_CACHE_BUILDS
+    Header set Pragma "no-cache" env=NO_CACHE_BUILDS
+    Header set Expires "Thu, 01 Jan 1970 00:00:00 GMT" env=NO_CACHE_BUILDS
+    Header set Cloudflare-CDN-Cache-Control "no-store, no-cache, max-age=0" env=NO_CACHE_BUILDS
+    Header set CF-Cache-Status "DYNAMIC" env=NO_CACHE_BUILDS
+    Header set CDN-Cache-Control "no-cache, no-store" env=NO_CACHE_BUILDS
+    Header set Edge-Control "no-store, bypass-cache" env=NO_CACHE_BUILDS
+    Header set X-LiteSpeed-Cache-Control "no-store, no-cache, max-age=0" env=NO_CACHE_BUILDS
+    Header set X-LiteSpeed-Cache "off" env=NO_CACHE_BUILDS
+    Header set X-LiteSpeed-Tag "no-cache" env=NO_CACHE_BUILDS
+    Header set Surrogate-Control "no-store" env=NO_CACHE_BUILDS
+    Header set X-Accel-Expires "0" env=NO_CACHE_BUILDS
+    Header set Vary "Cookie, Accept-Encoding" env=NO_CACHE_BUILDS
+</IfModule>
+
+<IfModule LiteSpeed>
+    <IfModule mod_headers.c>
+        Header set X-LiteSpeed-Cache-Control "no-cache, no-store, max-age=0" env=no-cache
+        Header set X-LiteSpeed-Cache "off" env=no-cache
+        Header set X-LiteSpeed-Tag "no-cache" env=no-cache
+        Header set X-LiteSpeed-Vary "value" env=no-cache
+    </IfModule>
+</IfModule>
+
+<Files "amp-onetap.html">
+    Header unset X-Frame-Options
+    Header set Content-Security-Policy "frame-ancestors 'self' https://*.ampproject.org https://*.cdn.ampproject.org https://cdn.ampproject.org"
+    Header set Cache-Control "public, max-age=600"
+</Files>

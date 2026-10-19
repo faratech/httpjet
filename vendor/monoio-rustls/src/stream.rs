@@ -14,7 +14,10 @@ use monoio::{
 use monoio_io_wrapper::ReadBuffer;
 use rustls::{ClientConnection, ConnectionCommon, ServerConnection, SideData};
 
-const TLS_WRITE_BUFFER_IDLE: usize = 64 * 1024;
+/// One rustls send batch in one write: rustls queues at most 64 KiB of plaintext
+/// (its default send-buffer limit), i.e. four full records, each adding at most
+/// 29 bytes of framing.
+const TLS_WRITE_BUFFER_IDLE: usize = 64 * 1024 + 256;
 const TLS_WRITE_BUFFER_BURST: usize = 512 * 1024;
 /// Idle-size write buffers kept warm per thread (see [`take_idle_box`]).
 const IDLE_BUFFER_POOL_CAP: usize = 32;
@@ -305,6 +308,47 @@ mod transition_tests {
         }
     }
 
+    /// A transport whose writes never complete, so a flush can be dropped mid-flight.
+    struct Stuck;
+
+    impl monoio::io::AsyncWriteRent for Stuck {
+        async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            std::future::pending::<()>().await;
+            (Ok(0), buf)
+        }
+        async fn writev<T: monoio::buf::IoVecBuf>(
+            &mut self,
+            buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            (Ok(0), buf)
+        }
+        async fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        async fn shutdown(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A flush dropped while its write is in flight takes the buffer with it; the next
+    /// write, flush or flush attempt (a close_notify at shutdown) is an error, not a panic.
+    #[test]
+    fn write_cancelled_in_flight_is_an_error_not_a_panic() {
+        let mut a = WriteBuffer::idle();
+        assert_eq!(a.write(b"alert").unwrap(), 5);
+        {
+            let mut stuck = Stuck;
+            let mut flush = std::pin::pin!(a.do_io(&mut stuck));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(flush.as_mut().poll(&mut context).is_pending());
+        }
+        let broken = |e: std::io::Error| e.kind() == std::io::ErrorKind::BrokenPipe;
+        assert!(a.write(b"close_notify").is_err_and(broken));
+        assert!(a.flush().is_err_and(broken));
+        assert!(ready(a.do_io(&mut Sink::default())).is_err_and(broken));
+        a.shrink_to_idle();
+    }
+
     /// Idle holds nothing; a write takes a pooled buffer, and the flushed buffer goes back
     /// to the pool for the next connection instead of being freed and re-faulted.
     #[test]
@@ -356,6 +400,70 @@ mod transition_tests {
         a.shrink_to_idle();
         assert_eq!(capacity(&a), 0);
         assert!(super::IDLE_BUFFERS.with(|pool| pool.borrow().is_empty()));
+    }
+
+    /// rustls offers every queued record to one `write_vectored`. Whole records that fit
+    /// the held buffer go out together; one that does not fit stays whole, and so does
+    /// everything after it, for the next write. Only the first slice may grow the buffer.
+    #[test]
+    fn vectored_write_copies_only_whole_slices_into_held_space() {
+        use std::io::IoSlice;
+
+        super::IDLE_BUFFERS.with(|pool| pool.borrow_mut().clear());
+        // A full rustls batch: 64 KiB of plaintext as four TLS 1.2 AES-GCM records.
+        let records: Vec<Vec<u8>> = (1..=5u8).map(|byte| vec![byte; 16_413]).collect();
+        let slices: Vec<IoSlice<'_>> = records.iter().map(|r| IoSlice::new(r)).collect();
+        let mut a = WriteBuffer::idle();
+        assert_eq!(a.write_vectored(&slices).unwrap(), 4 * 16_413);
+        assert_eq!(capacity(&a), super::TLS_WRITE_BUFFER_IDLE);
+        let mut sink = Sink::default();
+        ready(a.do_io(&mut sink)).unwrap();
+        assert_eq!(sink.0, records[..4].concat());
+
+        let big = vec![9u8; super::TLS_WRITE_BUFFER_IDLE - 100];
+        let partly_fits = vec![8u8; 101];
+        let would_fit = vec![7u8; 10];
+        let slices = [
+            IoSlice::new(&[]),
+            IoSlice::new(&big),
+            IoSlice::new(&partly_fits),
+            IoSlice::new(&would_fit),
+        ];
+        assert_eq!(a.write_vectored(&slices).unwrap(), big.len());
+        assert_eq!(capacity(&a), super::TLS_WRITE_BUFFER_IDLE);
+        sink.0.clear();
+        ready(a.do_io(&mut sink)).unwrap();
+        assert_eq!(sink.0, big);
+
+        let small = vec![6u8; 10];
+        let idle = vec![5u8; super::TLS_WRITE_BUFFER_IDLE];
+        assert_eq!(
+            a.write_vectored(&[IoSlice::new(&small), IoSlice::new(&idle)])
+                .unwrap(),
+            small.len(),
+            "a later slice never grows the buffer"
+        );
+        assert_eq!(capacity(&a), super::TLS_WRITE_BUFFER_IDLE);
+        sink.0.clear();
+        ready(a.do_io(&mut sink)).unwrap();
+        a.shrink_to_idle();
+
+        let burst = vec![4u8; super::TLS_WRITE_BUFFER_IDLE + 1];
+        assert_eq!(
+            a.write_vectored(&[IoSlice::new(&burst), IoSlice::new(&small)])
+                .unwrap(),
+            burst.len() + small.len(),
+            "the first slice grows the buffer as write does"
+        );
+        assert!(capacity(&a) > super::TLS_WRITE_BUFFER_IDLE);
+        sink.0.clear();
+        ready(a.do_io(&mut sink)).unwrap();
+        assert_eq!(sink.0, [burst, small].concat());
+        a.shrink_to_idle();
+
+        let mut b = WriteBuffer::idle();
+        assert_eq!(b.write_vectored(&[IoSlice::new(&[]); 3]).unwrap(), 0);
+        assert_eq!(capacity(&b), 0, "empty slices take no buffer");
     }
 
     #[test]
@@ -491,6 +599,14 @@ impl io::Write for WriteBuffer {
         }
     }
 
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Safe(b) => b.write_vectored(bufs),
+            #[cfg(feature = "unsafe_io")]
+            Self::Unsafe(b) => b.write_vectored(bufs),
+        }
+    }
+
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Safe(b) => b.flush(),
@@ -512,6 +628,13 @@ enum WriteStatus {
     Ok,
 }
 
+/// httpjet fork: a write future dropped mid-flight (a read that flushed alerts inside
+/// `read_io`, cancelled by a shutdown select) leaves no buffer behind. Every later use
+/// reports the connection as broken instead of panicking (panic=abort in httpjet).
+fn write_cancelled_in_flight() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "TLS write cancelled in flight")
+}
+
 impl SafeWriteBuffer {
     fn idle() -> Self {
         Self {
@@ -521,12 +644,16 @@ impl SafeWriteBuffer {
     }
 
     async fn do_io<IO: AsyncWriteRent>(&mut self, mut io: IO) -> io::Result<usize> {
-        let buffer = self.buffer.as_ref().expect("buffer ref expected");
+        let Some(buffer) = self.buffer.as_ref() else {
+            return Err(write_cancelled_in_flight());
+        };
         if buffer.is_empty() {
             return Ok(0);
         }
 
-        let buffer = self.buffer.take().expect("buffer present");
+        let Some(buffer) = self.buffer.take() else {
+            return Err(write_cancelled_in_flight());
+        };
         let (result, mut buffer) = io.write_all(buffer).await;
         match result {
             Ok(written_len) => {
@@ -561,7 +688,9 @@ impl SafeWriteBuffer {
 
 impl io::Write for SafeWriteBuffer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let buffer = self.buffer.as_mut().expect("buffer mut expected");
+        let Some(buffer) = self.buffer.as_mut() else {
+            return Err(write_cancelled_in_flight());
+        };
         match std::mem::replace(&mut self.status, WriteStatus::Ok) {
             WriteStatus::Err(e) => return Err(e),
             WriteStatus::Ok => {}
@@ -590,8 +719,36 @@ impl io::Write for SafeWriteBuffer {
         Ok(buffer.copy_from(buf))
     }
 
+    /// httpjet fork: rustls hands every queued record to one `write_vectored`; the
+    /// default copies only the first, costing one socket write per record. The first
+    /// slice keeps `write`'s semantics (buffer take, burst growth, WouldBlock); later
+    /// slices are copied only whole and only into space already held, so a record is
+    /// never split across writes and nothing grows the buffer.
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let mut rest = bufs.iter().skip_while(|slice| slice.is_empty());
+        let Some(first) = rest.next() else {
+            return self.write(&[]);
+        };
+        let mut written = self.write(first)?;
+        if written < first.len() {
+            return Ok(written);
+        }
+        let Some(buffer) = self.buffer.as_mut() else {
+            return Ok(written);
+        };
+        for slice in rest {
+            if slice.len() > buffer.available() {
+                break;
+            }
+            written += buffer.copy_from(slice);
+        }
+        Ok(written)
+    }
+
     fn flush(&mut self) -> io::Result<()> {
-        let buffer = self.buffer.as_mut().expect("buffer mut expected");
+        let Some(buffer) = self.buffer.as_mut() else {
+            return Err(write_cancelled_in_flight());
+        };
         match std::mem::replace(&mut self.status, WriteStatus::Ok) {
             WriteStatus::Err(e) => Err(e),
             WriteStatus::Ok if !buffer.is_empty() => Err(io::ErrorKind::WouldBlock.into()),

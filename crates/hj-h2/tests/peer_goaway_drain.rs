@@ -209,3 +209,243 @@ async fn peer_goaway_lets_an_in_progress_upload_finish() {
     drop(client);
     let _ = srv.await;
 }
+
+#[derive(Default, Debug)]
+struct Seen {
+    body: usize,
+    ended: bool,
+    cancelled: bool,
+    goaway: Option<u32>,
+}
+
+impl Seen {
+    /// Records one server frame on the #906 connection.
+    fn note(&mut self, hdr: &FrameHeader, p: &[u8]) {
+        match hdr.kind {
+            frame::kind::DATA if hdr.stream_id == 1 => {
+                self.body += p.len();
+                self.ended |= hdr.flags & frame::flags::END_STREAM != 0;
+            }
+            frame::kind::RST_STREAM if hdr.stream_id == 1 => {
+                assert_eq!(
+                    u32::from_be_bytes(p[..4].try_into().unwrap()),
+                    frame::error_code::CANCEL
+                );
+                self.cancelled = true;
+            }
+            frame::kind::GOAWAY => {
+                self.goaway = Some(u32::from_be_bytes(p[4..8].try_into().unwrap()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn drain_request() -> Vec<u8> {
+    let mut wire = hj_h2::conn::PREFACE.to_vec();
+    frame::write_settings(&mut wire, &[(frame::settings::INITIAL_WINDOW_SIZE, 16384)]);
+    let mut enc = Encoder::new();
+    get(&mut enc, &mut wire, 1);
+    frame::write_goaway(&mut wire, 0, frame::error_code::NO_ERROR);
+    wire
+}
+
+fn credit() -> Vec<u8> {
+    let mut w = Vec::new();
+    frame::write_window_update(&mut w, 1, 1_000_000);
+    frame::write_window_update(&mut w, 0, 1_000_000);
+    w
+}
+
+/// #906: GET with a 16 KiB stream window + GOAWAY(NO_ERROR), handler `delay`, 100 KB
+/// body; credit is granted once the window is exhausted when `grant`. Runs on paused
+/// time, so multi-second delays cost nothing.
+async fn drain_case(delay: Duration, grant: bool, config: Config) -> Seen {
+    let (mut client, server) = tokio::io::duplex(1 << 20);
+    let svc = move |_req: Request| async move {
+        tokio::time::sleep(delay).await;
+        http::Response::new(Body::Full(Bytes::from(vec![b'x'; BODY_LEN])))
+    };
+    let srv = tokio::spawn(async move { serve(server, svc, config, None).await });
+    client.write_all(&drain_request()).await.unwrap();
+
+    let mut seen = Seen::default();
+    let mut granted = false;
+    let read_all = async {
+        while let Some((hdr, p)) = read_frame(&mut client).await {
+            seen.note(&hdr, &p);
+            if grant && !granted && seen.body >= 16384 {
+                granted = true;
+                client.write_all(&credit()).await.unwrap();
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(600), read_all)
+        .await
+        .expect("server never closed the drained connection");
+    tokio::time::timeout(Duration::from_secs(10), srv)
+        .await
+        .expect("serve() must return after the drain")
+        .unwrap()
+        .unwrap();
+    seen
+}
+
+#[tokio::test(start_paused = true)]
+async fn peer_goaway_handler_past_twelve_seconds_is_fully_delivered() {
+    let seen = drain_case(Duration::from_secs(13), true, Config::default()).await;
+    assert!(
+        seen.ended && seen.body == BODY_LEN && !seen.cancelled,
+        "slow post-GOAWAY response truncated: {seen:?}"
+    );
+    assert_eq!(
+        seen.goaway, None,
+        "a completed drain needs no server GOAWAY"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_bound_resets_a_window_blocked_response_explicitly() {
+    let config = Config {
+        goaway_drain_timeout: Duration::from_secs(2),
+        send_stall_timeout: None,
+        ..Config::default()
+    };
+    let seen = drain_case(Duration::ZERO, false, config).await;
+    assert_eq!(seen.body, 16384, "{seen:?}");
+    assert!(!seen.ended && seen.cancelled, "silent truncation: {seen:?}");
+    assert_eq!(seen.goaway, Some(frame::error_code::NO_ERROR), "{seen:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn drain_bound_resets_an_inflight_handler_explicitly() {
+    let config = Config {
+        goaway_drain_timeout: Duration::from_secs(2),
+        ..Config::default()
+    };
+    let seen = drain_case(Duration::from_secs(30), true, config).await;
+    assert_eq!(seen.body, 0, "{seen:?}");
+    assert!(seen.cancelled, "silent truncation: {seen:?}");
+    assert_eq!(seen.goaway, Some(frame::error_code::NO_ERROR), "{seen:?}");
+}
+
+#[cfg(feature = "monoio")]
+mod monoio_path {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
+    /// The monoio twin of `drain_case`, on real time. The handler waits on a std
+    /// thread (monoio shares no timer with tokio) and resumes over a
+    /// runtime-agnostic oneshot.
+    fn monoio_drain_case(delay: Duration, grant: bool, config: Config) -> Seen {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .enable_timer()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                hj_h2::server::serve_local_with_prefix(
+                    stream,
+                    Vec::new(),
+                    move |_req: Request| {
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(delay);
+                            let _ = tx.send(());
+                        });
+                        async move {
+                            let _ = rx.await;
+                            http::Response::new(Body::Full(Bytes::from(vec![b'x'; BODY_LEN])))
+                        }
+                    },
+                    config,
+                    None,
+                    None,
+                )
+                .await
+            })
+        });
+
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        stream.write_all(&drain_request()).unwrap();
+
+        let (mut buf, mut at, mut raw) = ([0u8; 16384], 0usize, Vec::new());
+        let mut seen = Seen::default();
+        let mut granted = false;
+        let started = Instant::now();
+        loop {
+            assert!(
+                started.elapsed() < delay + Duration::from_secs(10),
+                "server never closed: {seen:?}"
+            );
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+            while let Some(h) = raw.get(at..at + FrameHeader::LEN) {
+                let hdr = FrameHeader::parse(h).unwrap();
+                let start = at + FrameHeader::LEN;
+                let Some(p) = raw.get(start..start + hdr.length as usize) else {
+                    break;
+                };
+                seen.note(&hdr, p);
+                at = start + hdr.length as usize;
+            }
+            if grant && !granted && seen.body >= 16384 {
+                granted = true;
+                stream.write_all(&credit()).unwrap();
+            }
+        }
+        drop(stream);
+        server.join().unwrap().unwrap();
+        seen
+    }
+
+    #[test]
+    fn monoio_peer_goaway_handler_past_twelve_seconds_is_fully_delivered() {
+        let seen = monoio_drain_case(Duration::from_secs(13), true, Config::default());
+        assert!(
+            seen.ended && seen.body == BODY_LEN && !seen.cancelled,
+            "slow post-GOAWAY response truncated: {seen:?}"
+        );
+        assert_eq!(seen.goaway, None);
+    }
+
+    #[test]
+    fn monoio_drain_bound_resets_a_window_blocked_response_explicitly() {
+        let config = Config {
+            goaway_drain_timeout: Duration::from_millis(500),
+            send_stall_timeout: None,
+            ..Config::default()
+        };
+        let seen = monoio_drain_case(Duration::ZERO, false, config);
+        assert_eq!(seen.body, 16384, "{seen:?}");
+        assert!(!seen.ended && seen.cancelled, "silent truncation: {seen:?}");
+        assert_eq!(seen.goaway, Some(frame::error_code::NO_ERROR), "{seen:?}");
+    }
+
+    #[test]
+    fn monoio_drain_bound_resets_an_inflight_handler_explicitly() {
+        let config = Config {
+            goaway_drain_timeout: Duration::from_millis(500),
+            ..Config::default()
+        };
+        let seen = monoio_drain_case(Duration::from_secs(3), true, config);
+        assert_eq!(seen.body, 0, "{seen:?}");
+        assert!(seen.cancelled, "silent truncation: {seen:?}");
+        assert_eq!(seen.goaway, Some(frame::error_code::NO_ERROR), "{seen:?}");
+    }
+}

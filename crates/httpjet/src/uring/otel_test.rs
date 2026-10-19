@@ -85,6 +85,7 @@ fn traced_fast_and_bridged_requests() {
         sni: None,
         tls: None,
         request_generation: None,
+        response_budget: crate::uring::bridge::connection_response_budget(),
     };
     // Drive the same H2 service dispatcher with both on-core and bridged requests.
     runtime.block_on(async {

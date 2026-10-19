@@ -958,7 +958,34 @@ fn resolve_page_cache_store_path(cli: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// SIGHUP/SIGUSR1/SIGUSR2 streams, installed before slow startup work (#946).
+/// Installing a tokio stream replaces the default action (terminate) for the
+/// process lifetime and queues one delivery, so a signal sent mid-startup (the
+/// cert-reload hook's HUP racing a restart) is acted on once the serve loop runs
+/// instead of killing the process. SIGTERM keeps its default action until the
+/// loop, so a stop during startup still exits at once.
+struct ControlSignals {
+    hup: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
+    usr2: tokio::signal::unix::Signal,
+}
+
+impl ControlSignals {
+    /// Must be called inside a runtime context with the signal driver enabled.
+    fn install() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            hup: signal(SignalKind::hangup())?,
+            usr1: signal(SignalKind::user_defined1())?,
+            usr2: signal(SignalKind::user_defined2())?,
+        })
+    }
+}
+
 fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
+    // (#945) Before anything can fork/exec (the in-process lsphp pool spawns long
+    // before the listeners are adopted), so no child inherits the public sockets.
+    server::cloexec_activation_fds();
     let request_decompression =
         uring::request_body::RequestDecompression::parse_extra(&args.request_decompression_extra)
             .map_err(anyhow::Error::msg)?;
@@ -1001,6 +1028,10 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         .on_thread_stop(memtrim::force_collect)
         .enable_all()
         .build()?;
+    let signals = {
+        let _enter = rt.enter();
+        ControlSignals::install()?
+    };
 
     // Initialize logging FIRST: inside the runtime context (the persistent error
     // logger spawns a writer task) and BEFORE config load, so startup warnings are
@@ -1841,9 +1872,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // exits, so the wait is a loop.
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
-        let mut sigusr1 = signal(SignalKind::user_defined1()).expect("install SIGUSR1 handler");
-        let mut sigusr2 = signal(SignalKind::user_defined2()).expect("install SIGUSR2 handler");
-        let mut sighup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+        // Installed at startup; a delivery queued since then is handled on the
+        // first loop iteration (HUP reloads, USR1 reopens, USR2 toggles).
+        let ControlSignals {
+            hup: mut sighup,
+            usr1: mut sigusr1,
+            usr2: mut sigusr2,
+        } = signals;
         // All transport groups and process-level setup are ready before any
         // worker accepts. A startup error above retires still-inactive groups.
         let resources = resource_generation::TransportResources::new(
@@ -1995,14 +2030,16 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // (including a streaming body) then closing, and closing idle keep-alives
         // promptly (GOAWAY / Connection: close). We then wait for `active_conns` to
         // reach zero so nothing is killed mid-response on a deploy/monit restart.
-        // The budget stays under the unit's TimeoutStopSec=20 (leaving headroom for
-        // the lsphp drain below) so systemd never SIGKILLs us mid-drain; an
-        // unbounded stream (SSE/long-poll) that never ends is cut at the budget.
+        // A stream idle on its backend (SSE/long-poll) is ended by its core after
+        // `SHUTDOWN_IDLE_GRACE`; anything else is bounded by the cores' own drain
+        // grace, which `finish_shutdown` below joins on — so this wait uses that same
+        // bound (a shorter one only moved the wait into the join, #1034), kept under
+        // the unit's TimeoutStopSec=20 with headroom for the lsphp drain below.
         tracing::info!("shutdown signal received; draining connections");
         transactions.close();
         state.shutdown.cancel();
         holder.load().proxy.pool().stop_health_checks();
-        let drain_budget = std::time::Duration::from_secs(12);
+        let drain_budget = uring::URING_DRAIN_GRACE;
         let drain_start = std::time::Instant::now();
         loop {
             let open = state.metrics.active_conns.load(std::sync::atomic::Ordering::Relaxed);
@@ -2101,12 +2138,21 @@ impl Drop for ControlSocketGuard {
     }
 }
 
+/// The control socket is bound, chmodded and renamed into place by name, so its
+/// directory gets the same owner/mode stance as the generation file's.
+fn prepare_lsphp_control_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    hj_lsapi::validate_operator_dir(parent, "lsphp control socket dir")
+}
+
 fn bind_lsphp_control(
     path: &std::path::Path,
 ) -> std::io::Result<(tokio::net::UnixListener, ControlSocketGuard)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    prepare_lsphp_control_dir(path)?;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
             if std::os::unix::net::UnixStream::connect(path).is_ok() {
@@ -2369,6 +2415,20 @@ fn lsphp(root: &std::path::Path, args: LsphpArgs) -> anyhow::Result<()> {
         .init();
     // Adopt a systemd socket-activated listen fd if present (clears LISTEN_* env).
     let inherited_fd = lsphp_listen_fd_from_env()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
+        .on_thread_park(memtrim::collect_if_requested_on_thread)
+        .on_thread_stop(memtrim::force_collect)
+        .enable_all()
+        .build()?;
+    // (#946) HUP/USR1/USR2 must never default-terminate the pool (and with it
+    // every PHP worker). Deliberately log-and-ignore: a reload is a privileged,
+    // candidate-first operation reached through the root-only control socket
+    // (`systemctl reload httpjet-lsphp`); a stray HUP must not trigger one.
+    let mut signals = {
+        let _enter = rt.enter();
+        ControlSignals::install()?
+    };
     let cfg = hj_config::load(root)?;
     let server = Arc::new(cfg);
     let php = server
@@ -2377,12 +2437,6 @@ fn lsphp(root: &std::path::Path, args: LsphpArgs) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("no <phpConfig> in the config — nothing to run"))?
         .clone();
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(RUNTIME_THREAD_STACK_BYTES)
-        .on_thread_park(memtrim::collect_if_requested_on_thread)
-        .on_thread_stop(memtrim::force_collect)
-        .enable_all()
-        .build()?;
     rt.block_on(async move {
         let generation_file = args
             .generation_file
@@ -2392,6 +2446,8 @@ fn lsphp(root: &std::path::Path, args: LsphpArgs) -> anyhow::Result<()> {
             .control_socket
             .clone()
             .unwrap_or_else(|| lsphp_sibling_path(&args.php_socket, "control"));
+        // Refuse an unsafe control directory before any state file or worker exists.
+        prepare_lsphp_control_dir(&control_socket)?;
         let generation_publisher = Arc::new(hj_lsapi::ExternalGenerationWriter::open_or_create(
             &generation_file,
         )?);
@@ -2491,14 +2547,21 @@ fn lsphp(root: &std::path::Path, args: LsphpArgs) -> anyhow::Result<()> {
             generation_publisher.clone(),
             control_shutdown.clone(),
         ));
-        let control_error = tokio::select! {
-            _ = tokio::signal::ctrl_c() => None,
-            _ = sigterm.recv() => None,
-            result = &mut control_task => Some(match result {
-                Ok(Ok(())) => anyhow::anyhow!("lsphp control server exited unexpectedly"),
-                Ok(Err(error)) => error.into(),
-                Err(error) => anyhow::anyhow!("lsphp control task failed: {error}"),
-            }),
+        let control_error = loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break None,
+                _ = sigterm.recv() => break None,
+                result = &mut control_task => break Some(match result {
+                    Ok(Ok(())) => anyhow::anyhow!("lsphp control server exited unexpectedly"),
+                    Ok(Err(error)) => error.into(),
+                    Err(error) => anyhow::anyhow!("lsphp control task failed: {error}"),
+                }),
+                _ = signals.hup.recv() => tracing::warn!(
+                    "SIGHUP ignored; reload the pool with `systemctl reload httpjet-lsphp` (httpjet lsphp-reload)"
+                ),
+                _ = signals.usr1.recv() => tracing::info!("SIGUSR1 ignored (the lsphp pool keeps no log files to reopen)"),
+                _ = signals.usr2.recv() => tracing::info!("SIGUSR2 ignored"),
+            }
         };
         let _ = systemd_notify("STOPPING=1\nSTATUS=Draining lsphp pool");
         if control_error.is_none() {
@@ -2644,8 +2707,21 @@ fn pp_bind_is_public(address: &str) -> bool {
 }
 
 fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
-    let cfg = hj_config::load(root)?;
+    let (cfg, skipped) = hj_config::load_report(root)?;
+    let cfg = Arc::new(cfg);
     hj_acl::AccessControl::from_security(&cfg.security).map_err(anyhow::Error::msg)?;
+    // Serving refuses a vhost whose inline rules do not parse (#754/#755), so the
+    // deploy-time `check --strict` must fail on them too.
+    for (name, decl) in &cfg.vhosts {
+        if let Some(vhost) = &decl.config
+            && vhost.rewrite.enable
+            && !vhost.rewrite.rules.trim().is_empty()
+        {
+            hj_rewrite::RuleSet::parse(&vhost.rewrite.rules).map_err(|e| {
+                anyhow::anyhow!("vhost {name}: inline rewrite rules do not parse: {e}")
+            })?;
+        }
+    }
     println!("httpjet config check — root: {}", cfg.server_root.display());
     println!("  server name : {}", cfg.server_name);
     println!("  run as      : {}:{}", cfg.user, cfg.group);
@@ -2669,19 +2745,10 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
         }
     );
 
-    // (Tier 2) Geo ACL rules that cannot fire are the worst kind of silent no-op.
-    {
-        let s = &cfg.security;
-        let configured = !s.geo_allow.is_empty()
-            || !s.geo_deny.is_empty()
-            || !s.asn_allow.is_empty()
-            || !s.asn_deny.is_empty();
-        if configured && s.geo_db_file.is_none() {
-            println!(
-                "  lint WARN : geoAllow/geoDeny/asnAllow/asnDeny configured without <geoipDBFile> — the geo ACL is INERT"
-            );
-        }
-    }
+    // Geo rules are validated exactly as boot and SIGHUP reload validate them: a
+    // missing/unreadable db or an unknown label refuses to serve, so the deploy
+    // gate must refuse too (#839).
+    crate::state::build_geo_rules(&cfg).map_err(anyhow::Error::msg)?;
 
     // (#593) POST page caching is not implemented in the cache glue; the
     // knob must not be silently inert.
@@ -2786,12 +2853,23 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
             .map(|c| c.doc_root.display().to_string())
             .unwrap_or_else(|| "<not loaded>".into());
         println!("    - {:<28} -> {}", name, docroot);
+        for line in vhost_status_lines(name, decl, &skipped) {
+            println!("{line}");
+        }
+        let mut docroot_htaccess = None;
         if let Some(c) = decl.config.as_ref()
             && c.overrides_enabled(c.rewrite.auto_load_htaccess)
             && let Ok(text) =
                 std::fs::read_to_string(c.doc_root.join(c.access_file_name_or_default()))
         {
             println!("      fast_memo: {}", describe_memo_eligibility(&text));
+            docroot_htaccess = Some(text);
+        }
+        if let Some(c) = decl.config.as_ref() {
+            println!(
+                "      page_cache: {}",
+                describe_page_cache_keying(c, docroot_htaccess.as_deref())
+            );
         }
     }
 
@@ -2800,7 +2878,158 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
         println!("  lint WARN : {w}");
     }
 
-    lint_topology(&cfg, strict)
+    let topology = lint_topology(&cfg, &skipped, strict);
+    // Serve refuses these configs at ServerState::new; the gate must too (#884).
+    state::validate_serving_config(&cfg).map_err(anyhow::Error::msg)?;
+    lint_listener_tls(&cfg, strict)?;
+    topology
+}
+
+/// `check`'s load/disable status lines for one vhost. scripts/deploy-lscache.sh
+/// greps the `DISABLED-VHOST:` lines (#1011).
+fn vhost_status_lines(
+    name: &str,
+    decl: &hj_config::VHostDecl,
+    skipped: &[hj_config::SkippedVhost],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(skip) = skipped.iter().find(|s| s.name == name) {
+        lines.push(format!("      not loaded: {}", skip.error));
+    }
+    if decl.config.as_ref().is_some_and(|c| c.disabled) {
+        lines.push(
+            "      disabled: every request answers 403 (enabled=0 or suspendedVhosts)".into(),
+        );
+        lines.push(format!("DISABLED-VHOST: {name}"));
+    }
+    lines
+}
+
+/// Load each secure listener's TLS material (default cert/key, SNI certs, client
+/// verifier) exactly as serve does — file reads only, never a bind (#884). Serve loads
+/// the FIRST secure listener; a failure there refuses to boot, so it is an error
+/// under --strict. Later secure listeners are not served, so theirs only warn.
+fn lint_listener_tls(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<()> {
+    let mut failures = 0usize;
+    for (index, listener) in cfg.listeners.iter().filter(|l| l.secure).enumerate() {
+        let prepared = hj_tls::install_crypto_provider().and_then(|()| {
+            hj_tls::PreparedListenerTls::prepare(cfg, listener, false, cfg.quic_enable, false)
+        });
+        let Err(error) = prepared else {
+            continue;
+        };
+        if index == 0 && strict {
+            failures += 1;
+            println!(
+                "  lint ERROR: listener '{}' TLS does not load: {error:#}",
+                listener.name
+            );
+        } else {
+            println!(
+                "  lint WARN : listener '{}' TLS does not load: {error:#}",
+                listener.name
+            );
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("strict lint failed: secure listener TLS material does not load");
+    }
+    Ok(())
+}
+
+/// One tag of a LiteSpeed XML file; comments, declarations and processing
+/// instructions are skipped. LiteSpeed matches element names case-insensitively
+/// (OLS `XmlNode`), so lints compare `name` with `eq_ignore_ascii_case`.
+struct XmlTag<'a> {
+    name: &'a str,
+    closing: bool,
+    empty: bool,
+    /// Byte offset just past the tag's `>`.
+    end: usize,
+}
+
+fn xml_tags(text: &str) -> impl Iterator<Item = XmlTag<'_>> {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        loop {
+            let open = pos + text.get(pos..)?.find('<')?;
+            let after = text.get(open + 1..)?;
+            if let Some(comment) = after.strip_prefix("!--") {
+                pos = open + 4 + comment.find("-->")? + 3;
+                continue;
+            }
+            let gt = open + 1 + after.find('>')?;
+            pos = gt + 1;
+            let inner = text.get(open + 1..gt)?;
+            if inner.starts_with(['!', '?']) {
+                continue;
+            }
+            let (closing, inner) = match inner.strip_prefix('/') {
+                Some(rest) => (true, rest),
+                None => (false, inner),
+            };
+            let name = inner
+                .split(|c: char| c.is_ascii_whitespace() || c == '/')
+                .next()
+                .unwrap_or_default();
+            if !name.is_empty() {
+                return Some(XmlTag {
+                    name,
+                    closing,
+                    empty: !closing && inner.ends_with('/'),
+                    end: pos,
+                });
+            }
+        }
+    })
+}
+
+/// Text content of the first `<tag>` element in `text`.
+fn first_element_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open =
+        xml_tags(text).find(|t| !t.closing && !t.empty && t.name.eq_ignore_ascii_case(tag))?;
+    let rest = text.get(open.end..)?;
+    rest.get(..rest.find('<')?)
+}
+
+/// Children of the server's first `<security><CGIRLimit>`: httpjet runs no CGI daemon
+/// and, like OLS's local workers, gives lsphp none of these limits (#1037), so every
+/// child is ignored.
+fn ignored_cgi_rlimit_children(text: &str) -> Vec<&str> {
+    let mut open: Vec<&str> = Vec::new();
+    let mut block: Option<usize> = None;
+    let mut ignored: Vec<&str> = Vec::new();
+    for tag in xml_tags(text) {
+        if tag.closing {
+            open.pop();
+            if block == Some(open.len()) {
+                break;
+            }
+            continue;
+        }
+        if let Some(depth) = block {
+            if open.len() == depth + 1
+                && !ignored
+                    .iter()
+                    .any(|seen| seen.eq_ignore_ascii_case(tag.name))
+            {
+                ignored.push(tag.name);
+            }
+        } else if tag.name.eq_ignore_ascii_case("CGIRLimit")
+            && open
+                .last()
+                .is_some_and(|parent| parent.eq_ignore_ascii_case("security"))
+        {
+            if tag.empty {
+                break;
+            }
+            block = Some(open.len());
+        }
+        if !tag.empty {
+            open.push(tag.name);
+        }
+    }
+    ignored
 }
 
 /// (audit 2026-08-30) Surface config that httpjet parses but does not implement, or
@@ -2815,30 +3044,54 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
     let mut texts: Vec<(String, String)> = Vec::new();
     let server_xml = root.join("conf/httpd_config.xml");
     if let Ok(t) = std::fs::read_to_string(&server_xml) {
-        texts.push((server_xml.display().to_string(), t));
+        let file = server_xml.display().to_string();
+        let ignored = ignored_cgi_rlimit_children(&t);
+        if !ignored.is_empty() {
+            let inherited = ignored.iter().any(|name| {
+                [
+                    "memSoftLimit",
+                    "memHardLimit",
+                    "procSoftLimit",
+                    "procHardLimit",
+                ]
+                .iter()
+                .any(|limit| limit.eq_ignore_ascii_case(name))
+            });
+            warnings.push(format!(
+                "element <CGIRLimit> in {file} is not implemented: httpjet runs no CGI daemon and lsphp workers take only the external app's own limits; {} ignored{}",
+                ignored
+                    .iter()
+                    .map(|name| format!("<{name}>"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if inherited {
+                    " (LiteSpeed also uses its memory/process limits as the default for external apps that set none)"
+                } else {
+                    ""
+                }
+            ));
+        }
+        texts.push((file, t));
     }
     for decl in cfg.vhosts.values() {
         if let Ok(t) = std::fs::read_to_string(&decl.config_file) {
             texts.push((decl.config_file.display().to_string(), t));
         }
     }
+    // Spelled as LiteSpeed's admin definitions (DTblDef.php) name them.
     const UNIMPLEMENTED: &[&str] = &[
         "lsrecaptcha",
         "censorshipControl",
         "requiredPermissionMask",
         "restrictedPermissionMask",
-        "cgiRlimit",
+        "restrictedScriptPermissionMask",
+        "restrictedDirPermissionMask",
     ];
     for (file, text) in &texts {
         for tag in ["connTimeout", "keepAliveTimeout"] {
-            let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-            let Some(start) = text.find(&open).map(|i| i + open.len()) else {
+            let Some(raw) = first_element_text(text, tag).map(str::trim) else {
                 continue;
             };
-            let Some(len) = text[start..].find(&close) else {
-                continue;
-            };
-            let raw = text[start..start + len].trim();
             if raw.parse::<u64>().is_ok_and(|v| !(1..=10_000).contains(&v)) {
                 warnings.push(format!(
                     "<{tag}>{raw}</{tag}> in {file} is outside LiteSpeed's range [1, 10000]; httpjet uses its default instead"
@@ -2846,7 +3099,7 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
             }
         }
         for tag in UNIMPLEMENTED {
-            if text.contains(&format!("<{tag}>")) || text.contains(&format!("<{tag} ")) {
+            if xml_tags(text).any(|t| !t.closing && t.name.eq_ignore_ascii_case(tag)) {
                 warnings.push(format!(
                     "element <{tag}> in {file} is not implemented by httpjet — it is ignored (e.g. reCAPTCHA/censorship protection is NOT active)"
                 ));
@@ -2935,6 +3188,30 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
 /// One-line `fast_memo` verdict for a docroot `.htaccess` (the on-core static
 /// memo stores only under a chain every file of which is `MemoClass`-eligible):
 /// what it varies on, or the first blocking directive and its line.
+/// (#857) Whether the vhost's inline rules and docroot `.htaccess` keep its
+/// responses shareable by the page cache (a deeper `.htaccess` is judged per
+/// request). An unkeyed read bypasses the cache for every request it governs.
+fn describe_page_cache_keying(c: &hj_core::config::VHostConfig, htaccess: Option<&str>) -> String {
+    if c.rewrite.enable
+        && !c.rewrite.rules.trim().is_empty()
+        && let Ok(rs) = hj_rewrite::RuleSet::parse(&c.rewrite.rules)
+        && !rs.page_cache_keyed()
+        && let Some(var) = rs.page_cache_unkeyed.as_deref()
+    {
+        return format!("bypass — inline rewrite reads %{{{var}}}");
+    }
+    let Some(text) = htaccess else {
+        return "keyed".to_string();
+    };
+    match hj_rewrite::Htaccess::parse(text) {
+        Ok(h) => match h.page_cache_unkeyed_reason() {
+            Some(reason) => format!("bypass — {reason}"),
+            None => "keyed".to_string(),
+        },
+        Err(e) => format!("bypass — .htaccess parse error: {e}"),
+    }
+}
+
 fn describe_memo_eligibility(text: &str) -> String {
     let h = match hj_rewrite::Htaccess::parse(text) {
         Ok(h) => h,
@@ -2979,13 +3256,23 @@ fn mapped_unloaded_vhosts(cfg: &hj_config::ServerConfig) -> Vec<&str> {
         .flat_map(|l| l.vhost_map.iter())
         .map(|m| m.vhost.as_str())
         .collect();
-    cfg.vhost_order
+    let mut out: Vec<&str> = cfg
+        .vhost_order
         .iter()
         .filter(|name| {
             all_mapped.contains(name.as_str()) && cfg.vhosts[name.as_str()].config.is_none()
         })
         .map(|s| s.as_str())
-        .collect()
+        .collect();
+    // A map naming a vhost absent from virtualHostList routes nowhere (Router::resolve
+    // yields None, a bare 404) — the same outage as an unloaded file (#885).
+    let mut undeclared: Vec<&str> = all_mapped
+        .into_iter()
+        .filter(|name| !cfg.vhosts.contains_key(*name))
+        .collect();
+    undeclared.sort_unstable();
+    out.extend(undeclared);
+    out
 }
 
 /// For a SIGHUP hot-reload: the mapped vhosts the new config would newly break (config file fails
@@ -3007,7 +3294,11 @@ fn reload_would_brick_vhosts(
 /// Vhost/listener topology lints + a local topology fingerprint. Every shape
 /// here is a generalization of a real foreign-host leak; the test names use reserved domains.
 /// a missing `www.` mapping falling to the `*` catch-all.
-fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<()> {
+fn lint_topology(
+    cfg: &hj_config::ServerConfig,
+    skipped: &[hj_config::SkippedVhost],
+    strict: bool,
+) -> anyhow::Result<()> {
     let mut warnings: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
@@ -3070,6 +3361,12 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
         }
     }
 
+    // OLS mapDomainList normalizations the router applies (#940): a configured port is ignored,
+    // and a domain a second vhost also claims (directly or via its `www.` form) keeps the first.
+    for l in &cfg.listeners {
+        warnings.extend(l.domain_routes().warnings);
+    }
+
     // A non-"*" wildcard vhostMap domain (e.g. "*.example.com") is stored as a LITERAL exact key
     // the router never matches (httpjet has no glob matcher, unlike OLS) — those hosts silently fall
     // to the "*" default vhost. Warn (not error: it degrades to the catch-all, not an invariant
@@ -3110,13 +3407,41 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
     }
 
     // A vhost that is MAPPED on a listener but whose per-vhost config file failed to load is
-    // reachable by routing yet would 404 EVERY request to that host — a silent per-host outage (a
-    // bad reload, a partial deploy/rsync, or a permission change). Hard error so `check --strict`
-    // and the deploy gate catch the broken file before traffic does.
-    for name in mapped_unloaded_vhosts(cfg) {
-        errors.push(format!(
-            "vhost '{name}' is mapped on a listener but its per-vhost config file did not load — every request to it would 404"
-        ));
+    // reachable by routing yet answers 503 to EVERY request — a per-host outage (a bad reload,
+    // a partial deploy/rsync, or a permission change). Hard error so `check --strict` and the
+    // deploy gate catch the broken file before traffic does.
+    let mapped_unloaded = mapped_unloaded_vhosts(cfg);
+    let skip_reason = |name: &str| {
+        skipped
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| format!(" ({})", s.error))
+            .unwrap_or_default()
+    };
+    for &name in &mapped_unloaded {
+        if cfg.vhosts.contains_key(name) {
+            errors.push(format!(
+                "vhost '{name}' is mapped on a listener but its per-vhost config file did not load{} — every request to it answers 503",
+                skip_reason(name)
+            ));
+        } else {
+            errors.push(format!(
+                "vhostMap names vhost '{name}', which is not declared in virtualHostList — every request to its domains would 404"
+            ));
+        }
+    }
+
+    // Serve skips a vhost without a document root, as OLS does (#1010); until then it
+    // refused the whole load, so the gate still refuses one even when unmapped.
+    for skip in skipped {
+        if matches!(skip.error, hj_config::ConfigError::MissingDirective { .. })
+            && !mapped_unloaded.contains(&skip.name.as_str())
+        {
+            errors.push(format!(
+                "vhost '{}' did not load: {}",
+                skip.name, skip.error
+            ));
+        }
     }
 
     // (audit 2026-08-30) Same class, one step later in the chain: a LOADED vhost whose
@@ -3184,6 +3509,58 @@ fn lint_topology(cfg: &hj_config::ServerConfig, strict: bool) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (#857) prod-safety: on the live host, every vhost's inline rules and
+    /// docroot `.htaccess` stay page-cache keyed, so the unkeyed-input bypass
+    /// never withdraws a live site from the cache.
+    #[test]
+    fn live_vhosts_stay_page_cache_keyed() {
+        let root = std::path::Path::new("/usr/local/lsws");
+        if !root.join("conf/httpd_config.xml").is_file() {
+            return;
+        }
+        let cfg = hj_config::load(root).expect("the live config must load");
+        let mut checked = 0;
+        for (name, decl) in &cfg.vhosts {
+            let Some(c) = decl.config.as_ref() else {
+                continue;
+            };
+            let htaccess = c
+                .overrides_enabled(c.rewrite.auto_load_htaccess)
+                .then(|| std::fs::read_to_string(c.doc_root.join(c.access_file_name_or_default())))
+                .and_then(Result::ok);
+            assert_eq!(
+                describe_page_cache_keying(c, htaccess.as_deref()),
+                "keyed",
+                "vhost {name}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0);
+        if let Ok(text) = std::fs::read_to_string("/web/public_html/.htaccess") {
+            let h = hj_rewrite::Htaccess::parse(&text).unwrap();
+            assert!(h.page_cache_keyed(), "{:?}", h.page_cache_unkeyed_reason());
+        }
+    }
+
+    #[test]
+    fn page_cache_keying_reports_the_first_unkeyed_read() {
+        let mut c = hj_core::config::VHostConfig::default();
+        assert_eq!(
+            describe_page_cache_keying(&c, Some("SetEnvIf Remote_Addr ^1 A=1\n")),
+            "bypass — set_env_if_remote at line 1"
+        );
+        assert_eq!(
+            describe_page_cache_keying(&c, Some("SetEnvIf Origin ^a A=1\n")),
+            "keyed"
+        );
+        c.rewrite.enable = true;
+        c.rewrite.rules = "RewriteCond %{SERVER_PORT} ^8080$\nRewriteRule ^ /x [L]".into();
+        assert_eq!(
+            describe_page_cache_keying(&c, None),
+            "bypass — inline rewrite reads %{SERVER_PORT}"
+        );
+    }
 
     #[test]
     fn sigusr2_toggle_keeps_non_httpjet_targets() {
@@ -3395,6 +3772,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1032: the lints match element names as LiteSpeed does (case-insensitively,
+    /// never inside comments), and `<CGIRLimit>` reports every child it carries, CPU
+    /// limits included: none of them reaches lsphp (#1037).
+    #[test]
+    fn unsupported_element_lints_match_litespeed_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "hj-lint-names-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let lint = |xml: &str| {
+            std::fs::write(dir.join("conf/httpd_config.xml"), xml).unwrap();
+            lint_unsupported_features(&hj_config::ServerConfig::default(), &dir)
+        };
+
+        let warnings = lint(
+            "<httpServerConfig>\
+               <!-- <censorshipControl> is only mentioned here -->\
+               <tuning><ConnTimeout>99999</ConnTimeout></tuning>\
+               <security>\
+                 <fileAccessControl>\
+                   <RestrictedScriptPermissionMask>000</RestrictedScriptPermissionMask>\
+                 </fileAccessControl>\
+                 <cgirlimit>\
+                   <CPUSoftLimit>300</CPUSoftLimit><maxCGIInstances>100</maxCGIInstances>\
+                   <procSoftLimit>1400</procSoftLimit><cgroups/>\
+                 </cgirlimit>\
+                 <censorshipRuleSet><enabled>0</enabled></censorshipRuleSet>\
+               </security>\
+               <LSRecaptcha><enabled>0</enabled></LSRecaptcha>\
+             </httpServerConfig>",
+        );
+        let has = |needle: &str| warnings.iter().any(|w| w.contains(needle));
+        assert!(
+            has("<CGIRLimit> in")
+                && has(
+                    "<CPUSoftLimit>, <maxCGIInstances>, <procSoftLimit>, <cgroups> ignored (LiteSpeed also"
+                ),
+            "{warnings:?}"
+        );
+        assert!(!has("<enabled>"), "{warnings:?}");
+        let cpu_only = lint(
+            "<httpServerConfig><security><CGIRLimit>\
+               <CPUSoftLimit>300</CPUSoftLimit><CPUHardLimit>600</CPUHardLimit>\
+             </CGIRLimit></security></httpServerConfig>",
+        );
+        assert!(
+            cpu_only
+                .iter()
+                .any(|w| w.contains("<CPUSoftLimit>, <CPUHardLimit> ignored")),
+            "CPU-only limits are inert, so they are reported: {cpu_only:?}"
+        );
+        assert!(has("element <lsrecaptcha> in"), "{warnings:?}");
+        assert!(
+            has("element <restrictedScriptPermissionMask> in"),
+            "{warnings:?}"
+        );
+        assert!(has("<connTimeout>99999</connTimeout>"), "{warnings:?}");
+        assert!(
+            !has("censorshipControl"),
+            "a comment is not an element: {warnings:?}"
+        );
+
+        for quiet in [
+            "<httpServerConfig><security><CGIRLimit/><censorshipControl>\
+               <enableCensorship>0</enableCensorship></censorshipControl></security>\
+             </httpServerConfig>",
+            "<httpServerConfig><CGIRLimit><minUID>11</minUID></CGIRLimit></httpServerConfig>",
+        ] {
+            let warnings = lint(quiet);
+            assert!(
+                !warnings.iter().any(|w| w.contains("CGIRLimit")),
+                "{quiet}: {warnings:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn unsupported_feature_and_missing_docroot_lints() {
         let dir = std::env::temp_dir().join(format!(
@@ -3432,8 +3891,9 @@ mod tests {
             location: None,
             handler: None,
             enabled: true,
+            allow_browse: true,
             extra_headers: Vec::new(),
-            add_default_charset: false,
+            add_default_charset: None,
             charset: None,
             cache_policy: None,
             bandwidth_limit: 0,
@@ -3489,14 +3949,156 @@ mod tests {
             },
         );
         assert!(
-            lint_topology(&cfg2, true).is_err(),
+            lint_topology(&cfg2, &[], true).is_err(),
             "a missing docroot must fail the strict deploy gate"
         );
         assert!(
-            lint_topology(&cfg2, false).is_ok(),
+            lint_topology(&cfg2, &[], false).is_ok(),
             "non-strict check keeps it a printed warning"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn topology_config(dir: &std::path::Path, mapped: &str) -> hj_config::ServerConfig {
+        let mut cfg = hj_config::ServerConfig {
+            server_root: dir.to_path_buf(),
+            ..Default::default()
+        };
+        let mut vhost = hj_config::VHostConfig::default();
+        vhost.doc_root = dir.to_path_buf();
+        cfg.vhosts.insert(
+            "real".into(),
+            hj_config::VHostDecl {
+                name: "real".into(),
+                vh_root: dir.to_path_buf(),
+                config_file: dir.join("vhost.xml"),
+                allow_symbol_link: None,
+                restrained: false,
+                enable_script: true,
+                config: Some(Arc::new(vhost)),
+            },
+        );
+        cfg.vhost_order.push("real".into());
+        cfg.listeners.push(hj_config::Listener {
+            name: "Default".into(),
+            secure: false,
+            address: "127.0.0.1:1".into(),
+            vhost_map: vec![hj_config::VhostMap {
+                vhost: mapped.into(),
+                domains: vec!["example.com".into(), "www.example.com".into()],
+            }],
+            tls: None,
+            uds_path: None,
+            proxy_protocol: false,
+            proxy_protocol_peers: vec![],
+        });
+        cfg
+    }
+
+    /// Regression (#885): a vhostMap naming an undeclared vhost is a hard check
+    /// error and blocks a SIGHUP / admin-write swap like an unloaded vhost file.
+    #[test]
+    fn vhost_map_naming_an_undeclared_vhost_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("hj-undeclared-map-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = topology_config(&dir, "real");
+        let bad = topology_config(&dir, "renamed");
+        assert!(mapped_unloaded_vhosts(&good).is_empty());
+        assert_eq!(mapped_unloaded_vhosts(&bad), vec!["renamed"]);
+        assert!(lint_topology(&good, &[], true).is_ok());
+        assert!(lint_topology(&bad, &[], true).is_err());
+        assert_eq!(
+            reload_would_brick_vhosts(&good, &bad).as_deref(),
+            Some("renamed")
+        );
+        assert!(reload_would_brick_vhosts(&bad, &bad).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression (#1010): serve skips a vhost file without `<docRoot>`, but
+    /// `check --strict` still refuses it, mapped or not; plain `check` passes.
+    #[test]
+    fn strict_check_refuses_a_vhost_without_doc_root() {
+        let stub = "<virtualHostConfig></virtualHostConfig>";
+        let root = crate::pipeline::e2e::write_stub_vhost_root("check-stub", stub);
+        assert!(check(&root, false).is_ok());
+        let err = check(&root, true).expect_err("strict refuses the stub vhost");
+        assert!(err.to_string().contains("strict lint failed"), "{err:#}");
+        let (cfg, skipped) = hj_config::load_report(&root).unwrap();
+        assert_eq!(mapped_unloaded_vhosts(&cfg), vec!["stub"]);
+        assert!(lint_topology(&cfg, &skipped, true).is_err());
+        let lines = vhost_status_lines("stub", &cfg.vhosts["stub"], &skipped);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("not loaded: missing <docRoot>"),
+            "{lines:?}"
+        );
+
+        // Unmapped, it is unreachable but still a vhost that never loads.
+        let mut unmapped = cfg.clone();
+        for l in &mut unmapped.listeners {
+            l.vhost_map.retain(|m| m.vhost != "stub");
+        }
+        assert!(mapped_unloaded_vhosts(&unmapped).is_empty());
+        assert!(lint_topology(&unmapped, &skipped, true).is_err());
+        assert!(lint_topology(&unmapped, &skipped, false).is_ok());
+        assert!(lint_topology(&unmapped, &[], true).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression (#1011): `check` names each disabled vhost on a greppable line;
+    /// a disabled vhost alone does not fail `check --strict` (the deploy gate does).
+    #[test]
+    fn check_reports_disabled_vhosts_on_a_greppable_line() {
+        let root = crate::pipeline::e2e::write_stub_vhost_root(
+            "check-disabled",
+            "<virtualHostConfig><docRoot>$VH_ROOT</docRoot><enabled>0</enabled></virtualHostConfig>",
+        );
+        let (cfg, skipped) = hj_config::load_report(&root).unwrap();
+        assert!(skipped.is_empty());
+        let lines = vhost_status_lines("stub", &cfg.vhosts["stub"], &skipped);
+        assert!(
+            lines.iter().any(|l| l == "DISABLED-VHOST: stub"),
+            "{lines:?}"
+        );
+        assert!(vhost_status_lines("good", &cfg.vhosts["good"], &skipped).is_empty());
+        assert!(check(&root, true).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Regression (#884): a secure listener whose default cert/key serve cannot load
+    /// fails `check --strict`.
+    #[test]
+    fn strict_check_loads_the_secure_listener_certificate() {
+        let dir = std::env::temp_dir().join(format!("hj-check-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = topology_config(&dir, "real");
+        cfg.listeners.push(hj_config::Listener {
+            name: "TLS".into(),
+            secure: true,
+            address: "127.0.0.1:2".into(),
+            vhost_map: Vec::new(),
+            tls: Some(hj_config::ListenerTls {
+                key_file: dir.join("missing.key"),
+                cert_file: dir.join("missing.crt"),
+                cert_chain: false,
+                ca_cert_file: None,
+                client_verify: 0,
+                verify_depth: 0,
+                enable_stapling: false,
+                crl_file: None,
+            }),
+            uds_path: None,
+            proxy_protocol: false,
+            proxy_protocol_peers: vec![],
+        });
+        assert!(lint_listener_tls(&cfg, true).is_err());
+        assert!(lint_listener_tls(&cfg, false).is_ok(), "non-strict warns");
+        cfg.listeners[1].tls = None;
+        assert!(lint_listener_tls(&cfg, true).is_err(), "no TLS block");
+        cfg.listeners.pop();
+        assert!(lint_listener_tls(&cfg, true).is_ok(), "no secure listener");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3566,6 +4168,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hj-control-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("lsphp-control.sock");
         let (listener, guard) = bind_lsphp_control(&path).unwrap();
         let meta = std::fs::symlink_metadata(&path).unwrap();
@@ -3585,6 +4188,37 @@ mod tests {
             accepted.is_ok() && connected.is_ok(),
             "the renamed socket accepts"
         );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lsphp_control_socket_dir_must_be_operator_owned() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("hj-control-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lsphp-control.sock");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = bind_lsphp_control(&path).map(drop).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{refused}");
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if rustix::process::geteuid().is_root() {
+            std::os::unix::fs::chown(&dir, Some(65534), Some(65534)).unwrap();
+            let refused = bind_lsphp_control(&path).map(drop).unwrap_err();
+            assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                refused.to_string().contains("owned by uid 65534"),
+                "{refused}"
+            );
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            std::os::unix::fs::chown(&dir, Some(0), Some(0)).unwrap();
+        }
+
+        let (_listener, guard) = bind_lsphp_control(&path).expect("an operator-owned 0755 dir");
         drop(guard);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3780,5 +4414,43 @@ mod tests {
         let mut routing_only = base.clone();
         routing_only.php_config.as_mut().unwrap().suffixes = vec!["html".into()];
         assert_eq!(hard_config_change(&base, &routing_only), None);
+    }
+
+    /// #1037: the live `<CGIRLimit>` 300/600 s CPU caps reached every persistent
+    /// lsphp worker, and RLIMIT_CPU accumulates over the worker's life (SIGXCPU,
+    /// then SIGKILL mid-request). Like OLS local workers, the spawn plan leaves
+    /// RLIMIT_CPU untouched and keeps the processor's own memory/process limits.
+    #[test]
+    fn lsphp_spawn_plan_leaves_rlimit_cpu_untouched() {
+        let server_xml = "<httpServerConfig><security><CGIRLimit>\
+             <CPUSoftLimit>300</CPUSoftLimit><CPUHardLimit>600</CPUHardLimit>\
+             </CGIRLimit></security><phpConfig><phpHandler><id>php8</id>\
+             <command>/usr/local/lsws/lsphp8/bin/lsphp</command></phpHandler>\
+             <memSoftLimit>2047M</memSoftLimit><memHardLimit>2047M</memHardLimit>\
+             <procSoftLimit>1000</procSoftLimit><procHardLimit>1000</procHardLimit>\
+             </phpConfig></httpServerConfig>";
+        let cfg = hj_config::parse_bundle(
+            std::path::Path::new("/tmp"),
+            server_xml,
+            &Default::default(),
+            "",
+        )
+        .unwrap();
+        assert!(cfg.security.cgi_cpu_limit_secs.is_some());
+        let php = cfg.php_config.as_ref().unwrap();
+        let plan =
+            hj_lsapi::SupervisorConfig::from_php_config(php, "/tmp/k1-unused.sock", "", "").limits;
+        let mem = Some(2047 * 1024 * 1024);
+        assert_eq!(
+            plan,
+            hj_lsapi::ResourceLimits {
+                mem_soft: mem,
+                mem_hard: mem,
+                cpu_soft_secs: None,
+                cpu_hard_secs: None,
+                nproc_soft: Some(1000),
+                nproc_hard: Some(1000),
+            }
+        );
     }
 }

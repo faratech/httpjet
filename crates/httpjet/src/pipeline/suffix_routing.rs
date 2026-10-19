@@ -111,6 +111,17 @@ fn configured_extension_is_executable(state: &ServerState, ctx: &ReqCtx, extensi
                 .any(|suffix| suffix.eq_ignore_ascii_case(extension)))
 }
 
+/// The URL's last segment carries an extension this vhost maps to a script handler
+/// (string-only: no suffix set, candidate path, or filesystem probe).
+pub(super) fn last_segment_is_script(state: &ServerState, ctx: &ReqCtx, path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or("");
+    matches!(
+        last.rsplit_once('.'),
+        Some((_, extension))
+            if !extension.is_empty() && configured_extension_is_executable(state, ctx, extension)
+    )
+}
+
 /// Whether configuration could map this URL to a script, without building a
 /// suffix set, candidate PathBuf, or probing the filesystem. Disabled vhosts use
 /// this to bypass page-cache/static fast paths. A directory is only *potential*:
@@ -524,7 +535,10 @@ fn resolve_script(
             if let Some(rel) = clean_rel(prefix) {
                 if !rel.as_os_str().is_empty() {
                     let abs = doc_root.join(&rel);
-                    if (is_php(&abs) || could_force) && is_file(&abs) {
+                    // `/env.php/` (or `//`, `/./`) cleans to the script already found: its
+                    // tail stays PATH_INFO, as OLS checkPathInfo splits it (#930).
+                    let same_script = best.as_ref().is_some_and(|(b, _)| *b == abs);
+                    if !same_script && (is_php(&abs) || could_force) && is_file(&abs) {
                         best = Some((abs, rel_end));
                     }
                 }
@@ -565,9 +579,14 @@ fn resolve_script(
             // force URL is the per-candidate path (`path` ends in '/'), so `<Files>`
             // matches the index basename rather than the directory.
             if is_php(&cand) || (force_active && force_php(&format!("{path}{idx}"))) {
-                // Dir index: SCRIPT_NAME stays the request path (matching prior
-                // behavior), no PATH_INFO; SCRIPT_FILENAME points at the index.
-                return Some((cand, path.to_string(), String::new()));
+                // (#947) OLS appendIndexToUri: SCRIPT_NAME (and so PHP_SELF) names the
+                // index file, so a subdirectory install derives its base path correctly.
+                let script_name = if path.ends_with('/') {
+                    format!("{path}{idx}")
+                } else {
+                    format!("{path}/{idx}")
+                };
+                return Some((cand, script_name, String::new()));
             }
             return None;
         }
@@ -646,6 +665,27 @@ mod tests {
         assert_eq!(script, root.0.join("index.php"));
         assert_eq!(name, "/index.php");
         assert_eq!(path_info, "/foo/bar");
+    }
+
+    /// Regression (#930): a trailing slash after the script is PATH_INFO.
+    #[test]
+    fn trailing_slash_after_script_is_path_info() {
+        let root = TempRoot::new();
+        let sfx = php_suffixes();
+        let index = vec!["index.php".to_string()];
+        let is_file = |p: &Path| p.is_file();
+        for (path, info) in [
+            ("/index.php/", "/"),
+            ("/index.php//", "//"),
+            ("/index.php/./", "/./"),
+        ] {
+            let (script, name, path_info) =
+                resolve_script(&root.0, path, &sfx, &index, &is_file, false, &no_force)
+                    .expect("routes to index.php");
+            assert_eq!(script, root.0.join("index.php"), "{path}");
+            assert_eq!(name, "/index.php", "{path}");
+            assert_eq!(path_info, info, "{path}");
+        }
     }
 
     #[test]
@@ -758,7 +798,10 @@ mod tests {
             resolve_script(&root.0, &canon, &sfx, &index, &is_file, false, &no_force)
                 .expect("dir-index must route /community/ to community/index.php");
         assert_eq!(script, sub.join("index.php"));
-        assert_eq!(name, "/community/");
+        assert_eq!(
+            name, "/community/index.php",
+            "#947: SCRIPT_NAME names the index"
+        );
         assert_eq!(path_info, "");
 
         // And the collapsing variant (slash stripped) would have lost the route,
@@ -850,7 +893,7 @@ mod tests {
             resolve_script(&root.0, "/tools/", &sfx, &index, &is_file, true, &force)
                 .expect("forced index.html must resolve to a script");
         assert_eq!(script, sub.join("index.html"));
-        assert_eq!(name, "/tools/");
+        assert_eq!(name, "/tools/index.html");
         assert_eq!(path_info, "");
     }
 }

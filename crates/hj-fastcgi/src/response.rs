@@ -21,7 +21,9 @@ pub enum ResponseError {
 }
 
 /// Parse a complete CGI header block plus any already-buffered body prefix.
-/// Only CRLF framing is accepted; folded and hop-by-hop fields fail closed.
+/// Only CRLF framing is accepted and folded fields fail closed. Hop-by-hop
+/// fields are dropped like OLS and nginx do: they describe the application's
+/// view of a connection that does not exist, and STDOUT is always the raw body.
 pub fn parse_cgi_head(
     bytes: Bytes,
     max_header_bytes: usize,
@@ -73,6 +75,10 @@ pub fn parse_cgi_head(
             status = Some(code);
             continue;
         }
+        count += 1;
+        if count > max_headers {
+            return Err(ResponseError::TooLarge);
+        }
         if matches!(
             name.as_str(),
             "connection"
@@ -83,11 +89,7 @@ pub fn parse_cgi_head(
                 | "te"
                 | "trailer"
         ) {
-            return Err(ResponseError::Malformed);
-        }
-        count += 1;
-        if count > max_headers {
-            return Err(ResponseError::TooLarge);
+            continue;
         }
         headers.append(
             name,
@@ -108,9 +110,10 @@ pub fn parse_cgi_head(
     })
 }
 
-/// Return the application status from a successful END_REQUEST record.
+/// Return the application status from a successful END_REQUEST record. The
+/// reserved bytes are ignored: php-cgi/php-fpm leave them uninitialized.
 pub fn parse_end_request(content: &[u8]) -> Result<u32, ResponseError> {
-    if content.len() != 8 || content[4] != 0 || content[5..].iter().any(|byte| *byte != 0) {
+    if content.len() != 8 || content[4] != 0 {
         return Err(ResponseError::IncompleteRequest);
     }
     Ok(u32::from_be_bytes(content[..4].try_into().unwrap()))
@@ -154,10 +157,47 @@ mod tests {
     }
 
     #[test]
-    fn malformed_folded_hop_by_hop_duplicate_status_and_bounds_reject() {
+    fn hop_by_hop_fields_are_dropped_not_rejected() {
+        let parsed = parse_cgi_head(
+            Bytes::from_static(
+                b"Connection: close\r\nKeep-Alive: timeout=5\r\nProxy-Connection: keep-alive\r\nTransfer-Encoding: chunked\r\nUpgrade: h2c\r\nTE: trailers\r\nTrailer: X-Sum\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok",
+            ),
+            1024,
+            16,
+        )
+        .unwrap();
+        assert_eq!(parsed.status, StatusCode::OK);
+        for name in [
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+            "te",
+            "trailer",
+        ] {
+            assert!(!parsed.headers.contains_key(name), "{name} must be dropped");
+        }
+        assert_eq!(parsed.headers.len(), 2);
+        assert_eq!(parsed.headers["content-length"], "2");
+        assert_eq!(parsed.body_prefix, "ok");
+        assert_eq!(
+            parse_cgi_head(
+                Bytes::from_static(b"Connection: close\r\nA: 1\r\n\r\n"),
+                1024,
+                1
+            )
+            .unwrap_err(),
+            ResponseError::TooLarge,
+            "dropped fields still count toward the header bound"
+        );
+    }
+
+    #[test]
+    fn malformed_folded_duplicate_status_and_bounds_reject() {
         for value in [
             b" Bad: fold\r\n\r\n".as_slice(),
-            b"Connection: close\r\n\r\n",
+            b"Connection: close\r\n Bad: fold\r\n\r\n",
             b"Status: 200 OK\r\nStatus: 201 X\r\n\r\n",
             b"Status: 103 Early Hints\r\n\r\n",
             b"Broken\r\n\r\n",
@@ -175,8 +215,14 @@ mod tests {
     }
 
     #[test]
-    fn end_request_requires_complete_protocol_status_and_reserved_bytes() {
+    fn end_request_requires_complete_protocol_status_and_ignores_reserved_bytes() {
         assert_eq!(parse_end_request(&[0, 0, 0, 7, 0, 0, 0, 0]), Ok(7));
+        // Observed from php-cgi 8.5 on a second connection.
+        assert_eq!(parse_end_request(&[0, 0, 0, 0, 0, 8, 0, 0]), Ok(0));
+        assert_eq!(
+            parse_end_request(&[0, 0, 0, 0, 0, 0, 0]),
+            Err(ResponseError::IncompleteRequest)
+        );
         assert_eq!(
             parse_end_request(&[0, 0, 0, 0, 2, 0, 0, 0]),
             Err(ResponseError::IncompleteRequest)

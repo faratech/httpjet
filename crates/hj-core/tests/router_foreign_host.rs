@@ -35,6 +35,7 @@ fn make_server(listeners: Vec<Listener>, vhosts: BTreeMap<String, VHostDecl>) ->
         vhost_order: vec![],
         mime: MimeMap {
             by_suffix: BTreeMap::new(),
+            default_type: None,
         },
     })
 }

@@ -19,7 +19,7 @@ fn eval(rules: &str, path: &str) -> RewriteOutcome {
 fn capture_with_decoded_space_is_encoded_in_query_tail() {
     let outcome = eval(
         "RewriteEngine On\nRewriteRule ^dl/(.*)$ /files/$1.txt?v=$1 [L]\n",
-        "/dl/a%20b",
+        "/dl/a b",
     );
     match outcome {
         RewriteOutcome::Rewritten {
@@ -43,7 +43,7 @@ fn query_structure_and_existing_escapes_survive() {
     // check uses `%FA`.
     let outcome = eval(
         "RewriteEngine On\nRewriteRule ^x/(.*)$ /y%FAz?keep=%FA&a=$1 [L]\n",
-        "/x/z%20q",
+        "/x/z q",
     );
     match outcome {
         RewriteOutcome::Rewritten {

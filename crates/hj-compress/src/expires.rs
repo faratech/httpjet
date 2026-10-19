@@ -235,8 +235,9 @@ impl ExpiresRules {
         ExpiresRules { entries }
     }
 
-    /// Find the first rule whose glob matches `content_type` (parameters and
-    /// case ignored). Returns `None` if no rule applies.
+    /// Find the LAST rule whose glob matches `content_type` (parameters and case
+    /// ignored): OLS `setExpiresByType` applies entries in order, each overwriting
+    /// the matching MIME types, so a later entry wins. `None` if no rule applies.
     pub fn lookup(&self, content_type: &str) -> Option<ExpiresRule> {
         let base = ct_base(content_type).to_ascii_lowercase();
         if base.is_empty() {
@@ -245,11 +246,13 @@ impl ExpiresRules {
             return self
                 .entries
                 .iter()
+                .rev()
                 .find(|(g, _)| g.is_any())
                 .map(|(_, r)| *r);
         }
         self.entries
             .iter()
+            .rev()
             .find(|(g, _)| g.matches(&base))
             .map(|(_, r)| *r)
     }
@@ -460,12 +463,14 @@ mod tests {
     }
 
     #[test]
-    fn rules_first_match_wins() {
-        // A more-specific exact rule listed before a broader wildcard should
-        // win for its exact type; the wildcard covers the rest.
-        let rules = ExpiresRules::from_pairs([("image/svg+xml", "A100"), ("image/*", "A604800")]);
+    fn rules_last_match_wins() {
+        // OLS applies entries in order, each overwriting the MIME types it matches:
+        // broad-then-specific lets the specific entry win, the reverse does not.
+        let rules = ExpiresRules::from_pairs([("image/*", "A604800"), ("image/svg+xml", "A100")]);
         assert_eq!(rules.lookup("image/svg+xml").unwrap().age_secs, 100);
         assert_eq!(rules.lookup("image/png").unwrap().age_secs, 604800);
+        let rules = ExpiresRules::from_pairs([("image/svg+xml", "A100"), ("image/*", "A604800")]);
+        assert_eq!(rules.lookup("image/svg+xml").unwrap().age_secs, 604800);
     }
 
     #[test]

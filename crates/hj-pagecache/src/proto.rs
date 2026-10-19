@@ -94,6 +94,10 @@ pub fn parse_lscache_control(v: &str) -> LsCacheControl {
     }
 
     let mut ttl_secs: u32 = 0;
+    // OLS CacheCtrl::parse: s-maxage takes priority over max-age in either order,
+    // so neither is judged until both are seen (#873).
+    let mut s_maxage: Option<u32> = None;
+    let mut max_age: Option<Option<u32>> = None;
     let mut stale_secs: u32 = 0;
     let mut stale_if_error_secs: u32 = 0;
     let mut is_private = false;
@@ -114,19 +118,25 @@ pub fn parse_lscache_control(v: &str) -> LsCacheControl {
             // `stale-while-revalidate`. Honor either (largest wins) for OLS parity.
             stale_secs = stale_secs.max(age);
         } else if let Some((k, val)) = tok.split_once('=') {
-            if k.trim() == "max-age" {
-                // An EXPLICIT max-age must be distinguished from an absent one (both used
-                // to collapse to ttl_secs=0 → the 900s default, so a page meant to be
-                // uncacheable was cached fresh for 15 min). `max-age=0` means "immediately
-                // stale", and a malformed/overflowing value we cannot trust → fail CLOSED
-                // (do not cache) rather than silently default-cache. Absent max-age (a bare
-                // `public`/`private`) still leaves ttl_secs=0 ⇒ the configured default.
+            if k.trim() == "s-maxage" {
                 match val.trim().trim_matches('"').parse::<u32>() {
                     Ok(0) | Err(_) => return LsCacheControl::NoCache,
-                    Ok(n) => ttl_secs = n,
+                    Ok(n) => s_maxage = Some(n),
                 }
+            } else if k.trim() == "max-age" {
+                // An EXPLICIT max-age must be distinguished from an absent one: `0`
+                // means "immediately stale", and a malformed/overflowing value fails
+                // CLOSED (do not cache) rather than silently default-cache. Absent
+                // max-age (a bare `public`/`private`) still means the configured default.
+                max_age = Some(val.trim().trim_matches('"').parse::<u32>().ok());
             }
         }
+    }
+    match (s_maxage, max_age) {
+        (Some(n), _) => ttl_secs = n,
+        (None, Some(Some(n))) if n > 0 => ttl_secs = n,
+        (None, Some(_)) => return LsCacheControl::NoCache,
+        (None, None) => {}
     }
     if is_private {
         LsCacheControl::Private { ttl_secs }
@@ -271,23 +281,36 @@ pub enum Purge {
 /// public entry instead of just thread T1). A bare non-scope token is accepted
 /// as a tag for robustness.
 pub fn parse_purge(v: &str) -> Purge {
-    let v = v.trim();
     let mut tags = Vec::new();
-    for tok in v.split(',') {
+    // `;` separates command groups, each with its own optional scope (OLS
+    // processPurge2); `,` separates the items of one group.
+    for tok in v.split([';', ',']) {
         let tok = tok.trim();
         if tok.is_empty() {
             continue;
         }
+        // Only a bare `public`/`private`/`stale` is a scope word; `tag=private` is
+        // the tag CacheOptimizer puts on every private entry for ops sweeps (#875).
+        let explicit_tag = tok.starts_with("tag=");
         let name = tok.strip_prefix("tag=").unwrap_or(tok).trim();
-        // A bare `*` or `tag=*` is purge-everything (LiteSpeed compat), not a
-        // literal tag named `*` (which would match nothing).
-        if name == "*" {
+        // A stale purge (`~s`/`~stale`) is purged hard, which never serves more.
+        let name = name
+            .strip_suffix("~stale")
+            .or_else(|| name.strip_suffix("~s"))
+            .unwrap_or(name)
+            .trim();
+        // A bare `*` or `tag=*` is purge-everything (LiteSpeed compat). A
+        // wildcard tag (`T*`, `*T`) or a URL purge (`/path`) selects entries this
+        // store does not index by pattern or URI; purging everything is the only
+        // way to never keep one of them (#860).
+        if name == "*" || name.contains('*') || name.starts_with('/') {
             return Purge::All;
         }
-        if name.eq_ignore_ascii_case("public")
-            || name.eq_ignore_ascii_case("private")
-            || name.eq_ignore_ascii_case("stale")
-            || name.is_empty()
+        if name.is_empty()
+            || (!explicit_tag
+                && (name.eq_ignore_ascii_case("public")
+                    || name.eq_ignore_ascii_case("private")
+                    || name.eq_ignore_ascii_case("stale")))
         {
             continue;
         }
@@ -591,6 +614,50 @@ mod tests {
         assert!(
             !all,
             "a non-cookie vary dimension must clear the all-cookie flag"
+        );
+    }
+
+    #[test]
+    fn purge_accepts_every_litespeed_form() {
+        let tags = |v: &str| match parse_purge(v) {
+            Purge::Tags(t) => t,
+            Purge::All => vec!["*".to_string()],
+        };
+        assert_eq!(tags("public, tag=A; private, tag=B"), ["A", "B"]);
+        assert_eq!(tags("tag=A;tag=B"), ["A", "B"]);
+        assert_eq!(tags("tag=A~s"), ["A"]);
+        assert_eq!(tags("stale,tag=A~stale"), ["A"]);
+        assert_eq!(tags("tag=A*"), ["*"], "wildcards fail closed");
+        assert_eq!(tags("*A"), ["*"]);
+        assert_eq!(tags("/forum/thread-1/"), ["*"], "URL purges fail closed");
+        // What the forum sends today is unchanged.
+        assert_eq!(tags("public, tag=T1, tag=T2"), ["T1", "T2"]);
+        assert_eq!(tags("tag=T123"), ["T123"]);
+        // A tag literally named after a scope word (#875).
+        assert_eq!(tags("tag=private"), ["private"]);
+        assert_eq!(tags("public, tag=public"), ["public"]);
+        assert_eq!(tags("private, tag=T1"), ["T1"]);
+    }
+
+    #[test]
+    fn s_maxage_overrides_max_age_in_either_order() {
+        let ttl = |v: &str| match parse_lscache_control(v) {
+            LsCacheControl::Public { ttl_secs, .. } => ttl_secs,
+            other => panic!("{v}: {other:?}"),
+        };
+        assert_eq!(ttl("public, s-maxage=30"), 30);
+        assert_eq!(ttl("public, max-age=600, s-maxage=30"), 30);
+        assert_eq!(ttl("public, s-maxage=30, max-age=600"), 30);
+        assert_eq!(
+            parse_lscache_control("public, s-maxage=0"),
+            LsCacheControl::NoCache
+        );
+        // A browser-only max-age=0 never vetoes the shared-cache s-maxage (#873).
+        assert_eq!(ttl("public, max-age=0, s-maxage=600"), 600);
+        assert_eq!(ttl("public, s-maxage=600, max-age=0"), 600);
+        assert_eq!(
+            parse_lscache_control("public, max-age=0"),
+            LsCacheControl::NoCache
         );
     }
 }

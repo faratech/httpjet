@@ -24,14 +24,15 @@ use hj_core::{ReqCtx, Request};
 ///
 /// - httpoxy (CVE-2016-5385): a client `Proxy` header would become HTTP_PROXY,
 ///   which CGI-mode PHP libraries consult for outbound calls.
-/// - An underscore collides with the `-`->`_` HTTP_* mapping: `X_Forwarded_For`
-///   and the real `X-Forwarded-For` both become `HTTP_X_FORWARDED_FOR`, letting a
-///   client spoof a value an app may trust (nginx `underscores_in_headers off`).
+/// - Only letters, digits and `-` survive (Apache `http2env`): an underscore
+///   collides with the `-`->`_` HTTP_* mapping, and PHP folds `.` and space to
+///   `_` when registering `$_SERVER`, so `X_Forwarded_For` or `X.Forwarded.For`
+///   would land on the real `HTTP_X_FORWARDED_FOR` and spoof a trusted value.
 /// - Forwarding-authority headers (`CF-Connecting-IP`, `X-Forwarded-*`, ...) are
 ///   assertions only a trusted proxy may make; `REMOTE_ADDR` remains the truth.
 pub fn header_forwardable(name: &str, forwarding_trusted: bool) -> bool {
     !name.eq_ignore_ascii_case("proxy")
-        && !name.contains('_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && (forwarding_trusted || !hj_core::is_forwarding_authority_header(name))
 }
 
@@ -502,7 +503,23 @@ impl<'a> CgiEnvBuilder<'a> {
 /// front-controller contract), `REDIRECT_*` (the #129 ErrorDocument
 /// subrequest contract), and `HTTP_*` (header mirrors whose wire values are
 /// computed independently).
+///
+/// Judged on the key PHP will register ([`php_server_var_name`]), not the raw
+/// spelling: `REMOTE.ADDR` or ` HTTPS` land on `$_SERVER['REMOTE_ADDR']` /
+/// `['HTTPS']` after the server-computed value and would win (#1017). Any
+/// other name keeps its raw spelling, so `my.var` still reaches the app as
+/// `$_SERVER['my_var']`.
 fn ctx_env_override_denied(name: &str) -> bool {
+    let Some(php_name) = php_server_var_name(name) else {
+        return true;
+    };
+    let php_name = php_name.as_ref();
+    server_var_reserved(php_name)
+        || (php_name.starts_with("HJ_")
+            && !(php_name == name && FORWARDED_INTERNAL_ENV.contains(&name)))
+}
+
+fn server_var_reserved(name: &str) -> bool {
     const DENIED: &[&str] = &[
         "SCRIPT_FILENAME",
         "PATH_TRANSLATED",
@@ -527,12 +544,45 @@ fn ctx_env_override_denied(name: &str) -> bool {
         "CONTENT_LENGTH",
         "CONTENT_TYPE",
         "GATEWAY_INTERFACE",
+        // php-fpm applies these FastCGI params as ini directives; `.htaccess` php_value
+        // reaches PHP through the LSAPI special-env section instead (#1024).
+        "PHP_VALUE",
+        "PHP_ADMIN_VALUE",
     ];
     DENIED.contains(&name)
         || name.starts_with("REQUEST_TIME")
         || name.starts_with("LSAPI_")
         || name.starts_with("SSL_")
-        || (name.starts_with("HJ_") && !FORWARDED_INTERNAL_ENV.contains(&name))
+}
+
+/// The `$_SERVER` key PHP registers for env name `name`
+/// (`php_register_variable_ex`, which both the LSAPI and FastCGI SAPIs use):
+/// leading spaces are dropped and ` `/`.` fold to `_`. A `[` opens array
+/// syntax: with a `]` anywhere after it the key ends at the `[`; without one,
+/// that `[` and every later ` `/`.`/`[` fold to `_` too (`A[b.c` -> `A_b_c`).
+///
+/// `None` when PHP registers nothing (the name is empty after the cut, e.g.
+/// all spaces or a leading `[`) or holds a NUL, where PHP's C-string read
+/// would see a different, truncated name.
+pub fn php_server_var_name(name: &str) -> Option<Cow<'_, str>> {
+    if name.as_bytes().contains(&0) {
+        return None;
+    }
+    let name = name.trim_start_matches(' ');
+    let key = match name.split_once('[') {
+        Some(("", _)) => return None,
+        Some((key, index)) if index.contains(']') => key,
+        _ => name,
+    };
+    if key.is_empty() {
+        return None;
+    }
+    const MANGLED: [char; 3] = [' ', '.', '['];
+    if key.contains(MANGLED) {
+        Some(Cow::Owned(key.replace(MANGLED, "_")))
+    } else {
+        Some(Cow::Borrowed(key))
+    }
 }
 
 /// Internal `HJ_*` pipeline names that ARE forwarded to the app. Config-driven
@@ -774,6 +824,144 @@ mod tests {
         assert_ne!(m.get("REQUEST_TIME_FLOAT").map(String::as_str), Some("1.0"));
     }
 
+    /// Expected keys observed from PHP 8.5.11 `parse_str`, which registers
+    /// through the same `php_register_variable_ex` as the LSAPI/FastCGI SAPIs.
+    #[test]
+    fn php_server_var_name_matches_php_registration() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("REMOTE_ADDR", Some("REMOTE_ADDR")),
+            ("Cache-Control", Some("Cache-Control")),
+            ("REMOTE.ADDR", Some("REMOTE_ADDR")),
+            (" HTTPS", Some("HTTPS")),
+            ("  SSL.CLIENT.VERIFY", Some("SSL_CLIENT_VERIFY")),
+            ("ab ", Some("ab_")),
+            ("REMOTE[USER]", Some("REMOTE")),
+            ("REMOTE[USER", Some("REMOTE_USER")),
+            ("REMOTE_ADDR[]", Some("REMOTE_ADDR")),
+            ("REMOTE_ADDR[", Some("REMOTE_ADDR_")),
+            ("A[b.c", Some("A_b_c")),
+            ("A[b[c", Some("A_b_c")),
+            ("A[b]c", Some("A")),
+            ("A[ b]", Some("A")),
+            ("A.[b", Some("A__b")),
+            ("A]x[b", Some("A]x_b")),
+            ("x.y[z.w", Some("x_y_z_w")),
+            ("a]b", Some("a]b")),
+            ("A\tB", Some("A\tB")),
+            ("[REMOTE_ADDR]", None),
+            ("[x", None),
+            ("  [x]", None),
+            (" ", None),
+            ("", None),
+            ("REMOTE_ADDR\0X", None),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(
+                php_server_var_name(raw).as_deref(),
+                *want,
+                "PHP key for {raw:?}"
+            );
+        }
+        assert!(matches!(
+            php_server_var_name("WF_NOINDEX_PATH"),
+            Some(Cow::Borrowed(_))
+        ));
+    }
+
+    #[test]
+    fn ctx_env_cannot_set_php_ini_params() {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/x.php")
+            .header("Host", "forum.example")
+            .body(empty_incoming())
+            .unwrap();
+        let mut c = ctx(false);
+        c.env = vec![
+            (
+                "PHP_ADMIN_VALUE".into(),
+                "auto_prepend_file=/tmp/x.php".into(),
+            ),
+            ("PHP_VALUE".into(), "auto_prepend_file=/tmp/x.php".into()),
+            ("PHP.ADMIN.VALUE".into(), "open_basedir=/".into()),
+            ("WF_NOINDEX_PATH".into(), "1".into()),
+        ];
+        let env = build_cgi_env(&req, &c, Path::new("/web/public_html/x.php"));
+        let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_ref()).collect();
+        assert!(!keys.iter().any(|k| {
+            php_server_var_name(k).is_some_and(|p| p == "PHP_VALUE" || p == "PHP_ADMIN_VALUE")
+        }));
+        assert!(keys.contains(&"WF_NOINDEX_PATH"));
+    }
+
+    #[test]
+    fn php_mangled_ctx_env_names_cannot_forge_server_vars() {
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("/x.php")
+            .header("Host", "forum.example")
+            .body(empty_incoming())
+            .unwrap();
+
+        let mut c = ctx(false);
+        c.env = vec![
+            ("REMOTE.ADDR".into(), "6.6.6.6".into()),
+            ("REMOTE_ADDR[]".into(), "6.6.6.6".into()),
+            (" HTTPS".into(), "on".into()),
+            ("SSL.CLIENT.VERIFY".into(), "SUCCESS".into()),
+            ("SSL_CLIENT_S[DN".into(), "CN=admin".into()),
+            ("REMOTE[USER".into(), "admin".into()),
+            ("REMOTE[USER]".into(), "admin".into()),
+            ("SCRIPT.FILENAME".into(), "/etc/passwd".into()),
+            ("REQUEST.TIME".into(), "1".into()),
+            ("HJ.CACHE.REFRESH".into(), "1".into()),
+            (" HJ_CACHE_REFRESH".into(), "1".into()),
+            ("HJ.AUTH.USER".into(), "admin".into()),
+            ("REMOTE_ADDR\0".into(), "6.6.6.6".into()),
+            ("[x]".into(), "1".into()),
+            // Non-protected names PHP mangles still reach the app unchanged.
+            ("my.flag".into(), "1".into()),
+            ("WF_NOINDEX_PATH".into(), "1".into()),
+        ];
+        let env = build_cgi_env(&req, &c, Path::new("/web/public_html/x.php"));
+        for (k, _) in &env {
+            let php = php_server_var_name(k).expect("every emitted name registers in PHP");
+            let protected = server_var_reserved(&php) || php.starts_with("HJ_");
+            let server_owned = k == &php
+                && matches!(
+                    k.as_ref(),
+                    "REMOTE_ADDR"
+                        | "REMOTE_PORT"
+                        | "SCRIPT_FILENAME"
+                        | "DOCUMENT_ROOT"
+                        | "REQUEST_METHOD"
+                        | "REQUEST_URI"
+                        | "REQUEST_TIME"
+                        | "REQUEST_TIME_FLOAT"
+                        | "REQUEST_SCHEME"
+                        | "SERVER_NAME"
+                        | "SERVER_ADDR"
+                        | "SERVER_PORT"
+                        | "SERVER_SOFTWARE"
+                        | "SERVER_PROTOCOL"
+                        | "GATEWAY_INTERFACE"
+                );
+            assert!(!protected || server_owned, "{k:?} reached PHP as {php:?}");
+        }
+        let m: std::collections::HashMap<String, String> = env
+            .into_iter()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(m["REMOTE_ADDR"], "203.0.113.7");
+        assert_eq!(m["SCRIPT_FILENAME"], "/web/public_html/x.php");
+        assert!(!m.contains_key("HTTPS"));
+        assert!(!m.contains_key("REMOTE_USER"));
+        assert!(!m.contains_key("AUTH_TYPE"));
+        assert_eq!(m["REMOTE[USER]"], "admin");
+        assert_eq!(m["my.flag"], "1");
+        assert_eq!(m["WF_NOINDEX_PATH"], "1");
+    }
+
     #[test]
     fn pipeline_internal_env_reaches_the_app() {
         let req = http::Request::builder()
@@ -977,6 +1165,10 @@ mod tests {
             ("forwarded", false, false),
             ("user-agent", false, true),
             ("cookie", false, true),
+            ("X.Forwarded.For", true, false),
+            ("CF.Connecting.IP", true, false),
+            ("User.Agent", false, false),
+            ("X-Test2", false, true),
         ] {
             assert_eq!(
                 header_forwardable(name, trusted),
@@ -997,6 +1189,8 @@ mod tests {
             .header("X-Forwarded-For", "203.0.113.7")
             .header("X_Forwarded_For", "127.0.0.1")
             .header("X_Custom_Auth", "spoofed")
+            .header("X.Forwarded.For", "127.0.0.2")
+            .header("X.Custom.Auth", "spoofed")
             .body(empty_incoming())
             .unwrap();
 

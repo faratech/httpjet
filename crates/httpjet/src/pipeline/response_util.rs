@@ -13,8 +13,12 @@ use http::StatusCode;
 
 use crate::state::ServerState;
 
-use super::htaccess_apply::{access_denied_iter, apply_set_env_iter_with_headers};
-use super::rewrite_glue::{build_uri, normalized_request_path, percent_encode_path};
+use super::htaccess_apply::{
+    access_denied_iter, apply_response_headers_for_target, apply_set_env_iter_with_headers,
+};
+use super::rewrite_glue::{
+    build_uri, normalized_request_path, percent_encode_path, resolved_rel_path,
+};
 use super::{GeneratedErrorPage, error_page, resolve_vhost_jail, run_handler};
 
 /// (#8a) If the response is an httpjet-generated 4xx/5xx, replace it with the
@@ -58,6 +62,8 @@ pub(super) async fn apply_error_document(
         return;
     };
     match doc {
+        // A deeper `ErrorDocument N default` restores the built-in page.
+        ErrorDoc::Default => {}
         ErrorDoc::External(url) => {
             *resp = redirect(302, &url);
         }
@@ -129,7 +135,7 @@ async fn render_path_error_document(
 
     // Policy reads inbound headers through borrowed lookups. No owned request
     // (and no full HeaderMap clone) is needed until terminal dispatch.
-    let has_set_env = target_chain().any(|ht| !ht.set_env_if.is_empty());
+    let has_set_env = target_chain().any(|ht| !ht.set_env_if.is_empty() || ht.has_set_env());
     let has_rewrite = state
         .inline_rules
         .get(&ctx.vhost_name)
@@ -138,12 +144,14 @@ async fn render_path_error_document(
             .iter()
             .any(|(_, ht)| !ht.rules.is_noop());
     if has_set_env {
-        apply_set_env_iter_with_headers(ctx, target_chain(), "GET", request_headers, rel, "")
+        apply_set_env_iter_with_headers(ctx, target_chain(), "GET", request_headers, rel, "", None)
             .ok()?;
     }
 
+    // An `allowBrowse 0` context is not accessible to the error page either (#814).
     if access_denied_iter(target_chain(), rel, "GET", ctx)
         || super::access_deny_dir(&state.acl, &ctx.vhost.doc_root, rel)
+        || context_refusal(&ctx.vhost.contexts, rel).is_some()
     {
         return None;
     }
@@ -176,6 +184,7 @@ async fn render_path_error_document(
             &target_chain_with_dirs,
             rel,
             "",
+            &mut super::rewrite_glue::RewriteTrace::default(),
         ) {
             super::rewrite_glue::RwResult::Unchanged { env } => {
                 super::merge_rewrite_env(ctx, env);
@@ -194,8 +203,7 @@ async fn render_path_error_document(
     let index_files = target_chain_with_dirs
         .iter()
         .rev()
-        .find(|(_, ht)| !ht.directory_index.is_empty())
-        .map(|(_, ht)| ht.directory_index.as_slice())
+        .find_map(|(_, ht)| ht.directory_index_override())
         .unwrap_or_else(|| super::base_index_files(state, ctx));
     if let Some((script_abs, script_name, path_info)) =
         super::suffix_routing::split_declared_script_path_with_dirs(
@@ -238,7 +246,8 @@ async fn render_path_error_document(
             .await
             .ok()?;
         }
-        let subreq = internal_error_document_request(&script_name);
+        let (subreq, orig_query) =
+            script_error_document_request(ctx, request_headers, &script_name);
         return run_script_error_document(
             state,
             ctx,
@@ -248,21 +257,31 @@ async fn render_path_error_document(
             &path_info,
             fastcgi_handler.as_deref(),
             orig_request_path,
+            orig_query.as_deref(),
             status,
         )
         .await;
     }
 
     let mut subreq = internal_error_document_request(rel);
+    // Map the target exactly as dispatch's static path would (#815): a location
+    // override context serves the error page from its own root.
+    apply_static_context_request(ctx, rel, &mut subreq);
     if let Some(index_files) = target_chain_with_dirs
         .iter()
         .rev()
-        .find(|(_, ht)| !ht.directory_index.is_empty())
-        .map(|(_, ht)| ht.directory_index.as_slice())
+        .find_map(|(_, ht)| ht.directory_index_override())
     {
         subreq
             .extensions_mut()
             .insert(hj_static::IndexFilesOverride(index_files.to_vec()));
+    }
+    if target_chain().any(|ht| ht.has_type_override) {
+        let chain: Vec<Arc<Htaccess>> = target_chain_with_dirs
+            .iter()
+            .map(|(_, ht)| ht.clone())
+            .collect();
+        super::apply_content_type_override(&chain, rel, &mut subreq);
     }
     let mut served = run_handler(&state.static_handler, ctx, subreq).await;
     if !served.status().is_success() || super::resolved_static_target_denied(&state.acl, &served) {
@@ -308,10 +327,12 @@ async fn render_path_error_document(
 /// `status` preserved. Returns `None` when execution is unavailable or unsafe;
 /// the caller retains the original page and never falls back to static source.
 ///
-/// The subrequest is a GET at the error-doc path with the standard Apache/CGI
-/// error-handler env: `REDIRECT_STATUS` (the original code, e.g. `404`) and
-/// `REDIRECT_URL` (the original request path) so the PHP page can detect it is
-/// an error subrequest.
+/// The subrequest is a bodyless GET carrying the original request headers and
+/// `REQUEST_URI` (LSWS `getOrgReqURL`), with the standard Apache/CGI
+/// error-handler env: `REDIRECT_STATUS` (the original code, e.g. `404`),
+/// `REDIRECT_URL` (the original request path) and `REDIRECT_QUERY_STRING`, so
+/// the PHP page can detect it is an error subrequest. `QUERY_STRING` is the
+/// error document's own (empty).
 async fn run_script_error_document(
     state: &Arc<ServerState>,
     ctx: &mut ReqCtx,
@@ -321,6 +342,7 @@ async fn run_script_error_document(
     path_info: &str,
     fastcgi_handler: Option<&str>,
     orig_request_path: &str,
+    orig_query: Option<&str>,
     status: u16,
 ) -> Option<Response> {
     // Apache error-handler CGI env, read by the LSAPI env builder so the PHP
@@ -328,6 +350,12 @@ async fn run_script_error_document(
     // context, so none of these values leak back to the outer request.
     ctx.set_env("REDIRECT_STATUS", status.to_string());
     ctx.set_env("REDIRECT_URL", orig_request_path.to_string());
+    if let Some(query) = orig_query.filter(|q| !q.is_empty()) {
+        ctx.set_env("REDIRECT_QUERY_STRING", query.to_string());
+    }
+    // The subrequest URI is the original request's (it is REQUEST_URI), so its
+    // query would otherwise become the error document's QUERY_STRING.
+    ctx.set_env("QUERY_STRING", String::new());
 
     let mut rendered = if let Some(handler_name) = fastcgi_handler {
         let Some(handler) = state
@@ -424,6 +452,54 @@ fn internal_error_document_request(path: &str) -> Request {
     request
 }
 
+/// Request headers that describe the original request BODY. The error
+/// subrequest never resends that body, so they must not reach the backend
+/// (a stale `Content-Length` would have PHP wait for bytes that never come).
+fn is_body_framing_header(name: &http::HeaderName) -> bool {
+    matches!(
+        *name,
+        http::header::CONTENT_LENGTH
+            | http::header::TRANSFER_ENCODING
+            | http::header::CONTENT_TYPE
+            | http::header::CONTENT_ENCODING
+            | http::header::EXPECT
+    )
+}
+
+/// The script ErrorDocument subrequest (#948). LSWS runs the error page as an
+/// internal redirect of the SAME request: it keeps the inbound headers (Cookie,
+/// User-Agent, Accept-Language, ...) and `REQUEST_URI` is the original request
+/// URI. The method becomes a bodyless GET, so the body framing headers go.
+/// Returns the request plus the original query for `REDIRECT_QUERY_STRING`.
+fn script_error_document_request(
+    ctx: &ReqCtx,
+    request_headers: &http::HeaderMap,
+    script_name: &str,
+) -> (Request, Option<String>) {
+    let original = ctx
+        .redirect_guard
+        .as_ref()
+        .and_then(|guard| guard.path_query())
+        .and_then(|pq| pq.parse::<http::Uri>().ok().map(|uri| (uri, pq)));
+    let (mut request, query) = match original {
+        Some((uri, pq)) => {
+            let mut request = Request::new(hj_core::empty_incoming());
+            *request.uri_mut() = uri;
+            let query = pq.split_once('?').map(|(_, q)| q.to_string());
+            (request, query)
+        }
+        None => (internal_error_document_request(script_name), None),
+    };
+    let headers = request.headers_mut();
+    headers.reserve(request_headers.len());
+    for (name, value) in request_headers {
+        if !is_body_framing_header(name) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    (request, query)
+}
+
 /// True only when target-chain authorization above covered the exact opened
 /// resource. PATH_INFO, indexes, symlinks, aliases, and alternate roots compare
 /// unequal and retain the final target-policy reload.
@@ -446,17 +522,78 @@ fn is_generated_error_body(resp: &Response) -> bool {
 
 /// Build a terminal response for a forbidden/gone outcome, preferring the
 /// chain's `ErrorDocument` for that status (#8a) over the built-in page.
+/// `request_path` is the original request path that `Header` URI tests read.
 pub(super) async fn error_doc_or_page(
     state: &Arc<ServerState>,
     ctx: &mut ReqCtx,
     request_headers: &http::HeaderMap,
     chain: &[Arc<Htaccess>],
     cur_path: &str,
+    request_path: &str,
     status: StatusCode,
 ) -> Response {
     let mut resp = error_page(status);
     apply_error_document(state, ctx, request_headers, chain, cur_path, &mut resp).await;
+    let rel = resolved_rel_path(cur_path);
+    apply_error_response_headers(ctx, chain, &rel, None, request_path, status, &mut resp);
     resp
+}
+
+/// Finish an auth refusal (`scoped_auth` 401/403/500/503) like any other
+/// generated error: `ErrorDocument` replacement plus the `always` header ops.
+/// The challenge (`WWW-Authenticate`) and `Retry-After` survive a local
+/// replacement page; a 401 never follows an external ErrorDocument (Apache
+/// ignores a URL there, since the browser would never see the challenge).
+pub(super) async fn auth_refusal(
+    state: &Arc<ServerState>,
+    ctx: &mut ReqCtx,
+    request_headers: &http::HeaderMap,
+    chain: &[Arc<Htaccess>],
+    cur_path: &str,
+    request_path: &str,
+    mut resp: Response,
+) -> Response {
+    let status = resp.status();
+    let challenge = resp.headers().get(http::header::WWW_AUTHENTICATE).cloned();
+    let retry_after = resp.headers().get(http::header::RETRY_AFTER).cloned();
+    let skip_doc = status == StatusCode::UNAUTHORIZED
+        && chain
+            .iter()
+            .rev()
+            .find_map(|ht| ht.error_document(status.as_u16()))
+            .is_some_and(|doc| matches!(doc, ErrorDoc::External(_)));
+    if !skip_doc {
+        apply_error_document(state, ctx, request_headers, chain, cur_path, &mut resp).await;
+    }
+    if resp.status() == status {
+        let headers = resp.headers_mut();
+        if let Some(v) = challenge {
+            headers.insert(http::header::WWW_AUTHENTICATE, v);
+        }
+        if let Some(v) = retry_after {
+            headers.insert(http::header::RETRY_AFTER, v);
+        }
+    }
+    let rel = resolved_rel_path(cur_path);
+    apply_error_response_headers(ctx, chain, &rel, None, request_path, status, &mut resp);
+    resp
+}
+
+/// Apply the chain's `Header` ops as they apply to an error of `status`, even
+/// when an external ErrorDocument turned the response into a 302: like Apache's
+/// `ap_send_error_response`, only `always` (err_headers_out) ops survive there.
+pub(super) fn apply_error_response_headers(
+    ctx: &ReqCtx,
+    chain: &[Arc<Htaccess>],
+    rel_path: &str,
+    target_basename: Option<&str>,
+    request_path: &str,
+    status: StatusCode,
+    resp: &mut Response,
+) {
+    let served = std::mem::replace(resp.status_mut(), status);
+    apply_response_headers_for_target(ctx, chain, rel_path, target_basename, request_path, resp);
+    *resp.status_mut() = served;
 }
 
 /// A bare status response (no body) for a non-3xx `[R=NNN]` outcome (#8/A).
@@ -470,48 +607,215 @@ pub(super) fn status_response(code: u16) -> Response {
     resp
 }
 
-/// (#9b) The longest-matching enabled **static** `<context>` for `path` that
-/// changes static serving: a location override, extra headers, or a default
-/// charset. Returns the context so the caller can apply those settings.
+/// (#9b) The single most-specific enabled **static** `<context>` for `path`.
+/// Selection never looks at what the context configures (#815): like OLS, a
+/// context without `<location>` serves `$DOC_ROOT + uri`, so a plain nested
+/// context must NOT fall through to its parent's location. dispatch, fast_serve
+/// and scoped_auth all resolve through this one selector (#673).
 pub(super) fn matching_static_context<'a>(
     ctx: &'a ReqCtx,
     path: &str,
 ) -> Option<&'a hj_core::config::Context> {
+    enclosing_static_contexts(&ctx.vhost.contexts, path)
+        .last()
+        .copied()
+}
+
+/// Every enabled static context enclosing `path`, outermost first.
+fn enclosing_static_contexts<'a>(
+    contexts: &'a [hj_core::config::Context],
+    path: &str,
+) -> Vec<&'a hj_core::config::Context> {
     use hj_core::config::ContextKind;
-    ctx.vhost
-        .contexts
+    let mut contexts: Vec<_> = contexts
         .iter()
         .filter(|c| {
             c.kind == ContextKind::Static && c.enabled && super::context_uri_matches(path, &c.uri)
         })
-        .filter(|c| !c.extra_headers.is_empty() || c.location.is_some() || c.add_default_charset)
-        .max_by_key(|c| c.uri.len())
+        .collect();
+    contexts.sort_by_key(|c| c.uri.len());
+    contexts
+}
+
+/// The `<extraHeaders>` that apply to `path`: every enclosing static context's,
+/// outermost to innermost, as OLS `HttpContext::inherit` prepends the parent's
+/// header ops to the child's (#816). Feed the result to
+/// [`apply_static_context_headers`] in one call.
+pub(super) fn static_context_extra_headers(ctx: &ReqCtx, path: &str) -> Vec<(String, String)> {
+    enclosing_static_contexts(&ctx.vhost.contexts, path)
+        .into_iter()
+        .flat_map(|c| c.extra_headers.iter().cloned())
+        .collect()
+}
+
+/// The effective `addDefaultCharset` for `path`: the innermost enclosing static
+/// context that SETS it wins, and a context leaving it absent inherits its
+/// parent's (OLS `HttpContext::inherit` copies the parent charset unless the
+/// child configured its own, #828). `None` = off.
+pub(super) fn static_context_charset(ctx: &ReqCtx, path: &str) -> Option<String> {
+    enclosing_static_charset(&ctx.vhost.contexts, path)
+}
+
+fn enclosing_static_charset(contexts: &[hj_core::config::Context], path: &str) -> Option<String> {
+    let context = enclosing_static_contexts(contexts, path)
+        .into_iter()
+        .rev()
+        .find(|c| c.add_default_charset.is_some())?;
+    (context.add_default_charset == Some(true)).then(|| {
+        context
+            .charset
+            .clone()
+            .unwrap_or_else(|| "UTF-8".to_string())
+    })
+}
+
+/// The `<location>` mapping the static handler must apply for `path`: the
+/// selected context's location and URI, whenever it moves the root OR strips a
+/// non-root context URI (OLS `translate` maps `/assets/x.css` under a
+/// `/assets/` context located at `$DOC_ROOT/` to `$DOC_ROOT/x.css`, #829).
+/// dispatch, fast_serve, the ErrorDocument subrequest and scoped_auth share it.
+pub(super) fn static_location_override<'a>(
+    ctx: &'a ReqCtx,
+    path: &str,
+) -> Option<(&'a std::path::PathBuf, &'a str)> {
+    vhost_static_location_override(&ctx.vhost, path)
+}
+
+fn vhost_static_location_override<'a>(
+    vhost: &'a hj_core::config::VHostConfig,
+    path: &str,
+) -> Option<(&'a std::path::PathBuf, &'a str)> {
+    let context = enclosing_static_contexts(&vhost.contexts, path)
+        .last()
+        .copied()?;
+    let location = context.location.as_ref()?;
+    (*location != vhost.doc_root || !context.uri.trim_matches('/').is_empty())
+        .then_some((location, context.uri.as_str()))
+}
+
+/// Pin the static `<context>` mapping for `path` onto a static-handler request:
+/// the location override and the inherited default charset.
+pub(super) fn apply_static_context_request(ctx: &ReqCtx, path: &str, req: &mut Request) {
+    if let Some((location, uri)) = static_location_override(ctx, path) {
+        req.extensions_mut()
+            .insert(hj_static::DocRootOverride(location.clone(), uri.to_owned()));
+    }
+    if let Some(charset) = static_context_charset(ctx, path) {
+        req.extensions_mut()
+            .insert(hj_static::DefaultCharsetOverride(charset));
+    }
+}
+
+/// (#830) OLS `bestMatch` selects a `/docs/` context for the slashless `/docs`
+/// (its tree matches by path component) and `redirectDir` answers 301 to
+/// `/docs/`. True when `path` is exactly such a trailing-slash context URI
+/// minus its slash.
+pub(super) fn context_slash_redirect(contexts: &[hj_core::config::Context], path: &str) -> bool {
+    // Every other context matching `path` is a strict ancestor of the slashed
+    // URI unless one is configured as exactly `path`, which then wins.
+    contexts
+        .iter()
+        .any(|c| c.enabled && c.uri.len() > 1 && c.uri.strip_suffix('/') == Some(path))
+        && !contexts.iter().any(|c| c.enabled && c.uri == path)
+}
+
+/// OLS resolves ONE most-specific context and refuses the whole request when
+/// that static context has `<allowBrowse>0</allowBrowse>` (`processURIEx`).
+/// A context kind httpjet does not route (only a hand-built model can carry
+/// one; the parser rejects them) fails closed instead of serving as static.
+pub(super) fn context_refusal(
+    contexts: &[hj_core::config::Context],
+    path: &str,
+) -> Option<StatusCode> {
+    use hj_core::config::ContextKind;
+    let context = contexts
+        .iter()
+        .filter(|c| c.enabled && super::context_uri_matches(path, &c.uri))
+        .max_by_key(|c| c.uri.len())?;
+    match context.kind {
+        ContextKind::Static => (!context.allow_browse).then_some(StatusCode::FORBIDDEN),
+        ContextKind::Proxy => None,
+        _ => Some(StatusCode::SERVICE_UNAVAILABLE),
+    }
 }
 
 /// Apply a static context's `<extraHeaders>` (e.g. mcp's `Vary`/`Cache-Control`)
-/// to a 2xx static response, without clobbering headers the handler already set.
+/// to a 2xx static response. `Vary` merges into the handler's own tokens (a
+/// precompressed sibling's `Accept-Encoding` must survive, #801); a repeated
+/// name appends, as OLS adds each line; otherwise the context value replaces.
 pub(super) fn apply_static_context_headers(extra: &[(String, String)], resp: &mut Response) {
-    if !resp.status().is_success() {
+    // A 304 carries the Vary/Cache-Control its 200 would (RFC 9110 §15.4.5, #843).
+    if !resp.status().is_success() && resp.status() != http::StatusCode::NOT_MODIFIED {
         return;
     }
+    let mut seen: Vec<http::header::HeaderName> = Vec::new();
     for (name, value) in extra {
-        if let (Ok(n), Ok(v)) = (
+        let (Ok(n), Ok(v)) = (
             http::header::HeaderName::from_bytes(name.as_bytes()),
             http::HeaderValue::from_str(value),
-        ) {
-            resp.headers_mut().insert(n, v);
+        ) else {
+            continue;
+        };
+        let headers = resp.headers_mut();
+        if n == http::header::VARY {
+            merge_vary_tokens(headers, value);
+        } else if seen.contains(&n) {
+            headers.append(n, v);
+        } else {
+            headers.insert(n.clone(), v);
+            seen.push(n);
         }
     }
 }
 
+fn merge_vary_tokens(headers: &mut http::HeaderMap, value: &str) {
+    let existing: Vec<String> = headers
+        .get_all(http::header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut tokens = existing.clone();
+    for token in value.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        if !tokens.iter().any(|t| t.eq_ignore_ascii_case(token)) {
+            tokens.push(token.to_string());
+        }
+    }
+    if tokens == existing && !existing.is_empty() {
+        return;
+    }
+    if let Ok(v) = http::HeaderValue::from_str(&tokens.join(", ")) {
+        headers.insert(http::header::VARY, v);
+    }
+}
+
 /// Page-cache collision-guard identity: `scheme\nvhost\norig_path`. Built from the
-/// canonical, operator-controlled vhost name and the decoded+normalized path — never the
-/// raw Host header (which the key already collapses, #5) and never the raw request path
-/// (encoding variants must share one identity, #6). A cached entry is served only when a
-/// request reproduces this exact string, so a key collision degrades to a miss.
-pub(super) fn cache_identity_for(is_tls: bool, vhost_name: &str, orig_path: &str) -> String {
+/// canonical, operator-controlled vhost name and the decoded+normalized path — never a
+/// wildcard-routed raw Host (which the key collapses, #5) and never the raw request path
+/// (encoding variants must share one identity, #6). An exact vhostMap alias (#938, see
+/// `lscache::cache_alias_host`) adds an `@alias` line before the path; the path always
+/// starts with `/`, so an alias identity never equals a canonical one, and the canonical
+/// form is unchanged. A cached entry is served only when a request reproduces this exact
+/// string, so a key collision degrades to a miss.
+pub(super) fn cache_identity_for(
+    is_tls: bool,
+    vhost_name: &str,
+    alias_host: Option<&str>,
+    orig_path: &str,
+) -> String {
     let scheme = if is_tls { "https" } else { "http" };
-    format!("{}\n{}\n{}", scheme, vhost_name, orig_path)
+    match alias_host {
+        None => format!("{}\n{}\n{}", scheme, vhost_name, orig_path),
+        Some(alias) => format!(
+            "{}\n{}\n@{}\n{}",
+            scheme,
+            vhost_name,
+            alias.to_ascii_lowercase(),
+            orig_path
+        ),
+    }
 }
 
 pub(super) fn redirect(code: u16, location: &str) -> Response {
@@ -658,7 +962,7 @@ mod tests {
             let decoded = decode_request_path(raw).expect("decodable");
             normalized_request_path(&decoded)
         };
-        let identity = |raw: &str| cache_identity_for(true, "v", &canon(raw));
+        let identity = |raw: &str| cache_identity_for(true, "v", None, &canon(raw));
 
         // /index.php vs /index%2Ephp -> same canonical path -> same identity.
         assert_eq!(identity("/index.php"), identity("/index%2Ephp"));
@@ -674,25 +978,372 @@ mod tests {
         // Host header. Two requests to the same vhost with different Host values share ONE
         // identity (a HIT — no re-render thrash, no false collision-guard warnings), while
         // a different vhost, path, or scheme still differs (collision guard preserved).
-        let base = cache_identity_for(true, "forum.example", "/threads/1");
+        let base = cache_identity_for(true, "forum.example", None, "/threads/1");
         assert_eq!(
             base,
-            cache_identity_for(true, "forum.example", "/threads/1")
+            cache_identity_for(true, "forum.example", None, "/threads/1")
         );
         // The raw Host never leaks into the identity (it isn't even an input here).
         assert!(!base.contains("evil.example"));
         // Distinct vhost / path / scheme each yield a distinct identity.
         assert_ne!(
             base,
-            cache_identity_for(true, "news.forum.example", "/threads/1")
+            cache_identity_for(true, "news.forum.example", None, "/threads/1")
         );
         assert_ne!(
             base,
-            cache_identity_for(true, "forum.example", "/threads/2")
+            cache_identity_for(true, "forum.example", None, "/threads/2")
         );
         assert_ne!(
             base,
-            cache_identity_for(false, "forum.example", "/threads/1")
+            cache_identity_for(false, "forum.example", None, "/threads/1")
         );
+    }
+
+    /// (#938) The canonical identity bytes are the pre-#938 format, so persisted entries
+    /// keep hitting; an exact alias gets a distinct identity that no path can reproduce.
+    #[test]
+    fn cache_identity_canonical_bytes_are_stable_and_aliases_differ() {
+        assert_eq!(
+            cache_identity_for(true, "forum.example", None, "/threads/1"),
+            "https\nforum.example\n/threads/1"
+        );
+        assert_eq!(
+            cache_identity_for(false, "forum.example", None, "/"),
+            "http\nforum.example\n/"
+        );
+        let alias = cache_identity_for(true, "forum.example", Some("WWW.Forum.Example"), "/");
+        assert_eq!(alias, "https\nforum.example\n@www.forum.example\n/");
+        assert_ne!(
+            alias,
+            cache_identity_for(true, "forum.example", Some("alias.example"), "/")
+        );
+        assert_ne!(alias, cache_identity_for(true, "forum.example", None, "/"));
+    }
+
+    fn static_context(
+        uri: &str,
+        location: Option<&str>,
+        extra: &[(&str, &str)],
+    ) -> hj_core::config::Context {
+        hj_core::config::Context {
+            cache_policy: None,
+            bandwidth_limit: 0,
+            max_body_override: None,
+            timeout_override: None,
+            sub_filter: None,
+            kind: hj_core::config::ContextKind::Static,
+            uri: uri.into(),
+            location: location.map(Into::into),
+            handler: None,
+            enabled: true,
+            allow_browse: true,
+            extra_headers: extra
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            add_default_charset: None,
+            charset: None,
+        }
+    }
+
+    #[test]
+    fn plain_nested_static_context_is_selected_over_its_parent() {
+        // #815: /docs/sub/ configures nothing, yet it is the most specific
+        // context, so it must win (serving $DOC_ROOT + uri), not /docs/'s location.
+        let contexts = vec![
+            static_context("/docs/", Some("/alt"), &[("X-Parent", "p")]),
+            static_context("/docs/sub/", None, &[]),
+        ];
+        let selected = enclosing_static_contexts(&contexts, "/docs/sub/a.txt");
+        assert_eq!(selected.last().unwrap().uri, "/docs/sub/");
+        assert!(selected.last().unwrap().location.is_none());
+        let parent = enclosing_static_contexts(&contexts, "/docs/a.txt");
+        assert_eq!(parent.last().unwrap().uri, "/docs/");
+    }
+
+    #[test]
+    fn nested_static_context_headers_inherit_outermost_first() {
+        // #816: the parent's header ops come first, then the child's.
+        let contexts = vec![
+            static_context("/docs/sub/", None, &[("X-Child", "c"), ("Vary", "Origin")]),
+            static_context("/", None, &[("X-Root", "r")]),
+            static_context("/docs/", None, &[("X-Parent", "p"), ("Vary", "Accept")]),
+            static_context("/other/", None, &[("X-Other", "o")]),
+        ];
+        let extra: Vec<(String, String)> = enclosing_static_contexts(&contexts, "/docs/sub/a")
+            .into_iter()
+            .flat_map(|c| c.extra_headers.iter().cloned())
+            .collect();
+        let names: Vec<&str> = extra.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["X-Root", "X-Parent", "Vary", "X-Child", "Vary"]);
+        let mut resp: Response = Response::new(Body::Empty);
+        apply_static_context_headers(&extra, &mut resp);
+        let h = resp.headers();
+        assert_eq!(h["x-root"], "r");
+        assert_eq!(h["x-parent"], "p");
+        assert_eq!(h["x-child"], "c");
+        assert_eq!(h[http::header::VARY], "Accept, Origin");
+        assert!(!h.contains_key("x-other"));
+    }
+
+    /// Prod safety (#815/#816): the live config's static contexts are not nested,
+    /// so selection and headers match the pre-fix selector exactly.
+    #[test]
+    fn live_config_static_context_selection_is_unchanged() {
+        use hj_core::config::ContextKind;
+        let root = std::path::Path::new("/usr/local/lsws");
+        if !root.join("conf/httpd_config.xml").is_file() {
+            return;
+        }
+        let cfg = hj_config::load(root).expect("the live config must load");
+        let mut mcp_checked = false;
+        for decl in cfg.vhosts.values() {
+            let Some(vhost) = decl.config.as_ref() else {
+                continue;
+            };
+            let probes = [
+                "/",
+                "/index.html",
+                "/a/b/c.json",
+                "/play",
+                "/api/x",
+                "/static/x.js",
+            ];
+            for path in probes {
+                let legacy = vhost
+                    .contexts
+                    .iter()
+                    .filter(|c| {
+                        c.kind == ContextKind::Static
+                            && c.enabled
+                            && super::super::context_uri_matches(path, &c.uri)
+                    })
+                    .filter(|c| {
+                        !c.extra_headers.is_empty()
+                            || c.location.is_some()
+                            || c.add_default_charset == Some(true)
+                    })
+                    .max_by_key(|c| c.uri.len());
+                let enclosing = enclosing_static_contexts(&vhost.contexts, path);
+                let selected = enclosing.last().copied();
+                assert_eq!(
+                    selected.map(|c| (&c.uri, &c.location)),
+                    legacy.map(|c| (&c.uri, &c.location)),
+                    "{} {path}",
+                    decl.name
+                );
+                let extra: Vec<(String, String)> = enclosing
+                    .iter()
+                    .flat_map(|c| c.extra_headers.iter().cloned())
+                    .collect();
+                assert_eq!(
+                    extra,
+                    legacy.map(|c| c.extra_headers.clone()).unwrap_or_default(),
+                    "{} {path}",
+                    decl.name
+                );
+                // (#828) Inherited charset == the legacy single-context charset.
+                let legacy_charset = legacy
+                    .filter(|c| c.add_default_charset == Some(true))
+                    .map(|c| c.charset.clone().unwrap_or_else(|| "UTF-8".to_string()));
+                assert_eq!(
+                    enclosing_static_charset(&vhost.contexts, path),
+                    legacy_charset,
+                    "{} {path}",
+                    decl.name
+                );
+                // (#829) The location mapping == the legacy `loc != doc_root` rule.
+                let legacy_location = legacy
+                    .and_then(|c| c.location.as_ref().map(|loc| (loc, c.uri.as_str())))
+                    .filter(|(loc, _)| **loc != vhost.doc_root);
+                assert_eq!(
+                    vhost_static_location_override(vhost, path),
+                    legacy_location,
+                    "{} {path}",
+                    decl.name
+                );
+            }
+            // (#830) No live context URI ends in `/` except the root, so no
+            // live request is ever answered by the slash redirect.
+            for c in &vhost.contexts {
+                assert!(
+                    c.uri == "/" || !c.uri.ends_with('/'),
+                    "{} live context {} ends in a slash",
+                    decl.name,
+                    c.uri
+                );
+                for path in [c.uri.as_str(), c.uri.trim_end_matches('/')]
+                    .into_iter()
+                    .chain(probes)
+                {
+                    assert!(
+                        !context_slash_redirect(&vhost.contexts, path),
+                        "{} {path}",
+                        decl.name
+                    );
+                }
+            }
+            if decl.name == "mcp.windowsforum.com" {
+                let selected = enclosing_static_contexts(&vhost.contexts, "/a/b/c.json");
+                let c = selected.last().expect("mcp static context");
+                assert_eq!(c.uri, "/");
+                assert_eq!(
+                    c.location.as_deref(),
+                    Some(std::path::Path::new("/web/mcp-static/"))
+                );
+                assert_eq!(
+                    c.extra_headers,
+                    vec![
+                        ("Vary".to_string(), "Accept".to_string()),
+                        (
+                            "Cache-Control".to_string(),
+                            "public, max-age=300".to_string()
+                        ),
+                    ]
+                );
+                mcp_checked = true;
+            }
+        }
+        assert!(mcp_checked, "live config lost the mcp static context");
+    }
+
+    fn charset_context(
+        uri: &str,
+        location: Option<&str>,
+        charset: Option<bool>,
+        custom: Option<&str>,
+    ) -> hj_core::config::Context {
+        hj_core::config::Context {
+            kind: hj_core::config::ContextKind::Static,
+            uri: uri.into(),
+            location: location.map(std::path::PathBuf::from),
+            handler: None,
+            enabled: true,
+            allow_browse: true,
+            extra_headers: vec![],
+            add_default_charset: charset,
+            charset: custom.map(str::to_owned),
+            cache_policy: None,
+            max_body_override: None,
+            bandwidth_limit: 0,
+            timeout_override: None,
+            sub_filter: None,
+        }
+    }
+
+    #[test]
+    fn nested_static_context_inherits_the_innermost_set_charset() {
+        // #828: OLS HttpContext::inherit copies the parent's charset unless the
+        // child configures addDefaultCharset itself.
+        let parent = charset_context("/assets/", None, Some(true), Some("ISO-8859-1"));
+        let inherit = [
+            parent.clone(),
+            charset_context("/assets/img/", None, None, None),
+        ];
+        assert_eq!(
+            enclosing_static_charset(&inherit, "/assets/img/x.png").as_deref(),
+            Some("ISO-8859-1")
+        );
+        let off = [
+            parent.clone(),
+            charset_context("/assets/img/", None, Some(false), None),
+        ];
+        assert_eq!(enclosing_static_charset(&off, "/assets/img/x.png"), None);
+        assert_eq!(
+            enclosing_static_charset(&off, "/assets/x.css").as_deref(),
+            Some("ISO-8859-1")
+        );
+        let own = [
+            parent,
+            charset_context("/assets/img/", None, Some(true), None),
+        ];
+        assert_eq!(
+            enclosing_static_charset(&own, "/assets/img/x.png").as_deref(),
+            Some("UTF-8")
+        );
+        let unset = [charset_context("/assets/", None, None, Some("ISO-8859-1"))];
+        assert_eq!(enclosing_static_charset(&unset, "/assets/x.css"), None);
+    }
+
+    #[test]
+    fn slashless_context_uri_redirect_selection() {
+        let docs = charset_context("/docs/", None, None, None);
+        let contexts = [charset_context("/", None, None, None), docs.clone()];
+        assert!(context_slash_redirect(&contexts, "/docs"));
+        assert!(!context_slash_redirect(&contexts, "/docs/"));
+        assert!(!context_slash_redirect(&contexts, "/docs/x"));
+        assert!(!context_slash_redirect(&contexts, "/doc"));
+        assert!(!context_slash_redirect(&contexts, ""));
+        let exact = [charset_context("/docs", None, None, None), docs.clone()];
+        assert!(
+            !context_slash_redirect(&exact, "/docs"),
+            "an exact slashless context is selected instead"
+        );
+        let mut disabled = docs;
+        disabled.enabled = false;
+        assert!(!context_slash_redirect(&[disabled], "/docs"));
+    }
+
+    #[test]
+    fn docroot_located_static_context_still_strips_its_uri() {
+        // #829: OLS translate strips the context URI whenever the context has a
+        // location, even one equal to $DOC_ROOT.
+        let vhost = |contexts| hj_core::config::VHostConfig {
+            doc_root: "/srv/www/".into(),
+            contexts,
+            ..Default::default()
+        };
+        let stripped = vhost(vec![charset_context(
+            "/assets/",
+            Some("/srv/www/"),
+            None,
+            None,
+        )]);
+        assert_eq!(
+            vhost_static_location_override(&stripped, "/assets/x.css"),
+            Some((&std::path::PathBuf::from("/srv/www/"), "/assets/"))
+        );
+        let root = vhost(vec![charset_context("/", Some("/srv/www/"), None, None)]);
+        assert_eq!(vhost_static_location_override(&root, "/x.css"), None);
+        let moved = vhost(vec![charset_context("/", Some("/srv/other/"), None, None)]);
+        assert!(vhost_static_location_override(&moved, "/x.css").is_some());
+        let plain = vhost(vec![charset_context("/assets/", None, None, None)]);
+        assert_eq!(
+            vhost_static_location_override(&plain, "/assets/x.css"),
+            None
+        );
+        assert_eq!(
+            hj_static::context_relative_path(std::path::Path::new("assets/x.css"), "/assets/"),
+            std::path::Path::new("x.css")
+        );
+    }
+
+    #[test]
+    fn static_context_headers_merge_vary_and_append_repeats() {
+        // #801: a precompressed sibling's Vary: Accept-Encoding must survive.
+        let mut resp = http::Response::new(hj_core::Body::Empty);
+        resp.headers_mut()
+            .insert(http::header::VARY, "Accept-Encoding".parse().unwrap());
+        resp.headers_mut()
+            .insert(http::header::CACHE_CONTROL, "no-cache".parse().unwrap());
+        let extra = vec![
+            ("Vary".to_string(), "Accept".to_string()),
+            (
+                "Cache-Control".to_string(),
+                "public, max-age=300".to_string(),
+            ),
+            ("Link".to_string(), "</a.css>; rel=preload".to_string()),
+            ("Link".to_string(), "</b.js>; rel=preload".to_string()),
+        ];
+        super::apply_static_context_headers(&extra, &mut resp);
+        let h = resp.headers();
+        assert_eq!(h[http::header::VARY], "Accept-Encoding, Accept");
+        assert_eq!(h[http::header::CACHE_CONTROL], "public, max-age=300");
+        assert_eq!(h.get_all(http::header::LINK).iter().count(), 2);
+
+        let mut bare = http::Response::new(hj_core::Body::Empty);
+        super::apply_static_context_headers(&extra[..1], &mut bare);
+        assert_eq!(bare.headers()[http::header::VARY], "Accept");
     }
 }

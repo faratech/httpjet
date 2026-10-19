@@ -64,6 +64,10 @@ pub struct ProxyTarget {
     pub client_key_file: Option<std::path::PathBuf>,
     /// (Tier 2) Speak HTTP/2 prior-knowledge to this upstream (`h2://`/`h2s://`).
     pub http2: bool,
+    /// OLS `[P,E=Proxy-Host:value]`: replaces the outbound `Host` (and h2
+    /// `:authority`). Set through [`Self::override_host`], which also moves the TLS
+    /// SNI / pool identity to it.
+    pub host_override: Option<String>,
 }
 
 impl ProxyTarget {
@@ -137,6 +141,33 @@ impl ProxyTarget {
         }
     }
 
+    /// Send `host` as the upstream `Host` (OLS `Proxy-Host`). Call after the dial
+    /// address is pinned: for a TLS leg the authority — the SNI and certificate name —
+    /// becomes `host` with this target's port, while the transport keeps dialing the
+    /// pinned address. An invalid authority is refused.
+    pub fn override_host(&mut self, host: &str) -> Result<(), TargetParseError> {
+        let host = host.trim();
+        let parsed: http::uri::Authority = host
+            .parse()
+            .map_err(|_| TargetParseError(format!("invalid Proxy-Host {host:?}")))?;
+        if host.contains('@') || http::HeaderValue::from_str(host).is_err() {
+            return Err(TargetParseError(format!("invalid Proxy-Host {host:?}")));
+        }
+        if self.is_tls() {
+            let port = parsed
+                .port_u16()
+                .or_else(|| {
+                    self.authority
+                        .rsplit_once(':')
+                        .and_then(|(_, p)| p.parse().ok())
+                })
+                .unwrap_or_else(|| default_port(&self.scheme));
+            self.authority = format!("{}:{port}", parsed.host());
+        }
+        self.host_override = Some(host.to_string());
+        Ok(())
+    }
+
     pub fn parse_url(url: &str) -> Result<ProxyTarget, TargetParseError> {
         let url = url.trim();
         if url.is_empty() {
@@ -174,6 +205,7 @@ impl ProxyTarget {
                 connect_timeout: None,
                 retry_timeout: None,
                 response_timeout_override: None,
+                host_override: None,
             });
         }
 
@@ -222,6 +254,7 @@ impl ProxyTarget {
             connect_timeout: None,
             retry_timeout: None,
             response_timeout_override: None,
+            host_override: None,
         })
     }
 
@@ -278,6 +311,7 @@ impl ProxyTarget {
             connect_timeout: Some(ep.init_timeout),
             retry_timeout: Some(ep.retry_timeout),
             response_timeout_override: None,
+            host_override: None,
             client_cert_file: ep.client_cert_file.clone(),
             client_key_file: ep.client_key_file.clone(),
         }
@@ -315,6 +349,7 @@ impl ProxyTarget {
             connect_timeout: None,
             retry_timeout: None,
             response_timeout_override: None,
+            host_override: None,
         }
     }
 }

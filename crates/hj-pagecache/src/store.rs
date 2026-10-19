@@ -44,7 +44,7 @@ use hj_cache::sharded::{
 };
 
 use crate::diskstore::{
-    DiskStore, ScanSummary, StoredBodyFile, TAG_PURGE_FLOOR_RECORD_BYTES,
+    DiskStore, ReadError, ScanSummary, StoredBodyFile, TAG_PURGE_FLOOR_RECORD_BYTES,
     TAG_PURGE_STAMP_RECORD_BYTES, key_hash as stable_key_hash,
 };
 use crate::key::PageCacheKey;
@@ -1211,6 +1211,15 @@ pub struct CacheFootprint {
     pub hot_bytes: u64,
     /// Charged tmpfs file-tier footprint (Σ shard `disk_used`; 0 without a file store).
     pub disk_bytes: u64,
+    /// Live entry count, from the same per-shard totals.
+    pub entries: u64,
+    /// The cumulative counters of the same names in [`CacheStats`].
+    pub purges: u64,
+    pub swept_expired: u64,
+    pub evictions: u64,
+    pub disk_evictions: u64,
+    pub missing_file_invalidations: u64,
+    pub disk_read_errors: u64,
 }
 
 /// Snapshot of store counters (loopback-only `/_lscache/cache-stats`).
@@ -1265,12 +1274,18 @@ pub struct CacheStats {
     pub orphan_deferred: u64,
     /// File-tier body reads that failed (each one degraded to a miss).
     pub disk_read_errors: u64,
+    /// Hits whose snapshot body was retired by a concurrent recompress/enrichment swap and
+    /// were served from the successor instead (not failures; kept out of `disk_read_errors`).
+    pub disk_read_swap_retries: u64,
     /// File-tier persists that failed (each entry stayed in RAM).
     pub disk_write_errors: u64,
     /// Subset of `disk_write_errors` caused specifically by a full tmpfs (`ENOSPC`). A nonzero
     /// value means bodies are being retained in RAM because the file tier is out of space —
     /// the early signal that the disk cap (or the tmpfs itself) needs raising before RAM spikes.
     pub disk_full_errors: u64,
+    /// Leaf fanout directories a persist found removed (an external tmpfs cleaner) and
+    /// recreated, so the file tier kept persisting instead of falling back to RAM.
+    pub fanout_recreations: u64,
     /// DEPRECATED (always 0): `parking_lot::Mutex` shards do not poison. Kept for format stability.
     pub poisoned_locks: u64,
     /// Compressed resident metadata bytes.
@@ -1533,6 +1548,18 @@ struct TagPurgeStamp {
     epoch: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BodyReadOp {
+    Resolve,
+    Read,
+}
+
+/// File-tier body failures held back by one hit attempt until the caller knows
+/// whether a swapped successor recovered it ([`PageStore::settle_body_read_failures`]).
+/// Dropping it unsettled discards the failures; settle it on every path.
+#[derive(Default)]
+pub struct BodyReadFailures(std::cell::RefCell<Vec<(BodyReadOp, Arc<Path>, ReadError)>>);
+
 /// Unified page-response and static-file body store.
 pub struct PageStore {
     /// The shared sharded byte-weighted LRU index (`hj_cache::sharded`) for page and static entries.
@@ -1632,10 +1659,13 @@ pub struct PageStore {
     /// this counts the lookups that beat it).
     expired_misses: AtomicU64,
     disk_read_errors: AtomicU64,
+    disk_read_swap_retries: AtomicU64,
     disk_write_errors: AtomicU64,
     disk_full_errors: AtomicU64,
     meta_decode_errors: AtomicU64,
     key_id_collisions: AtomicU64,
+    /// Per-URL (`X-LiteSpeed-Vary: cookie=…`) vary specs, see [`crate::urlvary`].
+    url_vary: crate::urlvary::UrlVarySpecs,
 }
 
 /// One cache line (64 B) of storage for an [`AtomicU64`], so hot per-request
@@ -1805,10 +1835,12 @@ impl PageStore {
             swept_expired: AtomicU64::new(0),
             expired_misses: AtomicU64::new(0),
             disk_read_errors: AtomicU64::new(0),
+            disk_read_swap_retries: AtomicU64::new(0),
             disk_write_errors: AtomicU64::new(0),
             disk_full_errors: AtomicU64::new(0),
             meta_decode_errors: AtomicU64::new(0),
             key_id_collisions: AtomicU64::new(0),
+            url_vary: Default::default(),
         }
     }
 
@@ -1881,13 +1913,24 @@ impl PageStore {
     /// caller must fail closed (degrade to a miss and invalidate the key); the
     /// bytes are re-rendered, never partially served.
     pub fn body_bytes(&self, entry: &CachedResponse) -> Option<Bytes> {
-        self.body_bytes_inner(&entry.body, true)
+        self.body_bytes_inner(&entry.body, true, None)
+    }
+
+    /// [`Self::body_bytes`] for a hit attempt that a concurrently swapped
+    /// successor may still rescue: a read failure is held in `failures` until
+    /// [`Self::settle_body_read_failures`] knows whether it was recovered.
+    pub fn body_bytes_deferred(
+        &self,
+        entry: &CachedResponse,
+        failures: &BodyReadFailures,
+    ) -> Option<Bytes> {
+        self.body_bytes_inner(&entry.body, true, Some(failures))
     }
 
     /// Resolve stored-form body bytes for background jobs that need the payload
     /// as compression input but must not populate the hot in-RAM body tier.
     pub fn body_bytes_cold(&self, entry: &CachedResponse) -> Option<Bytes> {
-        self.body_bytes_inner(&entry.body, false)
+        self.body_bytes_inner(&entry.body, false, None)
     }
 
     /// Resolve a file-backed body's immutable container path + byte range
@@ -1895,13 +1938,29 @@ impl PageStore {
     /// derived, missing, or corrupt bodies so callers can fall back to the byte
     /// path or fail closed.
     pub fn body_file(&self, entry: &CachedResponse) -> Option<StoredBodyFile> {
+        self.body_file_inner(entry, None)
+    }
+
+    /// [`Self::body_file`] with its failure accounting deferred like
+    /// [`Self::body_bytes_deferred`].
+    pub fn body_file_deferred(
+        &self,
+        entry: &CachedResponse,
+        failures: &BodyReadFailures,
+    ) -> Option<StoredBodyFile> {
+        self.body_file_inner(entry, Some(failures))
+    }
+
+    fn body_file_inner(
+        &self,
+        entry: &CachedResponse,
+        failures: Option<&BodyReadFailures>,
+    ) -> Option<StoredBodyFile> {
         match &entry.body {
             PageBody::File { path, len, .. } => match self.disk.as_ref()?.body_file(path, *len) {
                 Ok(f) => Some(f),
                 Err(e) => {
-                    self.disk_read_errors.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(path = %path.display(), error = ?e,
-                        "jetcache: body file resolve failed — degrading to a miss");
+                    self.body_read_failed(BodyReadOp::Resolve, path, e, failures);
                     None
                 }
             },
@@ -1909,11 +1968,62 @@ impl PageStore {
         }
     }
 
-    pub fn static_body_bytes(&self, entry: &StaticNode) -> Option<Bytes> {
-        self.body_bytes_inner(&entry.body, true)
+    /// Account the failures a deferred hit attempt collected. `recovered` means
+    /// the request was served by the successor a concurrent recompress/enrichment
+    /// published after the snapshot was taken: the old pathname was retired, not
+    /// lost, so that is one `disk_read_swap_retries` rather than read errors.
+    /// Otherwise each failure counts and logs exactly as the immediate path does.
+    pub fn settle_body_read_failures(&self, failures: BodyReadFailures, recovered: bool) {
+        let failures = failures.0.into_inner();
+        if failures.is_empty() {
+            return;
+        }
+        if recovered {
+            self.disk_read_swap_retries.fetch_add(1, Ordering::Relaxed);
+            for (op, path, error) in &failures {
+                tracing::debug!(path = %path.display(), error = ?error, op = ?op,
+                    "jetcache: hit snapshot body retired by a concurrent swap — served its successor");
+            }
+            return;
+        }
+        for (op, path, error) in &failures {
+            self.count_body_read_error(*op, path, error);
+        }
     }
 
-    fn body_bytes_inner(&self, body: &PageBody, promote_hot: bool) -> Option<Bytes> {
+    fn body_read_failed(
+        &self,
+        op: BodyReadOp,
+        path: &Arc<Path>,
+        error: ReadError,
+        failures: Option<&BodyReadFailures>,
+    ) {
+        match failures {
+            Some(f) => f.0.borrow_mut().push((op, path.clone(), error)),
+            None => self.count_body_read_error(op, path, &error),
+        }
+    }
+
+    fn count_body_read_error(&self, op: BodyReadOp, path: &Path, error: &ReadError) {
+        self.disk_read_errors.fetch_add(1, Ordering::Relaxed);
+        match op {
+            BodyReadOp::Resolve => tracing::warn!(path = %path.display(), error = ?error,
+                "jetcache: body file resolve failed — degrading to a miss"),
+            BodyReadOp::Read => tracing::warn!(path = %path.display(), error = ?error,
+                "jetcache: body read failed — degrading to a miss"),
+        }
+    }
+
+    pub fn static_body_bytes(&self, entry: &StaticNode) -> Option<Bytes> {
+        self.body_bytes_inner(&entry.body, true, None)
+    }
+
+    fn body_bytes_inner(
+        &self,
+        body: &PageBody,
+        promote_hot: bool,
+        failures: Option<&BodyReadFailures>,
+    ) -> Option<Bytes> {
         match body {
             PageBody::InMem(b) => Some(b.clone()),
             PageBody::Derived { .. } => None,
@@ -1942,9 +2052,7 @@ impl PageStore {
                         Some(b)
                     }
                     Err(e) => {
-                        self.disk_read_errors.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(path = %path.display(), error = ?e,
-                            "jetcache: body read failed — degrading to a miss");
+                        self.body_read_failed(BodyReadOp::Read, path, e, failures);
                         None
                     }
                 }
@@ -1975,6 +2083,93 @@ impl PageStore {
     /// instead of re-attempting a dead file.
     pub fn invalidate_key(&self, key: &PageCacheKey) {
         self.inner.remove(&CacheKeyId::new(key));
+    }
+
+    fn page_resident(&self, raw_hash: u64) -> bool {
+        let id = CacheKeyId::from_raw_page_hash(raw_hash);
+        self.inner.with_shard(&id, |acc| acc.contains(&id))
+    }
+
+    /// Lock-free and allocation-free: `false` means no spec exists for `base_hash`.
+    #[inline]
+    pub fn url_vary_may_have(&self, base_hash: u64) -> bool {
+        self.url_vary.may_have(base_hash)
+    }
+
+    /// True once any URL carries a per-URL vary spec; until then no request pays for one.
+    pub fn url_vary_active(&self) -> bool {
+        !self.url_vary.is_empty()
+    }
+
+    /// Live per-URL vary specs.
+    pub fn url_vary_spec_count(&self) -> usize {
+        self.url_vary.len()
+    }
+
+    /// The extra cookie names `base` (whose `key_hash` is `base_hash`) varies on, if a
+    /// response for it declared any.
+    pub fn url_vary_names(&self, base: &PageCacheKey, base_hash: u64) -> Option<Arc<[String]>> {
+        self.url_vary.names(base_hash, base)
+    }
+
+    /// Approximate bytes held by the per-URL vary spec map (bounded by
+    /// [`crate::urlvary::MAX_SPEC_BYTES`]).
+    pub fn url_vary_bytes(&self) -> usize {
+        self.url_vary.bytes()
+    }
+
+    /// Remove the page entry whose raw `key_hash` is `raw_hash`.
+    fn invalidate_page_hash(&self, raw_hash: u64) {
+        self.inner.remove(&CacheKeyId::from_raw_page_hash(raw_hash));
+    }
+
+    /// Register an ADMITTED variant (`variant_hash`) of `base`, which now varies on `names`
+    /// (non-empty), just before storing it. `false` ⇒ do not store (a base-hash collision, or
+    /// the spec map's bounds could not make room).
+    pub fn url_vary_prepare(
+        &self,
+        base: &PageCacheKey,
+        base_hash: u64,
+        names: &[String],
+        variant_hash: u64,
+    ) -> bool {
+        self.url_vary.prepare(
+            base,
+            base_hash,
+            names,
+            variant_hash,
+            |hash| self.page_resident(hash),
+            |hash| self.invalidate_page_hash(hash),
+        )
+    }
+
+    /// `base` no longer varies: drop its spec and retire every variant.
+    pub fn url_vary_drop(&self, base: &PageCacheKey, base_hash: u64) {
+        self.url_vary
+            .drop_spec(base, base_hash, |hash| self.invalidate_page_hash(hash));
+    }
+
+    /// Lock-free and allocation-free: `false` means no key of this vhost + path varies
+    /// per URL (`vhost_id`/`path` as they appear in [`PageCacheKey`]).
+    pub fn url_vary_may_vary_path(&self, vhost_id: u32, path: &str) -> bool {
+        self.url_vary.may_vary_path(vhost_id, path)
+    }
+
+    /// A served hit on a variant: keeps it (and its spec) recently used.
+    pub fn url_vary_touch(&self, base_hash: u64, variant_hash: u64) {
+        self.url_vary.touch(base_hash, variant_hash);
+    }
+
+    /// After a store: whether the spec map still routes `base` to the stored entry. On
+    /// `false` the caller invalidates what it stored (a concurrent opposite decision won).
+    pub fn url_vary_confirm(
+        &self,
+        base: &PageCacheKey,
+        base_hash: u64,
+        names: &[String],
+        stored_hash: u64,
+    ) -> bool {
+        self.url_vary.confirm(base, base_hash, names, stored_hash)
     }
 
     /// Remove `key` only when `expected` is still the exact serve snapshot held
@@ -2915,10 +3110,30 @@ impl PageStore {
                 se.version_seq,
                 None,
             );
-            if kept {
-                on_loaded(&se.key);
+            if !kept {
+                return false;
             }
-            kept
+            let verdict = self.url_vary.register_scanned(
+                &se.key,
+                stable_key_hash(&se.key),
+                stored_at,
+                stable_key_hash,
+                |base_hash| {
+                    let id = CacheKeyId::from_raw_page_hash(base_hash);
+                    self.inner.with_shard(&id, |acc| {
+                        acc.get(&id)
+                            .and_then(CacheEntry::as_page)
+                            .map(|n| n.stored_at)
+                    })
+                },
+                |hash| self.invalidate_page_hash(hash),
+            );
+            if matches!(verdict, crate::urlvary::ScanVerdict::Drop) {
+                self.invalidate_key(&se.key);
+                return false;
+            }
+            on_loaded(&se.key);
+            true
         });
         let static_max_obj = self.config.max_static_obj_bytes;
         let static_sum = disk.scan_static(|se| {
@@ -3405,6 +3620,7 @@ impl PageStore {
             0
         };
         self.tag_index.clear();
+        self.url_vary.clear();
         // Record purged-all in the boot-scan buffer BEFORE dropping the live set, so a concurrent
         // `load_scanned` whose under-lock re-check runs after `purge_if` swept its shard is still
         // rejected (mirrors `purge_tags`, which buffers its tags before tearing down). Together with
@@ -3471,14 +3687,23 @@ impl PageStore {
         self.inner.entry_count()
     }
 
-    /// Budget byte gauges without walking entries or the tag index: one short lock per
-    /// shard to sum the totals the shards already maintain. For periodic samplers.
+    /// Budget byte gauges and the entry count without walking entries or the tag index:
+    /// one short lock per shard to sum the totals the shards already maintain, plus the
+    /// removal counters' atomics. For periodic samplers.
     pub fn footprint(&self) -> CacheFootprint {
         let index = self.inner.stats();
         CacheFootprint {
             index_ram_bytes: index.ram_bytes,
             hot_bytes: self.hot.as_ref().map_or(0, |h| h.bytes()),
             disk_bytes: index.disk_bytes,
+            entries: index.entries,
+            purges: self.purges.load(Ordering::Relaxed),
+            swept_expired: self.swept_expired.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            disk_evictions: self.disk_evictions.load(Ordering::Relaxed),
+            // Always 0, as in `stats()`.
+            missing_file_invalidations: 0,
+            disk_read_errors: self.disk_read_errors.load(Ordering::Relaxed),
         }
     }
 
@@ -3536,8 +3761,10 @@ impl PageStore {
             orphan_reclaimed: 0,
             orphan_deferred: 0,
             disk_read_errors: self.disk_read_errors.load(Ordering::Relaxed),
+            disk_read_swap_retries: self.disk_read_swap_retries.load(Ordering::Relaxed),
             disk_write_errors: self.disk_write_errors.load(Ordering::Relaxed),
             disk_full_errors: self.disk_full_errors.load(Ordering::Relaxed),
+            fanout_recreations: self.disk.as_ref().map_or(0, |d| d.fanout_recreations()),
             poisoned_locks: 0,
             meta_compressed_bytes,
             meta_raw_bytes,
@@ -3694,6 +3921,10 @@ impl PageStore {
     /// caller's stable signature but ignored (there are no orphans to reconcile).
     pub fn maintenance(&self, _orphan_grace: Duration) {
         self.sweep_expired();
+        self.url_vary.prune(
+            |hash| self.page_resident(hash),
+            |hash| self.invalidate_page_hash(hash),
+        );
         if let Some(h) = &self.hot {
             h.evict_idle(Instant::now());
         }
@@ -4581,6 +4812,80 @@ mod tests {
             1,
             "dead file is not retried after invalidation"
         );
+    }
+
+    #[test]
+    fn deferred_body_read_failures_settle_as_swap_retry_or_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        s.load_from_disk(|_| {});
+        let k = PageCacheKey::public(1, true, "h", "/swap", "");
+        let id = "h\n/swap";
+        s.store(
+            k.clone(),
+            entry_id(&vec![b'a'; 2048], &[], Duration::from_secs(600), id),
+        );
+        let hit = s.lookup(&k, id, Instant::now()).expect("file-backed hit");
+        let PageBody::File { path, .. } = &hit.body else {
+            panic!("file tier should offload the body");
+        };
+        std::fs::remove_file(path.as_ref()).unwrap();
+
+        let recovered = BodyReadFailures::default();
+        assert!(s.body_bytes_deferred(&hit, &recovered).is_none());
+        assert!(s.body_file_deferred(&hit, &recovered).is_none());
+        assert_eq!(s.stats().disk_read_errors, 0, "held until settled");
+        s.settle_body_read_failures(recovered, true);
+        let st = s.stats();
+        assert_eq!(st.disk_read_errors, 0);
+        assert_eq!(st.disk_read_swap_retries, 1, "one recovered request");
+
+        let lost = BodyReadFailures::default();
+        assert!(s.body_bytes_deferred(&hit, &lost).is_none());
+        s.settle_body_read_failures(lost, false);
+        let st = s.stats();
+        assert_eq!(
+            st.disk_read_errors, 1,
+            "an unrecovered body is a read error"
+        );
+        assert_eq!(st.disk_read_swap_retries, 1);
+
+        s.settle_body_read_failures(BodyReadFailures::default(), true);
+        assert_eq!(
+            s.stats().disk_read_swap_retries,
+            1,
+            "nothing failed, nothing to classify"
+        );
+    }
+
+    #[test]
+    fn store_after_external_fanout_wipe_still_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        s.load_from_disk(|_| {});
+        let k = PageCacheKey::public(1, true, "h", "/wiped", "");
+        let id = "h\n/wiped";
+        let hex = format!("{:016x}", stable_key_hash(&k));
+        let leaf = dir
+            .path()
+            .join(&hex[0..1])
+            .join(&hex[1..2])
+            .join(&hex[2..3]);
+        std::fs::remove_dir_all(&leaf).unwrap();
+
+        s.store(
+            k.clone(),
+            entry_id(&vec![b'w'; 2048], &[], Duration::from_secs(600), id),
+        );
+        let got = s.lookup(&k, id, Instant::now()).expect("stored");
+        let PageBody::File { path, .. } = &got.body else {
+            panic!("the wiped fanout must not push the body back into RAM");
+        };
+        assert!(path.exists(), "persisted file exists after the wipe");
+        let st = s.stats();
+        assert_eq!(st.fanout_recreations, 1);
+        assert_eq!(st.disk_write_errors, 0);
+        assert_eq!(&s.body_bytes(&got).unwrap()[..], &[b'w'; 2048][..]);
     }
 
     #[test]

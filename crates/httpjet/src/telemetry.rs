@@ -884,11 +884,16 @@ impl Telemetry {
 /// position: process/transport measurements sampled once per flush, never on a request.
 /// Cumulative counters (raw totals since process start; diff two rows like the leading
 /// counters): `tls_handshakes_*`, `conn_*_closes_*`, `cpu_ticks_*` (USER_HZ ticks),
-/// `slices_*` (schedstat timeslices) and `minflt_total`. Instantaneous gauges at the
-/// row's `ts`: `active_*`, `rss_anon_bytes`, `pagecache_*_bytes` and `lsapi_inflight_now`;
+/// `slices_*` (schedstat timeslices), `minflt_total` and `pagecache_*_total`: the
+/// `httpjet_pagecache_*_total` metrics, so a drop in `pagecache_entries` /
+/// `pagecache_disk_bytes` names its mechanism (purge, expiry sweep, eviction; a body
+/// file deleted underneath the store counts as a disk read error on its next hit, and
+/// `pagecache_missing_file_invalidations_total` stays 0 like its metric).
+/// Instantaneous gauges at the row's `ts`: `active_*`, `rss_anon_bytes`,
+/// `pagecache_*_bytes`, `pagecache_entries` and `lsapi_inflight_now`;
 /// `lsapi_inflight_max_tick` is the peak in-flight count since the previous row.
 /// A source that cannot be read (no page cache, no PHP pool, a /proc failure) emits 0.
-pub const EXTRA_NAMES: [&str; 21] = [
+pub const EXTRA_NAMES: [&str; 29] = [
     "tls_handshakes_full",
     "tls_handshakes_resumed",
     "conn_idle_closes_h1",
@@ -910,6 +915,14 @@ pub const EXTRA_NAMES: [&str; 21] = [
     "slices_tokio",
     "slices_uring_tls",
     "minflt_total",
+    "pagecache_entries",
+    "pagecache_purges_total",
+    "pagecache_purges_received_total",
+    "pagecache_swept_expired_total",
+    "pagecache_evictions_total",
+    "pagecache_disk_evictions_total",
+    "pagecache_missing_file_invalidations_total",
+    "pagecache_disk_read_errors_total",
 ];
 
 /// One sample of the [`EXTRA_NAMES`] columns.
@@ -931,6 +944,15 @@ pub struct ExtraSample {
     pub lsapi_inflight_now: u64,
     pub lsapi_inflight_max_tick: u64,
     pub cpu: CpuTotals,
+    pub pagecache_entries: u64,
+    pub pagecache_purges_total: u64,
+    /// Loopback `/__hj_cache_purge` requests applied (a subset of `pagecache_purges_total`).
+    pub pagecache_purges_received_total: u64,
+    pub pagecache_swept_expired_total: u64,
+    pub pagecache_evictions_total: u64,
+    pub pagecache_disk_evictions_total: u64,
+    pub pagecache_missing_file_invalidations_total: u64,
+    pub pagecache_disk_read_errors_total: u64,
 }
 
 impl ExtraSample {
@@ -958,6 +980,14 @@ impl ExtraSample {
             self.cpu.slices_tokio,
             self.cpu.slices_uring_tls,
             self.cpu.minflt_total,
+            self.pagecache_entries,
+            self.pagecache_purges_total,
+            self.pagecache_purges_received_total,
+            self.pagecache_swept_expired_total,
+            self.pagecache_evictions_total,
+            self.pagecache_disk_evictions_total,
+            self.pagecache_missing_file_invalidations_total,
+            self.pagecache_disk_read_errors_total,
         ]
     }
 }
@@ -1191,6 +1221,14 @@ impl TelemetrySampler {
             lsapi_inflight_now: lsapi_now,
             lsapi_inflight_max_tick: lsapi_max,
             cpu,
+            pagecache_entries: page.entries,
+            pagecache_purges_total: page.purges,
+            pagecache_purges_received_total: m.purges_received.load(Relaxed),
+            pagecache_swept_expired_total: page.swept_expired,
+            pagecache_evictions_total: page.evictions,
+            pagecache_disk_evictions_total: page.disk_evictions,
+            pagecache_missing_file_invalidations_total: page.missing_file_invalidations,
+            pagecache_disk_read_errors_total: page.disk_read_errors,
         }
     }
 
@@ -1217,33 +1255,35 @@ pub async fn run_flush(
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     tracing::info!(path = %path.display(), secs = interval.as_secs(), "telemetry: disk snapshot flush enabled");
-    // (schema) Never mix column generations in one file: columns are appended
-    // over releases, but the header is only written when the file is created —
-    // by 2026-06 one file held 147/154/160-col rows under a stale 147-col
-    // header, silently breaking every name-addressed diff reader. If the
-    // existing header doesn't match the current schema, rotate the file out so
-    // this generation starts fresh with its own header.
-    {
-        use tokio::io::AsyncBufReadExt;
-        let expected = format!("ts\t{}", Telemetry::tsv_header());
-        if let Ok(f) = tokio::fs::File::open(&path).await {
-            let mut first = String::new();
-            let mut r = tokio::io::BufReader::new(f);
-            if r.read_line(&mut first).await.is_ok()
-                && !first.is_empty()
-                && first.trim_end() != expected
-            {
-                let _ = tokio::fs::rename(&path, path.with_extension("tsv.1")).await;
-                tracing::info!(path = %path.display(), "telemetry: snapshot schema changed; rotated old file to .tsv.1");
-            }
-        }
-    }
+    rotate_stale_schema(&path).await;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.cancelled() => break,
         }
         flush_once(&sampler, &path).await;
+    }
+}
+
+/// (schema) Never mix column generations in one file: columns are appended
+/// over releases, but the header is only written when the file is created —
+/// by 2026-06 one file held 147/154/160-col rows under a stale 147-col
+/// header, silently breaking every name-addressed diff reader. If the
+/// existing header doesn't match the current schema, rotate the file out so
+/// this generation starts fresh with its own header.
+async fn rotate_stale_schema(path: &std::path::Path) {
+    use tokio::io::AsyncBufReadExt;
+    let expected = format!("ts\t{}", Telemetry::tsv_header());
+    if let Ok(f) = tokio::fs::File::open(path).await {
+        let mut first = String::new();
+        let mut r = tokio::io::BufReader::new(f);
+        if r.read_line(&mut first).await.is_ok()
+            && !first.is_empty()
+            && first.trim_end() != expected
+        {
+            let _ = tokio::fs::rename(path, path.with_extension("tsv.1")).await;
+            tracing::info!(path = %path.display(), "telemetry: snapshot schema changed; rotated old file to .tsv.1");
+        }
     }
 }
 
@@ -1468,6 +1508,14 @@ mod tests {
                 slices_uring_tls: 20,
                 minflt_total: 21,
             },
+            pagecache_entries: 22,
+            pagecache_purges_total: 23,
+            pagecache_purges_received_total: 24,
+            pagecache_swept_expired_total: 25,
+            pagecache_evictions_total: 26,
+            pagecache_disk_evictions_total: 27,
+            pagecache_missing_file_invalidations_total: 28,
+            pagecache_disk_read_errors_total: 29,
         };
         let expected: Vec<u64> = (1..=EXTRA_NAMES.len() as u64).collect();
         assert_eq!(e.values().to_vec(), expected);
@@ -1686,6 +1734,38 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A file written before the page-cache counter columns existed is rotated out
+    /// at startup, so its rows never sit under the new header; a current one stays.
+    #[tokio::test]
+    async fn schema_change_rotates_the_old_file_out() {
+        let path = temp_path("schema");
+        let rotated = path.with_extension("tsv.1");
+        let current = format!("ts\t{}", Telemetry::tsv_header());
+        let cols: Vec<&str> = current.split('\t').collect();
+        let old = cols[..cols.len() - 8].join("\t");
+        assert!(old.ends_with("\tminflt_total"), "{old}");
+        std::fs::write(&path, format!("{old}\n1\t0\n")).unwrap();
+        rotate_stale_schema(&path).await;
+        assert!(!path.exists());
+        assert!(std::fs::read_to_string(&rotated).unwrap().starts_with(&old));
+
+        let extra = ExtraSample {
+            pagecache_disk_read_errors_total: 5,
+            ..ExtraSample::default()
+        };
+        append_snapshot(&Telemetry::default(), &extra, &path).await;
+        let body = std::fs::read_to_string(&path).unwrap();
+        let header = body.lines().next().unwrap();
+        assert_eq!(header, current);
+        let row = body.lines().nth(1).unwrap();
+        assert_eq!(cell(header, row, "pagecache_disk_read_errors_total"), "5");
+
+        rotate_stale_schema(&path).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(rotated);
+    }
+
     /// The flusher's sampler reads the gen-0 state's shared counters, the page cache and
     /// procfs, and the row lands under the right header names.
     #[tokio::test]
@@ -1707,11 +1787,41 @@ mod tests {
         let page_cache = std::sync::Arc::new(hj_pagecache::PageStore::new(
             hj_pagecache::StoreConfig::default(),
         ));
+        let file_id = |inode| hj_pagecache::FileId {
+            size: 1,
+            mtime_secs: 1,
+            mtime_nanos: 0,
+            inode,
+        };
+        for (path, inode) in [("/a", 1), ("/b", 2)] {
+            assert!(page_cache.store_static(
+                1,
+                std::path::Path::new(path),
+                file_id(inode),
+                bytes::Bytes::from_static(b"x"),
+                std::sync::Arc::from("text/plain"),
+                String::new(),
+                String::new(),
+            ));
+        }
+        // A changed file identity tears the cached copy down: one eviction.
+        assert!(
+            page_cache
+                .get_static(
+                    1,
+                    std::path::Path::new("/b"),
+                    &file_id(3),
+                    std::time::Instant::now()
+                )
+                .is_none()
+        );
+        page_cache.purge_tags(&["t"]);
+        page_cache.purge_all();
         let state = ServerState::new(
             std::sync::Arc::new(server),
             None,
             None,
-            Some(page_cache),
+            Some(page_cache.clone()),
             std::sync::Arc::new(hj_compress::PageDictRegistry::empty()),
             1,
             XfCapsuleConfig::disabled(),
@@ -1728,6 +1838,7 @@ mod tests {
         state.metrics.tls_handshakes_resumed.store(2, Relaxed);
         state.metrics.h1_idle_closes.store(5, Relaxed);
         state.metrics.h1_peer_closes.store(6, Relaxed);
+        state.metrics.purges_received.store(4, Relaxed);
         let sampler = std::sync::Arc::new(TelemetrySampler::new(state));
         let path = temp_path("sampler");
         flush_once(&sampler, &path).await;
@@ -1743,6 +1854,25 @@ mod tests {
         assert_eq!(cell(header, row, "conn_peer_closes_h1"), "6");
         assert_eq!(cell(header, row, "lsapi_inflight_now"), "0");
         assert_eq!(cell(header, row, "pagecache_disk_bytes"), "0");
+        assert_eq!(cell(header, row, "pagecache_entries"), "1");
+        assert_eq!(cell(header, row, "pagecache_purges_total"), "2");
+        assert_eq!(cell(header, row, "pagecache_purges_received_total"), "4");
+        assert_eq!(cell(header, row, "pagecache_evictions_total"), "1");
+        let stats = page_cache.stats();
+        for (name, value) in [
+            ("pagecache_entries", stats.entries),
+            ("pagecache_purges_total", stats.purges),
+            ("pagecache_swept_expired_total", stats.swept_expired),
+            ("pagecache_evictions_total", stats.evictions),
+            ("pagecache_disk_evictions_total", stats.disk_evictions),
+            (
+                "pagecache_missing_file_invalidations_total",
+                stats.missing_file_invalidations,
+            ),
+            ("pagecache_disk_read_errors_total", stats.disk_read_errors),
+        ] {
+            assert_eq!(cell(header, row, name), value.to_string(), "{name}");
+        }
         assert_ne!(cell(header, row, "rss_anon_bytes"), "0");
         assert_ne!(cell(header, row, "minflt_total"), "0");
         let _ = std::fs::remove_file(path);

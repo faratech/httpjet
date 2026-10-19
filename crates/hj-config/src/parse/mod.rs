@@ -9,6 +9,7 @@ mod balance;
 mod raw;
 mod scalar;
 mod vhost;
+mod xmlnorm;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -32,16 +33,22 @@ use vhost::{convert_vhost_decls, load_vhost_files};
 /// Load the full server config rooted at `server_root` (e.g. `/usr/local/lsws`),
 /// reading `conf/httpd_config.xml` and every referenced vhost file.
 pub fn load(server_root: impl AsRef<Path>) -> Result<ServerConfig> {
+    load_report(server_root).map(|(cfg, _)| cfg)
+}
+
+/// [`load`], also returning the declared vhosts whose files were skipped.
+pub fn load_report(server_root: impl AsRef<Path>) -> Result<(ServerConfig, Vec<SkippedVhost>)> {
     let server_root = server_root.as_ref().to_path_buf();
     let main = server_root.join("conf/httpd_config.xml");
-    let mut cfg = load_server_file(&server_root, &main)?;
-    load_vhost_files(&mut cfg)?;
+    let text = read_config_file(&main, MAX_CONFIG_FILE_BYTES)?;
+    let (mut cfg, inherit) = parse_server_parts(&server_root, &main, &text, false)?;
+    let skipped = load_vhost_files(&mut cfg, &inherit)?;
     // mime.properties (best-effort; absence is not fatal)
     let mime_path = server_root.join("conf/mime.properties");
     if let Ok(text) = read_config_file(&mime_path, MAX_CONFIG_FILE_BYTES) {
         cfg.mime = parse_mime(&text);
     }
-    Ok(cfg)
+    Ok((cfg, skipped))
 }
 
 /// Parse a complete in-memory configuration without reading config files.
@@ -72,15 +79,16 @@ pub fn parse_bundle(
     // Legacy file parsing logs operator diagnostics that can contain XML values.
     // A synchronous submission must not emit those values to ambient sinks.
     tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
-        let mut cfg = parse_server_text(server_root, Path::new("<submission>"), server_xml)
-            .map_err(|_| BundleError)?;
+        let (mut cfg, inherit) =
+            parse_server_parts(server_root, Path::new("<submission>"), server_xml, true)
+                .map_err(|_| BundleError)?;
         if cfg.vhost_order.len() != cfg.vhosts.len()
             || cfg.vhosts.len() != vhosts.len()
             || cfg.vhosts.keys().ne(vhosts.keys())
         {
             return Err(BundleError);
         }
-        vhost::load_vhost_sources(&mut cfg, true, |name, _| Ok(vhosts[name].clone()))
+        vhost::load_vhost_sources(&mut cfg, &inherit, true, |name, _| Ok(vhosts[name].clone()))
             .map_err(|_| BundleError)?;
         cfg.mime = parse_mime(mime);
         Ok(cfg)
@@ -155,16 +163,42 @@ pub(crate) fn read_config_file(path: &Path, max: u64) -> Result<String> {
 }
 
 /// Parse just the server file (no vhost-file loading); useful for tests.
+#[cfg(test)]
 pub(crate) fn load_server_file(server_root: &Path, path: &Path) -> Result<ServerConfig> {
     let text = read_config_file(path, MAX_CONFIG_FILE_BYTES)?;
     parse_server_text(server_root, path, &text)
 }
 
+#[cfg(test)]
 fn parse_server_text(server_root: &Path, path: &Path, text: &str) -> Result<ServerConfig> {
-    let raw: RawServer = quick_xml::de::from_str(text).map_err(|e| ConfigError::Xml {
+    parse_server_parts(server_root, path, text, false).map(|(cfg, _)| cfg)
+}
+
+/// Server-level state merged into each vhost when its file loads.
+struct VhostInherit {
+    /// The server `<scriptHandlerList>`, under each vhost's own handlers (#928).
+    script_handlers: Vec<ScriptHandler>,
+    /// Vhosts their declaration disables or `<suspendedVhosts>` lists (#1000).
+    disabled: std::collections::BTreeSet<String>,
+    /// The server `<htAccess><allowOverride>` (only 31 loads, #1028).
+    allow_override: Option<u32>,
+}
+
+fn parse_server_parts(
+    server_root: &Path,
+    path: &Path,
+    text: &str,
+    strict: bool,
+) -> Result<(ServerConfig, VhostInherit)> {
+    let text = xmlnorm::normalize(text, path);
+    let mut raw: RawServer = quick_xml::de::from_str(&text).map_err(|e| ConfigError::Xml {
         path: path.to_path_buf(),
         msg: e.to_string(),
     })?;
+    reject_template_members(path, raw.vh_template_list.as_ref())?;
+    vhost::reject_apache_conf(path, "server", raw.apache_conf.as_deref())?;
+    let allow_override = vhost::server_allow_override(path, raw.htaccess.as_ref())?;
+    let script_handlers = vhost::convert_script_handlers(raw.script_handler_list.take(), path)?;
 
     let hostname = nonempty(raw.server_name.clone())
         .filter(|s| !s.contains('$'))
@@ -178,12 +212,28 @@ fn parse_server_text(server_root: &Path, path: &Path, text: &str) -> Result<Serv
     let tuning = convert_tuning(raw.tuning.unwrap_or_default());
     let expires = convert_expires(raw.expires);
     let cache = convert_server_cache(raw.cache);
-    let security = convert_security(raw.security, &ctx, path)?;
+    let raw_security = match raw.security {
+        Some(security) => Some(security),
+        None if raw.access_control.is_some()
+            || raw.access_deny_dir.is_some()
+            || raw.file_access_control.is_some() =>
+        {
+            Some(RawSecurity {
+                access_control: raw.access_control,
+                access_deny_dir: raw.access_deny_dir,
+                file_access_control: raw.file_access_control,
+                ..RawSecurity::default()
+            })
+        }
+        None => None,
+    };
+    let security = convert_security(raw_security, &ctx, path)?;
     let suexec = convert_suexec(raw.suexec);
     let ext_processors = convert_ext_list(raw.ext_processor_list, &ctx, path)?;
     let php_config = raw
         .php_config
-        .map(|p| convert_php(p, &ctx, security.cgi_cpu_limit_secs));
+        .map(|p| convert_php(p, &ctx, path))
+        .transpose()?;
     let listeners = convert_listeners(raw.listener_list, &ctx);
     for listener in &listeners {
         listener
@@ -195,9 +245,15 @@ fn parse_server_text(server_root: &Path, path: &Path, text: &str) -> Result<Serv
                 reason,
             })?;
     }
-    let (vhosts, vhost_order) = convert_vhost_decls(raw.vhost_list, &ctx);
+    let (vhosts, vhost_order, disabled) = convert_vhost_decls(
+        raw.vhost_list,
+        raw.suspended_vhosts.as_deref(),
+        &ctx,
+        path,
+        strict,
+    )?;
 
-    Ok(ServerConfig {
+    let cfg = ServerConfig {
         server_root: server_root.to_path_buf(),
         server_name: hostname,
         user: nonempty(raw.user).unwrap_or_else(|| "nobody".into()),
@@ -222,20 +278,73 @@ fn parse_server_text(server_root: &Path, path: &Path, text: &str) -> Result<Serv
         vhosts,
         vhost_order,
         mime: MimeMap::default(),
-    })
+    };
+    Ok((
+        cfg,
+        VhostInherit {
+            script_handlers,
+            disabled,
+            allow_override,
+        },
+    ))
+}
+
+/// Template members would be instantiated as vhosts by OLS; httpjet does not
+/// expand templates, so a member is refused instead of left unserved (#921).
+/// A template with no members (the stock LSWS set) is inert and loads.
+fn reject_template_members(path: &Path, list: Option<&RawVhTemplateList>) -> Result<()> {
+    for template in list.into_iter().flat_map(|l| &l.vh_template) {
+        if let Some(member) = template.member.first() {
+            return Err(ConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                directive: "vhTemplate.member",
+                value: member.vh_name.as_deref().unwrap_or("").trim().to_string(),
+                reason: format!(
+                    "template {:?}: vhTemplate members are not supported; declare the vhost in <virtualHostList>",
+                    template.name.as_deref().unwrap_or("").trim()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn convert_tuning(r: RawTuning) -> Tuning {
     let d = Tuning::default();
+    // LSWS/OLS `enableBrCompress` is the dynamic brotli LEVEL, 0 (off) to 6
+    // (`getLongValue(.., 0, 6, 4)`), not a boolean. Absent keeps brotli on.
+    let br_level = r
+        .enable_brotli
+        .as_ref()
+        .map(|_| ols_long_value(&r.enable_brotli, 0, 6, 4) as u8);
     Tuning {
         max_connections: u32_of(&r.max_connections, d.max_connections),
         conn_timeout: secs_in_range(&r.conn_timeout, 60, 1..=10_000, "connTimeout"),
         keep_alive_timeout: secs_in_range(&r.keep_alive_timeout, 5, 1..=10_000, "keepAliveTimeout"),
-        max_keep_alive_req: u32_of(&r.max_keep_alive_req, d.max_keep_alive_req),
-        max_req_url_len: bytes_of(&r.max_req_url_len, d.max_req_url_len as u64) as usize,
-        max_req_header_size: bytes_of(&r.max_req_header_size, d.max_req_header_size as u64)
-            as usize,
-        max_req_body_size: bytes_of(&r.max_req_body_size, d.max_req_body_size),
+        // OLS range 0..=32767; out of range falls back to the default.
+        max_keep_alive_req: Some(u32_of(&r.max_keep_alive_req, d.max_keep_alive_req))
+            .filter(|v| *v <= 32_767)
+            .unwrap_or(d.max_keep_alive_req),
+        // OLS httpserver.cpp: maxReqURLLen 100..=MAX_URL_LEN (64 KiB),
+        // maxReqHeaderSize 1024..=131072-4, maxReqBodySize >= 4096 (#926).
+        max_req_url_len: bytes_in_range(
+            &r.max_req_url_len,
+            d.max_req_url_len as u64,
+            100..=65_536,
+            "maxReqURLLen",
+        ) as usize,
+        max_req_header_size: bytes_in_range(
+            &r.max_req_header_size,
+            d.max_req_header_size as u64,
+            1024..=131_068,
+            "maxReqHeaderSize",
+        ) as usize,
+        max_req_body_size: bytes_in_range(
+            &r.max_req_body_size,
+            d.max_req_body_size,
+            4096..=u64::MAX,
+            "maxReqBodySize",
+        ),
         max_cached_file_size: bytes_of(&r.max_cached_file_size, d.max_cached_file_size),
         total_in_mem_cache_size: bytes_of(&r.total_in_mem_cache_size, d.total_in_mem_cache_size),
         max_mmap_file_size: bytes_of(&r.max_mmap_file_size, d.max_mmap_file_size),
@@ -263,19 +372,29 @@ fn convert_tuning(r: RawTuning) -> Tuning {
             .as_ref()
             .map(|_| truthy(&r.enable_dyn_zstd))
             .unwrap_or(true),
-        enable_brotli: r
-            .enable_brotli
-            .as_ref()
-            .map(|_| truthy(&r.enable_brotli))
-            .unwrap_or(true),
+        enable_brotli: br_level != Some(0),
         enable_dyn_brotli: r
             .enable_dyn_brotli
             .as_ref()
             .map(|_| truthy(&r.enable_dyn_brotli))
             .unwrap_or(true),
+        gzip_level: bounded_u8(&r.gzip_level, 1, 9, d.gzip_level as u8) as u32,
+        // OLS reads an absent element as `default`; a present one, even empty, is the list.
+        compressible_types: r
+            .compressible_types
+            .as_deref()
+            .map(split_list)
+            .unwrap_or(d.compressible_types),
         // OLS-style bounded parse: out-of-range/absent falls back to the default.
         zstd_level: bounded_u8(&r.zstd_level, 1, 22, 3) as u32,
-        brotli_quality: bounded_u8(&r.brotli_quality, 0, 11, 5) as u32,
+        // The httpjet-native `brCompressLevel` wins; without it a LiteSpeed config's
+        // `enableBrCompress` level is the quality it asked for.
+        brotli_quality: bounded_u8(
+            &r.brotli_quality,
+            0,
+            11,
+            br_level.filter(|l| *l != 0).unwrap_or(5),
+        ) as u32,
         per_ip_rate: r.per_ip_rate.unwrap_or(0),
         per_ip_rate_window: std::time::Duration::from_secs(
             u64::from(r.per_ip_rate_window.unwrap_or(1)).max(1),
@@ -479,6 +598,19 @@ fn convert_ext_list(
     };
     for e in &r.ext_processor {
         balance::parse(e, path)?;
+        // OLS extappregistry.cpp drops a processor with a missing or unknown
+        // <type>; httpjet refuses the config instead of guessing proxy (#927).
+        if nonempty(e.name.clone()).is_some() && ext_kind(e.kind.as_deref()).is_none() {
+            return Err(ConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                directive: "extProcessor.type",
+                value: e.kind.as_deref().unwrap_or("").trim().to_string(),
+                reason: format!(
+                    "extProcessor {:?}: expected lsapi, fcgi, or proxy",
+                    e.name.as_deref().unwrap_or("").trim()
+                ),
+            });
+        }
     }
     Ok(r.ext_processor
         .into_iter()
@@ -486,14 +618,25 @@ fn convert_ext_list(
         .collect())
 }
 
+/// OLS `HandlerType::getHandlerType` compares case-insensitively.
+fn ext_kind(kind: Option<&str>) -> Option<ExtKind> {
+    let t = kind?.trim();
+    let is = |name: &str| t.eq_ignore_ascii_case(name);
+    if is("lsapi") {
+        Some(ExtKind::Lsapi)
+    } else if is("fcgi") || is("fastcgi") {
+        Some(ExtKind::FastCgi)
+    } else if is("proxy") {
+        Some(ExtKind::Proxy)
+    } else {
+        None
+    }
+}
+
 fn convert_ext(e: RawExtProcessor, ctx: &SubstCtx) -> Option<ExtProcessor> {
     let load_balance = balance::parse(&e, Path::new("<validated>")).ok()?;
     let name = nonempty(e.name)?;
-    let kind = match e.kind.as_deref().map(str::trim) {
-        Some("lsapi") => ExtKind::Lsapi,
-        Some("fcgi" | "fastcgi") => ExtKind::FastCgi,
-        _ => ExtKind::Proxy,
-    };
+    let kind = ext_kind(e.kind.as_deref())?;
     // (Tier 1.2) Every <address> element is a peer; the first is primary and the
     // rest are failover peers tried in order when the primary's breaker is open.
     let mut addr_iter = e.address.iter().map(|s| ext_address(s.as_str()));
@@ -525,16 +668,63 @@ fn convert_ext(e: RawExtProcessor, ctx: &SubstCtx) -> Option<ExtProcessor> {
     })
 }
 
-fn convert_php(p: RawPhpConfig, ctx: &SubstCtx, cpu_limit_secs: Option<RlimitPair>) -> PhpConfig {
-    let h = p.php_handler.unwrap_or_default();
-    PhpConfig {
-        handler_id: nonempty(h.id).unwrap_or_else(|| "php".into()),
-        command: PathBuf::from(ctx.expand(h.command.as_deref().unwrap_or(""))),
-        suffixes: h
-            .suffixes
-            .as_deref()
-            .map(split_list)
-            .unwrap_or_else(|| vec!["php".into()]),
+/// The `<phpHandler>` list (#1027). LSWS treats each handler's `<id>` as a
+/// handled suffix beside its `<suffixes>`. httpjet runs one PHP pool, so the
+/// handlers merge when they share a command and refuse the load otherwise:
+/// sending one handler's scripts to another handler's binary is not its config.
+fn convert_php_handlers(
+    handlers: Vec<RawPhpHandler>,
+    ctx: &SubstCtx,
+    path: &Path,
+) -> Result<(String, PathBuf, Vec<String>)> {
+    let mut first: Option<(String, PathBuf)> = None;
+    let mut listed: Option<Vec<String>> = None;
+    let mut ids = Vec::new();
+    for h in handlers {
+        let id = nonempty(h.id).unwrap_or_else(|| "php".into());
+        let command = PathBuf::from(ctx.expand(h.command.as_deref().unwrap_or("")));
+        match &first {
+            None => first = Some((id.clone(), command)),
+            Some((first_id, first_command)) if *first_command != command => {
+                return Err(ConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    directive: "phpHandler.command",
+                    value: format!(
+                        "{first_id}={} {id}={}",
+                        first_command.display(),
+                        command.display()
+                    ),
+                    reason: "httpjet runs one PHP pool; all <phpHandler> commands must match"
+                        .into(),
+                });
+            }
+            Some(_) => {}
+        }
+        if let Some(list) = h.suffixes.as_deref() {
+            listed.get_or_insert_with(Vec::new).extend(split_list(list));
+        }
+        ids.push(id);
+    }
+    let mut suffixes: Vec<String> = Vec::new();
+    for suffix in listed
+        .unwrap_or_else(|| vec!["php".into()])
+        .into_iter()
+        .chain(ids)
+    {
+        if !suffixes.iter().any(|s| s.eq_ignore_ascii_case(&suffix)) {
+            suffixes.push(suffix);
+        }
+    }
+    let (handler_id, command) = first.unwrap_or_else(|| ("php".into(), PathBuf::new()));
+    Ok((handler_id, command, suffixes))
+}
+
+fn convert_php(p: RawPhpConfig, ctx: &SubstCtx, path: &Path) -> Result<PhpConfig> {
+    let (handler_id, command, suffixes) = convert_php_handlers(p.php_handler, ctx, path)?;
+    Ok(PhpConfig {
+        handler_id,
+        command,
+        suffixes,
         env: p.env.iter().filter_map(|s| parse_env_pair(s)).collect(),
         max_conns: u32_of(&p.max_conns, 100),
         init_timeout: secs_of(&p.init_timeout, 60),
@@ -557,7 +747,10 @@ fn convert_php(p: RawPhpConfig, ctx: &SubstCtx, cpu_limit_secs: Option<RlimitPai
             .and_then(parse_secs)
             .filter(|&s| s > 0)
             .map(Duration::from_secs),
-        cpu_limit_secs,
+        // OLS LocalWorkerConfig runs local workers with unlimited CPU:
+        // `<CGIRLimit>` caps a CGI process, while RLIMIT_CPU accumulates over a
+        // persistent lsphp worker's life and would kill it mid-request (#1037).
+        cpu_limit_secs: None,
         proc_soft_limit: p.proc_soft_limit.as_deref().and_then(parse_pos_u64),
         proc_hard_limit: p.proc_hard_limit.as_deref().and_then(parse_pos_u64),
         max_idle_time: p
@@ -568,7 +761,7 @@ fn convert_php(p: RawPhpConfig, ctx: &SubstCtx, cpu_limit_secs: Option<RlimitPai
             .map(Duration::from_secs),
         min_restart_interval: Duration::from_secs(10),
         max_restart_backoff: Duration::from_secs(30),
-    }
+    })
 }
 
 fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener> {
@@ -619,12 +812,13 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
                         .collect()
                 })
                 .unwrap_or_default();
+            // OLS justSSLContext roots relative TLS files at $SERVER_ROOT (#1001).
             let tls = if secure || l.cert_file.is_some() {
                 Some(ListenerTls {
-                    key_file: PathBuf::from(ctx.expand(l.key_file.as_deref().unwrap_or(""))),
-                    cert_file: PathBuf::from(ctx.expand(l.cert_file.as_deref().unwrap_or(""))),
+                    key_file: vhost::server_rooted(ctx, l.key_file.as_deref().unwrap_or("")),
+                    cert_file: vhost::server_rooted(ctx, l.cert_file.as_deref().unwrap_or("")),
                     cert_chain: truthy(&l.cert_chain),
-                    ca_cert_file: nonempty(l.ca_cert_file).map(|p| PathBuf::from(ctx.expand(&p))),
+                    ca_cert_file: nonempty(l.ca_cert_file).map(|p| vhost::server_rooted(ctx, &p)),
                     // OLS: getLongValue(pNode,"clientVerify",0,3,0). 0=none,
                     // 1=optional, 2=require, 3=optional_no_ca. Out-of-range → 0.
                     client_verify: bounded_u8(&l.client_verify, 0, 3, 0),
@@ -637,7 +831,7 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
-                        .map(|p| PathBuf::from(ctx.expand(p))),
+                        .map(|p| vhost::server_rooted(ctx, p)),
                 })
             } else {
                 None
@@ -647,7 +841,7 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
                 .strip_prefix("unix:")
                 .or_else(|| address.strip_prefix("uds:"))
                 .map(|p| PathBuf::from(ctx.expand(p)));
-            Some(Listener {
+            let listener = Listener {
                 name,
                 address,
                 secure,
@@ -656,7 +850,11 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
                 uds_path,
                 proxy_protocol: truthy(&l.proxy_protocol),
                 proxy_protocol_peers: l.proxy_protocol_peers.as_deref().map(split_list).unwrap_or_default(),
-            })
+            };
+            for warning in listener.domain_routes().warnings {
+                tracing::warn!("{warning}");
+            }
+            Some(listener)
         })
         .collect()
 }
@@ -665,9 +863,11 @@ fn convert_listeners(r: Option<RawListenerList>, ctx: &SubstCtx) -> Vec<Listener
 /// (the side containing `/` is the type).
 pub(crate) fn parse_mime(text: &str) -> MimeMap {
     let mut by_suffix = std::collections::BTreeMap::new();
+    let mut default_type = None;
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        // OLS loadMime cuts every line at its first `#`, inline comments included.
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
             continue;
         }
         let Some((lhs, rhs)) = line.split_once('=') else {
@@ -683,10 +883,18 @@ pub(crate) fn parse_mime(text: &str) -> MimeMap {
             continue;
         }
         for suf in split_list(suffixes) {
-            by_suffix.insert(suf.to_ascii_lowercase(), mime.to_string());
+            let suf = suf.to_ascii_lowercase();
+            if suf == "default" {
+                default_type = Some(mime.to_string());
+                continue;
+            }
+            by_suffix.insert(suf, mime.to_string());
         }
     }
-    MimeMap { by_suffix }
+    MimeMap {
+        by_suffix,
+        default_type,
+    }
 }
 
 #[cfg(test)]
@@ -821,6 +1029,32 @@ mod tests {
         assert_eq!(bounded_u8(&Some("garbage".into()), 0, 4, 2), 2);
     }
 
+    /// OLS getLongValue reads with strtoll: a leading integer, K/M/G scaling, no
+    /// digits as 0; absent/empty or out-of-range values take the default.
+    #[test]
+    fn ols_long_value_mirrors_strtoll_and_the_range_default() {
+        let v = |s: Option<&str>| ols_long_value(&s.map(str::to_string), 0, 1, 1);
+        for (input, want) in [
+            (None, 1),
+            (Some(""), 1),
+            (Some("  "), 1),
+            (Some("0"), 0),
+            (Some(" 1 "), 1),
+            (Some("+0"), 0),
+            (Some("-0"), 0),
+            (Some("0abc"), 0),
+            (Some("true"), 0),
+            (Some("off"), 0),
+            (Some("2"), 1),
+            (Some("-1"), 1),
+            (Some("1k"), 1),
+            (Some("99999999999999999999"), 1),
+        ] {
+            assert_eq!(v(input), want, "{input:?}");
+        }
+        assert_eq!(ols_long_value(&Some("2K".into()), 0, 4096, 7), 2048);
+    }
+
     // ----- allowSymbolLink tri-state (audit M4) -----
 
     #[test]
@@ -862,7 +1096,7 @@ mod tests {
     fn vhost_logging_use_server_zero_yields_own_files() {
         // Modeled on the live windowsforum.com.xml block: useServer=0 + fileName
         // means THIS vhost writes its own files; logHeaders rides the access spec.
-        let text = r#"<virtualHostConfig>
+        let text = r#"<virtualHostConfig><docRoot>/web</docRoot>
             <logging>
                 <log>
                     <useServer>0</useServer>
@@ -904,6 +1138,24 @@ mod tests {
     }
 
     #[test]
+    fn vhost_log_headers_defaults_to_three_like_ols() {
+        let parse = |extra: &str| {
+            let text = format!(
+                "<virtualHostConfig><docRoot>/web</docRoot><logging><accessLog><useServer>0</useServer><fileName>/tmp/a.log</fileName>{extra}</accessLog></logging></virtualHostConfig>"
+            );
+            parse_vhost_config(&text, &Default::default())
+                .unwrap()
+                .access_log_file
+                .expect("own access log")
+                .log_headers
+        };
+        assert_eq!(parse(""), 3, "absent logHeaders = OLS default 3");
+        assert_eq!(parse("<logHeaders>0</logHeaders>"), 0);
+        assert_eq!(parse("<logHeaders>5</logHeaders>"), 5);
+        assert_eq!(parse("<logHeaders>9</logHeaders>"), 3, "out of range");
+    }
+
+    #[test]
     fn vhost_logging_absent_or_use_server_uses_unified() {
         let mk = |inner: &str| format!("<virtualHostConfig>{inner}</virtualHostConfig>");
         // Absent block entirely.
@@ -912,7 +1164,7 @@ mod tests {
         // useServer=1 ⇒ inherit the unified logs; no separate file.
         let vc = parse_vhost_config(
             &mk(
-                "<logging><accessLog><useServer>1</useServer><fileName>/tmp/a.log</fileName></accessLog></logging>",
+                "<docRoot>/web</docRoot><logging><accessLog><useServer>1</useServer><fileName>/tmp/a.log</fileName></accessLog></logging>",
             ),
             &Default::default(),
         )
@@ -929,7 +1181,7 @@ mod tests {
     fn context_cache_policy_six_flags_parse_with_lsws_defaults() {
         // Modeled on the live search.windowsforum.com.xml proxy context: all six
         // flags explicit 0 = "never check/enable any caching in this context".
-        let text = r#"<virtualHostConfig>
+        let text = r#"<virtualHostConfig><docRoot>/web</docRoot>
             <contextList>
                 <context>
                     <type>proxy</type>
@@ -965,7 +1217,7 @@ mod tests {
 
     #[test]
     fn context_native_resource_controls_preserve_absent_and_explicit_zero() {
-        let text = r#"<virtualHostConfig>
+        let text = r#"<virtualHostConfig><docRoot>/web</docRoot>
             <contextList>
                 <context>
                     <type>proxy</type><uri>/configured</uri><handler>app</handler>
@@ -980,7 +1232,6 @@ mod tests {
                     <type>proxy</type><uri>/zero</uri><handler>app</handler>
                     <maxReqBodySize>0</maxReqBodySize>
                     <bandwidthLimit>0</bandwidthLimit>
-                    <responseTimeout>0</responseTimeout>
                 </context>
             </contextList>
         </virtualHostConfig>"#;
@@ -996,7 +1247,7 @@ mod tests {
         let zero = &vc.contexts[2];
         assert_eq!(zero.max_body_override, Some(0));
         assert_eq!(zero.bandwidth_limit, 0);
-        assert_eq!(zero.timeout_override, Some(0));
+        assert_eq!(zero.timeout_override, None);
     }
 
     #[test]
@@ -1005,9 +1256,12 @@ mod tests {
             ("maxReqBodySize", "12XB"),
             ("bandwidthLimit", "-1"),
             ("responseTimeout", "1.5"),
+            // #1004: a zero upstream deadline would 504 every request.
+            ("responseTimeout", "0"),
+            ("responseTimeout", " 0 "),
         ] {
             let text = format!(
-                "<virtualHostConfig><contextList><context><uri>/api</uri><{directive}>{value}</{directive}></context></contextList></virtualHostConfig>"
+                "<virtualHostConfig><docRoot>/web</docRoot><contextList><context><uri>/api</uri><{directive}>{value}</{directive}></context></contextList></virtualHostConfig>"
             );
             let err = parse_vhost_config(&text, &crate::parse::SubstCtx::default())
                 .expect_err("a provided malformed native value must fail config parsing");
@@ -1028,7 +1282,7 @@ mod tests {
     fn script_handler_rejects_missing_unknown_and_unsupported_types() {
         for raw_type in ["", "<type>lsapii</type>", "<type>proxy</type>"] {
             let text = format!(
-                "<virtualHostConfig><scriptHandlerList><scriptHandler><suffix>php</suffix>{raw_type}<handler>php8</handler></scriptHandler></scriptHandlerList></virtualHostConfig>"
+                "<virtualHostConfig><docRoot>/web</docRoot><scriptHandlerList><scriptHandler><suffix>php</suffix>{raw_type}<handler>php8</handler></scriptHandler></scriptHandlerList></virtualHostConfig>"
             );
             let err = parse_vhost_config(&text, &crate::parse::SubstCtx::default())
                 .expect_err("an unsafe script-handler type must fail config parsing");
@@ -1047,7 +1301,7 @@ mod tests {
 
     #[test]
     fn script_handler_requires_executable_handler_but_keeps_static_opt_out() {
-        let executable = "<virtualHostConfig><scriptHandlerList><scriptHandler><suffix>php</suffix><type>lsapi</type></scriptHandler></scriptHandlerList></virtualHostConfig>";
+        let executable = "<virtualHostConfig><docRoot>/web</docRoot><scriptHandlerList><scriptHandler><suffix>php</suffix><type>lsapi</type></scriptHandler></scriptHandlerList></virtualHostConfig>";
         let err = parse_vhost_config(executable, &crate::parse::SubstCtx::default())
             .expect_err("an executable script route without a handler must fail");
         assert!(matches!(
@@ -1058,7 +1312,7 @@ mod tests {
             }
         ));
 
-        let explicit_static = "<virtualHostConfig><scriptHandlerList><scriptHandler><suffix>html</suffix><type>static</type></scriptHandler></scriptHandlerList></virtualHostConfig>";
+        let explicit_static = "<virtualHostConfig><docRoot>/web</docRoot><scriptHandlerList><scriptHandler><suffix>html</suffix><type>static</type></scriptHandler></scriptHandlerList></virtualHostConfig>";
         let parsed = parse_vhost_config(explicit_static, &crate::parse::SubstCtx::default())
             .expect("an explicit static suffix override remains valid");
         assert_eq!(parsed.script_handlers.len(), 1);
@@ -1194,6 +1448,63 @@ mod tests {
         assert!(t.enable_brotli, "enableBrCompress=1 enables brotli");
         assert_eq!(t.zstd_level, 19);
         assert_eq!(t.brotli_quality, 11);
+    }
+
+    fn tuning_of(xml: &str) -> Tuning {
+        convert_tuning(quick_xml::de::from_str(xml).unwrap())
+    }
+
+    /// Regression (#1020): LSWS/OLS `enableBrCompress` is the dynamic brotli
+    /// level 0-6 (`getLongValue(.., 0, 6, 4)`); `truthy` dropped OLS's stock `4`.
+    #[test]
+    fn enable_br_compress_is_a_level() {
+        let t = tuning_of("<tuning><enableBrCompress>4</enableBrCompress></tuning>");
+        assert!(t.enable_brotli);
+        assert_eq!(t.brotli_quality, 4);
+        let t = tuning_of("<tuning><enableBrCompress>0</enableBrCompress></tuning>");
+        assert!(!t.enable_brotli);
+        assert_eq!(t.brotli_quality, 5);
+        let t = tuning_of(
+            "<tuning><enableBrCompress>6</enableBrCompress>\
+             <brCompressLevel>9</brCompressLevel></tuning>",
+        );
+        assert!(t.enable_brotli);
+        assert_eq!(t.brotli_quality, 9, "brCompressLevel wins");
+        // Out of range falls back to OLS's default level 4; strtoll reads `true` as 0.
+        let t = tuning_of("<tuning><enableBrCompress>7</enableBrCompress></tuning>");
+        assert!(t.enable_brotli);
+        assert_eq!(t.brotli_quality, 4);
+        let t = tuning_of("<tuning><enableBrCompress>true</enableBrCompress></tuning>");
+        assert!(!t.enable_brotli);
+        // Absent: on at the httpjet default, as before.
+        let t = tuning_of("<tuning></tuning>");
+        assert!(t.enable_brotli);
+        assert_eq!(t.brotli_quality, 5);
+    }
+
+    #[test]
+    fn gzip_level_and_compressible_types() {
+        let t = tuning_of("<tuning></tuning>");
+        assert_eq!(t.gzip_level, 6);
+        assert_eq!(t.compressible_types, ["default"]);
+        let t = tuning_of(
+            "<tuning><gzipCompressLevel>9</gzipCompressLevel>\
+             <compressibleTypes>default, !text/css,\napplication/wasm</compressibleTypes></tuning>",
+        );
+        assert_eq!(t.gzip_level, 9);
+        assert_eq!(
+            t.compressible_types,
+            ["default", "!text/css", "application/wasm"]
+        );
+        for bad in ["0", "10", "x"] {
+            let t = tuning_of(&format!(
+                "<tuning><gzipCompressLevel>{bad}</gzipCompressLevel></tuning>"
+            ));
+            assert_eq!(t.gzip_level, 6, "{bad}");
+        }
+        // A present but empty list names no type (OLS); only an absent one is `default`.
+        let t = tuning_of("<tuning><compressibleTypes></compressibleTypes></tuning>");
+        assert!(t.compressible_types.is_empty());
     }
 
     #[test]
@@ -1373,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn cgi_cpu_rlimit_maps_to_php_config() {
+    fn cgi_cpu_rlimit_is_not_applied_to_php_workers() {
         let dir = std::env::temp_dir().join(format!(
             "httpjet_cfg_{}_{}",
             std::process::id(),
@@ -1409,10 +1720,8 @@ mod tests {
             hard: Some(600),
         };
         assert_eq!(cfg.security.cgi_cpu_limit_secs, Some(expected));
-        assert_eq!(
-            cfg.php_config.as_ref().unwrap().cpu_limit_secs,
-            Some(expected)
-        );
+        // #1037: OLS gives local workers unlimited CPU; the CGI limit stays CGI's.
+        assert_eq!(cfg.php_config.as_ref().unwrap().cpu_limit_secs, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1425,12 +1734,15 @@ mod tests {
                 ..Default::default()
             },
             &ctx,
-            None,
-        );
+            Path::new("<test>"),
+        )
+        .unwrap();
         assert_eq!(parsed.backlog, 8192);
 
-        let defaulted = convert_php(RawPhpConfig::default(), &ctx, None);
+        let defaulted = convert_php(RawPhpConfig::default(), &ctx, Path::new("<test>")).unwrap();
         assert_eq!(defaulted.backlog, 1024);
+        assert_eq!(defaulted.handler_id, "php");
+        assert_eq!(defaulted.suffixes, ["php"]);
     }
 
     // ----- Phase 5a: <namespace> policy parsing (default OFF) -----
@@ -1583,5 +1895,318 @@ mod read_limit_tests {
         std::fs::write(&path, vec![b'x'; 64]).unwrap();
         assert_eq!(read_config_file(&path, 64).unwrap().len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- #773: unenforced vhost/context access control fails closed -----
+
+    fn vhost_with(body: &str) -> String {
+        format!("<virtualHostConfig><docRoot>/web</docRoot>{body}</virtualHostConfig>")
+    }
+
+    fn context_with(body: &str) -> String {
+        vhost_with(&format!(
+            "<contextList><context><type>null</type><uri>/admin/</uri>{body}</context></contextList>"
+        ))
+    }
+
+    fn rejected(xml: &str, directive: &str) {
+        match parse_vhost_config(xml, &Default::default()) {
+            Err(ConfigError::InvalidValue { directive: d, .. }) => {
+                assert_eq!(d, directive, "{xml}")
+            }
+            other => panic!("expected {directive} rejection for {xml}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn context_access_control_and_auth_are_rejected() {
+        rejected(
+            &context_with(
+                "<accessControl><allow>127.0.0.1</allow><deny>ALL</deny></accessControl>",
+            ),
+            "accessControl",
+        );
+        rejected(
+            &context_with("<accessControl><deny>203.0.113.0/24</deny></accessControl>"),
+            "accessControl",
+        );
+        rejected(
+            &context_with("<accessControl><allow>10.0.0.0/8</allow></accessControl>"),
+            "accessControl",
+        );
+        rejected(
+            &context_with("<accessControl><denyList>1.2.3.4</denyList></accessControl>"),
+            "accessControl",
+        );
+        rejected(&context_with("<realm>admins</realm>"), "realm");
+        rejected(&context_with("<required>user bob</required>"), "required");
+        rejected(
+            &context_with("<authorizer>authz</authorizer>"),
+            "authorizer",
+        );
+        rejected(&context_with("<auth><realm>admins</realm></auth>"), "realm");
+    }
+
+    #[test]
+    fn vhost_access_control_and_realms_are_rejected() {
+        rejected(
+            &vhost_with(
+                "<security><accessControl><allow>ALL</allow><deny>203.0.113.0/24</deny></accessControl></security>",
+            ),
+            "accessControl",
+        );
+        rejected(
+            &vhost_with(
+                "<security><realmList><realm><type>file</type><name>admins</name></realm></realmList></security>",
+            ),
+            "realmList",
+        );
+        rejected(
+            &vhost_with("<realmList><realm><name>admins</name></realm></realmList>"),
+            "realmList",
+        );
+    }
+
+    #[test]
+    fn empty_or_open_access_control_still_parses() {
+        // The live admin.windowsforum.com.xml shape: an empty context block.
+        for xml in [
+            context_with("<accessControl>\n      </accessControl>"),
+            context_with("<accessControl><allow></allow><deny></deny></accessControl>"),
+            context_with("<accessControl><allow>*</allow><deny></deny></accessControl>"),
+            context_with("<accessControl><allowList>*</allowList></accessControl>"),
+            context_with("<authName>Admin area</authName>"),
+            // The LiteSpeed vhost template default.
+            vhost_with(
+                "<security><hotlinkCtrl></hotlinkCtrl><realmList>\n</realmList><accessControl><allow>*</allow><deny></deny></accessControl></security>",
+            ),
+            vhost_with("<security><accessControl><allow>ALL</allow></accessControl></security>"),
+        ] {
+            parse_vhost_config(&xml, &Default::default())
+                .unwrap_or_else(|e| panic!("{xml} must parse: {e}"));
+        }
+    }
+
+    // ----- #790: OLS reads a root-level <accessControl> without <security> -----
+
+    #[test]
+    fn root_level_vhost_access_control_is_rejected() {
+        rejected(
+            &vhost_with(
+                "<accessControl><allow>ALL</allow><deny>203.0.113.0/24</deny></accessControl>",
+            ),
+            "accessControl",
+        );
+        parse_vhost_config(
+            &vhost_with("<accessControl><allow>*</allow></accessControl>"),
+            &Default::default(),
+        )
+        .expect("an open root-level block is a no-op");
+    }
+
+    #[test]
+    fn root_level_server_access_control_is_the_server_acl() {
+        let text = "<httpServerConfig><accessControl><allow>ALL</allow><deny>203.0.113.0/24</deny></accessControl></httpServerConfig>";
+        let cfg = parse_server_text(Path::new("/tmp"), Path::new("<test>"), text).unwrap();
+        assert!(
+            cfg.security
+                .access_control
+                .iter()
+                .any(|r| !r.allow && r.spec.contains("203.0.113.0/24")),
+            "{:?}",
+            cfg.security.access_control
+        );
+        let wrapped = "<httpServerConfig><security><accessControl><allow>ALL</allow></accessControl></security><accessControl><deny>ALL</deny></accessControl></httpServerConfig>";
+        let cfg = parse_server_text(Path::new("/tmp"), Path::new("<test>"), wrapped).unwrap();
+        assert!(
+            cfg.security.access_control.iter().all(|r| r.allow),
+            "<security> wins"
+        );
+    }
+
+    // ----- #802: OLS context types -----
+
+    fn one_context(kind: &str, extra: &str) -> String {
+        vhost_with(&format!(
+            "<contextList><context><type>{kind}</type><uri>/app/</uri>{extra}</context></contextList>"
+        ))
+    }
+
+    #[test]
+    fn context_types_are_case_insensitive_and_null_is_static() {
+        for (kind, want) in [
+            ("null", ContextKind::Static),
+            ("NULL", ContextKind::Static),
+            ("Static", ContextKind::Static),
+            ("static", ContextKind::Static),
+            ("", ContextKind::Static),
+            ("Proxy", ContextKind::Proxy),
+            ("proxy", ContextKind::Proxy),
+        ] {
+            let extra = if want == ContextKind::Proxy {
+                "<handler>app</handler>"
+            } else {
+                "<location>/srv/app/</location><extraHeaders>X-A: 1</extraHeaders>"
+            };
+            let cfg = parse_vhost_config(&one_context(kind, extra), &Default::default())
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let c = &cfg.contexts[0];
+            assert_eq!(c.kind, want, "{kind:?}");
+            if want == ContextKind::Static {
+                assert_eq!(c.location.as_deref(), Some(Path::new("/srv/app/")));
+                assert_eq!(c.extra_headers, vec![("X-A".into(), "1".into())]);
+            }
+        }
+    }
+
+    #[test]
+    fn unimplemented_context_types_are_rejected() {
+        for kind in [
+            "fcgi",
+            "FCGI",
+            "servlet",
+            "redirect",
+            "Redirect",
+            "lsapi",
+            "appserver",
+            "rails",
+            "module",
+            "cgi",
+            "webapp",
+            "loadbalancer",
+            "bogus",
+        ] {
+            rejected(
+                &one_context(kind, "<handler>x</handler><location>/x</location>"),
+                "context.type",
+            );
+        }
+    }
+
+    // ----- #803: context allowBrowse -----
+
+    #[test]
+    fn context_allow_browse_is_parsed() {
+        let browse = |kind: &str, v: &str| {
+            parse_vhost_config(
+                &one_context(kind, &format!("<handler>app</handler>{v}")),
+                &Default::default(),
+            )
+            .unwrap()
+            .contexts[0]
+                .allow_browse
+        };
+        assert!(browse("null", ""));
+        assert!(browse("null", "<allowBrowse>1</allowBrowse>"));
+        assert!(!browse("null", "<allowBrowse>0</allowBrowse>"));
+        assert!(!browse("static", "<allowBrowse> 0 </allowBrowse>"));
+        // OLS forces browsing on for handler contexts.
+        assert!(browse("proxy", "<allowBrowse>0</allowBrowse>"));
+        rejected(
+            &one_context("null", "<allowBrowse>maybe</allowBrowse>"),
+            "allowBrowse",
+        );
+    }
+
+    // ----- #828: context addDefaultCharset is tri-state -----
+
+    #[test]
+    fn context_add_default_charset_distinguishes_absent_from_off() {
+        let charset = |v: &str| {
+            parse_vhost_config(&one_context("null", v), &Default::default())
+                .unwrap()
+                .contexts[0]
+                .add_default_charset
+        };
+        assert_eq!(charset(""), None, "absent inherits");
+        assert_eq!(
+            charset("<addDefaultCharset>off</addDefaultCharset>"),
+            Some(false)
+        );
+        assert_eq!(
+            charset("<addDefaultCharset>On</addDefaultCharset>"),
+            Some(true)
+        );
+    }
+
+    // ----- #804: root-level accessDenyDir / fileAccessControl -----
+
+    #[test]
+    fn root_level_deny_dir_and_file_access_control_fold_without_security() {
+        let text = "<httpServerConfig><accessDenyDir><dir>/etc/*</dir><dir>$SERVER_ROOT/conf/*</dir></accessDenyDir><fileAccessControl><followSymbolLink>1</followSymbolLink></fileAccessControl></httpServerConfig>";
+        let cfg = parse_server_text(Path::new("/srv/ls"), Path::new("<test>"), text).unwrap();
+        assert_eq!(
+            cfg.security.access_deny_dir,
+            vec!["/etc/*".to_string(), "/srv/ls/conf/*".to_string()]
+        );
+        assert!(cfg.security.follow_symlink);
+        let wrapped = "<httpServerConfig><security><accessDenyDir><dir>/a/*</dir></accessDenyDir></security><accessDenyDir><dir>/b/*</dir></accessDenyDir><fileAccessControl><followSymbolLink>1</followSymbolLink></fileAccessControl></httpServerConfig>";
+        let cfg = parse_server_text(Path::new("/srv/ls"), Path::new("<test>"), wrapped).unwrap();
+        assert_eq!(cfg.security.access_deny_dir, vec!["/a/*".to_string()]);
+        assert!(!cfg.security.follow_symlink, "<security> wins");
+    }
+
+    // ----- round 9: OLS config forms -----
+
+    #[test]
+    fn vhost_index_block_follows_use_server() {
+        let own = parse_vhost_config(
+            &vhost_with(
+                "<index><useServer>0</useServer><indexFiles>index.php</indexFiles></index>",
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(own.index_files, vec!["index.php".to_string()]);
+        assert_eq!(own.index_use_server, Some(0));
+        let server = parse_vhost_config(
+            &vhost_with("<index><indexFiles>index.php</indexFiles></index>"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(server.index_use_server, Some(1), "useServer defaults to 1");
+        // The flat form keeps its historical meaning (the live mcp vhost).
+        let flat = parse_vhost_config(
+            &vhost_with("<indexFiles>index.html</indexFiles>"),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(flat.index_files, vec!["index.html".to_string()]);
+        assert_eq!(flat.index_use_server, None);
+    }
+
+    #[test]
+    fn context_default_charset_customized_is_read() {
+        let vc = parse_vhost_config(
+            &context_with(
+                "<addDefaultCharset>on</addDefaultCharset><defaultCharsetCustomized>windows-1252</defaultCharsetCustomized>",
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(vc.contexts[0].charset.as_deref(), Some("windows-1252"));
+    }
+
+    #[test]
+    fn mime_inline_comments_are_stripped() {
+        let m = parse_mime("text/plain = xyz # plain text\n# whole line\n");
+        assert_eq!(
+            m.by_suffix.get("xyz").map(String::as_str),
+            Some("text/plain")
+        );
+    }
+
+    /// Regression (#944): `default = <type>` sets the fallback type (OLS
+    /// `m_pDefault`) instead of mapping a literal `.default` suffix.
+    #[test]
+    fn mime_default_entry_is_the_fallback_type() {
+        let m = parse_mime("default = text/plain\ntext/html = html\n");
+        assert_eq!(m.default_type(), "text/plain");
+        assert!(m.content_type("default").is_none());
+        assert_eq!(m.content_type("html"), Some("text/html"));
+        let m = parse_mime("image/png = Default, foo\n");
+        assert_eq!(m.default_type(), "image/png");
+        assert_eq!(m.content_type("foo"), Some("image/png"));
+        assert_eq!(parse_mime("").default_type(), "application/octet-stream");
     }
 }

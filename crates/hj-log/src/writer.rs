@@ -45,11 +45,7 @@ impl Writer {
                 fs::create_dir_all(parent).await?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&cfg.path)
-            .await?;
+        let file = open_live(&cfg.path).await?;
         let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         Ok(Writer {
             cfg,
@@ -114,11 +110,7 @@ impl Writer {
         // so concurrent appenders (and our next line) hit the new file.
         fs::rename(&self.cfg.path, &rolled).await?;
 
-        let fresh = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.cfg.path)
-            .await?;
+        let fresh = open_live(&self.cfg.path).await?;
         self.file = BufWriter::new(fresh);
         self.size = 0;
 
@@ -146,6 +138,18 @@ impl Writer {
     }
 }
 
+/// Open (or create) the live log for appending without following a link at its
+/// name: a log directory can be group-writable by the unprivileged web account
+/// while a root-run instance writes to it.
+async fn open_live(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .await
+}
+
 /// Build a rolled-file path `<stem>.<stamp><ext>` that does not yet exist,
 /// disambiguating with a counter when several rolls land in the same second.
 async fn unique_rolled_path(path: &Path, ts: SystemTime) -> PathBuf {
@@ -156,8 +160,9 @@ async fn unique_rolled_path(path: &Path, ts: SystemTime) -> PathBuf {
     loop {
         let plain = candidate.clone();
         let gz = with_gz(&candidate);
-        let plain_exists = fs::metadata(&plain).await.is_ok();
-        let gz_exists = fs::metadata(&gz).await.is_ok();
+        // A dangling link is an occupied name, not a free one.
+        let plain_exists = fs::symlink_metadata(&plain).await.is_ok();
+        let gz_exists = fs::symlink_metadata(&gz).await.is_ok();
         if !plain_exists && !gz_exists {
             return candidate;
         }
@@ -173,14 +178,22 @@ fn with_gz(path: &Path) -> PathBuf {
 }
 
 /// gzip `src` to `src.gz` and remove the original. Synchronous (run on a
-/// blocking thread by the caller).
+/// blocking thread by the caller). The archive name must be free: an occupant,
+/// including a dangling link, fails the roll and leaves `src` in place.
 fn gzip_file(src: &Path) -> io::Result<()> {
-    use std::fs::File as StdFile;
+    use std::fs::OpenOptions as StdOpenOptions;
     use std::io::copy;
+    use std::os::unix::fs::OpenOptionsExt;
 
     let dst = with_gz(src);
-    let mut input = StdFile::open(src)?;
-    let out = StdFile::create(&dst)?;
+    let mut input = StdOpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(src)?;
+    let out = StdOpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dst)?;
     // Level 1: archive gzip ran at the default level on the blocking pool and
     // profiled at ~5% of TOTAL serving CPU at high request rates (a 10M log
     // rolls every few seconds under load). Fast level is ~3-4x cheaper for a
@@ -668,6 +681,156 @@ mod tests {
             rotated.contains("before"),
             "pre-reopen line stays in rotated file"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn live_cfg(path: &Path) -> RollConfig {
+        RollConfig {
+            path: path.to_path_buf(),
+            rolling_size: 0,
+            keep_days: 0,
+            compress_archive: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn symlinked_live_log_is_refused_and_target_untouched() {
+        let dir = temp_dir("live-link");
+        let path = dir.join("access.log");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"victim\n").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let err = match Writer::open(live_cfg(&path)).await {
+            Err(e) => e,
+            Ok(_) => panic!("a symlinked live log must not open"),
+        };
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let h = tokio::spawn(run(live_cfg(&path), rx, logger_state(), None));
+        send_line(&tx, "attacker-influenced line").await;
+        tx.send(Msg::Reopen).unwrap();
+        send_line(&tx, "second line").await;
+        shutdown(&tx).await;
+        h.await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim\n");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+
+        let dangling = dir.join("error.log");
+        let missing = dir.join("missing");
+        std::os::unix::fs::symlink(&missing, &dangling).unwrap();
+        assert!(Writer::open(live_cfg(&dangling)).await.is_err());
+        assert!(!missing.exists(), "O_CREAT must not create a link's target");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn reopen_refuses_a_link_planted_at_the_live_path() {
+        let dir = temp_dir("reopen-link");
+        let path = dir.join("error.log");
+        let target = dir.join("victim");
+        std::fs::write(&target, b"victim\n").unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let h = tokio::spawn(run(live_cfg(&path), rx, logger_state(), None));
+
+        send_line(&tx, "before").await;
+        for _ in 0..50 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let moved = dir.join("error.log.rotated");
+        std::fs::rename(&path, &moved).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        tx.send(Msg::Reopen).unwrap();
+        send_line(&tx, "after").await;
+        shutdown(&tx).await;
+        h.await.unwrap();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim\n");
+        assert_eq!(
+            std::fs::read_to_string(&moved).unwrap(),
+            "before\nafter\n",
+            "a refused reopen keeps the current handle"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn rolled_name_treats_a_dangling_link_as_occupied() {
+        let dir = temp_dir("roll-name-link");
+        let path = dir.join("access.log");
+        let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_760_000_000);
+        let base = unique_rolled_path(&path, ts).await;
+        std::os::unix::fs::symlink(dir.join("missing"), with_gz(&base)).unwrap();
+
+        let chosen = unique_rolled_path(&path, ts).await;
+        assert_eq!(chosen, PathBuf::from(format!("{}.1", base.display())));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gzip_never_writes_through_a_planted_archive_link() {
+        let dir = temp_dir("gz-link");
+        let rolled = dir.join("access.log.2026_10_18_000000");
+        std::fs::write(&rolled, b"rolled line\n").unwrap();
+        let target = dir.join("victim");
+        std::os::unix::fs::symlink(&target, with_gz(&rolled)).unwrap();
+
+        let err = gzip_file(&rolled).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert!(
+            !target.exists(),
+            "the dangling link's target is never created"
+        );
+        assert_eq!(std::fs::read(&rolled).unwrap(), b"rolled line\n");
+        assert!(
+            std::fs::symlink_metadata(with_gz(&rolled))
+                .unwrap()
+                .is_symlink()
+        );
+
+        std::fs::write(&target, b"victim\n").unwrap();
+        let err = gzip_file(&rolled).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim\n");
+        assert_eq!(std::fs::read(&rolled).unwrap(), b"rolled line\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gzip_refuses_a_rolled_name_swapped_for_a_link() {
+        let dir = temp_dir("gz-src-link");
+        let secret = dir.join("secret");
+        std::fs::write(&secret, b"secret\n").unwrap();
+        let rolled = dir.join("access.log.2026_10_18_000000");
+        std::os::unix::fs::symlink(&secret, &rolled).unwrap();
+
+        let err = gzip_file(&rolled).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        assert!(std::fs::symlink_metadata(with_gz(&rolled)).is_err());
+        assert!(std::fs::symlink_metadata(&rolled).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"secret\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gzip_archives_a_regular_rolled_file() {
+        let dir = temp_dir("gz-regular");
+        let rolled = dir.join("access.log.2026_10_18_000000");
+        std::fs::write(&rolled, b"one\ntwo\n").unwrap();
+
+        gzip_file(&rolled).unwrap();
+        assert!(!rolled.exists());
+        let raw = std::fs::read(with_gz(&rolled)).unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&raw[..]), &mut text)
+            .unwrap();
+        assert_eq!(text, "one\ntwo\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 

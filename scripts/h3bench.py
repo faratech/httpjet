@@ -276,9 +276,16 @@ def _safe_total_time(handle, state: Transfer) -> float:
 
 
 def run_load(args) -> tuple[LoadStats, float]:
-    if not _http3_available():
+    if args.http2:
+        # --http2: the same bounded multiplexed client over HTTP/2 (hosts without h2load).
+        if pycurl is None or not pycurl.version_info()[4] & pycurl.VERSION_HTTP2:
+            raise RuntimeError("pycurl/libcurl has no HTTP/2 support")
+        want_version, wanted = pycurl.CURL_HTTP_VERSION_2TLS, pycurl.CURL_HTTP_VERSION_2_0
+    elif not _http3_available():
         detail = "pycurl is not installed" if pycurl is None else pycurl.version
         raise RuntimeError(f"pycurl/libcurl has no HTTP/3 support ({detail})")
+    else:
+        want_version, wanted = pycurl.CURL_HTTP_VERSION_3ONLY, pycurl.CURL_HTTP_VERSION_3
 
     max_errors = args.max_errors or min(args.concurrency, args.requests)
     scheduler = RequestScheduler(args.requests, args.concurrency, max_errors)
@@ -286,6 +293,11 @@ def run_load(args) -> tuple[LoadStats, float]:
     transfers = {}
     url = build_url(args.authority, args.port, args.path)
     resolve = build_resolve_entry(args.authority, args.port, args.connect_host)
+    if args.portless:
+        # A `:port` authority bypasses httpjet's page cache (and trips canonical
+        # redirects): keep the authority portless and dial the loopback port instead.
+        url = f"https://{args.authority}{args.path}"
+        connect_to = f"{_url_host(args.authority)}:443:{args.connect_host}:{args.port}"
     timeout_ms = max(1, round(args.timeout * 1000))
 
     multi = pycurl.CurlMulti()
@@ -304,8 +316,11 @@ def run_load(args) -> tuple[LoadStats, float]:
         state = Transfer(request_id=request_id, started_at=time.monotonic())
         handle = pycurl.Curl()
         handle.setopt(pycurl.URL, url)
-        handle.setopt(pycurl.RESOLVE, [resolve])
-        handle.setopt(pycurl.HTTP_VERSION, pycurl.CURL_HTTP_VERSION_3ONLY)
+        if args.portless:
+            handle.setopt(pycurl.CONNECT_TO, [connect_to])
+        else:
+            handle.setopt(pycurl.RESOLVE, [resolve])
+        handle.setopt(pycurl.HTTP_VERSION, want_version)
         handle.setopt(pycurl.PROXY, "")
         handle.setopt(pycurl.NOPROXY, "*")
         handle.setopt(pycurl.CONNECTTIMEOUT_MS, timeout_ms)
@@ -345,7 +360,7 @@ def run_load(args) -> tuple[LoadStats, float]:
                 stats.transport_failure(str(exc.args[0]), state.body_bytes, elapsed)
                 failed = True
             else:
-                if version != pycurl.CURL_HTTP_VERSION_3:
+                if version != wanted:
                     stats.transport_failure(
                         f"http_version_{version}", state.body_bytes, elapsed
                     )
@@ -419,6 +434,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--timeout", default=30.0, type=positive_float)
     parser.add_argument("--insecure", action="store_true", help="disable TLS verification")
+    parser.add_argument("--http2", action="store_true", help="HTTP/2 instead of HTTP/3")
+    parser.add_argument(
+        "--portless",
+        action="store_true",
+        help="portless authority; dial connect_host:port via CONNECT_TO",
+    )
     parser.add_argument("-H", "--header", action="append", type=request_header, default=[])
     args = parser.parse_args(argv)
     args.concurrency = min(args.concurrency, args.requests)

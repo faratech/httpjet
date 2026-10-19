@@ -13,8 +13,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 CRITICAL='quinn-proto|quinn-udp|rustls|rustls-webpki|rustls-pki-types|aws-lc-rs|aws-lc-sys|tokio|httparse|io-uring|zstd-safe|zstd-sys|brotli|brotli-decompressor|h2|hyper|http|mio|socket2|openssl|openssl-sys|bcrypt|libc'
-report="$(mktemp)"
-trap 'rm -f "$report" "$report.audit" "$report.update"' EXIT
+# Scratch files live in a private directory: root runs this from cron, and names next to a
+# listable mktemp file in a shared /tmp could be pre-created by another account.
+work="$(mktemp -d)"
+trap 'rm -rf -- "$work"' EXIT
+report="$work/report.md"
 findings=0
 
 command -v cargo-audit >/dev/null 2>&1 || cargo audit --version >/dev/null 2>&1 || {

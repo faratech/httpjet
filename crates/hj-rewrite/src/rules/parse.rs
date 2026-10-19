@@ -153,8 +153,9 @@ fn var_is_cache_safe(var: &str) -> bool {
 ///     per-request `ReqCtx`).
 ///
 /// So under Apache/LSWS the live `RewriteCond %{ENV:REDIRECT_STATUS} ^(403|5)`
-/// gates error subrequests, but in this engine it can only ever see `""` — a
-/// constant — unless something seeds the name (e.g. a hypothetical `SetEnvIf
+/// gates error subrequests, but in this engine it can only ever see `""`, or
+/// `"200"` on a per-directory restart pass (#880) — both determined by the rules
+/// and the key — unless something seeds the name (e.g. a hypothetical `SetEnvIf
 /// … REDIRECT_STATUS=…`), which the pipeline's seed check catches at runtime.
 fn env_var_assumed_empty(var: &str) -> Option<&'static str> {
     let name = var.strip_prefix("ENV:")?;
@@ -229,6 +230,14 @@ fn rule_cache_class(
     let mut ok = string_cache_class(&rule.subst, keys, assumed_env);
     for (k, v) in &rule.flags.env_sets {
         ok &= string_cache_class(k, keys, assumed_env) && string_cache_class(v, keys, assumed_env);
+        // `[E=]` output is visible to every later `%{ENV:}` read, in this ruleset and
+        // in later rulesets of the chain (#822). Writing a name the classifier treats
+        // as constant-empty (or a name only known at eval time) would break that
+        // assumption for every reader, so the writer itself is uncacheable.
+        let name = k.strip_prefix('!').unwrap_or(k);
+        if name.contains(['%', '$']) || env_var_assumed_empty(&format!("ENV:{name}")).is_some() {
+            ok = false;
+        }
     }
     for c in &rule.conds {
         ok &= string_cache_class(&c.test_string, keys, assumed_env);
@@ -241,6 +250,13 @@ fn rule_cache_class(
         }
     }
     ok
+}
+
+/// `%{HTTP_<WORD>}` with no further underscore names the request header `<WORD>`
+/// (OLS `parseServerVar2`); `HTTP_X_FORWARDED_FOR`-style names stay env reads.
+pub(super) fn single_word_header_var(var: &str) -> Option<&str> {
+    var.strip_prefix("HTTP_")
+        .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 fn collect_header_reads_from_string(s: &str, reads: &mut Vec<String>) {
@@ -263,6 +279,8 @@ fn collect_header_reads_from_string(s: &str, reads: &mut Vec<String>) {
             Some("accept".to_string())
         } else if var.eq_ignore_ascii_case("HTTP_HOST") {
             Some("host".to_string())
+        } else if let Some(word) = single_word_header_var(var) {
+            Some(word.to_ascii_lowercase())
         } else {
             None
         };
@@ -273,6 +291,75 @@ fn collect_header_reads_from_string(s: &str, reads: &mut Vec<String>) {
         }
         rest = &after[end + 1..];
     }
+}
+
+/// (#857) The first `%{VAR}` in `s` that the origin page cache neither keys nor
+/// varies on. Keyed: the base key ([`var_is_cache_safe`]), the assumed-empty env
+/// reads, and every request header the engine resolves (exact spelling, as
+/// `resolve_var_into` matches it), which the page cache folds from
+/// [`RuleSet::header_reads`]. Everything else — address, port, protocol,
+/// `THE_REQUEST`, `TIME*`, `%{ENV:…}` and bare env reads — is unkeyed. An
+/// unterminated `%{` is reported too, as [`string_cache_class`] fails closed on it.
+fn first_page_cache_unkeyed(s: &str) -> Option<&str> {
+    let mut rest = s;
+    while let Some(p) = rest.find("%{") {
+        let after = &rest[p + 2..];
+        let Some(end) = after.find('}') else {
+            return Some("%{");
+        };
+        let var = &after[..end];
+        let keyed = var_is_cache_safe(var)
+            || env_var_assumed_empty(var).is_some()
+            || var.strip_prefix("HTTP:").is_some_and(|h| !h.is_empty())
+            || single_word_header_var(var).is_some()
+            || matches!(
+                var,
+                "HTTP_USER_AGENT" | "HTTP_COOKIE" | "HTTP_REFERER" | "HTTP_ACCEPT"
+            );
+        if !keyed {
+            return Some(var);
+        }
+        rest = &after[end + 1..];
+    }
+    None
+}
+
+/// The first page-cache-unkeyed read over every string of `rules` the engine
+/// `%{VAR}`-expands — the same strings [`rule_cache_class`] classifies.
+fn rules_page_cache_unkeyed(rules: &[Rule]) -> Option<Box<str>> {
+    let mut chained = false;
+    for rule in rules {
+        // A rule that, when it fires, always ends the request outside the cache
+        // ([F]/[G]/[R]: rendered before the lookup, never stored) and, when it does
+        // not, changes nothing, cannot make a cached response depend on what it
+        // reads (#865). [C]/[N]/[S] and chain members steer later rules on a miss.
+        let terminal_uncached = (rule.flags.forbidden || rule.flags.gone || rule.flags.redirect.is_some())
+                // [P,R] proxies (proxy wins in apply_rule), through the page cache (#874).
+                && !rule.flags.proxy
+                && !rule.flags.chain
+                && !rule.flags.next
+                && rule.flags.skip == 0
+                && !chained;
+        chained = rule.flags.chain;
+        if terminal_uncached {
+            continue;
+        }
+        let mut strings: Vec<&str> = vec![&rule.subst];
+        for (k, v) in &rule.flags.env_sets {
+            strings.push(k);
+            strings.push(v);
+        }
+        for cond in &rule.conds {
+            strings.push(&cond.test_string);
+            if let CondPattern::Lexical(_, rhs) | CondPattern::Numeric(_, rhs) = &cond.pattern {
+                strings.push(rhs);
+            }
+        }
+        if let Some(var) = strings.into_iter().find_map(first_page_cache_unkeyed) {
+            return Some(var.into());
+        }
+    }
+    None
 }
 
 fn rules_header_reads(rules: &[Rule]) -> Vec<String> {
@@ -429,9 +516,9 @@ impl RuleSet {
     /// Parse a raw Apache `mod_rewrite` snippet into an evaluable [`RuleSet`].
     ///
     /// Recognizes `RewriteEngine`, `RewriteBase`, `RewriteCond`, and
-    /// `RewriteRule`. Non-rewrite directives are ignored here (see
-    /// [`crate::Htaccess`] for the directive-aware parser). Line continuations
-    /// (`\` at EOL) are joined.
+    /// `RewriteRule`; `RewriteMap` and `${map:key}` lookups are refused.
+    /// Non-rewrite directives are ignored here (see [`crate::Htaccess`] for the
+    /// directive-aware parser). Line continuations (`\` at EOL) are joined.
     pub fn parse(rules: &str) -> Result<RuleSet, RewriteError> {
         let rules = rules.strip_prefix('\u{FEFF}').unwrap_or(rules);
         let mut set = RuleSet::default();
@@ -459,6 +546,14 @@ impl RuleSet {
                 }
                 "rewritecond" => {
                     pending_conds.push(parse_cond(rest, line)?);
+                }
+                // Map lookups would compare the literal `${map:key}` text, so a
+                // map-driven deny would serve everyone (#1030).
+                "rewritemap" => {
+                    return Err(RewriteError::Malformed {
+                        line,
+                        msg: "RewriteMap is not supported".into(),
+                    });
                 }
                 "rewriterule" => {
                     let mut rule = parse_rule(rest, std::mem::take(&mut pending_conds), line)?;
@@ -534,6 +629,7 @@ impl RuleSet {
         // it either way (#603). Outcome-cache/memo consumers still gate on
         // `cache_key_vars`, so their behavior is unchanged.
         set.header_reads = rules_header_reads(&set.rules);
+        set.page_cache_unkeyed = rules_page_cache_unkeyed(&set.rules);
         set.reads_user_agent = rules_read_ua(&set.rules);
         if set.reads_user_agent {
             let (eligible, ua_conds) = compute_ua_classify(&set.rules);
@@ -572,7 +668,7 @@ fn rules_reference_the_request(rules: &[Rule]) -> bool {
                         CondPattern::Regex(_, s)
                         | CondPattern::Lexical(_, s)
                         | CondPattern::Numeric(_, s) => mentions(s),
-                        CondPattern::FileTest(_) => false,
+                        CondPattern::FileTest(_) | CondPattern::UrlAccess => false,
                     }
             })
     })
@@ -613,36 +709,46 @@ fn split_first_token(s: &str) -> (&str, &str) {
 }
 
 /// Tokenize a directive argument list, honoring double quotes (so a flag list
-/// like `[E=var:"a b"]` or a quoted substitution stays intact). Returns the
-/// whitespace-separated fields with surrounding quotes stripped.
+/// like `[E=var:"a b"]` or a quoted substitution stays intact) and, like OLS
+/// `ls_parsenextarg`, a single-quoted argument and an unquoted `\x` escape
+/// (`^a\ b$` is one token). Returns the fields with surrounding quotes stripped.
 fn tokenize_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut in_quotes = false;
+    let mut quote: Option<char> = None;
     let mut have_token = false;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '"' => {
-                in_quotes = !in_quotes;
+            '"' if quote != Some('\'') => {
+                quote = if quote.is_some() { None } else { Some('"') };
                 have_token = true;
             }
-            '\\' if in_quotes => {
-                // Only `\"` is an escape (a literal quote). Every other
+            '\'' if quote == Some('\'') => quote = None,
+            '\'' if quote.is_none() && !have_token => {
+                quote = Some('\'');
+                have_token = true;
+            }
+            '\\' if quote.is_some() => {
+                // Only an escaped closing quote is unescaped. Every other
                 // backslash is preserved verbatim because patterns are regexes
                 // (`\.`, `\d`, ...) and must keep their escapes.
-                if let Some(&next) = chars.peek() {
-                    if next == '"' {
-                        cur.push('"');
+                match chars.peek() {
+                    Some(&next) if Some(next) == quote => {
+                        cur.push(next);
                         chars.next();
-                    } else {
-                        cur.push('\\');
                     }
-                } else {
-                    cur.push('\\');
+                    _ => cur.push('\\'),
                 }
             }
-            c if c.is_whitespace() && !in_quotes => {
+            '\\' => {
+                cur.push('\\');
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+                have_token = true;
+            }
+            c if c.is_whitespace() && quote.is_none() => {
                 if have_token {
                     out.push(std::mem::take(&mut cur));
                     have_token = false;
@@ -660,6 +766,68 @@ fn tokenize_args(s: &str) -> Vec<String> {
     out
 }
 
+/// The `[flags]` argument starting at `args[idx]`. OLS skips whitespace inside the
+/// bracket list, so `[NC, F]` spans several tokens that are rejoined here.
+fn flag_field(args: &[String], idx: usize) -> Option<String> {
+    let first = args.get(idx)?;
+    if !first.starts_with('[') || first.ends_with(']') {
+        return Some(first.clone());
+    }
+    let mut field = first.clone();
+    for tok in args.iter().skip(idx + 1) {
+        field.push_str(tok);
+        if tok.ends_with(']') {
+            break;
+        }
+    }
+    Some(field)
+}
+
+/// OLS `parseServerVar` drops a `LA-U:`/`LA-F:` look-ahead prefix (any case) and
+/// evaluates the inner variable, so `%{LA-U:REQUEST_FILENAME}` is the request
+/// filename. Normalizing once at parse time keeps evaluation and every `%{VAR}`
+/// classifier (outcome cache, memo, header reads) on the inner name.
+fn strip_lookahead_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(p) = rest.find("%{") {
+        out.push_str(&rest[..p + 2]);
+        rest = &rest[p + 2..];
+        let b = rest.as_bytes();
+        if b.len() >= 5
+            && (b[..5].eq_ignore_ascii_case(b"LA-U:") || b[..5].eq_ignore_ascii_case(b"LA-F:"))
+        {
+            rest = &rest[5..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// An unescaped `${` opens a `${map:key|default}` lookup (expansion copies `\$`
+/// literally). OLS rejects the reference when no map is defined, and httpjet
+/// defines none (#1030).
+fn has_map_reference(s: &str) -> bool {
+    let mut bytes = s.bytes().peekable();
+    while let Some(b) = bytes.next() {
+        match b {
+            b'\\' => {
+                bytes.next();
+            }
+            b'$' if bytes.peek() == Some(&b'{') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn map_lookup_unsupported(line: usize) -> RewriteError {
+    RewriteError::Malformed {
+        line,
+        msg: "${map:key} lookups are not supported (no RewriteMap)".into(),
+    }
+}
+
 fn parse_cond(rest: &str, line: usize) -> Result<Cond, RewriteError> {
     let args = tokenize_args(rest);
     if args.len() < 2 {
@@ -668,7 +836,15 @@ fn parse_cond(rest: &str, line: usize) -> Result<Cond, RewriteError> {
             msg: "RewriteCond requires a test string and a pattern".into(),
         });
     }
-    let test_string = args[0].clone();
+    let test_string = strip_lookahead_vars(&args[0]);
+    if test_string.eq_ignore_ascii_case("expr") {
+        // Apache/OLS `ap_expr` conditions are not modelled; evaluated as a regex
+        // against the literal text they fail open or deny everything.
+        return Err(RewriteError::Malformed {
+            line,
+            msg: "RewriteCond expr is not supported".into(),
+        });
+    }
     let mut pattern_raw = args[1].clone();
 
     // (#240 + residual) Spaced numeric form, optionally NEGATED: both
@@ -705,8 +881,8 @@ fn parse_cond(rest: &str, line: usize) -> Result<Cond, RewriteError> {
     }
 
     // Optional trailing flag list `[NC,OR]`.
-    let (nocase, or_next) = match args.get(flag_idx) {
-        Some(flag_field) => parse_cond_flags(flag_field),
+    let (nocase, or_next) = match flag_field(&args, flag_idx) {
+        Some(field) => parse_cond_flags(&field),
         None => (false, false),
     };
 
@@ -718,6 +894,13 @@ fn parse_cond(rest: &str, line: usize) -> Result<Cond, RewriteError> {
     };
 
     let pattern = classify_cond_pattern(&pattern_raw, nocase, line)?;
+    let rhs_maps = matches!(
+        &pattern,
+        CondPattern::Lexical(_, rhs) | CondPattern::Numeric(_, rhs) if has_map_reference(rhs)
+    );
+    if rhs_maps || has_map_reference(&test_string) {
+        return Err(map_lookup_unsupported(line));
+    }
     Ok(Cond {
         test_string,
         pattern,
@@ -734,8 +917,8 @@ fn parse_cond_flags(field: &str) -> (bool, bool) {
     let mut or_next = false;
     for f in inner.split(',') {
         match f.trim().to_ascii_uppercase().as_str() {
-            "NC" => nocase = true,
-            "OR" => or_next = true,
+            "NC" | "NOCASE" => nocase = true,
+            "OR" | "ORNEXT" => or_next = true,
             _ => {}
         }
     }
@@ -757,6 +940,8 @@ fn classify_cond_pattern(
         "-s" => return Ok(CondPattern::FileTest(FileTestKind::Size)),
         "-x" => return Ok(CondPattern::FileTest(FileTestKind::Exec)),
         "-e" => return Ok(CondPattern::FileTest(FileTestKind::Exists)),
+        // OLS COND_OP_URL_ACC performs no subrequest and always matches.
+        "-U" => return Ok(CondPattern::UrlAccess),
         _ => {}
     }
     // Numeric comparisons: `-eq`/`-ne`/`-gt`/`-lt`/`-ge`/`-le` followed by the
@@ -773,31 +958,29 @@ fn classify_cond_pattern(
             _ => None,
         };
         if let Some(op) = op {
-            return Ok(CondPattern::Numeric(op, rest[2..].trim_start().to_string()));
+            return Ok(CondPattern::Numeric(
+                op,
+                strip_lookahead_vars(rest[2..].trim_start()),
+            ));
         }
     }
     // Lexical comparisons. `>=`/`<=` must be tested before bare `>`/`<`.
-    if let Some(rhs) = raw.strip_prefix(">=") {
-        return Ok(CondPattern::Lexical(
-            Ordering::GreaterEqual,
-            rhs.to_string(),
-        ));
-    }
-    if let Some(rhs) = raw.strip_prefix("<=") {
-        return Ok(CondPattern::Lexical(Ordering::LessEqual, rhs.to_string()));
-    }
-    if let Some(rhs) = raw.strip_prefix('<') {
-        return Ok(CondPattern::Lexical(Ordering::Less, rhs.to_string()));
-    }
-    if let Some(rhs) = raw.strip_prefix('>') {
-        return Ok(CondPattern::Lexical(Ordering::Greater, rhs.to_string()));
-    }
-    if let Some(rhs) = raw.strip_prefix('=') {
-        return Ok(CondPattern::Lexical(Ordering::Equal, rhs.to_string()));
+    let lexical = [
+        (">=", Ordering::GreaterEqual),
+        ("<=", Ordering::LessEqual),
+        ("<", Ordering::Less),
+        (">", Ordering::Greater),
+        ("=", Ordering::Equal),
+    ];
+    for (op, ord) in lexical {
+        if let Some(rhs) = raw.strip_prefix(op) {
+            return Ok(CondPattern::Lexical(ord, strip_lookahead_vars(rhs)));
+        }
     }
     // Regex.
-    let re = CompiledRegex::compile(raw, nocase, line)?;
-    Ok(CondPattern::Regex(re, raw.to_string()))
+    let raw = super::pcre_literal_escapes(raw);
+    let re = CompiledRegex::compile(&raw, nocase, line)?;
+    Ok(CondPattern::Regex(re, raw.into_owned()))
 }
 
 fn parse_rule(rest: &str, conds: Vec<Cond>, line: usize) -> Result<Rule, RewriteError> {
@@ -809,12 +992,19 @@ fn parse_rule(rest: &str, conds: Vec<Cond>, line: usize) -> Result<Rule, Rewrite
         });
     }
     let mut pattern_src = args[0].clone();
-    let subst = args[1].clone();
-    let flags = if let Some(flag_field) = args.get(2) {
-        parse_rule_flags(flag_field)
-    } else {
-        RuleFlags::default()
+    let subst = strip_lookahead_vars(&args[1]);
+    let flags = match flag_field(&args, 2) {
+        Some(field) => parse_rule_flags(&strip_lookahead_vars(&field), line)?,
+        None => RuleFlags::default(),
     };
+    if has_map_reference(&subst)
+        || flags
+            .env_sets
+            .iter()
+            .any(|(k, v)| has_map_reference(k) || has_map_reference(v))
+    {
+        return Err(map_lookup_unsupported(line));
+    }
 
     let negate = if let Some(stripped) = pattern_src.strip_prefix('!') {
         pattern_src = stripped.to_string();
@@ -823,6 +1013,8 @@ fn parse_rule(rest: &str, conds: Vec<Cond>, line: usize) -> Result<Rule, Rewrite
         false
     };
 
+    // Every consumer (prefilter DFA, literal prefix, total-match) sees the PCRE form.
+    let pattern_src = super::pcre_literal_escapes(&pattern_src).into_owned();
     let pattern = CompiledRegex::compile(&pattern_src, flags.nocase, line)?;
     // Does any COND reference a `$N` rule backref (test string or lexical|numeric
     // RHS)? Computed separately because it gates the cond pre-screen in `apply_rule`.
@@ -857,7 +1049,7 @@ fn parse_rule(rest: &str, conds: Vec<Cond>, line: usize) -> Result<Rule, Rewrite
     })
 }
 
-fn parse_rule_flags(field: &str) -> RuleFlags {
+fn parse_rule_flags(field: &str, line: usize) -> Result<RuleFlags, RewriteError> {
     let inner = field.trim();
     let inner = inner.strip_prefix('[').unwrap_or(inner);
     let inner = inner.strip_suffix(']').unwrap_or(inner);
@@ -915,15 +1107,14 @@ fn parse_rule_flags(field: &str) -> RuleFlags {
             // OLS uses strtol; a non-numeric value is a parse error there, but
             // we degrade to 0 (no skip) rather than failing the whole set.
             flags.skip = n.trim().parse().unwrap_or(0);
-        } else if let Some(spec) = (if upper.starts_with("ENV=") {
+        } else if let Some(spec) = upper
+            .starts_with("ENV=")
             // #621: strip from the ORIGINAL token, not upper, so the var
             // name and value keep their case.
-            tok.get(4..)
-        } else if upper.starts_with("E=") {
-            tok.get(2..)
-        } else {
-            None
-        }) {
+            .then(|| tok.get(4..))
+            .or_else(|| upper.starts_with("E=").then(|| tok.get(2..)))
+            .flatten()
+        {
             // (audit) Apache accepts any case for the env-set spelling ([E=], [e=],
             // [ENV=]); matching only the exact mixed-case forms silently DROPPED a
             // valid lowercase flag — the rule matched and stopped but never set the
@@ -931,10 +1122,45 @@ fn parse_rule_flags(field: &str) -> RuleFlags {
             if let Some((k, v)) = parse_env_set(spec) {
                 flags.env_sets.push((k, v));
             }
+        } else if ["T=", "TYPE=", "H=", "HANDLER="]
+            .iter()
+            .any(|p| upper.starts_with(p))
+        {
+            // A forced type/handler decides between executing a file and serving
+            // its source; ignoring it would do the opposite of what was asked.
+            return Err(RewriteError::Malformed {
+                line,
+                msg: format!("RewriteRule flag [{tok}] (forced type/handler) is not supported"),
+            });
+        } else if let Some(chars) = tok.get(4..).filter(|_| upper.starts_with("BNE=")) {
+            flags
+                .backref_escape
+                .get_or_insert_with(Default::default)
+                .no_escape
+                .push_str(chars);
+        } else if let Some(chars) = tok.get(2..).filter(|_| upper.starts_with("B=")) {
+            flags
+                .backref_escape
+                .get_or_insert_with(Default::default)
+                .only = Some(chars.into());
+        } else if upper == "BNP" || upper == "BACKREFNOPLUS" {
+            flags
+                .backref_escape
+                .get_or_insert_with(Default::default)
+                .no_plus = true;
+        } else if upper == "BCTLS" {
+            flags
+                .backref_escape
+                .get_or_insert_with(Default::default)
+                .ctls_only = true;
+        } else if upper == "B" {
+            flags.backref_escape.get_or_insert_with(Default::default);
+        } else if upper == "UNSAFEALLOW3F" {
+            flags.allow_3f = true;
         }
-        // Unknown flags ([T=...], [H=...], [DPI], etc.) are silently ignored.
+        // Other unknown flags ([DPI], [CO=...], etc.) are silently ignored.
     }
-    flags
+    Ok(flags)
 }
 
 fn parse_redirect_code(code: &str) -> u16 {

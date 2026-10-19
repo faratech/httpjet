@@ -12,7 +12,8 @@
 //! Mirrors the same TTL-coalescing already used by `HtaccessCache`; this closes
 //! the last redundant per-request `statx` on the rewrite hot path.
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -34,7 +35,10 @@ const MAX_KEY_BYTES: usize = 1024;
 
 /// TTL-coalesced cache of `-f`/`-d`/`-l`/`-s` file tests, keyed by absolute path.
 pub struct StatCache {
-    map: DashMap<PathBuf, (Instant, Option<FileTests>)>,
+    /// Keyed by the raw path bytes: `PathBuf` equality ignores a trailing `/`, but
+    /// `file/` fails with ENOTDIR where `file` exists, so they must not share an
+    /// entry (#899).
+    map: DashMap<OsString, (Instant, Option<FileTests>)>,
     ttl: Duration,
     cap: usize,
     /// Approximate entry count for the cap gate: `DashMap::len()` sweeps (and
@@ -68,7 +72,7 @@ impl StatCache {
             return Self::stat(path);
         }
         let mut present = false;
-        if let Some(e) = self.map.get(path) {
+        if let Some(e) = self.map.get(path.as_os_str()) {
             if e.0.elapsed() < self.ttl {
                 return e.1; // FileTests is Copy
             }
@@ -81,7 +85,7 @@ impl StatCache {
         {
             if self
                 .map
-                .insert(path.to_path_buf(), (Instant::now(), tests))
+                .insert(path.as_os_str().to_owned(), (Instant::now(), tests))
                 .is_none()
             {
                 self.count.fetch_add(1, Ordering::Relaxed);
@@ -188,12 +192,30 @@ mod tests {
         assert_eq!(c.map.len(), 2);
         std::thread::sleep(Duration::from_millis(40));
         c.tests(Path::new("/nonexistent-statcache-c"));
-        assert!(c.map.contains_key(Path::new("/nonexistent-statcache-c")));
+        assert!(
+            c.map
+                .contains_key(Path::new("/nonexistent-statcache-c").as_os_str())
+        );
         assert_eq!(c.map.len(), 1);
 
-        let long = PathBuf::from(format!("/{}", "x".repeat(2048)));
+        let long = std::path::PathBuf::from(format!("/{}", "x".repeat(2048)));
         assert!(c.tests(&long).is_none());
-        assert!(!c.map.contains_key(&long));
+        assert!(!c.map.contains_key(long.as_os_str()));
+    }
+
+    /// Regression (#899): `file/` (ENOTDIR) must not poison the entry for `file`.
+    #[test]
+    fn trailing_slash_does_not_share_an_entry() {
+        let dir =
+            std::env::temp_dir().join(format!("httpjet_statcache_slash_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("robots.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let c = StatCache::new(Duration::from_secs(60));
+        let slashed = std::path::PathBuf::from(format!("{}/", file.display()));
+        assert!(c.tests(&slashed).is_none());
+        assert!(c.tests(&file).unwrap().is_file);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -134,7 +134,7 @@ pub fn resolve_auth_for_request_paths<'a>(
     filesystem_paths: &[&str],
 ) -> Result<Option<AuthRealm>, InvalidAuth> {
     let basename = resource_path.rsplit('/').next().unwrap_or("");
-    let mut effective = EffectiveAuth::default();
+    let mut matched: Vec<&AuthGroup> = Vec::new();
     for ht in chain {
         if let Some(policy) = &ht.auth {
             for group in &policy.groups {
@@ -163,12 +163,19 @@ pub fn resolve_auth_for_request_paths<'a>(
                 if !group.matchers.iter().all(|m| matches_at(m, false)) {
                     return Err(InvalidAuth);
                 }
-                // Matching sections merge in configuration order. Only an
-                // explicit Require replaces requirements; metadata-only
-                // siblings must not erase a previously selected restriction.
-                effective.merge(group);
+                matched.push(group);
             }
         }
+    }
+    // Apache merges every directory's directory-level sections first, then all
+    // `<Files*>`, then all `<If>`, so a parent's `<Files>` Require outranks a
+    // child directory's. Within a phase, configuration order. Only an explicit
+    // Require replaces requirements; metadata-only siblings must not erase a
+    // previously selected restriction.
+    matched.sort_by_key(|g| super::merge_phase(&g.matchers));
+    let mut effective = EffectiveAuth::default();
+    for group in matched {
+        effective.merge(group);
     }
     effective.finish()
 }

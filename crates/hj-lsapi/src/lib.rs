@@ -73,8 +73,11 @@ pub use pool::{
 pub use proto::{
     HEADER_INDEX_LEN, HEADER_OFFSET_LEN, KNOWN_HEADER_COUNT, KNOWN_HEADER_NAMES, LsapiCodec,
     LsapiFrame, MAX_DATA_PACKET_LEN, PACKET_HEADER_LEN, PacketType, REQ_HEADER_LEN, RespHeader,
-    SOCK_FILENO, SpecialEnvType, build_begin_request, build_begin_request_body,
+    SOCK_FILENO, SpecialEnvType, WireHeader, build_begin_request, build_begin_request_body,
     build_begin_request_framed, known_header_index, parse_resp_header,
 };
 pub use registry::{LsapiRegistry, PoolKey};
-pub use supervisor::{LsphpSupervisor, PromotionHook, SocketSource, SupervisorConfig, WorkerState};
+pub use supervisor::{
+    LsphpSupervisor, PromotionHook, SocketSource, SupervisorConfig, WorkerState,
+    validate_operator_dir,
+};

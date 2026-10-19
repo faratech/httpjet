@@ -85,6 +85,33 @@ fn walkdir(dir: &Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+fn assert_footprint_counters_match(
+    fp: &hj_pagecache::CacheFootprint,
+    st: &hj_pagecache::CacheStats,
+) {
+    assert_eq!(
+        (
+            fp.entries,
+            fp.purges,
+            fp.swept_expired,
+            fp.evictions,
+            fp.disk_evictions,
+            fp.missing_file_invalidations,
+            fp.disk_read_errors,
+        ),
+        (
+            st.entries,
+            st.purges,
+            st.swept_expired,
+            st.evictions,
+            st.disk_evictions,
+            st.missing_file_invalidations,
+            st.disk_read_errors,
+        ),
+        "{fp:?} vs {st:?}"
+    );
+}
+
 #[test]
 fn footprint_matches_the_stats_byte_totals() {
     let td = tempfile::tempdir().unwrap();
@@ -108,10 +135,14 @@ fn footprint_matches_the_stats_byte_totals() {
     assert_eq!(fp.disk_bytes, st.disk_bytes);
     assert_eq!(fp.hot_bytes, st.hot_bytes);
     assert_eq!(fp.index_ram_bytes, st.memory_bytes - st.tag_index_bytes);
+    assert_eq!(fp.entries, 8, "{fp:?}");
+    assert_footprint_counters_match(&fp, &st);
 
     s.purge_tags(&["t"]);
     let fp = s.footprint();
     assert_eq!((fp.index_ram_bytes, fp.disk_bytes), (0, 0), "{fp:?}");
+    assert_eq!((fp.entries, fp.purges, fp.evictions), (0, 1, 8), "{fp:?}");
+    assert_footprint_counters_match(&fp, &s.stats());
 }
 
 #[test]

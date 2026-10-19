@@ -1,8 +1,6 @@
-//! Regression: two conflicting ALL rules — the first-listed one must win
-//! (most-specific-first stable sort; ALL has prefix_len 0, so among equal
-//! specificity the first-listed in config is authoritative). The dead
-//! all_allow fallback that disagreed with this was removed; check_peer now
-//! relies solely on the sorted self.rules list.
+//! Regression: two conflicting ALL rules — deny wins regardless of order
+//! (#808). OLS adds the allow list, then the deny list, and a later entry for
+//! the same network overwrites the earlier one, so an equal-network tie denies.
 
 use hj_acl::{AccessControl, AclDecision};
 use hj_core::config::{AccessRule, Security};
@@ -23,10 +21,9 @@ fn acl_from_rules(rules: Vec<AccessRule>) -> AccessControl {
     .unwrap()
 }
 
-/// Two ALL rules: first says allow, second says deny. First-listed wins (OLS
-/// most-specific-first + stable-sort-within-equal-prefix semantics).
+/// Two ALL rules: first says allow, second says deny. Deny wins.
 #[test]
-fn first_all_rule_wins_over_second() {
+fn all_deny_wins_over_earlier_all_allow() {
     let acl = acl_from_rules(vec![
         AccessRule {
             spec: "ALL".into(),
@@ -39,14 +36,11 @@ fn first_all_rule_wins_over_second() {
             allow: false,
         },
     ]);
-    // The first ALL (allow) is first in config; stable sort keeps it first
-    // among prefix-0 ties, so every IP is allowed.
-    assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
-    assert_eq!(acl.check_peer(ip("203.0.113.1")), AclDecision::Allow);
+    assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Deny);
+    assert_eq!(acl.check_peer(ip("203.0.113.1")), AclDecision::Deny);
 }
 
-/// Two ALL rules in deny-first order: first deny, then allow. First-listed
-/// (deny) wins.
+/// Two ALL rules in deny-first order: deny still wins.
 #[test]
 fn first_all_deny_wins_over_second_allow() {
     let acl = acl_from_rules(vec![

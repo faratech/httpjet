@@ -38,13 +38,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::hpack::{Decoder, Encoder};
 use bytes::Bytes;
 use futures_util::future::{AbortHandle, Abortable};
+use hj_core::body_deadline::BodyProgress;
 use hj_core::{Request, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::frame::{self, FrameHeader, error_code, settings};
 use recv::{FrameOutcome, process_frame};
 use send::{
-    Pulls, apply_pull, begin_response, cancel_outstream, pump_streams, reset_stalled_streams,
+    Pulls, apply_pull, begin_response, cancel_outstream, pump_streams, reset_drain_idle_streams,
+    reset_stalled_streams,
 };
 use state::{OutStream, PeerSettings, Recv, StreamState};
 
@@ -181,9 +183,10 @@ pub fn peer_settings_counts() -> Vec<(&'static str, String, u64)> {
 const H2_INBUF_IDLE: usize = 8 * 1024;
 /// Upper bound on the closing flush of a connection that is shutting down.
 const FINAL_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-/// Bound on how long a peer that sent GOAWAY may keep the connection open while its
-/// in-flight responses finish; reads stop after it, so a peer cannot pin the task.
-const PEER_GOAWAY_DRAIN: std::time::Duration = std::time::Duration::from_secs(12);
+/// Default [`Config::goaway_drain_timeout`].
+const GOAWAY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Default [`Config::shutdown_idle_stream_timeout`].
+const SHUTDOWN_IDLE_STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 const H2_READ_CHUNK: usize = 8 * 1024;
 const H2_INBUF_SHRINK_TRIGGER: usize = 64 * 1024;
@@ -238,8 +241,8 @@ pub struct Config {
     /// above any real CF request yet an order of magnitude below the bomb's ~2 MB.
     pub header_list_size: u32,
     /// Max buffered request body, PER STREAM (LiteSpeed `maxReqBodySize`). The native stack
-    /// buffers the whole request body before dispatch, so an over-cap stream is RST'd
-    /// (REFUSED_STREAM). The per-connection aggregate is bounded at `4 ×` this value.
+    /// buffers the whole request body before dispatch, so an over-cap stream is answered
+    /// 413 (#1014). The per-connection aggregate is bounded at `4 ×` this value.
     pub max_request_body: usize,
     /// Server-wide buffered-body budget shared with the other transports (#236 residual).
     /// `None` (default) skips global accounting — per-stream/per-connection caps still apply.
@@ -258,9 +261,14 @@ pub struct Config {
     /// Absolute deadline for completing one frame once any byte of its header
     /// or payload has arrived. Progress on that frame does not reset it.
     pub frame_read_timeout: Option<std::time::Duration>,
-    /// Absolute deadline for completing a request body after its initial
-    /// HEADERS block. Traffic on other streams does not reset it.
+    /// Deadline for completing a request body after its initial HEADERS block. Only
+    /// that stream's own progress extends it: each `BODY_MIN_PROGRESS` of its DATA
+    /// restarts the window, up to [`Config::request_body_ceiling`] (#1035). Traffic on
+    /// other streams does not.
     pub request_body_timeout: Option<std::time::Duration>,
+    /// Hard bound on receiving one request body from its initial HEADERS block,
+    /// however steadily it progresses.
+    pub request_body_ceiling: std::time::Duration,
     /// (Tier 2) Per-connection egress cap in bytes/sec. 0 (default) = unlimited. When set,
     /// EVERY DATA/header flush on this connection is paced through one token bucket —
     /// connection-level semantics: all streams share the pipe, so a paced stream
@@ -273,6 +281,19 @@ pub struct Config {
     /// response is judged on its own progress, so traffic on other streams cannot keep a
     /// starved one alive (#599). `None` disables it.
     pub send_stall_timeout: Option<std::time::Duration>,
+    /// Hard bound on a graceful drain after a peer GOAWAY (and, on the tokio `serve`
+    /// path, after our own shutdown GOAWAY; the monoio accept loop bounds that one).
+    /// Reads continue while streams are pending so window-blocked bodies still get
+    /// credit; each piece of work is bounded by its own handler / send-stall deadline.
+    /// If this elapses first, every pending stream is RST_STREAM(CANCEL)ed and a
+    /// GOAWAY is sent, never a silent truncation (#906).
+    pub goaway_drain_timeout: std::time::Duration,
+    /// (#1034) After the shutdown signal, a response that waits this long on its backend
+    /// with nothing left to send (an SSE or long-poll body) is reset with
+    /// RST_STREAM(CANCEL) rather than holding the drain to the transport's bound.
+    /// Responses still producing, window-blocked bodies and handlers that have not
+    /// answered are unaffected. `None` keeps every response until the drain bound.
+    pub shutdown_idle_stream_timeout: Option<std::time::Duration>,
 }
 
 impl Default for Config {
@@ -289,10 +310,81 @@ impl Default for Config {
             preface_timeout: None,
             frame_read_timeout: Some(std::time::Duration::from_secs(15)),
             request_body_timeout: Some(std::time::Duration::from_secs(60)),
+            request_body_ceiling: hj_core::body_deadline::BODY_DEADLINE_CEILING,
             bandwidth_limit: 0,
             send_stall_timeout: Some(std::time::Duration::from_secs(60)),
+            goaway_drain_timeout: GOAWAY_DRAIN_TIMEOUT,
+            shutdown_idle_stream_timeout: Some(SHUTDOWN_IDLE_STREAM_TIMEOUT),
         }
     }
+}
+
+/// Start the body deadline of every stream whose initial header block completed with a
+/// body to come, and extend each body that received `BODY_MIN_PROGRESS` since its last
+/// extension (#1035). Extension state lives beside `StreamState`, not in it, and only
+/// for streams with a body: a larger per-stream entry moved the stream map into an
+/// allocation class that re-faulted pages under `MIMALLOC_PURGE_DELAY=0` (see
+/// `reset_drain_idle_streams`). Entries of streams that left the map are dropped here;
+/// stream ids are never reused, so a stale entry is never applied to another stream.
+fn advance_body_deadlines(
+    streams: &mut FxHashMap<u32, StreamState>,
+    progress: &mut FxHashMap<u32, BodyProgress<tokio::time::Instant>>,
+    timeout: std::time::Duration,
+    ceiling: std::time::Duration,
+) {
+    let now = tokio::time::Instant::now();
+    for (&sid, st) in streams.iter_mut() {
+        if st.headers_done && !st.end_stream && st.body_deadline.is_none() {
+            st.body_deadline = Some(now + timeout);
+            progress.insert(sid, BodyProgress::new(now, ceiling, st.body.len() as u64));
+        }
+    }
+    if progress.is_empty() {
+        return;
+    }
+    progress.retain(|sid, progress| {
+        let Some(st) = streams.get_mut(sid) else {
+            return false;
+        };
+        if let Some(deadline) = st.body_deadline.as_mut() {
+            progress.extend(deadline, st.body.len() as u64, timeout, || now);
+        }
+        true
+    });
+}
+
+/// (#906) The drain bound elapsed with streams still pending: reset each one and send
+/// our GOAWAY so the peer sees an explicit end rather than a truncated response.
+fn abandon_drain(
+    recv: &mut Recv,
+    streams: &mut FxHashMap<u32, StreamState>,
+    outstreams: &mut FxHashMap<u32, OutStream>,
+    inflight_sids: &mut FxHashMap<u32, AbortHandle>,
+    cancelled: &mut FxHashSet<u32>,
+    pending_window: &mut FxHashMap<u32, i64>,
+    out: &mut OutQueue,
+) {
+    let receiving: Vec<u32> = streams.keys().copied().collect();
+    for sid in receiving {
+        if recv.expire_receiving(streams, sid) {
+            out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+        }
+    }
+    for (sid, abort) in inflight_sids.drain() {
+        abort.abort();
+        if cancelled.len() < recv.max_concurrent.saturating_mul(2) {
+            cancelled.insert(sid);
+        }
+        out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+    }
+    let sending: Vec<u32> = outstreams.keys().copied().collect();
+    for sid in sending {
+        out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+        cancel_outstream(outstreams, sid);
+    }
+    pending_window.clear();
+    let last = recv.goaway_last_stream_id();
+    out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
 }
 
 /// Boxed request-handler future tagged with its stream id and whether the request was a
@@ -430,17 +522,22 @@ where
     // transport (TCP accept / h2c sniff / TLS handshake) then stalls before/inside the
     // 24-byte preface previously pinned this task with no deadline (the per-frame idle
     // timer below only starts once the preface is read). `None` leaves it unbounded.
-    match config.preface_timeout.or(config.conn_idle_timeout) {
-        Some(d) => match tokio::time::timeout(d, read_preface(&mut reader)).await {
-            Ok(r) => r?,
-            Err(_) => {
-                return Err(std::io::Error::new(
+    // (#1034) No stream exists yet, so the shutdown signal closes at once.
+    let preface = async {
+        match config.preface_timeout.or(config.conn_idle_timeout) {
+            Some(d) => match tokio::time::timeout(d, read_preface(&mut reader)).await {
+                Ok(r) => r,
+                Err(_) => Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "HTTP/2 connection preface not received before idle timeout",
-                ));
-            }
-        },
-        None => read_preface(&mut reader).await?,
+                )),
+            },
+            None => read_preface(&mut reader).await,
+        }
+    };
+    tokio::select! {
+        result = preface => result?,
+        _ = shutdown_signal(shutdown.as_ref()) => return Ok(()),
     }
 
     let mut out = OutQueue::default();
@@ -494,7 +591,8 @@ where
         discarding_header_block: false,
         discard_header_block: Vec::new(),
         discard_rst_code: error_code::STREAM_CLOSED,
-        reset_ids: FxHashSet::default(),
+        reset_ids: Default::default(),
+        sent_reset_ids: Default::default(),
         max_concurrent: config.max_concurrent_streams as usize,
         // The connection receive window we advertise = the level grown to above (the §6.9.2
         // default 65535, raised to initial_window_size via the stream-0 WINDOW_UPDATE sent above).
@@ -516,6 +614,7 @@ where
     // Outgoing response bodies still being written, plus their async chunk pulls and the
     // connection-level send window (RFC 7540 §6.9, default 65535 until the peer grows it).
     let mut outstreams: FxHashMap<u32, OutStream> = FxHashMap::default();
+    let mut drain_idle: FxHashMap<u32, std::time::Instant> = FxHashMap::default();
     let mut send_schedule = VecDeque::new();
     let mut pulls: Pulls = Pulls::new();
     let mut send_conn: i64 = 65535;
@@ -538,11 +637,16 @@ where
     let mut reading = true;
     let mut accepting = true;
     let mut draining = false;
+    let mut shutdown_drain = false;
     let cap = config.max_frame_size.min(1 << 24);
     let frame_read_timeout = config.frame_read_timeout;
     let request_body_timeout = config.request_body_timeout;
+    let request_body_ceiling = config.request_body_ceiling;
+    let mut body_progress: FxHashMap<u32, BodyProgress<tokio::time::Instant>> =
+        FxHashMap::default();
     let send_stall_timeout = config.send_stall_timeout;
     let mut partial_frame_deadline: Option<tokio::time::Instant> = None;
+    let mut header_block_deadline: Option<tokio::time::Instant> = None;
 
     // (HTTP/2-Bomb hardening) Connection-idle deadline, reset at the top of every iteration so
     // it measures time spent blocked in `select` with nothing happening. If it elapses, GOAWAY
@@ -568,14 +672,22 @@ where
             // The loop guard guarantees 9 bytes, so parse always succeeds; fail closed with
             // a GOAWAY rather than panicking the connection task if that ever breaks.
             let Some(hdr) = FrameHeader::parse(&inbuf[cursor..]) else {
-                out.frames(|b| frame::write_goaway(b, 0, error_code::PROTOCOL_ERROR));
+                {
+                    // Report the streams already processed (RFC 9113 §6.8, #876).
+                    let last = recv.goaway_last_stream_id();
+                    out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
+                }
                 reading = false;
                 accepting = false;
                 draining = false;
                 break;
             };
             if hdr.length > cap {
-                out.frames(|b| frame::write_goaway(b, 0, error_code::FRAME_SIZE_ERROR));
+                {
+                    // Report the streams already processed (RFC 9113 §6.8, #876).
+                    let last = recv.goaway_last_stream_id();
+                    out.frames(|b| frame::write_goaway(b, last, error_code::FRAME_SIZE_ERROR));
+                }
                 reading = false;
                 accepting = false;
                 draining = false;
@@ -588,7 +700,8 @@ where
             let payload = cursor + FrameHeader::LEN..cursor + total;
             cursor += total;
             completed_frame = true;
-            match process_frame(
+            let block_was_open = recv.open_header_block.is_some();
+            let outcome = process_frame(
                 hdr,
                 &inbuf[payload],
                 &mut streams,
@@ -603,7 +716,14 @@ where
                 &mut inflight,
                 &mut cancelled,
                 &mut inflight_sids,
-            ) {
+            );
+            header_block_deadline = next_header_block_deadline(
+                block_was_open,
+                recv.open_header_block.is_some(),
+                header_block_deadline,
+                || frame_read_timeout.map(|d| tokio::time::Instant::now() + d),
+            );
+            match outcome {
                 FrameOutcome::Continue => {}
                 FrameOutcome::StopReading => {
                     reading = false;
@@ -616,7 +736,7 @@ where
                         draining = true;
                         drain
                             .as_mut()
-                            .reset(tokio::time::Instant::now() + PEER_GOAWAY_DRAIN);
+                            .reset(tokio::time::Instant::now() + config.goaway_drain_timeout);
                     }
                     accepting = false;
                 }
@@ -633,7 +753,13 @@ where
                     let was_blocked = send_conn <= 0;
                     send_conn += increment as i64;
                     if send_conn > i32::MAX as i64 {
-                        out.frames(|b| frame::write_goaway(b, 0, error_code::FLOW_CONTROL_ERROR));
+                        {
+                            // Report the streams already processed (RFC 9113 §6.8, #876).
+                            let last = recv.goaway_last_stream_id();
+                            out.frames(|b| {
+                                frame::write_goaway(b, last, error_code::FLOW_CONTROL_ERROR)
+                            });
+                        }
                         reading = false;
                         accepting = false;
                         draining = false;
@@ -706,6 +832,22 @@ where
                                     if cancelled.len() < recv.max_concurrent.saturating_mul(2) {
                                         cancelled.insert(stream_id);
                                     }
+                                    // (#905) A provoked reset of live work draws on the
+                                    // rapid-reset budget like a peer RST_STREAM.
+                                    if recv.charge_inflight_reset() {
+                                        let last = recv.goaway_last_stream_id();
+                                        out.frames(|b| {
+                                            frame::write_goaway(
+                                                b,
+                                                last,
+                                                error_code::ENHANCE_YOUR_CALM,
+                                            )
+                                        });
+                                        reading = false;
+                                        accepting = false;
+                                        draining = false;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -719,7 +861,13 @@ where
                         overflow |= st.window > i32::MAX as i64;
                     }
                     if overflow {
-                        out.frames(|b| frame::write_goaway(b, 0, error_code::FLOW_CONTROL_ERROR));
+                        {
+                            // Report the streams already processed (RFC 9113 §6.8, #876).
+                            let last = recv.goaway_last_stream_id();
+                            out.frames(|b| {
+                                frame::write_goaway(b, last, error_code::FLOW_CONTROL_ERROR)
+                            });
+                        }
                         reading = false;
                         accepting = false;
                         draining = false;
@@ -740,16 +888,20 @@ where
         } else if completed_frame || partial_frame_deadline.is_none() {
             partial_frame_deadline = frame_read_timeout.map(|d| tokio::time::Instant::now() + d);
         }
+        // Checked on every pass, not only by the timer arm, so a peer keeping the
+        // biased read arm ready cannot starve it.
+        if reading && header_block_deadline.is_some_and(|d| d <= tokio::time::Instant::now()) {
+            let last = recv.goaway_last_stream_id();
+            out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
+            reading = false;
+            accepting = false;
+            draining = false;
+        }
 
         // Start body deadlines only after the initial header block is fully
         // decoded. END_STREAM requests are dispatched synchronously above.
         if let Some(d) = request_body_timeout {
-            let now = tokio::time::Instant::now();
-            for st in streams.values_mut() {
-                if st.headers_done && !st.end_stream && st.body_deadline.is_none() {
-                    st.body_deadline = Some(now + d);
-                }
-            }
+            advance_body_deadlines(&mut streams, &mut body_progress, d, request_body_ceiling);
         }
         let now = tokio::time::Instant::now();
         let expired: Vec<u32> = streams
@@ -761,9 +913,10 @@ where
             })
             .collect();
         for sid in expired {
-            recv.teardown_receiving(&mut streams, sid);
             pending_window.remove(&sid);
-            out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+            if recv.expire_receiving(&mut streams, sid) {
+                out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+            }
         }
         // Release a read buffer that a large body / frame burst grew, once it has fully
         // drained between frames; idle CF keep-alives should not pin their peak capacity.
@@ -808,6 +961,9 @@ where
         while let Some((sid, body, res)) =
             futures_util::FutureExt::now_or_never(pulls.next()).flatten()
         {
+            if !drain_idle.is_empty() {
+                drain_idle.remove(&sid);
+            }
             apply_pull(sid, body, res, &mut outstreams, &mut out);
         }
         // Write as much body as the send windows allow (and queue further chunk pulls).
@@ -822,6 +978,12 @@ where
         // Checked on every pass (not only by the timer arm below) so a peer that keeps
         // the biased, first-polled read arm ready cannot starve the deadline.
         let stall_deadline = reset_stalled_streams(&mut outstreams, &mut out, send_stall_timeout);
+        let drain_idle_deadline = match config.shutdown_idle_stream_timeout {
+            Some(grace) if shutdown_drain => {
+                reset_drain_idle_streams(&mut outstreams, &mut drain_idle, &mut out, grace)
+            }
+            _ => None,
+        };
 
         // Flush queued output (ACKs, WINDOW_UPDATEs, and the batch of DATA) BEFORE the
         // select blocks on a read — otherwise the peer waits for bytes still queued and
@@ -840,7 +1002,8 @@ where
         }
 
         let far_future = tokio::time::Instant::now() + std::time::Duration::from_secs(86_400);
-        let frame_deadline = partial_frame_deadline.unwrap_or(far_future);
+        let read_deadline = earliest(partial_frame_deadline, header_block_deadline);
+        let frame_deadline = read_deadline.unwrap_or(far_future);
         let body_deadline = streams
             .values()
             .filter_map(|st| st.body_deadline)
@@ -851,9 +1014,13 @@ where
         let stall_timer = tokio::time::sleep_until(
             stall_deadline.map_or(far_future, tokio::time::Instant::from_std),
         );
+        let drain_idle_timer = tokio::time::sleep_until(
+            drain_idle_deadline.map_or(far_future, tokio::time::Instant::from_std),
+        );
         tokio::pin!(frame_timer);
         tokio::pin!(body_timer);
         tokio::pin!(stall_timer);
+        tokio::pin!(drain_idle_timer);
 
         tokio::select! {
             biased;
@@ -870,22 +1037,23 @@ where
             }
             // A streaming body produced a chunk (or ended): buffer it for the next pump.
             Some((sid, body, res)) = pulls.next(), if !pulls.is_empty() => {
-                apply_pull(sid, body, res, &mut outstreams, &mut out);
+                if !drain_idle.is_empty() {
+                drain_idle.remove(&sid);
+            }
+            apply_pull(sid, body, res, &mut outstreams, &mut out);
             }
             // (OPS2) Graceful drain: on the shutdown signal, send GOAWAY and stop accepting
             // new streams. Keep reading frames so existing response bodies can receive flow
             // control credit and finish instead of being truncated at the initial window.
-            _ = async {
-                match &shutdown {
-                    Some(t) => t.cancelled().await,
-                    None => std::future::pending::<()>().await,
+            _ = shutdown_signal(shutdown.as_ref()), if !shutdown_drain => {
+                shutdown_drain = true;
+                if reading && accepting {
+                    let last = recv.goaway_last_stream_id();
+                    out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
+                    accepting = false;
+                    draining = true;
+                    drain.as_mut().reset(tokio::time::Instant::now() + config.goaway_drain_timeout);
                 }
-            }, if reading && accepting => {
-                let last = recv.goaway_last_stream_id();
-                out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
-                accepting = false;
-                draining = true;
-                drain.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(12));
             }
             // More inbound bytes (read_buf is cancel-safe; a cancelled read loses nothing).
             r = read_more(&mut reader, &mut inbuf), if reading => {
@@ -904,7 +1072,7 @@ where
                     Err(e) => return Err(e),
                 }
             }
-            _ = &mut frame_timer, if reading && partial_frame_deadline.is_some() => {
+            _ = &mut frame_timer, if reading && read_deadline.is_some() => {
                 let last = recv.goaway_last_stream_id();
                 out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
                 reading = false;
@@ -927,6 +1095,7 @@ where
                 draining = false;
             }
             _ = &mut drain, if reading && draining => {
+                abandon_drain(&mut recv, &mut streams, &mut outstreams, &mut inflight_sids, &mut cancelled, &mut pending_window, &mut out);
                 reading = false;
                 accepting = false;
                 draining = false;
@@ -934,6 +1103,7 @@ where
             // Wake the loop at the earliest send-stall deadline; the pass at the loop
             // top resets the expired responses.
             _ = &mut stall_timer, if stall_deadline.is_some() => {}
+            _ = &mut drain_idle_timer, if drain_idle_deadline.is_some() => {}
         }
     }
 
@@ -958,6 +1128,38 @@ where
         .await;
     }
     Ok(())
+}
+
+/// (#1012) An open header block gets `frame_read_timeout` from the frame that opened it to
+/// reach END_HEADERS. Unlike the partial-frame deadline, completed CONTINUATION frames do not
+/// restart it: each one empties the read buffer and restarts the idle timer, so periodic empty
+/// CONTINUATIONs would otherwise pin the stream's block (and the connection) indefinitely.
+fn next_header_block_deadline<T>(
+    was_open: bool,
+    open: bool,
+    current: Option<T>,
+    arm: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    match (was_open, open) {
+        (_, false) => None,
+        (false, true) => arm(),
+        (true, true) => current,
+    }
+}
+
+/// Resolves once `shutdown` is cancelled; never without a token.
+async fn shutdown_signal(shutdown: Option<&tokio_util::sync::CancellationToken>) {
+    match shutdown {
+        Some(token) => token.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn earliest<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Should the connection loop close *now*, after pumping output but before it blocks
@@ -1387,9 +1589,10 @@ where
     // instead of monoio's UnsafeCell-based generic `Split` implementation.
     let (mut rh, mut wh) = stream.into_split();
 
-    // Client connection preface (24 bytes). Seeded with any pre-read prefix.
-    let mut inbuf: Vec<u8> = Vec::with_capacity(H2_INBUF_IDLE.max(prefix.len()));
-    inbuf.extend_from_slice(&prefix);
+    // Client connection preface (24 bytes). Seeded with any pre-read prefix, which
+    // becomes the inbound buffer itself rather than a copy kept for the connection.
+    let mut inbuf = prefix;
+    inbuf.reserve(H2_INBUF_IDLE.saturating_sub(inbuf.len()));
     // Bound the preface read so a peer that completes the TCP/TLS handshake then stalls
     // cannot pin this connection task forever (the monoio path otherwise had no deadline,
     // unlike the tokio `serve`). On timeout we close, so cancelling the in-flight read is
@@ -1398,23 +1601,27 @@ where
         .preface_timeout
         .or(config.conn_idle_timeout)
         .map(|duration| monoio::time::Instant::now() + duration);
-    let mut preface_buffer = vec![0u8; 4096];
-    while inbuf.len() < crate::conn::PREFACE.len() {
-        let (res, b) = match preface_deadline {
-            Some(deadline) => monoio::select! {
+    if inbuf.len() < crate::conn::PREFACE.len() {
+        // Scoped so the read buffer is freed once the preface is in, not held by the
+        // connection future for its whole lifetime.
+        let mut preface_buffer = vec![0u8; 4096];
+        while inbuf.len() < crate::conn::PREFACE.len() {
+            // (#1034) No stream exists yet, so the shutdown signal closes at once instead
+            // of letting a silent peer hold the drain to its bound.
+            let (res, b) = monoio::select! {
                 rb = rh.read(preface_buffer) => rb,
-                _ = monoio::time::sleep_until(deadline) => {
+                _ = async { match preface_deadline { Some(deadline) => monoio::time::sleep_until(deadline).await, None => std::future::pending::<()>().await } } => {
                     return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "h2 preface timeout"));
                 }
-            },
-            None => rh.read(preface_buffer).await,
-        };
-        let n = res?;
-        if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
+                _ = shutdown_signal(shutdown.as_ref()) => return Ok(()),
+            };
+            let n = res?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            inbuf.extend_from_slice(&b[..n]);
+            preface_buffer = b;
         }
-        inbuf.extend_from_slice(&b[..n]);
-        preface_buffer = b;
     }
     if &inbuf[..crate::conn::PREFACE.len()] != crate::conn::PREFACE {
         return Err(std::io::Error::new(
@@ -1464,7 +1671,8 @@ where
         discarding_header_block: false,
         discard_header_block: Vec::new(),
         discard_rst_code: error_code::STREAM_CLOSED,
-        reset_ids: FxHashSet::default(),
+        reset_ids: Default::default(),
+        sent_reset_ids: Default::default(),
         max_concurrent: config.max_concurrent_streams as usize,
         conn_recv_window: (config.initial_window_size.max(65535)) as i64,
         our_initial_window: config.initial_window_size as i64,
@@ -1479,6 +1687,7 @@ where
     let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
     let mut inflight: Inflight<F> = Inflight::new();
     let mut outstreams: FxHashMap<u32, OutStream> = FxHashMap::default();
+    let mut drain_idle: FxHashMap<u32, std::time::Instant> = FxHashMap::default();
     let mut send_schedule = VecDeque::new();
     let mut pulls: Pulls = Pulls::new();
     let mut send_conn: i64 = 65535;
@@ -1494,6 +1703,9 @@ where
     // in-flight work clears. The overall drain is bounded by the per-core accept loop,
     // which abandons still-running connection tasks after a grace window.
     let mut draining = false;
+    // The shutdown signal has been observed (whatever GOAWAY state the connection was in);
+    // from here a response idle on its backend is ended (#1034).
+    let mut shutdown_drain = false;
     let mut peer_goaway_deadline: Option<std::time::Instant> = None;
     let cap = config.max_frame_size.min(1 << 24);
     // Deadline state mirroring the tokio `serve` loop: a partially-received frame
@@ -1504,27 +1716,41 @@ where
     // its buffers indefinitely.
     let frame_read_timeout = config.frame_read_timeout;
     let request_body_timeout = config.request_body_timeout;
+    let request_body_ceiling = config.request_body_ceiling;
+    let mut body_progress: FxHashMap<u32, BodyProgress<tokio::time::Instant>> =
+        FxHashMap::default();
     let send_stall_timeout = config.send_stall_timeout;
     let mut partial_frame_deadline: Option<std::time::Instant> = None;
+    let mut header_block_deadline: Option<std::time::Instant> = None;
 
     // The read future stays pinned across select iterations because cancelling a monoio-rustls
     // read can lose its owned buffer. The box is allocated once; after a completed read,
     // `Pin::set` replaces the future in place with the same concrete future type and hands its
     // returned Vec straight into the next read.
     let mut read_fut = Box::pin(monoio_read_once(rh, vec![0u8; H2_READ_CHUNK]));
+    // A completed `read_fut` must never be polled again; only EOF leaves it so.
+    let mut read_eof = false;
 
     loop {
         // 1) Process every complete buffered frame (mirrors serve()).
         let mut completed_frame = false;
         while reading && inbuf.len() - cursor >= FrameHeader::LEN {
             let Some(hdr) = FrameHeader::parse(&inbuf[cursor..]) else {
-                out.frames(|b| frame::write_goaway(b, 0, error_code::PROTOCOL_ERROR));
+                {
+                    // Report the streams already processed (RFC 9113 §6.8, #876).
+                    let last = recv.goaway_last_stream_id();
+                    out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
+                }
                 reading = false;
                 accepting = false;
                 break;
             };
             if hdr.length > cap {
-                out.frames(|b| frame::write_goaway(b, 0, error_code::FRAME_SIZE_ERROR));
+                {
+                    // Report the streams already processed (RFC 9113 §6.8, #876).
+                    let last = recv.goaway_last_stream_id();
+                    out.frames(|b| frame::write_goaway(b, last, error_code::FRAME_SIZE_ERROR));
+                }
                 reading = false;
                 accepting = false;
                 break;
@@ -1536,7 +1762,8 @@ where
             let payload = cursor + FrameHeader::LEN..cursor + total;
             cursor += total;
             completed_frame = true;
-            match process_frame(
+            let block_was_open = recv.open_header_block.is_some();
+            let outcome = process_frame(
                 hdr,
                 &inbuf[payload],
                 &mut streams,
@@ -1551,7 +1778,14 @@ where
                 &mut inflight,
                 &mut cancelled,
                 &mut inflight_sids,
-            ) {
+            );
+            header_block_deadline = next_header_block_deadline(
+                block_was_open,
+                recv.open_header_block.is_some(),
+                header_block_deadline,
+                || frame_read_timeout.map(|d| std::time::Instant::now() + d),
+            );
+            match outcome {
                 FrameOutcome::Continue => {}
                 FrameOutcome::StopReading => {
                     reading = false;
@@ -1561,7 +1795,8 @@ where
                 FrameOutcome::PeerGoaway => {
                     if !draining {
                         draining = true;
-                        peer_goaway_deadline = Some(std::time::Instant::now() + PEER_GOAWAY_DRAIN);
+                        peer_goaway_deadline =
+                            Some(std::time::Instant::now() + config.goaway_drain_timeout);
                     }
                     accepting = false;
                 }
@@ -1578,7 +1813,13 @@ where
                     let was_blocked = send_conn <= 0;
                     send_conn += increment as i64;
                     if send_conn > i32::MAX as i64 {
-                        out.frames(|b| frame::write_goaway(b, 0, error_code::FLOW_CONTROL_ERROR));
+                        {
+                            // Report the streams already processed (RFC 9113 §6.8, #876).
+                            let last = recv.goaway_last_stream_id();
+                            out.frames(|b| {
+                                frame::write_goaway(b, last, error_code::FLOW_CONTROL_ERROR)
+                            });
+                        }
                         reading = false;
                         accepting = false;
                         break;
@@ -1631,6 +1872,16 @@ where
                                 if cancelled.len() < recv.max_concurrent.saturating_mul(2) {
                                     cancelled.insert(stream_id);
                                 }
+                                // (#905) Same rapid-reset charge as the tokio loop.
+                                if recv.charge_inflight_reset() {
+                                    let last = recv.goaway_last_stream_id();
+                                    out.frames(|b| {
+                                        frame::write_goaway(b, last, error_code::ENHANCE_YOUR_CALM)
+                                    });
+                                    reading = false;
+                                    accepting = false;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1642,7 +1893,13 @@ where
                         overflow |= st.window > i32::MAX as i64;
                     }
                     if overflow {
-                        out.frames(|b| frame::write_goaway(b, 0, error_code::FLOW_CONTROL_ERROR));
+                        {
+                            // Report the streams already processed (RFC 9113 §6.8, #876).
+                            let last = recv.goaway_last_stream_id();
+                            out.frames(|b| {
+                                frame::write_goaway(b, last, error_code::FLOW_CONTROL_ERROR)
+                            });
+                        }
                         reading = false;
                         accepting = false;
                         break;
@@ -1667,17 +1924,20 @@ where
         } else if completed_frame || partial_frame_deadline.is_none() {
             partial_frame_deadline = frame_read_timeout.map(|d| std::time::Instant::now() + d);
         }
+        // Checked on every pass, not only by the timer arm, so a peer keeping the
+        // biased read arm ready cannot starve it.
+        if reading && header_block_deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+            let last = recv.goaway_last_stream_id();
+            out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
+            reading = false;
+            accepting = false;
+        }
 
         // Start body deadlines only after the initial header block is fully decoded
-        // (END_STREAM requests dispatch synchronously), then expire any stream whose
-        // body never completed: release its body accounting and RST it.
+        // (END_STREAM requests dispatch synchronously) and extend those that progressed,
+        // then expire any stream whose body stalled: release its body accounting and RST it.
         if let Some(d) = request_body_timeout {
-            let now = tokio::time::Instant::now();
-            for st in streams.values_mut() {
-                if st.headers_done && !st.end_stream && st.body_deadline.is_none() {
-                    st.body_deadline = Some(now + d);
-                }
-            }
+            advance_body_deadlines(&mut streams, &mut body_progress, d, request_body_ceiling);
         }
         let now = std::time::Instant::now();
         let expired: Vec<u32> = streams
@@ -1689,9 +1949,10 @@ where
             })
             .collect();
         for sid in expired {
-            recv.teardown_receiving(&mut streams, sid);
             pending_window.remove(&sid);
-            out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+            if recv.expire_receiving(&mut streams, sid) {
+                out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+            }
         }
 
         // 2) Drain handlers + body pulls ready right now (immediate handlers resolve here).
@@ -1723,6 +1984,9 @@ where
         while let Some((sid, body, res)) =
             futures_util::FutureExt::now_or_never(pulls.next()).flatten()
         {
+            if !drain_idle.is_empty() {
+                drain_idle.remove(&sid);
+            }
             apply_pull(sid, body, res, &mut outstreams, &mut out);
         }
         pump_streams(
@@ -1736,6 +2000,12 @@ where
         // Checked on every pass (not only by the timer arm below) so a peer that keeps
         // the biased, first-polled read arm ready cannot starve the deadline.
         let stall_deadline = reset_stalled_streams(&mut outstreams, &mut out, send_stall_timeout);
+        let drain_idle_deadline = match config.shutdown_idle_stream_timeout {
+            Some(grace) if shutdown_drain => {
+                reset_drain_idle_streams(&mut outstreams, &mut drain_idle, &mut out, grace)
+            }
+            _ => None,
+        };
 
         // 3) Flush queued output.
         paced_flush(&mut wh, &mut out, ktls_fd, &mut pacer).await?;
@@ -1765,7 +2035,7 @@ where
         // On shutdown: GOAWAY + stop accepting new streams, but keep reading so in-flight
         // response bodies still receive flow-control credit and finish (matches `serve`).
         let mut read_done: Option<(std::io::Result<usize>, Vec<u8>, IO::OwnedRead)> = None;
-        let frame_wait = partial_frame_deadline
+        let frame_wait = earliest(partial_frame_deadline, header_block_deadline)
             .map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
         let body_wait = streams
             .values()
@@ -1777,11 +2047,14 @@ where
             stall_deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
         let peer_goaway_wait =
             peer_goaway_deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
+        let drain_idle_wait =
+            drain_idle_deadline.map(|dl| dl.saturating_duration_since(std::time::Instant::now()));
         monoio::select! {
             biased;
             rb = read_fut.as_mut(), if reading => { read_done = Some(rb); }
-            // (c03e287 parity) A partially-received frame that outlives
-            // `frame_read_timeout` is a slowloris: GOAWAY PROTOCOL_ERROR, stop reading.
+            // (c03e287 parity) A partially-received frame or an unfinished header block
+            // (#1012) that outlives `frame_read_timeout` is a slowloris: GOAWAY
+            // PROTOCOL_ERROR, stop reading.
             _ = async { match frame_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && frame_wait.is_some() => {
                 let last = recv.goaway_last_stream_id();
                 out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
@@ -1792,7 +2065,9 @@ where
             // centralized expiry pass at the loop top releases the accounting.
             _ = async { match body_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && body_wait.is_some() => {}
             _ = async { match stall_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if stall_wait.is_some() => {}
+            _ = async { match drain_idle_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if drain_idle_wait.is_some() => {}
             _ = async { match peer_goaway_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && peer_goaway_wait.is_some() => {
+                abandon_drain(&mut recv, &mut streams, &mut outstreams, &mut inflight_sids, &mut cancelled, &mut pending_window, &mut out);
                 reading = false;
                 accepting = false;
             }
@@ -1806,13 +2081,19 @@ where
                 }
             }
             Some((sid, body, res)) = pulls.next(), if !pulls.is_empty() => {
-                apply_pull(sid, body, res, &mut outstreams, &mut out);
+                if !drain_idle.is_empty() {
+                drain_idle.remove(&sid);
             }
-            _ = async { match &shutdown { Some(t) => t.cancelled().await, None => std::future::pending::<()>().await } }, if reading && accepting => {
-                let last = recv.goaway_last_stream_id();
-                out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
-                accepting = false;
-                draining = true;
+            apply_pull(sid, body, res, &mut outstreams, &mut out);
+            }
+            _ = shutdown_signal(shutdown.as_ref()), if !shutdown_drain => {
+                shutdown_drain = true;
+                if reading && accepting {
+                    let last = recv.goaway_last_stream_id();
+                    out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
+                    accepting = false;
+                    draining = true;
+                }
             }
             // Idle bound: no inbound frame within `conn_idle_timeout`. The sleep is
             // recreated each iteration, so it measures time since the last event. First
@@ -1839,6 +2120,7 @@ where
                     }
                     reading = false;
                     accepting = false;
+                    read_eof = true;
                 }
                 Ok(n) => inbuf.extend_from_slice(&b[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -1847,6 +2129,7 @@ where
                     }
                     reading = false;
                     accepting = false;
+                    read_eof = true;
                 }
                 Err(e) => return Err(e),
             }
@@ -1868,6 +2151,22 @@ where
         Err(_) => return Ok(()),
     }
     let _ = AsyncWriteRent::shutdown(&mut wh).await;
+    // Mirrors the tokio `serve` close: unread inbound bytes (WINDOW_UPDATEs for
+    // the last response, a PING after the peer's GOAWAY) make the kernel answer
+    // the close with a RST that discards our unsent tail. Bounded so a peer
+    // holding its write side open cannot pin the task.
+    if !read_eof {
+        let _ = monoio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                let (res, b, reader) = read_fut.as_mut().await;
+                if !matches!(res, Ok(n) if n > 0) {
+                    break;
+                }
+                read_fut.as_mut().set(monoio_read_once(reader, b));
+            }
+        })
+        .await;
+    }
     Ok(())
 }
 
@@ -2038,6 +2337,164 @@ mod tests {
              needed {} more bytes at 30 ms each",
             block_len - 5
         );
+    }
+
+    /// Client half of the header-block deadline tests: HEADERS without END_HEADERS, then
+    /// `continuation_gap`-spaced empty CONTINUATIONs; `None` instead sends the closing
+    /// CONTINUATION in the same write. Returns (time of EOF, GOAWAY code, response seen).
+    #[cfg(feature = "monoio")]
+    fn header_block_client(
+        address: std::net::SocketAddr,
+        continuation_gap: Option<Duration>,
+    ) -> (Option<Duration>, Option<u32>, bool) {
+        use std::io::{Read, Write};
+        use std::time::Instant;
+
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut block = Vec::new();
+        let mut encoder = Encoder::new();
+        for (name, value) in [
+            (":method", "GET"),
+            (":path", "/"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+        ] {
+            encoder.encode_header(&mut block, name, value);
+        }
+        let (first, rest) = block.split_at(block.len() / 2);
+        let mut wire = crate::conn::PREFACE.to_vec();
+        frame::write_settings(&mut wire, &[]);
+        frame::write_frame(
+            &mut wire,
+            frame::kind::HEADERS,
+            frame::flags::END_STREAM,
+            1,
+            first,
+        );
+        if continuation_gap.is_none() {
+            frame::write_frame(
+                &mut wire,
+                frame::kind::CONTINUATION,
+                frame::flags::END_HEADERS,
+                1,
+                rest,
+            );
+        }
+        stream.write_all(&wire).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(5)))
+            .unwrap();
+
+        let started = Instant::now();
+        let mut last_continuation = Instant::now();
+        let (mut seen, mut at) = (Vec::new(), 0usize);
+        let (mut eof_at, mut goaway, mut responded) = (None, None, false);
+        let mut buf = [0u8; 4096];
+        while started.elapsed() < Duration::from_secs(3) {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    eof_at = Some(started.elapsed());
+                    break;
+                }
+                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(_) => break,
+            }
+            while let Some(header) = seen.get(at..at + 9) {
+                let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+                let Some(payload) = seen.get(at + 9..at + 9 + len) else {
+                    break;
+                };
+                let sid = u32::from_be_bytes(header[5..9].try_into().unwrap());
+                match header[3] {
+                    frame::kind::HEADERS if sid == 1 => responded = true,
+                    frame::kind::GOAWAY => {
+                        goaway = Some(u32::from_be_bytes(payload[4..8].try_into().unwrap()));
+                    }
+                    _ => {}
+                }
+                at += 9 + len;
+            }
+            if responded && continuation_gap.is_none() {
+                break;
+            }
+            if let Some(gap) = continuation_gap
+                && last_continuation.elapsed() >= gap
+            {
+                let mut empty = Vec::new();
+                frame::write_frame(&mut empty, frame::kind::CONTINUATION, 0, 1, &[]);
+                if stream.write_all(&empty).is_err() {
+                    break;
+                }
+                last_continuation = Instant::now();
+            }
+        }
+        (eof_at, goaway, responded)
+    }
+
+    #[cfg(feature = "monoio")]
+    fn header_block_server(std_listener: std::net::TcpListener) -> std::io::Result<()> {
+        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let config = Config {
+                conn_idle_timeout: None,
+                frame_read_timeout: Some(Duration::from_millis(150)),
+                ..Config::default()
+            };
+            serve_local_with_prefix(
+                stream,
+                Vec::new(),
+                |_| std::future::ready(hj_core::text_response(http::StatusCode::OK, "ok")),
+                config,
+                None,
+                None,
+            )
+            .await
+        })
+    }
+
+    /// Regression (#1012): a header block kept open by periodic empty CONTINUATION frames
+    /// gets one absolute `frame_read_timeout` deadline. Every frame is complete (so the
+    /// partial-frame deadline never runs) and the idle timeout is disabled, so only the
+    /// header-block deadline can close the connection.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_unfinished_header_block_deadline_closes_continuation_trickle() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || header_block_server(std_listener));
+        let (eof_at, goaway, responded) =
+            header_block_client(address, Some(Duration::from_millis(30)));
+        assert!(server.join().unwrap().is_ok());
+        assert!(!responded, "the unfinished block must never be dispatched");
+        assert_eq!(goaway, Some(error_code::PROTOCOL_ERROR));
+        let eof = eof_at.expect("server must close while CONTINUATIONs keep arriving");
+        assert!(
+            eof < Duration::from_millis(1500),
+            "CONTINUATION frames must not extend the header-block deadline (closed after {eof:?})"
+        );
+    }
+
+    /// Control for #1012: HEADERS + CONTINUATION arriving in one burst is served.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_header_block_completed_in_one_burst_is_served() {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || header_block_server(std_listener));
+        let (_, goaway, responded) = header_block_client(address, None);
+        assert!(responded, "a completed header block must be served");
+        assert_eq!(goaway, None);
+        assert!(server.join().unwrap().is_ok());
     }
 
     /// Regression (c03e287 parity): the production monoio loop must enforce
@@ -2384,6 +2841,201 @@ mod tests {
         );
     }
 
+    /// (#1035) How stream 1 of a paced upload ended, and when (from its HEADERS).
+    #[cfg(feature = "monoio")]
+    #[derive(Debug)]
+    enum PacedEnd {
+        /// The response completed with this body.
+        Answered(Vec<u8>, Duration),
+        /// RST_STREAM with this code.
+        Reset(u32, Duration),
+        /// The connection closed with neither.
+        Closed,
+    }
+
+    /// (#1035) POSTs `chunks` DATA frames of `chunk` bytes on stream 1, one every `gap`,
+    /// to a monoio connection whose request-body timeout is 1 s and ceiling `ceiling`.
+    /// The handler answers with the body length it received.
+    #[cfg(feature = "monoio")]
+    fn paced_h2_upload(ceiling: Duration, chunk: usize, chunks: usize, gap: Duration) -> PacedEnd {
+        use std::io::{Read, Write};
+        use std::time::Instant;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .enable_timer()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                let config = Config {
+                    conn_idle_timeout: None,
+                    request_body_timeout: Some(Duration::from_secs(1)),
+                    request_body_ceiling: ceiling,
+                    ..Config::default()
+                };
+                let _ = serve_local_with_prefix(
+                    stream,
+                    Vec::new(),
+                    |req: Request| async move {
+                        let body = http_body_util::BodyExt::collect(req.into_body())
+                            .await
+                            .unwrap()
+                            .to_bytes();
+                        hj_core::text_response(http::StatusCode::OK, body.len().to_string())
+                    },
+                    config,
+                    None,
+                    None,
+                )
+                .await;
+            });
+        });
+
+        let mut stream = std::net::TcpStream::connect(address).unwrap();
+        let mut wire = crate::conn::PREFACE.to_vec();
+        frame::write_settings(&mut wire, &[]);
+        let mut block = Vec::new();
+        let mut encoder = Encoder::new();
+        let length = (chunk * chunks).to_string();
+        for (name, value) in [
+            (":method", "POST"),
+            (":path", "/upload"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+            ("content-length", length.as_str()),
+        ] {
+            encoder.encode_header(&mut block, name, value);
+        }
+        frame::write_frame(
+            &mut wire,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS,
+            1,
+            &block,
+        );
+        stream.write_all(&wire).unwrap();
+        let started = Instant::now();
+        let mut writer = stream.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for index in 0..chunks {
+                let mut data = Vec::new();
+                let flags = if index + 1 == chunks {
+                    frame::flags::END_STREAM
+                } else {
+                    0
+                };
+                frame::write_frame(&mut data, frame::kind::DATA, flags, 1, &vec![b'x'; chunk]);
+                if writer.write_all(&data).is_err() {
+                    return;
+                }
+                if index + 1 < chunks {
+                    std::thread::sleep(gap);
+                }
+            }
+        });
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut body = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        let end = 'read: loop {
+            while seen.len() >= FrameHeader::LEN {
+                let hdr = FrameHeader::parse(&seen).unwrap();
+                let total = FrameHeader::LEN + hdr.length as usize;
+                if seen.len() < total {
+                    break;
+                }
+                let payload = seen[FrameHeader::LEN..total].to_vec();
+                seen.drain(..total);
+                if hdr.stream_id != 1 {
+                    continue;
+                }
+                match hdr.kind {
+                    frame::kind::RST_STREAM => {
+                        let code = u32::from_be_bytes(payload[..4].try_into().unwrap());
+                        break 'read PacedEnd::Reset(code, started.elapsed());
+                    }
+                    frame::kind::DATA => {
+                        body.extend_from_slice(&payload);
+                        if hdr.flags & frame::flags::END_STREAM != 0 {
+                            break 'read PacedEnd::Answered(body, started.elapsed());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match stream.read(&mut buf) {
+                Ok(n) if n > 0 => seen.extend_from_slice(&buf[..n]),
+                _ => break PacedEnd::Closed,
+            }
+        };
+        // Ends the writer and the server's connection.
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        end
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_steady_upload_outlasting_the_body_timeout_is_answered() {
+        // 16 KiB every 400 ms for 2.4 s: past twice the 1 s body timeout.
+        match paced_h2_upload(
+            hj_core::body_deadline::BODY_DEADLINE_CEILING,
+            16 * 1024,
+            7,
+            Duration::from_millis(400),
+        ) {
+            PacedEnd::Answered(body, took) => {
+                assert_eq!(body, b"114688");
+                assert!(took > Duration::from_secs(2), "{took:?}");
+            }
+            other => panic!("a steady upload must not be reset: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_trickled_upload_is_reset_at_the_body_timeout() {
+        match paced_h2_upload(
+            hj_core::body_deadline::BODY_DEADLINE_CEILING,
+            1,
+            100,
+            Duration::from_millis(100),
+        ) {
+            PacedEnd::Reset(code, took) => {
+                assert_eq!(code, frame::error_code::CANCEL);
+                assert!(
+                    took >= Duration::from_millis(950) && took < Duration::from_millis(1700),
+                    "{took:?}"
+                );
+            }
+            other => panic!("a trickle below the floor must be reset: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_steady_upload_is_reset_at_the_body_ceiling() {
+        let ceiling = Duration::from_millis(1500);
+        match paced_h2_upload(ceiling, 16 * 1024, 10, Duration::from_millis(300)) {
+            PacedEnd::Reset(code, took) => {
+                assert_eq!(code, frame::error_code::CANCEL);
+                assert!(
+                    took >= ceiling - Duration::from_millis(50)
+                        && took < ceiling + Duration::from_millis(700),
+                    "{took:?}"
+                );
+            }
+            other => panic!("progress must not outlast the ceiling: {other:?}"),
+        }
+    }
+
     /// Regression for the monoio-loop in-flight abandonment bug: once reads stop, the loop
     /// must keep running while `inflight` or `pulls` is non-empty so a slow handler's
     /// response is still delivered to a client that half-closed / GOAWAYed mid-request.
@@ -2701,7 +3353,8 @@ mod tests {
             discarding_header_block: false,
             discard_header_block: Vec::new(),
             discard_rst_code: error_code::STREAM_CLOSED,
-            reset_ids: FxHashSet::default(),
+            reset_ids: Default::default(),
+            sent_reset_ids: Default::default(),
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
@@ -3046,7 +3699,8 @@ mod tests {
             discarding_header_block: false,
             discard_header_block: Vec::new(),
             discard_rst_code: error_code::STREAM_CLOSED,
-            reset_ids: FxHashSet::default(),
+            reset_ids: Default::default(),
+            sent_reset_ids: Default::default(),
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
@@ -3131,7 +3785,8 @@ mod tests {
             discarding_header_block: false,
             discard_header_block: Vec::new(),
             discard_rst_code: error_code::STREAM_CLOSED,
-            reset_ids: FxHashSet::default(),
+            reset_ids: Default::default(),
+            sent_reset_ids: Default::default(),
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
@@ -3195,8 +3850,128 @@ mod tests {
             &mut cancelled,
             &mut inflight_sids,
         );
-        assert!(matches!(outcome, FrameOutcome::ResetStream(1)));
+        // §5.1: ignored, not re-reset (#877).
+        assert!(matches!(outcome, FrameOutcome::Continue));
         assert_eq!(inflight.len(), 0, "reset request must never dispatch");
+    }
+
+    #[test]
+    fn recent_ids_keep_the_newest_entries() {
+        let mut ids = super::state::RecentIds::default();
+        for sid in [1, 3, 5, 3] {
+            ids.insert(sid, 3);
+        }
+        assert!(ids.contains(1) && ids.contains(3) && ids.contains(5));
+        ids.insert(7, 3);
+        assert!(!ids.contains(1), "the oldest id is evicted at the cap");
+        assert!(ids.contains(3) && ids.contains(5) && ids.contains(7));
+        let mut none = super::state::RecentIds::default();
+        none.insert(1, 0);
+        assert!(!none.contains(1));
+    }
+
+    /// Regression (#976): on a long-lived connection, resets past the cap used to go
+    /// unrecorded, so late frames racing our newest RST_STREAMs were misjudged — DATA
+    /// drew an RST instead of being ignored (#877) and trailers escalated to GOAWAY.
+    /// The most recent resets are remembered; only evicted old ids fail closed.
+    #[test]
+    fn late_frames_after_many_resets_still_track_the_newest_resets() {
+        use super::recv::process_frame;
+        use crate::frame::{flags, kind};
+
+        const RESETS: u32 = 600;
+        let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
+        let mut dec = Decoder::new(4096, 8192);
+        let mut enc = Encoder::new();
+        let mut out = OutQueue::default();
+        let mut peer = PeerSettings::default();
+        let mut recv = Recv {
+            seen_settings: true,
+            last_client_stream: 2 * RESETS - 1,
+            goaway_last: None,
+            open_header_block: None,
+            discarding_header_block: false,
+            discard_header_block: Vec::new(),
+            discard_rst_code: error_code::STREAM_CLOSED,
+            reset_ids: Default::default(),
+            sent_reset_ids: Default::default(),
+            max_concurrent: 256,
+            conn_recv_window: 65535,
+            our_initial_window: 65535,
+            rst_unanswered: 0,
+            total_buffered: 0,
+            max_request_body: 1 << 20,
+            per_conn_request_body: 4 << 20,
+            body_budget: None,
+            no_progress_frames: 0,
+        };
+        for sid in (1..2 * RESETS).step_by(2) {
+            recv.teardown_receiving(&mut streams, sid);
+        }
+        let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
+        let mut cancelled: FxHashSet<u32> = FxHashSet::default();
+        let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
+        let service = |_req: Request| std::future::ready(Response::new(hj_core::Body::Empty));
+        let mut trailers = Vec::new();
+        Encoder::new().encode_header(&mut trailers, "x-trailer", "1");
+        let newest = 2 * RESETS - 1;
+        let late = [
+            (kind::DATA, flags::END_STREAM, newest, &b"abc"[..]),
+            (
+                kind::HEADERS,
+                flags::END_HEADERS | flags::END_STREAM,
+                newest - 2,
+                &trailers[..],
+            ),
+            (kind::DATA, flags::END_STREAM, 1, &b"abc"[..]),
+            (
+                kind::HEADERS,
+                flags::END_HEADERS | flags::END_STREAM,
+                3,
+                &trailers[..],
+            ),
+        ];
+        let mut outcomes = Vec::new();
+        for (kind, flags, stream_id, payload) in late {
+            outcomes.push(process_frame(
+                FrameHeader {
+                    length: payload.len() as u32,
+                    kind,
+                    flags,
+                    stream_id,
+                },
+                payload,
+                &mut streams,
+                &mut dec,
+                &mut enc,
+                &mut out,
+                &mut peer,
+                &mut recv,
+                0,
+                true,
+                &service,
+                &mut inflight,
+                &mut cancelled,
+                &mut inflight_sids,
+            ));
+        }
+        assert!(
+            matches!(outcomes[0], FrameOutcome::Continue),
+            "late DATA on our newest reset is ignored (#877)"
+        );
+        assert!(
+            matches!(outcomes[1], FrameOutcome::ResetStream(sid) if sid == newest - 2),
+            "racing trailers on a recent reset stay stream-scoped"
+        );
+        assert!(
+            matches!(outcomes[2], FrameOutcome::ResetStream(1)),
+            "an evicted id gets the RST answer"
+        );
+        assert!(
+            matches!(outcomes[3], FrameOutcome::StopReading),
+            "HEADERS on an evicted id fails closed to GOAWAY"
+        );
+        assert_eq!(inflight.len(), 0);
     }
 
     #[test]
@@ -3233,7 +4008,8 @@ mod tests {
             discarding_header_block: false,
             discard_header_block: Vec::new(),
             discard_rst_code: error_code::STREAM_CLOSED,
-            reset_ids: FxHashSet::default(),
+            reset_ids: Default::default(),
+            sent_reset_ids: Default::default(),
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
@@ -3488,6 +4264,71 @@ mod tests {
         assert_eq!(budget.in_flight(), 0);
     }
 
+    /// Bytes the transport consumed before routing here become the inbound buffer: a
+    /// partial preface is completed from the socket, and bytes past the preface are
+    /// framed exactly as if they had arrived on the connection.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_prefix_seeds_the_preface_whole_or_split() {
+        use std::io::Write;
+
+        let mut wire = crate::conn::PREFACE.to_vec();
+        frame::write_settings(&mut wire, &[]);
+        get_headers(&mut Encoder::new(), 1, "/body", &mut wire);
+        let preface = crate::conn::PREFACE.len();
+        for split in [0, 10, preface, preface + 9, wire.len()] {
+            let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = std_listener.local_addr().unwrap();
+            std_listener.set_nonblocking(true).unwrap();
+            let (prefix, rest) = wire.split_at(split);
+            let (prefix, rest) = (prefix.to_vec(), rest.to_vec());
+            let client = std::thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect(address).unwrap();
+                stream.write_all(&rest).unwrap();
+                let mut seen = Vec::new();
+                read_frames_until(&mut stream, &mut seen, Duration::from_secs(3), |f| {
+                    f.iter().any(|&(kind, flags, sid, _)| {
+                        kind == frame::kind::DATA
+                            && sid == 1
+                            && flags & frame::flags::END_STREAM != 0
+                    })
+                })
+            });
+            let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .enable_timer()
+                .build()
+                .unwrap();
+            let _ = runtime.block_on(async move {
+                let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_local_with_prefix(
+                    stream,
+                    prefix,
+                    |_| {
+                        std::future::ready(hj_core::text_response(
+                            http::StatusCode::OK,
+                            "0123456789",
+                        ))
+                    },
+                    Config {
+                        conn_idle_timeout: Some(Duration::from_millis(500)),
+                        ..Config::default()
+                    },
+                    None,
+                    None,
+                )
+                .await
+            });
+            let frames = client.join().unwrap();
+            let body: Vec<u8> = frames
+                .iter()
+                .filter(|&&(kind, _, sid, _)| kind == frame::kind::DATA && sid == 1)
+                .flat_map(|(.., payload)| payload.iter().copied())
+                .collect();
+            assert_eq!(body, b"0123456789", "split at {split}");
+        }
+    }
+
     /// Raw frames the server wrote, as `(kind, flags, stream_id, payload)`.
     #[cfg(feature = "monoio")]
     fn read_frames_until(
@@ -3576,6 +4417,267 @@ mod tests {
             )
             .await
         });
+    }
+
+    fn trailer_block_split_wire() -> (Vec<u8>, Vec<u8>) {
+        let mut block = Vec::new();
+        Encoder::new().encode_header(&mut block, "x-trailer", "split-across-continuation");
+        let (first, rest) = block.split_at(block.len() / 2);
+        let mut headers = Vec::new();
+        frame::write_frame(
+            &mut headers,
+            frame::kind::HEADERS,
+            frame::flags::END_STREAM,
+            1,
+            first,
+        );
+        let mut continuation = Vec::new();
+        frame::write_frame(
+            &mut continuation,
+            frame::kind::CONTINUATION,
+            frame::flags::END_HEADERS,
+            1,
+            rest,
+        );
+        (headers, continuation)
+    }
+
+    fn parse_frames(wire: &[u8]) -> Vec<(u8, u8, u32, Vec<u8>)> {
+        let mut frames = Vec::new();
+        let mut rest = wire;
+        while let Some(head) = rest.get(..9) {
+            let len =
+                (usize::from(head[0]) << 16) | (usize::from(head[1]) << 8) | usize::from(head[2]);
+            let Some(payload) = rest.get(9..9 + len) else {
+                break;
+            };
+            let sid = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+            frames.push((head[3], head[4], sid, payload.to_vec()));
+            rest = &rest[9 + len..];
+        }
+        frames
+    }
+
+    fn assert_trailer_continuation_survived(frames: &[(u8, u8, u32, Vec<u8>)]) {
+        assert!(
+            !frames.iter().any(|&(kind, ..)| kind == frame::kind::GOAWAY),
+            "a CONTINUATION completing trailers on an expired stream must not tear down the connection"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|(kind, _, sid, payload)| *kind == frame::kind::RST_STREAM
+                    && *sid == 1
+                    && payload.as_slice() == frame::error_code::CANCEL.to_be_bytes()),
+            "the expired stream is still reset with CANCEL"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|&(kind, _, sid, _)| kind == frame::kind::HEADERS && sid == 3),
+            "the next request on the same connection must still be answered"
+        );
+    }
+
+    /// Regression: the body deadline expiring while a trailer block is open left
+    /// the block open on a removed stream, so its CONTINUATION was a connection error.
+    #[tokio::test]
+    async fn trailer_continuation_after_body_deadline_keeps_the_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let config = Config {
+            request_body_timeout: Some(Duration::from_millis(300)),
+            ..Config::default()
+        };
+        let task = tokio::spawn(async move {
+            serve(
+                server,
+                |_req| async { hj_core::text_response(http::StatusCode::OK, "") },
+                config,
+                None,
+            )
+            .await
+        });
+        let (trailer_headers, continuation) = trailer_block_split_wire();
+        client
+            .write_all(&body_budget_request_wire(false))
+            .await
+            .unwrap();
+        // The deadline arms once the headers are processed, before the trailers.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.write_all(&trailer_headers).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        let mut wire = continuation;
+        let mut block = Vec::new();
+        let mut encoder = Encoder::new();
+        for (name, value) in [
+            (":method", "GET"),
+            (":path", "/"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+        ] {
+            encoder.encode_header(&mut block, name, value);
+        }
+        frame::write_frame(
+            &mut wire,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS | frame::flags::END_STREAM,
+            3,
+            &block,
+        );
+        client.write_all(&wire).await.unwrap();
+
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 16384];
+        let frames = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let frames = parse_frames(&seen);
+                if frames.iter().any(|&(kind, _, sid, _)| {
+                    kind == frame::kind::GOAWAY || (kind == frame::kind::HEADERS && sid == 3)
+                }) {
+                    return frames;
+                }
+                let n = client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return frames;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("server must answer stream 3 or close");
+        assert_trailer_continuation_survived(&frames);
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    }
+
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_trailer_continuation_after_body_deadline_keeps_the_connection() {
+        use std::io::Write;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let (trailer_headers, continuation) = trailer_block_split_wire();
+            stream.write_all(&body_budget_request_wire(false)).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            stream.write_all(&trailer_headers).unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            let mut wire = continuation;
+            get_headers(&mut Encoder::new(), 3, "/", &mut wire);
+            stream.write_all(&wire).unwrap();
+            let mut seen = Vec::new();
+            read_frames_until(&mut stream, &mut seen, Duration::from_secs(3), |f| {
+                f.iter().any(|&(kind, _, sid, _)| {
+                    kind == frame::kind::GOAWAY || (kind == frame::kind::HEADERS && sid == 3)
+                })
+            })
+        });
+
+        serve_one_monoio_connection(
+            std_listener,
+            Config {
+                conn_idle_timeout: Some(Duration::from_secs(2)),
+                request_body_timeout: Some(Duration::from_millis(300)),
+                ..Config::default()
+            },
+        );
+        assert_trailer_continuation_survived(&client.join().unwrap());
+    }
+
+    /// Regression: the monoio loop closed with the peer's in-flight WINDOW_UPDATEs
+    /// unread, so the kernel answered the close with a RST that discarded the
+    /// unsent tail of the final response.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_close_drains_unread_input_before_dropping_socket() {
+        use std::io::{Read, Write};
+
+        const BODY: usize = 16 * 1024 * 1024;
+        const WINDOW: u32 = 8 * 1024 * 1024;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let socket = rustix::net::socket(
+                rustix::net::AddressFamily::INET,
+                rustix::net::SocketType::STREAM,
+                None,
+            )
+            .unwrap();
+            rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 64 * 1024).unwrap();
+            rustix::net::connect(&socket, &address).unwrap();
+            let mut stream = std::net::TcpStream::from(socket);
+            let mut wire = crate::conn::PREFACE.to_vec();
+            frame::write_settings(&mut wire, &[(frame::settings::INITIAL_WINDOW_SIZE, WINDOW)]);
+            frame::write_window_update(&mut wire, 0, WINDOW - 65_535);
+            get_headers(&mut Encoder::new(), 1, "/big", &mut wire);
+            frame::write_goaway(&mut wire, 0, frame::error_code::NO_ERROR);
+            stream.write_all(&wire).unwrap();
+
+            let mut seen = Vec::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let (mut cursor, mut unacked, mut data, mut end_stream) =
+                (0usize, 0usize, 0usize, false);
+            let outcome = loop {
+                std::thread::sleep(Duration::from_micros(300));
+                match stream.read(&mut buf) {
+                    Ok(0) => break "eof".to_string(),
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                    Err(e) => break e.to_string(),
+                }
+                for (kind, flags, _, payload) in parse_frames(&seen[cursor..]) {
+                    cursor += 9 + payload.len();
+                    if kind == frame::kind::DATA {
+                        data += payload.len();
+                        unacked += payload.len();
+                        end_stream |= flags & frame::flags::END_STREAM != 0;
+                    }
+                }
+                if unacked >= 1 << 20 && !end_stream {
+                    let mut wire = Vec::new();
+                    frame::write_window_update(&mut wire, 0, unacked as u32);
+                    frame::write_window_update(&mut wire, 1, unacked as u32);
+                    unacked = 0;
+                    let _ = stream.write_all(&wire);
+                }
+            };
+            (data, end_stream, outcome)
+        });
+
+        let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        let _ = runtime.block_on(async move {
+            let (stream, _) = std_listener.accept().unwrap();
+            rustix::net::sockopt::set_socket_send_buffer_size(&stream, 256 * 1024).unwrap();
+            stream.set_nonblocking(true).unwrap();
+            let stream = monoio::net::TcpStream::from_std(stream).unwrap();
+            let body = Bytes::from(vec![b'a'; BODY]);
+            serve_local(
+                stream,
+                move |_req: Request| {
+                    std::future::ready(Response::new(hj_core::Body::Full(body.clone())))
+                },
+                Config::default(),
+            )
+            .await
+        });
+        // Keep the ring alive so the deferred close is actually submitted.
+        runtime.block_on(async { monoio::time::sleep(Duration::from_millis(300)).await });
+        let (data, end_stream, outcome) = client.join().unwrap();
+        assert_eq!(
+            (data, end_stream, outcome.as_str()),
+            (BODY, true, "eof"),
+            "the final response must arrive whole and end in an orderly close"
+        );
     }
 
     /// Regression: a stream the body deadline reset must be recorded like every other

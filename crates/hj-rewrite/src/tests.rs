@@ -999,16 +999,25 @@ mod semantics {
         }
     }
 
-    /// An already-`%XX`-escaped sequence carried into the substitution via a
-    /// backref is NOT double-encoded (the `%` of `%20` is preserved, not turned
-    /// into `%2520`). We feed `%20` through `$1` since a literal `%2` in the
-    /// substitution source is otherwise consumed as a `%N` cond backref.
+    /// An `%XX` escape written in the substitution itself is NOT double-encoded.
     #[test]
     fn no_double_encoding_of_existing_escape() {
+        let rs = RuleSet::parse("RewriteEngine On\nRewriteRule ^s$ /x/caf%C3%A9 [L]").unwrap();
+        match evaluate(&rs, &input("/s")) {
+            RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/x/caf%C3%A9"),
+            other => panic!("expected single-encoded rewrite, got {other:?}"),
+        }
+    }
+
+    /// The match subject is the DECODED path, so a `%20` in it came from a `%2520`
+    /// request: the backref carries a literal `%` (OLS `appendSubst`), escaped so the
+    /// pipeline's single decode yields `a%20b` again, not `a b`.
+    #[test]
+    fn percent_in_a_backref_is_literal() {
         let rs = RuleSet::parse("RewriteEngine On\nRewriteRule ^(a%20b)$ /x/$1 [L]").unwrap();
         match evaluate(&rs, &input("/a%20b")) {
-            RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/x/a%20b"),
-            other => panic!("expected single-encoded rewrite, got {other:?}"),
+            RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/x/a%2520b"),
+            other => panic!("expected a literal-percent rewrite, got {other:?}"),
         }
     }
 
@@ -1030,24 +1039,23 @@ mod semantics {
         }
     }
 
-    // --- 3. [END] stops the restart loop AND signals cross-ruleset stop --
+    // --- 3. A rewrite is final; [END] also signals the cross-ruleset stop --
 
-    /// `[END]` on a rewriting rule stops the outer restart-on-URI-change loop:
-    /// a *following* rule that would otherwise re-fire against the rewritten
-    /// URI must NOT run. With plain `[L]` the engine restarts and the second
-    /// rule fires; `[END]` prevents that.
+    /// A rewrite is final for its ruleset (OLS keeps the context, #880): with
+    /// `[L]` or `[END]` the following rule never sees the rewritten URI. `[END]`
+    /// also signals the cross-ruleset stop.
     #[test]
-    fn end_stops_restart_loop() {
-        // [L] variant: /a -> /b (pass ends), restart, ^b$ matches -> /c.
+    fn rewrite_is_final_and_end_signals_stop() {
+        // [L] variant: /a -> /b, and the pass is over.
         let with_l =
             RuleSet::parse("RewriteEngine On\nRewriteRule ^a$ /b [L]\nRewriteRule ^b$ /c [L]")
                 .unwrap();
         match evaluate(&with_l, &input("/a")) {
             RewriteOutcome::Rewritten { new_uri, end, .. } => {
-                assert_eq!(new_uri, "/c", "[L] should restart and reach /c");
+                assert_eq!(new_uri, "/b", "[L] must not re-run the ruleset");
                 assert!(!end);
             }
-            other => panic!("expected /c, got {other:?}"),
+            other => panic!("expected /b, got {other:?}"),
         }
         // [END] variant: /a -> /b and STOP; the ^b$ rule never runs.
         let with_end =
@@ -1265,16 +1273,82 @@ mod semantics {
         assert!(env.contains(&("SP".into(), "443".into())));
     }
 
-    /// Genuinely-unavailable variables (TIME, LA-U) resolve to empty string.
+    /// Genuinely-unavailable variables (TIME) resolve to empty string.
     #[test]
     fn unavailable_variables_resolve_empty() {
-        let rs = RuleSet::parse(
-            "RewriteEngine On\nRewriteRule .* - [E=T:[%{TIME_YEAR}],E=U:[%{LA-U:REQUEST_FILENAME}]]",
-        )
-        .unwrap();
+        let rs = RuleSet::parse("RewriteEngine On\nRewriteRule .* - [E=T:[%{TIME_YEAR}]]").unwrap();
         let env = evaluate(&rs, &input("/x")).env().to_vec();
         assert!(env.contains(&("T".into(), "[]".into())));
-        assert!(env.contains(&("U".into(), "[]".into())));
+    }
+
+    /// #854: OLS strips the `LA-U:`/`LA-F:` look-ahead prefix (any case) and
+    /// evaluates the inner variable, in [E=], substitutions and cond RHS alike.
+    #[test]
+    fn look_ahead_vars_resolve_the_inner_variable() {
+        let rs = RuleSet::parse(
+            "RewriteEngine On\nRewriteCond %{QUERY_STRING} =%{la-f:QUERY_STRING}\n\
+             RewriteRule .* - [E=U:[%{LA-U:REQUEST_FILENAME}],E=F:[%{LA-F:REQUEST_URI}]]",
+        )
+        .unwrap();
+        let env = evaluate(&rs, &input("/x").query("a=1")).env().to_vec();
+        assert!(
+            env.contains(&("U".into(), "[/web/test/x]".into())),
+            "{env:?}"
+        );
+        assert!(env.contains(&("F".into(), "[/x]".into())), "{env:?}");
+    }
+
+    /// #854: the common front-controller guard must not swallow existing files.
+    #[test]
+    fn look_ahead_filename_guard_keeps_existing_files() {
+        let rs = RuleSet::parse(
+            "RewriteEngine On\nRewriteCond %{LA-U:REQUEST_FILENAME} !-f\n\
+             RewriteRule ^ index.php [L]",
+        )
+        .unwrap();
+        let exists = input("/styles/x.css").file_tests(FileTests {
+            is_file: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            evaluate(&rs, &exists),
+            RewriteOutcome::Unchanged { .. }
+        ));
+        let missing = input("/threads/1").file_tests(FileTests::default());
+        assert!(matches!(
+            evaluate(&rs, &missing),
+            RewriteOutcome::Rewritten { .. }
+        ));
+        // Classified like the inner variable, so the outcome cache still applies.
+        let plain = RuleSet::parse(
+            "RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteRule ^ index.php [L]",
+        )
+        .unwrap();
+        assert!(plain.path_cacheable);
+        assert_eq!(rs.path_cacheable, plain.path_cacheable);
+    }
+
+    /// #855: `-U` is OLS COND_OP_URL_ACC — always matches, never a regex.
+    #[test]
+    fn url_access_test_always_matches() {
+        let rs = RuleSet::parse(
+            "RewriteEngine On\nRewriteCond %{REQUEST_URI} !-U\nRewriteRule ^ /elsewhere [R=302,L]",
+        )
+        .unwrap();
+        for uri in ["/", "/-U", "/x-Uy"] {
+            assert!(
+                matches!(evaluate(&rs, &input(uri)), RewriteOutcome::Unchanged { .. }),
+                "{uri}"
+            );
+        }
+        let rs = RuleSet::parse(
+            "RewriteEngine On\nRewriteCond %{REQUEST_URI} -U\nRewriteRule ^ /hit [L]",
+        )
+        .unwrap();
+        assert!(matches!(
+            evaluate(&rs, &input("/anything")),
+            RewriteOutcome::Rewritten { .. }
+        ));
     }
 }
 
@@ -1613,11 +1687,10 @@ mod ols_parity {
              RewriteRule ^b\\.php$ /c.php [L]",
         )
         .unwrap();
-        // [PT] is last -> stops the pass after rewriting to /b.php; since the
-        // URI changed, the engine restarts and /b.php -> /c.php.
+        // [PT] is last -> stops the pass after rewriting to /b.php, which is final.
         match evaluate(&rs, &input("/a")) {
-            RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/c.php"),
-            other => panic!("expected /c.php, got {other:?}"),
+            RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/b.php"),
+            other => panic!("expected /b.php, got {other:?}"),
         }
     }
 }
@@ -2201,10 +2274,14 @@ mod directives {
         .unwrap();
         assert_eq!(h.set_env_if.len(), 2);
         assert_eq!(h.set_env_if[0].attribute, "Origin");
-        assert_eq!(h.set_env_if[0].var, "ORIGIN_ALLOWED");
-        assert_eq!(h.set_env_if[0].value, "$0");
-        assert_eq!(h.set_env_if[1].var, "AMP_PAGE");
-        assert_eq!(h.set_env_if[1].value, "1");
+        assert_eq!(
+            h.set_env_if[0].assigns,
+            [("ORIGIN_ALLOWED".to_string(), "$0".to_string())]
+        );
+        assert_eq!(
+            h.set_env_if[1].assigns,
+            [("AMP_PAGE".to_string(), "1".to_string())]
+        );
     }
 
     #[test]
@@ -2460,6 +2537,27 @@ mod live {
         }
         // Security: dotfiles are forbidden via the FilesMatch / rewrite rules.
         assert!(h.is_forbidden("/.env", ".env"));
+    }
+
+    /// The forum's asset alias serves the same file for an ordinary asset path,
+    /// and a decoded `%2e%2e` in its capture stays literal (#1033).
+    #[test]
+    #[ignore = "reads production /web/*/.htaccess; run with --ignored on the live host"]
+    fn public_html_thread_assets_alias_keeps_captures_literal() {
+        let h = parse_live("/web/public_html/.htaccess").expect("file present");
+        let rewritten =
+            |uri: &str| match evaluate(&h.rules, &input(uri).file_tests(FileTests::default())) {
+                RewriteOutcome::Rewritten { new_uri, .. } => new_uri,
+                other => panic!("{uri}: expected a rewrite, got {other:?}"),
+            };
+        assert_eq!(
+            rewritten("/threads/assets/searchresults.png"),
+            "/wf-statement/assets/searchresults.png"
+        );
+        assert_eq!(
+            rewritten("/threads/assets/%2e%2e/%2e%2e/%2emypy_cache/3.14/cache.0.db"),
+            "/wf-statement/assets/%252e%252e/%252e%252e/%252emypy_cache/3.14/cache.0.db"
+        );
     }
 
     #[test]
@@ -3211,5 +3309,186 @@ ErrorDocument 404 /cf-errors/cf-error-4xx.html
         assert!(!m.eligible);
         assert_eq!(m.blockers.len(), 8);
         assert_eq!(m.blockers[0], (1, "set_env_if_remote"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Page-cache keying (#857): RuleSet::page_cache_unkeyed / Htaccess::page_cache_keyed
+// ---------------------------------------------------------------------------
+mod page_cache_keying {
+    use super::*;
+
+    fn unkeyed(src: &str) -> Option<String> {
+        RuleSet::parse(src)
+            .unwrap()
+            .page_cache_unkeyed
+            .map(|v| v.to_string())
+    }
+
+    #[test]
+    fn terminal_uncached_rules_do_not_bypass_the_cache() {
+        // #865: [F]/[G]/[R] end the request before the cache when they fire.
+        for src in [
+            "RewriteCond %{SERVER_PORT} ^80$\nRewriteRule ^(.*)$ https://x/$1 [R=301,L]",
+            "RewriteCond %{REMOTE_ADDR} ^1\\.2\\.3\\.4$\nRewriteRule .* - [F]",
+            "RewriteCond %{THE_REQUEST} \\s/+index\\.php\nRewriteRule ^ / [R=301,L]",
+            "RewriteCond %{TIME_HOUR} ^0\nRewriteRule ^ - [G]",
+        ] {
+            assert_eq!(unkeyed(src), None, "{src}");
+        }
+        // ...unless a miss steers later rules.
+        for src in [
+            "RewriteCond %{REMOTE_ADDR} ^1\\.2\\.3\\.4$\nRewriteRule .* - [F,C]\nRewriteRule ^ /x [L]",
+            "RewriteCond %{REMOTE_ADDR} ^1\nRewriteRule ^ /y [C]\nRewriteCond %{REMOTE_ADDR} ^2\nRewriteRule ^ - [F]",
+            "RewriteCond %{REMOTE_ADDR} ^1\nRewriteRule ^ - [F,S=1]",
+            "RewriteCond %{REMOTE_ADDR} ^1\nRewriteRule ^api/(.*)$ http://b/$1 [P,R=301,L]",
+        ] {
+            assert!(unkeyed(src).is_some(), "{src}");
+        }
+    }
+
+    #[test]
+    fn unkeyed_request_inputs_are_reported() {
+        for (var, src) in [
+            (
+                "REMOTE_ADDR",
+                "RewriteCond %{REMOTE_ADDR} ^203\\.0\\.113\\.7$\nRewriteRule ^$ /admin.html [L]",
+            ),
+            ("REMOTE_PORT", "RewriteRule ^ - [E=P:%{REMOTE_PORT}]"),
+            (
+                "SERVER_ADDR",
+                "RewriteCond %{SERVER_ADDR} ^10\\.\nRewriteRule ^ /x [L]",
+            ),
+            (
+                "SERVER_PORT",
+                "RewriteCond %{SERVER_PORT} ^8080$\nRewriteRule ^ /x [L]",
+            ),
+            (
+                "SERVER_PROTOCOL",
+                "RewriteCond %{SERVER_PROTOCOL} HTTP/2\nRewriteRule ^ /x [L]",
+            ),
+            (
+                "THE_REQUEST",
+                "RewriteCond %{THE_REQUEST} \\s/a\nRewriteRule ^ /x [L]",
+            ),
+            (
+                "TIME_HOUR",
+                "RewriteCond %{TIME_HOUR} ^0\nRewriteRule ^ /night.html [L]",
+            ),
+            (
+                "ENV:ADMIN",
+                "RewriteCond %{ENV:ADMIN} =1\nRewriteRule ^ /x [L]",
+            ),
+            (
+                "REMOTE_HOST",
+                "RewriteCond %{REMOTE_HOST} example\nRewriteRule ^ /x [L]",
+            ),
+            // The comparison RHS is expanded too.
+            (
+                "REMOTE_ADDR",
+                "RewriteCond %{HTTP_HOST} =%{REMOTE_ADDR}\nRewriteRule ^ /x [L]",
+            ),
+            // A lowercase spelling is not a header read in this engine: it is an env read.
+            (
+                "http_cookie",
+                "RewriteCond %{http_cookie} a\nRewriteRule ^ /x [L]",
+            ),
+        ] {
+            assert_eq!(unkeyed(src).as_deref(), Some(var), "{src}");
+            assert!(!RuleSet::parse(src).unwrap().page_cache_keyed(), "{src}");
+        }
+    }
+
+    #[test]
+    fn keyed_inputs_stay_keyed() {
+        for src in [
+            "RewriteCond %{REQUEST_URI} ^/a\nRewriteCond %{QUERY_STRING} b\n\
+             RewriteCond %{HTTP_HOST} c\nRewriteCond %{HTTPS} on\n\
+             RewriteCond %{REQUEST_SCHEME} https\nRewriteCond %{REQUEST_METHOD} GET\n\
+             RewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{SERVER_NAME} x\n\
+             RewriteCond %{DOCUMENT_ROOT} y\nRewriteRule ^ /index.php [L]",
+            "RewriteCond %{HTTP_USER_AGENT} bot [NC]\nRewriteRule ^ - [E=BOT:1]",
+            "RewriteCond %{HTTP_COOKIE} xf_user\nRewriteRule ^ - [E=no-cache:1]",
+            "RewriteCond %{HTTP:Origin} ^https://a$\nRewriteCond %{HTTP:X-Custom} y\n\
+             RewriteCond %{HTTP_REFERER} z\nRewriteCond %{HTTP_ACCEPT} w\n\
+             RewriteRule ^ - [E=O:%{HTTP:Origin}]",
+            "RewriteCond %{ENV:REDIRECT_STATUS} ^(403|5)\nRewriteRule ^ - [L]",
+        ] {
+            let rs = RuleSet::parse(src).unwrap();
+            assert_eq!(rs.page_cache_unkeyed, None, "{src}");
+            assert!(rs.page_cache_keyed());
+        }
+    }
+
+    #[test]
+    fn engine_off_reads_nothing() {
+        let rs =
+            RuleSet::parse("RewriteEngine off\nRewriteCond %{REMOTE_ADDR} ^1\nRewriteRule ^ /x")
+                .unwrap();
+        assert!(rs.page_cache_unkeyed.is_some());
+        assert!(rs.page_cache_keyed());
+    }
+
+    #[test]
+    fn set_env_if_on_address_or_protocol_is_unkeyed() {
+        for attr in [
+            "Remote_Addr",
+            "Remote_Host",
+            "Server_Addr",
+            "Request_Protocol",
+        ] {
+            let h = Htaccess::parse(&format!(
+                "SetEnvIf {attr} ^203\\.0\\.113\\.7$ IS_ADMIN=1\n\
+                 Header set X-Admin yes env=IS_ADMIN"
+            ))
+            .unwrap();
+            assert!(!h.page_cache_keyed(), "{attr}");
+            assert_eq!(
+                h.page_cache_unkeyed_reason().as_deref(),
+                Some("set_env_if_remote at line 1")
+            );
+        }
+        let h = Htaccess::parse(
+            "RewriteEngine on\nRewriteCond %{REMOTE_ADDR} ^1\nRewriteRule ^ /a [L]",
+        )
+        .unwrap();
+        assert!(!h.page_cache_keyed());
+        assert_eq!(
+            h.page_cache_unkeyed_reason().as_deref(),
+            Some("rewrite reads %{REMOTE_ADDR}")
+        );
+    }
+
+    #[test]
+    fn keyed_set_env_if_and_ip_access_rules_stay_keyed() {
+        // Access rules on client address are judged per request before a hit is
+        // served, so they do not withdraw the response from the shared cache
+        // (they still block the per-thread memo).
+        let h = Htaccess::parse(
+            "SetEnvIf Origin ^https://a$ ORIGIN_ALLOWED=$0\n\
+             SetEnvIf Request_URI ^/beta WF_BETA=1\n\
+             SetEnvIf User-Agent bot BOT\n\
+             Order allow,deny\nAllow from 203.0.113.0/24\n\
+             <Files \"x.php\">\nRequire ip 10.0.0.0/8\n</Files>",
+        )
+        .unwrap();
+        assert!(!h.memo.eligible);
+        assert!(h.page_cache_keyed(), "{:?}", h.page_cache_unkeyed_reason());
+        assert_eq!(h.page_cache_unkeyed_reason(), None);
+    }
+
+    /// The deployed forum chain must stay page-cache eligible: a regression here
+    /// bypasses the cache for the whole forum.
+    #[test]
+    fn live_forum_chain_is_page_cache_keyed() {
+        let Ok(src) = std::fs::read_to_string("/web/public_html/.htaccess") else {
+            return;
+        };
+        let h = Htaccess::parse(&src).expect("live .htaccess must parse");
+        assert!(
+            h.page_cache_keyed(),
+            "live forum chain bypasses the page cache: {:?}",
+            h.page_cache_unkeyed_reason()
+        );
     }
 }

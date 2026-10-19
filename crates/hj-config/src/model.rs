@@ -78,6 +78,11 @@ pub struct Tuning {
     pub enable_dyn_zstd: bool,
     pub enable_brotli: bool,
     pub enable_dyn_brotli: bool,
+    /// gzip compression level (`gzipCompressLevel`, 1-9; default 6).
+    pub gzip_level: u32,
+    /// `compressibleTypes` entries in order (`default`, `type/sub`, `type/*`,
+    /// `!type` exclusions); an absent element reads as `default`.
+    pub compressible_types: Vec<String>,
     /// zstd compression level (1-22; default 3).
     pub zstd_level: u32,
     /// httpjet-native per-client-IP request throttle (Tier 1.1): max requests per
@@ -87,7 +92,8 @@ pub struct Tuning {
     pub per_ip_rate_window: Duration,
     /// (Tier 2) Per-connection bandwidth limit (bytes/sec). 0 = unlimited.
     pub bandwidth_limit: u64,
-    /// brotli quality (0-11; default 5).
+    /// brotli quality: `brCompressLevel` (0-11), else a non-zero LiteSpeed
+    /// `enableBrCompress` level (1-6), else 5.
     pub brotli_quality: u32,
 }
 
@@ -112,6 +118,8 @@ impl Default for Tuning {
             enable_dyn_zstd: true,
             enable_brotli: true,
             enable_dyn_brotli: true,
+            gzip_level: 6,
+            compressible_types: vec!["default".to_string()],
             zstd_level: 3,
             brotli_quality: 5,
             per_ip_rate: 0,
@@ -204,7 +212,7 @@ pub struct Security {
     /// (eligible to set proxy headers) — see [`AccessRule::trusted`].
     pub access_control: Vec<AccessRule>,
     /// Server-wide `<security><CGIRLimit>` CPU soft/hard limits, in seconds.
-    /// `None` = neither side configured.
+    /// `None` = neither side configured. Like OLS, lsphp workers do not get it.
     pub cgi_cpu_limit_secs: Option<RlimitPair>,
     /// (Tier 2) GeoIP/ASN ACL source: a CidrList text file mapping country
     /// labels and ASNs to prefixes (httpjet-native; absent = geo ACL inert).
@@ -413,8 +421,9 @@ pub struct PhpConfig {
     /// LiteSpeed `maxProcessTime` — wall-clock cap on a single request before
     /// the worker is killed. `None` = no cap (today's behavior).
     pub max_process_time: Option<Duration>,
-    /// RLIMIT_CPU seconds applied to the worker (LiteSpeed CPU soft/hard).
-    /// `None` = neither side configured (inherit both).
+    /// RLIMIT_CPU seconds applied to the worker. `None` = inherit both, which
+    /// the parser always yields: the server `<CGIRLimit>` (see
+    /// [`Security::cgi_cpu_limit_secs`]) is not a local-worker limit (#1037).
     pub cpu_limit_secs: Option<RlimitPair>,
     /// LiteSpeed `procSoftLimit` — RLIMIT_NPROC soft value. `None` = inherit.
     pub proc_soft_limit: Option<u64>,
@@ -539,6 +548,14 @@ pub struct VHostDecl {
     pub config: Option<Arc<VHostConfig>>,
 }
 
+/// A declared vhost whose per-vhost file did not load. Its `config` stays `None`,
+/// so the router answers 503 for the hosts mapped to it.
+#[derive(Debug)]
+pub struct SkippedVhost {
+    pub name: String,
+    pub error: crate::ConfigError,
+}
+
 /// The per-vhost configuration loaded from `conf/vhosts/<name>.xml`.
 #[derive(Debug, Clone, Default)]
 pub struct VHostConfig {
@@ -549,6 +566,10 @@ pub struct VHostConfig {
     /// effective `allow_symbol_link` by `load_vhost_files`: file override → decl
     /// override → server `followSymbolLink`.
     pub allow_symbol_link_override: Option<bool>,
+    /// The vhost's index `useServer` (OLS: 0 own list, 1 server list, 2 server list
+    /// then the vhost's). Resolved into `index_files` by `load_vhost_files`; `None`
+    /// keeps the vhost's own list (the flat `<indexFiles>` form).
+    pub index_use_server: Option<u8>,
     pub rewrite: InlineRewrite,
     pub contexts: Vec<Context>,
     pub script_handlers: Vec<ScriptHandler>,
@@ -581,11 +602,15 @@ pub struct VHostConfig {
     /// parser fills `.htaccess` when the element is absent/empty. Derived
     /// `Default` is `""` — consult [`VHostConfig::access_file_name_or_default`].
     pub access_file_name: String,
+    /// LSWS "Disable": the declaration's or the vhost file's `<enabled>0</enabled>`,
+    /// or the name listed in the server `<suspendedVhosts>`. Every request to the
+    /// vhost answers 403 (OLS `HttpReq::processNewReqData`).
+    pub disabled: bool,
 }
 
 /// A per-vhost log file declared in `<logging>` (#248), with LiteSpeed rolling
 /// parameters. `$VAR`s are already substituted at parse time.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VhostLogFile {
     pub path: PathBuf,
     /// Roll the live file once it exceeds this many bytes (LSWS `rollingSize`;
@@ -593,7 +618,7 @@ pub struct VhostLogFile {
     pub rolling_bytes: u64,
     /// Prune rolled files older than this many days (LSWS `keepDays`; 0 disables).
     pub keep_days: u64,
-    /// LSWS `logHeaders` bitmask. Nonzero ⇒ request headers accompany each record.
+    /// LSWS `logHeaders` bitmask (1 Referer, 2 User-Agent, 4 Host; default 3).
     pub log_headers: u8,
 }
 
@@ -643,11 +668,17 @@ pub struct Context {
     /// For proxy/lsapi contexts: the ext-processor handler name.
     pub handler: Option<String>,
     pub enabled: bool,
+    /// `<allowBrowse>`: `false` makes every request resolved to this static
+    /// context a 403 (OLS `processURIEx`). Always `true` for proxy contexts.
+    pub allow_browse: bool,
     /// Raw `<extraHeaders>` text (newline-delimited header ops).
     pub extra_headers: Vec<(String, String)>,
-    /// Per-context `addDefaultCharset` (on/off/1/true). Default `false`.
-    pub add_default_charset: bool,
-    /// `addDefaultCharsetCustomized`; `None` = server default (UTF-8).
+    /// Per-context `addDefaultCharset` (on/1/true/yes = `Some(true)`, any other
+    /// value = `Some(false)`). `None` = absent: the context inherits the enclosing
+    /// context's setting, together with its `charset` (OLS `HttpContext::inherit`).
+    pub add_default_charset: Option<bool>,
+    /// `defaultCharsetCustomized` (OLS key; `addDefaultCharsetCustomized` accepted);
+    /// `None` = server default (UTF-8).
     pub charset: Option<String>,
     /// (#249) Context-level `<cachePolicy>` (LSWS six-flag set). A context whose
     /// `enable_cache=0` or `check_public_cache=0` FORBIDS public page-cache
@@ -812,6 +843,9 @@ pub struct VhSsl {
 #[derive(Debug, Clone, Default)]
 pub struct MimeMap {
     pub by_suffix: BTreeMap<String, String>,
+    /// The `default = <type>` entry (OLS `HttpMime::m_pDefault`): the type for a
+    /// file whose suffix is absent or unmapped. `None` ⇒ `application/octet-stream`.
+    pub default_type: Option<String>,
 }
 
 impl MimeMap {
@@ -819,6 +853,13 @@ impl MimeMap {
         self.by_suffix
             .get(&suffix.to_ascii_lowercase())
             .map(|s| s.as_str())
+    }
+
+    /// The fallback type for an absent or unmapped suffix.
+    pub fn default_type(&self) -> &str {
+        self.default_type
+            .as_deref()
+            .unwrap_or("application/octet-stream")
     }
 }
 

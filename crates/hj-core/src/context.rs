@@ -17,6 +17,14 @@ pub enum Proto {
     Http3,
 }
 
+/// Response extension the reverse proxy sets on a forwarded upstream response whose
+/// body the upstream framed without a `Content-Length` (an open-ended feed: audio,
+/// ndjson, long-poll) or sent with `X-Accel-Buffering: no`; the LSAPI handler sets it
+/// on a streamed script response sent with `X-Accel-Buffering: no`. The transport
+/// bridge streams such a body as it arrives instead of buffering it like a local render.
+#[derive(Debug, Clone, Copy)]
+pub struct ProxiedBody;
+
 /// Request extension the H1 transport sets on an HTTP/1.0 request, so the pipeline
 /// can report [`Proto::Http10`] while the request itself stays normalized to 1.1.
 #[derive(Debug, Clone, Copy)]
@@ -172,6 +180,11 @@ impl ReqCtx {
         } else {
             self.env.push((key, val.into()));
         }
+    }
+
+    /// Remove `key` from the request env (no-op when absent).
+    pub fn unset_env(&mut self, key: &str) {
+        self.env.retain(|(k, _)| k != key);
     }
 
     pub fn get_env(&self, key: &str) -> Option<&str> {

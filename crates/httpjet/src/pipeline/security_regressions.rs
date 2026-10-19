@@ -143,6 +143,7 @@ async fn rewritten_target_is_canonicalized_before_destination_chain_and_access_c
     std::fs::create_dir_all(root.join("secret")).unwrap();
     std::fs::write(root.join("files/ok.txt"), "ok\n").unwrap();
     std::fs::write(root.join("files/100%.txt"), "percent\n").unwrap();
+    std::fs::write(root.join("files/100%25.txt"), "literal\n").unwrap();
     std::fs::write(root.join("secret/flag.txt"), "flag\n").unwrap();
     std::fs::write(root.join("secret/.htaccess"), "Require all denied\n").unwrap();
     std::fs::create_dir_all(root.join("scoped")).unwrap();
@@ -154,7 +155,8 @@ async fn rewritten_target_is_canonicalized_before_destination_chain_and_access_c
     .unwrap();
     std::fs::write(
         root.join(".htaccess"),
-        "RewriteEngine On\nRewriteRule ^pub/(.*)$ /files/$1 [L]\n",
+        "RewriteEngine On\nRewriteRule ^pub/(.*)$ /files/$1 [L]\n\
+         RewriteCond %{QUERY_STRING} ^to=(.+)$\nRewriteRule ^jump$ /files/%1 [L]\n",
     )
     .unwrap();
     let state = build_state_htaccess(root.clone());
@@ -170,7 +172,8 @@ async fn rewritten_target_is_canonicalized_before_destination_chain_and_access_c
         "control: the secret dir denies directly"
     );
 
-    let traversal = get(CANON_HOST, "/pub/%252e%252e/secret/flag.txt", None);
+    // A capture carrying literal dot segments resolves into another directory.
+    let traversal = get(CANON_HOST, "/jump?to=../secret/flag.txt", None);
     assert!(
         fast_serve_req(&state, &traversal).await.is_none(),
         "the on-core path must bridge a rewrite into another directory"
@@ -182,11 +185,7 @@ async fn rewritten_target_is_canonicalized_before_destination_chain_and_access_c
         "the destination directory's access file must judge the path that is served"
     );
 
-    let scoped = run(
-        &state,
-        get(CANON_HOST, "/pub/%252e%252e/scoped/page.txt", None),
-    )
-    .await;
+    let scoped = run(&state, get(CANON_HOST, "/jump?to=../scoped/page.txt", None)).await;
     assert_eq!(status(&scoped), 200);
     assert_eq!(
         scoped
@@ -197,18 +196,149 @@ async fn rewritten_target_is_canonicalized_before_destination_chain_and_access_c
         "the served file's own directory scope (headers, limits, contexts) must apply"
     );
 
-    let above_root = run(
-        &state,
-        get(CANON_HOST, "/pub/%252e%252e/%252e%252e/x", None),
-    )
-    .await;
+    let above_root = run(&state, get(CANON_HOST, "/jump?to=../../x", None)).await;
     assert_eq!(status(&above_root), 404);
 
-    let literal_percent = run(&state, get(CANON_HOST, "/pub/100%2525.txt", None)).await;
-    assert_eq!(status(&literal_percent), 200);
-    assert_eq!(&body_bytes(literal_percent.into_body())[..], b"percent\n");
+    // A `%` in a capture is literal (OLS appendSubst): `%252e%252e` names a
+    // `files/%2e%2e/` directory, never the one above.
+    for path in [
+        "/pub/%252e%252e/secret/flag.txt",
+        "/pub/%252e%252e/scoped/page.txt",
+        "/pub/%252e%252e/%252e%252e/x",
+    ] {
+        if let Some(fast) = fast_serve_req(&state, &get(CANON_HOST, path, None)).await {
+            assert_eq!(status(&fast), 404, "on-core {path}");
+        }
+        let resp = run(&state, get(CANON_HOST, path, None)).await;
+        assert_eq!(status(&resp), 404, "{path}");
+        assert!(resp.headers().get("x-scope").is_none(), "{path}");
+    }
 
-    let nul = run(&state, get(CANON_HOST, "/pub/a%2500b", None)).await;
+    for (path, body) in [
+        ("/pub/100%25.txt", &b"percent\n"[..]),
+        ("/pub/100%2525.txt", b"literal\n"),
+    ] {
+        let resp = run(&state, get(CANON_HOST, path, None)).await;
+        assert_eq!(status(&resp), 200, "{path}");
+        assert_eq!(&body_bytes(resp.into_body())[..], body, "{path}");
+    }
+
+    let nul = run(&state, get(CANON_HOST, "/pub/a%00b", None)).await;
     assert_eq!(status(&nul), 400);
+    let literal_nul_escape = run(&state, get(CANON_HOST, "/pub/a%2500b", None)).await;
+    assert_eq!(
+        status(&literal_nul_escape),
+        404,
+        "names `files/a%00b`; no NUL is ever decoded"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// (#1033) The forum's dot-path `[F]` rule is the only guard for dot directories;
+/// a rewrite target that shares the root chain is not re-judged by it. Decoding a
+/// `%252e` capture a second time turned it into a dot segment that rule never saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn percent_encoded_capture_cannot_reach_a_dot_path_past_its_deny_rule() {
+    let root = temp_root("rewrite-literal-percent");
+    std::fs::create_dir_all(root.join(".hidden")).unwrap();
+    std::fs::write(root.join(".hidden/s.txt"), "hidden\n").unwrap();
+    std::fs::create_dir_all(root.join("files")).unwrap();
+    std::fs::create_dir_all(root.join("wf-statement/assets/css")).unwrap();
+    std::fs::write(root.join("wf-statement/assets/css/app.css"), "body{}\n").unwrap();
+    std::fs::write(root.join("wf-statement/assets/100%.css"), "pct{}\n").unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "RewriteEngine On\n\
+         RewriteRule (^|/)\\.(?!well-known|footer(?:/|$)) - [F,L]\n\
+         RewriteRule ^threads/assets/(.+)$ /wf-statement/assets/$1 [L]\n\
+         RewriteRule ^pub/(.*)$ /files/$1 [L]\n\
+         RewriteRule ^old/(.*)$ /new/$1 [R=301,L]\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root.clone());
+    let status = |resp: &Response| resp.status().as_u16();
+
+    let direct = run(&state, get(CANON_HOST, "/.hidden/s.txt", None)).await;
+    assert_eq!(status(&direct), 403);
+    for path in [
+        "/pub/%252e%252e/%252ehidden/s.txt",
+        "/threads/assets/%252e%252e/%252e%252e/%252ehidden/s.txt",
+    ] {
+        if let Some(fast) = fast_serve_req(&state, &get(CANON_HOST, path, None)).await {
+            assert_eq!(status(&fast), 404, "on-core {path}");
+        }
+        let resp = run(&state, get(CANON_HOST, path, None)).await;
+        assert_eq!(status(&resp), 404, "{path}");
+    }
+
+    for (path, body) in [
+        ("/threads/assets/css/app.css", &b"body{}\n"[..]),
+        ("/threads/assets/100%25.css", b"pct{}\n"),
+    ] {
+        let resp = run(&state, get(CANON_HOST, path, None)).await;
+        assert_eq!(status(&resp), 200, "{path}");
+        assert_eq!(&body_bytes(resp.into_body())[..], body, "{path}");
+    }
+
+    let redirect = run(&state, get(CANON_HOST, "/old/%2541", None)).await;
+    assert_eq!(status(&redirect), 301);
+    let location = redirect.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.ends_with("/new/%2541"), "{location}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// (#1038) A `%{VAR}` in the substitution path is literal too: a `%2e`-bearing
+/// query, header or (decoded `%252e`) REQUEST_URI must not become a dot segment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn percent_encoded_variable_cannot_reach_a_dot_path_past_its_deny_rule() {
+    let root = temp_root("rewrite-literal-var");
+    std::fs::create_dir_all(root.join(".hidden")).unwrap();
+    std::fs::write(root.join(".hidden/s.txt"), "hidden\n").unwrap();
+    std::fs::create_dir_all(root.join("files/go")).unwrap();
+    std::fs::write(root.join("files/ok.txt"), "ok\n").unwrap();
+    std::fs::write(root.join("files/go/ok.txt"), "go\n").unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "RewriteEngine On\n\
+         RewriteRule (^|/)\\.(?!well-known|footer(?:/|$)) - [F,L]\n\
+         RewriteRule ^dl$ /files/%{QUERY_STRING} [L]\n\
+         RewriteRule ^hdr$ /files/%{HTTP:X-Path} [L]\n\
+         RewriteRule ^go/ /files%{REQUEST_URI} [L]\n",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root.clone());
+    let status = |resp: &Response| resp.status().as_u16();
+    let with_path = |path: &str, header: Option<&str>| {
+        let mut req = get(CANON_HOST, path, None);
+        if let Some(v) = header {
+            req.headers_mut().insert("x-path", v.parse().unwrap());
+        }
+        req
+    };
+
+    assert_eq!(
+        status(&run(&state, with_path("/.hidden/s.txt", None)).await),
+        403
+    );
+    for (path, header) in [
+        ("/dl?%2e%2e/%2ehidden/s.txt", None),
+        ("/hdr", Some("%2e%2e/%2ehidden/s.txt")),
+        ("/go/%252e%252e/%252e%252e/%252ehidden/s.txt", None),
+    ] {
+        if let Some(fast) = fast_serve_req(&state, &with_path(path, header)).await {
+            assert_eq!(status(&fast), 404, "on-core {path}");
+        }
+        let resp = run(&state, with_path(path, header)).await;
+        assert_eq!(status(&resp), 404, "{path} {header:?}");
+    }
+    for (path, header, body) in [
+        ("/dl?ok.txt", None, &b"ok\n"[..]),
+        ("/hdr", Some("ok.txt"), b"ok\n"),
+        ("/go/ok.txt", None, b"go\n"),
+    ] {
+        let resp = run(&state, with_path(path, header)).await;
+        assert_eq!(status(&resp), 200, "{path} {header:?}");
+        assert_eq!(&body_bytes(resp.into_body())[..], body, "{path}");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

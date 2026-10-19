@@ -75,6 +75,19 @@ pub(crate) use stream::CompressStream;
 /// negotiate. CGI-style name to match how other env values are carried.
 pub const ACCEPT_ENCODING_ENV: &str = "HTTP_ACCEPT_ENCODING";
 
+/// Whether the request env withholds content-coding from this response:
+/// `no-gzip` (any case) set to a value that does not start with `0`, as OLS
+/// `RequestVars::setEnv` reads it; `[E=!no-gzip]` / `SetEnvIf … !no-gzip`
+/// removes the variable. httpjet's one compressor stands in for mod_deflate, so
+/// every coding is withheld (and no precompressed variant is served), not only gzip.
+pub fn no_gzip(ctx: &ReqCtx) -> bool {
+    ctx.env
+        .iter()
+        .rev()
+        .find(|(k, _)| k.eq_ignore_ascii_case("no-gzip"))
+        .is_some_and(|(_, v)| !v.starts_with('0'))
+}
+
 /// Default minimum body size (bytes) at or above which compression is applied.
 ///
 /// Ground truth: OLS gates dynamic gzip on `m_response.getContentLen() > 200`
@@ -93,6 +106,21 @@ pub(crate) const DEFAULT_LEVEL: u32 = 6;
 /// compressor emits its first block when the backend stalls.
 #[derive(Clone, Copy, Debug)]
 pub struct ProgressiveBody;
+
+/// Response-extension marker set by the static handler on a bodyless HEAD 200 or
+/// 304 for an identity representation of this many bytes. It lets compression
+/// stamp the headers the matching GET would carry (Content-Encoding, the ETag
+/// variant slot, `Vary`). The pipeline removes it when the GET would not be
+/// buffered (above the static-cache object cap), because only buffered static
+/// bodies are compressed.
+#[derive(Clone, Copy, Debug)]
+pub struct StaticIdentityLength(pub u64);
+
+/// Response extension: this answers a HEAD. A bodied HEAD (a backend's empty
+/// stream) is passed through verbatim: encoding its empty body would replace the
+/// backend's Content-Length with the length of an encoded nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct HeadResponse;
 
 /// Response compression transform.
 ///
@@ -162,7 +190,8 @@ impl Compress {
     /// Build from server [`Tuning`]. The per-codec `enable_*` flags select which
     /// codings are offered (and in what residual priority); the `enable_dyn_*`
     /// flags control whether streamed/dynamic bodies are compressed per codec;
-    /// `zstd_level` / `brotli_quality` set the levels.
+    /// `gzip_level` / `zstd_level` / `brotli_quality` set the levels and
+    /// `compressible_types` the eligible content types.
     pub fn from_tuning(tuning: &Tuning) -> Self {
         let priority: Vec<Encoding> = DEFAULT_PRIORITY
             .iter()
@@ -174,6 +203,8 @@ impl Compress {
             })
             .collect();
         Compress {
+            compressible: CompressibleSet::from_entries(&tuning.compressible_types),
+            level: tuning.gzip_level,
             enabled: !priority.is_empty(),
             enable_stream: tuning.enable_dyn_gzip,
             enable_dyn_zstd: tuning.enable_dyn_zstd,
@@ -212,12 +243,57 @@ impl Compress {
         self.compressible.matches(content_type)
     }
 
+    /// Whether any codec is enabled (the master switch).
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// The enabled codecs in server preference order, best first.
+    pub fn priority(&self) -> &[Encoding] {
+        &self.priority
+    }
+
+    /// The minimum identity length this transform compresses.
+    pub fn min_size(&self) -> u64 {
+        self.min_size
+    }
+
+    /// Whether a stored identity response with these headers is one this
+    /// transform could encode at all: compression on, no `Content-Encoding` or
+    /// `Content-Range`, a compressible non-SSE type and no `no-transform`. The
+    /// page cache gates its precompressed variants on this, so a hit serves only
+    /// a coding the transform would have produced. Client negotiation and the
+    /// body-length gate are left to the caller.
+    pub fn stored_encodable(&self, headers: &[(http::HeaderName, HeaderValue)]) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let mut content_type = "";
+        for (k, v) in headers {
+            if *k == CONTENT_TYPE {
+                content_type = v.to_str().unwrap_or("");
+            } else if *k == CACHE_CONTROL {
+                if has_no_transform(v) {
+                    return false;
+                }
+            } else if *k == CONTENT_ENCODING || *k == http::header::CONTENT_RANGE {
+                return false;
+            }
+        }
+        !ct_base(content_type).eq_ignore_ascii_case("text/event-stream")
+            && self.compressible.matches(content_type)
+    }
+
     /// Decide whether `resp` should be gzip-compressed given the client's
     /// `accept_encoding`. Returns the chosen [`Encoding`] when it should be,
     /// `None` to leave the response as-is. Pure / no mutation, so it is unit
     /// testable in isolation.
     pub fn should_compress(&self, resp: &Response, accept_encoding: &str) -> Option<Encoding> {
         if !self.enabled {
+            return None;
+        }
+        if !matches!(resp.body(), Body::Empty) && resp.extensions().get::<HeadResponse>().is_some()
+        {
             return None;
         }
 
@@ -239,10 +315,69 @@ impl Compress {
         ) {
             return None;
         }
+        let enc = self.negotiable(resp, accept_encoding)?;
+
+        // Size + body-kind gating.
+        match resp.body() {
+            Body::Empty => {
+                let len = self.bodyless_static_len(resp)?;
+                (len >= self.min_size).then_some(enc)
+            }
+            Body::Full(b) => ((b.len() as u64) >= self.min_size).then_some(enc),
+            Body::Stream(_) => self.dyn_ok(enc).then_some(enc),
+            Body::File(f) => {
+                if !self.dyn_ok(enc) {
+                    return None;
+                }
+                if f.content_len() < self.min_size {
+                    return None;
+                }
+                // Ranged files would break with whole-stream compression; and
+                // we only act on cached (in-memory) bytes — a non-cached file
+                // is left to the zero-copy/sendfile static path.
+                if f.range.is_some() {
+                    return None;
+                }
+                f.cached.is_some().then_some(enc)
+            }
+        }
+    }
+
+    /// Per-codec gate for dynamic (streamed / cached-file) bodies. The codec is
+    /// chosen by priority first, then this gate is applied — so disabling a
+    /// high-priority codec's dynamic path does not silently fall back to a lower
+    /// one for streamed bodies.
+    fn dyn_ok(&self, enc: Encoding) -> bool {
+        match enc {
+            Encoding::Gzip => self.enable_stream,
+            Encoding::Zstd => self.enable_dyn_zstd,
+            Encoding::Brotli => self.enable_dyn_brotli,
+        }
+    }
+
+    /// The length the matching GET body would have, for a bodyless static HEAD
+    /// 200 or 304 carrying [`StaticIdentityLength`]. A HEAD's declared length
+    /// wins: an earlier transform (sub_filter) may have restated it.
+    fn bodyless_static_len(&self, resp: &Response) -> Option<u64> {
+        let identity = resp.extensions().get::<StaticIdentityLength>()?.0;
+        if resp.status() != StatusCode::OK {
+            return Some(identity);
+        }
+        Some(
+            resp.headers()
+                .get(CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(identity),
+        )
+    }
+
+    /// The status-independent gates: encoding, range, type, client negotiation
+    /// and `no-transform`.
+    fn negotiable(&self, resp: &Response, accept_encoding: &str) -> Option<Encoding> {
         if resp.headers().contains_key(http::header::CONTENT_RANGE) {
             return None;
         }
-
         // Content-Type gating (defaults compress text-ish types only).
         let ct = resp
             .headers()
@@ -264,45 +399,50 @@ impl Compress {
         // Honor `Cache-Control: no-transform` (RFC 9111 §5.2.2.6).
         // Scan ALL Cache-Control header lines (a proxied upstream may split
         // directives across multiple lines; get() only sees the first).
-        if resp.headers().get_all(CACHE_CONTROL).iter().any(|v| {
-            v.to_str().map_or(false, |s| {
-                s.split(',')
-                    .any(|d| d.trim().eq_ignore_ascii_case("no-transform"))
-            })
-        }) {
+        if resp
+            .headers()
+            .get_all(CACHE_CONTROL)
+            .iter()
+            .any(has_no_transform)
+        {
             return None;
         }
+        Some(enc)
+    }
 
-        // Per-codec gate for dynamic (streamed / cached-file) bodies. Note: the
-        // codec is chosen by priority first, then this gate is applied — so
-        // disabling a high-priority codec's dynamic path does not silently fall
-        // back to a lower one for streamed bodies.
-        let dyn_ok = match enc {
-            Encoding::Gzip => self.enable_stream,
-            Encoding::Zstd => self.enable_dyn_zstd,
-            Encoding::Brotli => self.enable_dyn_brotli,
+    /// Stamp a bodyless static HEAD 200 with the headers of the encoded GET.
+    /// The encoded length is unknown without encoding, so none is advertised.
+    fn apply_bodyless(&self, resp: &mut Response, enc: Encoding) {
+        let h = resp.headers_mut();
+        h.insert(CONTENT_ENCODING, HeaderValue::from_static(enc.token()));
+        h.remove(CONTENT_LENGTH);
+        h.remove(TRANSFER_ENCODING);
+        h.remove(ACCEPT_RANGES);
+        tag_etag_variant(resp, enc);
+        add_vary_accept_encoding(resp);
+    }
+
+    /// A static 304 carries the `Vary` its 200 would: when this request's GET
+    /// would be encoded, or when the echoed validator names an encoded variant.
+    /// Such a 304 also drops `Accept-Ranges`, as [`Self::apply`] does on the 200:
+    /// a cache merges the 304's headers into the stored encoded response.
+    fn not_modified_vary(&self, resp: &mut Response, accept_encoding: &str, ctx: &ReqCtx) {
+        let Some(len) = self.bodyless_static_len(resp) else {
+            return;
         };
-
-        // Size + body-kind gating.
-        match resp.body() {
-            Body::Empty => None,
-            Body::Full(b) => ((b.len() as u64) >= self.min_size).then_some(enc),
-            Body::Stream(_) => dyn_ok.then_some(enc),
-            Body::File(f) => {
-                if !dyn_ok {
-                    return None;
-                }
-                if f.content_len() < self.min_size {
-                    return None;
-                }
-                // Ranged files would break with whole-stream compression; and
-                // we only act on cached (in-memory) bytes — a non-cached file
-                // is left to the zero-copy/sendfile static path.
-                if f.range.is_some() {
-                    return None;
-                }
-                f.cached.is_some().then_some(enc)
-            }
+        let encoded_tag = resp
+            .headers()
+            .get(ETAG)
+            .is_some_and(|e| etag_variant(e.as_bytes()).is_some());
+        let would_encode = || {
+            len >= self.min_size
+                && !resp.headers().contains_key(CONTENT_ENCODING)
+                && self.negotiable(resp, accept_encoding).is_some()
+                && !no_gzip(ctx)
+        };
+        if self.enabled && (encoded_tag || would_encode()) {
+            resp.headers_mut().remove(ACCEPT_RANGES);
+            add_vary_accept_encoding(resp);
         }
     }
 
@@ -314,6 +454,7 @@ impl Compress {
         let levels = self.levels();
 
         let progressive = resp.extensions().get::<ProgressiveBody>().is_some();
+        let proxied = resp.extensions().get::<hj_core::ProxiedBody>().is_some();
         // Swap the body out so we can transform it.
         let body = std::mem::replace(resp.body_mut(), Body::Empty);
 
@@ -328,7 +469,11 @@ impl Compress {
             Body::Stream(s) => {
                 resp.headers_mut().remove(CONTENT_LENGTH);
                 let stream = CompressStream::new(s, enc, &levels);
-                let stream = if progressive {
+                let stream = if proxied {
+                    // #866 streams this body unbuffered; batching here would hold a
+                    // sub-32 KiB burst until EOF (#889).
+                    stream.flush_when_idle()
+                } else if progressive {
                     stream.flush_first_when_idle()
                 } else {
                     stream
@@ -418,8 +563,19 @@ impl ResponseTransform for Compress {
         } else {
             self.accept_encoding(ctx)
         };
-        if let Some(enc) = self.should_compress(resp, accept) {
-            self.apply(resp, enc);
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            self.not_modified_vary(resp, accept, ctx);
+            return;
+        }
+        // The env scan runs only for a response that would otherwise be encoded.
+        if let Some(enc) = self.should_compress(resp, accept)
+            && !no_gzip(ctx)
+        {
+            if matches!(resp.body(), Body::Empty) {
+                self.apply_bodyless(resp, enc);
+            } else {
+                self.apply(resp, enc);
+            }
             tracing::trace!(vhost = %ctx.vhost_name, codec = enc.token(), "compressed response");
         }
         // NOTE on Vary: OLS adds `Vary: Accept-Encoding` *only* when it actually
@@ -510,6 +666,28 @@ pub fn tag_etag_variant(resp: &mut Response, enc: Encoding) {
     }
 }
 
+/// The codec named by a LiteSpeed-shape strong ETag's variant slot
+/// (`"<core>;gz"`/`;br`/`;zs`), if any.
+pub fn etag_variant(etag: &[u8]) -> Option<Encoding> {
+    let n = etag.len();
+    if n < 4 || etag[n - 1] != b'"' || etag[n - 4] != b';' {
+        return None;
+    }
+    match &etag[n - 3..n - 1] {
+        b"gz" => Some(Encoding::Gzip),
+        b"br" => Some(Encoding::Brotli),
+        b"zs" => Some(Encoding::Zstd),
+        _ => None,
+    }
+}
+
+fn has_no_transform(v: &HeaderValue) -> bool {
+    v.to_str().is_ok_and(|s| {
+        s.split(',')
+            .any(|d| d.trim().eq_ignore_ascii_case("no-transform"))
+    })
+}
+
 /// Strip any `;`-delimited parameter and surrounding whitespace from a
 /// content-type (callers compare case-insensitively).
 fn ct_base(ct: &str) -> &str {
@@ -529,105 +707,143 @@ impl FileLenExt for hj_core::FileBody {
     }
 }
 
-/// The set of content-types eligible for compression.
+/// The EXACT `compressibleTypes=default` set used by LiteSpeed / OLS.
+///
+/// Ground truth: OLS `HttpMime::setDefaultCompressibleType`
+/// (src/http/httpmime.cpp:949-962). This list is reproduced verbatim
+/// (it is an uncopyrightable set of MIME-type facts) so httpjet gzips
+/// exactly the types the production server does — no more, no less.
+/// Notably this means `font/woff`/`font/woff2` are NOT compressed (they
+/// are already compressed) and structured types OLS omits — e.g.
+/// `application/atom+xml`, `application/ld+json`,
+/// `application/manifest+json`, `application/wasm` — are NOT in the
+/// default set either.
+///
+/// text/css and text/event-stream fall under `text/*`; event-stream is
+/// explicitly excluded at the gating call site (see `should_compress`).
+const DEFAULT_COMPRESSIBLE_TYPES: &[&str] = &[
+    "text/*",
+    "application/x-javascript",
+    "application/javascript",
+    "application/xml",
+    "image/svg+xml",
+    "application/rss+xml",
+    "application/json",
+    "application/vnd.ms-fontobject",
+    "application/x-font",
+    "application/x-font-opentype",
+    "application/x-font-truetype",
+    "application/x-font-ttf",
+    "font/eot",
+    "font/opentype",
+    "font/otf",
+    "font/ttf",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
+    "application/xhtml+xml",
+];
+
+/// One `compressibleTypes` entry's type pattern (lowercased).
+#[derive(Debug, Clone)]
+enum TypePattern {
+    /// `*` / `*/*`.
+    Any,
+    /// `type/*`, stored as `type/`.
+    Prefix(String),
+    /// `type/subtype`.
+    Exact(String),
+}
+
+impl TypePattern {
+    fn parse(t: &str) -> Option<Self> {
+        let t = t.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            None
+        } else if t == "*" || t == "*/*" {
+            Some(TypePattern::Any)
+        } else if let Some(prefix) = t.strip_suffix("/*") {
+            Some(TypePattern::Prefix(format!("{prefix}/")))
+        } else {
+            Some(TypePattern::Exact(t))
+        }
+    }
+
+    /// Allocation-free: patterns are lowercased at construction, so compare the
+    /// borrowed (possibly mixed-case) base with ascii-case-insensitive equality.
+    fn matches(&self, base: &str) -> bool {
+        match self {
+            TypePattern::Any => true,
+            TypePattern::Exact(t) => t.eq_ignore_ascii_case(base),
+            TypePattern::Prefix(p) => {
+                base.len() >= p.len()
+                    && p.as_bytes()
+                        .eq_ignore_ascii_case(&base.as_bytes()[..p.len()])
+            }
+        }
+    }
+}
+
+/// The set of content-types eligible for compression: the `compressibleTypes`
+/// entries in order, each marking the types it covers compressible or, for a
+/// `!type` exclusion, not. OLS applies the list in turn, so for a type several
+/// entries cover the LAST one decides.
 #[derive(Debug, Clone)]
 struct CompressibleSet {
-    /// Exact `type/subtype` entries (lowercased).
-    exact: Vec<String>,
-    /// `type/*` prefixes stored as `type/` (lowercased).
-    prefixes: Vec<String>,
-    /// `*` matches everything.
-    any: bool,
+    rules: Vec<(TypePattern, bool)>,
 }
 
 impl Default for CompressibleSet {
     fn default() -> Self {
-        // The EXACT `compressibleTypes=default` set used by LiteSpeed / OLS.
-        //
-        // Ground truth: OLS `HttpMime::setDefaultCompressibleType`
-        // (src/http/httpmime.cpp:949-962). This list is reproduced verbatim
-        // (it is an uncopyrightable set of MIME-type facts) so httpjet gzips
-        // exactly the types the production server does — no more, no less.
-        // Notably this means `font/woff`/`font/woff2` are NOT compressed (they
-        // are already compressed) and structured types OLS omits — e.g.
-        // `application/atom+xml`, `application/ld+json`,
-        // `application/manifest+json`, `application/wasm` — are NOT in the
-        // default set either.
-        //
-        // text/css and text/event-stream fall under `text/*`; event-stream is
-        // explicitly excluded at the gating call site (see `should_compress`).
-        CompressibleSet::from_types([
-            "text/*",
-            "application/x-javascript",
-            "application/javascript",
-            "application/xml",
-            "image/svg+xml",
-            "application/rss+xml",
-            "application/json",
-            "application/vnd.ms-fontobject",
-            "application/x-font",
-            "application/x-font-opentype",
-            "application/x-font-truetype",
-            "application/x-font-ttf",
-            "font/eot",
-            "font/opentype",
-            "font/otf",
-            "font/ttf",
-            "image/x-icon",
-            "image/vnd.microsoft.icon",
-            "application/xhtml+xml",
-        ])
+        let mut set = CompressibleSet { rules: Vec::new() };
+        set.push_default();
+        set
     }
 }
 
 impl CompressibleSet {
-    fn from_types<I, S>(types: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let mut exact = Vec::new();
-        let mut prefixes = Vec::new();
-        let mut any = false;
-        for t in types {
-            let t = t.into().trim().to_ascii_lowercase();
-            if t.is_empty() {
-                continue;
-            }
-            if t == "*" || t == "*/*" {
-                any = true;
-            } else if let Some(prefix) = t.strip_suffix("/*") {
-                prefixes.push(format!("{prefix}/"));
-            } else {
-                exact.push(t);
+    /// OLS `HttpMime::setCompressibleByType`: `default` (matched on its first
+    /// seven bytes, with or without `!`) adds the default list as compressible.
+    fn from_entries<S: AsRef<str>>(entries: &[S]) -> Self {
+        let mut set = CompressibleSet { rules: Vec::new() };
+        for entry in entries {
+            let entry = entry.as_ref().trim();
+            let (compressible, ty) = match entry.strip_prefix('!') {
+                Some(ty) => (false, ty),
+                None => (true, entry),
+            };
+            if ty
+                .get(..7)
+                .is_some_and(|p| p.eq_ignore_ascii_case("default"))
+            {
+                set.push_default();
+            } else if let Some(pattern) = TypePattern::parse(ty) {
+                set.rules.push((pattern, compressible));
             }
         }
-        CompressibleSet {
-            exact,
-            prefixes,
-            any,
-        }
+        set
     }
 
-    /// Does `content_type` (possibly with parameters) match the set?
+    fn push_default(&mut self) {
+        self.rules.extend(
+            DEFAULT_COMPRESSIBLE_TYPES
+                .iter()
+                .filter_map(|t| TypePattern::parse(t))
+                .map(|p| (p, true)),
+        );
+    }
+
+    /// Does `content_type` (possibly with parameters) match the set? A response
+    /// without a type is never compressible.
     fn matches(&self, content_type: &str) -> bool {
-        if self.any {
-            return true;
-        }
-        // Allocation-free: set entries are lowercased at construction, so compare the
-        // borrowed (possibly mixed-case) base with ascii-case-insensitive equality.
         let base = ct_base(content_type);
         if base.is_empty() {
             return false;
         }
-        if self.exact.iter().any(|t| t.eq_ignore_ascii_case(base)) {
-            return true;
-        }
-        self.prefixes.iter().any(|p| {
-            base.len() >= p.len()
-                && p.as_bytes()
-                    .eq_ignore_ascii_case(&base.as_bytes()[..p.len()])
-        })
+        self.rules
+            .iter()
+            .rev()
+            .find(|(p, _)| p.matches(base))
+            .is_some_and(|(_, compressible)| *compressible)
     }
 }
 
@@ -970,6 +1186,160 @@ mod tests {
         assert!(c.is_compressible_type("application/json; charset=utf-8"));
     }
 
+    const TYPE_CORPUS: &[&str] = &[
+        "text/html",
+        "TEXT/CSS",
+        "text/plain; charset=utf-8",
+        "text/event-stream",
+        "text/x-unknown",
+        "application/json",
+        "application/javascript",
+        "application/xhtml+xml",
+        "application/wasm",
+        "application/octet-stream",
+        "application/ld+json",
+        "image/svg+xml",
+        "image/png",
+        "image/x-icon",
+        "font/ttf",
+        "font/woff2",
+        "",
+        "  ",
+    ];
+
+    /// (#1020) `compressibleTypes`: `default` is today's exact set; entries apply
+    /// in order with `!type` exclusions, as OLS `setCompressibleByType` does.
+    #[test]
+    fn compressible_types_follow_ols_list_semantics() {
+        let default = CompressibleSet::default();
+        for list in [
+            &["default"][..],
+            &["DEFAULT"],
+            &["!default"],
+            &[" default "],
+        ] {
+            let set = CompressibleSet::from_entries(list);
+            for ct in TYPE_CORPUS {
+                assert_eq!(set.matches(ct), default.matches(ct), "{list:?} {ct:?}");
+            }
+        }
+        let set = CompressibleSet::from_entries(&["default", "!text/css"]);
+        assert!(!set.matches("text/css; charset=utf-8"));
+        assert!(set.matches("text/html"));
+        // A later entry overrides an earlier exclusion.
+        let set = CompressibleSet::from_entries(&["!text/css", "default"]);
+        assert!(set.matches("text/css"));
+        let set = CompressibleSet::from_entries(&["Text/HTML", "application/wasm"]);
+        assert!(set.matches("text/html"));
+        assert!(set.matches("application/wasm"));
+        assert!(!set.matches("text/css"));
+        assert!(!set.matches("application/json"));
+        let set = CompressibleSet::from_entries(&["*/*", "!image/*"]);
+        assert!(set.matches("application/octet-stream"));
+        assert!(!set.matches("image/png"));
+        assert!(!set.matches(""), "no Content-Type is never compressible");
+        let none = CompressibleSet::from_entries::<&str>(&[]);
+        assert!(TYPE_CORPUS.iter().all(|ct| !none.matches(ct)));
+
+        let c = Compress::from_tuning(&Tuning {
+            compressible_types: vec!["default".into(), "!text/css".into()],
+            ..Tuning::default()
+        });
+        assert_eq!(
+            c.should_compress(&resp_with("text/css", b"x".repeat(1000)), "gzip"),
+            None
+        );
+        assert!(!c.stored_encodable(&[(CONTENT_TYPE, HeaderValue::from_static("text/css"))]));
+        assert_eq!(
+            c.should_compress(&resp_with("text/html", b"x".repeat(1000)), "gzip"),
+            Some(Encoding::Gzip)
+        );
+    }
+
+    /// (#1020) The live configs set no compression level or type list beyond
+    /// `default`: built from that tuning, the transform encodes byte-identically
+    /// to the built-in defaults. `gzipCompressLevel` sets the gzip level.
+    #[tokio::test]
+    async fn default_tuning_encodes_like_the_builtin_defaults() {
+        let tuned = Compress::from_tuning(&Tuning::default());
+        let builtin = Compress::new();
+        let body = b"<p>identical bytes for the default config</p>".repeat(100);
+        for ae in ["gzip", "br", "zstd"] {
+            for ct in TYPE_CORPUS {
+                assert_eq!(
+                    tuned.is_compressible_type(ct),
+                    builtin.is_compressible_type(ct)
+                );
+            }
+            let mut a = resp_with("text/html", body.clone());
+            let mut b = resp_with("text/html", body.clone());
+            tuned.transform(&make_ctx(ae), &mut a).await;
+            builtin.transform(&make_ctx(ae), &mut b).await;
+            assert_eq!(a.headers(), b.headers(), "{ae}");
+            assert_eq!(
+                body_collect(a.into_body()).await,
+                body_collect(b.into_body()).await
+            );
+        }
+        let fast = Compress::from_tuning(&Tuning {
+            gzip_level: 1,
+            ..Tuning::default()
+        });
+        let mut r = resp_with("text/html", body.clone());
+        fast.transform(&make_ctx("gzip"), &mut r).await;
+        let encoded = body_collect(r.into_body()).await;
+        assert_eq!(encoded, crate::encoding::gzip_bytes_level(&body, 1));
+        assert_ne!(encoded, crate::encoding::gzip_bytes_level(&body, 6));
+    }
+
+    /// (#1020) `no-gzip` (OLS `RequestVars::setEnv`): any case, a value not
+    /// starting with `0` withholds every coding — body, bodyless HEAD and the
+    /// 304's `Vary` — even the forced zstd for a trusted proxy.
+    #[tokio::test]
+    async fn no_gzip_env_withholds_compression() {
+        let c = Compress::new().with_cf_send_zstd(true);
+        let with_env = |ae: &str, key: &str, val: &str| {
+            let mut ctx = make_ctx(ae);
+            ctx.set_env(key, val);
+            ctx
+        };
+        for (key, val, encoded) in [
+            ("no-gzip", "1", false),
+            ("No-Gzip", "yes", false),
+            ("no-gzip", "", false),
+            ("no-gzip", "0", true),
+            ("no-gzip", "0ff", true),
+            ("no-gzipx", "1", true),
+        ] {
+            let mut r = resp_with("text/html", b"x".repeat(1000));
+            c.transform(&with_env("gzip, br", key, val), &mut r).await;
+            assert_eq!(
+                r.headers().contains_key(CONTENT_ENCODING),
+                encoded,
+                "{key}={val:?}"
+            );
+            assert_eq!(r.headers().contains_key(VARY), encoded, "{key}={val:?}");
+        }
+        let mut cf = with_env("br, gzip", "no-gzip", "1");
+        cf.trusted_proxy = true;
+        let mut r = resp_with("text/html", b"x".repeat(1000));
+        c.transform(&cf, &mut r).await;
+        assert!(r.headers().get(CONTENT_ENCODING).is_none());
+
+        let ctx = with_env("gzip", "no-gzip", "1");
+        let mut head = bodyless_static(200, 6000, "\"1770-1-2;;;\"");
+        c.transform(&ctx, &mut head).await;
+        assert!(head.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(head.headers()[ETAG], "\"1770-1-2;;;\"");
+        assert_eq!(head.headers()[CONTENT_LENGTH], "6000");
+        assert_eq!(head.headers()[ACCEPT_RANGES], "bytes");
+
+        let mut not_modified = bodyless_static(304, 6000, "\"1770-1-2;;;\"");
+        c.transform(&ctx, &mut not_modified).await;
+        assert!(not_modified.headers().get(VARY).is_none());
+        assert_eq!(not_modified.headers()[ACCEPT_RANGES], "bytes");
+    }
+
     #[test]
     fn should_compress_negotiates_by_priority() {
         let c = Compress::new();
@@ -1118,6 +1488,37 @@ mod tests {
         // A buffered (Full) body still compresses with zstd (gate is dynamic-only).
         let full = resp_with("text/html", b"x".repeat(500));
         assert_eq!(c.should_compress(&full, "zstd"), Some(Encoding::Zstd));
+    }
+
+    #[test]
+    fn stored_encodable_mirrors_the_transform_gates() {
+        let h = |pairs: &[(http::HeaderName, &'static str)]| -> Vec<_> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.clone(), HeaderValue::from_static(v)))
+                .collect()
+        };
+        let c = Compress::new();
+        assert!(c.stored_encodable(&h(&[(CONTENT_TYPE, "text/html")])));
+        assert!(!c.stored_encodable(&h(&[(CONTENT_TYPE, "image/png")])));
+        assert!(!c.stored_encodable(&h(&[(CONTENT_TYPE, "text/event-stream")])));
+        assert!(!c.stored_encodable(&h(&[
+            (CONTENT_TYPE, "text/html"),
+            (CACHE_CONTROL, "public, No-Transform"),
+        ])));
+        assert!(!c.stored_encodable(&h(&[
+            (CONTENT_TYPE, "text/html"),
+            (CONTENT_ENCODING, "gzip"),
+        ])));
+        let off = Compress::from_tuning(&Tuning {
+            enable_brotli: false,
+            enable_gzip: false,
+            enable_zstd: false,
+            ..Default::default()
+        });
+        assert!(!off.is_enabled());
+        assert!(off.priority().is_empty());
+        assert!(!off.stored_encodable(&h(&[(CONTENT_TYPE, "text/html")])));
     }
 
     #[test]
@@ -1354,5 +1755,132 @@ mod tests {
             Body::Empty => Vec::new(),
             Body::File(_) => panic!("unexpected file body"),
         }
+    }
+
+    fn bodyless_static(status: u16, len: u64, etag: &str) -> Response {
+        let mut r = http::Response::builder()
+            .status(status)
+            .header(CONTENT_TYPE, "text/plain")
+            .header(ETAG, etag)
+            .header(ACCEPT_RANGES, "bytes");
+        if status == 200 {
+            r = r.header(CONTENT_LENGTH, len.to_string());
+        }
+        let mut r = r.body(Body::Empty).unwrap();
+        r.extensions_mut().insert(StaticIdentityLength(len));
+        r
+    }
+
+    #[tokio::test]
+    async fn head_static_advertises_the_encoded_get_headers() {
+        let c = Compress::new();
+        let mut r = bodyless_static(200, 6000, "\"1770-1-2;;;\"");
+        c.transform(&make_ctx("gzip"), &mut r).await;
+        assert_eq!(r.headers()[CONTENT_ENCODING], "gzip");
+        assert_eq!(r.headers()[ETAG], "\"1770-1-2;gz\"");
+        assert_eq!(r.headers()[VARY], "Accept-Encoding");
+        assert!(r.headers().get(CONTENT_LENGTH).is_none());
+        assert!(r.headers().get(ACCEPT_RANGES).is_none());
+        assert!(matches!(r.body(), Body::Empty));
+
+        // Same gates as GET: below the minimum size, or no shared codec, stays identity.
+        for (len, ae) in [(100, "gzip"), (6000, "")] {
+            let mut r = bodyless_static(200, len, "\"1770-1-2;;;\"");
+            c.transform(&make_ctx(ae), &mut r).await;
+            assert!(r.headers().get(CONTENT_ENCODING).is_none());
+            assert_eq!(r.headers()[ETAG], "\"1770-1-2;;;\"");
+            assert_eq!(r.headers()[CONTENT_LENGTH], len.to_string());
+        }
+
+        // A bodyless 200 without the static marker (a backend HEAD) is untouched.
+        let mut r = bodyless_static(200, 6000, "\"x;;;\"");
+        r.extensions_mut().remove::<StaticIdentityLength>();
+        c.transform(&make_ctx("gzip"), &mut r).await;
+        assert!(r.headers().get(CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn head_static_follows_cf_send_zstd_for_trusted_proxy() {
+        let c = Compress::new().with_cf_send_zstd(true);
+        let mut cf = make_ctx("br, gzip");
+        cf.trusted_proxy = true;
+        let mut r = bodyless_static(200, 6000, "\"1770-1-2;;;\"");
+        c.transform(&cf, &mut r).await;
+        assert_eq!(r.headers()[CONTENT_ENCODING], "zstd");
+        assert_eq!(r.headers()[ETAG], "\"1770-1-2;zs\"");
+    }
+
+    #[tokio::test]
+    async fn static_304_carries_vary_of_its_encoded_200() {
+        let c = Compress::new().with_cf_send_zstd(true);
+        // Echoed variant tag: Vary even when this request would not encode.
+        let mut r = bodyless_static(304, 6000, "\"1770-1-2;gz\"");
+        c.transform(&make_ctx(""), &mut r).await;
+        assert_eq!(r.headers()[VARY], "Accept-Encoding");
+        assert_eq!(r.headers()[ETAG], "\"1770-1-2;gz\"");
+        assert!(r.headers().get(CONTENT_ENCODING).is_none());
+        assert!(r.headers().get(ACCEPT_RANGES).is_none());
+
+        let mut cf = make_ctx("br");
+        cf.trusted_proxy = true;
+        let mut r = bodyless_static(304, 6000, "\"1770-1-2;zs\"");
+        c.transform(&cf, &mut r).await;
+        assert_eq!(r.headers()[VARY], "Accept-Encoding");
+        assert!(r.headers().get(ACCEPT_RANGES).is_none());
+
+        // Identity representation the 200 would not encode: no Vary.
+        let mut r = bodyless_static(304, 100, "\"64-1-2;;;\"");
+        c.transform(&make_ctx("gzip"), &mut r).await;
+        assert!(r.headers().get(VARY).is_none());
+        assert_eq!(r.headers()[ACCEPT_RANGES], "bytes");
+    }
+
+    /// Regression (#992): a 304 whose 200 would be encoded must not advertise
+    /// ranges the encoded 200 withholds — the cache merges it into that response.
+    #[tokio::test]
+    async fn static_304_of_an_encoded_200_omits_accept_ranges() {
+        let c = Compress::new();
+        let mut get = bodyless_static(200, 6000, "\"1770-1-2;;;\"");
+        get.extensions_mut().remove::<StaticIdentityLength>();
+        *get.body_mut() = Body::Full(Bytes::from(vec![b'a'; 6000]));
+        c.transform(&make_ctx("gzip"), &mut get).await;
+        assert_eq!(get.headers()[CONTENT_ENCODING], "gzip");
+        assert!(get.headers().get(ACCEPT_RANGES).is_none());
+
+        let mut r = bodyless_static(304, 6000, "\"1770-1-2;;;\"");
+        c.transform(&make_ctx("gzip"), &mut r).await;
+        assert_eq!(r.headers()[VARY], "Accept-Encoding");
+        assert!(r.headers().get(ACCEPT_RANGES).is_none());
+
+        // Not encodable for this client, or compression off: identity keeps ranges.
+        let mut r = bodyless_static(304, 6000, "\"1770-1-2;;;\"");
+        c.transform(&make_ctx(""), &mut r).await;
+        assert_eq!(r.headers()[ACCEPT_RANGES], "bytes");
+        let mut r = bodyless_static(304, 6000, "\"1770-1-2;;;\"");
+        let mut off = Compress::new();
+        off.enabled = false;
+        off.transform(&make_ctx("gzip"), &mut r).await;
+        assert_eq!(r.headers()[ACCEPT_RANGES], "bytes");
+    }
+
+    #[tokio::test]
+    async fn bodied_head_response_passes_through_verbatim() {
+        use hj_core::{BoxError, StreamBody};
+        use http_body_util::{BodyExt, Full as FullBody};
+        // A backend HEAD's empty stream must keep its Content-Length and stay identity.
+        let ctx = make_ctx("gzip");
+        let c = Compress::new();
+        let inner: StreamBody = FullBody::new(Bytes::new())
+            .map_err(|e| Box::new(e) as BoxError)
+            .boxed();
+        let mut r = http::Response::new(Body::Stream(inner));
+        r.headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/html"));
+        r.headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("12345"));
+        r.extensions_mut().insert(HeadResponse);
+        c.transform(&ctx, &mut r).await;
+        assert!(r.headers().get(CONTENT_ENCODING).is_none());
+        assert_eq!(r.headers()[CONTENT_LENGTH], "12345");
     }
 }

@@ -125,6 +125,14 @@ impl AcceptRetirement {
     }
 }
 
+// A successor gates on this token; a worker exiting without its accept loop
+// must still release it or every later generation waits forever.
+impl Drop for AcceptRetirement {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 /// Pin active socket ownership briefly under the coordinator lock, then duplicate
 /// descriptors outside it. Dropping the source or prepared candidate closes only
 /// these extra owners, never the active workers' descriptors.
@@ -259,6 +267,38 @@ impl ActivationGate {
 
     pub(crate) fn raced_connections(&self) -> Option<flume::Receiver<std::net::TcpStream>> {
         self.predecessors.get().map(|old| old.raced.clone())
+    }
+
+    /// Retire a TCP acceptor that never passed its gate. Once activated, this
+    /// generation is the predecessor's successor: connections the predecessor
+    /// races into our queue must reach our own successor, and our stop
+    /// acknowledgment must not precede the predecessor's. `bound` caps the wait
+    /// for a predecessor that never acknowledges.
+    pub(crate) async fn retire_unstarted(
+        &self,
+        mut retirement: AcceptRetirement,
+        bound: impl std::future::Future<Output = ()>,
+    ) {
+        if self.activation.is_cancelled()
+            && let Some(predecessors) = self.predecessors.get()
+        {
+            let stopped = async {
+                for stopped in &predecessors.stopped {
+                    stopped.cancelled().await;
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = stopped => {},
+                _ = bound => {
+                    tracing::warn!("TCP predecessor did not stop accepting; retiring unstarted acceptor");
+                },
+            }
+            for stream in predecessors.raced.try_iter() {
+                retirement.transfer(stream);
+            }
+        }
+        retirement.cancel();
     }
 }
 
@@ -529,7 +569,10 @@ impl WorkerGroup {
         builder: thread::Builder,
         run: impl FnOnce(CancellationToken) + Send + 'static,
     ) -> io::Result<()> {
-        let shutdown = self.shutdown.clone();
+        // Each worker polls its token per request and per h2 loop turn; a child token
+        // keeps that lock and waiter list on the worker's own core. Cancelling the
+        // group token still reaches every child.
+        let shutdown = self.shutdown.child_token();
         self.threads.push(builder.spawn(move || run(shutdown))?);
         Ok(())
     }
@@ -861,6 +904,93 @@ mod tests {
         assert!(!parent.is_cancelled());
     }
 
+    // B is replaced by C before A acknowledges its stop, so B's worker never
+    // passes its gate. C must still start, and a connection A raced to B must
+    // reach C instead of being stranded in B's queue.
+    #[test]
+    fn unstarted_successor_retirement_releases_next_generation_and_forwards_raced() {
+        use std::io::Read;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let parent = CancellationToken::new();
+        let mut a = WorkerGroup::new(&parent);
+        let a_retirement = a.register_acceptor(&listener).unwrap();
+        a.activate();
+        let b_source = a.tcp_handoff_source().unwrap().prepare(address).unwrap();
+        let mut b = WorkerGroup::new(&parent);
+        let b_retirement = b.register_acceptor(&b_source.listeners[0]).unwrap();
+        b.follow_acceptors(b_source.predecessor.clone()).unwrap();
+        let b_gate = b.activation_gate();
+        b.spawn(std::thread::Builder::new(), move |_| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    if !b_gate.wait().await {
+                        b_gate
+                            .retire_unstarted(
+                                b_retirement,
+                                tokio::time::sleep(Duration::from_secs(10)),
+                            )
+                            .await;
+                    }
+                });
+        })
+        .unwrap();
+        a.stop();
+        b.activate();
+        let c_source = b.tcp_handoff_source().unwrap().prepare(address).unwrap();
+        let mut c = WorkerGroup::new(&parent);
+        let _c_retirement = c.register_acceptor(&c_source.listeners[0]).unwrap();
+        c.follow_acceptors(c_source.predecessor.clone()).unwrap();
+        let c_gate = c.activation_gate();
+        b.stop();
+        c.activate();
+
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (raced, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let mut a_retirement = a_retirement;
+        a_retirement.transfer(raced);
+        a_retirement.cancel();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        assert!(
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), c_gate.wait()).await
+            })
+            .expect("successor gate must open after the unstarted generation retires"),
+        );
+        let forwarded = c_gate
+            .raced_connections()
+            .unwrap()
+            .try_recv()
+            .expect("A's raced connection must be forwarded to C");
+        drop(forwarded);
+        assert_eq!(client.read(&mut [0u8; 1]).unwrap(), 0);
+        drop((a, b, c));
+        assert!(!parent.is_cancelled());
+    }
+
+    #[test]
+    fn dropped_retirement_acknowledges_stop() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let parent = CancellationToken::new();
+        let mut group = WorkerGroup::new(&parent);
+        let retirement = group.register_acceptor(&listener).unwrap();
+        let handoff = group.accept_handoff().unwrap();
+        drop(retirement);
+        assert!(handoff.stopped.iter().all(CancellationToken::is_cancelled));
+    }
+
     #[tokio::test]
     async fn activation_is_explicit_and_cancellation_takes_precedence() {
         let parent = CancellationToken::new();
@@ -946,6 +1076,40 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(exited.load(Ordering::SeqCst), 1);
         drop(group);
+    }
+
+    /// Each worker gets its own child of the group token, so cores never share one
+    /// token's lock or waiter list, while stopping the group still reaches all of them.
+    #[test]
+    fn each_worker_gets_its_own_child_of_the_group_token() {
+        let parent = CancellationToken::new();
+        let mut group = WorkerGroup::new(&parent);
+        let (tokens_tx, tokens_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+        for _ in 0..2 {
+            let tokens_tx = tokens_tx.clone();
+            let release_rx = release_rx.clone();
+            group
+                .spawn(thread::Builder::new(), move |token| {
+                    tokens_tx.send(token).unwrap();
+                    let _ = release_rx.lock().unwrap().recv();
+                })
+                .unwrap();
+        }
+        let first = tokens_rx.recv().unwrap();
+        let second = tokens_rx.recv().unwrap();
+        first.cancel();
+        assert!(!second.is_cancelled(), "workers do not share one token");
+        assert!(!group.shutdown.is_cancelled());
+        group.stop();
+        assert!(
+            second.is_cancelled(),
+            "stopping the group reaches every worker"
+        );
+        drop(release_tx);
+        drop(group);
+        assert!(!parent.is_cancelled());
     }
 
     #[test]
@@ -1203,6 +1367,140 @@ mod tests {
         drop(client);
         drop(group);
         assert!(!shutdown.is_cancelled());
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(server_root).unwrap();
+    }
+
+    /// One h2 frame off a blocking client socket: (type, flags, stream id, payload).
+    fn read_h2_frame(client: &mut std::net::TcpStream) -> io::Result<(u8, u8, u32, Vec<u8>)> {
+        use std::io::Read;
+        let mut header = [0u8; 9];
+        client.read_exact(&mut header)?;
+        let len = u32::from_be_bytes([0, header[0], header[1], header[2]]) as usize;
+        let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) & 0x7fff_ffff;
+        let mut payload = vec![0u8; len];
+        client.read_exact(&mut payload)?;
+        Ok((header[3], header[4], stream, payload))
+    }
+
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        frame.extend_from_slice(&[kind, flags]);
+        frame.extend_from_slice(&stream.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// Workers hold child tokens (#974), so stopping the group must still reach a
+    /// connection on a core other than the first: a live h2c connection accepted by
+    /// core 1 gets the graceful-drain GOAWAY (NO_ERROR, last stream = the one it
+    /// served) and is then closed.
+    #[test]
+    fn group_stop_sends_goaway_to_an_h2_connection_on_a_later_core() {
+        use super::super::{ListenerBinding, pipeline_admission, spawn_uring_http};
+        use std::io::Write;
+        const DATA: u8 = 0x0;
+        const HEADERS: u8 = 0x1;
+        const SETTINGS: u8 = 0x4;
+        const GOAWAY: u8 = 0x7;
+        const END_STREAM: u8 = 0x1;
+        const ACK: u8 = 0x1;
+
+        let root = std::env::temp_dir().join(format!(
+            "hj-h2-drain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("index.html"), b"served before the drain").unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let state = runtime.block_on(async { crate::pipeline::e2e::build_state(root.clone()) });
+        let server_root = state.server.server_root.clone();
+        let process_shutdown = state.shutdown.clone();
+        let holder = Arc::new(arc_swap::ArcSwap::from(state));
+        // One listener per core, on distinct ports: core 1 alone owns `later`.
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let later = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        first.set_nonblocking(true).unwrap();
+        later.set_nonblocking(true).unwrap();
+        let first_address = first.local_addr().unwrap();
+        let later_address = later.local_addr().unwrap();
+        let group = runtime.block_on(async {
+            let admission = pipeline_admission(holder.clone());
+            spawn_uring_http(
+                holder,
+                "http".into(),
+                first_address,
+                2,
+                Some(vec![first, later]),
+                admission,
+                ListenerBinding::default(),
+            )
+            .unwrap()
+        });
+        group.activate();
+
+        let mut client = std::net::TcpStream::connect(later_address).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut hello = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        hello.extend(h2_frame(SETTINGS, 0, 0, &[]));
+        // GET / (HPACK: :method GET, :scheme http, :path /, :authority literal).
+        let mut block = vec![0x82, 0x86, 0x84, 0x01, 10];
+        block.extend_from_slice(b"canon.test");
+        hello.extend(h2_frame(HEADERS, END_STREAM | 0x4, 1, &block));
+        client.write_all(&hello).unwrap();
+
+        let mut body = Vec::new();
+        let mut status = None;
+        loop {
+            let (kind, flags, stream, payload) = read_h2_frame(&mut client).unwrap();
+            match kind {
+                SETTINGS if flags & ACK == 0 => {
+                    client.write_all(&h2_frame(SETTINGS, ACK, 0, &[])).unwrap()
+                }
+                HEADERS if stream == 1 => status = payload.first().copied(),
+                DATA if stream == 1 => body.extend_from_slice(&payload),
+                GOAWAY => panic!("GOAWAY before the group stopped: {payload:?}"),
+                _ => {}
+            }
+            if matches!(kind, HEADERS | DATA) && stream == 1 && flags & END_STREAM != 0 {
+                break;
+            }
+        }
+        // 0x88 = HPACK static-table `:status 200`.
+        assert_eq!(status, Some(0x88));
+        assert_eq!(body, b"served before the drain");
+
+        group.stop();
+        let goaway = loop {
+            let (kind, _, _, payload) = read_h2_frame(&mut client)
+                .expect("the stopped group must send GOAWAY before closing");
+            if kind == GOAWAY {
+                break payload;
+            }
+        };
+        let last_stream = u32::from_be_bytes(goaway[..4].try_into().unwrap()) & 0x7fff_ffff;
+        let error = u32::from_be_bytes(goaway[4..8].try_into().unwrap());
+        assert_eq!((last_stream, error), (1, 0), "graceful drain: NO_ERROR");
+        let mut rest = Vec::new();
+        let closed = std::io::Read::read_to_end(&mut client, &mut rest);
+        assert!(closed.is_ok(), "drained connection must close: {closed:?}");
+        drop(client);
+        drop(group);
+        assert!(
+            !process_shutdown.is_cancelled(),
+            "a group stop stays in the group"
+        );
         drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(server_root).unwrap();

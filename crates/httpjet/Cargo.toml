@@ -50,7 +50,7 @@ thiserror = { workspace = true }
 # Optional: in-process sampling profiler → raw pprof protobuf (gated by `profiling`).
 # Rendering is intentionally left to `go tool pprof` or another external viewer,
 # keeping the CDDL-licensed inferno renderer out of httpjet's dependency graph.
-pprof = { version = "=0.15.0", features = ["prost-codec", "frame-pointer"], optional = true }
+pprof = { version = "=0.15.0", default-features = false, features = ["prost-codec", "frame-pointer"], optional = true }
 # The pure-io_uring thread-per-core transport (monoio) is the ONLY transport, so its
 # runtime + the raw io_uring API + quinn's UDP datapath (GSO/GRO) for the quinn-on-monoio
 # H3 adapter are unconditional deps. quinn-udp 0.6 is API-compatible with the uring H3
@@ -79,6 +79,8 @@ flume = { version = "0.12" }
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-aws-lc-rs", "log"] }
 # Zero-copy HTTP/1.1 request-head parser for the custom monoio H1 codec.
 httparse = { version = "1" }
+# SIMD substring search (already in the lock via the regex stack).
+memchr = { version = "2" }
 # Self-signed cert for the H3 driver dev-smoke entrypoint. default-features=false +
 # aws_lc_rs reuses the already-linked aws-lc-rs provider so `ring` is NOT pulled in.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }

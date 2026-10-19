@@ -19,7 +19,7 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.0.7"
+version = "0.0.18"
 edition = "2024"
 publish = false
 rust-version = "1.99"
@@ -53,7 +53,7 @@ hj-h2 = { path = "crates/hj-h2" }
 
 # async runtime + io
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "fs", "signal", "sync", "time", "macros", "process"] }
-tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio-util = { version = "0.7", features = ["codec"] }
 monoio = { version = "=0.2.4" }
 # Same crate/version monoio drives its rings with — used only to hand
 # `uring_builder` a flags-configured io_uring::Builder (#330).
@@ -104,7 +104,9 @@ rustc-hash = "2"
 # caching / compression
 memmap2 = "0.9"
 flate2 = "1"
-zstd = "0.14"
+# No `legacy` (pre-v0.8 frame decoders) or `zdict_builder`: httpjet decodes only its own
+# frames and modern request bodies, and dictionaries are trained with the zstd CLI.
+zstd = { version = "0.14", default-features = false, features = ["arrays"] }
 brotli = "9"
 
 # utility

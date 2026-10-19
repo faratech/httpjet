@@ -335,9 +335,19 @@ thread_local! {
     /// (zstd `compress2`, which resets the session), so the output is byte-identical
     /// to a fresh `zstd::bulk::compress` at the same level — verified by the
     /// `zstd_bytes_pooled_matches_oneshot` test. The level is (re)set per call
-    /// because the pooled context outlives any single `Levels`.
-    static ZSTD_CCTX: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+    /// because the pooled context outlives any single `Levels`; so is the window
+    /// cap (the `bool`: whether [`zstd_window_log`] is applied), which a level
+    /// change does not clear.
+    static ZSTD_CCTX: std::cell::RefCell<Option<(zstd::bulk::Compressor<'static>, bool)>> =
         std::cell::RefCell::new(None);
+}
+
+/// RFC 9659 §3: HTTP `zstd` decoders need not support a window above 8 MiB,
+/// and browsers refuse one. zstd itself picks at most 2^23 through level 19;
+/// levels 20-22 pick up to 2^27, so only they are capped, and every other
+/// level keeps zstd's own parameters byte for byte.
+pub(crate) fn zstd_window_log(level: i32) -> Option<u32> {
+    (level > 19).then_some(23)
 }
 
 /// Compress a buffer with zstd at the given level (1-22), reusing a per-thread
@@ -347,10 +357,17 @@ pub(crate) fn zstd_bytes_level(input: &[u8], level: i32) -> Option<Vec<u8>> {
     ZSTD_CCTX.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            *slot = Some(zstd::bulk::Compressor::new(level).ok()?);
+            *slot = Some((zstd::bulk::Compressor::new(level).ok()?, false));
         }
-        let comp = slot.as_mut().expect("just initialized above");
+        let (comp, capped) = slot.as_mut()?;
         comp.set_compression_level(level).ok()?;
+        let window = zstd_window_log(level);
+        if window.is_some() != *capped {
+            // 0 restores the level's own window.
+            comp.set_parameter(zstd::zstd_safe::CParameter::WindowLog(window.unwrap_or(0)))
+                .ok()?;
+            *capped = window.is_some();
+        }
         comp.compress(input).ok()
     })
 }
@@ -514,6 +531,42 @@ mod tests {
                 b"context-reuse-check"
             );
         }
+    }
+
+    fn decode_within_http_window(frame: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut dec = zstd::stream::read::Decoder::new(frame)?;
+        dec.window_log_max(23)?;
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out)?;
+        Ok(out)
+    }
+
+    /// Regression (#1020): above 8 MiB a level 20-22 buffer framed a window
+    /// past RFC 9659's 8 MiB decoder limit. The cap is the pooled context's
+    /// state, so the next level-3 body must again match zstd's own parameters.
+    #[test]
+    fn ultra_zstd_buffer_fits_the_http_window() {
+        let input: Vec<u8> = (0..(9u32 << 20) / 4)
+            .flat_map(|i| (i % 4099).to_le_bytes())
+            .collect();
+        let ultra = zstd_bytes_level(&input, 22).expect("level 22");
+        assert_eq!(
+            decode_within_http_window(&ultra).expect("8 MiB window"),
+            input
+        );
+        let pooled = zstd_bytes_level(&input, 3).expect("level 3");
+        assert_eq!(pooled, zstd::bulk::compress(&input, 3).unwrap());
+        let small = b"the quick brown fox jumps over the lazy dog ".repeat(64);
+        for level in [1, 3, 9, 19] {
+            zstd_bytes_level(&small, 22).expect("level 22");
+            assert_eq!(
+                zstd_bytes_level(&small, level).unwrap(),
+                zstd::bulk::compress(&small, level).unwrap(),
+                "level {level}"
+            );
+        }
+        assert_eq!(zstd_window_log(19), None);
+        assert_eq!(zstd_window_log(20), Some(23));
     }
 
     #[test]

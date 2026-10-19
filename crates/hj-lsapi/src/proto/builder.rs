@@ -23,6 +23,26 @@ pub enum SpecialEnvType {
     Admin = 0x04,
 }
 
+/// One request header for the BEGIN_REQUEST header block, in wire order.
+pub trait WireHeader {
+    fn name(&self) -> &str;
+    fn value(&self) -> &str;
+    /// The well-known index slot ([`known_header_index`]). The builder consults it
+    /// twice per header, so a caller that already resolved it can carry it.
+    fn known_index(&self) -> Option<usize> {
+        known_header_index(self.name())
+    }
+}
+
+impl<N: AsRef<str>, V: AsRef<str>> WireHeader for (N, V) {
+    fn name(&self) -> &str {
+        self.0.as_ref()
+    }
+    fn value(&self) -> &str {
+        self.1.as_ref()
+    }
+}
+
 /// Build the BEGIN_REQUEST packet *body* (everything after the 8-byte packet
 /// header) from a list of CGI env vars.
 ///
@@ -75,17 +95,16 @@ pub fn build_begin_request_body<K: AsRef<str>>(env: &[(K, String)], req_body_len
 ///   - the raw header block itself (`m_httpHeaderLen` bytes)
 ///
 /// The request body is still NOT part of this packet; it follows on the wire.
-pub fn build_begin_request<K, V, HN, HV>(
+pub fn build_begin_request<K, V, H>(
     env: &[(K, V)],
     special_env: &[(SpecialEnvType, String, String)],
-    headers: &[(HN, HV)],
+    headers: &[H],
     req_body_len: i32,
 ) -> Bytes
 where
     K: AsRef<str>,
     V: AsRef<str>,
-    HN: AsRef<str>,
-    HV: AsRef<str>,
+    H: WireHeader,
 {
     // Legacy body-only form (no packet header): the codec prepends the 8-byte
     // header. Offsets are absolute *including* that header (see the helper).
@@ -100,17 +119,16 @@ where
 /// directly behind the reserved packet header, each value's absolute offset is
 /// simply its index in the buffer. The 8-byte header is backfilled last (its
 /// `total` length is only known once the body is complete).
-pub fn build_begin_request_framed<K, V, HN, HV>(
+pub fn build_begin_request_framed<K, V, H>(
     env: &[(K, V)],
     special_env: &[(SpecialEnvType, String, String)],
-    headers: &[(HN, HV)],
+    headers: &[H],
     req_body_len: i32,
 ) -> Bytes
 where
     K: AsRef<str>,
     V: AsRef<str>,
-    HN: AsRef<str>,
-    HV: AsRef<str>,
+    H: WireHeader,
 {
     let mut out = BytesMut::new();
     build_begin_request_framed_into(&mut out, env, special_env, headers, req_body_len);
@@ -123,17 +141,16 @@ where
 /// [`build_begin_request_framed`] (the MEM1 gate covers this). `out`'s prior
 /// contents are wiped by `clear()` before the full packet is written, so a
 /// recycled buffer leaks nothing of the previous request.
-pub fn build_begin_request_framed_into<K, V, HN, HV>(
+pub fn build_begin_request_framed_into<K, V, H>(
     out: &mut BytesMut,
     env: &[(K, V)],
     special_env: &[(SpecialEnvType, String, String)],
-    headers: &[(HN, HV)],
+    headers: &[H],
     req_body_len: i32,
 ) where
     K: AsRef<str>,
     V: AsRef<str>,
-    HN: AsRef<str>,
-    HV: AsRef<str>,
+    H: WireHeader,
 {
     out.clear();
     let est = PACKET_HEADER_LEN
@@ -159,17 +176,16 @@ pub fn build_begin_request_framed_into<K, V, HN, HV>(
 /// 8-byte packet header (framed form) or be empty (legacy body-only form). All
 /// LSAPI offsets are absolute *including* the packet header; `body_start` (the
 /// length of `out` on entry) lets the same offset math serve both callers.
-fn build_begin_request_into<K, V, HN, HV>(
+fn build_begin_request_into<K, V, H>(
     out: &mut BytesMut,
     env: &[(K, V)],
     special_env: &[(SpecialEnvType, String, String)],
-    headers: &[(HN, HV)],
+    headers: &[H],
     req_body_len: i32,
 ) where
     K: AsRef<str>,
     V: AsRef<str>,
-    HN: AsRef<str>,
-    HV: AsRef<str>,
+    H: WireHeader,
 {
     // CGI vars go in the normal env table; php.ini overrides (php_value/...) go in
     // the special-env table (cntSpecialEnv) — lsphp reads ini overrides ONLY there.
@@ -275,7 +291,7 @@ fn build_begin_request_into<K, V, HN, HV>(
     // Pass 1: count unknown headers so the offset-table reservation is exact.
     let unknown_cnt = headers
         .iter()
-        .filter(|(name, _)| known_header_index(name.as_ref()).is_none())
+        .filter(|header| header.known_index().is_none())
         .count();
     let unknown_table_len = unknown_cnt * 16; // (nameOff, nameLen, valueOff, valueLen)
 
@@ -289,9 +305,9 @@ fn build_begin_request_into<K, V, HN, HV>(
     let mut block_rel: i32 = 0;
     let mut unknown_written = 0usize;
     let mut unknown_wpos = index_start + HEADER_INDEX_LEN;
-    for (name, value) in headers {
-        let nb = name.as_ref().as_bytes();
-        let vb = value.as_ref().as_bytes();
+    for header in headers {
+        let nb = header.name().as_bytes();
+        let vb = header.value().as_bytes();
         let name_off = block_rel;
         out.extend_from_slice(nb);
         out.extend_from_slice(b": ");
@@ -303,7 +319,7 @@ fn build_begin_request_into<K, V, HN, HV>(
         out.extend_from_slice(b"\r\n");
         block_rel += (vb.len() + 2) as i32;
 
-        match known_header_index(name.as_ref()) {
+        match header.known_index() {
             // Last occurrence wins, matching how a single indexed slot behaves.
             Some(i) => {
                 // (#3) The known-header index `len` slot is also a u16; a value

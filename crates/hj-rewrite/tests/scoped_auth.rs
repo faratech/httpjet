@@ -169,3 +169,21 @@ fn single_quoted_auth_values_and_file_scopes_keep_their_meaning() {
     assert!(realm.user_satisfies("Admin"));
     assert!(resolve_auth([&ht], "/public.txt").unwrap().is_none());
 }
+
+#[test]
+fn parent_files_require_outranks_child_directory_grant() {
+    let parent = Htaccess::parse(
+        "AuthType Basic\nAuthName Admin\nAuthUserFile users\n<Files \"admin.php\">\nRequire valid-user\n</Files>\n",
+    )
+    .unwrap();
+    let child = Htaccess::parse("Require all granted\n").unwrap();
+    let realm = resolve_auth([&parent, &child], "/sub/admin.php")
+        .unwrap()
+        .expect("the parent's <Files> Require must still apply");
+    assert_eq!(realm.realm, "Admin");
+    assert!(
+        resolve_auth([&parent, &child], "/sub/other.php")
+            .unwrap()
+            .is_none()
+    );
+}

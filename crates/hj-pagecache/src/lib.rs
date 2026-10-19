@@ -30,6 +30,7 @@ mod metablob;
 pub mod proto;
 pub mod shared_paths;
 pub mod store;
+pub mod urlvary;
 
 pub use admission::AdmissionFilter;
 pub use classify::{Disposition, classify_response};
@@ -45,6 +46,6 @@ pub use proto::{
 };
 pub use shared_paths::{SharedPathMatcher, parse_shared_paths, path_has_segment_prefix};
 pub use store::{
-    CacheFootprint, CacheListing, CacheStats, CachedResponse, EntryInfo, EntryState, FileId,
-    Freshness, PageBody, PageScope, PageStore, StaticNode, StoreConfig,
+    BodyReadFailures, CacheFootprint, CacheListing, CacheStats, CachedResponse, EntryInfo,
+    EntryState, FileId, Freshness, PageBody, PageScope, PageStore, StaticNode, StoreConfig,
 };

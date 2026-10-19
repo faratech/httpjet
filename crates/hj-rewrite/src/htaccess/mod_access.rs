@@ -122,7 +122,12 @@ impl HostEntry {
                 .unwrap_or_else(|| HostEntry::Unevaluable(token.to_string()));
         }
         // Partial dotted-quad (`10`, `10.1`, `10.1.2`): the leading 1-3 octets.
-        let octets: Vec<&str> = token.split('.').collect();
+        // Apache also accepts the documented trailing-dot spelling (`10.1.`).
+        let octets: Vec<&str> = token
+            .strip_suffix('.')
+            .unwrap_or(token)
+            .split('.')
+            .collect();
         if (1..=3).contains(&octets.len()) && octets.iter().all(|o| o.parse::<u8>().is_ok()) {
             let mut b = [0u8; 4];
             for (i, o) in octets.iter().enumerate() {
@@ -159,19 +164,126 @@ impl HostEntry {
 }
 
 /// The accumulated `Order` + `Allow from` + `Deny from` lines of one scope.
+///
+/// Apache keeps ONE `mod_access_compat` config per section: `<IfModule>` is
+/// transparent and `<Limit>`/`<LimitExcept>` only tags the enclosed lines with a
+/// method mask (`order[method]`, `allowdeny.limited`) inside that same config, so
+/// a `<Limit GET> Allow from …` refines the enclosing `Order`/`Deny` rather than
+/// starting a fresh, default-open block (#778).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostAccess {
+    /// The `Order` for every method no later `<Limit>`-scoped `Order` overrides.
     pub order: AccessOrder,
+    /// Unlimited (all-method) `Allow from` entries.
+    pub allow: Vec<HostEntry>,
+    /// Unlimited (all-method) `Deny from` entries.
+    pub deny: Vec<HostEntry>,
+    /// Whether any line outside a `<Limit>` was recorded (the block then has an
+    /// opinion on every method).
+    pub unlimited: bool,
+    /// `<Limit>`/`<LimitExcept>` refinements, in source order.
+    pub limited: Vec<LimitedAccess>,
+}
+
+/// The lines of one `<Limit>`/`<LimitExcept>` section within a [`HostAccess`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitedAccess {
+    pub methods: Vec<String>,
+    pub except: bool,
+    /// A `Order` line inside this section (cleared by a later unlimited `Order`,
+    /// which in Apache rewrites `order[]` for every method).
+    pub order: Option<AccessOrder>,
     pub allow: Vec<HostEntry>,
     pub deny: Vec<HostEntry>,
 }
 
+impl LimitedAccess {
+    pub fn covers(&self, method: &str) -> bool {
+        method_listed(&self.methods, method) != self.except
+    }
+}
+
+/// Apache's built-in method names (`lookup_builtin_method`). `.htaccess` cannot
+/// register new ones, and the lookup is case-sensitive, so anything else in a
+/// `<Limit>`/`<LimitExcept>` is a configuration error.
+const BUILTIN_METHODS: &[&str] = &[
+    "GET",
+    "HEAD",
+    "PUT",
+    "POST",
+    "DELETE",
+    "CONNECT",
+    "OPTIONS",
+    "TRACE",
+    "PATCH",
+    "PROPFIND",
+    "PROPPATCH",
+    "MKCOL",
+    "COPY",
+    "MOVE",
+    "LOCK",
+    "UNLOCK",
+    "VERSION-CONTROL",
+    "CHECKOUT",
+    "UNCHECKOUT",
+    "CHECKIN",
+    "UPDATE",
+    "LABEL",
+    "REPORT",
+    "MKWORKSPACE",
+    "MKACTIVITY",
+    "BASELINE-CONTROL",
+    "MERGE",
+];
+
+pub(crate) fn is_builtin_method(method: &str) -> bool {
+    BUILTIN_METHODS.contains(&method)
+}
+
+/// Apache numbers `HEAD` as `M_GET`, so each one names the other in a method
+/// mask: `<Limit HEAD>` restricts GET exactly as `<Limit GET>` restricts HEAD.
+fn method_number(method: &str) -> &str {
+    if method == "HEAD" { "GET" } else { method }
+}
+
+pub(crate) fn method_listed(methods: &[String], method: &str) -> bool {
+    let want = method_number(method);
+    methods.iter().any(|m| method_number(m) == want)
+}
+
 impl HostAccess {
-    /// Apache's `mod_access_compat` truth table.
+    /// Apache's `mod_access_compat` truth table for a method-agnostic check
+    /// (only the unlimited lines).
     pub fn permits(&self, subject: &AccessSubject<'_>) -> bool {
         let allowed = self.allow.iter().any(|e| e.matches(subject, false));
         let denied = self.deny.iter().any(|e| e.matches(subject, true));
-        match self.order {
+        Self::verdict(self.order, allowed, denied)
+    }
+
+    /// The truth table for `method`: unlimited lines plus every `<Limit>`
+    /// section covering it, under the last `Order` that applies to it.
+    pub fn permits_method(&self, subject: &AccessSubject<'_>, method: &str) -> bool {
+        let mut order = self.order;
+        let mut allowed = self.allow.iter().any(|e| e.matches(subject, false));
+        let mut denied = self.deny.iter().any(|e| e.matches(subject, true));
+        for l in self.limited.iter().filter(|l| l.covers(method)) {
+            if let Some(o) = l.order {
+                order = o;
+            }
+            allowed |= l.allow.iter().any(|e| e.matches(subject, false));
+            denied |= l.deny.iter().any(|e| e.matches(subject, true));
+        }
+        Self::verdict(order, allowed, denied)
+    }
+
+    /// Whether any recorded line applies to `method`. A block holding only
+    /// `<Limit POST>` lines has no opinion on a `GET`.
+    pub fn applies_to(&self, method: &str) -> bool {
+        self.unlimited || self.limited.iter().any(|l| l.covers(method))
+    }
+
+    fn verdict(order: AccessOrder, allowed: bool, denied: bool) -> bool {
+        match order {
             AccessOrder::DenyAllow => !denied || allowed,
             AccessOrder::AllowDeny | AccessOrder::MutualFailure => allowed && !denied,
         }
@@ -306,11 +418,46 @@ mod tests {
     }
 
     #[test]
+    fn partial_ipv4_with_trailing_dot_is_a_prefix() {
+        // (#893) Apache's documented `Allow from 10.1.` spelling.
+        assert_eq!(
+            HostEntry::parse("10.1."),
+            HostEntry::Net {
+                addr: "10.1.0.0".parse().unwrap(),
+                prefix: 16
+            }
+        );
+        assert_eq!(
+            HostEntry::parse("192.168.1."),
+            HostEntry::Net {
+                addr: "192.168.1.0".parse().unwrap(),
+                prefix: 24
+            }
+        );
+        assert!(HostEntry::parse("10..").is_unevaluable());
+        assert!(HostEntry::parse(".").is_unevaluable());
+        let ha = HostAccess {
+            order: AccessOrder::parse("Deny,Allow"),
+            deny: vec![HostEntry::parse("10.1.")],
+            ..Default::default()
+        };
+        assert!(!ha.permits(&AccessSubject {
+            client_ip: ip("10.1.2.3"),
+            env_set: None
+        }));
+        assert!(ha.permits(&AccessSubject {
+            client_ip: ip("10.2.0.1"),
+            env_set: None
+        }));
+    }
+
+    #[test]
     fn order_allow_deny_denies_by_default() {
         let ha = HostAccess {
             order: AccessOrder::parse("Allow,Deny"),
             allow: vec![HostEntry::parse("203.0.113.0/24")],
             deny: vec![],
+            ..Default::default()
         };
         assert!(ha.permits(&AccessSubject {
             client_ip: ip("203.0.113.9"),
@@ -335,6 +482,7 @@ mod tests {
             order: AccessOrder::DenyAllow,
             allow: vec![HostEntry::parse("198.51.100.7")],
             deny: vec![HostEntry::parse("198.51.100.0/24")],
+            ..Default::default()
         };
         assert!(ha.permits(&AccessSubject {
             client_ip: ip("192.0.2.1"),
@@ -356,6 +504,7 @@ mod tests {
             order: AccessOrder::AllowDeny,
             allow: vec![HostEntry::All],
             deny: vec![HostEntry::parse("env=bad_bot")],
+            ..Default::default()
         };
         let set = |n: &str| n == "bad_bot";
         let unset = |_: &str| false;
@@ -380,6 +529,7 @@ mod tests {
             order: AccessOrder::AllowDeny,
             allow: vec![HostEntry::parse(".example.com")],
             deny: vec![],
+            ..Default::default()
         };
         assert!(!allow_host.permits(&AccessSubject {
             client_ip: ip("192.0.2.1"),
@@ -389,6 +539,7 @@ mod tests {
             order: AccessOrder::DenyAllow,
             allow: vec![],
             deny: vec![HostEntry::parse("evil.example")],
+            ..Default::default()
         };
         assert!(!deny_host.permits(&AccessSubject {
             client_ip: ip("192.0.2.1"),
@@ -402,12 +553,14 @@ mod tests {
             order: AccessOrder::DenyAllow,
             allow: vec![],
             deny: vec![HostEntry::All],
+            ..Default::default()
         };
         assert!(!deny_all.permits(&AccessSubject::default()));
         let allow_all = HostAccess {
             order: AccessOrder::AllowDeny,
             allow: vec![HostEntry::All],
             deny: vec![],
+            ..Default::default()
         };
         assert!(allow_all.permits(&AccessSubject::default()));
         // Apache: with allow,deny a matching Deny beats a matching Allow.
@@ -415,6 +568,7 @@ mod tests {
             order: AccessOrder::AllowDeny,
             allow: vec![HostEntry::All],
             deny: vec![HostEntry::All],
+            ..Default::default()
         };
         assert!(!both.permits(&AccessSubject::default()));
     }
@@ -450,6 +604,7 @@ mod tests {
             order: AccessOrder::DenyAllow,
             allow: vec![],
             deny: vec![HostEntry::parse("::ffff:10.1.2.3")],
+            ..Default::default()
         };
         let subject = |s| AccessSubject {
             client_ip: ip(s),
@@ -463,6 +618,7 @@ mod tests {
             order: AccessOrder::parse("Allow,Deny"),
             allow: vec![HostEntry::parse("::ffff:10.1.0.0/112")],
             deny: vec![],
+            ..Default::default()
         };
         assert!(allow.permits(&subject("10.1.200.7")));
         assert!(!allow.permits(&subject("8.8.8.8")));

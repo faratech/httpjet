@@ -76,8 +76,6 @@ optional = true
 [dependencies.backtrace]
 version = "0.3"
 
-[dependencies.cfg-if]
-version = "1.0"
 
 [dependencies.criterion]
 version = "0.5"
@@ -125,9 +123,6 @@ version = "1.9"
 version = "0.12"
 optional = true
 
-[dependencies.prost-derive]
-version = "0.12"
-optional = true
 
 [dependencies.protobuf]
 version = ">=3.7.2"
@@ -184,7 +179,6 @@ large-depth = []
 perfmaps = ["arc-swap"]
 prost-codec = [
     "prost",
-    "prost-derive",
     "prost-build",
     "sha2",
     "_protobuf",

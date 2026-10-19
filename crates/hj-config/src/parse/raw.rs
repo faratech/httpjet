@@ -30,6 +30,15 @@ pub(super) struct RawServer {
     pub(super) cache: Option<RawServerCache>,
     #[serde(default)]
     pub(super) security: Option<RawSecurity>,
+    /// OLS `getChild("security", 1)` falls back to the root node, so a bare
+    /// root-level `<accessControl>` is the server ACL when `<security>` is absent.
+    #[serde(rename = "accessControl", default)]
+    pub(super) access_control: Option<RawAccessControl>,
+    /// Root-level forms of the other `<security>` children (same OLS fallback).
+    #[serde(rename = "accessDenyDir", default)]
+    pub(super) access_deny_dir: Option<RawAccessDenyDir>,
+    #[serde(rename = "fileAccessControl", default)]
+    pub(super) file_access_control: Option<RawFileAccessControl>,
     #[serde(default)]
     pub(super) suexec: Option<RawSuExec>,
     #[serde(rename = "extProcessorList", default)]
@@ -40,6 +49,40 @@ pub(super) struct RawServer {
     pub(super) vhost_list: Option<RawVHostList>,
     #[serde(rename = "listenerList", default)]
     pub(super) listener_list: Option<RawListenerList>,
+    #[serde(rename = "vhTemplateList", default)]
+    pub(super) vh_template_list: Option<RawVhTemplateList>,
+    /// Server-level suffix routes, inherited by every vhost (#928).
+    #[serde(rename = "scriptHandlerList", default)]
+    pub(super) script_handler_list: Option<RawScriptHandlerList>,
+    /// Vhost names the WebAdmin "Disable" action lists; each answers 403 (#1000).
+    #[serde(rename = "suspendedVhosts", default)]
+    pub(super) suspended_vhosts: Option<String>,
+    #[serde(rename = "apacheConf", default)]
+    pub(super) apache_conf: Option<String>,
+    /// Server `<htAccess>`: the default and ceiling for every vhost (#1028).
+    #[serde(rename = "htAccess", default)]
+    pub(super) htaccess: Option<RawHtAccess>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawVhTemplateList {
+    #[serde(rename = "vhTemplate", default)]
+    pub(super) vh_template: Vec<RawVhTemplate>,
+}
+
+/// Templates are not instantiated; only the presence of members matters.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawVhTemplate {
+    #[serde(default)]
+    pub(super) name: Option<String>,
+    #[serde(default)]
+    pub(super) member: Vec<RawVhTemplateMember>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawVhTemplateMember {
+    #[serde(rename = "vhName", default)]
+    pub(super) vh_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -92,6 +135,10 @@ pub(super) struct RawTuning {
     pub(super) enable_brotli: Option<String>,
     #[serde(rename = "enableDynBrCompress", default)]
     pub(super) enable_dyn_brotli: Option<String>,
+    #[serde(rename = "gzipCompressLevel", default)]
+    pub(super) gzip_level: Option<String>,
+    #[serde(rename = "compressibleTypes", default)]
+    pub(super) compressible_types: Option<String>,
     #[serde(rename = "zstdCompressLevel", default)]
     pub(super) zstd_level: Option<String>,
     #[serde(rename = "brCompressLevel", default)]
@@ -306,8 +353,9 @@ pub(super) struct RawHealthCheck {
 pub(super) struct RawPhpConfig {
     #[serde(rename = "detachedMode", default)]
     pub(super) detached_mode: Option<String>,
+    /// LSWS `setRepeated('id')`: one entry per handler (#1027).
     #[serde(rename = "phpHandler", default)]
-    pub(super) php_handler: Option<RawPhpHandler>,
+    pub(super) php_handler: Vec<RawPhpHandler>,
     #[serde(default)]
     pub(super) env: Vec<String>,
     #[serde(rename = "maxConns", default)]
@@ -367,6 +415,12 @@ pub(super) struct RawVHostDecl {
     /// (#249 drift class) LSWS `restrained`: confine the vhost to its vhRoot.
     #[serde(default)]
     pub(super) restrained: Option<String>,
+    /// OLS auto-maps a vhost to these listeners; httpjet only maps through
+    /// `<vhostMapList>`, so a declared value is refused (#921).
+    #[serde(default)]
+    pub(super) listeners: Option<String>,
+    #[serde(default)]
+    pub(super) enabled: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -429,6 +483,12 @@ pub(super) struct RawVHostConfig {
     pub(super) doc_root: Option<String>,
     #[serde(rename = "indexFiles", default)]
     pub(super) index_files: Option<String>,
+    /// Flat-form companion of `<indexFiles>` (OLS `indexFiles_useServer`).
+    #[serde(rename = "indexFiles_useServer", default)]
+    pub(super) index_files_use_server: Option<String>,
+    /// The `<index>` block the LSWS webadmin writes (OLS `configIndex`).
+    #[serde(default)]
+    pub(super) index: Option<RawIndex>,
     #[serde(rename = "allowSymbolLink", default)]
     pub(super) allow_symbol_link: Option<String>,
     #[serde(default)]
@@ -467,6 +527,38 @@ pub(super) struct RawVHostConfig {
     /// (#248) Per-vhost `<logging>` block (error `<log>` + `<accessLog>`).
     #[serde(default)]
     pub(super) logging: Option<RawLogging>,
+    #[serde(default)]
+    pub(super) security: Option<RawVhostSecurity>,
+    #[serde(rename = "realmList", default)]
+    pub(super) realm_list: Option<RawRealmList>,
+    /// Root-level form, read by OLS when `<security>` is absent.
+    #[serde(rename = "accessControl", default)]
+    pub(super) access_control: Option<RawScopedAccessControl>,
+    #[serde(rename = "vhDomain", default)]
+    pub(super) vh_domain: Option<String>,
+    // Not implemented: parsed only so a non-empty block refuses the load (#925).
+    #[serde(rename = "phpIniOverride", default)]
+    pub(super) php_ini_override: Option<String>,
+    #[serde(rename = "customErrorPages", default)]
+    pub(super) custom_error_pages: Option<RawCustomErrorPages>,
+    #[serde(rename = "apacheConf", default)]
+    pub(super) apache_conf: Option<String>,
+    #[serde(default)]
+    pub(super) enabled: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawCustomErrorPages {
+    #[serde(rename = "errorPage", default)]
+    pub(super) error_page: Vec<RawErrorPage>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawErrorPage {
+    #[serde(rename = "errCode", default)]
+    pub(super) err_code: Option<String>,
+    #[serde(default)]
+    pub(super) url: Option<String>,
 }
 
 /// (#248) One `<logging>` block: an error-log spec plus an access-log spec, each
@@ -519,6 +611,18 @@ pub(super) struct RawRewrite {
     pub(super) base: Option<String>,
     #[serde(default)]
     pub(super) rules: Option<String>,
+    /// OLS `configRewriteMap`; maps are not implemented, so a declared one
+    /// refuses the load (#1030).
+    #[serde(default)]
+    pub(super) map: Vec<RawRewriteMap>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawRewriteMap {
+    #[serde(default)]
+    pub(super) name: Option<String>,
+    #[serde(default)]
+    pub(super) location: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -563,11 +667,17 @@ pub(super) struct RawContext {
     pub(super) handler: Option<String>,
     #[serde(default)]
     pub(super) enabled: Option<String>,
+    #[serde(rename = "allowBrowse", default)]
+    pub(super) allow_browse: Option<String>,
     #[serde(rename = "extraHeaders", default)]
     pub(super) extra_headers: Option<String>,
     #[serde(rename = "addDefaultCharset", default)]
     pub(super) add_default_charset: Option<String>,
-    #[serde(rename = "addDefaultCharsetCustomized", default)]
+    #[serde(
+        rename = "defaultCharsetCustomized",
+        alias = "addDefaultCharsetCustomized",
+        default
+    )]
     pub(super) charset: Option<String>,
     // httpjet-native per-context resource controls. Keep the raw strings so
     // conversion can distinguish an absent directive from an explicit zero
@@ -591,6 +701,73 @@ pub(super) struct RawContext {
     pub(super) sub_filter_types: Option<String>,
     #[serde(rename = "subFilterMaxBody", default)]
     pub(super) sub_filter_max_body: Option<String>,
+    // Context access control and HTTP auth are not enforced; parsed only so a
+    // declared policy rejects the config instead of being dropped.
+    #[serde(rename = "accessControl", default)]
+    pub(super) access_control: Option<RawScopedAccessControl>,
+    #[serde(default)]
+    pub(super) realm: Option<String>,
+    #[serde(default)]
+    pub(super) required: Option<String>,
+    #[serde(default)]
+    pub(super) authorizer: Option<String>,
+    #[serde(default)]
+    pub(super) auth: Option<RawContextAuth>,
+    #[serde(rename = "phpIniOverride", default)]
+    pub(super) php_ini_override: Option<String>,
+    #[serde(rename = "customErrorPages", default)]
+    pub(super) custom_error_pages: Option<RawCustomErrorPages>,
+    // Not implemented per context: parsed only so a declared one refuses the
+    // load instead of being dropped (#999).
+    #[serde(default)]
+    pub(super) rewrite: Option<RawRewrite>,
+    #[serde(rename = "apacheConf", default)]
+    pub(super) apache_conf: Option<String>,
+    #[serde(rename = "forceType", default)]
+    pub(super) force_type: Option<String>,
+    #[serde(rename = "addMIMEType", default)]
+    pub(super) add_mime_type: Option<String>,
+    #[serde(rename = "allowOverride", default)]
+    pub(super) allow_override: Option<String>,
+}
+
+/// OLS reads a context's realm from an `<auth>` child when present.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawContextAuth {
+    #[serde(default)]
+    pub(super) realm: Option<String>,
+    #[serde(default)]
+    pub(super) required: Option<String>,
+}
+
+/// Vhost/context `<accessControl>`; `allowList`/`denyList` are accepted
+/// spellings so they cannot slip past the fail-closed check either.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawScopedAccessControl {
+    #[serde(default, alias = "allowList")]
+    pub(super) allow: Vec<String>,
+    #[serde(default, alias = "denyList")]
+    pub(super) deny: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawVhostSecurity {
+    #[serde(rename = "accessControl", default)]
+    pub(super) access_control: Option<RawScopedAccessControl>,
+    #[serde(rename = "realmList", default)]
+    pub(super) realm_list: Option<RawRealmList>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawRealmList {
+    #[serde(default)]
+    pub(super) realm: Vec<RawRealm>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawRealm {
+    #[serde(default)]
+    pub(super) name: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -633,4 +810,25 @@ pub(super) struct RawVhSsl {
     pub(super) cert_chain: Option<String>,
     #[serde(rename = "CACertFile", default)]
     pub(super) ca_cert_file: Option<String>,
+    // Client-certificate verification is listener-only in httpjet; parsed so a
+    // vhost that requires it refuses the load (#1029).
+    #[serde(rename = "clientVerify", default)]
+    pub(super) client_verify: Option<String>,
+    #[serde(rename = "verifyDepth", default)]
+    pub(super) verify_depth: Option<String>,
+    #[serde(rename = "crlFile", default)]
+    pub(super) crl_file: Option<String>,
+    #[serde(rename = "CACertPath", default)]
+    pub(super) ca_cert_path: Option<String>,
+}
+
+/// `<index><useServer/><indexFiles/><autoIndex/></index>`.
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawIndex {
+    #[serde(rename = "useServer", default)]
+    pub(super) use_server: Option<String>,
+    #[serde(rename = "indexFiles", default)]
+    pub(super) index_files: Option<String>,
+    #[serde(rename = "autoIndex", default)]
+    pub(super) auto_index: Option<String>,
 }

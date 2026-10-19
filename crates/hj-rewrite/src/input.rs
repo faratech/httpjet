@@ -148,8 +148,9 @@ pub struct RewriteInput<'a> {
     /// request's `ctx.env` instead of cloning every entry into `env` per request.
     /// Env reads (`%{ENV:NAME}` / bare `%{NAME}`) consult the `[E=]` overlay, then
     /// the owned `env`, then this borrowed seed. Tests populate the owned `env` and
-    /// leave this `None`; on the hot path `env` is empty and this is `Some(&ctx.env)`
-    /// — the two are never both populated, so precedence is unambiguous. A slice
+    /// leave this `None`; on the hot path this is `Some(&ctx.env)` and `env` holds
+    /// only the `[E=]` output of earlier rulesets in the chain, which must shadow
+    /// the seed (an unset is carried as `""`). A slice
     /// (not a map) because the pipeline's `ctx.env` is a key-deduped `Vec`, so an
     /// `iter().find()` is an exact-key lookup equivalent to the old `BTreeMap::get`.
     pub env_seed: Option<&'a [(String, String)]>,

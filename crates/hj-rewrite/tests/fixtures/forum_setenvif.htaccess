@@ -1,0 +1,21 @@
+# The SetEnvIf directives of the production forum .htaccess, in source order
+# with their containers (#977 differential: reuse/caching must not change any
+# assignment). Includes the adjacent identical-test pairs.
+<IfModule mod_headers.c>
+    SetEnvIf Query_String "(^|&)amp=1(&|$)" AMP_PAGE
+</IfModule>
+SetEnvIf Origin "^https://(windowsforum\.com|.*\.windowsforum\.com|googleads\.g\.doubleclick\.net|.*\.doubleclick\.net|.*\.googlesyndication\.com|.*\.googleadservices\.com|.*\.google\.com|.*\.gstatic\.com|.*\.cloudflare\.com|challenges\.cloudflare\.com)$" ORIGIN_ALLOWED=$0
+SetEnvIf Request_URI "^/(chat|tts)\.php$" WF_CHAT_CORS_ENDPOINT=1
+<IfModule mod_headers.c>
+  SetEnvIf Request_URI "^/(data|js|styles)/?$" WF_NOINDEX_PATH
+  SetEnvIf Request_URI "^/data/(attachments|avatars)/?$" WF_NOINDEX_PATH
+  SetEnvIf Request_URI "\.rss$" WF_NOINDEX_PATH
+</IfModule>
+<IfModule LiteSpeed>
+    SetEnvIf Request_URI "^/beta/?$" Cache-Control=no-cache
+    SetEnvIf Request_URI "^/beta/?$" WF_BETA_CONTROL=1
+    SetEnvIfNoCase Cookie xf_session_admin Cache-Control=no-cache
+    SetEnvIfNoCase Cookie xf_session_admin cache-vary=admin
+    SetEnvIfNoCase Cookie "^(?=.*(?:^|;[[:space:]]*)xf_(?:user|session)=[^;]+(?:;|$))(?=.*(?:^|;[[:space:]]*)xf_style_id=51(?:;|$))" Cache-Control=no-cache
+    SetEnvIfNoCase Cookie "^(?=.*(?:^|;[[:space:]]*)xf_(?:user|session)=[^;]+(?:;|$))(?=.*(?:^|;[[:space:]]*)xf_style_id=51(?:;|$))" cache-vary=wf-preview
+</IfModule>

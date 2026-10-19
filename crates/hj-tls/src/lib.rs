@@ -65,7 +65,7 @@
 #[cfg(feature = "ocsp")]
 pub mod ocsp;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,6 +112,11 @@ pub(crate) const ALPN_PROTOCOLS: &[&[u8]] = &[b"h2", b"http/1.1"];
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SniCertMap {
     by_name: HashMap<String, Vec<Arc<CertifiedKey>>>,
+    /// Names mapped to a vhost that has no usable certificate: OLS serves the
+    /// listener's own context for them (`pVHost->getSslContext()` is null).
+    default_names: HashSet<String>,
+    /// The catch-all (`*`) vhost's certificate chains.
+    catch_all: Vec<Arc<CertifiedKey>>,
     #[cfg(feature = "ocsp")]
     stapling: Option<Arc<ocsp::Slots>>,
 }
@@ -147,9 +152,58 @@ impl SniCertMap {
             .push(ck);
     }
 
+    /// Register the catch-all (`*`) vhost's certificate.
+    pub(crate) fn add_catch_all(&mut self, ck: Arc<CertifiedKey>) {
+        self.catch_all.push(ck);
+    }
+
+    /// Record that `name` is mapped to a vhost without a usable certificate.
+    pub(crate) fn add_listener_default(&mut self, name: &str) {
+        self.default_names.insert(name.to_ascii_lowercase());
+    }
+
+    /// Every registered chain (OCSP slot registration).
+    #[cfg(feature = "ocsp")]
+    pub(crate) fn keys(&self) -> impl Iterator<Item = Arc<CertifiedKey>> + '_ {
+        self.by_name
+            .values()
+            .flatten()
+            .chain(self.catch_all.iter())
+            .cloned()
+    }
+
+    /// OLS `VHostMapFindSslContext`: the mapped vhost for the name, retried
+    /// without a leading `www.` when the name is unmapped (or only reaches the
+    /// catch-all), then the catch-all vhost. `None` means the listener's own
+    /// certificate: SNI is absent, nothing (not even a catch-all) maps the name,
+    /// or the selected vhost has no certificate.
+    pub(crate) fn select(
+        &self,
+        server_name: Option<&str>,
+        signature_schemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        let name = server_name?.to_ascii_lowercase();
+        let mapped = |name: &str| -> Option<Option<Arc<CertifiedKey>>> {
+            if let Some(certs) = self.by_name.get(name) {
+                return Some(pick_key(certs, signature_schemes));
+            }
+            self.default_names.contains(name).then_some(None)
+        };
+        if name != "*" {
+            if let Some(hit) = mapped(&name) {
+                return hit;
+            }
+            if let Some(bare) = name.strip_prefix("www.")
+                && let Some(hit) = mapped(bare)
+            {
+                return hit;
+            }
+        }
+        pick_key(&self.catch_all, signature_schemes)
+    }
+
     /// Resolve by exact (lowercased) servername. Returns `None` when SNI is
-    /// absent or maps to no configured domain — the wrapping resolver then
-    /// supplies the listener default certificate.
+    /// absent or maps to no configured domain.
     pub(crate) fn resolve_name(
         &self,
         server_name: Option<&str>,
@@ -157,50 +211,57 @@ impl SniCertMap {
     ) -> Option<Arc<CertifiedKey>> {
         let name = server_name?;
         let certs = self.by_name.get(&name.to_ascii_lowercase())?;
-        let compatible =
-            |ck: &&Arc<CertifiedKey>| ck.key.choose_scheme(signature_schemes).is_some();
-        // Multiple chains: prefer a compatible ECDSA key when the client offers
-        // one of its exact schemes, otherwise prefer a compatible non-ECDSA key.
-        // Never select a key solely by its broad algorithm: rustls cannot sign
-        // the handshake when, for example, a P-256 key is paired with a client
-        // that offered only ECDSA P-384 plus a compatible RSA scheme.
-        let prefers_ecdsa = signature_schemes.iter().any(|scheme| {
-            matches!(
-                scheme,
-                rustls::SignatureScheme::ECDSA_NISTP256_SHA256
-                    | rustls::SignatureScheme::ECDSA_NISTP384_SHA384
-            )
-        });
-        if prefers_ecdsa {
-            certs
-                .iter()
-                .filter(compatible)
-                .find(|ck| ck.key.algorithm() == rustls::SignatureAlgorithm::ECDSA)
-        } else {
-            certs
-                .iter()
-                .filter(compatible)
-                .find(|ck| ck.key.algorithm() != rustls::SignatureAlgorithm::ECDSA)
-        }
-        .or_else(|| certs.iter().find(compatible))
-        // Preserve the configured-name boundary when none of its keys can sign
-        // for this client: return that mapping's original first key so rustls
-        // rejects the handshake, rather than falling through to the listener's
-        // unrelated default certificate.
-        .or_else(|| certs.first())
-        .cloned()
+        pick_key(certs, signature_schemes)
     }
+}
+
+fn pick_key(
+    certs: &[Arc<CertifiedKey>],
+    signature_schemes: &[rustls::SignatureScheme],
+) -> Option<Arc<CertifiedKey>> {
+    let compatible = |ck: &&Arc<CertifiedKey>| ck.key.choose_scheme(signature_schemes).is_some();
+    // Multiple chains: prefer a compatible ECDSA key when the client offers
+    // one of its exact schemes, otherwise prefer a compatible non-ECDSA key.
+    // Never select a key solely by its broad algorithm: rustls cannot sign
+    // the handshake when, for example, a P-256 key is paired with a client
+    // that offered only ECDSA P-384 plus a compatible RSA scheme.
+    let prefers_ecdsa = signature_schemes.iter().any(|scheme| {
+        matches!(
+            scheme,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256
+                | rustls::SignatureScheme::ECDSA_NISTP384_SHA384
+        )
+    });
+    if prefers_ecdsa {
+        certs
+            .iter()
+            .filter(compatible)
+            .find(|ck| ck.key.algorithm() == rustls::SignatureAlgorithm::ECDSA)
+    } else {
+        certs
+            .iter()
+            .filter(compatible)
+            .find(|ck| ck.key.algorithm() != rustls::SignatureAlgorithm::ECDSA)
+    }
+    .or_else(|| certs.iter().find(compatible))
+    // Preserve the configured-name boundary when none of its keys can sign
+    // for this client: return that mapping's original first key so rustls
+    // rejects the handshake, rather than falling through to the listener's
+    // unrelated default certificate.
+    .or_else(|| certs.first())
+    .cloned()
 }
 
 /// A certificate resolver that tries the SNI map first and falls back to a
 /// default certificate when SNI is absent or unmatched.
 ///
-/// [`SniCertMap`] returns `None` for unknown / missing SNI; that alone would
+/// [`SniCertMap::select`] returns `None` for missing SNI, a name no mapping
+/// (not even a catch-all vhost) supplies a certificate for; that alone would
 /// abort the handshake. Wrapping it with a default mirrors LiteSpeed's
-/// behaviour where the listener's own certificate serves any name not
-/// explicitly mapped to a vhost cert (including raw-IP TLS with no SNI). This
-/// matches OLS `VHostMapFindSslContext`, which falls back to the listener-level
-/// `pMap->getSslContext()` when no mapped vhost supplies a context.
+/// behaviour where the listener's own certificate serves those (including
+/// raw-IP TLS with no SNI). This matches OLS `VHostMapFindSslContext`, which
+/// falls back to the listener-level `pMap->getSslContext()` when no mapped
+/// vhost supplies a context.
 #[derive(Debug, Clone)]
 struct SniWithDefault {
     sni: SniCertMap,
@@ -211,10 +272,10 @@ struct SniWithDefault {
 
 impl ResolvesServerCert for SniWithDefault {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // Match the configured domain exactly (no SAN validation); otherwise
-        // fall back to the listener default cert.
+        // Configured domain (no SAN validation), `www.` retry, catch-all
+        // vhost; otherwise the listener default cert.
         self.sni
-            .resolve_name(client_hello.server_name(), client_hello.signature_schemes())
+            .select(client_hello.server_name(), client_hello.signature_schemes())
             .or_else(|| self.default.clone())
     }
 }
@@ -291,7 +352,7 @@ impl CertReloadHandle {
         }
         #[cfg(feature = "ocsp")]
         if let Some(stapling) = self.2.load_full() {
-            map.stapling = Some(stapling.register(map.by_name.values().flatten().cloned())?);
+            map.stapling = Some(stapling.register(map.keys())?);
         }
         self.1.store(Arc::new(map));
         Ok(())
@@ -306,22 +367,29 @@ impl CertReloadHandle {
     /// renewal, a half-written PEM, a key that does not match) keeps the certificate it
     /// had before instead of silently falling back to the listener default, which would
     /// be a name mismatch (Cloudflare 526) until the next reload (#606).
+    ///
+    /// A generation built in ACME bootstrap mode has no listener default; a reload keeps
+    /// it that way instead of requiring the default certificate bootstrap omits (#809).
     pub fn reload(&self, server: &ServerConfig, listener: &Listener) -> Result<()> {
         let previous = self.0.load_full();
         #[allow(unused_mut)]
-        let mut next = build_sni_with_default_retaining(server, listener, Some(&previous.sni))?;
+        let mut next = if previous.default.is_none() {
+            SniWithDefault {
+                sni: build_sni_resolver_retaining(server, listener, Some(&previous.sni))
+                    .with_context(|| {
+                        format!("listener {}: building SNI resolver", listener.name)
+                    })?,
+                default: None,
+                #[cfg(feature = "ocsp")]
+                stapling: None,
+            }
+        } else {
+            build_sni_with_default_retaining(server, listener, Some(&previous.sni))?
+        };
         #[cfg(feature = "ocsp")]
         if let Some(stapling) = self.2.load_full() {
-            next.stapling = Some(
-                stapling.register(
-                    next.sni
-                        .by_name
-                        .values()
-                        .flatten()
-                        .cloned()
-                        .chain(next.default.iter().cloned()),
-                )?,
-            );
+            next.stapling =
+                Some(stapling.register(next.sni.keys().chain(next.default.iter().cloned()))?);
         }
         self.0.store(Arc::new(next));
         Ok(())
@@ -602,7 +670,23 @@ fn build_sni_resolver_retaining(
     let mut resolver = SniCertMap::new();
     let mut registered = 0usize;
 
-    for map in &listener.vhost_map {
+    let routes = listener.domain_routes().routes;
+    for (map_index, map) in listener.vhost_map.iter().enumerate() {
+        // The SNI names this mapping owns, under the router's OLS mapDomainList rules (port
+        // ignored, `www.` folded, a duplicate claimed by an earlier vhost dropped): the
+        // configured spelling plus its `www.`-stripped key, and the `*` catch-all.
+        let mut names: Vec<&str> = Vec::new();
+        if map.domains.iter().any(|d| d.trim() == "*") {
+            names.push("*");
+        }
+        for r in routes.iter().filter(|r| r.map_index == map_index) {
+            for name in [r.literal.as_str(), r.key.as_str()] {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        let map_domains = &names;
         let Some(decl) = server.vhosts.get(&map.vhost) else {
             tracing::warn!(
                 listener = %listener.name,
@@ -611,12 +695,22 @@ fn build_sni_resolver_retaining(
             );
             continue;
         };
+        let listener_default = |resolver: &mut SniCertMap| {
+            for domain in map_domains {
+                let domain = domain.trim();
+                if !domain.is_empty() && domain != "*" {
+                    resolver.add_listener_default(domain);
+                }
+            }
+        };
         let Some(vhconf) = decl.config.as_ref() else {
             tracing::debug!(vhost = %map.vhost, "vhost config not loaded; skipping for SNI");
+            listener_default(&mut resolver);
             continue;
         };
         let Some(vhssl) = vhconf.vhssl.as_ref() else {
             // No per-vhost cert: this domain will be served by the default cert.
+            listener_default(&mut resolver);
             continue;
         };
 
@@ -628,15 +722,30 @@ fn build_sni_resolver_retaining(
             Ok(ck) => Arc::new(ck),
             Err(err) => {
                 let mut retained = 0usize;
-                if let Some(previous) = previous {
-                    for domain in &map.domains {
-                        let domain = domain.trim();
-                        if let Some(keys) = previous.by_name.get(&domain.to_ascii_lowercase()) {
+                for domain in map_domains {
+                    let domain = domain.trim();
+                    let keys = previous.and_then(|previous| {
+                        if domain == "*" {
+                            (!previous.catch_all.is_empty()).then_some(&previous.catch_all)
+                        } else {
+                            previous.by_name.get(&domain.to_ascii_lowercase())
+                        }
+                    });
+                    match keys {
+                        Some(keys) => {
                             for key in keys {
-                                resolver.add(domain, key.clone());
+                                if domain == "*" {
+                                    resolver.add_catch_all(key.clone());
+                                } else {
+                                    resolver.add(domain, key.clone());
+                                }
                             }
                             retained += 1;
                         }
+                        None if !domain.is_empty() && domain != "*" => {
+                            resolver.add_listener_default(domain);
+                        }
+                        None => {}
                     }
                 }
                 if retained > 0 {
@@ -662,9 +771,14 @@ fn build_sni_resolver_retaining(
             }
         };
 
-        for domain in &map.domains {
+        for domain in map_domains {
             let domain = domain.trim();
-            if domain.is_empty() || domain == "*" {
+            if domain.is_empty() {
+                continue;
+            }
+            if domain == "*" {
+                resolver.add_catch_all(ck.clone());
+                registered += 1;
                 continue;
             }
             // OLS maps the configured domain straight to the vhost's cert with
@@ -729,6 +843,9 @@ fn build_optional_client_verifier(
 struct DepthLimitedClientVerifier {
     inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
     max_intermediates: usize,
+    /// DER of the configured trust anchors: a client that sends its root along with the
+    /// chain is not one intermediate deeper (OpenSSL verify_depth counts the built path).
+    anchors: Vec<CertificateDer<'static>>,
     /// Reuse a verified chain only for the identical verifier UnixTime. A new
     /// handshake time must recheck certificate and revocation validity. Exact
     /// DER keys and per-policy verifier instances retain the trust boundary.
@@ -772,10 +889,12 @@ impl DepthLimitedClientVerifier {
     fn wrap(
         inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
         max_intermediates: usize,
+        anchors: Vec<CertificateDer<'static>>,
     ) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
         Arc::new(DepthLimitedClientVerifier {
             inner,
             max_intermediates,
+            anchors,
             chain_memo: parking_lot::Mutex::new(Vec::new()),
         })
     }
@@ -800,14 +919,17 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
         // OLS verifyDepth N == at most N intermediate CAs between the leaf and the trust anchor.
         // Checked FIRST (before webpki AND before the memo): a too-deep chain is rejected for
         // free, and a cached verdict can never bypass the depth limit.
-        if intermediates.len() > self.max_intermediates {
+        let depth = intermediates
+            .iter()
+            .filter(|c| !self.anchors.iter().any(|a| a.as_ref() == c.as_ref()))
+            .count();
+        if depth > self.max_intermediates {
             return Err(rustls::Error::InvalidCertificate(
                 rustls::CertificateError::Other(rustls::OtherError(Arc::new(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
                         "client certificate chain has {} intermediate(s), exceeding verifyDepth {}",
-                        intermediates.len(),
-                        self.max_intermediates
+                        depth, self.max_intermediates
                     ),
                 )))),
             ));
@@ -1105,7 +1227,11 @@ fn build_listener_verifier(
         _ => WebPkiClientVerifier::no_client_auth(),
     };
     Ok(if matches!(tls.client_verify, 1 | 2 | 3) {
-        DepthLimitedClientVerifier::wrap(base_verifier, tls.verify_depth as usize)
+        let anchors = match tls.ca_cert_file.as_deref() {
+            Some(ca) => read_certs(ca)?,
+            None => Vec::new(),
+        };
+        DepthLimitedClientVerifier::wrap(base_verifier, tls.verify_depth as usize, anchors)
     } else {
         base_verifier
     })
@@ -1778,8 +1904,8 @@ mod tests {
 
         // Should not error even though `*` and an unknown vhost are present.
         let resolver = build_sni_resolver(&server, &listener).expect("resolver");
-        // `*` (catch-all) and the unknown `ghost` vhost are skipped; only the
-        // single real domain is registered.
+        // `*` is not an exact name (it is the catch-all) and the unknown
+        // `ghost` vhost is skipped; only the single real domain is registered.
         assert!(
             resolver
                 .resolve_name(Some("real.example.com"), P256_SCHEMES)
@@ -1790,6 +1916,17 @@ mod tests {
             resolver
                 .resolve_name(Some("ghost.example.com"), P256_SCHEMES)
                 .is_none()
+        );
+        // An unmapped name selects the catch-all vhost's (vh1's) cert.
+        assert_eq!(
+            resolver
+                .select(Some("ghost.example.com"), P256_SCHEMES)
+                .unwrap()
+                .cert,
+            resolver
+                .resolve_name(Some("real.example.com"), P256_SCHEMES)
+                .unwrap()
+                .cert
         );
     }
 
@@ -1913,6 +2050,52 @@ mod tests {
         (server, listener, vh_key)
     }
 
+    /// Regression (#809): in ACME bootstrap mode the listener default certificate is
+    /// intentionally absent, so a SIGHUP reload must not require it. A rotated vhost
+    /// certificate is picked up and the generation keeps no default identity.
+    #[test]
+    fn bootstrap_reload_rotates_vhost_cert_without_listener_default() {
+        ensure_provider();
+        let dir = tmpdir();
+        let (server, listener, _vh_key) = reload_fixture(&dir, "reload-bootstrap");
+        let tls = listener.tls.as_ref().unwrap();
+        std::fs::remove_file(&tls.cert_file).unwrap();
+        std::fs::remove_file(&tls.key_file).unwrap();
+        let (_config, handle) =
+            build_server_config_alpn_with_bootstrap(&server, &listener, vec![b"h2".to_vec()], true)
+                .expect("bootstrap builds without a default cert");
+        let leaf = |handle: &CertReloadHandle| {
+            handle
+                .0
+                .load()
+                .sni
+                .resolve_name(Some("publisher.example"), P256_SCHEMES)
+                .expect("vhost resolves")
+                .cert[0]
+                .as_ref()
+                .to_vec()
+        };
+        let before = leaf(&handle);
+
+        let renewed = gen_cert(&["publisher.example"]);
+        let vh_cert = write_tmp(&dir, "reload-bootstrap-vh-cert.pem", &renewed.cert_pem);
+        write_tmp(&dir, "reload-bootstrap-vh-key.pem", &renewed.key_pem);
+        let expected = load_cert_chain(&vh_cert, None).unwrap()[0]
+            .as_ref()
+            .to_vec();
+        assert_ne!(before, expected, "test sanity: the vhost cert changed");
+
+        handle
+            .reload(&server, &listener)
+            .expect("bootstrap-mode reload succeeds without a listener default");
+        assert_eq!(leaf(&handle), expected, "renewed vhost cert is live");
+        assert!(
+            handle.0.load().default.is_none(),
+            "reload keeps bootstrap mode's absent default"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     /// Regression (#606): a vhost whose certificate cannot be loaded at SIGHUP time
     /// keeps its previous certificate instead of silently falling back to the listener
     /// default (a name mismatch, i.e. Cloudflare 526, until the next reload).
@@ -1953,6 +2136,138 @@ mod tests {
         assert!(
             CERT_RELOAD_RETAINED.load(std::sync::atomic::Ordering::Relaxed) >= retained_before + 2
         );
+    }
+
+    /// OLS `VHostMapFindSslContext` (#820): an unmapped name gets the catch-all
+    /// vhost's cert before the listener's, and a `www.` name that is unmapped (or
+    /// only reaches the catch-all) is retried without the prefix. Exact mappings,
+    /// vhosts without a certificate and missing SNI keep their old selection; the
+    /// catch-all is retained across a failed reload like any other vhost cert.
+    #[test]
+    fn sni_select_uses_catch_all_and_www_retry_like_ols() {
+        ensure_provider();
+        let dir = tmpdir();
+        let vh = |name: &str, server: &mut ServerConfig| {
+            let c = gen_cert(&[name]);
+            let cert = write_tmp(&dir, &format!("ols-{name}-cert.pem"), &c.cert_pem);
+            let key = write_tmp(&dir, &format!("ols-{name}-key.pem"), &c.key_pem);
+            server.vhosts.insert(
+                name.into(),
+                make_vhost_decl(
+                    name,
+                    Some(VhSsl {
+                        key_file: key.clone(),
+                        cert_file: cert,
+                        cert_chain: false,
+                        ca_cert_file: None,
+                    }),
+                ),
+            );
+            key
+        };
+        let mut server = base_server();
+        let main_key = vh("main.example", &mut server);
+        vh("pub.example", &mut server);
+        server
+            .vhosts
+            .insert("plain".into(), make_vhost_decl("plain", None));
+        let dflt = gen_cert(&["listener.example"]);
+        let listener = Listener {
+            name: "TLS".into(),
+            address: "*:8443".into(),
+            secure: true,
+            proxy_protocol: false,
+            proxy_protocol_peers: vec![],
+            uds_path: None,
+            vhost_map: vec![
+                VhostMap {
+                    vhost: "main.example".into(),
+                    domains: vec!["*".into(), "main.example".into()],
+                },
+                VhostMap {
+                    vhost: "pub.example".into(),
+                    domains: vec!["pub.example".into(), "www.alias.example".into()],
+                },
+                VhostMap {
+                    vhost: "plain".into(),
+                    domains: vec!["plain.example".into()],
+                },
+                // #940: a configured port is ignored, and a later vhost claiming an
+                // already-mapped domain never adds its certificate for that name.
+                VhostMap {
+                    vhost: "pub.example".into(),
+                    domains: vec!["port.example:8443".into()],
+                },
+                VhostMap {
+                    vhost: "main.example".into(),
+                    domains: vec!["pub.example".into()],
+                },
+            ],
+            tls: Some(ListenerTls {
+                key_file: write_tmp(&dir, "ols-listener-key.pem", &dflt.key_pem),
+                cert_file: write_tmp(&dir, "ols-listener-cert.pem", &dflt.cert_pem),
+                cert_chain: false,
+                ca_cert_file: None,
+                client_verify: 0,
+                verify_depth: 1,
+                enable_stapling: false,
+                crl_file: None,
+            }),
+        };
+        let (_config, handle) = build_server_config_reloadable(&server, &listener).unwrap();
+        let pick = |name: Option<&str>| {
+            let generation = handle.0.load();
+            generation
+                .sni
+                .select(name, P256_SCHEMES)
+                .or_else(|| generation.default.clone())
+                .unwrap()
+        };
+        let main = pick(Some("main.example"));
+        let publ = pick(Some("pub.example"));
+        let listener_ck = handle.0.load().default.clone().unwrap();
+        assert!(main.cert != publ.cert && main.cert != listener_ck.cert);
+        let check = |name: Option<&str>, want: &Arc<CertifiedKey>| {
+            assert_eq!(pick(name).cert, want.cert, "{name:?}");
+        };
+        let check_all = |main: &Arc<CertifiedKey>| {
+            check(Some("pub.example"), &publ);
+            check(Some("www.pub.example"), &publ);
+            check(Some("WWW.Pub.Example"), &publ);
+            check(Some("www.alias.example"), &publ);
+            // OLS mapDomainList strips the configured `www.` (#940), so the bare
+            // `alias.example` maps to the same vhost as its configured www. form.
+            check(Some("alias.example"), &publ);
+            check(Some("port.example"), &publ);
+            check(Some("unmapped.example"), main);
+            check(Some("www.unmapped.example"), main);
+            check(Some("www.main.example"), main);
+            check(Some("sub.pub.example"), main);
+            // A vhost without a certificate keeps the listener's, www. form too.
+            check(Some("plain.example"), &listener_ck);
+            check(Some("www.plain.example"), &listener_ck);
+            check(None, &listener_ck);
+        };
+        check_all(&main);
+
+        std::fs::remove_file(&main_key).unwrap();
+        handle.reload(&server, &listener).expect("reload succeeds");
+        check_all(&main);
+    }
+
+    /// Without a catch-all mapping, unmapped names keep the listener cert.
+    #[test]
+    fn sni_select_without_catch_all_falls_back_to_listener_cert() {
+        let mut map = SniCertMap::new();
+        let key = exact_scheme_cert(rustls::SignatureAlgorithm::ECDSA, P256_SCHEMES[0]);
+        map.add("example.com", key.clone());
+        assert!(Arc::ptr_eq(
+            &map.select(Some("www.example.com"), P256_SCHEMES).unwrap(),
+            &key
+        ));
+        assert!(map.select(Some("other.example"), P256_SCHEMES).is_none());
+        assert!(map.select(Some("www."), P256_SCHEMES).is_none());
+        assert!(map.select(None, P256_SCHEMES).is_none());
     }
 
     #[test]
@@ -2155,9 +2470,11 @@ mod tests {
         // only ever ADD a rejection, never accept what the inner verifier refused.
         use rustls::server::danger::ClientCertVerifier as _;
         let leaf = CertificateDer::from(vec![1u8, 2, 3, 4]);
+        let root = CertificateDer::from(vec![9u8, 9, 9]);
         let v = DepthLimitedClientVerifier {
             inner: Arc::new(AlwaysOkVerifier),
             max_intermediates: 1,
+            anchors: vec![root.clone()],
             chain_memo: parking_lot::Mutex::new(Vec::new()),
         };
         let now = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
@@ -2175,6 +2492,12 @@ mod tests {
             v.verify_client_cert(&leaf, &[leaf.clone(), leaf.clone()], now)
                 .is_err(),
             "2 intermediates exceeds verifyDepth 1 → rejected"
+        );
+        // #903: the client's copy of the trust anchor is not an intermediate.
+        assert!(
+            v.verify_client_cert(&leaf, &[leaf.clone(), root.clone()], now)
+                .is_ok(),
+            "leaf + intermediate + root is depth 1"
         );
     }
 
@@ -2772,6 +3095,158 @@ mod tests {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         );
     }
+
+    /// Live-config SNI audit (#820): for every mapped domain, its `www.` form and
+    /// a set of unmapped names, compare the exact-or-listener selection (the
+    /// pre-#820 resolver) with [`SniCertMap::select`]. A name whose old
+    /// certificate covered it must keep that certificate.
+    #[test]
+    #[ignore = "reads /usr/local/lsws + /etc cert files; run explicitly"]
+    fn live_sni_selection_keeps_every_covered_name() {
+        ensure_provider();
+        let root = "/usr/local/lsws";
+        if !Path::new(root).join("conf/httpd_config.xml").exists() {
+            eprintln!("skip: no live LSWS config");
+            return;
+        }
+        let cfg = hj_config::load(root).expect("live config loads");
+        let describe = |ck: &CertifiedKey| -> (String, Vec<String>) {
+            let (_, cert) = x509_parser::parse_x509_certificate(ck.cert[0].as_ref()).unwrap();
+            let cn = cert
+                .subject()
+                .iter_common_name()
+                .next()
+                .and_then(|c| c.as_str().ok())
+                .unwrap_or("?")
+                .to_string();
+            let sans = cert
+                .subject_alternative_name()
+                .ok()
+                .flatten()
+                .map(|ext| {
+                    ext.value
+                        .general_names
+                        .iter()
+                        .filter_map(|n| match n {
+                            x509_parser::extensions::GeneralName::DNSName(d) => {
+                                Some(d.to_ascii_lowercase())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (cn, sans)
+        };
+        let covers = |sans: &[String], name: &str| {
+            sans.iter().any(|san| {
+                san == name
+                    || san.strip_prefix("*.").is_some_and(|suffix| {
+                        name.split_once('.').is_some_and(|(_, rest)| rest == suffix)
+                    })
+            })
+        };
+        let mut regressions = Vec::new();
+        let mut checked = 0usize;
+        for listener in cfg.listeners.iter().filter(|l| l.secure && l.tls.is_some()) {
+            let generation = build_sni_with_default(&cfg, listener).expect("live SNI builds");
+            let mut names: Vec<String> = vec![
+                "windowsforum.com".into(),
+                "moontimenow.com".into(),
+                "thisdayinhistory.ai".into(),
+                "windowsnews.ai".into(),
+                "httpjet.net".into(),
+                "mfara.com".into(),
+                "news.windowsforum.com".into(),
+                "admin.windowsforum.com".into(),
+                "node.windowsforum.com".into(),
+                "unmapped.example".into(),
+            ];
+            names.extend(cfg.vhosts.keys().cloned());
+            for map in &listener.vhost_map {
+                names.extend(map.domains.iter().map(|d| d.trim().to_ascii_lowercase()));
+            }
+            names.retain(|n| !n.is_empty() && n != "*");
+            let bare: Vec<String> = names.clone();
+            for n in bare {
+                if let Some(rest) = n.strip_prefix("www.") {
+                    names.push(rest.to_string());
+                } else {
+                    names.push(format!("www.{n}"));
+                }
+            }
+            names.sort();
+            names.dedup();
+            println!(
+                "listener {} (default cert {}):",
+                listener.name,
+                listener.tls.as_ref().unwrap().cert_file.display()
+            );
+            println!(
+                "  {:<40} {:<32} {:<5} {:<32} {:<5} {:<13} changed",
+                "name", "before", "ok", "after", "ok", "after-source"
+            );
+            for name in &names {
+                let schemes = &[
+                    rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                    rustls::SignatureScheme::RSA_PSS_SHA256,
+                    rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                ];
+                let before = generation
+                    .sni
+                    .resolve_name(Some(name), schemes)
+                    .or_else(|| generation.default.clone())
+                    .unwrap();
+                let after = generation
+                    .sni
+                    .select(Some(name), schemes)
+                    .or_else(|| generation.default.clone())
+                    .unwrap();
+                let (b_cn, b_sans) = describe(&before);
+                let (a_cn, a_sans) = describe(&after);
+                let changed = before.cert != after.cert;
+                let b_ok = covers(&b_sans, name);
+                let a_ok = covers(&a_sans, name);
+                let source = if generation.sni.resolve_name(Some(name), schemes).is_some() {
+                    "exact"
+                } else if generation.sni.default_names.contains(name.as_str()) {
+                    "vhost-no-cert"
+                } else if name.strip_prefix("www.").is_some_and(|bare| {
+                    generation.sni.by_name.contains_key(bare)
+                        || generation.sni.default_names.contains(bare)
+                }) {
+                    "www-retry"
+                } else if !generation.sni.catch_all.is_empty() {
+                    "catch-all"
+                } else {
+                    "listener"
+                };
+                println!(
+                    "  {name:<40} {b_cn:<32} {b_ok:<5} {a_cn:<32} {a_ok:<5} {source:<13} {}",
+                    if changed { "CHANGED" } else { "-" }
+                );
+                if changed && b_ok {
+                    regressions.push(format!("{}: {name}", listener.name));
+                }
+                checked += 1;
+            }
+            let none_before = generation.default.clone().unwrap();
+            let none_after = generation
+                .sni
+                .select(None, &[rustls::SignatureScheme::ECDSA_NISTP256_SHA256])
+                .or_else(|| generation.default.clone())
+                .unwrap();
+            assert_eq!(
+                none_before.cert, none_after.cert,
+                "no-SNI keeps the listener cert"
+            );
+        }
+        assert!(checked > 0);
+        assert!(
+            regressions.is_empty(),
+            "covered names changed: {regressions:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2923,7 +3398,7 @@ mod resumption_tests {
             inner: webpki,
             calls: AtomicUsize::new(0),
         });
-        let verifier = DepthLimitedClientVerifier::wrap(counting.clone(), 3);
+        let verifier = DepthLimitedClientVerifier::wrap(counting.clone(), 3, Vec::new());
 
         let now = rustls::pki_types::UnixTime::now();
         let leaf = client_cert.der().clone();

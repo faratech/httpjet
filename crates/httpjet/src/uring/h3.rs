@@ -21,6 +21,7 @@ use arc_swap::ArcSwap;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use bytes::{Bytes, BytesMut};
+use hj_core::body_deadline::BodyProgress;
 use monoio::net::udp::UdpSocket;
 use quinn_proto::{
     ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event, ServerConfig,
@@ -69,6 +70,7 @@ pub(crate) struct H3AdmissionCounts {
     pub refused_budget: u64,
     pub refused_handshakes: u64,
     pub handshake_timeouts: u64,
+    pub send_stall_resets: u64,
 }
 
 pub(crate) fn admission_counts() -> H3AdmissionCounts {
@@ -78,6 +80,7 @@ pub(crate) fn admission_counts() -> H3AdmissionCounts {
         refused_budget: H3_REFUSED_BUDGET.load(Relaxed),
         refused_handshakes: H3_REFUSED_HANDSHAKES.load(Relaxed),
         handshake_timeouts: H3_HANDSHAKE_TIMEOUTS.load(Relaxed),
+        send_stall_resets: H3_SEND_STALL_RESETS.load(Relaxed),
     }
 }
 
@@ -187,6 +190,8 @@ struct PendingConnectionBudget {
     cap: u32,
 }
 
+const H3_NO_ERROR: u32 = 0x0100;
+const H3_INTERNAL_ERROR: u32 = 0x0102;
 const H3_STREAM_CREATION_ERROR: u32 = 0x0103;
 const H3_CLOSED_CRITICAL_STREAM: u32 = 0x0104;
 const H3_FRAME_UNEXPECTED: u32 = 0x0105;
@@ -194,6 +199,7 @@ const H3_EXCESSIVE_LOAD: u32 = 0x0107;
 const H3_SETTINGS_ERROR: u32 = 0x0109;
 const H3_MISSING_SETTINGS: u32 = 0x010a;
 const H3_REQUEST_CANCELLED: u32 = 0x010c;
+const H3_MESSAGE_ERROR: u32 = 0x010e;
 const MAX_SETTINGS_PAYLOAD: usize = 64 * 1024;
 
 /// One coherent accept-time QUIC policy. The quinn configuration and serving
@@ -299,17 +305,28 @@ impl H3RequestLimits {
 }
 
 /// (#509) Request-stream limits captured together from one configuration generation.
-/// `timeout` is an absolute budget from stream acceptance through FIN; progress
-/// never refreshes it.
+/// `timeout` is the budget from stream acceptance through FIN. Only the stream's own
+/// progress extends it: each `BODY_MIN_PROGRESS` received restarts the window, up to
+/// `body_ceiling` from acceptance (#1035).
 #[derive(Clone, Copy)]
 pub(crate) struct H3RequestConfig {
     limits: H3RequestLimits,
     timeout: Option<Duration>,
+    body_ceiling: Duration,
 }
 
 impl H3RequestConfig {
     pub(crate) fn new(limits: H3RequestLimits, timeout: Option<Duration>) -> Self {
-        Self { limits, timeout }
+        Self {
+            limits,
+            timeout,
+            body_ceiling: hj_core::body_deadline::BODY_DEADLINE_CEILING,
+        }
+    }
+
+    pub(crate) fn with_body_ceiling(mut self, body_ceiling: Duration) -> Self {
+        self.body_ceiling = body_ceiling;
+        self
     }
 }
 
@@ -321,6 +338,8 @@ struct H3RequestSnapshot {
     config: H3RequestConfig,
     generation: Option<crate::serving_generation::RequestGeneration>,
     deadline: Option<H3RequestDeadlineKey>,
+    /// Extension state for `deadline`, armed with it (#1035).
+    progress: Option<BodyProgress<Instant>>,
 }
 
 impl H3RequestSnapshot {
@@ -330,6 +349,7 @@ impl H3RequestSnapshot {
             config,
             generation: None,
             deadline: None,
+            progress: None,
         }
     }
 }
@@ -376,6 +396,9 @@ pub(crate) struct H3RuntimeConfig {
     /// finished request is taken for dispatch (per-connection wire bytes are already
     /// bounded separately by `total_req_bytes`).
     body_budget: std::sync::Arc<hj_core::budget::BodyBufferBudget>,
+    /// The serving core's shutdown token, handed to every accepted connection so a
+    /// streamed response idle on its backend ends during the drain (#1034).
+    shutdown: Option<CancellationToken>,
 }
 
 impl H3RuntimeConfig {
@@ -392,7 +415,13 @@ impl H3RuntimeConfig {
             serving_view: None,
             active_conns,
             body_budget,
+            shutdown: None,
         }
+    }
+
+    fn with_shutdown(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = Some(shutdown);
+        self
     }
 
     pub(crate) fn with_serving_view(
@@ -450,6 +479,7 @@ impl H3RuntimeConfig {
             epoch,
             body_budget: Some(self.body_budget.clone()),
             egress_budget: Some(H3EgressBudget::new(self.body_budget.clone())),
+            shutdown: self.shutdown.clone(),
             ..Default::default()
         }
     }
@@ -465,6 +495,8 @@ const H3_CONNECTION_EGRESS_MEM: u64 = 128 * 1024 * 1024;
 struct H3EgressBudget {
     global: Arc<hj_core::budget::BodyBufferBudget>,
     connection: Arc<hj_core::budget::BodyBufferBudget>,
+    /// The connection's bridge-side share for response streams (`BridgeCtx::response_budget`).
+    bridge: Arc<hj_core::budget::BodyBufferBudget>,
 }
 
 impl H3EgressBudget {
@@ -474,6 +506,7 @@ impl H3EgressBudget {
             connection: Arc::new(hj_core::budget::BodyBufferBudget::new(
                 H3_CONNECTION_EGRESS_MEM,
             )),
+            bridge: crate::uring::bridge::connection_response_budget(),
         }
     }
 
@@ -563,6 +596,10 @@ fn server_config(rustls_cfg: Arc<rustls::ServerConfig>) -> io::Result<ServerConf
     transport.max_idle_timeout(Some(idle));
     transport.stream_receive_window((4u32 * 1024 * 1024).into());
     transport.receive_window((64u32 * 1024 * 1024).into());
+    // No RFC 9297 support: the default advertised max_datagram_frame_size and buffered
+    // up to 1.25 MB of DATAGRAM frames nothing reads for the connection's life (#1047).
+    // Unadvertised, a peer DATAGRAM is a PROTOCOL_VIOLATION (RFC 9221 §3).
+    transport.datagram_receive_buffer_size(None);
     cfg.transport_config(Arc::new(transport));
     // Linux SO_REUSEPORT hashes a rebinding tuple independently for every datagram. Each
     // worker owns a separate sans-I/O endpoint, so a migrated tuple can land on a worker
@@ -664,10 +701,13 @@ struct H3State {
     draining: bool,
     next_request_stream_index: u64,
     client_leaf: Option<rustls::pki_types::CertificateDer<'static>>,
+    /// TLS SNI from the QUIC handshake: the routing fallback, like H2's
+    /// `server_name()`, never derived from `:authority`.
+    server_name: Option<Arc<str>>,
     /// In-flight client request bidi streams (removed once served), so we never
     /// re-scan already-served streams — bounded by concurrent requests, not total.
     requests: std::collections::HashSet<StreamId>,
-    /// Absolute deadlines for unfinished request streams. The same key is held
+    /// Receive deadlines for unfinished request streams. The same key is held
     /// in `request_snapshots`, so completion removes it directly in O(log N).
     /// Equal batch deadlines never trigger a scan of the remaining streams.
     request_deadlines: BTreeSet<H3RequestDeadlineKey>,
@@ -725,6 +765,8 @@ struct H3State {
     /// a NEW connection) must be dropped — guarded by comparing this epoch (see
     /// [`Completion`] / `write_completion`).
     epoch: u64,
+    /// The serving core's shutdown token (see [`H3RuntimeConfig`]).
+    shutdown: Option<CancellationToken>,
 }
 
 impl H3State {
@@ -743,12 +785,14 @@ impl H3State {
                     ),
                     generation.0.serve_config.header_read_timeout,
                 )
+                .with_body_ceiling(generation.0.serve_config.request_body_ceiling)
             })
             .unwrap_or(fallback);
         H3RequestSnapshot {
             config,
             generation,
             deadline: None,
+            progress: None,
         }
     }
 
@@ -759,8 +803,8 @@ impl H3State {
         mut snapshot: H3RequestSnapshot,
     ) {
         // accept(Dir::Bi) yields each stream once. Keeping the insertion guard
-        // makes the absolute deadline non-sliding even if that assumption ever
-        // changes in quinn-proto.
+        // makes a re-accept unable to restart the deadline even if that assumption
+        // ever changes in quinn-proto.
         if self.requests.insert(id) {
             self.req_buf.entry(id).or_default();
             if let Some(timeout) = snapshot.config.timeout {
@@ -771,6 +815,11 @@ impl H3State {
                     stream: id,
                 };
                 snapshot.deadline = Some(key);
+                snapshot.progress = Some(BodyProgress::new(
+                    accepted_at,
+                    snapshot.config.body_ceiling,
+                    0,
+                ));
                 self.request_deadlines.insert(key);
                 self.next_request_deadline_sequence =
                     self.next_request_deadline_sequence.wrapping_add(1);
@@ -781,6 +830,28 @@ impl H3State {
 
     fn next_request_deadline(&self) -> Option<Instant> {
         self.request_deadlines.first().map(|key| key.when)
+    }
+
+    /// (#1035) The request stream `id` has `buffered` bytes: once that is
+    /// `BODY_MIN_PROGRESS` past its last extension, move its deadline (re-keyed in the
+    /// ordered set) to `now + timeout`, capped at its ceiling.
+    fn extend_request_deadline(&mut self, id: StreamId, buffered: usize, now: Instant) {
+        let Some(snapshot) = self.request_snapshots.get_mut(&id) else {
+            return;
+        };
+        let (Some(timeout), Some(key), Some(progress)) = (
+            snapshot.config.timeout,
+            snapshot.deadline.as_mut(),
+            snapshot.progress.as_mut(),
+        ) else {
+            return;
+        };
+        let mut when = key.when;
+        if progress.extend(&mut when, buffered as u64, timeout, || now) {
+            self.request_deadlines.remove(key);
+            key.when = when;
+            self.request_deadlines.insert(*key);
+        }
     }
 
     fn handshake_deadline(&self) -> Option<Instant> {
@@ -974,8 +1045,9 @@ enum CompletionKind {
         ack: Option<flume::Sender<()>>,
         lease: Option<H3EgressLease>,
     },
-    /// Mid-stream upstream abort — reset the send stream (RFC 9114 stream error).
-    Abort,
+    /// Reset the send stream with this RFC 9114 code: a mid-stream upstream abort, or a
+    /// body left idle on its backend through the shutdown grace (#1034).
+    Abort(u32),
 }
 
 /// A response buffered in the driver awaiting the QUIC flow-control window. Parts retain an
@@ -1465,7 +1537,7 @@ fn reclaim_buffered_requests(st: &mut H3State) {
     release_request_charge(st, bytes);
 }
 
-/// Reclaim every request stream whose absolute receive deadline has elapsed.
+/// Reclaim every request stream whose receive deadline has elapsed.
 /// The caller resets both QUIC halves for each returned id so MAX_STREAMS credit
 /// is released. The empty fast path does not allocate.
 fn reclaim_expired_requests(st: &mut H3State, now: Instant) -> Vec<StreamId> {
@@ -1482,6 +1554,64 @@ fn release_request_charge(st: &mut H3State, bytes: usize) {
         .set(st.total_req_bytes.get().saturating_sub(bytes));
 }
 
+/// A decoded request field section and its RFC 9114 §4.2.2 size.
+type DecodedFieldSection = (Vec<(Vec<u8>, Vec<u8>)>, usize);
+
+/// The request head as the frame counter sees it. It is decoded when the first DATA
+/// frame header arrives (a body-less request is never decoded here), so a declared
+/// content-length bounds the body while it is received (#1049). Dispatch reuses it.
+#[derive(Default)]
+enum H3RequestHead {
+    #[default]
+    Pending,
+    /// QPACK rejected the field section; dispatch answers 400.
+    Undecodable,
+    Decoded {
+        fields: DecodedFieldSection,
+        content_length: Option<usize>,
+    },
+}
+
+fn decode_request_head(field: &[u8], max_header_bytes: usize) -> H3RequestHead {
+    let Some(fields) = qpack_decode_limited(field, max_header_bytes) else {
+        return H3RequestHead::Undecodable;
+    };
+    // An unresolvable length is left to dispatch, which answers 400 for it.
+    let content_length = super::codec::resolve_content_length(
+        fields
+            .0
+            .iter()
+            .filter(|(name, _)| name.as_slice() == b"content-length")
+            .map(|(_, value)| value.as_slice()),
+    )
+    .ok()
+    .flatten();
+    H3RequestHead::Decoded {
+        fields,
+        content_length,
+    }
+}
+
+/// Bytes `range` of a request stream whose first `buffered.len()` bytes are already
+/// buffered and whose following bytes start `input`.
+fn request_stream_bytes<'a>(
+    buffered: &'a [u8],
+    input: &'a [u8],
+    range: std::ops::Range<usize>,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+    let base = buffered.len();
+    if range.end <= base {
+        return buffered.get(range).map(std::borrow::Cow::Borrowed);
+    }
+    let tail = input.get(range.start.saturating_sub(base)..range.end - base)?;
+    if range.start >= base {
+        return Some(std::borrow::Cow::Borrowed(tail));
+    }
+    Some(std::borrow::Cow::Owned(
+        [buffered.get(range.start..)?, tail].concat(),
+    ))
+}
+
 #[derive(Default)]
 struct H3FrameCounter {
     phase: H3FramePhase,
@@ -1491,6 +1621,9 @@ struct H3FrameCounter {
     frame_type: u64,
     header_bytes: usize,
     body_bytes: usize,
+    /// Stream range of the first HEADERS frame's payload (the request field section).
+    field: Option<std::ops::Range<usize>>,
+    head: H3RequestHead,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1505,6 +1638,10 @@ enum H3FramePhase {
 enum RequestFrameError {
     Limit,
     Unexpected,
+    /// The body is over the configured maximum and its head decoded: answered 413.
+    TooLarge,
+    /// DATA past the declared content-length (RFC 9114 §4.1.2): H3_MESSAGE_ERROR.
+    Malformed,
 }
 
 fn request_frame_forbidden(frame_type: u64) -> bool {
@@ -1541,7 +1678,13 @@ impl H3FrameCounter {
         None
     }
 
-    fn consume(&mut self, input: &[u8], limits: H3RequestLimits) -> Result<(), RequestFrameError> {
+    /// Validate `input`, the stream bytes that follow the already-buffered `buffered`.
+    fn consume(
+        &mut self,
+        buffered: &[u8],
+        input: &[u8],
+        limits: H3RequestLimits,
+    ) -> Result<(), RequestFrameError> {
         let mut pos = 0usize;
         while pos < input.len() {
             match self.phase {
@@ -1562,26 +1705,23 @@ impl H3FrameCounter {
                     let Ok(length) = usize::try_from(length) else {
                         return Err(RequestFrameError::Limit);
                     };
-                    let total = match self.frame_type {
-                        0x01 => self.header_bytes.checked_add(length),
-                        0x00 => self.body_bytes.checked_add(length),
-                        _ => Some(0),
-                    };
-                    let Some(total) = total else {
-                        return Err(RequestFrameError::Limit);
-                    };
                     match self.frame_type {
                         0x01 => {
+                            let Some(total) = self.header_bytes.checked_add(length) else {
+                                return Err(RequestFrameError::Limit);
+                            };
                             if total > limits.max_header_bytes {
                                 return Err(RequestFrameError::Limit);
                             }
                             self.header_bytes = total;
+                            if self.field.is_none() {
+                                let start = buffered.len() + pos;
+                                self.field = Some(start..start + length);
+                            }
                         }
                         0x00 => {
-                            if total > limits.max_body_bytes {
-                                return Err(RequestFrameError::Limit);
-                            }
-                            self.body_bytes = total;
+                            let consumed = input.get(..pos).unwrap_or_default();
+                            self.data_frame(buffered, consumed, length, limits)?;
                         }
                         _ => {}
                     }
@@ -1604,24 +1744,77 @@ impl H3FrameCounter {
         }
         Ok(())
     }
+
+    /// Admit the next DATA frame's declared `length`. The frame header is checked
+    /// before any of its payload is buffered, as H2 checks each DATA frame (#1014).
+    fn data_frame(
+        &mut self,
+        buffered: &[u8],
+        input: &[u8],
+        length: usize,
+        limits: H3RequestLimits,
+    ) -> Result<(), RequestFrameError> {
+        if matches!(self.head, H3RequestHead::Pending)
+            && let Some(field) = self
+                .field
+                .clone()
+                .and_then(|range| request_stream_bytes(buffered, input, range))
+        {
+            self.head = decode_request_head(&field, limits.max_header_bytes);
+        }
+        let Some(total) = self.body_bytes.checked_add(length) else {
+            return Err(RequestFrameError::Limit);
+        };
+        let declared = match &self.head {
+            H3RequestHead::Decoded { content_length, .. } => Some(*content_length),
+            _ => None,
+        };
+        if let Some(Some(content_length)) = declared {
+            if content_length > limits.max_body_bytes {
+                return Err(RequestFrameError::TooLarge);
+            }
+            if total > content_length {
+                return Err(RequestFrameError::Malformed);
+            }
+        }
+        if total > limits.max_body_bytes {
+            // Without a decoded head there is no request to answer.
+            return Err(if declared.is_some() {
+                RequestFrameError::TooLarge
+            } else {
+                RequestFrameError::Limit
+            });
+        }
+        self.body_bytes = total;
+        Ok(())
+    }
+
+    fn take_decoded_head(&mut self) -> Option<DecodedFieldSection> {
+        match std::mem::take(&mut self.head) {
+            H3RequestHead::Decoded { fields, .. } => Some(fields),
+            _ => None,
+        }
+    }
 }
 
+/// Returns the stream's buffered request bytes.
 fn append_request_bytes(
     st: &mut H3State,
     id: StreamId,
     bytes: &[u8],
     limits: H3RequestLimits,
-) -> Result<(), RequestFrameError> {
+) -> Result<usize, RequestFrameError> {
     let Some(total) = st.total_req_bytes.get().checked_add(bytes.len()) else {
         return Err(RequestFrameError::Limit);
     };
     if total > limits.max_connection_bytes {
         return Err(RequestFrameError::Limit);
     }
+    let buffered = st.req_buf.get(&id).map_or(&[][..], Vec::as_slice);
     st.req_frames
         .entry(id)
         .or_default()
-        .consume(bytes, limits)?;
+        .consume(buffered, bytes, limits)?;
     // (security #263) Reserve against the server-wide budget BEFORE extending, so
     // pre-dispatch accumulation is bounded by the same cap as H1/H2/LSAPI. The
     // owned reservation follows the buffer through dispatch and every drop path.
@@ -1640,7 +1833,7 @@ fn append_request_bytes(
     if buffer.len() > limits.max_request_wire_bytes {
         Err(RequestFrameError::Limit)
     } else {
-        Ok(())
+        Ok(buffer.len())
     }
 }
 
@@ -1981,15 +2174,33 @@ fn service_peer_uni(
 
 async fn send_endpoint_datagram(
     udp: &UdpSocket,
-    reusable: &mut Vec<u8>,
+    udp_state: &UdpSocketState,
     payload: &[u8],
     destination: SocketAddr,
+    src_ip: Option<std::net::IpAddr>,
 ) {
-    let mut owned = std::mem::take(reusable);
-    owned.clear();
-    owned.extend_from_slice(payload);
-    let (_, owned) = udp.send_to(owned, destination).await;
-    *reusable = owned;
+    // Reply from the address the client's Initial was sent to: on a wildcard bind a
+    // plain send_to lets the kernel pick another local address, and a connected
+    // client socket drops the Retry/refusal (#894).
+    let transmit = UdpTransmit {
+        destination,
+        ecn: None,
+        contents: payload,
+        segment_size: None,
+        src_ip,
+    };
+    loop {
+        // SAFETY: `udp` owns the fd and outlives this borrow.
+        let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
+        match udp_state.try_send(UdpSockRef::from(&bfd), &transmit) {
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if udp.writable(false).await.is_err() {
+                    return;
+                }
+            }
+            _ => return,
+        }
+    }
 }
 
 /// The per-core datagram loop. On loopback, QUIC is driven by the packet exchange
@@ -2013,7 +2224,6 @@ where
         let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
         UdpSocketState::new(UdpSockRef::from(&bfd))?
     };
-    let max_gso = udp_state.max_gso_segments();
     // Reused across recvs — monoio's recv_from takes the buffer by value and hands it
     // back, so threading one buffer avoids a per-datagram heap allocation.
     let mut recv_buf: Vec<u8> = vec![0u8; MAX_DATAGRAM];
@@ -2033,9 +2243,10 @@ where
                 DatagramEvent::Response(t) => {
                     send_endpoint_datagram(
                         &udp,
-                        &mut tx_scratch,
+                        &udp_state,
                         &scratch[..t.size],
                         t.destination,
+                        t.src_ip,
                     )
                     .await;
                 }
@@ -2050,9 +2261,10 @@ where
                             if let Some(t) = e.response {
                                 send_endpoint_datagram(
                                     &udp,
-                                    &mut tx_scratch,
+                                    &udp_state,
                                     &scratch[..t.size],
                                     t.destination,
+                                    t.src_ip,
                                 )
                                 .await;
                             }
@@ -2070,7 +2282,6 @@ where
         drive_connections(
             &udp,
             &udp_state,
-            max_gso,
             &mut endpoint,
             &mut conns,
             &mut h3,
@@ -2252,6 +2463,7 @@ fn service_conn(
                         st._connection_permit = permit;
                     }
                     st.client_leaf = leaf;
+                    st.server_name = conns.get(&hd).and_then(h3_handshake_server_name);
                     st.connected = true;
                     tracing::info!("uring h3: QUIC handshake complete (Connected)");
                 } else {
@@ -2501,19 +2713,25 @@ fn certificate_chain_present(certificates: &[rustls::pki_types::CertificateDer<'
 const MAX_TX_SEGMENTS: usize = 10;
 const MAX_TX_DATAGRAMS: usize = 20;
 
+/// Read per transmit, never cached: quinn-udp drops its GSO cap to 1 after a
+/// segmented send fails with EIO/EINVAL (IPsec, no checksum offload), and every
+/// later multi-segment transmit would fail the same way (#1048).
+fn tx_segment_cap(udp_state: &UdpSocketState) -> usize {
+    udp_state.max_gso_segments().clamp(1, MAX_TX_SEGMENTS)
+}
+
 async fn flush_conn(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    max_gso: usize,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     hd: ConnectionHandle,
     now: Instant,
     tbuf: &mut Vec<u8>,
 ) -> bool {
-    let seg_cap = max_gso.min(MAX_TX_SEGMENTS).max(1);
     let mut datagrams = 0usize;
     loop {
         tbuf.clear();
+        let seg_cap = tx_segment_cap(udp_state);
         let t = match conns
             .get_mut(&hd)
             .and_then(|c| c.poll_transmit(now, seg_cap, tbuf))
@@ -2558,7 +2776,6 @@ async fn flush_conn(
 async fn drive_connections<H, Fut>(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    max_gso: usize,
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
@@ -2577,61 +2794,14 @@ async fn drive_connections<H, Fut>(
             H3RequestConfig::new(H3RequestLimits::new(64 * 1024, MAX_H3_REQ_BYTES), None);
         service_conn(endpoint, conns, h3, hd, now, true, smoke_config);
         if h3.get(&hd).is_some_and(|state| state.rejected) {
-            flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
+            flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
             continue;
         }
         let st = h3.entry(hd).or_default();
-        let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
-        let mut finished = Vec::new();
-        for id in req_ids {
-            let Some(snapshot) = st.request_snapshots.get(&id).cloned() else {
-                reclaim_request(st, id);
-                continue;
-            };
-            let (end, append) = conns
-                .get_mut(&hd)
-                .map(|c| {
-                    for_each_stream_chunk(c, id, |bytes| {
-                        append_request_bytes(st, id, bytes, snapshot.config.limits)
-                    })
-                })
-                .unwrap_or((ReadEnd::Open, Ok(())));
-            if end == ReadEnd::Gone {
-                // Peer reset / stream gone: reclaim the slot + buffer (see the concurrent
-                // driver — same per-connection memory-exhaustion vector).
-                reclaim_request(st, id);
-                continue;
-            }
-            if append == Err(RequestFrameError::Unexpected) {
-                reclaim_request(st, id);
-                st.rejected = true;
-                if let Some(c) = conns.get_mut(&hd) {
-                    c.close(
-                        now,
-                        quinn_proto::VarInt::from_u32(H3_FRAME_UNEXPECTED),
-                        Bytes::from_static(b"frame is forbidden on a request stream"),
-                    );
-                }
-                break;
-            }
-            if append == Err(RequestFrameError::Limit) {
-                // (N3) Oversize request (header+body) — reset the stream and drop the buffer
-                // rather than accumulate an unbounded Vec until FIN.
-                reclaim_request(st, id);
-                if let Some(c) = conns.get_mut(&hd) {
-                    let _ = c
-                        .recv_stream(id)
-                        .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-                    let _ = c
-                        .send_stream(id)
-                        .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-                }
-                continue;
-            }
-            if end == ReadEnd::Fin {
-                finished.push(id);
-            }
-        }
+        let finished = match conns.get_mut(&hd) {
+            Some(c) => receive_request_streams(c, st, now),
+            None => Vec::new(),
+        };
         if st.rejected {
             for id in finished {
                 reclaim_request(st, id);
@@ -2655,7 +2825,7 @@ async fn drive_connections<H, Fut>(
                 }
             }
         }
-        flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
+        flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
     }
 }
 
@@ -2742,7 +2912,6 @@ fn reclaim_stalled_sends(st: &mut H3State, now: Instant) -> Vec<StreamId> {
 async fn write_completion(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    max_gso: usize,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
     c: Completion,
@@ -2812,9 +2981,9 @@ async fn write_completion(
             }
             None => return,
         },
-        // Mid-stream upstream abort: reset the send stream (H3_INTERNAL_ERROR) rather than
-        // a clean finish, so the peer sees the body was truncated (mirrors the H1 path).
-        CompletionKind::Abort => {
+        // Mid-stream abort: reset the send stream rather than a clean finish, so the
+        // peer sees the body was truncated (mirrors the H1 path).
+        CompletionKind::Abort(code) => {
             st.request_cancellations.remove(&stream);
             if let Some(mut pending) = st.pending.remove(&stream) {
                 if let Some(completion) = pending.completion.take() {
@@ -2823,13 +2992,123 @@ async fn write_completion(
             }
             let _ = conn
                 .send_stream(stream)
-                .reset(quinn_proto::VarInt::from_u32(0x0102));
-            flush_conn(udp, udp_state, max_gso, conns, ch, now, tx_scratch).await;
+                .reset(quinn_proto::VarInt::from_u32(code));
+            flush_conn(udp, udp_state, conns, ch, now, tx_scratch).await;
             return;
         }
     }
     pump_stream(conn, st, stream); // write what the window allows; remainder pumps on Writable
-    flush_conn(udp, udp_state, max_gso, conns, ch, now, tx_scratch).await;
+    flush_conn(udp, udp_state, conns, ch, now, tx_scratch).await;
+}
+
+/// Read every unfinished request stream into its buffer, retiring the ones that
+/// are gone or refused, and return those that reached FIN. A forbidden frame closes
+/// the connection (`st.rejected`), which ends the pass.
+fn receive_request_streams(
+    c: &mut quinn_proto::Connection,
+    st: &mut H3State,
+    now: Instant,
+) -> Vec<StreamId> {
+    let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
+    let mut finished = Vec::new();
+    for id in req_ids {
+        let Some((request_limits, progress)) = st
+            .request_snapshots
+            .get(&id)
+            .map(|snapshot| (snapshot.config.limits, snapshot.progress))
+        else {
+            // Internal invariant failure: never receive under a live-reloaded
+            // policy chosen after this stream began. Reclaim and fail closed.
+            reclaim_request(st, id);
+            refuse_request_stream(c, st, id, RequestFrameError::Limit);
+            continue;
+        };
+        let mut buffered = None;
+        let (end, append) = for_each_stream_chunk(c, id, |bytes| {
+            append_request_bytes(st, id, bytes, request_limits).map(|len| buffered = Some(len))
+        });
+        if end == ReadEnd::Gone {
+            // Peer RESET_STREAM (or the stream is otherwise gone): reclaim the slot +
+            // buffer now. Without this, a reset-without-FIN stream stays in `requests`
+            // and its buffered bytes in `req_buf` until the whole connection drains —
+            // a per-connection memory-exhaustion vector on the H3 path.
+            reclaim_request(st, id);
+            // Also retire the server's SEND half of this client-initiated BIDI stream.
+            // quinn-proto reissues the remote-bidi MAX_STREAMS credit only when the stream is
+            // FULLY freed, which for the recv half requires the send half to be finished/reset
+            // too. A client that RESET_STREAMs its send side (our recv) WITHOUT STOP_SENDING our
+            // send side would otherwise leave `self.send` holding the id forever — 256 such
+            // recv-only resets exhaust max_concurrent_bidi_streams and wedge the connection.
+            let _ = c
+                .send_stream(id)
+                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
+            continue;
+        }
+        match append {
+            Err(RequestFrameError::Unexpected) => {
+                reclaim_request(st, id);
+                st.rejected = true;
+                c.close(
+                    now,
+                    quinn_proto::VarInt::from_u32(H3_FRAME_UNEXPECTED),
+                    Bytes::from_static(b"frame is forbidden on a request stream"),
+                );
+                break;
+            }
+            Err(error) => {
+                reclaim_request(st, id);
+                refuse_request_stream(c, st, id, error);
+                continue;
+            }
+            Ok(()) => {}
+        }
+        if end == ReadEnd::Fin {
+            finished.push(id);
+        } else if let Some(buffered) = buffered
+            && progress.is_some_and(|progress| progress.due(buffered as u64))
+        {
+            st.extend_request_deadline(id, buffered, now);
+        }
+    }
+    finished
+}
+
+/// Retire a request stream the receive path refused, closing both halves so
+/// quinn-proto frees it and reissues the peer's MAX_STREAMS credit.
+fn refuse_request_stream(
+    c: &mut quinn_proto::Connection,
+    st: &mut H3State,
+    id: StreamId,
+    error: RequestFrameError,
+) {
+    let code = match error {
+        RequestFrameError::TooLarge => {
+            // (#1049) As H1/H2 (#1014): a complete 413 rather than a reset the client
+            // may retry with the whole upload, then STOP_SENDING(H3_NO_ERROR) so it
+            // stops sending and keeps the response (RFC 9114 §4.1). Dispatch waits for
+            // FIN, so no response has started on this stream.
+            let _ = c
+                .recv_stream(id)
+                .stop(quinn_proto::VarInt::from_u32(H3_NO_ERROR));
+            st.pending.insert(
+                id,
+                PendingSend {
+                    completion: None,
+                    parts: std::iter::once(PendingPart::contiguous(h3_payload_too_large(), None))
+                        .collect(),
+                    fin: true,
+                    stall: None,
+                },
+            );
+            pump_stream(c, st, id);
+            return;
+        }
+        RequestFrameError::Malformed => H3_MESSAGE_ERROR,
+        RequestFrameError::Limit | RequestFrameError::Unexpected => H3_REQUEST_CANCELLED,
+    };
+    let code = quinn_proto::VarInt::from_u32(code);
+    let _ = c.recv_stream(id).stop(code);
+    let _ = c.send_stream(id).reset(code);
 }
 
 /// Drive ONE connection: service its I/O, spawn a task per finished request (QPACK decode +
@@ -2842,7 +3121,6 @@ async fn write_completion(
 async fn drive_one_conn(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    max_gso: usize,
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
@@ -2873,7 +3151,7 @@ async fn drive_one_conn(
             cancel_all_dispatched_requests(state);
             reclaim_buffered_requests(state);
         }
-        return flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
+        return flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
     }
     let epoch = h3.get(&hd).map(|s| s.epoch).unwrap_or(0);
     let st = h3.entry(hd).or_default();
@@ -2899,92 +3177,23 @@ async fn drive_one_conn(
                 .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
         }
     }
-    let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
-    let mut finished = Vec::new();
-    for id in req_ids {
-        let Some(request_limits) = st
-            .request_snapshots
-            .get(&id)
-            .map(|snapshot| snapshot.config.limits)
-        else {
-            // Internal invariant failure: never receive under a live-reloaded
-            // policy chosen after this stream began. Reclaim and fail closed.
-            reclaim_request(st, id);
-            if let Some(c) = conns.get_mut(&hd) {
-                let code = quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED);
-                let _ = c.recv_stream(id).stop(code);
-                let _ = c.send_stream(id).reset(code);
-            }
-            continue;
-        };
-        let (end, append) = conns
-            .get_mut(&hd)
-            .map(|c| {
-                for_each_stream_chunk(c, id, |bytes| {
-                    append_request_bytes(st, id, bytes, request_limits)
-                })
-            })
-            .unwrap_or((ReadEnd::Open, Ok(())));
-        if end == ReadEnd::Gone {
-            // Peer RESET_STREAM (or the stream is otherwise gone): reclaim the slot +
-            // buffer now. Without this, a reset-without-FIN stream stays in `requests`
-            // and its buffered bytes in `req_buf` until the whole connection drains —
-            // a per-connection memory-exhaustion vector on the H3 path.
-            reclaim_request(st, id);
-            // Also retire the server's SEND half of this client-initiated BIDI stream.
-            // quinn-proto reissues the remote-bidi MAX_STREAMS credit only when the stream is
-            // FULLY freed, which for the recv half requires the send half to be finished/reset
-            // too. A client that RESET_STREAMs its send side (our recv) WITHOUT STOP_SENDING our
-            // send side would otherwise leave `self.send` holding the id forever — 256 such
-            // recv-only resets exhaust max_concurrent_bidi_streams and wedge the connection.
-            if let Some(c) = conns.get_mut(&hd) {
-                let _ = c
-                    .send_stream(id)
-                    .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-            }
-            continue;
-        }
-        if append == Err(RequestFrameError::Unexpected) {
-            reclaim_request(st, id);
-            st.rejected = true;
-            if let Some(c) = conns.get_mut(&hd) {
-                c.close(
-                    now,
-                    quinn_proto::VarInt::from_u32(H3_FRAME_UNEXPECTED),
-                    Bytes::from_static(b"frame is forbidden on a request stream"),
-                );
-            }
-            break;
-        }
-        if append == Err(RequestFrameError::Limit) {
-            // (N3) Oversize request — reset the stream and drop the buffer.
-            reclaim_request(st, id);
-            if let Some(c) = conns.get_mut(&hd) {
-                let _ = c
-                    .recv_stream(id)
-                    .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-                // Retire the send half too so the bidi stream is fully freed and its
-                // MAX_STREAMS credit is reissued (same reason as the Gone branch).
-                let _ = c
-                    .send_stream(id)
-                    .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-            }
-            continue;
-        }
-        if end != ReadEnd::Fin {
-            continue;
-        }
-        finished.push(id);
-    }
+    let finished = match conns.get_mut(&hd) {
+        Some(c) => receive_request_streams(c, st, now),
+        None => Vec::new(),
+    };
     if st.rejected {
         for id in finished {
             reclaim_request(st, id);
         }
         cancel_all_dispatched_requests(st);
         reclaim_buffered_requests(st);
-        return flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
+        return flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
     }
     for id in finished {
+        let decoded_head = st
+            .req_frames
+            .get_mut(&id)
+            .and_then(H3FrameCounter::take_decoded_head);
         let (req_bytes, body_lease, request_snapshot) = take_request_for_dispatch(st, id);
         let req_charge = req_bytes.len();
         let Some(request_snapshot) = request_snapshot else {
@@ -3008,6 +3217,7 @@ async fn drive_one_conn(
         // TCP paths take it from getsockname; QUIC from the datagram's IP_PKTINFO).
         let local = request_local_addr(local, conns.get(&hd).and_then(|c| c.local_ip()));
         let leaf = st.client_leaf.clone();
+        let sni = st.server_name.clone();
         let has_client_cert = leaf.is_some();
         let tls = Some(hj_tls::tls_params_from_parts(
             "TLSv1.3",
@@ -3033,6 +3243,7 @@ async fn drive_one_conn(
         let cancel = CancellationToken::new();
         st.request_cancellations.insert(id, cancel.clone());
         let egress_budget = st.egress_budget.clone();
+        let shutdown = st.shutdown.clone();
         let peer_max_field_section = st.peer_max_field_section_size.clone();
         let bridge = bridge.clone();
         let tx = comp_tx.clone();
@@ -3052,8 +3263,10 @@ async fn drive_one_conn(
             let outcome = handle_h3_request(
                 req_bytes,
                 body_lease,
+                decoded_head,
                 has_client_cert,
                 tls,
+                sni,
                 peer,
                 local,
                 &bridge,
@@ -3083,8 +3296,21 @@ async fn drive_one_conn(
                         send(CompletionKind::Head(head, completion, head_lease))
                             .await
                             .map_err(|_| ())?;
+                        let mut stopping = false;
                         loop {
-                            match rx.recv().await {
+                            let next = match &shutdown {
+                                Some(shutdown) => {
+                                    super::next_stream_chunk(&mut rx, shutdown, &mut stopping).await
+                                }
+                                None => Ok(rx.recv().await),
+                            };
+                            let Ok(next) = next else {
+                                send(CompletionKind::Abort(H3_REQUEST_CANCELLED))
+                                    .await
+                                    .map_err(|_| ())?;
+                                break;
+                            };
+                            match next {
                                 Some(Ok(chunk)) => {
                                     if chunk.is_empty() {
                                         continue;
@@ -3095,7 +3321,7 @@ async fn drive_one_conn(
                                             let Some(lease) =
                                                 budget.reserve(chunk.len().saturating_add(16))
                                             else {
-                                                send(CompletionKind::Abort)
+                                                send(CompletionKind::Abort(H3_INTERNAL_ERROR))
                                                     .await
                                                     .map_err(|_| ())?;
                                                 break;
@@ -3115,7 +3341,9 @@ async fn drive_one_conn(
                                     ack_rx.recv_async().await.map_err(|_| ())?;
                                 }
                                 Some(Err(())) => {
-                                    send(CompletionKind::Abort).await.map_err(|_| ())?;
+                                    send(CompletionKind::Abort(H3_INTERNAL_ERROR))
+                                        .await
+                                        .map_err(|_| ())?;
                                     break;
                                 }
                                 None => {
@@ -3139,21 +3367,42 @@ async fn drive_one_conn(
         };
         monoio::spawn(run_cancelable_request(cancel, work));
     }
-    flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await
+    flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await
+}
+
+/// recvmmsg slots: fixed, initialized storage the kernel writes into on every pass.
+/// Nothing handed to quinn-proto ever borrows from them (see [`received_segments`]).
+type RecvSlots = [Vec<u8>; GRO_BATCH];
+
+fn recv_slots() -> RecvSlots {
+    std::array::from_fn(|_| vec![0u8; MAX_DATAGRAM])
+}
+
+fn recv_iovecs(slots: &mut RecvSlots) -> [std::io::IoSliceMut<'_>; GRO_BATCH] {
+    slots.each_mut().map(|slot| std::io::IoSliceMut::new(slot))
+}
+
+/// Copy one received message out of its slot as one exact-size buffer per GRO
+/// segment (`stride` 0 = not coalesced). quinn-proto retains received CRYPTO and
+/// STREAM frames as slices of the datagram it is handed but charges only the packet
+/// payload, so a datagram sharing a larger allocation (the 64 KiB slot, or the
+/// coalesced message) let a peer pin that whole allocation per tiny packet (#1046).
+fn received_segments(message: &[u8], stride: usize) -> impl Iterator<Item = BytesMut> + '_ {
+    let stride = if stride == 0 { message.len() } else { stride };
+    message.chunks(stride.max(1)).map(BytesMut::from)
 }
 
 /// Non-blocking GRO drain: pull up to [`MAX_RECV_DRAIN_BATCHES`] batches (recvmmsg into
-/// reused buffers, GRO-coalesced, split by `stride`), feed quinn-proto, and return the set
+/// reused slots, GRO-coalesced, split by `stride`), feed quinn-proto, and return the set
 /// of connections that got new state. Connections whose absolute request deadline became
 /// due during the bounded drain are included so the caller drives them immediately.
 #[allow(clippy::too_many_arguments)]
 async fn recv_drain(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    recv_bufs: &mut [BytesMut; GRO_BATCH],
+    recv_bufs: &mut RecvSlots,
     recv_metas: &mut [quinn_udp::RecvMeta; GRO_BATCH],
     scratch: &mut Vec<u8>,
-    tx_scratch: &mut Vec<u8>,
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
@@ -3170,59 +3419,8 @@ async fn recv_drain(
     let mut completed_batches = 0;
     loop {
         let nmsg = {
-            // (#333) The kernel receives straight into each slot's spare
-            // capacity; segments are then split_to() off as O(1) refcounted
-            // views instead of an alloc+memcpy per GRO segment. reserve()
-            // reuses the block when no split segment still holds it and
-            // allocates a fresh one otherwise — a long-held stream chunk can
-            // pin at most its own 64 KiB slot block.
-            for b in recv_bufs.iter_mut() {
-                b.clear();
-                b.reserve(MAX_DATAGRAM);
-            }
-            let [b0, b1, b2, b3, b4, b5, b6, b7] = recv_bufs.each_mut();
-            // SAFETY: every slot has ≥ MAX_DATAGRAM spare capacity (reserved
-            // above, len 0). The raw slices only ever receive kernel writes
-            // inside udp_state.recv below, while no other borrow of the slots
-            // exists; the initialized prefix is claimed via advance_mut with
-            // the kernel-reported length.
-            let mut iov = unsafe {
-                use bytes::BufMut;
-                [
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b0.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b1.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b2.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b3.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b4.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b5.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b6.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                    std::io::IoSliceMut::new(std::slice::from_raw_parts_mut(
-                        b7.chunk_mut().as_mut_ptr(),
-                        MAX_DATAGRAM,
-                    )),
-                ]
-            };
+            let mut iov = recv_iovecs(recv_bufs);
+            // SAFETY: `udp` owns the fd and outlives this borrow.
             let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
             match udp_state.recv(UdpSockRef::from(&bfd), &mut iov, recv_metas) {
                 Ok(n) => n,
@@ -3233,37 +3431,24 @@ async fn recv_drain(
             break;
         }
         completed_batches += 1;
-        for i in 0..nmsg {
-            let meta = recv_metas[i];
-            if meta.len == 0 {
+        for (meta, buf) in recv_metas.iter().zip(recv_bufs.iter()).take(nmsg) {
+            let Some(message) = buf.get(..meta.len) else {
                 continue;
-            }
-            let stride = if meta.stride == 0 {
-                meta.len
-            } else {
-                meta.stride
             };
             let pecn = meta
                 .ecn
                 .and_then(|e| quinn_proto::EcnCodepoint::from_bits(e as u8));
-            // SAFETY: the kernel initialized exactly meta.len bytes of slot
-            // i's spare capacity in the recv above (len was 0).
-            unsafe {
-                use bytes::BufMut;
-                recv_bufs[i].advance_mut(meta.len);
-            }
-            let mut slot = recv_bufs[i].split();
-            while !slot.is_empty() {
-                let seg = slot.split_to(stride.min(slot.len()));
+            for seg in received_segments(message, meta.stride) {
                 scratch.clear();
                 if let Some(ev) = endpoint.handle(now, meta.addr, meta.dst_ip, pecn, seg, scratch) {
                     match ev {
                         DatagramEvent::Response(t) => {
                             send_endpoint_datagram(
                                 udp,
-                                tx_scratch,
+                                udp_state,
                                 &scratch[..t.size],
                                 t.destination,
+                                t.src_ip,
                             )
                             .await;
                         }
@@ -3291,9 +3476,10 @@ async fn recv_drain(
                                 Admission::Transmit(transmit) => {
                                     send_endpoint_datagram(
                                         udp,
-                                        tx_scratch,
+                                        udp_state,
                                         &scratch[..transmit.size],
                                         transmit.destination,
+                                        transmit.src_ip,
                                     )
                                     .await;
                                 }
@@ -3328,8 +3514,7 @@ async fn recv_drain(
 async fn pump(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    max_gso: usize,
-    recv_bufs: &mut [BytesMut; GRO_BATCH],
+    recv_bufs: &mut RecvSlots,
     recv_metas: &mut [quinn_udp::RecvMeta; GRO_BATCH],
     scratch: &mut Vec<u8>,
     tx_scratch: &mut Vec<u8>,
@@ -3362,7 +3547,6 @@ async fn pump(
             let more_to_send = drive_one_conn(
                 udp,
                 udp_state,
-                max_gso,
                 endpoint,
                 conns,
                 h3,
@@ -3390,7 +3574,6 @@ async fn pump(
             recv_bufs,
             recv_metas,
             scratch,
-            tx_scratch,
             endpoint,
             conns,
             h3,
@@ -3447,7 +3630,6 @@ fn h3_drain_complete(
 async fn close_h3_connections(
     udp: &UdpSocket,
     udp_state: &UdpSocketState,
-    max_gso: usize,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     reason: &'static [u8],
     tx_scratch: &mut Vec<u8>,
@@ -3462,7 +3644,7 @@ async fn close_h3_connections(
                 bytes::Bytes::from_static(reason),
             );
         }
-        flush_conn(udp, udp_state, max_gso, conns, hd, now, tx_scratch).await;
+        flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
     }
 }
 
@@ -3481,6 +3663,7 @@ async fn endpoint_loop_concurrent(
     ready: super::WorkerReadyTx,
     activation: super::worker_group::ActivationGate,
 ) -> io::Result<()> {
+    let runtime = runtime.with_shutdown(shutdown.clone());
     let mut conns: HashMap<ConnectionHandle, quinn_proto::Connection> = HashMap::new();
     let mut h3: HashMap<ConnectionHandle, H3State> = HashMap::new();
     let mut scratch: Vec<u8> = Vec::with_capacity(MAX_DATAGRAM);
@@ -3489,18 +3672,17 @@ async fn endpoint_loop_concurrent(
     let inflight = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let mut epoch_ctr: u64 = 0;
     let handshakes = Arc::new(AtomicU64::new(0));
-    // quinn-udp socket state for GSO send (probes UDP_SEGMENT support once per core).
+    // quinn-udp socket state for GSO send (probes UDP_SEGMENT support once per core;
+    // flush_conn re-reads the cap it may lower later).
     let udp_state = {
         let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
         UdpSocketState::new(UdpSockRef::from(&bfd))?
     };
-    let max_gso = udp_state.max_gso_segments();
     // GRO recv: drain many datagrams per readiness wake into reused buffers (one recvmmsg
     // returns up to GRO_BATCH messages, each GRO-coalescing up to ~64 segments). Batching ACK
     // processing into ONE flush per wake stops the send-bunching (one flush per ACK) that
     // overwhelmed the path and caused ~48% loss on large transfers.
-    let mut recv_bufs: [BytesMut; GRO_BATCH] =
-        std::array::from_fn(|_| BytesMut::with_capacity(MAX_DATAGRAM));
+    let mut recv_bufs = recv_slots();
     let mut recv_metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
     let mut request_deadlines = RequestDeadlineIndex::default();
     let mut draining = false;
@@ -3519,15 +3701,7 @@ async fn endpoint_loop_concurrent(
             policy = latest;
         }
         if draining && h3_drain_complete(&h3, inflight.get(), comp_rx.is_empty()) {
-            close_h3_connections(
-                &udp,
-                &udp_state,
-                max_gso,
-                &mut conns,
-                b"shutdown",
-                &mut tx_scratch,
-            )
-            .await;
+            close_h3_connections(&udp, &udp_state, &mut conns, b"shutdown", &mut tx_scratch).await;
             return Ok(());
         }
         let now = Instant::now();
@@ -3535,7 +3709,6 @@ async fn endpoint_loop_concurrent(
             close_h3_connections(
                 &udp,
                 &udp_state,
-                max_gso,
                 &mut conns,
                 b"drain deadline",
                 &mut tx_scratch,
@@ -3552,7 +3725,6 @@ async fn endpoint_loop_concurrent(
             pump(
                 &udp,
                 &udp_state,
-                max_gso,
                 &mut recv_bufs,
                 &mut recv_metas,
                 &mut scratch,
@@ -3599,7 +3771,7 @@ async fn endpoint_loop_concurrent(
                 let now = Instant::now();
                 drain_deadline = Some(now + super::URING_DRAIN_GRACE);
                 let handles = conns.keys().copied().collect();
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
             }
             // (1) Finished request(s): write each response into its stream, then pump the
             // sends (the response streams out cooperatively, interleaved with ACK processing).
@@ -3609,7 +3781,7 @@ async fn endpoint_loop_concurrent(
                 let mut completed = 0;
                 if let Ok(c) = comp {
                     let hd = c.conn;
-                    write_completion(&udp, &udp_state, max_gso, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
+                    write_completion(&udp, &udp_state, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
                     to_drive.insert(hd);
                     completed = 1;
                 }
@@ -3618,18 +3790,18 @@ async fn endpoint_loop_concurrent(
                         break;
                     };
                     let hd = c.conn;
-                    write_completion(&udp, &udp_state, max_gso, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
+                    write_completion(&udp, &udp_state, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
                     to_drive.insert(hd);
                     completed += 1;
                 }
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
             }
             // (2) Socket readable: GRO-drain queued datagrams, then pump (drive affected conns
             // + interleave further ACK processing). `readable()` is a poll op (cancel-safe).
             _ = udp.readable(false) => {
                 let now = Instant::now();
-                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now).await;
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
+                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now).await;
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
             }
             // (3) A QUIC timer (handshake retransmit / idle / pacing) or absolute
             // request-stream deadline fired — pump every connection now due.
@@ -3640,7 +3812,7 @@ async fn endpoint_loop_concurrent(
                     .filter_map(|(hd, c)| c.poll_timeout().filter(|t| *t <= now).map(|_| *hd))
                     .collect();
                 request_deadlines.extend_due(&mut due, now);
-                pump(&udp, &udp_state, max_gso, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
             }
         }
     }
@@ -3829,6 +4001,16 @@ fn h3_error(status: http::StatusCode) -> Vec<u8> {
     encode_h3_response(status, &http::HeaderMap::new(), b"")
 }
 
+/// The bodiless 413 H1 and H2 send for an over-limit request body.
+fn h3_payload_too_large() -> Vec<u8> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        http::HeaderValue::from_static("0"),
+    );
+    encode_h3_response(http::StatusCode::PAYLOAD_TOO_LARGE, &headers, b"")
+}
+
 /// The result of dispatching an H3 request: either a whole buffered response (errors,
 /// small/HIT bodies — sent as one `Completion::Full`) or a streamed response (HEADERS frame
 /// + a chunk source the spawn task forwards as `Completion::Chunk`s, so a large body flows
@@ -3862,6 +4044,15 @@ struct H3RequestHeaders {
     path: Vec<u8>,
     authority: Option<Vec<u8>>,
     regular: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+fn h3_handshake_server_name(conn: &quinn_proto::Connection) -> Option<Arc<str>> {
+    conn.crypto_session()
+        .handshake_data()?
+        .downcast::<quinn_proto::crypto::rustls::HandshakeData>()
+        .ok()?
+        .server_name
+        .map(|name| Arc::from(name.as_str()))
 }
 
 fn split_h3_request_headers(headers: Vec<(Vec<u8>, Vec<u8>)>) -> Option<H3RequestHeaders> {
@@ -3923,9 +4114,7 @@ fn valid_h3_trailers(field: &[u8], max_field_section_size: usize) -> bool {
 /// Validate the decoded H3 request head and construct the HTTP request builder.
 /// Keeping raw pseudo-header checks here avoids `http::Uri` silently discarding
 /// fragments, and gives tests a seam that consumes real QPACK-decoded fields.
-fn build_h3_request_head(
-    head: H3RequestHeaders,
-) -> Option<(http::request::Builder, Option<Arc<str>>)> {
+fn build_h3_request_head(head: H3RequestHeaders) -> Option<http::request::Builder> {
     let H3RequestHeaders {
         method,
         path,
@@ -3958,11 +4147,6 @@ fn build_h3_request_head(
         }
         None => None,
     };
-    let sni = authority
-        .as_deref()
-        .and_then(|a| std::str::from_utf8(a).ok())
-        .map(|s| Arc::from(hj_core::host_without_port(s).as_str()));
-
     let mut builder = http::Request::builder()
         .version(http::Version::HTTP_3)
         .method(method)
@@ -4002,9 +4186,11 @@ fn build_h3_request_head(
         (Some(authority), Some(host)) if authority.as_bytes() != host.as_bytes() => return None,
         (Some(authority), _) => builder = builder.header(http::header::HOST, authority),
         (None, Some(host)) => builder = builder.header(http::header::HOST, host),
-        (None, None) => {}
+        // RFC 9114 §4.3.1: an https request MUST carry :authority or Host
+        // (H1 answers the same shape with 400).
+        (None, None) => return None,
     }
-    Some((builder, sni))
+    Some(builder)
 }
 
 /// Decode one io_uring-H3 request, dispatch it through the bridge (real pipeline), and
@@ -4012,8 +4198,10 @@ fn build_h3_request_head(
 async fn handle_h3_request(
     req_bytes: Vec<u8>,
     body_lease: Option<hj_core::budget::BodyBufferLease>,
+    decoded_head: Option<DecodedFieldSection>,
     has_client_cert: bool,
     tls: Option<hj_core::TlsParams>,
+    sni: Option<Arc<str>>,
     peer: SocketAddr,
     local: SocketAddr,
     bridge: &Bridge,
@@ -4033,11 +4221,13 @@ async fn handle_h3_request(
     if parsed.body.len() > request_limits.max_body_bytes {
         return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     }
-    let (headers, initial_field_size) =
-        match qpack_decode_limited(&parsed.field, request_limits.max_header_bytes) {
-            Some(decoded) => decoded,
-            None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
-        };
+    // The receive path decodes the head of a request with a body; it is the same
+    // field section under the same limit.
+    let decoded = decoded_head
+        .or_else(|| qpack_decode_limited(&parsed.field, request_limits.max_header_bytes));
+    let Some((headers, initial_field_size)) = decoded else {
+        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
+    };
     if parsed.trailers.as_deref().is_some_and(|field| {
         !valid_h3_trailers(
             field,
@@ -4070,7 +4260,7 @@ async fn handle_h3_request(
     if declared_cl.is_some_and(|cl| cl != parsed.body.len()) {
         return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     }
-    let (builder, sni) = match build_h3_request_head(head) {
+    let builder = match build_h3_request_head(head) {
         Some(head) => head,
         None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
     };
@@ -4099,19 +4289,33 @@ async fn handle_h3_request(
         sni,
         tls,
         request_generation,
+        response_budget: egress_budget
+            .as_ref()
+            .map_or_else(crate::uring::bridge::connection_response_budget, |budget| {
+                budget.bridge.clone()
+            }),
     };
     // A HEAD response must carry no DATA (RFC 9114): even if the pipeline streams a body,
     // emit headers only and don't open a streamed body.
     let is_head = req.method() == http::Method::HEAD;
-    match bridge.dispatch(req, ctx).await {
+    match bridge
+        .dispatch(req, ctx)
+        .await
+        .map(crate::uring::bridge::no_upgrade_final)
+    {
         Some(mut r) => {
             let mut completion = r.completion;
             let status = r.status;
             let mut headers = r.headers;
-            let streaming_unknown_len = matches!(
-                &r.body,
-                crate::uring::bridge::BridgeBody::Stream { len: None, .. }
-            );
+            let streaming_unknown_len = match &r.body {
+                crate::uring::bridge::BridgeBody::Stream { len: Some(n), .. } => {
+                    // The bridge stripped the file's framing; restate its known length.
+                    headers.insert(http::header::CONTENT_LENGTH, http::HeaderValue::from(*n));
+                    false
+                }
+                crate::uring::bridge::BridgeBody::Stream { len: None, .. } => true,
+                _ => false,
+            };
             let body_forbidden =
                 prepare_h3_response_headers(&mut headers, is_head, status, streaming_unknown_len);
             // #626 (RFC 9114 §7.2.4.1): never emit a field section larger than
@@ -4471,6 +4675,65 @@ mod h3_codec_tests {
     // Decode a request block exercising: indexed static field lines, literal-with-name-ref
     // (static), and literal-with-literal-name. Byte layouts per RFC 9204 §4.5.
     #[tokio::test]
+    async fn bridge_sni_is_the_handshake_server_name_not_authority() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<Option<Arc<str>>>));
+        let observed = seen.clone();
+        let bridge = crate::uring::bridge::spawn_on_current(1, move |_req, ctx| {
+            *observed.lock().unwrap() = Some(ctx.sni.clone());
+            async { http::Response::new(hj_core::Body::Empty) }
+        });
+        let request = |authority: Option<&'static [u8]>| {
+            let mut fields: Vec<(&[u8], &[u8])> = vec![
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":path", b"/"),
+            ];
+            if let Some(authority) = authority {
+                fields.push((b":authority", authority));
+            }
+            let fields = literal_qpack_fields(&fields);
+            let mut wire = Vec::new();
+            write_varint(&mut wire, 1);
+            write_varint(&mut wire, fields.len() as u64);
+            wire.extend(fields);
+            wire
+        };
+        let run = |wire| {
+            handle_h3_request(
+                wire,
+                None,
+                None,
+                false,
+                None,
+                Some(Arc::from("a.test")),
+                "127.0.0.1:32000".parse().unwrap(),
+                "127.0.0.1:8443".parse().unwrap(),
+                &bridge,
+                false,
+                H3RequestLimits::new(4096, 4096),
+                None,
+                None,
+                Default::default(),
+            )
+        };
+        let _ = run(request(Some(b"b.test:443"))).await;
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(Some(Arc::from("a.test"))),
+            "BridgeCtx.sni must be the QUIC SNI, like H2"
+        );
+        let response = run(request(None)).await;
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "host-less request never dispatches"
+        );
+        let H3Body::Full { data, .. } = response.body else {
+            panic!("full error response")
+        };
+        assert_eq!(data, h3_error(http::StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
     async fn peer_settings_received_during_dispatch_limit_the_response() {
         let started = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -4505,7 +4768,9 @@ mod h3_codec_tests {
         let request = handle_h3_request(
             wire,
             None,
+            None,
             false,
+            None,
             None,
             "127.0.0.1:32000".parse().unwrap(),
             "127.0.0.1:8443".parse().unwrap(),
@@ -4989,7 +5254,9 @@ mod h3_codec_tests {
         let _response = handle_h3_request(
             wire,
             None,
+            None,
             false,
+            None,
             None,
             "127.0.0.1:32000".parse().unwrap(),
             "127.0.0.1:8443".parse().unwrap(),
@@ -5247,6 +5514,21 @@ mod h3_codec_tests {
         assert!(certificate_chain_present(&present));
     }
 
+    /// Feed `stream` to `counter` in `chunk`-byte reads, as the receive path does.
+    fn consume_in_chunks(
+        counter: &mut H3FrameCounter,
+        stream: &[u8],
+        chunk: usize,
+        limits: H3RequestLimits,
+    ) -> Result<(), RequestFrameError> {
+        let mut buffered = 0;
+        for piece in stream.chunks(chunk) {
+            counter.consume(&stream[..buffered], piece, limits)?;
+            buffered += piece.len();
+        }
+        Ok(())
+    }
+
     #[test]
     fn incremental_frame_counter_enforces_independent_limits() {
         let limits = H3RequestLimits {
@@ -5263,20 +5545,18 @@ mod h3_codec_tests {
         write_varint(&mut valid, 5);
         valid.extend_from_slice(b"12345");
         let mut counter = H3FrameCounter::default();
-        for byte in valid.chunks(1) {
-            assert!(counter.consume(byte, limits).is_ok());
-        }
+        assert!(consume_in_chunks(&mut counter, &valid, 1, limits).is_ok());
         assert_eq!(counter.header_bytes, 4);
         assert_eq!(counter.body_bytes, 5);
 
         let mut header_too_large = H3FrameCounter::default();
         assert_eq!(
-            header_too_large.consume(&[0x01, 5], limits),
+            header_too_large.consume(&[], &[0x01, 5], limits),
             Err(RequestFrameError::Limit)
         );
         let mut body_too_large = H3FrameCounter::default();
         assert_eq!(
-            body_too_large.consume(&[0x00, 6], limits),
+            body_too_large.consume(&[], &[0x00, 6], limits),
             Err(RequestFrameError::Limit)
         );
     }
@@ -5303,11 +5583,10 @@ mod h3_codec_tests {
             write_varint(&mut encoded, frame_type);
             write_varint(&mut encoded, 0);
             let mut counter = H3FrameCounter::default();
-            for byte in &encoded[..encoded.len() - 1] {
-                assert!(counter.consume(std::slice::from_ref(byte), limits).is_ok());
-            }
+            let split = encoded.len() - 1;
+            assert!(consume_in_chunks(&mut counter, &encoded[..split], 1, limits).is_ok());
             assert_eq!(
-                counter.consume(&encoded[encoded.len() - 1..], limits),
+                counter.consume(&encoded[..split], &encoded[split..], limits),
                 Err(RequestFrameError::Unexpected)
             );
         }
@@ -5332,7 +5611,7 @@ mod h3_codec_tests {
         write_varint(&mut exact, 0x00);
         write_varint(&mut exact, LIVE_BODY_LIMIT as u64);
         let mut counter = H3FrameCounter::default();
-        assert!(counter.consume(&exact, limits).is_ok());
+        assert!(counter.consume(&[], &exact, limits).is_ok());
         assert_eq!(counter.header_bytes, 2);
         assert_eq!(counter.body_bytes, LIVE_BODY_LIMIT);
 
@@ -5340,7 +5619,7 @@ mod h3_codec_tests {
         write_varint(&mut body_over, 0x00);
         write_varint(&mut body_over, (LIVE_BODY_LIMIT + 1) as u64);
         assert_eq!(
-            H3FrameCounter::default().consume(&body_over, limits),
+            H3FrameCounter::default().consume(&[], &body_over, limits),
             Err(RequestFrameError::Limit)
         );
 
@@ -5349,16 +5628,194 @@ mod h3_codec_tests {
         write_varint(&mut header_exact, LIVE_HEADER_LIMIT as u64);
         assert!(
             H3FrameCounter::default()
-                .consume(&header_exact, limits)
+                .consume(&[], &header_exact, limits)
                 .is_ok()
         );
         let mut header_over = Vec::new();
         write_varint(&mut header_over, 0x01);
         write_varint(&mut header_over, (LIVE_HEADER_LIMIT + 1) as u64);
         assert_eq!(
-            H3FrameCounter::default().consume(&header_over, limits),
+            H3FrameCounter::default().consume(&[], &header_over, limits),
             Err(RequestFrameError::Limit)
         );
+    }
+
+    /// A request stream: HEADERS with `fields`, then one DATA frame per `bodies` length.
+    pub(super) fn request_stream(fields: &[(&[u8], &[u8])], bodies: &[usize]) -> Vec<u8> {
+        let field = literal_qpack_fields(fields);
+        let mut wire = Vec::new();
+        write_varint(&mut wire, 0x01);
+        write_varint(&mut wire, field.len() as u64);
+        wire.extend(field);
+        for (index, len) in bodies.iter().enumerate() {
+            write_varint(&mut wire, 0x00);
+            write_varint(&mut wire, *len as u64);
+            wire.extend(std::iter::repeat_n(b'a' + index as u8, *len));
+        }
+        wire
+    }
+
+    pub(super) const UPLOAD_HEAD: [(&[u8], &[u8]); 4] = [
+        (b":method", b"POST"),
+        (b":scheme", b"https"),
+        (b":authority", b"upload.test"),
+        (b":path", b"/upload"),
+    ];
+
+    fn upload_fields(content_length: Option<&'static [u8]>) -> Vec<(&'static [u8], &'static [u8])> {
+        let mut fields = UPLOAD_HEAD.to_vec();
+        if let Some(length) = content_length {
+            fields.push((b"content-length", length));
+        }
+        fields
+    }
+
+    #[test]
+    fn declared_content_length_bounds_the_body_as_it_arrives() {
+        let limits = H3RequestLimits::new(1024, 1024);
+        let fields = upload_fields(Some(b"10"));
+        for chunk in [1, 3, 7, usize::MAX] {
+            // The second DATA frame header already overruns: refused before its payload.
+            let overrun = request_stream(&fields, &[6, 5]);
+            let mut counter = H3FrameCounter::default();
+            assert_eq!(
+                consume_in_chunks(&mut counter, &overrun, chunk, limits),
+                Err(RequestFrameError::Malformed),
+                "chunk={chunk}"
+            );
+            assert_eq!(counter.body_bytes, 6, "chunk={chunk}");
+
+            let mut single = H3FrameCounter::default();
+            assert_eq!(
+                consume_in_chunks(&mut single, &request_stream(&fields, &[11]), chunk, limits),
+                Err(RequestFrameError::Malformed),
+                "chunk={chunk}"
+            );
+
+            let exact = request_stream(&fields, &[4, 6]);
+            let mut counter = H3FrameCounter::default();
+            assert!(consume_in_chunks(&mut counter, &exact, chunk, limits).is_ok());
+            assert_eq!(counter.body_bytes, 10);
+            let parsed = parse_h3_request(exact).unwrap();
+            assert_eq!(
+                counter.take_decoded_head(),
+                qpack_decode_limited(&parsed.field, limits.max_header_bytes),
+                "dispatch reuses the head decoded while receiving (chunk={chunk})"
+            );
+        }
+        // A request without a body is never decoded on the receive path.
+        let mut bodiless = H3FrameCounter::default();
+        assert!(
+            bodiless
+                .consume(&[], &request_stream(&fields, &[]), limits)
+                .is_ok()
+        );
+        assert!(bodiless.take_decoded_head().is_none());
+    }
+
+    #[test]
+    fn over_cap_body_is_too_large_only_once_its_head_decodes() {
+        let limits = H3RequestLimits::new(1024, 16);
+        let refused = |stream: Vec<u8>| {
+            let mut counter = H3FrameCounter::default();
+            consume_in_chunks(&mut counter, &stream, 5, limits)
+        };
+        assert_eq!(
+            refused(request_stream(&upload_fields(Some(b"17")), &[1])),
+            Err(RequestFrameError::TooLarge),
+            "a declared length over the cap is refused at the first DATA frame"
+        );
+        assert_eq!(
+            refused(request_stream(&upload_fields(None), &[10, 7])),
+            Err(RequestFrameError::TooLarge),
+            "an undeclared body is refused when it crosses the cap"
+        );
+        assert_eq!(
+            refused(request_stream(&upload_fields(Some(b"16")), &[16])),
+            Ok(())
+        );
+        let mut undecodable = Vec::new();
+        write_varint(&mut undecodable, 0x01);
+        write_varint(&mut undecodable, 2);
+        undecodable.extend_from_slice(&[0x01, 0x00]); // nonzero Required Insert Count
+        write_varint(&mut undecodable, 0x00);
+        write_varint(&mut undecodable, 17);
+        assert_eq!(refused(undecodable), Err(RequestFrameError::Limit));
+        let mut headless = Vec::new();
+        write_varint(&mut headless, 0x00);
+        write_varint(&mut headless, 17);
+        assert_eq!(refused(headless), Err(RequestFrameError::Limit));
+    }
+
+    fn numbered(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn retained_datagram_never_pins_or_moves_a_recv_slot() {
+        let mut slots = recv_slots();
+        let bases: Vec<*const u8> = recv_iovecs(&mut slots)
+            .iter()
+            .map(|iov| {
+                assert_eq!(iov.len(), MAX_DATAGRAM);
+                iov.as_ptr()
+            })
+            .collect();
+        let first = numbered(2900);
+        slots[0][..first.len()].copy_from_slice(&first);
+        let mut segments: Vec<BytesMut> =
+            received_segments(&slots[0][..first.len()], 1200).collect();
+        let retained = segments.remove(1);
+        drop(segments);
+
+        // Pass 2 receives into the same slot memory while pass 1's segment is held.
+        let again: Vec<*const u8> = recv_iovecs(&mut slots)
+            .iter()
+            .map(|iov| iov.as_ptr())
+            .collect();
+        assert_eq!(bases, again);
+        slots[0].fill(0xee);
+        assert_eq!(&retained[..], &first[1200..2400]);
+        assert!(!slots[0].as_ptr_range().contains(&retained.as_ptr()));
+    }
+
+    #[test]
+    fn retained_segment_owns_an_allocation_no_larger_than_its_message() {
+        let message = numbered(2900);
+        for (stride, kept, len) in [(1200, 1, 1200), (1200, 2, 500), (0, 0, 2900)] {
+            let mut segments: Vec<BytesMut> = received_segments(&message, stride).collect();
+            let retained = segments.remove(kept);
+            drop(segments);
+            let owned = retained
+                .freeze()
+                .try_into_mut()
+                .expect("the retained segment is the sole owner of its allocation");
+            assert_eq!(owned.len(), len);
+            assert!(owned.capacity() <= message.len(), "stride={stride}");
+            assert_eq!(owned.capacity(), len, "stride={stride}");
+        }
+    }
+
+    #[test]
+    fn gro_stride_split_yields_the_original_segment_bytes() {
+        let message = numbered(2900);
+        let split = |stride| -> Vec<Vec<u8>> {
+            received_segments(&message, stride)
+                .map(|segment| segment.to_vec())
+                .collect()
+        };
+        assert_eq!(
+            split(1200),
+            vec![
+                message[..1200].to_vec(),
+                message[1200..2400].to_vec(),
+                message[2400..].to_vec(),
+            ]
+        );
+        for whole in [0, 2900, 4096] {
+            assert_eq!(split(whole), vec![message.clone()], "stride={whole}");
+        }
+        assert_eq!(received_segments(&[], 1200).count(), 0);
     }
 
     #[test]
@@ -5550,6 +6007,58 @@ mod h3_codec_tests {
         drop(extra);
     }
 
+    #[tokio::test]
+    async fn bridged_h3_requests_share_their_connections_response_budget() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = seen.clone();
+        let bridge = crate::uring::bridge::spawn_on_current(2, move |_req, ctx: BridgeCtx| {
+            observed.lock().unwrap().push(ctx.response_budget.clone());
+            async { http::Response::new(hj_core::Body::Empty) }
+        });
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(1 << 20));
+        let connection = H3EgressBudget::new(global.clone());
+        let other = H3EgressBudget::new(global);
+        for egress in [&connection, &connection, &other] {
+            let fields = literal_qpack_fields(&[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"a.test"),
+                (b":path", b"/"),
+            ]);
+            let mut wire = Vec::new();
+            write_varint(&mut wire, 1);
+            write_varint(&mut wire, fields.len() as u64);
+            wire.extend(fields);
+            let _ = handle_h3_request(
+                wire,
+                None,
+                None,
+                false,
+                None,
+                None,
+                "127.0.0.1:32000".parse().unwrap(),
+                "127.0.0.1:8443".parse().unwrap(),
+                &bridge,
+                false,
+                H3RequestLimits::new(4096, 4096),
+                None,
+                Some(egress.clone()),
+                Default::default(),
+            )
+            .await;
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(Arc::ptr_eq(&seen[0], &connection.bridge));
+        assert!(Arc::ptr_eq(&seen[1], &connection.bridge));
+        assert!(Arc::ptr_eq(&seen[2], &other.bridge));
+        assert!(!Arc::ptr_eq(&connection.bridge, &other.bridge));
+        assert_eq!(
+            connection.bridge.capacity(),
+            crate::uring::bridge::CONNECTION_RESPONSE_MEM
+        );
+    }
+
     #[test]
     fn pending_response_releases_egress_budget_on_reset() {
         let global = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
@@ -5705,7 +6214,12 @@ mod h3_codec_tests {
         }
         assert_eq!(st.next_deadline(), Some(t0 + timeout));
         assert!(reclaim_stalled_sends(&mut st, t0 + timeout - Duration::from_nanos(1)).is_empty());
+        let resets = admission_counts().send_stall_resets;
         assert_eq!(reclaim_stalled_sends(&mut st, t0 + timeout), vec![id]);
+        assert!(
+            admission_counts().send_stall_resets > resets,
+            "the reset is exported through the admission counters"
+        );
         assert!(
             token.is_cancelled(),
             "the bridge request and its slot are released"
@@ -5886,6 +6400,56 @@ mod h3_codec_tests {
         assert!(st.request_deadlines.is_empty());
         assert_eq!(st.next_request_deadline(), None);
         assert_eq!(st.total_req_bytes.get(), 0);
+    }
+
+    /// (#1035) Each `BODY_MIN_PROGRESS` of request bytes re-keys the stream's deadline
+    /// to `now + timeout`, never past `accepted + ceiling`; less progress never moves it.
+    #[test]
+    fn progressing_request_deadline_is_rekeyed_and_capped_at_the_ceiling() {
+        use hj_core::body_deadline::BODY_MIN_PROGRESS;
+        let accepted = Instant::now();
+        let timeout = Duration::from_secs(10);
+        let ceiling = Duration::from_secs(25);
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let other = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
+        let mut st = H3State::default();
+        let config = H3RequestConfig::new(H3RequestLimits::new(16, 1 << 20), Some(timeout))
+            .with_body_ceiling(ceiling);
+        st.track_request_stream(id, accepted, H3RequestSnapshot::unscoped(config));
+        st.track_request_stream(other, accepted, H3RequestSnapshot::unscoped(config));
+        let floor = BODY_MIN_PROGRESS as usize;
+
+        st.extend_request_deadline(id, floor - 1, accepted + Duration::from_secs(5));
+        assert_eq!(
+            st.request_snapshots[&id].deadline.map(|key| key.when),
+            Some(accepted + timeout)
+        );
+        let at = accepted + Duration::from_secs(8);
+        st.extend_request_deadline(id, floor, at);
+        assert_eq!(
+            st.request_snapshots[&id].deadline.map(|key| key.when),
+            Some(at + timeout)
+        );
+        assert_eq!(st.request_deadlines.len(), 2, "the old node is replaced");
+        assert_eq!(st.next_request_deadline(), Some(accepted + timeout));
+        assert_eq!(
+            reclaim_expired_requests(&mut st, accepted + timeout),
+            vec![other]
+        );
+        assert!(
+            reclaim_expired_requests(&mut st, at + timeout - Duration::from_nanos(1)).is_empty()
+        );
+
+        let late = accepted + Duration::from_secs(17);
+        st.extend_request_deadline(id, 2 * floor, late);
+        assert_eq!(st.next_request_deadline(), Some(accepted + ceiling));
+        st.extend_request_deadline(id, 3 * floor, accepted + Duration::from_secs(20));
+        assert_eq!(st.next_request_deadline(), Some(accepted + ceiling));
+        assert_eq!(
+            reclaim_expired_requests(&mut st, accepted + ceiling),
+            vec![id]
+        );
+        assert!(st.request_deadlines.is_empty());
     }
 
     #[test]
@@ -6117,7 +6681,7 @@ mod h3_codec_tests {
         );
     }
 
-    fn literal_qpack_fields(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
+    pub(super) fn literal_qpack_fields(fields: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut block = vec![0x00, 0x00]; // RIC=0, Base=0
         for (name, value) in fields {
             // Literal Field Line With Literal Name, both strings non-Huffman.
@@ -6132,8 +6696,29 @@ mod h3_codec_tests {
     fn request_from_raw_qpack(fields: &[(&[u8], &[u8])]) -> Option<http::Request<()>> {
         let decoded = qpack_decode(&literal_qpack_fields(fields))?;
         let head = split_h3_request_headers(decoded)?;
-        let (builder, _) = build_h3_request_head(head)?;
+        let builder = build_h3_request_head(head)?;
         builder.body(()).ok()
+    }
+
+    #[test]
+    fn raw_qpack_request_head_requires_authority_or_host() {
+        let pseudo = [
+            (b":method".as_slice(), b"GET".as_slice()),
+            (b":scheme".as_slice(), b"https".as_slice()),
+            (b":path".as_slice(), b"/".as_slice()),
+        ];
+        assert!(
+            request_from_raw_qpack(&pseudo).is_none(),
+            "RFC 9114 4.3.1: neither :authority nor Host is malformed"
+        );
+        let mut with_host = pseudo.to_vec();
+        with_host.push((b"host".as_slice(), b"a.test".as_slice()));
+        let req = request_from_raw_qpack(&with_host).expect("Host alone suffices");
+        assert_eq!(req.headers()[http::header::HOST], "a.test");
+        let mut with_authority = pseudo.to_vec();
+        with_authority.push((b":authority".as_slice(), b"a.test".as_slice()));
+        let req = request_from_raw_qpack(&with_authority).expect(":authority alone suffices");
+        assert_eq!(req.headers()[http::header::HOST], "a.test");
     }
 
     #[test]
@@ -6484,57 +7069,505 @@ mod admission_tests {
             now: Instant,
         ) {
             let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
-            let mut buf = Vec::new();
-            let mut scratch = Vec::new();
             for _ in 0..64 {
                 service_conn(&mut self.server, conns, h3, hd, now, true, config);
                 if h3[&hd].connected || h3[&hd].rejected {
                     return;
                 }
-                loop {
-                    buf.clear();
-                    let Some(transmit) =
-                        conns.get_mut(&hd).unwrap().poll_transmit(now, 1, &mut buf)
-                    else {
-                        break;
-                    };
-                    scratch.clear();
-                    if let Some(DatagramEvent::ConnectionEvent(_, event)) = self.client.handle(
-                        now,
-                        SERVER,
-                        None,
-                        None,
-                        BytesMut::from(&buf[..transmit.size]),
-                        &mut scratch,
-                    ) {
-                        client.handle_event(event);
-                    }
-                }
-                while let Some(event) = client.poll_endpoint_events() {
-                    if let Some(event) = self.client.handle_event(client_handle, event) {
-                        client.handle_event(event);
-                    }
-                }
+                self.to_client(conns.get_mut(&hd).unwrap(), client_handle, client, now);
                 while client.poll().is_some() {}
-                loop {
-                    buf.clear();
-                    let Some(transmit) = client.poll_transmit(now, 1, &mut buf) else {
-                        break;
-                    };
-                    scratch.clear();
-                    if let Some(DatagramEvent::ConnectionEvent(handle, event)) = self.server.handle(
-                        now,
-                        client_addr,
-                        None,
-                        None,
-                        BytesMut::from(&buf[..transmit.size]),
-                        &mut scratch,
-                    ) {
-                        conns.get_mut(&handle).unwrap().handle_event(event);
-                    }
-                }
+                self.to_server(conns, client, client_addr, now);
             }
             panic!("handshake did not finish");
+        }
+
+        /// Deliver every datagram the server connection has queued to the client.
+        fn to_client(
+            &mut self,
+            server: &mut quinn_proto::Connection,
+            client_handle: ConnectionHandle,
+            client: &mut quinn_proto::Connection,
+            now: Instant,
+        ) {
+            let mut buf = Vec::new();
+            let mut scratch = Vec::new();
+            loop {
+                buf.clear();
+                let Some(transmit) = server.poll_transmit(now, 1, &mut buf) else {
+                    break;
+                };
+                scratch.clear();
+                if let Some(DatagramEvent::ConnectionEvent(_, event)) = self.client.handle(
+                    now,
+                    SERVER,
+                    None,
+                    None,
+                    BytesMut::from(&buf[..transmit.size]),
+                    &mut scratch,
+                ) {
+                    client.handle_event(event);
+                }
+            }
+            while let Some(event) = client.poll_endpoint_events() {
+                if let Some(event) = self.client.handle_event(client_handle, event) {
+                    client.handle_event(event);
+                }
+            }
+        }
+
+        /// Deliver every datagram the client has queued to the server.
+        fn to_server(
+            &mut self,
+            conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+            client: &mut quinn_proto::Connection,
+            client_addr: SocketAddr,
+            now: Instant,
+        ) {
+            let mut buf = Vec::new();
+            let mut scratch = Vec::new();
+            loop {
+                buf.clear();
+                let Some(transmit) = client.poll_transmit(now, 1, &mut buf) else {
+                    break;
+                };
+                scratch.clear();
+                if let Some(DatagramEvent::ConnectionEvent(handle, event)) = self.server.handle(
+                    now,
+                    client_addr,
+                    None,
+                    None,
+                    BytesMut::from(&buf[..transmit.size]),
+                    &mut scratch,
+                ) {
+                    conns.get_mut(&handle).unwrap().handle_event(event);
+                }
+            }
+        }
+
+        /// Accept one client from `client_addr` and complete its handshake.
+        fn establish(&mut self, client_addr: SocketAddr, now: Instant) -> Established {
+            let policy = self.policy();
+            let (client_handle, mut client) = self.connect(now);
+            let initial = Self::first_datagram(&mut client, now);
+            let incoming = self.incoming(client_addr, &initial, now);
+            let Admission::Accepted(hd, conn, slot) = self.admit(incoming, now) else {
+                panic!("an idle server accepts the connection");
+            };
+            let mut conns = HashMap::from([(hd, conn)]);
+            let mut h3 = HashMap::from([(
+                hd,
+                self.runtime
+                    .accepted_state_with_policy(slot, now, 1, &policy),
+            )]);
+            self.drive_handshake(
+                &mut conns,
+                &mut h3,
+                hd,
+                client_handle,
+                &mut client,
+                client_addr,
+                now,
+            );
+            assert!(h3[&hd].connected);
+            Established {
+                conns,
+                h3,
+                hd,
+                client_handle,
+                client,
+            }
+        }
+    }
+
+    struct Established {
+        conns: HashMap<ConnectionHandle, quinn_proto::Connection>,
+        h3: HashMap<ConnectionHandle, H3State>,
+        hd: ConnectionHandle,
+        client_handle: ConnectionHandle,
+        client: quinn_proto::Connection,
+    }
+
+    #[test]
+    fn server_does_not_advertise_quic_datagrams() {
+        let mut h = Harness::new(65_000);
+        let mut e = h.establish(spoofed(5), Instant::now());
+        assert_eq!(
+            e.client.datagrams().max_size(),
+            None,
+            "max_datagram_frame_size must not be advertised without RFC 9297 support"
+        );
+        assert!(matches!(
+            e.client.datagrams().send(Bytes::from_static(b"x"), true),
+            Err(quinn_proto::SendDatagramError::UnsupportedByPeer)
+        ));
+    }
+
+    #[test]
+    fn recv_drain_hands_quinn_owned_copies_of_each_datagram() {
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let policy = h.policy();
+        let server_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        server_sock.set_nonblocking(true).unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let udp_state = UdpSocketState::new(UdpSockRef::from(&server_sock)).unwrap();
+        let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (_, mut client) = h
+            .client
+            .connect(now, h.client_config.clone(), server_addr, "localhost")
+            .unwrap();
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let Some(transmit) = client.poll_transmit(now, 1, &mut buf) else {
+                break;
+            };
+            client_sock
+                .send_to(&buf[..transmit.size], server_addr)
+                .unwrap();
+        }
+        let mut slots = recv_slots();
+        let bases: Vec<*const u8> = slots.iter().map(|slot| slot.as_ptr()).collect();
+        let mut metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
+        let mut scratch = Vec::new();
+        let mut conns = HashMap::new();
+        let mut h3 = HashMap::new();
+        let mut deadlines = RequestDeadlineIndex::default();
+        let mut epoch = 0;
+        let mut rt = crate::uring::build_core_runtime().unwrap();
+        let affected = rt.block_on(async {
+            let udp = UdpSocket::from_std(server_sock).unwrap();
+            recv_drain(
+                &udp,
+                &udp_state,
+                &mut slots,
+                &mut metas,
+                &mut scratch,
+                &mut h.server,
+                &mut conns,
+                &mut h3,
+                &mut deadlines,
+                &mut epoch,
+                &h.handshakes,
+                &h.runtime,
+                &policy,
+                true,
+                now,
+            )
+            .await
+        });
+        assert_eq!(
+            affected.len(),
+            1,
+            "the client's Initial opened a connection"
+        );
+        assert_eq!(conns.len(), 1);
+        let after: Vec<*const u8> = slots.iter().map(|slot| slot.as_ptr()).collect();
+        assert_eq!(bases, after, "recv slots are reused in place");
+        assert!(slots.iter().all(|slot| slot.len() == MAX_DATAGRAM));
+    }
+
+    #[test]
+    fn flush_conn_follows_quinn_udp_disabling_segmentation_offload() {
+        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_nonblocking(true).unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_nonblocking(true).unwrap();
+        // The kernel refuses UDP GSO on a socket that sends without checksums
+        // (EINVAL), the failure shape of a route or NIC without segmentation offload.
+        let one: libc::c_int = 1;
+        // SAFETY: `sock` owns a live fd; the option value is a c_int of the stated size.
+        let rc = unsafe {
+            libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_NO_CHECK,
+                (&one as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(rc, 0);
+        let udp_state = UdpSocketState::new(UdpSockRef::from(&sock)).unwrap();
+        let at_startup = udp_state.max_gso_segments();
+        if at_startup < 2 {
+            eprintln!("skipped: this kernel has no UDP GSO");
+            return;
+        }
+        assert_eq!(tx_segment_cap(&udp_state), at_startup.min(MAX_TX_SEGMENTS));
+        let probe = [0u8; 2400];
+        let segmented = UdpTransmit {
+            destination: sink_addr,
+            ecn: None,
+            contents: &probe,
+            segment_size: Some(1200),
+            src_ip: None,
+        };
+        assert!(
+            udp_state
+                .try_send(UdpSockRef::from(&sock), &segmented)
+                .is_err()
+        );
+        assert_eq!(udp_state.max_gso_segments(), 1, "quinn-udp halted GSO");
+        assert_eq!(tx_segment_cap(&udp_state), 1);
+
+        // A connection with many datagrams queued must still reach its peer.
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let mut e = h.establish(sink_addr, now);
+        let conn = e.conns.get_mut(&e.hd).unwrap();
+        let id = conn.streams().open(Dir::Uni).unwrap();
+        let written = conn.send_stream(id).write(&[0x5a; 16 * 1024]).unwrap();
+        assert!(written > 4 * 1200);
+        let mut tbuf = Vec::new();
+        let mut rt = crate::uring::build_core_runtime().unwrap();
+        rt.block_on(async {
+            let udp = UdpSocket::from_std(sock).unwrap();
+            flush_conn(&udp, &udp_state, &mut e.conns, e.hd, now, &mut tbuf).await;
+        });
+        let mut received = 0;
+        let mut datagram = [0u8; MAX_DATAGRAM];
+        while let Ok(n) = sink.recv(&mut datagram) {
+            assert!(n <= 1500, "a {n}-byte receive was not a single datagram");
+            received += 1;
+        }
+        assert!(
+            received >= 2,
+            "only {received} datagrams arrived: transmits kept requesting GSO"
+        );
+    }
+
+    fn read_response(conn: &mut quinn_proto::Connection, id: StreamId) -> Result<Vec<u8>, u64> {
+        let mut stream = conn.recv_stream(id);
+        let mut chunks = stream.read(true).expect("the response stream is readable");
+        let mut body = Vec::new();
+        let end = loop {
+            match chunks.next(usize::MAX) {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk.bytes),
+                Ok(None) => break Ok(()),
+                Err(quinn_proto::ReadError::Reset(code)) => break Err(code.into_inner()),
+                Err(quinn_proto::ReadError::Blocked) => panic!("the response did not finish"),
+            }
+        };
+        let _ = chunks.finalize();
+        end.map(|()| body)
+    }
+
+    #[test]
+    fn oversized_and_overrunning_uploads_are_refused_like_h1_and_h2() {
+        use super::h3_codec_tests::{UPLOAD_HEAD, request_stream};
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let addr = spoofed(11);
+        let mut e = h.establish(addr, now);
+        let with_length = |length: &'static [u8]| {
+            let mut fields = UPLOAD_HEAD.to_vec();
+            fields.push((b"content-length", length));
+            fields
+        };
+        // The harness accepts request streams with 1024-byte header and body caps.
+        let requests = [
+            (request_stream(&with_length(b"5000"), &[100]), false),
+            (request_stream(&with_length(b"10"), &[11]), false),
+            (request_stream(&UPLOAD_HEAD, &[600, 600]), false),
+            (request_stream(&with_length(b"4"), &[4]), true),
+        ];
+        let ids: Vec<StreamId> = requests
+            .iter()
+            .map(|(wire, fin)| {
+                let id = e.client.streams().open(Dir::Bi).unwrap();
+                let mut send = e.client.send_stream(id);
+                assert_eq!(send.write(wire).unwrap(), wire.len());
+                if *fin {
+                    send.finish().unwrap();
+                }
+                id
+            })
+            .collect();
+        h.to_server(&mut e.conns, &mut e.client, addr, now);
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        service_conn(
+            &mut h.server,
+            &mut e.conns,
+            &mut e.h3,
+            e.hd,
+            now,
+            true,
+            config,
+        );
+        let st = e.h3.get_mut(&e.hd).unwrap();
+        let conn = e.conns.get_mut(&e.hd).unwrap();
+        assert_eq!(receive_request_streams(conn, st, now), vec![ids[3]]);
+        assert!(
+            st.req_frames
+                .get_mut(&ids[3])
+                .and_then(H3FrameCounter::take_decoded_head)
+                .is_some(),
+            "the accepted upload carries its decoded head to dispatch"
+        );
+        for id in &ids[..3] {
+            assert!(!st.requests.contains(id) && !st.req_buf.contains_key(id));
+        }
+        assert!(st.pending.is_empty(), "each 413 was written whole");
+        h.to_client(conn, e.client_handle, &mut e.client, now);
+
+        let mut stopped = HashMap::new();
+        while let Some(event) = e.client.poll() {
+            if let Event::Stream(StreamEvent::Stopped { id, error_code }) = event {
+                stopped.insert(id, error_code.into_inner());
+            }
+        }
+        let too_large = h3_payload_too_large();
+        let no_error = u64::from(H3_NO_ERROR);
+        let message_error = u64::from(H3_MESSAGE_ERROR);
+        assert_eq!(read_response(&mut e.client, ids[0]), Ok(too_large.clone()));
+        assert_eq!(stopped.get(&ids[0]), Some(&no_error));
+        assert_eq!(read_response(&mut e.client, ids[1]), Err(message_error));
+        assert_eq!(stopped.get(&ids[1]), Some(&message_error));
+        assert_eq!(read_response(&mut e.client, ids[2]), Ok(too_large));
+        assert_eq!(stopped.get(&ids[2]), Some(&no_error));
+        assert!(!stopped.contains_key(&ids[3]));
+    }
+
+    /// (#1035) How a paced H3 upload ended, measured from stream acceptance on the
+    /// harness's virtual clock.
+    #[derive(Debug)]
+    enum PacedUpload {
+        /// FIN reached with every byte buffered: the request goes to dispatch.
+        Finished(Duration, usize),
+        /// The receive deadline expired; `drive_one_conn` resets both halves.
+        Expired(Duration),
+    }
+
+    /// Upload `total` body bytes on one request stream, `chunk` bytes every `gap` of
+    /// virtual time, driving the server in `drive_one_conn`'s order (expire, then
+    /// receive) under `config`.
+    fn paced_h3_upload(
+        config: H3RequestConfig,
+        chunk: usize,
+        gap: Duration,
+        total: usize,
+    ) -> PacedUpload {
+        use super::h3_codec_tests::{UPLOAD_HEAD, request_stream};
+        let mut h = Harness::new(65_000);
+        let start = Instant::now();
+        let addr = spoofed(40);
+        let mut e = h.establish(addr, start);
+        let length = total.to_string();
+        let mut fields = UPLOAD_HEAD.to_vec();
+        fields.push((b"content-length", length.as_bytes()));
+        let wire = request_stream(&fields, &[total]);
+        let head = wire.len() - total;
+        let id = e.client.streams().open(Dir::Bi).unwrap();
+        let mut written = 0;
+        let mut finished = false;
+        let mut accepted = None;
+        let mut now = start;
+        while now - start < Duration::from_secs(120) {
+            let chunks = ((now - start).as_nanos() / gap.as_nanos()) as usize + 1;
+            let goal = (head + chunks * chunk).min(wire.len());
+            let mut send = e.client.send_stream(id);
+            while written < goal {
+                match send.write(&wire[written..goal]) {
+                    Ok(n) if n > 0 => written += n,
+                    _ => break,
+                }
+            }
+            if written == wire.len() && !finished {
+                send.finish().unwrap();
+                finished = true;
+            }
+            if e.client.poll_timeout().is_some_and(|t| t <= now) {
+                e.client.handle_timeout(now);
+            }
+            h.to_server(&mut e.conns, &mut e.client, addr, now);
+            if let Some(conn) = e.conns.get_mut(&e.hd)
+                && conn.poll_timeout().is_some_and(|t| t <= now)
+            {
+                conn.handle_timeout(now);
+            }
+            service_conn(
+                &mut h.server,
+                &mut e.conns,
+                &mut e.h3,
+                e.hd,
+                now,
+                true,
+                config,
+            );
+            let st = e.h3.get_mut(&e.hd).unwrap();
+            // `service_conn` stamps acceptance with the real clock; recover it from the
+            // stream's initial deadline.
+            if accepted.is_none()
+                && let (Some(key), Some(timeout)) = (
+                    st.request_snapshots.get(&id).and_then(|s| s.deadline),
+                    config.timeout,
+                )
+            {
+                accepted = Some(key.when - timeout);
+            }
+            let since_accept = now - accepted.unwrap_or(now);
+            if reclaim_expired_requests(st, now).contains(&id) {
+                return PacedUpload::Expired(since_accept);
+            }
+            let conn = e.conns.get_mut(&e.hd).unwrap();
+            if receive_request_streams(conn, st, now).contains(&id) {
+                let buffered = st.req_buf.get(&id).map_or(0, Vec::len);
+                return PacedUpload::Finished(since_accept, buffered - head);
+            }
+            h.to_client(conn, e.client_handle, &mut e.client, now);
+            now += STEP;
+        }
+        panic!("the upload neither finished nor expired");
+    }
+
+    /// The virtual clock's resolution in [`paced_h3_upload`].
+    const STEP: Duration = Duration::from_millis(1);
+
+    fn paced_config(timeout: Duration) -> H3RequestConfig {
+        H3RequestConfig::new(H3RequestLimits::new(1024, 1 << 20), Some(timeout))
+    }
+
+    #[test]
+    fn steady_upload_outlasting_the_timeout_is_received_whole() {
+        let timeout = Duration::from_secs(1);
+        // 16 KiB per half window for 2.5 windows: past the old absolute deadline.
+        let total = 6 * 16 * 1024;
+        match paced_h3_upload(
+            paced_config(timeout),
+            16 * 1024,
+            Duration::from_millis(500),
+            total,
+        ) {
+            PacedUpload::Finished(at, body) => {
+                assert!(at > 2 * timeout, "{at:?}");
+                assert_eq!(body, total);
+            }
+            other => panic!("a steady upload must not be cut: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trickled_upload_is_cut_at_the_timeout() {
+        let timeout = Duration::from_secs(1);
+        match paced_h3_upload(paced_config(timeout), 1, Duration::from_millis(100), 100) {
+            PacedUpload::Expired(at) => assert!(at >= timeout && at < timeout + STEP, "{at:?}"),
+            other => panic!("a trickle below the floor must be cut: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn steady_upload_is_cut_at_the_ceiling() {
+        let timeout = Duration::from_secs(1);
+        let ceiling = Duration::from_millis(1500);
+        match paced_h3_upload(
+            paced_config(timeout).with_body_ceiling(ceiling),
+            16 * 1024,
+            Duration::from_millis(300),
+            10 * 16 * 1024,
+        ) {
+            PacedUpload::Expired(at) => assert!(at >= ceiling && at < ceiling + STEP, "{at:?}"),
+            other => panic!("progress must not outlast the ceiling: {other:?}"),
         }
     }
 
@@ -6665,6 +7698,11 @@ mod admission_tests {
             now,
         );
         assert!(h3[&hd].connected);
+        assert_eq!(
+            h3[&hd].server_name.as_deref(),
+            Some("localhost"),
+            "the routing SNI comes from the QUIC handshake"
+        );
         assert_eq!(
             h.active.load(Relaxed),
             1,

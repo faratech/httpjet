@@ -311,7 +311,7 @@ pub fn is_forwarding_authority_header(name: &str) -> bool {
 }
 
 fn fold(b: u8) -> u8 {
-    if b == b'_' {
+    if b == b'_' || b == b'.' {
         b'-'
     } else {
         b.to_ascii_lowercase()
@@ -358,6 +358,8 @@ mod forwarding_authority_tests {
             "Proxy-Client-IP",
             "WL-Proxy-Client-IP",
             "X_Forwarded_Protocol",
+            "X.Forwarded.For",
+            "CF.Connecting.IP",
         ] {
             assert!(is_forwarding_authority_header(name), "{name}");
         }

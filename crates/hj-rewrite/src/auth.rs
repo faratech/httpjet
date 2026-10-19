@@ -5,9 +5,12 @@
 //! reads the htpasswd file at authorization time (admin-controlled path, low
 //! traffic trees) and supports the standard hash formats:
 //!
-//! * `$2y$` / `$2b$` / `$2a$` bcrypt (htpasswd `-B`, the Apache 2.4 default)
+//! * `$apr1$` APR1-MD5 (htpasswd `-m`, the htpasswd default) and its glibc
+//!   `crypt()` sibling `$1$` MD5-crypt
+//! * `$2y$` / `$2b$` / `$2a$` bcrypt (htpasswd `-B`)
 //! * `{SHA}base64(sha1)` (htpasswd `-s`)
-//! * `apr1` MD5 → **unsupported**: verifies false
+//! * traditional DES `crypt()` (htpasswd `-d`) and `$5$`/`$6$` SHA-crypt →
+//!   **unsupported**: verifies false
 //! * plaintext (htpasswd `-p`) → **unsupported**, as in Apache on Unix: accepting it
 //!   would let any readable `user:value` line act as a password
 //!
@@ -128,9 +131,87 @@ pub fn verify_hash(pass: &str, hash: &str) -> bool {
             }
             _ => false,
         }
+    } else if let Some((magic, salt, expected)) = md5_crypt_parts(hash) {
+        ct_eq(&md5_crypt(pass.as_bytes(), magic, salt), expected)
     } else {
-        false // apr1, crypt() and plaintext: unsupported
+        false // DES/SHA crypt() and plaintext: unsupported
     }
+}
+
+/// Split `$apr1$salt$digest` / `$1$salt$digest` into (magic, salt, digest).
+fn md5_crypt_parts(hash: &str) -> Option<(&'static [u8], &[u8], &[u8])> {
+    let (magic, rest): (&'static [u8], &str) = if let Some(rest) = hash.strip_prefix("$apr1$") {
+        (b"$apr1$", rest)
+    } else {
+        (b"$1$", hash.strip_prefix("$1$")?)
+    };
+    let (salt, digest) = rest.split_once('$')?;
+    (salt.len() <= 8 && digest.len() == 22).then_some((magic, salt.as_bytes(), digest.as_bytes()))
+}
+
+/// The FreeBSD MD5-crypt algorithm (APR1 differs only in its magic string):
+/// returns the 22-character encoded digest.
+fn md5_crypt(pw: &[u8], magic: &[u8], salt: &[u8]) -> [u8; 22] {
+    use md5::{Digest, Md5};
+    const ITOA64: &[u8; 64] = b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let alt: [u8; 16] = Md5::new()
+        .chain_update(pw)
+        .chain_update(salt)
+        .chain_update(pw)
+        .finalize()
+        .into();
+    let mut ctx = Md5::new();
+    ctx.update(pw);
+    ctx.update(magic);
+    ctx.update(salt);
+    for chunk in pw.chunks(16) {
+        ctx.update(&alt[..chunk.len()]);
+    }
+    let mut i = pw.len();
+    while i > 0 {
+        if i & 1 == 1 {
+            ctx.update([0u8]);
+        } else {
+            ctx.update(&pw[..1]);
+        }
+        i >>= 1;
+    }
+    let mut fin: [u8; 16] = ctx.finalize().into();
+    for round in 0..1000 {
+        let mut c = Md5::new();
+        if round & 1 == 1 {
+            c.update(pw);
+        } else {
+            c.update(fin);
+        }
+        if round % 3 != 0 {
+            c.update(salt);
+        }
+        if round % 7 != 0 {
+            c.update(pw);
+        }
+        if round & 1 == 1 {
+            c.update(fin);
+        } else {
+            c.update(pw);
+        }
+        fin = c.finalize().into();
+    }
+    let mut out = [0u8; 22];
+    let mut pos = 0;
+    let mut put = |mut v: u32, n: usize| {
+        for _ in 0..n {
+            out[pos] = ITOA64[(v & 0x3f) as usize];
+            pos += 1;
+            v >>= 6;
+        }
+    };
+    let f = |i: usize| u32::from(fin[i]);
+    for (a, b, c) in [(0, 6, 12), (1, 7, 13), (2, 8, 14), (3, 9, 15), (4, 10, 5)] {
+        put((f(a) << 16) | (f(b) << 8) | f(c), 4);
+    }
+    put(f(11), 2);
+    out
 }
 
 fn sha1_sha1(data: &[u8]) -> [u8; 20] {
@@ -181,6 +262,8 @@ pub fn verify_credentials(
     if !matched {
         if let Some(cost) = entries.iter().find_map(|e| bcrypt_cost(&e.hash)) {
             let _ = bcrypt::hash_with_salt(pass, cost, [0u8; 16]);
+        } else if let Some(entry) = entries.iter().find(|e| md5_crypt_parts(&e.hash).is_some()) {
+            let _ = verify_hash(pass, &entry.hash);
         }
     }
     Ok(valid)
@@ -231,8 +314,43 @@ mod tests {
     }
 
     #[test]
-    fn apr1_and_crypt_are_unsupported() {
+    fn apr1_hashes_verify() {
+        // htpasswd -nbm user <password> (Apache htpasswd 2.4) and
+        // `openssl passwd -apr1 -salt <salt>` cross-checks.
+        for (pass, hash) in [
+            ("password", "$apr1$d.1VdWhX$i8q6s25E0eSCUQLOfOkbr."),
+            ("password", "$apr1$1PxDvRiG$SScsMyA0Mcb/n8o7brYkH/"),
+            ("", "$apr1$6Ez.wQaX$lxRWPdrwvmgxST26PnEG8."),
+            (
+                "a-much-longer-password-than-sixteen-bytes",
+                "$apr1$ZuvKTgZZ$X8o9mWZfFnMTjRAyEFu7m1",
+            ),
+            // openssl passwd -apr1 -salt xx password (short salt).
+            ("password", "$apr1$xx$2eRrCdRwKOfJOth0w31wR."),
+        ] {
+            assert!(verify_hash(pass, hash), "{hash}");
+            assert!(!verify_hash("wrong", hash), "{hash}");
+        }
+        // openssl passwd -1 -salt abcdefgh password (glibc MD5-crypt).
+        assert!(verify_hash(
+            "password",
+            "$1$abcdefgh$G//4keteveJp0qb8z2DxG/"
+        ));
+        assert!(!verify_hash(
+            "password",
+            "$apr1$abcdefgh$G//4keteveJp0qb8z2DxG/"
+        ));
+    }
+
+    #[test]
+    fn malformed_and_des_crypt_are_unsupported() {
         assert!(!verify_hash("x", "$apr1$salt$hash"));
+        assert!(!verify_hash(
+            "x",
+            "$apr1$toolongsalt$i8q6s25E0eSCUQLOfOkbr."
+        ));
+        // htpasswd -nbd user password (traditional DES crypt).
+        assert!(!verify_hash("password", "rqXexS6ZhobKA"));
         assert!(!verify_hash("x", "cryptstylehash"));
     }
 

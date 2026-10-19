@@ -38,12 +38,12 @@
 pub mod throttle;
 pub use throttle::ClientThrottle;
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::Path;
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use http::HeaderMap;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv6Net};
 
 use hj_core::config::Security;
 
@@ -65,14 +65,15 @@ impl AclDecision {
 }
 
 /// A single parsed access-control matcher: either the catch-all `ALL` or a
-/// CIDR network. Carries the `allow` verdict. The `trusted` ("T") flag is tracked
-/// separately on [`AccessControl`] (`trusted_nets` for CIDR rules, `all_trusted`
-/// for a trusted `ALL`), not on the rule.
+/// CIDR network. Carries the `allow` verdict and the `trusted` ("T") flag: as in
+/// OLS (`hasAccess() == AC_TRUST`), a peer is trusted only when the most specific
+/// rule matching it is a trusted allow.
 #[derive(Debug, Clone)]
 struct Rule {
     /// `None` means `ALL` (matches every IP, prefix length 0).
     net: Option<IpNet>,
     allow: bool,
+    trusted: bool,
 }
 
 impl Rule {
@@ -107,12 +108,8 @@ pub struct AccessControl {
     /// configured, so the loop always finds a match; no separate fallback is
     /// needed.
     rules: Vec<Rule>,
-    /// Trusted ("T") networks only, for fast [`is_trusted`](Self::is_trusted).
-    trusted_nets: Vec<IpNet>,
-    /// A trusted catch-all (`allow ALL T`) marks EVERY peer trusted. Tracked separately because
-    /// the `ALL` rule carries no CIDR to push into `trusted_nets`; without this the `T` on an
-    /// `ALL` rule was silently dropped, so `is_trusted` returned false for all peers and forwarded
-    /// client-IP headers were never honored under `useIpInProxyHeader=2`.
+    /// Every peer is trusted: an `ALL` rule exists (so every address matches some
+    /// rule) and every rule is a trusted allow. Lets the XFF walk skip trust scans.
     all_trusted: bool,
     /// Compiled `accessDenyDir` globs.
     deny_globs: GlobSet,
@@ -125,33 +122,26 @@ impl AccessControl {
     /// Invalid access-control addresses and deny globs reject the configuration.
     pub fn from_security(security: &Security) -> Result<Self, String> {
         let mut rules: Vec<Rule> = Vec::with_capacity(security.access_control.len());
-        let mut trusted_nets: Vec<IpNet> = Vec::new();
-        let mut all_trusted = false;
 
         for ar in &security.access_control {
             let spec = ar.spec.trim();
-            if spec.eq_ignore_ascii_case("ALL") {
-                // A trusted catch-all (`ALL T`) marks every peer trusted. Record it here — the
-                // `ALL` rule has no CIDR for `trusted_nets`, so dropping `ar.trusted` (the old
-                // behavior) silently lost the trust semantics for all peers.
-                if ar.trusted {
-                    all_trusted = true;
-                }
+            // OLS `checkTrust` only upgrades an allow entry to AC_TRUST.
+            let trusted = ar.trusted && ar.allow;
+            if spec == "*" || spec.eq_ignore_ascii_case("ALL") {
                 rules.push(Rule {
                     net: None,
                     allow: ar.allow,
+                    trusted,
                 });
                 continue;
             }
 
             match parse_cidr(spec) {
                 Some(net) => {
-                    if ar.trusted {
-                        trusted_nets.push(net);
-                    }
                     rules.push(Rule {
                         net: Some(net),
                         allow: ar.allow,
+                        trusted,
                     });
                 }
                 None => {
@@ -164,15 +154,19 @@ impl AccessControl {
         }
 
         // Most-specific-first: longest prefix wins, `ALL` (len 0) sinks to the
-        // bottom. Stable sort preserves config order among equal prefixes so
-        // the *first-listed* of two equal-specificity rules stays first.
-        rules.sort_by_key(|b| std::cmp::Reverse(b.prefix_len()));
+        // bottom. Two rules of equal prefix that match the same address name the
+        // same network; OLS lets the later-added deny list overwrite the allow
+        // entry for that network, so a deny sorts ahead of an equal allow. Within
+        // one list a later entry for the same network overwrites an earlier one
+        // (this only decides the trust flag, e.g. `ALL` vs `::T` for IPv6).
+        rules.reverse();
+        rules.sort_by_key(|b| (std::cmp::Reverse(b.prefix_len()), b.allow));
+        let all_trusted = rules.iter().any(|r| r.net.is_none()) && rules.iter().all(|r| r.trusted);
 
         let deny_globs = build_deny_globs(&security.access_deny_dir)?;
 
         Ok(AccessControl {
             rules,
-            trusted_nets,
             all_trusted,
             deny_globs,
         })
@@ -184,8 +178,8 @@ impl AccessControl {
     ///
     /// The **most specific matching rule wins**. Rules are pre-sorted by CIDR
     /// prefix length (longest first), so the first rule that matches `ip` is
-    /// authoritative; among rules with equal specificity the first-listed in
-    /// config wins. `ALL` (prefix 0) is the least specific and therefore acts
+    /// authoritative; among rules with equal specificity (the same network) a
+    /// deny wins, as in OLS. `ALL` (prefix 0) is the least specific and therefore acts
     /// as the default/base verdict.
     ///
     /// If no rule matches at all the connection is **allowed** (LiteSpeed's
@@ -216,12 +210,28 @@ impl AccessControl {
         AclDecision::Allow
     }
 
-    /// `true` if `ip` falls inside any network tagged trusted (`T` suffix) —
-    /// e.g. the Cloudflare authenticated-origin ranges. Trusted peers are the
-    /// only ones whose forwarded client-IP headers are honored under
-    /// `useIpInProxyHeader=2`.
+    /// Verdict for a request whose resolved client IP may differ from the TCP peer.
+    ///
+    /// Both identities must be allowed: OLS re-runs `checkAccess()` after switching to the
+    /// forwarded client (`updateClientInfoFromProxyHeader`), so a deny rule that matches the
+    /// real visitor blocks it even though the proxy peer is allowed.
+    pub fn check_client(&self, peer: IpAddr, client: IpAddr) -> AclDecision {
+        match self.check_peer(peer) {
+            AclDecision::Deny => AclDecision::Deny,
+            AclDecision::Allow if client.to_canonical() == peer.to_canonical() => {
+                AclDecision::Allow
+            }
+            AclDecision::Allow => self.check_peer(client),
+        }
+    }
+
+    /// `true` if the most specific rule matching `ip` is a trusted allow (`T`
+    /// suffix) — e.g. the Cloudflare authenticated-origin ranges. Like OLS, a more
+    /// specific untrusted allow or a deny inside a trusted network is NOT trusted,
+    /// and equal-prefix ties resolve as in [`check_peer`](Self::check_peer) (deny
+    /// wins). Trusted peers are the only ones whose forwarded client-IP headers
+    /// are honored under `useIpInProxyHeader=2`.
     pub fn is_trusted(&self, ip: IpAddr) -> bool {
-        // A trusted catch-all (`allow ALL T`) trusts every peer.
         if self.all_trusted {
             return true;
         }
@@ -229,7 +239,10 @@ impl AccessControl {
         // listener (see `check_peer`) — else a trusted CF v4 range fails to match a mapped peer
         // (fail-closed: real-IP resolution silently keeps the proxy IP).
         let ip = ip.to_canonical();
-        self.trusted_nets.iter().any(|net| net_contains(net, ip))
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(ip))
+            .is_some_and(|rule| rule.trusted)
     }
 
     /// Resolve the real client IP, applying `useIpInProxyHeader` semantics and
@@ -317,21 +330,12 @@ impl AccessControl {
         peer
     }
 
-    /// The last (right-most) parseable `X-Forwarded-For` address across all XFF header
-    /// lines — the hop nearest this server. Used by `useIpInProxyHeader=4`. `None` if no
-    /// XFF entry parses.
+    /// The last (right-most) `X-Forwarded-For` entry across all XFF header lines
+    /// — the hop nearest this server. Used by `useIpInProxyHeader=4`. `None` (the
+    /// caller falls back to the peer) when that entry does not parse: like OLS,
+    /// an unparsable nearest hop never lets the walk skip left onto a forgeable one.
     fn rightmost_valid_xff(&self, headers: &HeaderMap) -> Option<IpAddr> {
-        let mut last = None;
-        for value in headers.get_all("x-forwarded-for").iter() {
-            if let Ok(s) = value.to_str() {
-                for part in s.split(',') {
-                    if let Some(ip) = parse_ip(part.trim()) {
-                        last = Some(ip);
-                    }
-                }
-            }
-        }
-        last
+        xff_entries(headers).last().copied().flatten()
     }
 
     /// Pick the left-most `X-Forwarded-For` entry that is not one of our own
@@ -393,20 +397,18 @@ impl AccessControl {
     /// are stripped from the right edge only; the first non-trusted hop is the
     /// address that connected to that trusted suffix. Addresses farther left
     /// remain untrusted client input and cannot override it.
+    /// An unparsable entry reached before the first non-trusted hop ends the walk
+    /// with `None` (the peer): skipping it would land on an address farther left,
+    /// which the client wrote.
     fn rightmost_untrusted_xff(&self, headers: &HeaderMap) -> Option<IpAddr> {
-        let parsed: Vec<IpAddr> = headers
-            .get_all("x-forwarded-for")
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
-            .filter_map(|part| parse_ip(part.trim()))
-            .collect();
-        parsed
-            .iter()
-            .rev()
-            .copied()
-            .find(|ip| !self.is_trusted(*ip))
-            .or_else(|| parsed.first().copied())
+        let entries = xff_entries(headers);
+        for entry in entries.iter().rev() {
+            let ip = (*entry)?;
+            if !self.is_trusted(ip) {
+                return Some(ip);
+            }
+        }
+        entries.first().copied().flatten()
     }
 
     /// `true` if `resolved_path` matches any `accessDenyDir` glob and must not
@@ -558,33 +560,141 @@ fn add_glob_ci(builder: &mut GlobSetBuilder, pat: &str) {
 }
 
 /// Parse a CIDR or bare IP into an [`IpNet`]. A bare address becomes a host
-/// route (`/32` or `/128`).
+/// route (`/32` or `/128`). The LiteSpeed IPv4 shorthands are accepted with OLS
+/// `AccessControl::addIPv4` semantics: `192.168.1.*`, `192.168` and `192.168.`
+/// cover every octet that is not written out, and `10.0.0.0/255.0.0.0` is a
+/// dotted netmask (which must be contiguous).
 fn parse_cidr(spec: &str) -> Option<IpNet> {
+    let unbracketed;
+    let spec = match spec.strip_prefix('[') {
+        // OLS `strToIPv6` accepts `[::1]` and `[2001:db8::]/32`.
+        Some(rest) => {
+            let (addr, tail) = rest.split_once(']')?;
+            if !(tail.is_empty() || tail.starts_with('/')) || addr.parse::<Ipv6Addr>().is_err() {
+                return None;
+            }
+            unbracketed = format!("{addr}{tail}");
+            unbracketed.as_str()
+        }
+        None => spec,
+    };
     let net = if let Ok(net) = spec.parse::<IpNet>() {
         net
-    } else {
-        // Bare IP → host network.
-        let ip = spec.parse::<IpAddr>().ok()?;
+    } else if let Some((addr, mask)) = spec.split_once('/') {
+        let addr = addr.parse::<std::net::Ipv4Addr>().ok()?;
+        let mask = u32::from(mask.parse::<std::net::Ipv4Addr>().ok()?);
+        if mask.leading_ones() + mask.trailing_zeros() != 32 {
+            return None;
+        }
+        IpNet::new(IpAddr::V4(addr), mask.leading_ones() as u8).ok()?
+    } else if let Ok(ip) = spec.parse::<IpAddr>() {
         let prefix = if ip.is_ipv4() { 32 } else { 128 };
         IpNet::new(ip, prefix).ok()?
+    } else {
+        partial_ipv4(spec)?
     };
+    // OLS `addIPControl(in6_addr)` treats the all-zero host as the IPv6 root, so
+    // `::` is the all-IPv6 catch-all rather than the unspecified address alone.
+    if let IpNet::V6(v6) = net
+        && v6.prefix_len() == 128
+        && v6.addr().is_unspecified()
+    {
+        return Some(IpNet::V6(Ipv6Net::default()));
+    }
     // Peers are canonicalized to v4 before matching (#689).
     hj_geo::fold_mapped_v4(net)
 }
 
-/// Parse an IP address, tolerating an IPv6 zone id and surrounding brackets.
+/// OLS partial IPv4: the written octets before the first `*` (or all of them
+/// when there is none) form the network, one `/8` per octet.
+fn partial_ipv4(spec: &str) -> Option<IpNet> {
+    let written = match spec.find('*') {
+        Some(star) => {
+            let (head, tail) = spec.split_at(star);
+            if !tail.bytes().all(|b| b == b'*' || b == b'.') {
+                return None;
+            }
+            head.strip_suffix('.')?
+        }
+        None => spec.strip_suffix('.').unwrap_or(spec),
+    };
+    if written.is_empty() {
+        return None;
+    }
+    let octets = written
+        .split('.')
+        .map(|o| {
+            let canonical = o == "0" || (!o.starts_with('0') && !o.is_empty());
+            (canonical && o.len() <= 3 && o.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| o.parse::<u8>().ok())
+                .flatten()
+        })
+        .collect::<Option<Vec<u8>>>()?;
+    if octets.len() > 4 {
+        return None;
+    }
+    let mut addr = [0u8; 4];
+    addr[..octets.len()].copy_from_slice(&octets);
+    IpNet::new(
+        IpAddr::V4(std::net::Ipv4Addr::from(addr)),
+        8 * octets.len() as u8,
+    )
+    .ok()
+}
+
+/// Every non-empty `X-Forwarded-For` entry across all header lines, in order,
+/// with `None` for one that does not parse (a non-UTF-8 line counts as one
+/// unparsable entry).
+fn xff_entries(headers: &HeaderMap) -> Vec<Option<IpAddr>> {
+    let mut out = Vec::new();
+    for value in headers.get_all("x-forwarded-for").iter() {
+        match value.to_str() {
+            Ok(s) => out.extend(
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(parse_ip),
+            ),
+            Err(_) => out.push(None),
+        }
+    }
+    out
+}
+
+/// Parse an IP address, tolerating an IPv6 zone id, surrounding brackets and a
+/// proxy-appended port (`1.2.3.4:567`, `[::1]:567`), as OLS does.
 fn parse_ip(s: &str) -> Option<IpAddr> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    // Strip brackets from `[::1]` style and any `%zone` suffix.
-    let s = s
-        .strip_prefix('[')
-        .and_then(|r| r.strip_suffix(']'))
-        .unwrap_or(s);
+    let s = match s.strip_prefix('[') {
+        Some(rest) => {
+            let (inner, after) = rest.split_once(']')?;
+            if !after.is_empty() && !is_port_suffix(after) {
+                return None;
+            }
+            inner
+        }
+        None => match s.split_once(':') {
+            // Exactly one colon: IPv4 with a port. IPv6 always has two or more.
+            Some((host, port)) if !port.contains(':') => {
+                if !is_port_suffix(&s[host.len()..]) {
+                    return None;
+                }
+                return host.parse::<std::net::Ipv4Addr>().ok().map(IpAddr::V4);
+            }
+            _ => s,
+        },
+    };
     let s = s.split('%').next().unwrap_or(s);
     s.parse::<IpAddr>().ok()
+}
+
+/// `:<digits>` — the port a proxy may append to an XFF address.
+fn is_port_suffix(s: &str) -> bool {
+    s.strip_prefix(':')
+        .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// First parseable IP from a single-valued header (e.g. `CF-Connecting-IP`).
@@ -611,7 +721,7 @@ mod tests {
 
     /// The real Cloudflare ranges from this LiteSpeed install (allow ALL +
     /// trusted CF CIDRs).
-    fn cf_security() -> Security {
+    pub(crate) fn cf_security() -> Security {
         let cf = [
             "103.21.244.0/22",
             "103.22.200.0/22",
@@ -744,6 +854,39 @@ mod tests {
         assert_eq!(acl.check_peer(ip("10.0.0.7")), AclDecision::Deny);
         assert_eq!(acl.check_peer(ip("10.0.1.7")), AclDecision::Allow);
         assert_eq!(acl.check_peer(ip("8.8.8.8")), AclDecision::Allow);
+    }
+
+    #[test]
+    fn check_client_denies_a_denied_forwarded_client_behind_an_allowed_peer() {
+        let mut sec = cf_security();
+        sec.access_control.push(AccessRule {
+            spec: "203.0.113.0/24".into(),
+            trusted: false,
+            allow: false,
+        });
+        let acl = AccessControl::from_security(&sec).unwrap();
+        let cf = ip("173.245.48.5");
+        assert_eq!(acl.check_client(cf, cf), AclDecision::Allow);
+        assert_eq!(acl.check_client(cf, ip("8.8.8.8")), AclDecision::Allow);
+        assert_eq!(acl.check_client(cf, ip("203.0.113.9")), AclDecision::Deny);
+        assert_eq!(
+            acl.check_client(ip("203.0.113.9"), cf),
+            AclDecision::Deny,
+            "the peer verdict still applies"
+        );
+    }
+
+    #[test]
+    fn check_client_keeps_production_allow_only_config_open() {
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
+        let cf = ip("104.16.0.1");
+        for client in ["8.8.8.8", "203.0.113.9", "173.245.48.5", "2001:db8::1"] {
+            assert_eq!(
+                acl.check_client(cf, ip(client)),
+                AclDecision::Allow,
+                "{client}"
+            );
+        }
     }
 
     #[test]
@@ -1268,6 +1411,50 @@ mod tests {
     }
 
     #[test]
+    fn xff_port_suffix_is_stripped() {
+        assert_eq!(parse_ip("5.6.7.8:4321"), Some(ip("5.6.7.8")));
+        assert_eq!(parse_ip("[2001:db8::1]:443"), Some(ip("2001:db8::1")));
+        assert_eq!(parse_ip("2001:db8::1"), Some(ip("2001:db8::1")));
+        assert_eq!(parse_ip("5.6.7.8:"), None);
+        assert_eq!(parse_ip("5.6.7.8:x"), None);
+        assert_eq!(parse_ip("[2001:db8::1]x"), None);
+    }
+
+    #[test]
+    fn xff_ported_or_unparsable_nearest_hop_never_skips_left() {
+        let acl = AccessControl::from_security(&cf_security()).unwrap();
+        let peer = ip("8.8.8.8");
+        // (#892) A ported nearest hop is that hop, not a reason to walk onto the
+        // client-written entry to its left.
+        let h = xff("6.6.6.6, 5.6.7.8:4321");
+        assert_eq!(acl.resolve_client_ip(peer, &h, 4, false), ip("5.6.7.8"));
+        // An unparsable nearest hop falls back to the peer (OLS mode 4).
+        let h = xff("6.6.6.6, garbage");
+        assert_eq!(acl.resolve_client_ip(peer, &h, 4, false), peer);
+        // Trailing empty entries are not hops.
+        let h = xff("6.6.6.6, 5.6.7.8 , ");
+        assert_eq!(acl.resolve_client_ip(peer, &h, 4, false), ip("5.6.7.8"));
+
+        let trusted_peer = ip("173.245.48.5");
+        let h = xff("6.6.6.6, 5.6.7.8:4321");
+        assert_eq!(
+            acl.resolve_client_ip(trusted_peer, &h, 2, true),
+            ip("5.6.7.8")
+        );
+        let h = xff("6.6.6.6, garbage, 173.245.48.9");
+        assert_eq!(
+            acl.resolve_client_ip(trusted_peer, &h, 2, true),
+            trusted_peer
+        );
+        // Unparsable input farther left than the first untrusted hop is moot.
+        let h = xff("garbage, 5.6.7.8, 173.245.48.9");
+        assert_eq!(
+            acl.resolve_client_ip(trusted_peer, &h, 2, true),
+            ip("5.6.7.8")
+        );
+    }
+
+    #[test]
     fn ipv4_mapped_ipv6_peer_is_canonicalized() {
         // Regression (#91): a v4 client on a dual-stack [::] listener arrives as ::ffff:a.b.c.d.
         // A `deny 1.2.3.0/24` (v4 CIDR) must still match it — else check_peer falls through to
@@ -1493,5 +1680,256 @@ mod geo_rules_tests {
         let rules = GeoRules::resolve(&source(), &[], &[], &[], &[]).unwrap();
         assert!(rules.is_empty());
         assert!(rules.allows(ip("8.8.8.8")));
+    }
+}
+
+#[cfg(test)]
+mod ols_address_tests {
+    use super::*;
+    use hj_core::config::AccessRule;
+
+    fn rule(spec: &str, allow: bool) -> AccessRule {
+        AccessRule {
+            spec: spec.into(),
+            trusted: false,
+            allow,
+        }
+    }
+
+    fn acl(rules: Vec<AccessRule>) -> AccessControl {
+        AccessControl::from_security(&Security {
+            access_control: rules,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn net(s: &str) -> Option<String> {
+        parse_cidr(s).map(|n| n.to_string())
+    }
+
+    fn decide(a: &AccessControl, ip: &str) -> AclDecision {
+        a.check_peer(ip.parse().unwrap())
+    }
+
+    #[test]
+    fn partial_and_wildcard_ipv4_expand_like_ols() {
+        assert_eq!(net("192.168.1.*").as_deref(), Some("192.168.1.0/24"));
+        assert_eq!(net("192.168.*").as_deref(), Some("192.168.0.0/16"));
+        assert_eq!(net("192.168.*.*").as_deref(), Some("192.168.0.0/16"));
+        assert_eq!(net("192.168").as_deref(), Some("192.168.0.0/16"));
+        assert_eq!(net("192.168.").as_deref(), Some("192.168.0.0/16"));
+        assert_eq!(net("10").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(net("10.*").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(net("1.2.3.4.").as_deref(), Some("1.2.3.4/32"));
+        for bad in [
+            "192.168*",
+            "192.168.*.5",
+            "*.*",
+            "1.2.3.4.5",
+            "256.1",
+            "1..2",
+            "01.2",
+            "abc",
+            "",
+        ] {
+            assert_eq!(net(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn dotted_netmasks_must_be_contiguous() {
+        assert_eq!(net("10.0.0.0/255.0.0.0").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(
+            net("192.168.128.5/255.255.128.0").as_deref(),
+            Some("192.168.128.5/17")
+        );
+        assert_eq!(net("0.0.0.0/0.0.0.0").as_deref(), Some("0.0.0.0/0"));
+        assert_eq!(net("10.0.0.0/255.0.255.0"), None);
+        assert_eq!(net("10.0.0.0/0.255.255.255"), None);
+        assert_eq!(net("::1/255.0.0.0"), None);
+    }
+
+    #[test]
+    fn star_is_all_and_wildcards_enforce() {
+        let a = acl(vec![rule("*", false), rule("192.168.1.*", true)]);
+        assert_eq!(decide(&a, "192.168.1.9"), AclDecision::Allow);
+        assert_eq!(decide(&a, "192.168.2.9"), AclDecision::Deny);
+        assert_eq!(decide(&a, "2001:db8::1"), AclDecision::Deny);
+        let trusted = AccessControl::from_security(&Security {
+            access_control: vec![AccessRule {
+                spec: "*".into(),
+                trusted: true,
+                allow: true,
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(trusted.is_trusted("8.8.8.8".parse().unwrap()));
+        let b = acl(vec![rule("ALL", true), rule("10.0.0.0/255.0.0.0", false)]);
+        assert_eq!(decide(&b, "10.9.9.9"), AclDecision::Deny);
+        assert_eq!(decide(&b, "11.0.0.1"), AclDecision::Allow);
+    }
+
+    #[test]
+    fn equal_network_tie_denies() {
+        let a = acl(vec![
+            rule("ALL", true),
+            rule("1.2.3.4", true),
+            rule("1.2.3.4", false),
+        ]);
+        assert_eq!(decide(&a, "1.2.3.4"), AclDecision::Deny);
+        assert_eq!(decide(&a, "1.2.3.5"), AclDecision::Allow);
+        let all = acl(vec![rule("ALL", true), rule("ALL", false)]);
+        assert_eq!(decide(&all, "8.8.8.8"), AclDecision::Deny);
+        let star = acl(vec![rule("*", true), rule("ALL", false)]);
+        assert_eq!(decide(&star, "8.8.8.8"), AclDecision::Deny);
+        let nets = acl(vec![
+            rule("ALL", false),
+            rule("10.0.0.0/8", true),
+            rule("10.1.0.0/16", false),
+            rule("10.0.0.0/255.0.0.0", false),
+        ]);
+        assert_eq!(decide(&nets, "10.2.0.1"), AclDecision::Deny);
+        // A more specific allow still beats a broader deny.
+        let specific = acl(vec![
+            rule("ALL", false),
+            rule("10.0.0.0/8", false),
+            rule("10.1.0.0/16", true),
+        ]);
+        assert_eq!(decide(&specific, "10.1.0.1"), AclDecision::Allow);
+    }
+
+    fn trule(spec: &str) -> AccessRule {
+        AccessRule {
+            spec: spec.into(),
+            trusted: true,
+            allow: true,
+        }
+    }
+
+    #[test]
+    fn bracketed_ipv6_parses_like_ols() {
+        assert_eq!(net("[::1]").as_deref(), Some("::1/128"));
+        assert_eq!(net("[2001:db8::]/32").as_deref(), Some("2001:db8::/32"));
+        assert_eq!(net("[::ffff:10.0.0.0]/104").as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(net("[::1"), None);
+        assert_eq!(net("[::1]x"), None);
+        assert_eq!(net("[::1/128]"), None);
+        assert_eq!(net("[1.2.3.4]"), None);
+        let a = acl(vec![rule("ALL", true), rule("[2001:db8::]/32", false)]);
+        assert_eq!(decide(&a, "2001:db8::5"), AclDecision::Deny);
+        assert_eq!(decide(&a, "2001:db9::5"), AclDecision::Allow);
+        let t = acl(vec![rule("ALL", true), trule("[::1]")]);
+        assert!(t.is_trusted("::1".parse().unwrap()));
+        assert!(!t.is_trusted("::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn bare_unspecified_ipv6_is_the_ipv6_catch_all() {
+        assert_eq!(net("::").as_deref(), Some("::/0"));
+        assert_eq!(net("[::]").as_deref(), Some("::/0"));
+        assert_eq!(net("::/128").as_deref(), Some("::/0"));
+        let d = acl(vec![rule("ALL", true), rule("::", false)]);
+        assert_eq!(decide(&d, "2001:db8::1"), AclDecision::Deny);
+        assert_eq!(decide(&d, "::1"), AclDecision::Deny);
+        assert_eq!(decide(&d, "8.8.8.8"), AclDecision::Allow);
+        // A v4-mapped peer is a v4 client, not IPv6.
+        assert_eq!(decide(&d, "::ffff:8.8.8.8"), AclDecision::Allow);
+        // A more specific v6 allow still beats the catch-all deny.
+        let carve = acl(vec![
+            rule("ALL", true),
+            rule("::", false),
+            rule("::1", true),
+        ]);
+        assert_eq!(decide(&carve, "::1"), AclDecision::Allow);
+        assert_eq!(decide(&carve, "::2"), AclDecision::Deny);
+        let t = acl(vec![rule("ALL", true), trule("::")]);
+        assert!(t.is_trusted("2606:4700::1".parse().unwrap()));
+        assert!(!t.is_trusted("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn trust_is_the_flag_of_the_most_specific_matching_rule() {
+        let a = acl(vec![
+            rule("ALL", true),
+            trule("10.0.0.0/8"),
+            rule("10.1.0.0/16", true),
+        ]);
+        assert!(a.is_trusted("10.2.3.4".parse().unwrap()));
+        assert!(!a.is_trusted("10.1.3.4".parse().unwrap()));
+        assert!(!a.is_trusted("11.0.0.1".parse().unwrap()));
+        // A more specific deny inside a trusted network is untrusted (and denied).
+        let d = acl(vec![
+            rule("ALL", true),
+            trule("10.0.0.0/8"),
+            rule("10.1.0.0/16", false),
+        ]);
+        assert!(!d.is_trusted("10.1.0.1".parse().unwrap()));
+        assert_eq!(decide(&d, "10.1.0.1"), AclDecision::Deny);
+        assert!(d.is_trusted("10.2.0.1".parse().unwrap()));
+        // Equal-network tie: the deny wins, so the peer is not trusted.
+        let tie = acl(vec![
+            rule("ALL", true),
+            trule("1.2.3.4"),
+            rule("1.2.3.4", false),
+        ]);
+        assert!(!tie.is_trusted("1.2.3.4".parse().unwrap()));
+        // Same network twice in one list: the later entry overwrites (OLS addUpdate).
+        let later = acl(vec![
+            rule("ALL", true),
+            trule("1.2.3.4"),
+            rule("1.2.3.4", true),
+        ]);
+        assert!(!later.is_trusted("1.2.3.4".parse().unwrap()));
+        let later_t = acl(vec![
+            rule("ALL", true),
+            rule("1.2.3.4", true),
+            trule("1.2.3.4"),
+        ]);
+        assert!(later_t.is_trusted("1.2.3.4".parse().unwrap()));
+        let v6_root = acl(vec![trule("::"), rule("ALL", true)]);
+        assert!(!v6_root.is_trusted("2606:4700::1".parse().unwrap()));
+        // A trusted catch-all with a more specific untrusted carve-out.
+        let all_t = acl(vec![trule("ALL"), rule("10.0.0.0/8", true)]);
+        assert!(all_t.is_trusted("8.8.8.8".parse().unwrap()));
+        assert!(!all_t.is_trusted("10.0.0.1".parse().unwrap()));
+        // XFF walk: the carved-out hop is the client, not a skipped proxy.
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", "1.1.1.1, 10.0.0.1".parse().unwrap());
+        assert_eq!(
+            all_t.resolve_client_ip("8.8.8.8".parse().unwrap(), &h, 1, true),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        // A deny catch-all that is "trusted" never trusts (T applies to allow only).
+        let deny_t = acl(vec![AccessRule {
+            spec: "ALL".into(),
+            trusted: true,
+            allow: false,
+        }]);
+        assert!(!deny_t.is_trusted("8.8.8.8".parse().unwrap()));
+        // No rule matches: open allow, but untrusted.
+        let none = acl(vec![trule("10.0.0.0/8")]);
+        assert!(!none.is_trusted("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn cloudflare_shape_trust_is_unchanged() {
+        let a = AccessControl::from_security(&crate::tests::cf_security()).unwrap();
+        for ip in [
+            "173.245.48.1",
+            "104.16.0.1",
+            "162.159.255.254",
+            "::ffff:172.64.0.9",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(a.is_trusted(ip), "{ip}");
+            assert_eq!(a.check_peer(ip), AclDecision::Allow);
+        }
+        for ip in ["8.8.8.8", "127.0.0.1", "10.0.0.1", "::1", "2001:db8::1"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!a.is_trusted(ip), "{ip}");
+            assert_eq!(a.check_peer(ip), AclDecision::Allow);
+        }
     }
 }

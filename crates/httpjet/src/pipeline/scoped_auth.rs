@@ -139,8 +139,14 @@ where
     if authenticated.contains(&realm) {
         return Ok(());
     }
-    let credentials = headers
-        .get(http::header::AUTHORIZATION)
+    // lsphp keeps the LAST Authorization (PHP_AUTH_USER) while this check reads
+    // one value: a repeated header could verify one user and hand PHP another (#864).
+    let mut authorizations = headers.get_all(http::header::AUTHORIZATION).iter();
+    let first = authorizations.next();
+    if authorizations.next().is_some() {
+        return Err(error_page(StatusCode::BAD_REQUEST));
+    }
+    let credentials = first
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
@@ -225,6 +231,54 @@ async fn enforce_resource(
     enforce_chain(ctx, headers, &chain, path, request_path, authenticated).await
 }
 
+/// The last resource [`enforce_mapped_resources`] passed, with the realm count it
+/// left. Enforcement mutates `ctx` only when it authenticates a new realm, which
+/// also grows `authenticated`, so an equal count means a repeat of that resource
+/// would see identical inputs and pass again.
+#[derive(Default)]
+struct LastEnforced(Option<(String, usize)>);
+
+impl LastEnforced {
+    async fn resource(
+        &mut self,
+        state: &ServerState,
+        ctx: &mut ReqCtx,
+        headers: &http::HeaderMap,
+        path: &str,
+        request_path: &str,
+        authenticated: &mut Vec<AuthRealm>,
+    ) -> Result<(), Response> {
+        if self
+            .0
+            .as_ref()
+            .is_some_and(|(last, realms)| last == path && *realms == authenticated.len())
+        {
+            return Ok(());
+        }
+        let realms = authenticated.len();
+        enforce_resource(state, ctx, headers, path, request_path, authenticated).await?;
+        self.0 = (authenticated.len() == realms).then(|| (path.to_owned(), realms));
+        Ok(())
+    }
+
+    async fn target(
+        &mut self,
+        state: &ServerState,
+        ctx: &mut ReqCtx,
+        headers: &http::HeaderMap,
+        target: &Path,
+        request_path: &str,
+        authenticated: &mut Vec<AuthRealm>,
+    ) -> Result<(), Response> {
+        if let Some(relative) = relative_to_doc_root(ctx, target) {
+            let path = format!("/{}", relative.to_string_lossy());
+            self.resource(state, ctx, headers, &path, request_path, authenticated)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 fn relative_to_doc_root(ctx: &ReqCtx, target: &Path) -> Option<PathBuf> {
     if let Ok(relative) = target.strip_prefix(&ctx.vhost.doc_root) {
         return Some(relative.to_path_buf());
@@ -244,11 +298,9 @@ pub(super) async fn enforce_target(
     request_path: &str,
     authenticated: &mut Vec<AuthRealm>,
 ) -> Result<(), Response> {
-    if let Some(relative) = relative_to_doc_root(ctx, target) {
-        let path = format!("/{}", relative.to_string_lossy());
-        enforce_resource(state, ctx, headers, &path, request_path, authenticated).await?;
-    }
-    Ok(())
+    LastEnforced::default()
+        .target(state, ctx, headers, target, request_path, authenticated)
+        .await
 }
 
 fn static_candidates(
@@ -259,13 +311,8 @@ fn static_candidates(
 ) -> Vec<(String, PathBuf)> {
     // Same mapping as the static handler's DocRootOverride (#673).
     let rel = std::path::Path::new(path.trim_start_matches('/'));
-    let (root, rel) = match matching_static_context(ctx, path)
-        .and_then(|c| c.location.as_ref().map(|loc| (loc, c.uri.as_str())))
-    {
-        Some((loc, uri)) if loc != &ctx.vhost.doc_root => {
-            (loc, hj_static::context_relative_path(rel, uri))
-        }
-        Some((loc, _)) => (loc, rel),
+    let (root, rel) = match static_location_override(ctx, path) {
+        Some((loc, uri)) => (loc, hj_static::context_relative_path(rel, uri)),
         None => (&ctx.vhost.doc_root, rel),
     };
     let lexical = root.join(rel);
@@ -283,10 +330,27 @@ fn static_candidates(
 }
 
 fn aliases_possible(ctx: &ReqCtx, path: &str) -> bool {
-    ctx.vhost.allow_symbol_link
-        || matching_static_context(ctx, path)
-            .and_then(|c| c.location.as_ref())
-            .is_some_and(|p| p != &ctx.vhost.doc_root)
+    ctx.vhost.allow_symbol_link || static_location_override(ctx, path).is_some()
+}
+
+/// What the on-core path learned about a request's mapped filesystem targets.
+#[derive(Default)]
+pub(super) struct TargetPolicy {
+    /// Auth-protected or access-denied: bridge so dispatch() renders the outcome.
+    pub protected: bool,
+    /// Every checked target chain is memo-eligible (its access rules are a pure
+    /// function of the memo key), so a finished response may be memoized.
+    pub memo_ok: bool,
+    pub deadline: Option<std::time::Instant>,
+    pub targets: Vec<PathBuf>,
+    /// The script the path maps to, when judged, with its opened target, so a
+    /// later gate on the same script need not open it again.
+    pub script: Option<OpenedScript>,
+}
+
+pub(super) struct OpenedScript {
+    pub lexical: PathBuf,
+    pub target: Option<PathBuf>,
 }
 
 /// On-core cache/static serving cannot authenticate. Discover a mapped target's
@@ -298,53 +362,144 @@ pub(super) fn target_has_auth(
     path: &str,
     chain: &[Arc<Htaccess>],
 ) -> (bool, Option<std::time::Instant>) {
+    let policy = target_policy(state, ctx, path, chain);
+    (policy.protected, policy.deadline)
+}
+
+/// [`target_has_auth`] with the memo verdict and the resolved targets. The access
+/// part reads `ctx.client_ip` and `ctx.env`, so call it after both are final.
+pub(super) fn target_policy(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    path: &str,
+    chain: &[Arc<Htaccess>],
+) -> TargetPolicy {
+    let mut policy = TargetPolicy {
+        memo_ok: true,
+        ..TargetPolicy::default()
+    };
     if !ctx
         .vhost
         .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess)
         || !aliases_possible(ctx, path)
     {
-        return (false, None);
+        return policy;
     }
     let indexes = effective_index_files(state, ctx, chain);
     let script = split_script_path(state, ctx, path, indexes, chain);
+    let is_script = script.is_some();
     let candidates = if let Some((script, _, _)) = script {
         vec![(path.to_owned(), script)]
     } else {
         static_candidates(state, ctx, path, chain)
     };
-    let mut deadline: Option<std::time::Instant> = None;
     for (_, lexical) in candidates {
-        let Ok(target) = opened_target_path(&lexical) else {
+        let opened = opened_target_path(&lexical).ok();
+        if is_script {
+            policy.script = Some(OpenedScript {
+                lexical,
+                target: opened.clone(),
+            });
+        }
+        let Some(target) = opened else {
             continue;
         };
-        let Some((protected, checked_until)) = opened_target_has_auth(state, ctx, &target) else {
+        let Some(checked) = opened_target_policy(state, ctx, &target) else {
             continue;
         };
-        deadline = Some(deadline.map_or(checked_until, |old| old.min(checked_until)));
-        if protected {
-            return (true, deadline);
+        policy.deadline = Some(
+            policy
+                .deadline
+                .map_or(checked.until, |old| old.min(checked.until)),
+        );
+        policy.memo_ok &= checked.memo_ok;
+        policy.targets.push(target);
+        if checked.protected {
+            policy.protected = true;
+            return policy;
         }
     }
-    (false, deadline)
+    policy
 }
 
-fn opened_target_has_auth(
+/// The opened inode of an on-core static response, when it is not one of the
+/// targets [`target_policy`] already judged (a precompressed sibling the static
+/// handler substituted, or a target that changed after the prediction).
+/// `None` = nothing new to judge.
+pub(super) fn served_target_policy(
     state: &ServerState,
     ctx: &ReqCtx,
-    target: &Path,
-) -> Option<(bool, std::time::Instant)> {
+    path: &str,
+    predicted: &[PathBuf],
+    response: &Response,
+) -> Option<ServedTargetPolicy> {
+    if !ctx
+        .vhost
+        .overrides_enabled(ctx.vhost.rewrite.auto_load_htaccess)
+    {
+        return None;
+    }
+    let target = served_target(response)?;
+    if predicted.contains(&target) {
+        return None;
+    }
+    // Without aliases only the lexical request file was judged (by its own
+    // chain); a DirectoryIndex or precompressed sibling still needs its check (#795).
+    if !aliases_possible(ctx, path)
+        && target
+            == ctx
+                .vhost
+                .doc_root
+                .join(resolved_rel_path(path).trim_start_matches('/'))
+    {
+        return None;
+    }
+    // A target outside the docroot has no .htaccess chain: dispatch()'s
+    // enforce_target skips it the same way.
+    let checked = opened_target_policy(state, ctx, &target)?;
+    Some(ServedTargetPolicy {
+        protected: checked.protected,
+        denied: checked.denied,
+        memo_ok: checked.memo_ok,
+        until: checked.until,
+    })
+}
+
+/// The verdict of [`served_target_policy`] on an opened target.
+pub(super) struct ServedTargetPolicy {
+    /// Auth-gated or denied: on-core serving must not return it.
+    pub(super) protected: bool,
+    /// Denied whatever the client's credentials (dispatch()'s 403 shape).
+    pub(super) denied: bool,
+    pub(super) memo_ok: bool,
+    /// When the target's chain is next revalidated; a memoized response must
+    /// not outlive it.
+    pub(super) until: std::time::Instant,
+}
+
+struct CheckedTarget {
+    protected: bool,
+    denied: bool,
+    memo_ok: bool,
+    until: std::time::Instant,
+}
+
+fn opened_target_policy(state: &ServerState, ctx: &ReqCtx, target: &Path) -> Option<CheckedTarget> {
     let rel = relative_to_doc_root(ctx, target)?;
     let resource = format!("/{}", rel.to_string_lossy());
-    let (entries, checked_until) = state.rewrite_cache.load_chain_with_dirs_and_deadline(
+    let (entries, until) = state.rewrite_cache.load_chain_with_dirs_and_deadline(
         &ctx.vhost.doc_root,
         &resource,
         ctx.vhost.access_file_name_or_default(),
     );
     let chain: Vec<_> = entries.into_iter().map(|(_, ht)| ht).collect();
-    Some((
-        chain.iter().any(|ht| ht.has_auth()) || access_denied(&chain, &resource, "GET", ctx),
-        checked_until,
-    ))
+    let denied = access_denied(&chain, &resource, "GET", ctx);
+    Some(CheckedTarget {
+        protected: denied || chain.iter().any(|ht| ht.has_auth()),
+        denied,
+        memo_ok: chain.iter().all(|ht| ht.memo.eligible),
+        until,
+    })
 }
 
 /// [`target_has_auth`] for a script the caller already opened and resolved, so the
@@ -363,11 +518,18 @@ pub(super) fn resolved_target_has_auth(
         // first), so only an aliased target needs its own chain load. This keeps the
         // load off every front-controller cache hit (`/threads/..` -> `/index.php`).
         && target != ctx.vhost.doc_root.join(path.trim_start_matches('/'))
-        && opened_target_has_auth(state, ctx, target).is_some_and(|(protected, _)| protected)
+        && opened_target_policy(state, ctx, target).is_some_and(|checked| checked.protected)
 }
 
 /// Prefer the opened inode over a lexical target hint for the final backstop.
 pub(super) fn served_target(response: &Response) -> Option<PathBuf> {
+    // hj-static resolves its target after precompressed selection, from the
+    // opened descriptor whenever a symlink was followed: no readlink needed.
+    if let Some(resolved) = response.extensions().get::<hj_static::ResolvedTargetPath>()
+        && matches!(response.body(), Body::File(_))
+    {
+        return Some(resolved.0.clone());
+    }
     if let Body::File(file) = response.body() {
         if let Some(opened) = &file.file {
             use std::os::fd::AsRawFd;
@@ -400,10 +562,11 @@ pub(super) async fn enforce_mapped_resources(
     {
         return Ok(());
     }
+    let mut last = LastEnforced::default();
     if path != original {
         // Always rebuild the target's auth chain: a rewrite to an ancestor must
         // not retain a child file's different credentials or narrower Require.
-        enforce_resource(
+        last.resource(
             state,
             ctx,
             headers,
@@ -414,9 +577,11 @@ pub(super) async fn enforce_mapped_resources(
         .await?;
     }
     if let Some(script) = script {
-        enforce_target(state, ctx, headers, script, original, authenticated).await?;
+        last.target(state, ctx, headers, script, original, authenticated)
+            .await?;
         if let Some(target) = pinned_script.filter(|target| *target != script) {
-            enforce_target(state, ctx, headers, target, original, authenticated).await?;
+            last.target(state, ctx, headers, target, original, authenticated)
+                .await?;
         }
         return Ok(());
     }
@@ -427,9 +592,11 @@ pub(super) async fn enforce_mapped_resources(
         return Ok(());
     }
     for (resource, target) in static_candidates(state, ctx, path, chain) {
-        enforce_resource(state, ctx, headers, &resource, original, authenticated).await?;
+        last.resource(state, ctx, headers, &resource, original, authenticated)
+            .await?;
         if let Ok(resolved) = opened_target_path(&target) {
-            enforce_target(state, ctx, headers, &resolved, original, authenticated).await?;
+            last.target(state, ctx, headers, &resolved, original, authenticated)
+                .await?;
         }
     }
     Ok(())

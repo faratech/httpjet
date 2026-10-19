@@ -205,17 +205,9 @@ impl CertReloadHandle {
         }
         let mut file = (**self.0.load()).clone();
         let mut managed = (**self.1.load()).clone();
-        file.stapling = Some(
-            manager.register(
-                file.sni
-                    .by_name
-                    .values()
-                    .flatten()
-                    .cloned()
-                    .chain(file.default.iter().cloned()),
-            )?,
-        );
-        managed.stapling = Some(manager.register(managed.by_name.values().flatten().cloned())?);
+        file.stapling =
+            Some(manager.register(file.sni.keys().chain(file.default.iter().cloned()))?);
+        managed.stapling = Some(manager.register(managed.keys())?);
         self.2.store(Some(manager));
         self.0.store(Arc::new(file));
         self.1.store(Arc::new(managed));

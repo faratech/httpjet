@@ -33,10 +33,9 @@ impl Htaccess {
         let mut section_stack: Vec<PendingSection> = Vec::new();
         let mut malformed_sections = false;
         // The legacy mod_access block of each scope (keyed by the innermost open
-        // section's line, `None` = top level): its `Order`/`Allow`/`Deny` lines
-        // accumulate into ONE `AccessRule` so they are judged together (#359).
-        let mut legacy_slots: std::collections::HashMap<Option<usize>, usize> =
-            std::collections::HashMap::new();
+        // scoping section's line, `None` = top level): its `Order`/`Allow`/`Deny`
+        // lines accumulate into ONE `AccessRule` so they are judged together (#359).
+        let mut legacy_slots = LegacySlots::default();
         // Per nesting depth: the conditions of the `<If>`/`<ElseIf>` chain that a
         // following `<Else>`/`<ElseIf>` at that depth continues.
         let mut if_chains: std::collections::HashMap<usize, Vec<Option<UriExpr>>> =
@@ -101,6 +100,32 @@ impl Htaccess {
                 let depth = section_stack.len();
                 let prior = if_chains.remove(&depth);
                 let pending = PendingSection::open(line, lineno, prior.as_deref())?;
+                // Apache: "<Files> cannot occur within <Limit> section" (likewise
+                // Directory*/If*). Scoping inside a method block also has no
+                // per-scope legacy slot to land in (#791).
+                if pending.is_scoping() && section_stack.iter().any(|s| s.method.is_some()) {
+                    return Err(RewriteError::Malformed {
+                        line: lineno,
+                        msg: format!(
+                            "<{}> cannot occur within <Limit> section",
+                            pending.kind_name
+                        ),
+                    });
+                }
+                // A Require container folds its children into one verdict recorded
+                // under the container's own scope, so a <Limit>/<Files*>/<If> inside
+                // it would widen its grant to every method and path (#800).
+                if (pending.is_scoping() || pending.method.is_some())
+                    && section_stack.iter().any(|s| s.require_kind.is_some())
+                {
+                    return Err(RewriteError::Malformed {
+                        line: lineno,
+                        msg: format!(
+                            "<{}> inside a <Require*> container is not supported",
+                            pending.kind_name
+                        ),
+                    });
+                }
                 if pending.method.is_some() {
                     // The memo keys GET only; a method filter could tell HEAD apart.
                     h.memo.block(lineno, "access_method_limit");
@@ -121,8 +146,10 @@ impl Htaccess {
 
             // Rewrite directives always flow to the rewrite stream regardless of
             // the enclosing block (LiteSpeed honors RewriteRule inside IfModule).
+            // `RewriteMap` rides along so the rule parser fails the file closed
+            // (Apache answers 500 for it in a per-directory file).
             match dlow.as_str() {
-                "rewriteengine" | "rewritebase" | "rewritecond" | "rewriterule" => {
+                "rewriteengine" | "rewritebase" | "rewritecond" | "rewriterule" | "rewritemap" => {
                     rewrite_stream.push_str(line);
                     rewrite_stream.push('\n');
                     continue;
@@ -175,6 +202,13 @@ impl Htaccess {
                         msg: "legacy access directive inside an authorization container".into(),
                     });
                 }
+                if section_stack.iter().any(PendingSection::is_unmodelled) {
+                    // Its Allow could only widen to the whole directory.
+                    return Err(RewriteError::Malformed {
+                        line: lineno,
+                        msg: "legacy access directive inside an unsupported container".into(),
+                    });
+                }
                 record_legacy_access(
                     &mut h,
                     &section_stack,
@@ -182,7 +216,7 @@ impl Htaccess {
                     &dlow,
                     rest,
                     lineno,
-                );
+                )?;
                 continue;
             }
 
@@ -216,20 +250,87 @@ impl Htaccess {
                 }
                 "errordocument" => {
                     // `ErrorDocument code target`. The target may be a local
-                    // path, an `http(s)://` URL, or a quoted inline message
-                    // (which can contain spaces) — so split off the code and
-                    // keep the remainder raw for classification.
+                    // path, an absolute URL, or a quoted inline message (which can
+                    // contain spaces) — so split off the code and keep the
+                    // remainder raw for classification.
                     let rest = rest.trim();
                     if let Some((code_str, target)) = rest.split_once(char::is_whitespace) {
                         if let Ok(code) = code_str.parse::<u16>() {
-                            let raw = target.trim();
-                            h.error_docs
-                                .insert(code, crate::directives::ErrorDoc::classify(raw));
+                            let doc = crate::directives::ErrorDoc::classify(target.trim());
+                            // Apache ignores a URL for 401: the browser would never
+                            // see the challenge.
+                            if !(code == 401
+                                && matches!(doc, crate::directives::ErrorDoc::External(_)))
+                            {
+                                h.error_docs.insert(code, doc);
+                            }
                         }
                     }
                 }
-                "setenvif" | "setenvifnocase" => {
-                    if let Some(s) = parse_set_env_if(rest, dlow == "setenvifnocase", lineno) {
+                "setenv" | "unsetenv" => {
+                    let toks = tokenize(rest);
+                    if !toks.is_empty() {
+                        reject_unscopable(&section_stack, &cur_scopes, lineno, directive)?;
+                        if dlow == "setenv" {
+                            h.set_env.push(EnvDirective {
+                                name: toks[0].clone(),
+                                value: Some(toks[1..].join(" ")),
+                                scopes: cur_scopes.clone(),
+                            });
+                        } else {
+                            h.set_env.extend(toks.into_iter().map(|name| EnvDirective {
+                                name,
+                                value: None,
+                                scopes: cur_scopes.clone(),
+                            }));
+                        }
+                        h.has_scoped_set_env |= !cur_scopes.is_empty();
+                    }
+                }
+                "adddefaultcharset" => {
+                    if let Some(arg) = tokenize(rest).into_iter().next() {
+                        reject_unscopable(&section_stack, &cur_scopes, lineno, directive)?;
+                        let charset = if arg.eq_ignore_ascii_case("off") {
+                            None
+                        } else if arg.eq_ignore_ascii_case("on") {
+                            Some("ISO-8859-1".to_string())
+                        } else {
+                            Some(arg)
+                        };
+                        h.default_charset.push(CharsetDirective {
+                            charset,
+                            scopes: cur_scopes.clone(),
+                        });
+                    }
+                }
+                "setenvif" | "setenvifnocase" | "browsermatch" | "browsermatchnocase" => {
+                    // `BrowserMatch[NoCase] re VAR…` is mod_setenvif's alias for
+                    // `SetEnvIf[NoCase] User-Agent re VAR…` (#779).
+                    let browser;
+                    let args = if dlow.starts_with("browsermatch") {
+                        browser = format!("User-Agent {rest}");
+                        browser.as_str()
+                    } else {
+                        rest
+                    };
+                    let nocase = dlow.ends_with("nocase");
+                    {
+                        let mut s = parse_set_env_if(args, nocase, lineno)?;
+                        // A guard this parser cannot evaluate would either widen
+                        // the assignment to the whole directory or drop it; both
+                        // can open an `Allow/Deny from env=` (#781).
+                        if section_stack.iter().any(PendingSection::is_unmodelled)
+                            || cur_scopes
+                                .iter()
+                                .any(|sc| sc.kind == ScopeKind::If && sc.uri_expr.is_none())
+                        {
+                            return Err(RewriteError::Malformed {
+                                line: lineno,
+                                msg: "SetEnvIf inside an unsupported container".into(),
+                            });
+                        }
+                        s.scopes = cur_scopes.clone();
+                        h.has_scoped_set_env |= !s.scopes.is_empty();
                         classify_set_env_if_for_memo(&mut h.memo, &s, lineno);
                         h.set_env_if.push(s);
                     }
@@ -260,11 +361,15 @@ impl Htaccess {
                     h.cache_key_modifiers.extend(parse_cache_key_modify(rest));
                 }
                 "directoryindex" => {
+                    // Apache mod_dir: a single `disabled` argument turns the index
+                    // search off; next to other names it is a literal file name.
                     let toks = tokenize(rest);
-                    if toks.iter().any(|t| t.eq_ignore_ascii_case("disabled")) {
+                    if toks.len() == 1 && toks[0].eq_ignore_ascii_case("disabled") {
                         h.directory_index.clear();
+                        h.directory_index_disabled = true;
                     } else if !toks.is_empty() {
                         h.directory_index = toks;
+                        h.directory_index_disabled = false;
                     }
                 }
                 // PHP ini overrides — passed to lsphp via the LSAPI special-env
@@ -277,40 +382,21 @@ impl Htaccess {
                         _ => PhpDirectiveKind::AdminFlag,
                     };
                     if let Some(mut pd) = parse_php_directive(rest, kind) {
+                        reject_unscopable(&section_stack, &cur_scopes, lineno, directive)?;
                         pd.scopes = cur_scopes.clone();
                         h.php_directives.push(pd);
                     }
                 }
-                // `SetHandler application/x-httpd-php` forces PHP on every file in
-                // scope regardless of extension; any other handler (`none`,
-                // `default-handler`, …) records an explicit non-PHP reset.
-                "sethandler" => {
-                    let php = rest.trim().eq_ignore_ascii_case("application/x-httpd-php");
-                    h.set_handlers.push(HandlerDirective {
-                        php,
-                        scopes: cur_scopes.clone(),
-                    });
-                }
-                // `AddHandler/AddType application/x-httpd-php .html …` map extensions
-                // to PHP for this directory subtree. Only the PHP handler/type is
-                // recorded (a non-PHP `AddType text/html .shtml` is ignored).
-                "addhandler" | "addtype" => {
-                    let toks = tokenize(rest);
-                    if toks
-                        .first()
-                        .is_some_and(|t| t.eq_ignore_ascii_case("application/x-httpd-php"))
-                    {
-                        let exts: Vec<String> = toks[1..]
-                            .iter()
-                            .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
-                            .filter(|e| !e.is_empty())
-                            .collect();
-                        if !exts.is_empty() {
-                            h.add_php_exts.push(AddPhpExt {
-                                exts,
-                                scopes: cur_scopes.clone(),
-                            });
-                        }
+                "sethandler" | "forcetype" | "addhandler" | "addtype" | "removehandler"
+                | "removetype" => {
+                    if let Some(kind) = parse_handler_op(&dlow, rest) {
+                        // Applied unconditionally, a guard we cannot evaluate would
+                        // turn PHP routing on or off for the whole directory.
+                        reject_unscopable(&section_stack, &cur_scopes, lineno, directive)?;
+                        h.handler_ops.push(HandlerOp {
+                            kind,
+                            scopes: cur_scopes.clone(),
+                        });
                     }
                 }
                 // Remaining vendor / no-op directives — recognized & dropped.
@@ -336,14 +422,17 @@ impl Htaccess {
         // `headers` are fully populated (so they share this Htaccess's Arc + mtime
         // TTL and can never be stale vs the rules they index).
         h.has_resp_op = !h.headers.is_empty();
-        h.has_handler_override = !h.set_handlers.is_empty() || !h.add_php_exts.is_empty();
+        h.has_handler_override = h.handler_ops.iter().any(HandlerOp::can_force_php);
+        h.has_type_override = h.handler_ops.iter().any(HandlerOp::can_set_mime);
         if let Some(policy) = &mut h.auth {
             // Root metadata applies regardless of its line position. Enclosing
             // sections precede their descendants; sibling order remains intact.
             policy.groups.sort_by_key(|g| g.scope_id);
         }
         h.access_index = build_access_index(&h.access_rules);
+        h.access_memo_useful = h.access_rules.iter().any(AccessRule::has_path_matcher);
         h.header_index = build_header_index(&h.headers);
+        finish_set_env_if(&mut h);
 
         h.rules = RuleSet::parse(&rewrite_stream)?;
         classify_rules_for_memo(&mut h.memo, &h.rules);
@@ -549,27 +638,51 @@ fn classify_access_directive(dlow: &str, rest: &str) -> Option<bool> {
     }
 }
 
+/// Where each scope's legacy block lives: the [`AccessRule`] index per scope
+/// key, and the [`LimitedAccess`] index per (scope key, `<Limit>` section line).
+#[derive(Default)]
+struct LegacySlots {
+    blocks: std::collections::HashMap<Option<usize>, usize>,
+    limits: std::collections::HashMap<(Option<usize>, usize), usize>,
+}
+
 /// Fold one `Order` / `Allow from …` / `Deny from …` line into the
-/// [`HostAccess`] block of the innermost open scope, creating that scope's rule
-/// on first sight. The rule's scope matchers carry deny polarity (`denied:
-/// true`) so an un-evaluable enclosing block fails closed, exactly like a
-/// `Require` deny. An `Allow`/`Deny` line without the mandatory `from` keyword
-/// is an Apache config error: a malformed `Deny` denies everything, a
-/// malformed `Allow` grants nothing.
+/// [`HostAccess`] block of the innermost open scoping section, creating that
+/// scope's rule on first sight. `<IfModule>` is transparent and `<Limit>` /
+/// `<LimitExcept>` only method-tags the line within the SAME block, as Apache
+/// keeps one `mod_access_compat` config per section (#778). The rule's scope
+/// matchers carry deny polarity (`denied: true`) so an un-evaluable enclosing
+/// block fails closed, exactly like a `Require` deny. An `Allow`/`Deny` line
+/// without the mandatory `from` keyword is an Apache config error: a malformed
+/// `Deny` denies everything, a malformed `Allow` grants nothing.
 fn record_legacy_access(
     h: &mut Htaccess,
     stack: &[PendingSection],
-    slots: &mut std::collections::HashMap<Option<usize>, usize>,
+    slots: &mut LegacySlots,
     dlow: &str,
     rest: &str,
     lineno: usize,
-) {
-    let key = stack.last().map(|s| s.lineno);
-    let idx = match slots.get(&key) {
+) -> Result<(), RewriteError> {
+    let mut limits = stack.iter().filter_map(|s| match &s.method {
+        Some(AccessMatcher::Method { methods, except }) => Some((s.lineno, methods, *except)),
+        _ => None,
+    });
+    let limit = limits.next();
+    if limits.next().is_some() {
+        return Err(RewriteError::Malformed {
+            line: lineno,
+            msg: "legacy access directive inside nested <Limit> sections".into(),
+        });
+    }
+    let scoping = || stack.iter().filter(|s| s.method.is_none());
+    let key = scoping()
+        .rfind(|s| !s.kind_name.eq_ignore_ascii_case("ifmodule"))
+        .map(|s| s.lineno);
+    let idx = match slots.blocks.get(&key) {
         Some(&i) => i,
         None => {
-            let Some(matchers) = access_matchers(stack, true) else {
-                return;
+            let Some(matchers) = access_matchers(scoping(), true) else {
+                return Ok(());
             };
             h.access_rules.push(AccessRule {
                 matchers,
@@ -577,7 +690,7 @@ fn record_legacy_access(
                 host_access: Some(HostAccess::default()),
             });
             let i = h.access_rules.len() - 1;
-            slots.insert(key, i);
+            slots.blocks.insert(key, i);
             i
         }
     };
@@ -585,8 +698,7 @@ fn record_legacy_access(
         .host_access
         .as_mut()
         .expect("legacy slot always points at a host_access rule");
-    match dlow {
-        "order" => ha.order = AccessOrder::parse(rest),
+    let entries = match dlow {
         "allow" | "deny" => {
             let entries = match parse_host_entries(rest) {
                 Some(e) => e,
@@ -604,14 +716,51 @@ fn record_legacy_access(
                     ".htaccess host/domain access operand is not evaluable (no reverse DNS); treated fail-closed"
                 );
             }
-            if dlow == "allow" {
-                ha.allow.extend(entries);
-            } else {
-                ha.deny.extend(entries);
-            }
+            entries
         }
-        _ => {}
+        _ => Vec::new(),
+    };
+    let Some(limit) = limit else {
+        ha.unlimited = true;
+        match dlow {
+            "order" => {
+                // Apache rewrites `order[]` for every method, so a later
+                // unlimited `Order` supersedes an earlier `<Limit>` one.
+                ha.order = AccessOrder::parse(rest);
+                for l in &mut ha.limited {
+                    l.order = None;
+                }
+            }
+            "allow" => ha.allow.extend(entries),
+            _ => ha.deny.extend(entries),
+        }
+        return Ok(());
+    };
+    let (limit_line, methods, except) = limit;
+    // Keyed by (block, section): a `<Limit>` index only ever names an entry of
+    // the block it was created in (#791/#792).
+    let li = *slots.limits.entry((key, limit_line)).or_insert_with(|| {
+        ha.limited.push(LimitedAccess {
+            methods: methods.clone(),
+            except,
+            order: None,
+            allow: Vec::new(),
+            deny: Vec::new(),
+        });
+        ha.limited.len() - 1
+    });
+    let Some(l) = ha.limited.get_mut(li) else {
+        return Err(RewriteError::Malformed {
+            line: lineno,
+            msg: "legacy <Limit> slot out of range".into(),
+        });
+    };
+    match dlow {
+        "order" => l.order = Some(AccessOrder::parse(rest)),
+        "allow" => l.allow.extend(entries),
+        _ => l.deny.extend(entries),
     }
+    Ok(())
 }
 
 /// Record an [`AccessRule`] scoped by the conjunction of the currently-open
@@ -633,7 +782,10 @@ fn record_access_rule(h: &mut Htaccess, stack: &[PendingSection], denied: bool) 
 /// The ANDed scope matchers of the currently-open blocks, or `None` when the
 /// rule must be dropped (an uncompilable `<Files*>`/`<Directory*>`, or a grant
 /// under an unverifiable `<If>`).
-fn access_matchers(stack: &[PendingSection], denied: bool) -> Option<Vec<AccessMatcher>> {
+fn access_matchers<'a>(
+    stack: impl IntoIterator<Item = &'a PendingSection>,
+    denied: bool,
+) -> Option<Vec<AccessMatcher>> {
     let mut matchers: Vec<AccessMatcher> = Vec::new();
     for sec in stack {
         match sec.kind {
@@ -671,6 +823,10 @@ fn access_matchers(stack: &[PendingSection], denied: bool) -> Option<Vec<AccessM
                             });
                         }
                     }
+                } else if !denied && sec.is_unmodelled() {
+                    // `<IfDefine>`, `<Location*>`, ...: the condition is not evaluated,
+                    // so a deny still applies but a grant must not widen to the directory.
+                    return None;
                 }
             }
         }
@@ -748,6 +904,23 @@ fn else_expr(prior: Option<&[Option<UriExpr>]>, own: Option<Option<UriExpr>>) ->
 }
 
 impl PendingSection {
+    /// `<Files*>`, `<Directory*>` and the `<If>` chain: the sections that narrow
+    /// the request scope (and so key their own legacy access block).
+    fn is_scoping(&self) -> bool {
+        self.kind.is_some() || self.branch.is_some()
+    }
+
+    /// A container whose condition this parser does not model (anything but
+    /// `IfModule`, `Files*`, `Directory*`, `If`/`ElseIf`/`Else`, `Limit*` and
+    /// `Require*`).
+    fn is_unmodelled(&self) -> bool {
+        self.kind.is_none()
+            && self.method.is_none()
+            && self.require_kind.is_none()
+            && self.scope.is_none()
+            && !self.kind_name.eq_ignore_ascii_case("ifmodule")
+    }
+
     /// An access section whose pattern does not compile is a parse error (#604):
     /// the whole file then fails closed through the cache's deny-all sentinel, as
     /// Apache answers 500 for the directory, instead of silently dropping the
@@ -790,7 +963,7 @@ impl PendingSection {
                 // not compile (e.g. a reversed range) matches its text literally.
                 Some(SectionKind::Files) if !is_regex_marker => Regex::new(&fnmatch_to_regex(&pat))
                     .or_else(|_| Regex::new(&format!("^{}$", fancy_regex::escape(&pat)))),
-                _ => Regex::new(&pat),
+                _ => Regex::new(&crate::rules::pcre_literal_escapes(&pat)),
             }
             .map_err(|e| RewriteError::BadRegex {
                 line: lineno,
@@ -843,6 +1016,23 @@ impl PendingSection {
                     return Err(RewriteError::Malformed {
                         line: lineno,
                         msg: format!("<{tag}> without methods"),
+                    });
+                }
+                // Apache resolves names case-sensitively against its built-in
+                // registry and cannot register a method from `.htaccess` (#793).
+                if let Some(bad) = methods
+                    .iter()
+                    .find(|m| !super::mod_access::is_builtin_method(m))
+                {
+                    return Err(RewriteError::Malformed {
+                        line: lineno,
+                        msg: format!("could not register method '{bad}' for <{tag}>"),
+                    });
+                }
+                if tag_low == "limit" && methods.iter().any(|m| m == "TRACE") {
+                    return Err(RewriteError::Malformed {
+                        line: lineno,
+                        msg: "TRACE cannot be controlled by <Limit>".into(),
                     });
                 }
                 method = Some(AccessMatcher::Method {
@@ -900,17 +1090,17 @@ fn auth_section_matcher(kind: Option<SectionKind>, tag: &str, args: &str) -> Opt
         Some(SectionKind::Files) if !regex_marker => Some(AccessMatcher::Basename(
             Regex::new(&fnmatch_to_regex(pattern)).ok()?,
         )),
-        Some(SectionKind::Files | SectionKind::FilesMatch) => {
-            Some(AccessMatcher::Basename(Regex::new(pattern).ok()?))
-        }
+        Some(SectionKind::Files | SectionKind::FilesMatch) => Some(AccessMatcher::Basename(
+            Regex::new(&crate::rules::pcre_literal_escapes(pattern)).ok()?,
+        )),
         Some(SectionKind::Directory) if !regex_marker => {
             let glob = fnmatch_to_regex(pattern.trim_end_matches('/'));
             let regex = Regex::new(&format!("{}(?:/|$)", glob.trim_end_matches('$'))).ok()?;
             Some(AccessMatcher::Path(regex))
         }
-        Some(SectionKind::Directory | SectionKind::DirectoryMatch) => {
-            Some(AccessMatcher::Path(Regex::new(pattern).ok()?))
-        }
+        Some(SectionKind::Directory | SectionKind::DirectoryMatch) => Some(AccessMatcher::Path(
+            Regex::new(&crate::rules::pcre_literal_escapes(pattern)).ok()?,
+        )),
         None if tag == "if" => parse_if_scope(pattern)?
             .uri_expr
             .map(AccessMatcher::IfUriExpr),
@@ -1191,11 +1381,12 @@ fn parse_if_uri_cond(expr: &str) -> Option<UriCond> {
         "i" => true,
         _ => return None,
     };
-    let pattern = &body[..end];
+    // ap_expr regexes are PCRE: `\<`/`\>` are literal brackets (#978).
+    let pattern = crate::rules::pcre_literal_escapes(&body[..end]);
     let pattern = if nocase {
         std::borrow::Cow::Owned(format!("(?i){pattern}"))
     } else {
-        std::borrow::Cow::Borrowed(pattern)
+        pattern
     };
     let regex = Regex::new(&pattern).ok()?;
     Some(UriCond {
@@ -1362,10 +1553,20 @@ fn parse_header(rest: &str, line: usize) -> Result<Option<HeaderDirective>, Rewr
             i += 1;
         }
     }
+    let field_name = http::HeaderName::from_bytes(name.as_bytes()).ok();
+    let interpolated = value.contains("%{");
+    let static_value = match action {
+        HeaderAction::Unset | HeaderAction::Echo => None,
+        _ if interpolated => None,
+        _ => http::HeaderValue::from_str(&value).ok(),
+    };
     Ok(Some(HeaderDirective {
         action,
         name,
         value,
+        field_name,
+        static_value,
+        interpolated,
         env,
         expr,
         always,
@@ -1425,9 +1626,15 @@ fn header_tokens(text: &str) -> Option<Vec<String>> {
 /// are neither, and a directive that seeds an `%{ENV:}` name the rewrite
 /// classifier assumes constant-empty (`REDIRECT_STATUS`) would invalidate that
 /// assumption for every later reader. Mirrors the attribute set of
-/// `ReqAttrs::resolve`.
+/// `ReqAttrs::resolve`. A header attribute that is absent falls back to the
+/// env variable of that name (#794); that value is either a server variable
+/// determined by the base key (`HTTPS`), or an earlier `SetEnvIf`'s output,
+/// whose own inputs were classified here, so the fallback adds no input.
 fn classify_set_env_if_for_memo(memo: &mut MemoClass, s: &SetEnvIf, lineno: usize) {
-    if s.var.eq_ignore_ascii_case("REDIRECT_STATUS") {
+    if s.assigns
+        .iter()
+        .any(|(var, _)| var.eq_ignore_ascii_case("REDIRECT_STATUS"))
+    {
         memo.block(lineno, "set_env_if_seeds_redirect_status");
         // Page-cache keying also consumes vary_headers, even when finished
         // response memoization is blocked. Retain the attribute's header read.
@@ -1443,13 +1650,17 @@ fn classify_set_env_if_for_memo(memo: &mut MemoClass, s: &SetEnvIf, lineno: usiz
     if eq("request_uri") || eq("request_method") || eq("query_string") {
         return;
     }
-    if eq("request_protocol") || eq("remote_addr") || eq("server_addr") {
+    if eq("request_protocol") || eq("remote_addr") || eq("remote_host") || eq("server_addr") {
         memo.block(lineno, "set_env_if_remote");
+        memo.unkeyed(lineno, "set_env_if_remote");
         return;
     }
     match fold_header_name(attr) {
         Some(name) => memo.vary(name),
-        None => memo.block(lineno, "set_env_if_bad_attribute"),
+        None => {
+            memo.block(lineno, "set_env_if_bad_attribute");
+            memo.unkeyed(lineno, "set_env_if_bad_attribute");
+        }
     }
 }
 
@@ -1471,39 +1682,119 @@ fn classify_rules_for_memo(memo: &mut MemoClass, rules: &RuleSet) {
     }
 }
 
-fn parse_set_env_if(rest: &str, nocase: bool, line: usize) -> Option<SetEnvIf> {
+/// A malformed directive is a parse error, as Apache refuses the directory: a
+/// dropped `SetEnvIf` feeding `Deny from env=` would otherwise fail open.
+fn parse_set_env_if(rest: &str, nocase: bool, line: usize) -> Result<SetEnvIf, RewriteError> {
+    let malformed = |msg: String| RewriteError::Malformed { line, msg };
     let toks = tokenize(rest);
     if toks.len() < 3 {
-        return None;
+        return Err(malformed(
+            "SetEnvIf needs an attribute, a regex and a variable".into(),
+        ));
     }
     let attribute = toks[0].clone();
+    // mod_setenvif treats a name with any character outside `[-A-Za-z0-9_]` as
+    // a regex over request-header NAMES. That reads an open-ended header set no
+    // cache key can capture, so it is refused rather than dropped (#794).
+    if attribute.is_empty()
+        || !attribute
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(malformed(format!(
+            "SetEnvIf header-name regex attribute {attribute:?} is not supported"
+        )));
+    }
     let regex_src = toks[1].clone();
-    let assign = toks[2].clone();
-    let (var, value) = match assign.split_once('=') {
-        Some((k, v)) => (k.to_string(), v.to_string()),
-        None => (assign, "1".to_string()),
-    };
-    let prepared = if nocase {
+    // `!VAR` unsets VAR (mod_setenvif); the whole token after `!` is the name.
+    let assigns: Vec<(String, String)> = toks
+        .iter()
+        .skip(2)
+        .map(|assign| {
+            if assign.starts_with('!') {
+                return (assign.clone(), String::new());
+            }
+            match assign.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (assign.clone(), "1".to_string()),
+            }
+        })
+        .collect();
+    let regex =
+        crate::rules::CompiledRegex::compile(&regex_src, nocase, line).map_err(|e| match e {
+            RewriteError::BadRegex { source, .. } => {
+                malformed(format!("invalid SetEnvIf regex: {source}"))
+            }
+            other => other,
+        })?;
+    // (#312) Same literal-prefix extraction the RewriteRule prefilter uses, on
+    // the same PCRE form the regex compiles; for SetEnvIfNoCase the (?i)
+    // wrapper makes any prefix case-sensitive-invalid, so pass nocase through
+    // (extractor returns empty for it).
+    let literal_prefix = crate::rules::extract_literal_prefix(
+        &crate::rules::pcre_literal_escapes(&regex_src),
+        false,
+        nocase,
+    );
+    let needs_caps = assigns
+        .iter()
+        .any(|(var, value)| !var.starts_with('!') && value.contains('$'));
+    let regex_src = if nocase {
         format!("(?i){regex_src}")
     } else {
-        regex_src.clone()
+        regex_src
     };
-    let regex = Regex::new(&prepared)
-        .map_err(|e| {
-            tracing::debug!(line, error = %e, "invalid SetEnvIf regex; skipping");
-        })
-        .ok()?;
-    // (#312) Same literal-prefix extraction the RewriteRule prefilter uses; for
-    // SetEnvIfNoCase the (?i) wrapper makes any prefix case-sensitive-invalid,
-    // so pass nocase through (extractor returns empty for it).
-    let literal_prefix = crate::rules::extract_literal_prefix(&regex_src, false, nocase);
-    Some(SetEnvIf {
+    Ok(SetEnvIf {
+        attr: crate::directives::SetEnvAttr::classify(&attribute),
         attribute,
         regex,
+        regex_src: regex_src.into_boxed_str(),
         literal_prefix,
-        var,
-        value,
+        assigns,
+        scopes: Vec::new(),
+        needs_caps,
+        reuse_prev: false,
     })
+}
+
+/// (#977) Per-file facts that let each request's `SetEnvIf` run skip work
+/// whose result is already known.
+fn finish_set_env_if(h: &mut Htaccess) {
+    let reuse: Vec<bool> = h
+        .set_env_if
+        .windows(2)
+        .map(|w| matches!(w, [prev, cur] if tests_same_subject(prev, cur)))
+        .collect();
+    for (cur, reuse) in h.set_env_if.iter_mut().skip(1).zip(reuse) {
+        cur.reuse_prev = reuse;
+    }
+    h.set_env_if_reads_conn = h.set_env_if.iter().any(|s| s.attr.reads_connection());
+    h.cookie_env_absent = Some(h.eval_cookie_env(None));
+}
+
+/// Whether `cur` necessarily matches exactly when `prev` does: the same
+/// attribute spelling (an env fallback prefers an exact-case name), pattern,
+/// prefix and scopes, and `prev` assigns no variable the attribute's env
+/// fallback could then read. Only a test without captures can be reused.
+fn tests_same_subject(prev: &SetEnvIf, cur: &SetEnvIf) -> bool {
+    let folded = |b: u8| match b {
+        b'_' => b'-',
+        b => b.to_ascii_lowercase(),
+    };
+    let names_attribute = |var: &str| {
+        let var = var.strip_prefix('!').unwrap_or(var);
+        var.len() == cur.attribute.len()
+            && var
+                .bytes()
+                .zip(cur.attribute.bytes())
+                .all(|(a, b)| folded(a) == folded(b))
+    };
+    !cur.needs_caps
+        && prev.attribute == cur.attribute
+        && prev.regex_src == cur.regex_src
+        && prev.literal_prefix == cur.literal_prefix
+        && prev.scopes == cur.scopes
+        && !prev.assigns.iter().any(|(var, _)| names_attribute(var))
 }
 
 // ===========================================================================
@@ -1574,6 +1865,99 @@ fn parse_php_directive(rest: &str, kind: PhpDirectiveKind) -> Option<PhpDirectiv
 }
 
 /// Tokenize honoring double quotes, stripping the outer quotes from each token.
+/// A directive whose effect must stay inside its enclosing section cannot sit in a
+/// container this parser does not model (or an `<If>` whose expression it cannot
+/// evaluate): applying it directory-wide or dropping it could each flip PHP
+/// routing or ini policy, so the file fails closed as Apache-500 does.
+fn reject_unscopable(
+    section_stack: &[PendingSection],
+    cur_scopes: &[Scope],
+    lineno: usize,
+    directive: &str,
+) -> Result<(), RewriteError> {
+    if section_stack.iter().any(PendingSection::is_unmodelled)
+        || cur_scopes
+            .iter()
+            .any(|sc| sc.kind == ScopeKind::If && sc.uri_expr.is_none())
+    {
+        return Err(RewriteError::Malformed {
+            line: lineno,
+            msg: format!("{directive} inside an unsupported container"),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a handler name selects PHP. Fails toward PHP for the common vendor
+/// spellings (`application/x-httpd-ea-php81`, `php-script`, an FPM `proxy:` URL)
+/// so a renamed PHP handler never degrades to static source serving; the
+/// highlighter `application/x-httpd-php-source` is not an executor.
+fn handler_is_php(handler: &str) -> bool {
+    let h = handler.to_ascii_lowercase();
+    h.contains("php") && !h.contains("php-source")
+}
+
+/// Whether a MIME type selects PHP (`application/x-httpd-php`, `…-lsphp`,
+/// `…-ea-php81`, …), excluding the `-source` highlighter type.
+fn type_is_php(mime: &str) -> bool {
+    let t = mime.to_ascii_lowercase();
+    (t.starts_with("application/x-httpd-") || t.starts_with("x-httpd-"))
+        && t.contains("php")
+        && !t.contains("php-source")
+}
+
+fn type_spec(mime: &str) -> TypeSpec {
+    TypeSpec {
+        mime: mime.to_string(),
+        php: type_is_php(mime),
+    }
+}
+
+fn parse_handler_op(dlow: &str, rest: &str) -> Option<HandlerOpKind> {
+    let toks = tokenize(rest);
+    let exts = |toks: &[String]| -> Vec<String> {
+        toks.iter()
+            .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect()
+    };
+    let first = toks.first()?;
+    let none = first.eq_ignore_ascii_case("none");
+    let kind = match dlow {
+        "sethandler" => HandlerOpKind::SetHandler((!none).then(|| handler_is_php(first))),
+        "forcetype" => HandlerOpKind::ForceType((!none).then(|| type_spec(first))),
+        "addhandler" | "addtype" => {
+            let exts = exts(&toks[1..]);
+            if exts.is_empty() {
+                return None;
+            }
+            if dlow == "addhandler" {
+                HandlerOpKind::AddHandler {
+                    exts,
+                    php: handler_is_php(first),
+                }
+            } else {
+                HandlerOpKind::AddType {
+                    exts,
+                    ty: type_spec(first),
+                }
+            }
+        }
+        _ => {
+            let exts = exts(&toks);
+            if exts.is_empty() {
+                return None;
+            }
+            if dlow == "removehandler" {
+                HandlerOpKind::RemoveHandler(exts)
+            } else {
+                HandlerOpKind::RemoveType(exts)
+            }
+        }
+    };
+    Some(kind)
+}
+
 fn tokenize(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -1689,19 +2073,74 @@ php_admin_flag allow_url_fopen On
             "<Files \"crontab.html\">\n  SetHandler application/x-httpd-php\n</Files>",
         )
         .unwrap();
-        assert_eq!(h.set_handlers.len(), 1);
-        assert!(h.set_handlers[0].php);
-        assert_eq!(h.set_handlers[0].scopes.len(), 1);
+        assert_eq!(h.handler_ops.len(), 1);
+        assert_eq!(h.handler_ops[0].kind, HandlerOpKind::SetHandler(Some(true)));
+        assert_eq!(h.handler_ops[0].scopes.len(), 1);
         assert!(h.has_handler_override);
     }
 
     #[test]
-    fn set_handler_none_is_a_non_php_reset() {
-        let h = Htaccess::parse("SetHandler none\n").unwrap();
-        assert_eq!(h.set_handlers.len(), 1);
-        assert!(!h.set_handlers[0].php);
-        assert!(h.set_handlers[0].scopes.is_empty()); // directory-wide
-        assert!(h.has_handler_override);
+    fn set_handler_reset_forms() {
+        let h = Htaccess::parse("SetHandler default-handler\n").unwrap();
+        assert_eq!(
+            h.handler_ops[0].kind,
+            HandlerOpKind::SetHandler(Some(false))
+        );
+        assert!(h.handler_ops[0].scopes.is_empty()); // directory-wide
+        // A pure reset can never select PHP, so the hot-path gate stays off.
+        assert!(!h.has_handler_override);
+        let h = Htaccess::parse("SetHandler None\n").unwrap();
+        assert_eq!(h.handler_ops[0].kind, HandlerOpKind::SetHandler(None));
+    }
+
+    #[test]
+    fn quoted_handler_and_type_values_are_dequoted() {
+        // #851: the quoted spelling must not be recorded as a non-PHP handler.
+        for (directive, kind) in [
+            (
+                "SetHandler \"application/x-httpd-php\"",
+                HandlerOpKind::SetHandler(Some(true)),
+            ),
+            (
+                "ForceType \"application/x-httpd-php\"",
+                HandlerOpKind::ForceType(Some(TypeSpec {
+                    mime: "application/x-httpd-php".into(),
+                    php: true,
+                })),
+            ),
+            (
+                "AddHandler \"application/x-httpd-php\" \".html\"",
+                HandlerOpKind::AddHandler {
+                    exts: vec!["html".into()],
+                    php: true,
+                },
+            ),
+        ] {
+            let h = Htaccess::parse(directive).unwrap();
+            assert_eq!(h.handler_ops[0].kind, kind, "{directive}");
+            assert!(h.has_handler_override, "{directive}");
+        }
+    }
+
+    #[test]
+    fn php_handler_spellings() {
+        for handler in [
+            "application/x-httpd-php",
+            "APPLICATION/X-HTTPD-PHP",
+            "application/x-httpd-lsphp",
+            "application/x-httpd-ea-php81",
+            "x-httpd-php",
+            "php-script",
+        ] {
+            assert!(handler_is_php(handler), "{handler}");
+        }
+        assert!(!handler_is_php("application/x-httpd-php-source"));
+        assert!(!handler_is_php("default-handler"));
+        assert!(type_is_php("application/x-httpd-php"));
+        assert!(type_is_php("application/x-httpd-ea-php74"));
+        assert!(!type_is_php("application/x-httpd-php-source"));
+        assert!(!type_is_php("text/x-php"));
+        assert!(!type_is_php("image/webp"));
     }
 
     #[test]
@@ -1711,17 +2150,88 @@ php_admin_flag allow_url_fopen On
             "AddType application/x-httpd-php .html .htm",
         ] {
             let h = Htaccess::parse(directive).unwrap();
-            assert_eq!(h.add_php_exts.len(), 1, "{directive}");
-            assert_eq!(h.add_php_exts[0].exts, vec!["html", "htm"], "{directive}");
+            assert_eq!(h.handler_ops.len(), 1, "{directive}");
+            match &h.handler_ops[0].kind {
+                HandlerOpKind::AddHandler { exts, php }
+                | HandlerOpKind::AddType {
+                    exts,
+                    ty: TypeSpec { php, .. },
+                } => {
+                    assert_eq!(exts, &vec!["html".to_string(), "htm".to_string()]);
+                    assert!(php, "{directive}");
+                }
+                other => panic!("{directive}: {other:?}"),
+            }
             assert!(h.has_handler_override, "{directive}");
         }
     }
 
     #[test]
-    fn non_php_add_type_is_not_recorded() {
-        let h = Htaccess::parse("AddType text/html .shtml\n").unwrap();
-        assert!(h.add_php_exts.is_empty());
+    fn non_php_add_type_is_recorded_but_cannot_force() {
+        // Recorded so it can override an inherited PHP mapping (#853), but it
+        // never opens the hot-path gate on its own.
+        let h = Htaccess::parse("AddType text/html .shtml\nRemoveHandler .html\n").unwrap();
+        assert_eq!(h.handler_ops.len(), 2);
         assert!(!h.has_handler_override);
+    }
+
+    #[test]
+    fn handler_and_php_value_inside_unevaluable_if_fail_closed() {
+        // #852: an <If> we cannot evaluate would apply these directory-wide.
+        for directive in [
+            "SetHandler none",
+            "SetHandler application/x-httpd-php",
+            "ForceType application/x-httpd-php",
+            "AddHandler application/x-httpd-php .html",
+            "AddType application/x-httpd-php .html",
+            "AddType text/plain .html",
+            "RemoveHandler .html",
+            "RemoveType .html",
+            "php_value auto_prepend_file none",
+        ] {
+            let text = format!("<If \"%{{HTTP_HOST}} == 'static.example'\">\n{directive}\n</If>\n");
+            assert!(
+                matches!(Htaccess::parse(&text), Err(RewriteError::Malformed { .. })),
+                "{directive}"
+            );
+            let text = format!("<IfDefine FOO>\n{directive}\n</IfDefine>\n");
+            assert!(
+                matches!(Htaccess::parse(&text), Err(RewriteError::Malformed { .. })),
+                "{directive} in IfDefine"
+            );
+        }
+        // An evaluable <If> and <IfModule> keep working.
+        let h = Htaccess::parse(
+            "<If \"%{REQUEST_URI} =~ m#^/admin#\">\nSetHandler application/x-httpd-php\n</If>\n\
+             <IfModule mod_mime.c>\nAddType application/manifest+json .webmanifest\n</IfModule>\n",
+        )
+        .unwrap();
+        assert_eq!(h.handler_ops.len(), 2);
+    }
+
+    #[test]
+    fn directory_index_disabled_is_an_override() {
+        let h = Htaccess::parse("DirectoryIndex disabled\n").unwrap();
+        assert_eq!(h.directory_index_override(), Some(&[][..]));
+        let h = Htaccess::parse("DirectoryIndex index.php\n").unwrap();
+        assert_eq!(
+            h.directory_index_override(),
+            Some(&["index.php".to_string()][..])
+        );
+        assert_eq!(
+            Htaccess::parse("").unwrap().directory_index_override(),
+            None
+        );
+        // Next to other names `disabled` is a literal file name (Apache mod_dir).
+        let h = Htaccess::parse("DirectoryIndex index.php disabled\n").unwrap();
+        assert!(!h.directory_index_disabled);
+        assert_eq!(h.directory_index, vec!["index.php", "disabled"]);
+        // A later list re-enables the search.
+        let h = Htaccess::parse("DirectoryIndex disabled\nDirectoryIndex a.php\n").unwrap();
+        assert_eq!(
+            h.directory_index_override(),
+            Some(&["a.php".to_string()][..])
+        );
     }
 
     #[test]

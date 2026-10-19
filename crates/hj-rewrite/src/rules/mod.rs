@@ -16,7 +16,7 @@ use regex_automata::{
 use crate::error::RewriteError;
 use crate::input::RewriteInput;
 
-use eval::{EvalState, PassResult, rule_match_target, run_pass};
+use eval::{EvalState, FsMemoScope, PassResult, rule_match_target, run_pass};
 
 /// Maximum number of full passes over the rule list before the engine gives up
 /// (Apache uses an internal redirect limit of 10).
@@ -59,6 +59,11 @@ pub struct RuleSet {
     /// the ruleset non-path-cacheable: downstream page caching still needs to
     /// distinguish responses by these header values.
     pub header_reads: Vec<String>,
+    /// (#857) The first `%{VAR}` read the origin page cache can neither key nor
+    /// vary on (client/server address or port, protocol, `THE_REQUEST`, `TIME*`,
+    /// `%{ENV:…}` / bare env reads). `None` = a response built under this set is
+    /// a function of the page-cache key plus its header vary.
+    pub page_cache_unkeyed: Option<Box<str>>,
     /// `%{ENV:NAME}` names this ruleset reads that classification treated as
     /// CONSTANT-EMPTY at rewrite-eval time (currently only `REDIRECT_STATUS`):
     /// httpjet itself never seeds them into the request env before/during rewrite
@@ -109,6 +114,12 @@ impl RuleSet {
     /// The explicit `RewriteEngine` state, or `None` to inherit the parent's.
     pub fn engine_state(&self) -> Option<bool> {
         self.engine_set.then_some(self.engine_on)
+    }
+
+    /// (#857) Whether every input this set can read is covered by the page-cache
+    /// key or its header vary. A set that never evaluates reads nothing.
+    pub fn page_cache_keyed(&self) -> bool {
+        self.page_cache_unkeyed.is_none() || self.is_noop()
     }
 
     /// Unique nonzero parse-time id (0 only for a default-constructed empty set).
@@ -372,6 +383,9 @@ pub(crate) enum CondPattern {
     Regex(CompiledRegex, String),
     /// File test: `-f`, `-d`, `-l`, `-s` (and the rarer `-x`, treated as exists).
     FileTest(FileTestKind),
+    /// `-U` URL-access test: OLS `COND_OP_URL_ACC` never runs a subrequest and
+    /// always matches (so `!-U` never does).
+    UrlAccess,
     /// Lexical (string) comparison: `<str`, `>str`, `=str`, `<=str`, `>=str`.
     Lexical(Ordering, String),
     /// Numeric comparison: `-eq`, `-ne`, `-gt`, `-lt`, `-ge`, `-le`.
@@ -444,6 +458,23 @@ pub(crate) struct RuleFlags {
     pub(crate) skip: usize,
     /// `[E=var:val]` sets (in order).
     pub(crate) env_sets: Vec<(String, String)>,
+    /// `[B]`-family backreference escaping of the substitution.
+    pub(crate) backref_escape: Option<BackrefEscape>,
+    /// `[UnsafeAllow3F]`: a `?` inside a path-part backreference may start the query.
+    pub(crate) allow_3f: bool,
+}
+
+/// `[B]` / `[B=chars]` / `[BNP]` / `[BCTLS]` / `[BNE=chars]` (OLS `escape_uri`).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BackrefEscape {
+    /// `[BNP]`: a space becomes `%20` instead of `+`.
+    pub(crate) no_plus: bool,
+    /// `[BCTLS]`: only control characters and spaces are escaped.
+    pub(crate) ctls_only: bool,
+    /// `[BNE=chars]`: characters left verbatim.
+    pub(crate) no_escape: String,
+    /// `[B=chars]`: only these characters are escaped.
+    pub(crate) only: Option<String>,
 }
 
 /// The outcome of evaluating a [`RuleSet`] against a [`RewriteInput`].
@@ -505,6 +536,9 @@ pub enum RewriteOutcome {
     /// `[P]` — proxy the request to this upstream URL.
     Proxy {
         target_url: String,
+        /// OLS `[P,E=Proxy-Host:value]`: the outbound `Host` (and TLS SNI) for the
+        /// upstream leg. Not recorded as an env var.
+        proxy_host: Option<String>,
         env: Vec<(String, String)>,
     },
 }
@@ -549,7 +583,7 @@ impl RewriteOutcome {
 /// `regex::Regex::new` accepts has *identical* match semantics under both engines.
 /// `regex` is SIMD-accelerated and avoids `fancy_regex`'s per-call backtracking,
 /// which profiling identified as httpjet's #1 CPU cost (per-rule, per-request).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum CompiledRegex {
     Fast(FastRegex),
     Fancy(Regex),
@@ -562,7 +596,9 @@ pub(crate) enum CompiledRegex {
 /// connection task migrates across all workers, so the other threads take the
 /// pool's cross-thread mutex slow path (`Pool::get_slow`, ~5% of CPU on the
 /// 130-rule front controller). A per-thread cache removes that contention.
-#[derive(Debug)]
+/// A clone keeps its `id`: it shares the original's compiled engine, so its
+/// per-thread cache stays valid.
+#[derive(Debug, Clone)]
 pub struct FastRegex {
     re: meta::Regex,
     id: usize,
@@ -588,6 +624,21 @@ thread_local! {
 }
 
 impl FastRegex {
+    fn is_match(&self, text: &str) -> bool {
+        FAST_REGEX_CACHES.with(|cell| {
+            let mut map = cell.borrow_mut();
+            if map.len() > FAST_REGEX_CACHE_CAP {
+                map.clear();
+            }
+            let (cache, _) = map
+                .entry(self.id)
+                .or_insert_with(|| (self.re.create_cache(), self.re.create_captures()));
+            self.re
+                .search_half_with(cache, &Input::new(text).earliest(true))
+                .is_some()
+        })
+    }
+
     fn captures<'t>(&self, text: &'t str) -> Option<Caps<'t>> {
         FAST_REGEX_CACHES.with(|cell| {
             let mut map = cell.borrow_mut();
@@ -690,7 +741,7 @@ pub(crate) enum Caps<'t> {
 
 impl<'t> Caps<'t> {
     #[inline]
-    fn get(&self, i: usize) -> Option<&str> {
+    pub(crate) fn get(&self, i: usize) -> Option<&str> {
         match self {
             Caps::Fast { groups, text } => {
                 groups.get(i).copied().flatten().map(|(s, e)| &text[s..e])
@@ -698,6 +749,32 @@ impl<'t> Caps<'t> {
             Caps::Fancy(c) => c.get(i).map(|m| m.as_str()),
         }
     }
+}
+
+/// PCRE (Apache/OLS) reads `\<` and `\>` as the literal brackets, where Rust's
+/// regex syntax reads them as word boundaries: the common `(\<|%3C).*script` block
+/// rule 403'd every `description` query and `^\<foo` never matched (#952).
+pub(crate) fn pcre_literal_escapes(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains("\\<") && !src.contains("\\>") {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some(n @ ('<' | '>')) => out.push(n),
+            Some(n) => {
+                out.push('\\');
+                out.push(n);
+            }
+            None => out.push('\\'),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 impl CompiledRegex {
@@ -708,11 +785,16 @@ impl CompiledRegex {
 
     /// Compile `src` (case-insensitive when `nocase`), preferring the linear-time
     /// `regex_automata` engine and falling back to `fancy_regex` for unsupported features.
-    fn compile(src: &str, nocase: bool, line: usize) -> Result<CompiledRegex, RewriteError> {
+    pub(crate) fn compile(
+        src: &str,
+        nocase: bool,
+        line: usize,
+    ) -> Result<CompiledRegex, RewriteError> {
+        let pcre = pcre_literal_escapes(src);
         let prepared = if nocase {
-            format!("(?i){src}")
+            format!("(?i){pcre}")
         } else {
-            src.to_string()
+            pcre.into_owned()
         };
         // `meta::Regex` is the same engine the high-level `regex` crate is built on,
         // so it accepts/rejects the identical pattern set with identical match
@@ -742,6 +824,17 @@ impl CompiledRegex {
         }
     }
 
+    /// [`CompiledRegex::captures_checked`] without the groups. fancy_regex runs
+    /// the same VM (same backtrack budget) for both, so match/no-match and the
+    /// match-time error are identical; only the saves are not copied out.
+    #[inline]
+    pub(crate) fn is_match_checked(&self, text: &str) -> Result<bool, ()> {
+        match self {
+            CompiledRegex::Fast(r) => Ok(r.is_match(text)),
+            CompiledRegex::Fancy(r) => r.is_match(text).map_err(|_| ()),
+        }
+    }
+
     /// Checked runtime match used by request authorization/routing. Fancy
     /// regexes can fail after successful compilation (for example when their
     /// backtracking limit is exhausted); preserve that distinction.
@@ -761,10 +854,9 @@ impl CompiledRegex {
 // Evaluation entry
 // ===========================================================================
 
-/// Run a [`RuleSet`] against a [`RewriteInput`]. Implements Apache's per-pass
-/// loop: rules run top-to-bottom; a matched `[L]`/`[F]`/`[P]`/`[R]` stops the
-/// pass; if any non-terminal rule rewrote the URI, the whole list is re-run
-/// (up to [`MAX_ITERATIONS`]).
+/// Run a [`RuleSet`] against a [`RewriteInput`]: rules run top-to-bottom once;
+/// a matched `[L]`/`[F]`/`[P]`/`[R]` stops the pass, and only `[N]` re-runs
+/// the list (up to [`MAX_ITERATIONS`]).
 /// True when an absolute `location` names the request's own URL (same scheme,
 /// Host and path+query).
 fn absolute_target_is_current(location: &str, input: &RewriteInput) -> bool {
@@ -849,6 +941,7 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
         };
     }
 
+    let _fs_memo = FsMemoScope::enter();
     let mut state = EvalState {
         // EvalState owns a mutable working copy (the engine rewrites it in place), so this
         // owns regardless of whether `input.uri` borrows — the one alloc the engine needs.
@@ -861,16 +954,15 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
         // [E=] on top" (last-writer-wins preserved).
         env: std::collections::BTreeMap::new(),
         env_order: Vec::new(),
+        env_unset: Vec::new(),
         last_cond_caps: std::array::from_fn(|_| None),
         prefilter_valid: true,
         pending_absolute: false,
+        uri_escaped: false,
+        last_cond_escaped: None,
         next_loops: 0,
         regex_failed: false,
     };
-    // Set true once an `[END]` rule fires, so the final outcome flags the
-    // pipeline to stop subsequent rulesets / `.htaccess` processing.
-    let mut ended = false;
-
     // Run the multi-pattern prefilter once against the initial stripped target.
     // `state.prefilter_valid` guards its use after any URI rewrite.
     let prefilter_target = rule_match_target(input, &input.uri);
@@ -880,49 +972,21 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
         .map(|pf| pf.matches(prefilter_target.as_ref()));
     let hits = hits.as_ref();
 
-    // Two distinct restart kinds, each bounded at MAX_ITERATIONS (Apache's
-    // internal-redirect limit):
-    //   * restart-on-URI-change: counted by `uri_restarts` here;
-    //   * `[N]`/`[next]` jumps: counted by `state.next_loops` inside `run_pass`,
-    //     which bails to `Continue` once it exceeds MAX_ITERATIONS.
-    // They are counted separately because a `[N]` jump returns out of `run_pass`
-    // to restart the ruleset — if both shared this loop's counter, the per-call
-    // `next_loops` would reset every restart and its guard would be dead code (the
-    // bug being fixed). A `[N]` restart therefore does NOT consume the URI-change
-    // budget, so the `[N]` guard can reach (and enforce) its own bound.
-    let mut uri_restarts = 0usize;
-    loop {
-        let uri_before = state.uri.clone();
+    // One pass, as OLS `processRuleSet`: a changed URI is final for this ruleset
+    // (a target in another directory is handed to that directory's chain by the
+    // pipeline). Only `[N]`/`[next]` re-runs it, bounded by `state.next_loops`.
+    // Re-running on a changed URI re-matched a front controller's own target:
+    // Symfony's `^index\.php` guard redirected every route, and `index.php/$1`
+    // nested itself to MAX_ITERATIONS (#880).
+    // `ended`: an `[END]` fired, so the outcome tells the pipeline to stop
+    // subsequent rulesets / `.htaccess` processing.
+    let ended = loop {
         match run_pass(rs, input, &mut state, hits) {
             PassResult::Terminal(outcome) => return outcome,
-            PassResult::Restart => {
-                // `[N]`/`[next]`: re-run the rule set from the top, regardless of
-                // whether the URI changed (OLS jumps back to the first rule). The
-                // jump was already counted + bounded by `state.next_loops`.
-            }
-            PassResult::Continue { end } => {
-                if end {
-                    // `[END]`: stop the per-pass loop AND the outer restart loop
-                    // unconditionally — even if the URI changed this pass.
-                    ended = true;
-                    break;
-                }
-                // An absolute URL is final; restarting would match rules against it.
-                // Only a per-directory ruleset re-runs on a changed URI (Apache/OLS
-                // re-enter .htaccess processing after an internal redirect); vhost-level
-                // rules run once, restarting only for [N] (OLS processVHostRewrite, #701).
-                if state.uri == uri_before || state.pending_absolute || input.server_context {
-                    // No URI change this pass and no terminal rule fired: done.
-                    break;
-                }
-                // URI changed -> restart from the top, up to MAX_ITERATIONS times.
-                uri_restarts += 1;
-                if uri_restarts >= MAX_ITERATIONS {
-                    break;
-                }
-            }
+            PassResult::Restart => {}
+            PassResult::Continue { end } => break end,
         }
-    }
+    };
 
     if state.pending_absolute && eval::is_absolute_uri(&state.uri) {
         let mut location = std::mem::take(&mut state.uri);

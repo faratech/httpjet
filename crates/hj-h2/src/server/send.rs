@@ -152,7 +152,21 @@ pub(super) fn begin_response(
     // them before encoding so a backend that emits e.g. `Connection`/`Transfer-Encoding`
     // (PHP over LSAPI, a proxied upstream) can't produce a malformed frame stream.
     hj_core::strip_hop_by_hop_response(&mut head.headers);
-    let streaming_unknown_len = matches!(body, Body::Stream(_));
+    let streaming_unknown_len = match &body {
+        // A stream keeps its Content-Length only when the body's exact size
+        // hint confirms it (a bridged file of known length).
+        Body::Stream(s) => {
+            use http_body::Body as _;
+            s.size_hint().exact().is_none_or(|n| {
+                head.headers
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    != Some(n)
+            })
+        }
+        _ => false,
+    };
     let body_forbidden = hj_core::response_body_forbidden(is_head, head.status);
     hj_core::sanitize_h2_h3_body_headers(
         &mut head.headers,
@@ -253,7 +267,7 @@ pub(super) fn begin_response(
                 eof,
                 done: false,
                 window,
-                cancel: tokio_util::sync::CancellationToken::new(),
+                cancel: None,
                 stall: None,
                 send_blocked: false,
             },
@@ -572,7 +586,11 @@ pub(super) fn pump_streams(
                 if !st.done && st.pending.is_empty() && !st.eof && !st.pulling {
                     if let Some(body) = st.body.take() {
                         st.pulling = true;
-                        pulls.push(Box::pin(pull_next(sid, body, st.cancel.clone())));
+                        let cancel = st
+                            .cancel
+                            .get_or_insert_with(tokio_util::sync::CancellationToken::new)
+                            .clone();
+                        pulls.push(Box::pin(pull_next(sid, body, cancel)));
                     }
                 }
                 if !st.done {
@@ -651,9 +669,52 @@ pub(super) fn reset_stalled_streams(
     earliest
 }
 
+/// (#1034) Shutdown drain: reset (RST_STREAM CANCEL) every response that has waited
+/// `grace` on its backend with nothing left to send — an SSE or long-poll body would
+/// otherwise hold the drain to the transport's bound. Responses still producing, bodies
+/// waiting on the peer's credit and handlers yet to answer are left alone. Returns the
+/// earliest remaining deadline.
+///
+/// `idle_since` holds each waiting response's start (the serve loop clears an entry when
+/// that stream's pull completes); it lives beside `OutStream` rather than in it because a
+/// larger per-stream entry moved the stream map into an allocation class that, under
+/// `MIMALLOC_PURGE_DELAY=0`, re-faulted pages on every h2 cache hit (+10% CPU).
+pub(super) fn reset_drain_idle_streams(
+    outstreams: &mut FxHashMap<u32, OutStream>,
+    idle_since: &mut FxHashMap<u32, std::time::Instant>,
+    out: &mut OutQueue,
+    grace: std::time::Duration,
+) -> Option<std::time::Instant> {
+    let mut now: Option<std::time::Instant> = None;
+    let mut earliest: Option<std::time::Instant> = None;
+    let mut expired = Vec::new();
+    for (&sid, st) in outstreams.iter() {
+        if st.done || !st.pulling || !st.pending.is_empty() {
+            idle_since.remove(&sid);
+            continue;
+        }
+        let now = *now.get_or_insert_with(std::time::Instant::now);
+        let deadline = *idle_since.entry(sid).or_insert(now) + grace;
+        if deadline <= now {
+            expired.push(sid);
+        } else {
+            earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
+        }
+    }
+    idle_since.retain(|sid, _| outstreams.contains_key(sid));
+    for sid in expired {
+        idle_since.remove(&sid);
+        out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+        cancel_outstream(outstreams, sid);
+    }
+    earliest
+}
+
 pub(super) fn cancel_outstream(outstreams: &mut FxHashMap<u32, OutStream>, sid: u32) {
-    if let Some(st) = outstreams.remove(&sid) {
-        st.cancel.cancel();
+    if let Some(st) = outstreams.remove(&sid)
+        && let Some(cancel) = &st.cancel
+    {
+        cancel.cancel();
     }
 }
 
@@ -800,7 +861,7 @@ mod tests {
                 eof: true,
                 done: false,
                 window: 64,
-                cancel: tokio_util::sync::CancellationToken::new(),
+                cancel: None,
                 stall: None,
                 send_blocked: false,
             }
@@ -870,7 +931,7 @@ mod tests {
             eof: true,
             done: false,
             window: 0,
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel: None,
             stall: None,
             send_blocked: false,
         };
@@ -1044,7 +1105,7 @@ mod tests {
                     eof: false,
                     done: false,
                     window: 0,
-                    cancel,
+                    cancel: Some(cancel),
                     stall: None,
                     send_blocked: false,
                 },
@@ -1085,5 +1146,60 @@ mod tests {
             !outstreams.contains_key(&1),
             "late pull cannot resurrect reset stream"
         );
+    }
+
+    /// Only a body that is pulled gets a cancellation token, and a reset still cancels
+    /// that pull; an in-memory body is sent without one.
+    #[tokio::test]
+    async fn pull_cancel_token_exists_only_for_pulled_bodies() {
+        use futures_util::StreamExt;
+        use http_body_util::BodyExt;
+
+        let pending = BodyExt::boxed(http_body_util::StreamBody::new(
+            futures_util::stream::pending::<Result<http_body::Frame<Bytes>, hj_core::BoxError>>(),
+        ));
+        let mut outstreams = FxHashMap::default();
+        for (sid, body, payload) in [(1, None, &b"in-memory"[..]), (3, Some(pending), b"")] {
+            outstreams.insert(
+                sid,
+                OutStream {
+                    completion: None,
+                    pending: Bytes::from_static(payload),
+                    eof: body.is_none(),
+                    body,
+                    pulling: false,
+                    done: false,
+                    window: 65_535,
+                    cancel: None,
+                    stall: None,
+                    send_blocked: false,
+                },
+            );
+        }
+        let mut schedule = VecDeque::from([1, 3]);
+        let mut out = OutQueue::default();
+        let mut pulls = Pulls::new();
+        let mut connection_window = 65_535;
+        pump_streams(
+            &mut outstreams,
+            &mut schedule,
+            &mut out,
+            &mut connection_window,
+            &mut pulls,
+            &PeerSettings::default(),
+        );
+        assert!(!outstreams.contains_key(&1), "the in-memory body finished");
+        let streaming = outstreams.get(&3).expect("streaming body stays registered");
+        assert!(streaming.pulling && streaming.cancel.is_some());
+        assert_eq!(pulls.len(), 1);
+
+        cancel_outstream(&mut outstreams, 3);
+        let (sid, _, result) =
+            tokio::time::timeout(std::time::Duration::from_millis(100), pulls.next())
+                .await
+                .expect("a reset cancels the in-flight pull")
+                .expect("pull result");
+        assert_eq!(sid, 3);
+        assert!(result.is_none());
     }
 }

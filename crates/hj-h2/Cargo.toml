@@ -40,7 +40,9 @@ rustc-hash = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "io-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "io-util", "time", "test-util"] }
+# Cross-thread wakeups for the monoio-path tests (httpjet enables this too).
+monoio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

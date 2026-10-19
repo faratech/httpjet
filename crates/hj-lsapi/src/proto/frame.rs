@@ -183,16 +183,6 @@ pub fn parse_resp_header(mut body: &[u8], little_endian: bool) -> std::io::Resul
         *b = &b[4..];
         v
     };
-    let rd_u16 = |b: &mut &[u8]| -> u16 {
-        let v = if little_endian {
-            u16::from_le_bytes([b[0], b[1]])
-        } else {
-            u16::from_be_bytes([b[0], b[1]])
-        };
-        *b = &b[2..];
-        v
-    };
-
     let cnt = rd_i32(&mut body);
     let status = rd_i32(&mut body);
     if !(0..=4096).contains(&cnt) {
@@ -203,16 +193,18 @@ pub fn parse_resp_header(mut body: &[u8], little_endian: bool) -> std::io::Resul
         return Err(bad("implausible status"));
     }
 
-    if body.len() < cnt * 2 {
+    let Some((lens, mut body)) = body.split_at_checked(cnt * 2) else {
         return Err(bad("truncated length array"));
-    }
-    let mut lens = Vec::with_capacity(cnt);
-    for _ in 0..cnt {
-        lens.push(rd_u16(&mut body) as usize);
-    }
+    };
+    let (lens, _) = lens.as_chunks::<2>();
 
     let mut headers = Vec::with_capacity(cnt);
-    for len in lens {
+    for &len in lens {
+        let len = usize::from(if little_endian {
+            u16::from_le_bytes(len)
+        } else {
+            u16::from_be_bytes(len)
+        });
         if body.len() < len {
             return Err(bad("truncated header strings"));
         }
@@ -223,22 +215,27 @@ pub fn parse_resp_header(mut body: &[u8], little_endian: bool) -> std::io::Resul
             Some(0) => &line[..line.len() - 1],
             _ => line,
         };
-        let Ok(line) = std::str::from_utf8(line) else {
-            continue;
-        };
-        let (name, value) = match line.split_once(':') {
-            Some((name, value)) => (name.trim(), value.trim()),
+        // Byte-level split: obs-text (0x80-0xFF) is legal in a value and LSWS passes it
+        // raw, so a Latin-1 Location must not drop the header (#895).
+        let (name, value) = match line.iter().position(|&b| b == b':') {
+            Some(i) => {
+                let (name, value) = line.split_at(i);
+                (
+                    name.trim_ascii(),
+                    value.get(1..).unwrap_or_default().trim_ascii(),
+                )
+            }
             None => {
                 // tolerate a bare line by treating it as a header with empty value
-                if line.trim().is_empty() {
+                if line.trim_ascii().is_empty() {
                     continue;
                 }
-                (line.trim(), "")
+                (line.trim_ascii(), &b""[..])
             }
         };
         if let (Ok(hn), Ok(hv)) = (
-            http::header::HeaderName::from_bytes(name.as_bytes()),
-            http::header::HeaderValue::from_str(value),
+            http::header::HeaderName::from_bytes(name),
+            http::header::HeaderValue::from_bytes(value),
         ) {
             headers.push((hn, hv));
         }
@@ -375,6 +372,66 @@ mod tests {
         assert_eq!(parsed.headers[0].1, "text/html; charset=UTF-8");
         assert_eq!(parsed.headers[1].0.as_str(), "x-powered-by");
         assert_eq!(parsed.headers[1].1, "PHP/8");
+    }
+
+    // (#990) The length table is read in place: both byte orders, and a table or
+    // string area cut short, behave as before.
+    #[test]
+    fn resp_header_reads_the_length_table_in_place() {
+        let lines: [&str; 3] = ["Set-Cookie: a=1", "Set-Cookie: b=2", "X-LiteSpeed-Tag: T1"];
+        let mut be = BytesMut::new();
+        be.put_i32(lines.len() as i32);
+        be.put_i32(200);
+        for l in &lines {
+            be.put_u16((l.len() + 1) as u16);
+        }
+        for l in &lines {
+            be.extend_from_slice(l.as_bytes());
+            be.put_u8(0);
+        }
+        let parsed = parse_resp_header(&be, false).unwrap();
+        let seen: Vec<_> = parsed
+            .headers
+            .iter()
+            .map(|(n, v)| (n.as_str(), v.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("set-cookie", "a=1"),
+                ("set-cookie", "b=2"),
+                ("x-litespeed-tag", "T1")
+            ]
+        );
+
+        let table_end = 8 + lines.len() * 2;
+        let err = parse_resp_header(&be[..table_end - 1], false).unwrap_err();
+        assert!(err.to_string().contains("truncated length array"), "{err}");
+        let err = parse_resp_header(&be[..be.len() - 1], false).unwrap_err();
+        assert!(
+            err.to_string().contains("truncated header strings"),
+            "{err}"
+        );
+    }
+
+    /// Regression (#895): an obs-text byte in a value keeps the header.
+    #[test]
+    fn resp_header_keeps_obs_text_values() {
+        let lines: [&[u8]; 2] = [b"Location: /caf\xe9.php", b"X-After: yes"];
+        let mut body = BytesMut::new();
+        body.put_i32_le(lines.len() as i32);
+        body.put_i32_le(302);
+        for l in &lines {
+            body.put_u16_le((l.len() + 1) as u16);
+        }
+        for l in &lines {
+            body.extend_from_slice(l);
+            body.put_u8(0);
+        }
+        let parsed = parse_resp_header(&body, true).unwrap();
+        assert_eq!(parsed.headers.len(), 2);
+        assert_eq!(parsed.headers[0].0.as_str(), "location");
+        assert_eq!(parsed.headers[0].1.as_bytes(), b"/caf\xe9.php");
     }
 
     #[test]
