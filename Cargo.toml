@@ -19,10 +19,10 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.0.18"
+version = "0.1.0"
 edition = "2024"
 publish = false
-rust-version = "1.99"
+rust-version = "1.99.1"
 license = "GPL-3.0-only"
 repository = "https://github.com/faratech/httpjet"
 homepage = "https://github.com/faratech/httpjet"

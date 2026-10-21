@@ -21,10 +21,10 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Install Rust 1.99
+      - name: Install Rust 1.99.1
         run: |
-          rustup toolchain install 1.99.0 --profile minimal
-          rustup default 1.99.0
+          rustup toolchain install 1.99.1 --profile minimal
+          rustup default 1.99.1
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --version 0.22.2 --locked
