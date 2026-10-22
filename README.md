@@ -1,19 +1,52 @@
 # httpjet
 
-httpjet is an experimental Linux web server written in Rust. It reads
-LiteSpeed-compatible XML, speaks LSAPI to `lsphp`, and supports H1/H2/H3, TLS,
+An experimental Linux web server written in Rust: it reads LiteSpeed-compatible
+XML, speaks LSAPI to `lsphp`, and serves HTTP/1.1, HTTP/2, and HTTP/3 with TLS,
 static files, proxying, rewrites, compression, and an opt-in page cache.
 
-It is early-stage software built around one production configuration. Test on
-alternate ports before using it elsewhere.
+> **Production note.** httpjet is early-stage software built around one
+> production configuration. It powers
+> [WindowsForum.com](https://windowsforum.com) in production. Test on alternate
+> ports before using it elsewhere. Learn more — or at least enjoy the
+> animation — at [httpjet.net](https://httpjet.net).
 
-httpjet powers [WindowsForum.com](https://windowsforum.com) in production.
-Learn more—or at least enjoy the animation—at
-[httpjet.net](https://httpjet.net).
+## Contents
+
+- [Features at a glance](#features-at-a-glance)
+- [Build and try it](#build-and-try-it)
+- [Configuration](#configuration)
+- [Capability limits](#capability-limits)
+- [Operations](#operations)
+- [Development](#development)
+- [Security and contributing](#security-and-contributing)
+- [License](#license)
+
+## Features at a glance
+
+Verified against the crate layout and the `httpjet` binary's argument
+definitions in `crates/httpjet/src/main.rs`:
+
+| Area | What is implemented |
+|---|---|
+| Protocols | HTTP/1.1, native HTTP/2, HTTP/3 (QUIC), TLS/mTLS |
+| PHP | LSAPI to `lsphp`, with an optional standalone supervised pool (`httpjet lsphp`, `httpjet lsphp-reload`) |
+| Content | Static files, reverse proxy with WebSocket and SSE forwarding |
+| Rewrites | Apache `mod_rewrite` / `.htaccess` subset, including a limited `mod_headers` subset |
+| Compression | Response zstd, Brotli, and gzip; gzip request decompression by default, Brotli/zstd opt-in via `--request-decompression-extra` |
+| Caching | Opt-in LSCache-equivalent full-page cache (`--page-cache`, off by default); short-TTL origin (microcache) caching |
+| Access control | LiteSpeed-compatible IP allow/deny, plus GeoIP/ASN sources loaded offline |
+| Operations | Loopback Prometheus metrics (`--metrics-addr`, default `127.0.0.1:9090`), optional loopback admin and WAF-sidecar endpoints, access/error logging |
+
+The `httpjet` binary is under `crates/httpjet`; reusable components are the
+`hj-*` crates (`hj-config`, `hj-lsapi`, `hj-h2`, `hj-pagecache`, `hj-proxy`,
+`hj-rewrite`, `hj-tls`, and others). Optional Cargo features are off by
+default: `acme`, `ocsp`, `otel`, `profiling`, `allocount`, and the staged
+`ktls`.
 
 ## Build and try it
 
-Requires Linux with io_uring and Rust 1.98+.
+Requires Linux with io_uring and Rust 1.99.1 or newer (the workspace
+`rust-version`).
 
 ```bash
 git clone https://github.com/faratech/httpjet.git
@@ -25,46 +58,68 @@ target/release/httpjet --root "$PWD/examples/litespeed" serve \
 curl -H 'Host: example.test' http://127.0.0.1:8080/
 ```
 
-Use `--root` with an existing LiteSpeed configuration tree. Run
+Use `--root` with an existing LiteSpeed configuration tree (default
+`/usr/local/lsws`). With no subcommand, `httpjet` runs `check`. Run
 `httpjet serve --help` for runtime options.
 
-Before adopting it, review the current [capability matrix and operational
-limits](docs/capability-matrix.md), [configuration
-examples](docs/configuration-examples.md), and [LiteSpeed migration
-guide](docs/migrating-from-litespeed.md). Compatibility is limited to the
-implemented/tested directive and protocol surface; `check --strict` warnings
-must be reviewed rather than treated as parity.
+## Configuration
 
-Optional Brotli/zstd uploads use the bounded, transport-independent
-[request decompression policy](docs/request-decompression.md); gzip retains its
-existing default behavior.
+httpjet reads a LiteSpeed configuration tree: `conf/httpd_config.xml` under
+the server root, plus one XML file per virtual host. Start from the bundled,
+synthetic quick-start fixture:
 
-Short-TTL origin caching is supported today. The missing reusable route-policy
-controls and their isolated executable proof are documented in the
-[microcache policy requirements](docs/microcache-policy.md).
+- [`examples/litespeed/conf/httpd_config.xml`](examples/litespeed/conf/httpd_config.xml) — server, tuning, listener, and vhost map
+- [`examples/litespeed/conf/vhosts/example.test.xml`](examples/litespeed/conf/vhosts/example.test.xml) — per-vhost document root and rewrite settings
+- [`examples/litespeed/example/public/index.html`](examples/litespeed/example/public/index.html) — the page the quick start serves
 
-`.htaccess` response-header operations are intentionally a subset of Apache
-`mod_headers`; the exact supported and ignored forms are pinned in the
-[header-directive compatibility inventory](docs/header-directive-compatibility.md).
+Validate any tree before serving it:
 
-A hardened, non-root [OCI example](packaging/oci/README.md) documents the
-required writable mounts, separate TCP/UDP publication for HTTP/3, io_uring
-runtime requirements, and its non-privileged smoke gate. It is an adoption
-example, not the production deployment model.
+```bash
+target/release/httpjet --root /path/to/litespeed check --strict
+```
 
-Optional certificate automation is available in the private development branch
-with `--features acme` and explicit runtime opt-in. See
-[HTTP-01](docs/acme-http01.md) and [DNS-01/wildcard configuration](docs/acme-dns01.md); it is disabled by
-default and does not replace existing certbot configuration automatically.
+Treat `check --strict` warnings as review items, not as proof of LiteSpeed
+parity (see [Capability limits](#capability-limits)).
 
-Optional [OCSP stapling](docs/ocsp-stapling.md) uses `--features ocsp` and an
-explicit responder URL. It is for compatible certificate authorities, not
-current Let's Encrypt certificates (whose issuer retired OCSP).
+## Capability limits
+
+Compatibility covers only the implemented and tested directive and protocol
+surface:
+
+- LiteSpeed XML is the configuration format; directives outside the
+  implemented subset do not behave as they would under LiteSpeed.
+- `.htaccess` response-header operations are intentionally a subset of
+  Apache `mod_headers`; unsupported forms are ignored rather than emulated.
+- Request decompression is bounded: gzip keeps its existing default
+  behavior, while Brotli and zstd uploads are opt-in
+  (`--request-decompression-extra`) under a transport-independent policy.
+- Short-TTL origin caching works today; reusable route-policy controls for
+  microcache are not yet exposed.
+- The page cache is opt-in and additionally gated per vhost and per
+  response; it is inert unless enabled.
+- FastCGI primitives exist (`hj-fastcgi`) but are deliberately not wired
+  into request routing yet.
+
+## Operations
+
+- **OCI / containers:** a hardened, non-root
+  [OCI example](packaging/oci/README.md) documents the required writable
+  mounts, separate TCP/UDP publication for HTTP/3, io_uring runtime
+  requirements, and its non-privileged smoke gate. It is an adoption
+  example, not the production deployment model.
+- **systemd:** unit examples and install steps are in
+  [`packaging/systemd/README.md`](packaging/systemd/README.md).
+- **ACME (optional):** certificate automation is available with
+  `--features acme` and explicit runtime opt-in (HTTP-01 and
+  DNS-01/wildcard). It is disabled by default and does not replace
+  existing certbot configuration automatically.
+- **OCSP stapling (optional):** available with `--features ocsp` and an
+  explicit responder URL. It is for compatible certificate authorities,
+  not current Let's Encrypt certificates (whose issuer retired OCSP).
+- **Fuzzing:** targets and the continuous corpus checks are described in
+  [`fuzz/README.md`](fuzz/README.md).
 
 ## Development
-
-The `httpjet` binary is under `crates/httpjet`; reusable components are the
-`hj-*` crates.
 
 ```bash
 cargo fmt --all --check
@@ -72,11 +127,17 @@ cargo check -p httpjet --bin httpjet
 cargo test --workspace
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and
+## Security and contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) (focused changes, regression tests,
+signed commits), [SECURITY.md](SECURITY.md) (private vulnerability
+reporting and the production trust boundary), and
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Donations support maintenance only; they do not buy features or influence.
 Funding links will appear in GitHub's Sponsor button when enabled.
 
-httpjet is [GPL-3.0-only](LICENSE), with no paid edition or license key. It is
-independent of and not endorsed by LiteSpeed Technologies.
+## License
+
+httpjet is [GPL-3.0-only](LICENSE), with no paid edition or license key. It
+is independent of and not endorsed by LiteSpeed Technologies.
