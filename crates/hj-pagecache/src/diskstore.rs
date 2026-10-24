@@ -922,7 +922,11 @@ impl DiskStore {
             // another principal truncating a mapped container would raise SIGBUS
             // on the next access. Keep the root unwritable to anything else (the
             // lsphp sandbox runbook isolates /dev/shm/jetcache from PHP workers).
-            let map = unsafe { memmap2::Mmap::map(&f) }?;
+            //
+            // Populated at map time: every reader (the egress copy, an encoder, the
+            // hot tier) walks the whole body, so mapping it up front replaces one
+            // fault per touched fault-around window with a single kernel pass.
+            let map = unsafe { memmap2::MmapOptions::new().populate().map(&f) }?;
             let start = body_start as usize;
             return Ok(Bytes::from_owner(map).slice(start..start + body_len as usize));
         }

@@ -52,7 +52,6 @@ pub mod expires;
 mod stream;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use http::StatusCode;
 use http::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
@@ -65,7 +64,7 @@ use hj_core::{Body, ReqCtx, Response, ResponseTransform};
 pub use dict::{DEFAULT_DICT_LEVEL, PageDict, PageDictRegistry};
 pub use encoding::{
     AcceptEncoding, DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, decode_bytes,
-    decode_bytes_bounded, encode_bytes, negotiate_with,
+    decode_bytes_bounded, decode_bytes_sized, encode_bytes, encode_bytes_transient, negotiate_with,
 };
 pub use expires::{ExpiresBase, ExpiresHeaders, ExpiresRule, ExpiresRules};
 pub(crate) use stream::CompressStream;
@@ -459,8 +458,11 @@ impl Compress {
         let body = std::mem::replace(resp.body_mut(), Body::Empty);
 
         let new_body = match body {
-            Body::Full(b) => match encode_bytes(enc, &b, &levels) {
-                Some(c) => Body::Full(Bytes::from(c)),
+            Body::Full(b) => match encode_bytes_transient(enc, &b, &levels) {
+                Some(c) => {
+                    resp.extensions_mut().insert(hj_core::FreshBody::of(&c));
+                    Body::Full(c)
+                }
                 None => {
                     *resp.body_mut() = Body::Full(b);
                     return;
@@ -482,8 +484,11 @@ impl Compress {
             }
             Body::File(f) => match &f.cached {
                 // Only reached when cached bytes exist (see should_compress).
-                Some(bytes) => match encode_bytes(enc, bytes.as_ref(), &levels) {
-                    Some(c) => Body::Full(Bytes::from(c)),
+                Some(bytes) => match encode_bytes_transient(enc, bytes.as_ref(), &levels) {
+                    Some(c) => {
+                        resp.extensions_mut().insert(hj_core::FreshBody::of(&c));
+                        Body::Full(c)
+                    }
                     None => {
                         *resp.body_mut() = Body::File(f);
                         return;
@@ -850,6 +855,7 @@ impl CompressibleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -1039,6 +1045,18 @@ mod tests {
         let r = resp_with("text/html", b"x".repeat(1000));
         // Full (already-buffered) bodies still compress.
         assert_eq!(c.should_compress(&r, "gzip"), Some(Encoding::Gzip));
+    }
+
+    #[test]
+    fn a_compressed_full_body_is_marked_fresh_for_the_bridge() {
+        let c = Compress::new();
+        let mut r = resp_with("text/html", b"hello ".repeat(5000));
+        c.apply(&mut r, Encoding::Zstd);
+        let Body::Full(body) = r.body() else {
+            panic!("a Full body stays Full");
+        };
+        let mark = r.extensions().get::<hj_core::FreshBody>().expect("marked");
+        assert!(mark.names(body), "the mark names the encoded bytes");
     }
 
     #[test]

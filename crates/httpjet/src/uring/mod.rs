@@ -1092,6 +1092,10 @@ pub(crate) fn spawn_uring_https(
     Ok(group)
 }
 
+/// rustls's largest outbound record allocation: a 16 KiB fragment plus the 5-byte
+/// header, content type and 16-byte AEAD tag.
+const TLS_RECORD_ALLOC: usize = 16 * 1024 + 5 + 1 + 16;
+
 fn per_core_https(
     core_idx: usize,
     std_listener: std::net::TcpListener,
@@ -1107,6 +1111,7 @@ fn per_core_https(
     binding: ListenerBinding,
     accept_stopped: worker_group::AcceptRetirement,
 ) {
+    let _record_classes = crate::memtrim::pin_size_classes(1024, TLS_RECORD_ALLOC);
     let mut rt = match build_core_runtime() {
         Ok(runtime) => runtime,
         Err(error) => {

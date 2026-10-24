@@ -6,6 +6,8 @@
 //! priority list that the client also accepts (q>0), honoring per-coding
 //! q-values, the `*` wildcard, and explicit `q=0` refusals.
 
+use bytes::Bytes;
+
 /// A response content-coding this crate can produce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
@@ -212,6 +214,38 @@ pub fn encode_bytes(enc: Encoding, input: &[u8], levels: &Levels) -> Option<Vec<
     }
 }
 
+/// [`encode_bytes`] for a body that is sent and dropped (an egress response): the
+/// codec writes straight into a pooled buffer that returns to the pool once the
+/// response is written, instead of into a scratch copied out to a fresh exact-size
+/// allocation per response. Anything that keeps the result (a cache entry, a
+/// memoized response) must copy it out or use [`encode_bytes`].
+pub fn encode_bytes_transient(enc: Encoding, input: &[u8], levels: &Levels) -> Option<Bytes> {
+    let pool = &hj_core::BODY_BUFS;
+    let out = match enc {
+        Encoding::Gzip => {
+            let mut out = pool.take_buf(gzip_bound(input.len()), hj_core::BODY_BUF_CAP);
+            gzip_into(input, levels.gzip, &mut out);
+            out
+        }
+        Encoding::Zstd => {
+            let bound = zstd::zstd_safe::compress_bound(input.len());
+            let mut out = pool.take_buf(bound, hj_core::BODY_BUF_CAP);
+            if zstd_into(input, levels.zstd, &mut out).is_none() {
+                pool.give_buf(out, hj_core::BODY_BUF_CAP);
+                return None;
+            }
+            out
+        }
+        Encoding::Brotli => brotli_into(
+            input,
+            levels.brotli_q,
+            levels.brotli_lgwin,
+            pool.take_buf(input.len() / 2 + 64, hj_core::BODY_BUF_CAP),
+        ),
+    };
+    Some(pool.freeze(out, hj_core::BODY_BUF_CAP))
+}
+
 /// Maximum bytes [`decode_bytes`] will expand a compressed body to.
 ///
 /// Set well above a realistic max cacheable object so normal content never
@@ -234,11 +268,23 @@ pub fn decode_bytes(enc: Encoding, input: &[u8]) -> Option<Vec<u8>> {
 /// identity body exactly at the caller's already-enforced object cap is valid,
 /// while one byte more is rejected without materializing the remaining stream.
 pub fn decode_bytes_bounded(enc: Encoding, input: &[u8], max: u64) -> Option<Vec<u8>> {
+    decode_bytes_sized(enc, input, max, input.len().saturating_mul(3).max(64))
+}
+
+/// [`decode_bytes_bounded`] for an output whose length is already known (`expected`):
+/// the buffer is sized once instead of growing by doubling from a guess, which on a
+/// large body faulted in and copied several intermediate buffers. A wrong `expected`
+/// only costs growth; the bound is still `max`.
+pub fn decode_bytes_sized(
+    enc: Encoding,
+    input: &[u8],
+    max: u64,
+    expected: usize,
+) -> Option<Vec<u8>> {
     use std::io::Read;
     let cap = usize::try_from(max).unwrap_or(usize::MAX);
     let read_cap = cap.saturating_add(1);
-    let initial = input.len().saturating_mul(3).max(64).min(cap);
-    let mut out = Vec::with_capacity(initial);
+    let mut out = Vec::with_capacity(expected.min(cap));
     match enc {
         Encoding::Gzip => {
             let mut decoder = flate2::read::GzDecoder::new(input).take(read_cap as u64);
@@ -275,11 +321,15 @@ pub fn decode_bytes_bounded(enc: Encoding, input: &[u8], max: u64) -> Option<Vec
     }
 }
 
+fn gzip_bound(input_len: usize) -> usize {
+    input_len + input_len / 8 + 286
+}
+
 /// Compress a buffer with gzip at the given compression level, returning the
 /// gzip stream. Thin wrapper over `flate2` used by the buffered (`Body::Full`)
 /// path and tests.
 pub(crate) fn gzip_bytes_level(input: &[u8], level: u32) -> Vec<u8> {
-    let bound = input.len() + input.len() / 8 + 286;
+    let bound = gzip_bound(input.len());
     exact_output(bound, |out| {
         gzip_into(input, level, out);
         Some(())
@@ -406,6 +456,14 @@ pub(crate) fn zstd_window_log(level: i32) -> Option<u32> {
 /// compression context (see [`ZSTD_CCTX`]) instead of allocating one per call.
 /// Returns `None` if the compressor fails (allocation only, in practice).
 pub(crate) fn zstd_bytes_level(input: &[u8], level: i32) -> Option<Vec<u8>> {
+    exact_output(zstd::zstd_safe::compress_bound(input.len()), |out| {
+        zstd_into(input, level, out)
+    })
+}
+
+/// Append the zstd frame of `input` to `out`, which must have room for
+/// `compress_bound(input.len())` more bytes.
+fn zstd_into(input: &[u8], level: i32, out: &mut Vec<u8>) -> Option<()> {
     ZSTD_CCTX.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
@@ -420,9 +478,7 @@ pub(crate) fn zstd_bytes_level(input: &[u8], level: i32) -> Option<Vec<u8>> {
                 .ok()?;
             *capped = window.is_some();
         }
-        exact_output(zstd::zstd_safe::compress_bound(input.len()), |out| {
-            comp.compress_to_buffer(input, out).ok().map(drop)
-        })
+        comp.compress_to_buffer(input, out).ok().map(drop)
     })
 }
 
@@ -430,15 +486,19 @@ pub(crate) fn zstd_bytes_level(input: &[u8], level: i32) -> Option<Vec<u8>> {
 /// `CompressorWriter::into_inner` performs the brotli FINISH operation, so the
 /// returned buffer is a complete, self-contained brotli stream.
 pub(crate) fn brotli_bytes(input: &[u8], quality: u32, lgwin: u32) -> Vec<u8> {
+    brotli_into(
+        input,
+        quality,
+        lgwin,
+        Vec::with_capacity(input.len() / 2 + 64),
+    )
+}
+
+fn brotli_into(input: &[u8], quality: u32, lgwin: u32, out: Vec<u8>) -> Vec<u8> {
     use brotli::CompressorWriter;
     use std::io::Write;
 
-    let mut w = CompressorWriter::new(
-        Vec::with_capacity(input.len() / 2 + 64),
-        4096,
-        quality,
-        lgwin,
-    );
+    let mut w = CompressorWriter::new(out, 4096, quality, lgwin);
     // Writing to a Vec sink is infallible.
     let _ = w.write_all(input);
     w.into_inner()
@@ -449,6 +509,42 @@ mod tests {
     use super::*;
     use flate2::read::GzDecoder;
     use std::io::Read;
+
+    #[test]
+    fn transient_encodes_round_trip_and_return_their_buffer() {
+        let input = b"<li>transient egress body</li>".repeat(3000);
+        for enc in [Encoding::Zstd, Encoding::Gzip, Encoding::Brotli] {
+            let out = encode_bytes_transient(enc, &input, &Levels::default()).unwrap();
+            assert_eq!(decode_bytes(enc, &out).unwrap(), input, "{enc:?}");
+            assert_eq!(
+                out,
+                encode_bytes(enc, &input, &Levels::default()).unwrap(),
+                "{enc:?}"
+            );
+            let addr = out.as_ptr() as usize;
+            drop(out);
+            let again = hj_core::BODY_BUFS.take_buf(16, hj_core::BODY_BUF_CAP);
+            assert_eq!(
+                again.as_ptr() as usize,
+                addr,
+                "{enc:?} buffer was not pooled"
+            );
+            hj_core::BODY_BUFS.give_buf(again, hj_core::BODY_BUF_CAP);
+        }
+    }
+
+    #[test]
+    fn a_sized_decode_allocates_its_known_length_once() {
+        let identity = b"<p>known length</p>".repeat(20_000);
+        let z = zstd_bytes_level(&identity, 3).unwrap();
+        let out = decode_bytes_sized(Encoding::Zstd, &z, MAX_DECODE, identity.len()).unwrap();
+        assert_eq!(out, identity);
+        assert_eq!(out.capacity(), identity.len());
+        // A wrong guess only changes the growth; the bound is still enforced.
+        let small = decode_bytes_sized(Encoding::Zstd, &z, MAX_DECODE, 16).unwrap();
+        assert_eq!(small, identity);
+        assert!(decode_bytes_sized(Encoding::Zstd, &z, 1000, identity.len()).is_none());
+    }
 
     #[test]
     fn compressed_output_is_exact_sized() {

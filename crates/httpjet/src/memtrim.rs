@@ -129,6 +129,26 @@ pub fn collect_after_connection_close() {
     );
 }
 
+/// Hold one block of every allocator size class in `min..=max` on the calling
+/// thread for as long as the returned value lives. Prod purges a page as soon as
+/// its last block is freed (`MIMALLOC_PURGE_DELAY=0`), so a size class used only
+/// briefly per request re-faulted its page every time: rustls allocates each
+/// outbound TLS record afresh, sized by that record, so the last record of every
+/// response lands in a different class. A held block keeps each class's page in
+/// use, and the blocks freed back to it stay resident.
+pub fn pin_size_classes(min: usize, max: usize) -> Vec<Vec<u8>> {
+    let mut pins = Vec::new();
+    let mut size = min.max(1);
+    while size <= max {
+        pins.push(Vec::<u8>::with_capacity(size));
+        // SAFETY: `mi_good_size` only computes the block size mimalloc would use for
+        // `size`; it reads and writes no memory.
+        let block = unsafe { libmimalloc_sys::mi_good_size(size) };
+        size = block.max(size) + 1;
+    }
+    pins
+}
+
 /// Force a full mimalloc reclaim on the current thread.
 pub fn force_collect() {
     // SAFETY: `mi_collect` is mimalloc's documented, thread-safe public entry point.

@@ -41,6 +41,31 @@ use crate::encoding::{Encoding, Levels, zstd_window_log};
 /// (ratio) and the worst-case latency added while a slow upstream fills the
 /// buffer; the terminal `finish()` always flushes whatever remains.
 const FLUSH_THRESHOLD: usize = 32 * 1024;
+
+thread_local! {
+    static STREAM_OUT_LOCAL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Encoder sinks and input batches. Every streamed response used to grow fresh
+/// ones per block; pooled, they stay resident and each emitted block returns its
+/// buffer once the client side has written it.
+static STREAM_OUT: hj_core::TieredPool<Vec<u8>> =
+    hj_core::TieredPool::new(&STREAM_OUT_LOCAL, 8, 32);
+
+/// Largest pooled sink or batch buffer; a block that grew past it frees it.
+const STREAM_OUT_KEEP: usize = 64 * 1024;
+
+/// Initial room for the next encoder sink (compressed output of one batch).
+const SINK_ROOM: usize = 16 * 1024;
+
+fn next_sink(input_len: usize) -> Vec<u8> {
+    STREAM_OUT.take_buf(input_len.min(SINK_ROOM), SINK_ROOM)
+}
+
+fn block_bytes(buf: Vec<u8>) -> Bytes {
+    STREAM_OUT.freeze(buf, STREAM_OUT_KEEP)
+}
 /// Always-ready empty DATA frames make no compression or wire progress. Return
 /// `Pending` after this many so a faulty producer cannot monopolize one runtime
 /// thread inside a single [`Body::poll_frame`] call.
@@ -63,12 +88,7 @@ impl BlockEncoder for GzipEnc {
     fn write_block(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
         self.0.write_all(buf)?;
         self.0.flush()?;
-        let out = std::mem::take(self.0.get_mut());
-        // `take` left the encoder's sink at zero capacity; pre-grow it so the NEXT
-        // streamed frame doesn't reallocate from scratch (each PHP DATA frame would
-        // otherwise force a fresh Vec). Capped at 16 KiB to bound over-allocation.
-        self.0.get_mut().reserve(buf.len().min(16 * 1024));
-        Ok(out)
+        Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
     }
     fn finish(self: Box<Self>) -> io::Result<Vec<u8>> {
         let GzipEnc(enc) = *self;
@@ -132,12 +152,7 @@ impl BlockEncoder for ZstdEnc {
             .expect("zstd stream writer is present until finish");
         w.write_all(buf)?;
         w.flush()?;
-        let out = std::mem::take(w.writer_mut());
-        // `take` left the encoder's sink at zero capacity; pre-grow it so the NEXT
-        // streamed frame doesn't reallocate from scratch (each PHP DATA frame would
-        // otherwise force a fresh Vec). Capped at 16 KiB to bound over-allocation.
-        w.writer_mut().reserve(buf.len().min(16 * 1024));
-        Ok(out)
+        Ok(std::mem::replace(w.writer_mut(), next_sink(buf.len())))
     }
     fn finish(mut self: Box<Self>) -> io::Result<Vec<u8>> {
         let mut w = self
@@ -156,12 +171,7 @@ impl BlockEncoder for BrotliEnc {
     fn write_block(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
         self.0.write_all(buf)?;
         self.0.flush()?;
-        let out = std::mem::take(self.0.get_mut());
-        // `take` left the encoder's sink at zero capacity; pre-grow it so the NEXT
-        // streamed frame doesn't reallocate from scratch (each PHP DATA frame would
-        // otherwise force a fresh Vec). Capped at 16 KiB to bound over-allocation.
-        self.0.get_mut().reserve(buf.len().min(16 * 1024));
-        Ok(out)
+        Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
     }
     fn finish(self: Box<Self>) -> io::Result<Vec<u8>> {
         // `into_inner` performs the brotli FINISH operation before returning.
@@ -206,19 +216,19 @@ impl CompressStream {
     pub fn new(inner: StreamBody, enc: Encoding, levels: &Levels) -> Self {
         let encoder: Box<dyn BlockEncoder> = match enc {
             Encoding::Gzip => Box::new(GzipEnc(GzEncoder::new(
-                Vec::new(),
+                next_sink(SINK_ROOM),
                 Compression::new(levels.gzip),
             ))),
             Encoding::Zstd => Box::new(ZstdEnc {
                 writer: Some(ZioWriter::new(
-                    Vec::new(),
+                    next_sink(SINK_ROOM),
                     take_zstd_stream_encoder(levels.zstd)
                         .expect("zstd encoder init is infallible for a valid level"),
                 )),
                 level: levels.zstd,
             }),
             Encoding::Brotli => Box::new(BrotliEnc(BrotliCompressor::new(
-                Vec::new(),
+                next_sink(SINK_ROOM),
                 4096,
                 levels.brotli_q,
                 levels.brotli_lgwin,
@@ -227,7 +237,7 @@ impl CompressStream {
         CompressStream {
             inner,
             state: EncState::Active(encoder),
-            pending_in: Vec::new(),
+            pending_in: STREAM_OUT.take_buf(FLUSH_THRESHOLD, FLUSH_THRESHOLD),
             flush_first_when_idle: false,
             flush_when_idle: false,
             skipped_empty_frames: 0,
@@ -253,6 +263,12 @@ impl CompressStream {
     /// Box this into the workspace [`StreamBody`] type.
     pub fn boxed_stream(self) -> StreamBody {
         BodyExt::boxed(self)
+    }
+}
+
+impl Drop for CompressStream {
+    fn drop(&mut self) {
+        STREAM_OUT.give_buf(std::mem::take(&mut self.pending_in), STREAM_OUT_KEEP);
     }
 }
 
@@ -285,7 +301,7 @@ impl Body for CompressStream {
                             // The upstream registered the waker, so an empty write can wait.
                             return match written {
                                 Ok(buf) if buf.is_empty() => Poll::Pending,
-                                Ok(buf) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(buf))))),
+                                Ok(buf) => Poll::Ready(Some(Ok(Frame::data(block_bytes(buf))))),
                                 Err(e) => Poll::Ready(Some(Err(Box::new(e) as BoxError))),
                             };
                         }
@@ -309,16 +325,16 @@ impl Body for CompressStream {
                                     // finish; concatenate both outputs into the single terminal
                                     // chunk ([final block][epilogue]) before the trailers.
                                     let pending = std::mem::take(&mut self.pending_in);
-                                    let mut out = if pending.is_empty() {
-                                        Vec::new()
+                                    let written = if pending.is_empty() {
+                                        Ok(Vec::new())
                                     } else {
-                                        match enc.write_block(&pending) {
-                                            Ok(b) => b,
-                                            Err(e) => {
-                                                return Poll::Ready(Some(Err(
-                                                    Box::new(e) as BoxError
-                                                )));
-                                            }
+                                        enc.write_block(&pending)
+                                    };
+                                    STREAM_OUT.give_buf(pending, STREAM_OUT_KEEP);
+                                    let mut out = match written {
+                                        Ok(b) => b,
+                                        Err(e) => {
+                                            return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
                                         }
                                     };
                                     match enc.finish() {
@@ -330,7 +346,7 @@ impl Body for CompressStream {
                                             }
                                             self.state = EncState::PendingTrailers(non_data);
                                             return Poll::Ready(Some(Ok(Frame::data(
-                                                Bytes::from(out),
+                                                block_bytes(out),
                                             ))));
                                         }
                                         Err(e) => {
@@ -368,7 +384,7 @@ impl Body for CompressStream {
                             match written {
                                 Ok(buf) if buf.is_empty() => continue, // encoder buffering
                                 Ok(buf) => {
-                                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from(buf)))));
+                                    return Poll::Ready(Some(Ok(Frame::data(block_bytes(buf)))));
                                 }
                                 Err(e) => return Poll::Ready(Some(Err(Box::new(e) as BoxError))),
                             }
@@ -380,14 +396,16 @@ impl Body for CompressStream {
                                 std::mem::replace(&mut self.state, EncState::Done)
                             {
                                 let pending = std::mem::take(&mut self.pending_in);
-                                let mut out = if pending.is_empty() {
-                                    Vec::new()
+                                let written = if pending.is_empty() {
+                                    Ok(Vec::new())
                                 } else {
-                                    match enc.write_block(&pending) {
-                                        Ok(b) => b,
-                                        Err(e) => {
-                                            return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
-                                        }
+                                    enc.write_block(&pending)
+                                };
+                                STREAM_OUT.give_buf(pending, STREAM_OUT_KEEP);
+                                let mut out = match written {
+                                    Ok(b) => b,
+                                    Err(e) => {
+                                        return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
                                     }
                                 };
                                 match enc.finish() {
@@ -396,7 +414,7 @@ impl Body for CompressStream {
                                         if out.is_empty() {
                                             return Poll::Ready(None);
                                         }
-                                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from(
+                                        return Poll::Ready(Some(Ok(Frame::data(block_bytes(
                                             out,
                                         )))));
                                     }

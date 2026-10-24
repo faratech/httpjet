@@ -737,13 +737,19 @@ async fn forward_response_with_budget(
         Body::Empty => {
             let _ = resp.send(full_resp(parts, Bytes::new(), bw_rate));
         }
-        Body::Full(b) => send_full(parts, b, resp, bw_rate, body_budget).await,
+        Body::Full(b) => {
+            let fresh = parts
+                .extensions
+                .get::<hj_core::FreshBody>()
+                .is_some_and(|mark| mark.names(&b));
+            send_full(parts, b, fresh, resp, bw_rate, body_budget).await
+        }
         Body::File(f) if f.cached.is_some() => {
             // `cached` holds the WHOLE file; apply the range (single-sourced, bounds-clamped) so a
             // 206 served here matches the native-H2 path — previously this emitted the whole file
             // under a partial Content-Range.
             let body = f.cached_ranged().unwrap_or_default();
-            send_full(parts, body, resp, bw_rate, body_budget).await;
+            send_full(parts, body, false, resp, bw_rate, body_budget).await;
         }
         Body::File(f) if direct_file => {
             let status = parts.status;
@@ -837,16 +843,18 @@ fn leased_bytes(data: Bytes, lease: ResponseLease) -> Bytes {
 /// as the transport holds it: an h2 peer withholding WINDOW_UPDATE keeps every queued body
 /// alive. A body that shares its allocation (page-cache, memo or static-cache bytes, a
 /// static) is accounted where it lives and passes uncharged, so a hit pays one atomic
-/// load. Like a stream frame, server-wide pressure sheds the response; the connection's
-/// own share waits for its other streams to drain.
+/// load. `fresh` vouches for pooled bytes, which `is_unique` cannot recognize. Like a
+/// stream frame, server-wide pressure sheds the response; the connection's own share
+/// waits for its other streams to drain.
 async fn send_full(
     parts: http::response::Parts,
     body: Bytes,
+    fresh: bool,
     mut resp: oneshot::Sender<BridgeResp>,
     bw_rate: Option<u64>,
     budget: &ResponseBudget,
 ) {
-    if body.len() < FULL_LEASE_MIN || !body.is_unique() {
+    if body.len() < FULL_LEASE_MIN || !(fresh || body.is_unique()) {
         let _ = resp.send(full_resp(parts, body, bw_rate));
         return;
     }
@@ -1116,7 +1124,15 @@ async fn forward_stream(
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok());
-    let mut acc: Vec<u8> = Vec::with_capacity(declared.map_or(0, |n| n.min(threshold)));
+    let mut acc: Vec<u8> = if threshold == 0 {
+        Vec::new()
+    } else {
+        hj_core::BODY_BUFS.take_buf(
+            declared.map_or(0, |n| n.min(threshold)),
+            hj_core::BODY_BUF_CAP,
+        )
+    };
+    let freeze = |acc: Vec<u8>| hj_core::BODY_BUFS.freeze(acc, hj_core::BODY_BUF_CAP);
     let mut skipped_frames = 0usize;
     loop {
         // The client side dropping its receiver (disconnect, stream reset) must drop
@@ -1143,7 +1159,7 @@ async fn forward_stream(
                             body: BridgeBody::Stream { rx: rrx, len: None },
                             bw_rate,
                         });
-                        if send_leased_chunk(&tx, body_budget, Bytes::from(acc))
+                        if send_leased_chunk(&tx, body_budget, freeze(acc))
                             .await
                             .is_err()
                             || send_leased_chunk(&tx, body_budget, d).await.is_err()
@@ -1162,7 +1178,7 @@ async fn forward_stream(
                 return;
             }
             None => {
-                send_full(parts, Bytes::from(acc), resp, bw_rate, body_budget).await;
+                send_full(parts, freeze(acc), true, resp, bw_rate, body_budget).await;
                 return;
             }
         }
@@ -2261,6 +2277,55 @@ mod tests {
         wait_for_in_flight(&global, 0).await;
         assert_eq!(conn.connection.in_flight(), 0);
         assert_eq!(global.rejected(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pooled_body_is_charged_only_under_its_fresh_mark() {
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(
+            hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
+        ));
+        let conn = one_connection(&global);
+        let pooled = || {
+            let mut buf = hj_core::BODY_BUFS.take_buf(64 * 1024, hj_core::BODY_BUF_CAP);
+            buf.resize(64 * 1024, 7);
+            hj_core::BODY_BUFS.freeze(buf, hj_core::BODY_BUF_CAP)
+        };
+        let marked = |body: Bytes, mark: &Bytes| {
+            let mut resp = http::Response::new(Body::Full(body));
+            resp.extensions_mut().insert(hj_core::FreshBody::of(mark));
+            resp
+        };
+        let send = |resp: http::Response<Body>| {
+            let (tx, rx) = oneshot::channel();
+            let conn = conn.clone();
+            tokio::spawn(async move { forward_response_with_budget(resp, tx, false, &conn).await });
+            rx
+        };
+
+        let body = pooled();
+        let fresh = full_body(send(marked(body.clone(), &body)).await.unwrap());
+        drop(body);
+        assert_eq!(
+            global.in_flight(),
+            64 * 1024,
+            "a marked pooled body is charged"
+        );
+        drop(fresh);
+        assert_eq!(global.in_flight(), 0);
+
+        let (body, other) = (pooled(), Bytes::from(vec![0; 16]));
+        let unmarked = full_body(
+            send(http::Response::new(Body::Full(body.clone())))
+                .await
+                .unwrap(),
+        );
+        let stale = full_body(send(marked(body.clone(), &other)).await.unwrap());
+        assert_eq!(
+            global.in_flight(),
+            0,
+            "unmarked or swapped bytes pass uncharged"
+        );
+        drop((unmarked, stale, body));
     }
 
     #[tokio::test]

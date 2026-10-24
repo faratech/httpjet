@@ -14,12 +14,13 @@
 //! with the dictionary when it needs the identity (to serve a non-precompressed encoding, or to
 //! (re)build a precompressed variant).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use zstd::bulk::Compressor;
 use zstd::dict::DecoderDictionary;
-use zstd::zstd_safe::CParameter;
+use zstd::zstd_safe::{CParameter, DCtx};
 
 /// Default zstd level for dict-compressing a stored body. Level 12 is the last level on zstd's
 /// row-based lazy matcher; 13-15 switch to the binary-tree btlazy2 search, which was ~55% of all
@@ -44,7 +45,7 @@ const DICT_HASH_LOG: u32 = 18;
 
 /// Encode contexts kept per dictionary. Matches the page cache's dict-fill concurrency, so
 /// steady state never builds a context; it is a global pool (not thread-local) because the
-/// encode runs under `block_in_place`, which moves between threads.
+/// encode runs on tokio's blocking pool, whose threads come and go.
 const ENCODE_POOL_CAP: usize = 2;
 
 /// A prepared shared dictionary for page-cache internal storage. Holds the raw dictionary bytes, a
@@ -135,9 +136,31 @@ impl PageDict {
     /// (decompression-bomb guard). `None` on malformed input, a dictionary mismatch, or if the
     /// content would exceed `max`.
     pub fn decode(&self, input: &[u8], max: usize) -> Option<Vec<u8>> {
-        let mut d = zstd::bulk::Decompressor::with_prepared_dictionary(&self.dec).ok()?;
-        d.decompress(input, max).ok()
+        let capacity = zstd::bulk::Decompressor::upper_bound(input)
+            .unwrap_or(max)
+            .min(max);
+        let mut out = Vec::with_capacity(capacity);
+        DECODE_CTX
+            .try_with(|cell| {
+                let mut slot = cell.try_borrow_mut().ok()?;
+                let dctx = match &mut *slot {
+                    Some(dctx) => dctx,
+                    None => slot.insert(DCtx::try_create()?),
+                };
+                dctx.decompress_using_ddict(&mut out, input, self.dec.as_ddict())
+                    .ok()
+            })
+            .ok()
+            .flatten()?;
+        Some(out)
     }
+}
+
+thread_local! {
+    /// A fresh decode context per cold hit was a ~100 KiB libc allocation whose pages
+    /// faulted in again on every decode. The dictionary is passed per call, so one
+    /// context serves every vhost's dictionary.
+    static DECODE_CTX: RefCell<Option<DCtx<'static>>> = const { RefCell::new(None) };
 }
 
 /// FNV-1a 32-bit hash of the dictionary bytes → its generation id.
@@ -384,6 +407,35 @@ mod tests {
             "decode must respect the max-output cap"
         );
         assert!(d.decode(&comp, 8192).is_some(), "under the cap it decodes");
+    }
+
+    #[test]
+    fn one_thread_decodes_alternating_dictionaries_after_a_failure() {
+        // The per-thread context takes its dictionary per call: a failed decode against the
+        // wrong dictionary must not leave state behind for the next, right one.
+        let a = dict();
+        let b = other_dict();
+        let body_a = [CHROME, b"thread a"].concat();
+        let body_b = [b"a completely different".as_slice(), b" body b"].concat();
+        let comp_a = a.encode(&body_a).expect("encode a");
+        let comp_b = b.encode(&body_b).expect("encode b");
+        for _ in 0..3 {
+            assert!(b.decode(&comp_a, 1 << 20).is_none());
+            assert_eq!(
+                a.decode(&comp_a, 1 << 20).as_deref(),
+                Some(body_a.as_slice())
+            );
+            assert_eq!(
+                b.decode(&comp_b, 1 << 20).as_deref(),
+                Some(body_b.as_slice())
+            );
+        }
+        let decoded = a.decode(&comp_a, 1 << 20).expect("decode");
+        assert_eq!(
+            decoded.capacity(),
+            body_a.len(),
+            "sized from the frame header"
+        );
     }
 
     fn other_dict() -> PageDict {

@@ -385,7 +385,9 @@ pub(super) fn store_until(
         status: resp.status(),
         headers,
         stamp_date,
-        body: body.clone(),
+        // Held for the memo's TTL: an exact copy, never a slice of a pooled egress buffer
+        // the entry would pin whole while the byte budget counted only its length.
+        body: Bytes::copy_from_slice(body),
         expires,
     };
     MEMO.with(|m| {

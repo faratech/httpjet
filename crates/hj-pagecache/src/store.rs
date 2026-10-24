@@ -2540,7 +2540,7 @@ impl PageStore {
         &self,
         key_hash: u64,
         key: PageCacheKey,
-        entry: CachedResponse,
+        mut entry: CachedResponse,
         render_epoch: u64,
     ) -> bool {
         if entry.body.len() as u64 > self.config.max_obj_bytes {
@@ -2564,6 +2564,14 @@ impl PageStore {
                     tracing::warn!(error = %e, "jetcache: identity persist failed — entry stays in RAM");
                 }
             }
+        }
+        // A body kept in RAM lives as long as the entry, so it gets its own exact-size
+        // allocation instead of possibly being a slice of a larger (pooled or shared)
+        // response buffer that the entry would pin whole.
+        if prepared.is_none()
+            && let PageBody::InMem(bytes) = &mut entry.body
+        {
+            *bytes = Bytes::copy_from_slice(bytes);
         }
         let tags = entry.tags.clone();
         let mut node = match Node::from_cached(&key, entry, render_epoch) {
@@ -4061,6 +4069,26 @@ mod tests {
             "post-mutation hit must observe a rebuilt snapshot"
         );
         assert_eq!(third.variants.len(), 1, "fill result visible on next hit");
+    }
+
+    #[test]
+    fn an_in_ram_body_is_stored_in_its_own_exact_allocation() {
+        let s = PageStore::new(cfg());
+        let k = PageCacheKey::public(1, true, "example.com", "/exact", "");
+        let id = "example.com\n/exact";
+        let response_buffer = bytes::Bytes::from(vec![b'x'; 64 * 1024]);
+        let body = response_buffer.slice(..100);
+        let mut e = entry_id(b"", &["T1"], Duration::from_secs(60), id);
+        e.body = PageBody::InMem(body.clone());
+        s.store(k.clone(), e);
+        let hit = s.lookup(&k, id, Instant::now()).expect("stored");
+        let stored = hit.body.in_mem().expect("in-RAM body");
+        assert_eq!(stored, body);
+        assert_ne!(
+            stored.as_ptr(),
+            body.as_ptr(),
+            "the entry pins the caller's buffer"
+        );
     }
 
     #[test]

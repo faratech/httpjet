@@ -117,11 +117,11 @@ const INLINE_BODY_CAP: usize = 256 * 1024;
 /// INLINE_BODY_CAP behind the header read.
 const INLINE_FILL_READS: u32 = 4;
 
-/// Largest single-chunk inline body copied out of the read buffer instead of
-/// sliced (#989): a slice keeps the whole >= 64 KiB buffer alive behind a body the
-/// page cache charges by its length, and leaves the recycled buffer shared, so the
-/// next reader on this thread allocates a fresh one.
-const INLINE_COPY_MAX: usize = 64 * 1024;
+/// Largest single-chunk inline body copied out of its read buffer. A small copy
+/// lands in a densely used size class and frees the pooled read buffer at once; a
+/// larger body stays a zero-copy slice whose buffer returns to the pool when the
+/// response is done (the page cache copies any body it keeps in RAM).
+const INLINE_COPY_MAX: usize = 8 * 1024;
 
 /// The first `len` bytes of `chunks` (`len` <= their total) as one `Bytes`.
 fn inline_body(chunks: Vec<Bytes>, len: usize) -> Bytes {
@@ -137,7 +137,7 @@ fn inline_body(chunks: Vec<Bytes>, len: usize) -> Bytes {
             first
         };
     }
-    let mut body = bytes::BytesMut::with_capacity(len);
+    let mut body = hj_core::BODY_BUFS.take_buf(len, hj_core::BODY_BUF_CAP);
     body.extend_from_slice(&first);
     for chunk in chunks {
         let take = (len - body.len()).min(chunk.len());
@@ -146,7 +146,7 @@ fn inline_body(chunks: Vec<Bytes>, len: usize) -> Bytes {
             break;
         }
     }
-    body.freeze()
+    hj_core::BODY_BUFS.freeze(body, hj_core::BODY_BUF_CAP)
 }
 
 /// Headers the pipeline typically adds to a PHP response after it is read.
@@ -782,21 +782,15 @@ const BEGIN_BUF_KEEP_CAP: usize = 16 * 1024;
 // most readers allocating, and with prod's immediate mimalloc purge faulting in,
 // a fresh 64 KiB.
 thread_local! {
-    static PACKET_LOCAL: std::cell::RefCell<Vec<bytes::BytesMut>> =
+    static PACKET_LOCAL: std::cell::RefCell<Vec<Vec<u8>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
-static PACKET_BUFS: hj_core::TieredPool<bytes::BytesMut> =
+static PACKET_BUFS: hj_core::TieredPool<Vec<u8>> =
     hj_core::TieredPool::new(&PACKET_LOCAL, BUF_POOL_LOCAL, BUF_POOL_SHARED);
 
 /// Spare buffers one thread keeps in each pool above, and the shared overflow.
 const BUF_POOL_LOCAL: usize = 8;
 const BUF_POOL_SHARED: usize = 32;
-
-fn take_packet_buf(alloc: usize) -> bytes::BytesMut {
-    PACKET_BUFS
-        .take()
-        .unwrap_or_else(|| bytes::BytesMut::with_capacity(alloc))
-}
 
 /// Take a pooled begin buffer (or a fresh one). The borrow is synchronous
 /// (never held across an `.await`), so it cannot conflict with another task that
@@ -1782,6 +1776,9 @@ impl Lsapi {
                 }
             };
             self.pool.note_response_body(path);
+            response
+                .extensions_mut()
+                .insert(hj_core::FreshBody::of(&body));
             *response.body_mut() = Body::Full(body);
             return Ok(response);
         }
@@ -2441,8 +2438,21 @@ fn lsapi_worker_pid(body: &[u8]) -> Option<u32> {
 
 /// Incremental LSAPI packet reader over an `AsyncRead` with a per-read idle
 /// timeout AND an optional absolute (total) processing deadline (Tier 1).
+///
+/// Reads land in a pooled buffer that stays writable until the first response-body
+/// frame is taken from it. Taking one freezes the buffer: body frames are zero-copy
+/// slices of it, and its memory returns to [`PACKET_BUFS`] when the last slice
+/// drops, on whichever thread that happens. Control frames are copied out, so they
+/// never freeze a buffer, and the next read moves the unparsed tail into a fresh
+/// pooled buffer once.
 struct PacketReader {
-    buf: bytes::BytesMut,
+    /// Writable read buffer; the unparsed bytes are `buf[start..]`. Empty while
+    /// `frozen` holds the current buffer.
+    buf: Vec<u8>,
+    start: usize,
+    /// The current buffer once a body frame was sliced from it; the unparsed bytes
+    /// are then `frozen[start..]`.
+    frozen: Option<Bytes>,
     /// Per-read idle ceiling: no progress within this window -> `TimedOut`.
     timeout: Duration,
     /// Absolute total-processing deadline; reads also fail `TimedOut` once it
@@ -2454,48 +2464,79 @@ struct PacketReader {
 }
 
 impl PacketReader {
-    /// Clear + park the read buffer for reuse on this thread. Runs on EVERY drop
-    /// path (inline drain, pump completion, client abort): clearing guarantees no
-    /// cross-request byte survives into the next reader.
-    /// A buffer still shared with a live body slice cannot be written again without
-    /// reallocating, so only a reclaimable one is kept.
-    fn recycle_buf(&mut self) {
-        self.buf.clear();
-        if self.buf.capacity() <= Self::READ_CHUNK && self.buf.try_reclaim(Self::READ_CHUNK) {
-            PACKET_BUFS.give(std::mem::take(&mut self.buf));
-        }
-    }
-
-    /// Build a reader with a per-read idle `timeout` and an optional Tier 1
-    /// total-processing `deadline` (`None` = only the idle timeout applies).
-    /// Per-read target: lsphp delivers a whole response in one socket write on the
-    /// fast path, so reading up to 64 KiB per syscall (instead of a 16 KiB stack
-    /// buffer copied into `buf`) lets the sync inline-drain fast path actually
-    /// cover bodies up to `INLINE_BODY_CAP` — a 60 KiB page previously exhausted
-    /// the buffer at ~16 KiB at header-parse time and fell back to the streaming
-    /// pump (a spawn + per-chunk channel hops). Also the initial capacity: 8 KiB
-    /// was outgrown by nearly every page render, costing a realloc per request.
+    /// Per-read target and pooled buffer size: lsphp delivers a whole response in
+    /// one socket write on the fast path, so reading up to 64 KiB per syscall lets
+    /// the sync inline-drain fast path cover bodies up to `INLINE_BODY_CAP` without
+    /// falling back to the streaming pump.
     const READ_CHUNK: usize = 64 * 1024;
 
-    /// Spare room below which a read first makes more: reserving a full
-    /// [`Self::READ_CHUNK`] while bytes are buffered always doubled the buffer, so
-    /// it could no longer be recycled.
+    /// Spare room below which a read first makes more.
     const MIN_READ_ROOM: usize = 16 * 1024;
-
-    fn ensure_read_room(&mut self) {
-        if self.buf.capacity() - self.buf.len() < Self::MIN_READ_ROOM
-            && !self.buf.try_reclaim(Self::MIN_READ_ROOM)
-        {
-            self.buf.reserve(Self::READ_CHUNK);
-        }
-    }
 
     fn with_deadline(timeout: Duration, deadline: Option<Instant>) -> Self {
         PacketReader {
-            buf: take_packet_buf(Self::READ_CHUNK),
+            buf: PACKET_BUFS.take_buf(0, Self::READ_CHUNK),
+            start: 0,
+            frozen: None,
             timeout,
             deadline,
             parked: None,
+        }
+    }
+
+    fn unparsed(&self) -> &[u8] {
+        let all: &[u8] = match &self.frozen {
+            Some(frozen) => frozen,
+            None => &self.buf,
+        };
+        all.get(self.start..).unwrap_or_default()
+    }
+
+    /// The full length of the packet at the head of the unparsed bytes, once its
+    /// header is buffered (`try_parse` rejects an implausible one first).
+    fn pending_packet_len(&self) -> usize {
+        match self.header() {
+            Some(header) => Self::packet_len(&header).min(crate::proto::MAX_PACKET_LEN),
+            None => 0,
+        }
+    }
+
+    fn header(&self) -> Option<[u8; PACKET_HEADER_LEN]> {
+        self.unparsed().get(..PACKET_HEADER_LEN)?.try_into().ok()
+    }
+
+    /// The length field of a packet header, in the sender's byte order: this host's
+    /// LSAPI_ENDIAN (BIG on aarch64), swapped only on a real cross-endian mismatch.
+    /// See HOST_LSAPI_ENDIAN in proto.rs.
+    fn packet_len(header: &[u8; PACKET_HEADER_LEN]) -> usize {
+        let lb = [header[4], header[5], header[6], header[7]];
+        (if header[3] & ENDIAN_BIT == HOST_LSAPI_ENDIAN {
+            u32::from_le_bytes(lb)
+        } else {
+            u32::from_be_bytes(lb)
+        }) as usize
+    }
+
+    /// Make `buf` writable with room for the next read, and for the rest of a
+    /// partial packet whose header is already buffered (so a large packet is
+    /// gathered in one buffer instead of being re-copied on every read).
+    fn ensure_read_room(&mut self) {
+        let unparsed = self.unparsed().len();
+        let need = Self::MIN_READ_ROOM.max(self.pending_packet_len().saturating_sub(unparsed));
+        if let Some(frozen) = self.frozen.take() {
+            let tail = frozen.get(self.start..).unwrap_or_default();
+            let mut buf = PACKET_BUFS.take_buf(tail.len() + need, Self::READ_CHUNK);
+            buf.extend_from_slice(tail);
+            self.buf = buf;
+            self.start = 0;
+            return;
+        }
+        if self.buf.capacity() - self.buf.len() < need {
+            if self.start > 0 {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+            self.buf.reserve(need);
         }
     }
 
@@ -2533,7 +2574,7 @@ impl PacketReader {
     }
 
     /// [`Self::next`] without the idle timeout or deadline; the caller bounds the
-    /// wait. Cancel-safe: buffered bytes stay in `buf`.
+    /// wait. Cancel-safe: buffered bytes stay buffered.
     async fn next_untimed<R>(&mut self, r: &mut R) -> std::io::Result<Option<LsapiFrame>>
     where
         R: AsyncReadExt + Unpin,
@@ -2605,7 +2646,7 @@ impl PacketReader {
             };
             if n == 0 {
                 // EOF. If we have a partial packet it's an error, else clean end.
-                if self.buf.is_empty() {
+                if !self.has_buffered() {
                     return Ok(None);
                 }
                 return Err(std::io::Error::new(
@@ -2617,55 +2658,63 @@ impl PacketReader {
     }
 
     fn has_buffered(&self) -> bool {
-        !self.buf.is_empty()
+        !self.unparsed().is_empty()
     }
 
     fn try_parse(&mut self) -> std::io::Result<Option<LsapiFrame>> {
-        if self.buf.len() < PACKET_HEADER_LEN {
+        let Some(header) = self.header() else {
             return Ok(None);
-        }
-        if self.buf[0] != VERSION_B0 || self.buf[1] != VERSION_B1 {
+        };
+        if header[0] != VERSION_B0 || header[1] != VERSION_B1 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "lsapi bad magic",
             ));
         }
-        let flag = self.buf[3];
-        let lb = [self.buf[4], self.buf[5], self.buf[6], self.buf[7]];
-        // Match this host's LSAPI_ENDIAN (BIG on aarch64); swap only on a real
-        // cross-endian mismatch. See HOST_LSAPI_ENDIAN in proto.rs.
-        let total = if flag & ENDIAN_BIT == HOST_LSAPI_ENDIAN {
-            u32::from_le_bytes(lb)
-        } else {
-            u32::from_be_bytes(lb)
-        } as usize;
+        let flag = header[3];
+        let total = Self::packet_len(&header);
         if !(PACKET_HEADER_LEN..=crate::proto::MAX_PACKET_LEN).contains(&total) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "lsapi implausible packet length",
             ));
         }
-        if self.buf.len() < total {
+        if self.unparsed().len() < total {
             return Ok(None);
         }
-        let type_byte = self.buf[2];
-        let ptype = PacketType::from_u8(type_byte).ok_or_else(|| {
+        let ptype = PacketType::from_u8(header[2]).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "lsapi unknown packet type")
         })?;
-        let mut packet = self.buf.split_to(total);
-        use bytes::Buf;
-        packet.advance(PACKET_HEADER_LEN);
-        Ok(Some(LsapiFrame {
-            ptype,
-            body: packet.freeze(),
-            flag,
-        }))
+        let body = if ptype == PacketType::RespStream && total > PACKET_HEADER_LEN {
+            let body_at = self.start + PACKET_HEADER_LEN..self.start + total;
+            let buf = &mut self.buf;
+            self.frozen
+                .get_or_insert_with(|| PACKET_BUFS.freeze(std::mem::take(buf), Self::READ_CHUNK))
+                .slice(body_at)
+        } else {
+            Bytes::copy_from_slice(
+                self.unparsed()
+                    .get(PACKET_HEADER_LEN..total)
+                    .unwrap_or_default(),
+            )
+        };
+        self.start += total;
+        if self.frozen.is_none() && self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        }
+        Ok(Some(LsapiFrame { ptype, body, flag }))
     }
 }
 
 impl Drop for PacketReader {
+    /// Park a writable buffer for the next reader, cleared so no byte of this
+    /// response survives into it. A frozen buffer returns by itself once its last
+    /// body slice drops.
     fn drop(&mut self) {
-        self.recycle_buf();
+        if self.frozen.is_none() {
+            PACKET_BUFS.give_buf(std::mem::take(&mut self.buf), Self::READ_CHUNK);
+        }
     }
 }
 
@@ -2676,21 +2725,26 @@ mod inline_body_tests {
     use bytes::Bytes;
     use tokio::io::AsyncWriteExt;
 
-    use super::{
-        BUF_POOL_LOCAL, INLINE_COPY_MAX, PACKET_LOCAL, PacketReader, inline_body, take_packet_buf,
-    };
+    use super::{BUF_POOL_LOCAL, INLINE_COPY_MAX, PACKET_LOCAL, PacketReader, inline_body};
     use crate::proto::{HOST_LSAPI_ENDIAN, PACKET_HEADER_LEN, PacketType, VERSION_B0, VERSION_B1};
 
-    fn stream_packet(body: &[u8]) -> Vec<u8> {
-        let mut out = vec![
-            VERSION_B0,
-            VERSION_B1,
-            PacketType::RespStream as u8,
-            HOST_LSAPI_ENDIAN,
-        ];
+    fn packet(ptype: PacketType, body: &[u8]) -> Vec<u8> {
+        let mut out = vec![VERSION_B0, VERSION_B1, ptype as u8, HOST_LSAPI_ENDIAN];
         out.extend_from_slice(&((PACKET_HEADER_LEN + body.len()) as u32).to_le_bytes());
         out.extend_from_slice(body);
         out
+    }
+
+    fn stream_packet(body: &[u8]) -> Vec<u8> {
+        packet(PacketType::RespStream, body)
+    }
+
+    fn pooled_len() -> usize {
+        PACKET_LOCAL.with(|pool| pool.borrow().len())
+    }
+
+    fn pooled_contains(addr: *const u8) -> bool {
+        PACKET_LOCAL.with(|pool| pool.borrow().iter().any(|b| b.as_ptr() == addr))
     }
 
     #[test]
@@ -2712,7 +2766,8 @@ mod inline_body_tests {
         assert!(inline_body(chunks(&[b"abc"]), 0).is_empty());
     }
 
-    // (#989) A small single chunk is copied; only a large one stays a slice.
+    // A small single chunk is copied (freeing its read buffer at once); a larger
+    // one stays a slice.
     #[test]
     fn copies_small_single_chunks_and_slices_large_ones() {
         let small = Bytes::from(vec![7u8; INLINE_COPY_MAX]);
@@ -2725,25 +2780,93 @@ mod inline_body_tests {
         assert_eq!(body.as_ptr(), large.as_ptr());
     }
 
-    // (#989) Once the inline body is out, the parked read buffer is unique again:
-    // the next reader on the thread reclaims the same allocation (#280) instead of
-    // allocating a fresh 64 KiB.
+    // A body frame is a zero-copy slice of the read buffer, and that buffer goes
+    // back to the pool only once the last such slice drops.
     #[test]
-    fn single_chunk_inline_body_leaves_the_read_buffer_reusable() {
+    fn a_frozen_buffer_returns_to_the_pool_after_its_last_body_slice() {
         PACKET_LOCAL.with(|pool| pool.borrow_mut().clear());
         let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
         let base = reader.buf.as_ptr();
-        reader.buf.extend_from_slice(&stream_packet(b"hello"));
-        let frame = reader.try_parse().unwrap().unwrap();
-        let body = inline_body(vec![frame.body], 5);
-        assert_eq!(&body[..], b"hello");
-        assert!(body.is_unique());
+        reader.buf.extend_from_slice(&stream_packet(&[1u8; 128]));
+        reader.buf.extend_from_slice(&stream_packet(&[2u8; 64]));
+        let first = reader.try_parse().unwrap().unwrap();
+        let second = reader.try_parse().unwrap().unwrap();
+        assert_eq!(
+            first.body.as_ptr() as usize,
+            base as usize + PACKET_HEADER_LEN
+        );
+        assert_eq!(&second.body[..], &[2u8; 64][..]);
         drop(reader);
+        drop(first);
+        assert!(!pooled_contains(base), "returned while a body slice lived");
+        drop(second);
+        assert!(pooled_contains(base));
+    }
 
-        let mut buf = take_packet_buf(PacketReader::READ_CHUNK);
-        buf.reserve(PacketReader::READ_CHUNK);
-        assert_eq!(buf.as_ptr(), base, "the recycled buffer was reallocated");
-        drop(body);
+    // Control frames are copied out, so they never freeze the buffer: it is reused
+    // in place for the next read.
+    #[test]
+    fn control_frames_leave_the_buffer_writable() {
+        let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
+        let base = reader.buf.as_ptr();
+        reader
+            .buf
+            .extend_from_slice(&packet(PacketType::StderrStream, b"warn"));
+        reader
+            .buf
+            .extend_from_slice(&packet(PacketType::RespEnd, b""));
+        let stderr = reader.try_parse().unwrap().unwrap();
+        assert_eq!(&stderr.body[..], b"warn");
+        let end = reader.try_parse().unwrap().unwrap();
+        assert_eq!(end.ptype, PacketType::RespEnd);
+        assert!(reader.frozen.is_none());
+        assert!(!reader.has_buffered());
+        assert_eq!(reader.start, 0);
+        reader.ensure_read_room();
+        assert_eq!(reader.buf.as_ptr(), base);
+    }
+
+    // A packet cut by the end of a frozen buffer moves into a fresh buffer sized
+    // for the whole packet, and completes there.
+    #[test]
+    fn a_packet_split_across_reads_reassembles_in_one_buffer() {
+        let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
+        let big: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let tail = stream_packet(&big);
+        reader.buf.extend_from_slice(&stream_packet(b"head"));
+        reader.buf.extend_from_slice(&tail[..10_000]);
+        let head = reader.try_parse().unwrap().unwrap();
+        assert_eq!(&head.body[..], b"head");
+        assert!(reader.try_parse().unwrap().is_none());
+        reader.ensure_read_room();
+        assert!(reader.frozen.is_none());
+        assert!(reader.buf.capacity() >= tail.len());
+        let room = reader.buf.as_ptr();
+        reader.buf.extend_from_slice(&tail[10_000..150_000]);
+        reader.ensure_read_room();
+        assert_eq!(reader.buf.as_ptr(), room, "a partial packet was re-copied");
+        reader.buf.extend_from_slice(&tail[150_000..]);
+        let body = reader.try_parse().unwrap().unwrap();
+        assert_eq!(&body.body[..], &big[..]);
+        assert!(!reader.has_buffered());
+    }
+
+    #[test]
+    fn malformed_headers_are_refused() {
+        for bytes in [
+            vec![b'X', b'S', 7, HOST_LSAPI_ENDIAN, 8, 0, 0, 0],
+            vec![VERSION_B0, VERSION_B1, 7, HOST_LSAPI_ENDIAN, 4, 0, 0, 0],
+            vec![VERSION_B0, VERSION_B1, 0xEE, HOST_LSAPI_ENDIAN, 8, 0, 0, 0],
+            {
+                let mut v = vec![VERSION_B0, VERSION_B1, 7, HOST_LSAPI_ENDIAN];
+                v.extend_from_slice(&((crate::proto::MAX_PACKET_LEN + 1) as u32).to_le_bytes());
+                v
+            },
+        ] {
+            let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
+            reader.buf.extend_from_slice(&bytes);
+            assert!(reader.try_parse().is_err(), "accepted {bytes:?}");
+        }
     }
 
     // Concurrent readers on one thread each park their buffer, so the next wave
@@ -2756,10 +2879,7 @@ mod inline_body_tests {
             .collect();
         let mut bases: Vec<_> = readers.iter().map(|r| r.buf.as_ptr()).collect();
         drop(readers);
-        assert_eq!(
-            PACKET_LOCAL.with(|pool| pool.borrow().len()),
-            BUF_POOL_LOCAL
-        );
+        assert_eq!(pooled_len(), BUF_POOL_LOCAL);
 
         let again: Vec<_> = (0..BUF_POOL_LOCAL)
             .map(|_| PacketReader::with_deadline(Duration::from_secs(1), None))
@@ -2774,21 +2894,8 @@ mod inline_body_tests {
         }
     }
 
-    // A buffer whose bytes still back a live body cannot be written in place, so
-    // parking it would only make the next reader reallocate.
-    #[test]
-    fn a_buffer_shared_with_a_live_body_is_not_parked() {
-        PACKET_LOCAL.with(|pool| pool.borrow_mut().clear());
-        let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
-        reader.buf.extend_from_slice(&stream_packet(&[1u8; 128]));
-        let frame = reader.try_parse().unwrap().unwrap();
-        drop(reader);
-        assert_eq!(PACKET_LOCAL.with(|pool| pool.borrow().len()), 0);
-        drop(frame);
-    }
-
     // A read with buffered bytes and room to spare reads into that room instead of
-    // doubling the buffer past the recyclable size.
+    // growing the buffer past the recyclable size.
     #[test]
     fn a_read_with_room_left_does_not_grow_the_buffer() {
         let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
@@ -2797,10 +2904,6 @@ mod inline_body_tests {
         reader.ensure_read_room();
         assert_eq!(reader.buf.as_ptr(), base);
         assert_eq!(reader.buf.capacity(), PacketReader::READ_CHUNK);
-
-        reader.buf.extend_from_slice(&vec![0u8; 40 * 1024]);
-        reader.ensure_read_room();
-        assert!(reader.buf.capacity() - reader.buf.len() >= PacketReader::MIN_READ_ROOM);
     }
 
     #[tokio::test]
@@ -2822,6 +2925,28 @@ mod inline_body_tests {
         drop(peer);
         read_half.readable().await.unwrap();
         assert!(!reader.try_fill(&read_half));
+        assert!(reader.next(&mut read_half).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn next_reads_body_frames_across_socket_writes() {
+        let (ours, mut peer) = tokio::net::UnixStream::pair().unwrap();
+        let (mut read_half, _write_half) = ours.into_split();
+        let mut reader = PacketReader::with_deadline(Duration::from_secs(5), None);
+        let body: Vec<u8> = (0..150_000u32).map(|i| (i * 7) as u8).collect();
+        let wire = [stream_packet(&body), packet(PacketType::RespEnd, b"")].concat();
+        let writer = tokio::spawn(async move {
+            for part in wire.chunks(9_973) {
+                peer.write_all(part).await.unwrap();
+            }
+            peer
+        });
+        let frame = reader.next(&mut read_half).await.unwrap().unwrap();
+        assert_eq!(frame.ptype, PacketType::RespStream);
+        assert_eq!(&frame.body[..], &body[..]);
+        let end = reader.next(&mut read_half).await.unwrap().unwrap();
+        assert_eq!(end.ptype, PacketType::RespEnd);
+        drop(writer.await.unwrap());
         assert!(reader.next(&mut read_half).await.unwrap().is_none());
     }
 }

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http::header::{
     CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, DATE, ETAG, LOCATION, SET_COOKIE,
     TRANSFER_ENCODING,
@@ -29,7 +29,9 @@ use http_body_util::BodyExt;
 
 use std::borrow::Cow;
 
-use hj_compress::{ACCEPT_ENCODING_ENV, AcceptEncoding, Encoding, decode_bytes_bounded};
+use hj_compress::{
+    ACCEPT_ENCODING_ENV, AcceptEncoding, Encoding, decode_bytes_bounded, decode_bytes_sized,
+};
 use hj_core::budget::{BodyBufferBudget, BodyBufferLease};
 use hj_core::{Body, FileBody, ReqCtx, Request, Response};
 use hj_pagecache::{
@@ -1177,17 +1179,27 @@ fn spawn_variant_fill(
             }
         };
         // The same single-variant precompression the store path used to do eagerly, now deferred
-        // to a proven hit. block_in_place caps concurrent compressions at --workers (no
-        // spawn_blocking thread-pool oversubscription on a CPU-bound box).
-        let variants = tokio::task::block_in_place(|| {
-            hit::precompress_variants(
-                &state,
-                &entry.headers,
-                &body,
-                accept_encoding,
-                capsule_shell,
-            )
-        });
+        // to a proven hit. It runs on the blocking pool; the variant-fill registry already caps
+        // how many run at once. `block_in_place` instead handed this worker's core to another
+        // thread on every fill, so the runtime kept bringing in fresh threads, each starting
+        // with a cold allocator heap and empty per-thread pools.
+        let variants = {
+            let (state, entry, body) = (state.clone(), entry.clone(), body.clone());
+            match tokio::task::spawn_blocking(move || {
+                hit::precompress_variants(
+                    &state,
+                    &entry.headers,
+                    &body,
+                    accept_encoding,
+                    capsule_shell,
+                )
+            })
+            .await
+            {
+                Ok(variants) => variants,
+                Err(_) => return,
+            }
+        };
         // Enrich IN PLACE only if K still holds this exact entry (identity + stored_at). If a
         // purge or an SWR refresh landed during the compression window, the fill is a NO-OP — so
         // it can never resurrect a purged entry nor clobber a fresher one. `variants_filled` is
@@ -1210,8 +1222,9 @@ fn spawn_variant_fill(
                 variants
                     .iter()
                     .find_map(|(tok, b)| {
-                        Encoding::from_token(tok)
-                            .and_then(|e| decode_bytes_bounded(e, b, store.config().max_obj_bytes))
+                        Encoding::from_token(tok).and_then(|e| {
+                            decode_bytes_sized(e, b, store.config().max_obj_bytes, body.len())
+                        })
                     })
                     .filter(|id| id.as_slice() == body.as_ref())
                     .and(u32::try_from(body.len()).ok())
@@ -1336,12 +1349,18 @@ fn spawn_finalize(
         task_metrics
             .input_bytes
             .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        // block_in_place caps concurrent compressions at --workers (no spawn_blocking pool
-        // oversubscription on a CPU-bound box), same as the variant fill.
+        // On the blocking pool, like the variant fill; the dict-fill registry caps concurrency.
         // Savings gate: a dict-stored body costs a decode on every AE-mismatch hit and on
         // every variant fill, so the swap must buy real RAM. An incompressible body (already-
         // minified JSON blobs, binary-ish payloads) that shrinks <12.5% stays the identity file.
-        let compressed = match tokio::task::block_in_place(|| dict.encode(&bytes)) {
+        let encoded = {
+            let (dict, input) = (dict.clone(), bytes.clone());
+            tokio::task::spawn_blocking(move || dict.encode(&input))
+                .await
+                .ok()
+                .flatten()
+        };
+        let compressed = match encoded {
             Some(c) if c.len() <= bytes.len().saturating_sub(bytes.len() / 8) => Bytes::from(c),
             _ => {
                 task_metrics.skip(DictSkip::Savings, targets.len() as u64);
@@ -3819,7 +3838,7 @@ pub async fn cache_store_leading(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let body = StreamFill {
             inner,
-            buf: BytesMut::with_capacity(COLLECT_DEFAULT_CAPACITY),
+            buf: hj_core::BODY_BUFS.take_buf(COLLECT_DEFAULT_CAPACITY, hj_core::BODY_BUF_CAP),
             lease: Some(lease),
             max_bytes: cfg.max_obj_bytes,
             commit: Some(commit),
@@ -3872,7 +3891,7 @@ pub async fn cache_store_leading(
         n.min(COLLECT_PRESIZE_CAP).min(cfg.max_obj_bytes) as usize
     });
     // The fill lease lives until the store decision below; the served copy is charged by the
-    // transport bridge, which skips bytes the store now shares.
+    // transport bridge (an entry kept in RAM gets its own copy, so these bytes stay fresh).
     let (mut bytes, _fill_lease) = match collect_body(
         body,
         cfg.max_obj_bytes,
@@ -4128,6 +4147,7 @@ pub async fn cache_store_leading(
     parts
         .headers
         .insert(HDR_CACHE_STATUS, HeaderValue::from_static("miss"));
+    parts.extensions.insert(hj_core::FreshBody::of(&bytes));
     Response::from_parts(parts, Body::Full(bytes))
 }
 
@@ -4352,7 +4372,7 @@ impl FillCommit {
 /// so a partial body can never become an entry.
 struct StreamFill {
     inner: hj_core::StreamBody,
-    buf: BytesMut,
+    buf: Vec<u8>,
     /// The fill budget charged for `buf`, held until the store is done.
     lease: Option<BodyBufferLease>,
     max_bytes: u64,
@@ -4362,7 +4382,7 @@ struct StreamFill {
 impl StreamFill {
     fn abandon(&mut self) {
         self.commit = None;
-        self.buf = BytesMut::new();
+        hj_core::BODY_BUFS.give_buf(std::mem::take(&mut self.buf), hj_core::BODY_BUF_CAP);
         self.lease = None;
     }
 }
@@ -4398,7 +4418,11 @@ impl http_body::Body for StreamFill {
             Poll::Ready(Some(Err(_))) => this.abandon(),
             Poll::Ready(None) => {
                 if let Some(commit) = this.commit.take() {
-                    commit.finish(std::mem::take(&mut this.buf).freeze(), this.lease.take());
+                    commit.finish(
+                        hj_core::BODY_BUFS
+                            .freeze(std::mem::take(&mut this.buf), hj_core::BODY_BUF_CAP),
+                        this.lease.take(),
+                    );
                 }
             }
             Poll::Pending => {}
@@ -4595,7 +4619,8 @@ async fn collect_body(
             if !lease.reserve(capacity_hint as u64) {
                 return Collected::Passthrough(Body::Stream(s));
             }
-            let mut buf = BytesMut::with_capacity(capacity_hint);
+            let mut buf = hj_core::BODY_BUFS.take_buf(capacity_hint, hj_core::BODY_BUF_CAP);
+            let freeze = |buf| hj_core::BODY_BUFS.freeze(buf, hj_core::BODY_BUF_CAP);
             loop {
                 match s.frame().await {
                     Some(Ok(frame)) => {
@@ -4612,7 +4637,7 @@ async fn collect_body(
                                     rest: s,
                                 };
                                 let passthrough = PrefixedBody {
-                                    prefix: Some(buf.freeze()),
+                                    prefix: Some(freeze(buf)),
                                     rest: rest.boxed(),
                                 };
                                 return Collected::Passthrough(Body::Stream(passthrough.boxed()));
@@ -4623,7 +4648,7 @@ async fn collect_body(
                                 // remainder and serve it through, uncached — never materializing
                                 // the whole body in RAM. (Over-shoots by at most one frame.)
                                 let passthrough = PrefixedBody {
-                                    prefix: Some(buf.freeze()),
+                                    prefix: Some(freeze(buf)),
                                     rest: s,
                                 };
                                 return Collected::Passthrough(Body::Stream(passthrough.boxed()));
@@ -4631,7 +4656,7 @@ async fn collect_body(
                         }
                     }
                     Some(Err(_)) => return Collected::Error,
-                    None => return Collected::Buffered(buf.freeze(), Some(lease)),
+                    None => return Collected::Buffered(freeze(buf), Some(lease)),
                 }
             }
         }

@@ -31,7 +31,7 @@ pub use net::{
     FORWARDING_AUTHORITY_HEADERS, host_without_port, is_forwarding_authority_header,
     is_trusted_internal_peer, valid_http_authority, valid_uri_authority, valid_uri_scheme,
 };
-pub use recycle::{Recycled, TieredPool};
+pub use recycle::{BODY_BUF_CAP, BODY_BUFS, FreshBody, Recycled, TieredPool};
 pub use reqid::ReqId;
 pub use router::{ResolvedVhost, Router};
 

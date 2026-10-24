@@ -9,7 +9,7 @@ use http::header::{AGE, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, V
 use http::{HeaderMap, HeaderValue, StatusCode};
 
 use hj_compress::{
-    AcceptEncoding, Compress, Encoding, Levels, MAX_DECODE, PageDict, decode_bytes_bounded,
+    AcceptEncoding, Compress, Encoding, Levels, MAX_DECODE, PageDict, decode_bytes_sized,
     encode_bytes, etag_variant,
 };
 use hj_core::{Body, FileBody, Response};
@@ -231,7 +231,8 @@ fn resolve_identity(
             .variants
             .iter()
             .find_map(|(tok, b)| {
-                Encoding::from_token(tok).and_then(|e| decode_bytes_bounded(e, b, decode_limit))
+                Encoding::from_token(tok)
+                    .and_then(|e| decode_bytes_sized(e, b, decode_limit, entry.body.len()))
             })
             .map(Bytes::from)
             .map(HitBody::Bytes);

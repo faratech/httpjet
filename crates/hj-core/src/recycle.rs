@@ -16,6 +16,7 @@
 //! once per several values, not per request. Every tier is capped, so the pools
 //! only grow to the peak concurrency they serve.
 
+use bytes::Bytes;
 use std::alloc::Layout;
 use std::cell::RefCell;
 use std::future::Future;
@@ -227,6 +228,97 @@ impl<T: Send + 'static> TieredPool<T> {
     }
 }
 
+impl TieredPool<Vec<u8>> {
+    /// A cleared buffer with at least `min` bytes of capacity: a pooled one when
+    /// available, else a fresh `max(min, fresh_cap)` allocation.
+    pub fn take_buf(&self, min: usize, fresh_cap: usize) -> Vec<u8> {
+        match self.take() {
+            Some(mut buf) => {
+                buf.reserve(min);
+                buf
+            }
+            None => Vec::with_capacity(min.max(fresh_cap)),
+        }
+    }
+
+    /// Return an unused buffer: cleared, and kept only if it has capacity and at
+    /// most `keep_cap` of it.
+    pub fn give_buf(&self, mut buf: Vec<u8>, keep_cap: usize) {
+        if buf.capacity() != 0 && buf.capacity() <= keep_cap {
+            buf.clear();
+            self.give(buf);
+        }
+    }
+
+    /// Freeze `buf` into `Bytes` whose allocation returns to this pool once the last
+    /// clone or slice drops, as long as its capacity is at most `keep_cap`. Only
+    /// for transient bodies: anything retaining these bytes long-term pins the
+    /// whole buffer, so long-lived holders must copy them out.
+    pub fn freeze(&'static self, buf: Vec<u8>, keep_cap: usize) -> Bytes {
+        Bytes::from_owner(PooledBytes {
+            buf,
+            pool: self,
+            keep_cap,
+        })
+    }
+}
+
+/// Response extension naming the `Body::Full` bytes a handler assembled in a pooled
+/// buffer ([`TieredPool::freeze`]). They are the response's own fresh allocation, but an
+/// owner-backed `Bytes` never reports `is_unique`, which is how the transport bridge tells
+/// a fresh body (charged to the response budget) from cache-shared bytes (accounted where
+/// they live). The mark names the exact bytes, so a later body swap leaves it inert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FreshBody {
+    ptr: usize,
+    len: usize,
+}
+
+impl FreshBody {
+    pub fn of(body: &Bytes) -> Self {
+        FreshBody {
+            ptr: body.as_ptr() as usize,
+            len: body.len(),
+        }
+    }
+
+    pub fn names(&self, body: &Bytes) -> bool {
+        *self == Self::of(body)
+    }
+}
+
+struct PooledBytes {
+    buf: Vec<u8>,
+    pool: &'static TieredPool<Vec<u8>>,
+    keep_cap: usize,
+}
+
+impl AsRef<[u8]> for PooledBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl Drop for PooledBytes {
+    fn drop(&mut self) {
+        self.pool
+            .give_buf(std::mem::take(&mut self.buf), self.keep_cap);
+    }
+}
+
+thread_local! {
+    static BODY_LOCAL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Capacity of the shared response-body assembly buffers ([`BODY_BUFS`]); a body
+/// that grew its buffer past this frees it instead of pooling it.
+pub const BODY_BUF_CAP: usize = 256 * 1024;
+
+/// Assembly buffers for transient response bodies (a PHP body joined from
+/// several frames, a streamed body collected for the page cache or the bridge).
+/// Freeze them with [`TieredPool::freeze`] and [`BODY_BUF_CAP`].
+pub static BODY_BUFS: TieredPool<Vec<u8>> = TieredPool::new(&BODY_LOCAL, 2, 16);
+
 /// An owned value in a recycled heap slot: `Box`-like (stable address, so a pinned
 /// future stays sound), but its memory is reused by the next `Recycled` of the
 /// same layout on whichever thread drops it.
@@ -402,6 +494,44 @@ mod tests {
         }
         assert_eq!(got.len(), 4);
         assert!(got.iter().all(|p| ptrs.contains(p)));
+    }
+
+    #[test]
+    fn frozen_bytes_return_their_buffer_after_the_last_slice_drops() {
+        thread_local! {
+            static BUFS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+        }
+        static POOL: TieredPool<Vec<u8>> = TieredPool::new(&BUFS, 4, 4);
+        let mut buf = POOL.take_buf(4096, 4096);
+        buf.extend_from_slice(b"header|body-one|body-two");
+        let addr = buf.as_ptr() as usize;
+        let whole = POOL.freeze(buf, 8192);
+        let one = whole.slice(7..15);
+        let two = whole.slice(16..);
+        drop(whole);
+        assert_eq!(&one[..], b"body-one");
+        drop(one);
+        assert!(
+            BUFS.with(|b| b.borrow().is_empty()),
+            "returned while a slice lived"
+        );
+        assert_eq!(&two[..], b"body-two");
+        drop(two);
+        let back = POOL.take_buf(16, 4096);
+        assert_eq!(back.as_ptr() as usize, addr);
+        assert!(back.is_empty());
+    }
+
+    #[test]
+    fn a_frozen_buffer_grown_past_its_keep_cap_is_freed() {
+        thread_local! {
+            static BUFS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+        }
+        static POOL: TieredPool<Vec<u8>> = TieredPool::new(&BUFS, 4, 4);
+        let mut buf = POOL.take_buf(0, 1024);
+        buf.extend_from_slice(&[7u8; 8192]);
+        drop(POOL.freeze(buf, 4096));
+        assert!(BUFS.with(|b| b.borrow().is_empty()));
     }
 
     #[test]

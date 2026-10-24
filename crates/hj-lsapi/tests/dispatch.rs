@@ -2164,6 +2164,27 @@ async fn small_inline_body_does_not_share_the_read_buffer() {
     }
 }
 
+/// A buffered body joined from several frames lives in a pooled buffer, which
+/// `Bytes::is_unique` cannot recognize as fresh; the response's mark vouches for it so
+/// the transport still charges it to the response budget.
+#[tokio::test]
+async fn a_joined_inline_body_carries_its_fresh_mark() {
+    let first = vec![b'a'; 12 * 1024];
+    let second = vec![b'b'; 12 * 1024];
+    let (result, _) =
+        buffered_mock_response("inline-fresh-mark", "GET", 200, &[], &[&first, &second]).await;
+    let response = result.expect("response");
+    let mark = *response
+        .extensions()
+        .get::<hj_core::FreshBody>()
+        .expect("marked");
+    let hj_core::Body::Full(bytes) = response.into_body() else {
+        panic!("a buffered response must return inline");
+    };
+    assert_eq!(bytes.len(), first.len() + second.len());
+    assert!(mark.names(&bytes));
+}
+
 /// (#990) Building the head by moving the parsed fields keeps their order and
 /// duplicates: repeated Set-Cookie and custom X-LiteSpeed-* names reach the
 /// response exactly as lsphp sent them, `Status:` is consumed, Content-Length is
