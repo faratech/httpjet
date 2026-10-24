@@ -1993,6 +1993,36 @@ async fn precompressed_negotiation_honors_tokens_qvalues_and_wildcards() {
 // (Tier 2) multipart/byteranges handler behavior
 // ----------------------------------------------------------------------------
 
+/// Regression (#1118): the boundary carried a stack address of the serving
+/// thread. It must be random and never embed the stack region.
+#[test]
+fn multipart_boundary_is_random_and_reveals_no_address() {
+    let local = 0u8;
+    let region = (&local as *const u8 as usize) >> 16;
+    let prefixes: Vec<String> = [region - 1, region, region + 1]
+        .iter()
+        .map(|r| format!("{r:x}"))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1000 {
+        let boundary = multipart_boundary();
+        for prefix in &prefixes {
+            assert!(
+                !boundary.contains(prefix.as_str()),
+                "{boundary} embeds {prefix}"
+            );
+        }
+        assert_eq!(boundary.len(), 32, "{boundary}");
+        assert!(
+            boundary
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{boundary}"
+        );
+        assert!(seen.insert(boundary), "boundary repeated");
+    }
+}
+
 #[tokio::test]
 async fn range_multi_serves_framed_multipart_byteranges() {
     let root = temp_root("multipart");

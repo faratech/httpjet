@@ -1186,7 +1186,7 @@ mod tests {
             2,
             h3::self_signed_config().unwrap(),
             bridge,
-            false,
+            crate::uring::ClientAuth::None,
             h3::H3RuntimeConfig::new(
                 || {
                     (
@@ -1232,7 +1232,7 @@ mod tests {
             1,
             h3::self_signed_config().unwrap(),
             bridge,
-            false,
+            crate::uring::ClientAuth::None,
             h3::H3RuntimeConfig::new(
                 || {
                     (
@@ -1304,7 +1304,7 @@ mod tests {
                     address,
                     1,
                     h3::self_signed_config().unwrap(),
-                    false,
+                    crate::uring::ClientAuth::None,
                     None,
                     Some(vec![socket]),
                     admission,

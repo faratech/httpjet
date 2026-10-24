@@ -33,6 +33,7 @@ pub(super) enum RwResult {
         target_url: String,
         proxy_host: Option<String>,
         env: Vec<(String, String)>,
+        authority_substituted: bool,
     },
     Redirect {
         code: u16,
@@ -487,6 +488,7 @@ pub(super) fn run_rewrite(
 #[derive(Debug, Clone)]
 pub(super) struct RewriteHop {
     pub(super) path: String,
+    pub(super) query: String,
     pub(super) chain: Vec<(PathBuf, Arc<Htaccess>)>,
 }
 
@@ -869,7 +871,7 @@ thread_local! {
 /// `RewriteCond %{HTTP:...}` vars (`cache_key_vars`) from the chain whose
 /// conds actually ran PLUS the vhost's inline rules (the same sources as
 /// [`page_cache_ua_class`], not just the destination chain). Each present
-/// header contributes `name:<fnv64>;` in sorted order; absent headers keep
+/// header contributes `name:<sha256>;` in sorted order; absent headers keep
 /// the historic key. `user-agent` is excluded only when a rewrite cond set
 /// is fully UA-classifiable and no SetEnvIf reads it; otherwise its raw value
 /// is folded. `origin` is included so inline and pre-rewrite Origin reads key
@@ -958,13 +960,10 @@ pub(crate) fn page_cache_header_vary(
 }
 
 fn append_header_vary(out: &mut String, name: &str, value: &str) {
-    use std::fmt::Write;
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for &byte in value.as_bytes() {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let _ = write!(out, "{name}:{hash:016x};");
+    out.push_str(name);
+    out.push(':');
+    crate::lscache::push_vary_digest(out, value.as_bytes());
+    out.push(';');
 }
 
 /// Header extraction for outcome-cache keying, byte-identical to the engine's
@@ -1230,6 +1229,7 @@ fn run_rewrite_inner(
             note_extra(&mut trace.extra, chain, &dest);
             trace.hops.push(RewriteHop {
                 path: new_path.clone(),
+                query: new_query.clone().unwrap_or_default(),
                 chain: dest.clone(),
             });
             hop_chain = Cow::Owned(dest);
@@ -1302,6 +1302,7 @@ fn run_rewrite_inner(
         note_extra(&mut trace.extra, chain, &dest);
         trace.hops.push(RewriteHop {
             path: new_path.clone(),
+            query: new_query.clone().unwrap_or_default(),
             chain: dest.clone(),
         });
         // The internal redirect's env (Apache sets it on the redirected request;
@@ -1341,12 +1342,14 @@ fn terminal_outcome(outcome: RewriteOutcome, mut all: Vec<(String, String)>) -> 
             target_url,
             proxy_host,
             mut env,
+            authority_substituted,
         } => {
             all.append(&mut env);
             RwResult::Proxy {
                 target_url,
                 proxy_host,
                 env: all,
+                authority_substituted,
             }
         }
         RewriteOutcome::Redirect {

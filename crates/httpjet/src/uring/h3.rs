@@ -209,7 +209,7 @@ const MAX_SETTINGS_PAYLOAD: usize = 64 * 1024;
 struct QuicServerPolicy {
     config: Arc<ServerConfig>,
     serving_view: Option<crate::serving_generation::ServingView>,
-    require_client_cert: bool,
+    client_auth: crate::uring::ClientAuth,
 }
 
 /// Fully validated replacement for future QUIC handshakes. Preparing this is
@@ -220,23 +220,23 @@ impl PreparedQuicPolicy {
     pub(crate) fn prepare(
         serving_view: crate::serving_generation::ServingView,
         rustls: Arc<rustls::ServerConfig>,
-        require_client_cert: bool,
+        client_auth: crate::uring::ClientAuth,
     ) -> io::Result<Self> {
         Ok(Self(Arc::new(QuicServerPolicy {
             config: Arc::new(server_config(rustls)?),
             serving_view: Some(serving_view),
-            require_client_cert,
+            client_auth,
         })))
     }
 
     fn prepare_unscoped(
         rustls: Arc<rustls::ServerConfig>,
-        require_client_cert: bool,
+        client_auth: crate::uring::ClientAuth,
     ) -> io::Result<Self> {
         Ok(Self(Arc::new(QuicServerPolicy {
             config: Arc::new(server_config(rustls)?),
             serving_view: None,
-            require_client_cert,
+            client_auth,
         })))
     }
 
@@ -271,7 +271,7 @@ impl QuicReloadHandle {
     pub(crate) fn test_snapshot(&self) -> (bool, Option<Arc<()>>) {
         let policy = self.load_full();
         (
-            policy.require_client_cert,
+            policy.client_auth.required(),
             policy
                 .serving_view
                 .as_ref()
@@ -340,6 +340,8 @@ struct H3RequestSnapshot {
     deadline: Option<H3RequestDeadlineKey>,
     /// Extension state for `deadline`, armed with it (#1035).
     progress: Option<BodyProgress<Instant>>,
+    /// Queued in `H3State::readable_requests`.
+    read_queued: bool,
 }
 
 impl H3RequestSnapshot {
@@ -350,6 +352,7 @@ impl H3RequestSnapshot {
             generation: None,
             deadline: None,
             progress: None,
+            read_queued: false,
         }
     }
 }
@@ -475,7 +478,7 @@ impl H3RuntimeConfig {
                 .serving_view
                 .as_ref()
                 .map(|view| view.pin_connection()),
-            require_client_cert: policy.require_client_cert,
+            client_auth: policy.client_auth,
             epoch,
             body_budget: Some(self.body_budget.clone()),
             egress_budget: Some(H3EgressBudget::new(self.body_budget.clone())),
@@ -715,6 +718,10 @@ struct H3State {
     /// Limits and dispatch generation captured once when each stream is accepted.
     /// This travels with the buffered request until dispatch or reclamation.
     request_snapshots: std::collections::HashMap<StreamId, H3RequestSnapshot>,
+    /// Unfinished request streams with data, FIN or a reset to read: each newly
+    /// accepted stream and each `StreamEvent::Readable`, at most once per stream
+    /// (`H3RequestSnapshot::read_queued`). A drive reads only these.
+    readable_requests: Vec<StreamId>,
     /// Accumulated request bytes per in-flight bidi stream (a request's HEADERS+DATA
     /// frames may arrive across several datagrams); drained + handled on stream fin.
     req_buf: std::collections::HashMap<StreamId, Vec<u8>>,
@@ -744,7 +751,7 @@ struct H3State {
     rejected: bool,
     /// Accept-time mTLS policy. Established connections retain the decision
     /// from the QUIC configuration that authenticated their handshake.
-    require_client_cert: bool,
+    client_auth: crate::uring::ClientAuth,
     /// Encoded response bytes not yet fully written to the send stream, with the
     /// byte offset already accepted. QUIC stream flow control bounds how much
     /// `SendStream::write` accepts at once, so a large response (> the peer's stream
@@ -759,6 +766,7 @@ struct H3State {
     /// STOP_SENDING must drop the monoio request task so the bridge drops its response
     /// receiver, cancels the tokio pipeline future, and releases the global slot.
     request_cancellations: RequestCancellations,
+    cancel_budget: CancelBudget,
     /// Per-connection generation, assigned from a per-core counter at accept. quinn-proto
     /// reuses `ConnectionHandle` indices after a connection drains, so a response from a
     /// spawned task that finished AFTER its connection closed (and the handle was reused by
@@ -793,6 +801,7 @@ impl H3State {
             generation,
             deadline: None,
             progress: None,
+            read_queued: false,
         }
     }
 
@@ -824,7 +833,30 @@ impl H3State {
                 self.next_request_deadline_sequence =
                     self.next_request_deadline_sequence.wrapping_add(1);
             }
+            // Its first bytes arrived with the frame that opened it, which quinn
+            // reports as `Opened`, never as `Readable`.
+            snapshot.read_queued = true;
+            self.readable_requests.push(id);
             self.request_snapshots.insert(id, snapshot);
+        }
+    }
+
+    /// Queue request stream `id` for the next receive pass after a
+    /// `StreamEvent::Readable`; false if it is not an unfinished request stream.
+    fn queue_readable_request(&mut self, id: StreamId) -> bool {
+        match self.request_snapshots.get_mut(&id) {
+            Some(snapshot) => {
+                if !std::mem::replace(&mut snapshot.read_queued, true) {
+                    self.readable_requests.push(id);
+                }
+                true
+            }
+            None if self.requests.contains(&id) => {
+                // A tracked stream without a snapshot is reclaimed by the receive pass.
+                self.readable_requests.push(id);
+                true
+            }
+            None => false,
         }
     }
 
@@ -902,27 +934,27 @@ fn recv_drain_should_continue(completed_batches: usize, received_messages: usize
 }
 
 #[derive(Clone, Copy)]
-struct RequestDeadlineKey {
+struct ConnectionDeadlineKey {
     when: Instant,
     sequence: u64,
     handle: ConnectionHandle,
 }
 
-impl PartialEq for RequestDeadlineKey {
+impl PartialEq for ConnectionDeadlineKey {
     fn eq(&self, other: &Self) -> bool {
         self.when == other.when && self.sequence == other.sequence
     }
 }
 
-impl Eq for RequestDeadlineKey {}
+impl Eq for ConnectionDeadlineKey {}
 
-impl PartialOrd for RequestDeadlineKey {
+impl PartialOrd for ConnectionDeadlineKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for RequestDeadlineKey {
+impl Ord for ConnectionDeadlineKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.when
             .cmp(&other.when)
@@ -930,33 +962,45 @@ impl Ord for RequestDeadlineKey {
     }
 }
 
-/// Per-core index of the nearest absolute request deadline. There is exactly
-/// one node per connection, so packet processing never scans every connection
-/// and the index cannot accumulate lazy tombstones.
+/// Per-core index of each connection's next deadline: its QUIC timer or an HTTP/3
+/// handshake, request or send-stall deadline ([`connection_deadline`]). There is
+/// exactly one node per connection, so neither packet processing nor the timer wait
+/// scans every connection, and the index cannot accumulate lazy tombstones. Every
+/// path that touches a connection drives it, and every drive re-syncs its node.
 #[derive(Default)]
-struct RequestDeadlineIndex {
-    ordered: BTreeSet<RequestDeadlineKey>,
-    by_connection: HashMap<ConnectionHandle, RequestDeadlineKey>,
+struct ConnectionDeadlineIndex {
+    ordered: BTreeSet<ConnectionDeadlineKey>,
+    by_connection: HashMap<ConnectionHandle, ConnectionDeadlineKey>,
     next_sequence: u64,
 }
 
-impl RequestDeadlineIndex {
+impl ConnectionDeadlineIndex {
     fn sync(&mut self, handle: ConnectionHandle, deadline: Option<Instant>) {
-        if self.by_connection.get(&handle).map(|key| key.when) == deadline {
-            return;
-        }
-        self.remove(handle);
         let Some(when) = deadline else {
+            self.remove(handle);
             return;
         };
-        let key = RequestDeadlineKey {
-            when,
-            sequence: self.next_sequence,
-            handle,
-        };
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        self.ordered.insert(key);
-        self.by_connection.insert(handle, key);
+        let sequence = self.next_sequence;
+        match self.by_connection.entry(handle) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().when == when {
+                    return;
+                }
+                self.ordered.remove(entry.get());
+                let key = entry.get_mut();
+                key.when = when;
+                key.sequence = sequence;
+                self.ordered.insert(*key);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                self.ordered.insert(*entry.insert(ConnectionDeadlineKey {
+                    when,
+                    sequence,
+                    handle,
+                }));
+            }
+        }
+        self.next_sequence = sequence.wrapping_add(1);
     }
 
     fn remove(&mut self, handle: ConnectionHandle) {
@@ -982,6 +1026,23 @@ impl RequestDeadlineIndex {
             self.by_connection.remove(&key.handle);
             affected.insert(key.handle);
         }
+    }
+}
+
+/// When the driver must next revisit `hd` on its own: the earlier of its QUIC timer
+/// (which only quinn calls on the connection can move) and its HTTP/3 deadlines.
+fn connection_deadline(
+    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+    h3: &HashMap<ConnectionHandle, H3State>,
+    hd: ConnectionHandle,
+) -> Option<Instant> {
+    let quic = conns
+        .get_mut(&hd)
+        .and_then(quinn_proto::Connection::poll_timeout);
+    let h3 = h3.get(&hd).and_then(H3State::next_deadline);
+    match (quic, h3) {
+        (Some(quic), Some(h3)) => Some(quic.min(h3)),
+        (quic, h3) => quic.or(h3),
     }
 }
 
@@ -1229,6 +1290,44 @@ impl PendingPart {
             }
         }
     }
+}
+
+/// Peer cancellations (RESET_STREAM or STOP_SENDING) of request streams that were still
+/// being received or still had dispatched work: a burst of `H3_CANCEL_BURST`, then one
+/// per `H3_CANCEL_REFILL`. Completed responses never refund it, so open→cancel churn
+/// cannot keep it level the way a net counter can; a browser abandoning a page's
+/// in-flight requests stays far inside the burst.
+const H3_CANCEL_BURST: u32 = 200;
+const H3_CANCEL_REFILL: Duration = Duration::from_millis(100);
+
+/// GCRA form of a token bucket: one instant per connection, O(1) per charge.
+#[derive(Default)]
+struct CancelBudget {
+    /// When the charges so far are fully paid back at the refill rate.
+    debt_until: Option<Instant>,
+}
+
+impl CancelBudget {
+    /// Charge one cancellation at `now`; true once the burst is exhausted.
+    fn charge(&mut self, now: Instant) -> bool {
+        let debt_until = self.debt_until.filter(|t| *t > now).unwrap_or(now) + H3_CANCEL_REFILL;
+        self.debt_until = Some(debt_until);
+        debt_until - now > H3_CANCEL_REFILL * H3_CANCEL_BURST
+    }
+}
+
+/// Charge one peer cancellation of an unanswered request stream. Once the budget is
+/// exhausted every dispatched request is cancelled and the error to close with returned.
+fn charge_request_cancel(st: &mut H3State, now: Instant) -> Option<H3ConnectionError> {
+    if !st.cancel_budget.charge(now) {
+        return None;
+    }
+    cancel_all_dispatched_requests(st);
+    st.rejected = true;
+    Some(H3ConnectionError::new(
+        H3_EXCESSIVE_LOAD,
+        b"excessive HTTP/3 request cancellation",
+    ))
 }
 
 fn cancel_dispatched_request(st: &mut H3State, id: StreamId) {
@@ -1490,45 +1589,46 @@ where
 }
 
 /// Reclaim a request stream's per-connection bookkeeping (slot + buffered bytes),
-/// returning whatever was buffered. Used when a stream is gone (reset/closed),
+/// returning whatever body was buffered. Used when a stream is gone (reset/closed),
 /// oversize, or fully received — every removal from `requests` goes through here so a
 /// stream can never be dropped from one map but left in the other.
 fn reclaim_request(st: &mut H3State, id: StreamId) -> Bytes {
-    let (bytes, lease, _snapshot) = take_request_for_dispatch(st, id);
-    st.total_req_bytes
-        .set(st.total_req_bytes.get().saturating_sub(bytes.len()));
-    match lease {
-        Some(lease) => lease.into_bytes(bytes),
-        None => Bytes::from(bytes),
+    let taken = take_request_for_dispatch(st, id);
+    release_request_charge(st, taken.frames.charged);
+    match taken.lease {
+        Some(lease) => lease.into_bytes(taken.body),
+        None => Bytes::from(taken.body),
     }
 }
 
-fn take_request_for_dispatch(
-    st: &mut H3State,
-    id: StreamId,
-) -> (
-    Vec<u8>,
-    Option<hj_core::budget::BodyBufferLease>,
-    Option<H3RequestSnapshot>,
-) {
+/// A request stream's receive state, removed from the connection in one step.
+struct TakenRequest {
+    body: Vec<u8>,
+    frames: H3FrameCounter,
+    lease: Option<hj_core::budget::BodyBufferLease>,
+    snapshot: Option<H3RequestSnapshot>,
+}
+
+fn take_request_for_dispatch(st: &mut H3State, id: StreamId) -> TakenRequest {
     st.requests.remove(&id);
-    st.req_frames.remove(&id);
     let snapshot = st.request_snapshots.remove(&id);
     if let Some(deadline) = snapshot.as_ref().and_then(|snapshot| snapshot.deadline) {
         st.request_deadlines.remove(&deadline);
     }
-    (
-        st.req_buf.remove(&id).unwrap_or_default(),
-        st.body_leases.remove(&id),
+    TakenRequest {
+        body: st.req_buf.remove(&id).unwrap_or_default(),
+        frames: st.req_frames.remove(&id).unwrap_or_default(),
+        lease: st.body_leases.remove(&id),
         snapshot,
-    )
+    }
 }
 
 /// Release unfinished request allocations as soon as the connection is lost.
 /// Dispatched requests own separate leases and keep their remaining charge.
 fn reclaim_buffered_requests(st: &mut H3State) {
-    let bytes: usize = st.req_buf.values().map(Vec::len).sum();
+    let bytes: usize = st.req_frames.values().map(|frames| frames.charged).sum();
     st.requests.clear();
+    st.readable_requests.clear();
     st.request_deadlines.clear();
     st.request_snapshots.clear();
     st.req_frames.clear();
@@ -1592,26 +1692,30 @@ fn decode_request_head(field: &[u8], max_header_bytes: usize) -> H3RequestHead {
     }
 }
 
-/// Bytes `range` of a request stream whose first `buffered.len()` bytes are already
-/// buffered and whose following bytes start `input`.
-fn request_stream_bytes<'a>(
-    buffered: &'a [u8],
-    input: &'a [u8],
-    range: std::ops::Range<usize>,
-) -> Option<std::borrow::Cow<'a, [u8]>> {
-    let base = buffered.len();
-    if range.end <= base {
-        return buffered.get(range).map(std::borrow::Cow::Borrowed);
-    }
-    let tail = input.get(range.start.saturating_sub(base)..range.end - base)?;
-    if range.start >= base {
-        return Some(std::borrow::Cow::Borrowed(tail));
-    }
-    Some(std::borrow::Cow::Owned(
-        [buffered.get(range.start..)?, tail].concat(),
-    ))
+/// Heap a decoded field section retains until dispatch: each field's slot and its
+/// owned name and value, plus RFC 9114's 32 bytes per field for allocator rounding.
+/// A one-byte static reference decodes to about 80 bytes, so this, not the wire
+/// size, is what the request must hold against its budgets.
+fn decoded_head_footprint(fields: &[(Vec<u8>, Vec<u8>)], slots: usize) -> usize {
+    fields.iter().fold(
+        slots.saturating_mul(std::mem::size_of::<(Vec<u8>, Vec<u8>)>()),
+        |sum, (name, value)| {
+            sum.saturating_add(32)
+                .saturating_add(name.capacity())
+                .saturating_add(value.capacity())
+        },
+    )
 }
 
+/// Frames one request may carry that advance neither its head nor its body: empty
+/// DATA or HEADERS, and extension or reserved (grease) frames. A client sends a
+/// handful; each costs a frame parse but no buffered progress, so a flood of them is
+/// closed with H3_EXCESSIVE_LOAD (H2 bounds the same class at this count).
+const H3_NO_PROGRESS_FRAMES: u32 = 10_000;
+
+/// Incremental parser for one request stream. The receive path validates every frame
+/// once, as it arrives, and keeps only what dispatch needs: the field sections and the
+/// DATA payloads, compacted into the stream's body buffer. Dispatch never reparses.
 #[derive(Default)]
 struct H3FrameCounter {
     phase: H3FramePhase,
@@ -1621,8 +1725,20 @@ struct H3FrameCounter {
     frame_type: u64,
     header_bytes: usize,
     body_bytes: usize,
-    /// Stream range of the first HEADERS frame's payload (the request field section).
-    field: Option<std::ops::Range<usize>>,
+    /// Request-stream bytes received, framing included.
+    wire_bytes: usize,
+    /// Bytes this stream holds against the connection's `total_req_bytes`: its wire
+    /// bytes and its decoded head.
+    charged: usize,
+    /// [`decoded_head_footprint`] of `head` once decoded.
+    head_footprint: usize,
+    no_progress_frames: u32,
+    /// The first HEADERS frame's payload (the request field section).
+    field: Option<Vec<u8>>,
+    trailers: Option<Vec<u8>>,
+    /// The frame sequence is not a request (dispatch answers 400): DATA before the
+    /// head or after trailers, or a third HEADERS frame.
+    malformed: bool,
     head: H3RequestHead,
 }
 
@@ -1631,7 +1747,16 @@ enum H3FramePhase {
     #[default]
     Type,
     Length,
-    Payload(usize),
+    Payload(usize, PayloadSink),
+}
+
+/// Where a frame payload's bytes are kept.
+#[derive(Clone, Copy)]
+enum PayloadSink {
+    Field,
+    Trailers,
+    Body,
+    Discard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1642,6 +1767,8 @@ enum RequestFrameError {
     TooLarge,
     /// DATA past the declared content-length (RFC 9114 §4.1.2): H3_MESSAGE_ERROR.
     Malformed,
+    /// Over [`H3_NO_PROGRESS_FRAMES`]: the connection is closed with H3_EXCESSIVE_LOAD.
+    ExcessiveLoad,
 }
 
 fn request_frame_forbidden(frame_type: u64) -> bool {
@@ -1678,11 +1805,12 @@ impl H3FrameCounter {
         None
     }
 
-    /// Validate `input`, the stream bytes that follow the already-buffered `buffered`.
+    /// Validate `input`, the next bytes of the request stream, appending its DATA
+    /// payloads to `body`.
     fn consume(
         &mut self,
-        buffered: &[u8],
         input: &[u8],
+        body: &mut Vec<u8>,
         limits: H3RequestLimits,
     ) -> Result<(), RequestFrameError> {
         let mut pos = 0usize;
@@ -1705,7 +1833,13 @@ impl H3FrameCounter {
                     let Ok(length) = usize::try_from(length) else {
                         return Err(RequestFrameError::Limit);
                     };
-                    match self.frame_type {
+                    if length == 0 || !matches!(self.frame_type, 0x00 | 0x01) {
+                        self.no_progress_frames += 1;
+                        if self.no_progress_frames > H3_NO_PROGRESS_FRAMES {
+                            return Err(RequestFrameError::ExcessiveLoad);
+                        }
+                    }
+                    let sink = match self.frame_type {
                         0x01 => {
                             let Some(total) = self.header_bytes.checked_add(length) else {
                                 return Err(RequestFrameError::Limit);
@@ -1715,29 +1849,55 @@ impl H3FrameCounter {
                             }
                             self.header_bytes = total;
                             if self.field.is_none() {
-                                let start = buffered.len() + pos;
-                                self.field = Some(start..start + length);
+                                self.field = Some(Vec::new());
+                                PayloadSink::Field
+                            } else if self.trailers.is_none() {
+                                self.trailers = Some(Vec::new());
+                                PayloadSink::Trailers
+                            } else {
+                                self.malformed = true;
+                                PayloadSink::Discard
                             }
                         }
                         0x00 => {
-                            let consumed = input.get(..pos).unwrap_or_default();
-                            self.data_frame(buffered, consumed, length, limits)?;
+                            self.data_frame(length, limits)?;
+                            if self.field.is_none() || self.trailers.is_some() {
+                                self.malformed = true;
+                            }
+                            if self.malformed {
+                                PayloadSink::Discard
+                            } else {
+                                PayloadSink::Body
+                            }
                         }
-                        _ => {}
-                    }
+                        _ => PayloadSink::Discard,
+                    };
                     self.phase = if length == 0 {
                         H3FramePhase::Type
                     } else {
-                        H3FramePhase::Payload(length)
+                        H3FramePhase::Payload(length, sink)
                     };
                 }
-                H3FramePhase::Payload(remaining) => {
+                H3FramePhase::Payload(remaining, sink) => {
                     let consumed = remaining.min(input.len() - pos);
+                    let payload = &input[pos..pos + consumed];
+                    match sink {
+                        PayloadSink::Field => self
+                            .field
+                            .get_or_insert_default()
+                            .extend_from_slice(payload),
+                        PayloadSink::Trailers => self
+                            .trailers
+                            .get_or_insert_default()
+                            .extend_from_slice(payload),
+                        PayloadSink::Body => body.extend_from_slice(payload),
+                        PayloadSink::Discard => {}
+                    }
                     pos += consumed;
                     self.phase = if consumed == remaining {
                         H3FramePhase::Type
                     } else {
-                        H3FramePhase::Payload(remaining - consumed)
+                        H3FramePhase::Payload(remaining - consumed, sink)
                     };
                 }
             }
@@ -1749,18 +1909,20 @@ impl H3FrameCounter {
     /// before any of its payload is buffered, as H2 checks each DATA frame (#1014).
     fn data_frame(
         &mut self,
-        buffered: &[u8],
-        input: &[u8],
         length: usize,
         limits: H3RequestLimits,
     ) -> Result<(), RequestFrameError> {
         if matches!(self.head, H3RequestHead::Pending)
-            && let Some(field) = self
-                .field
-                .clone()
-                .and_then(|range| request_stream_bytes(buffered, input, range))
+            && let Some(field) = self.field.as_deref()
         {
-            self.head = decode_request_head(&field, limits.max_header_bytes);
+            self.head = decode_request_head(field, limits.max_header_bytes);
+            if let H3RequestHead::Decoded {
+                fields: (fields, _),
+                ..
+            } = &self.head
+            {
+                self.head_footprint = decoded_head_footprint(fields, fields.capacity());
+            }
         }
         let Some(total) = self.body_bytes.checked_add(length) else {
             return Err(RequestFrameError::Limit);
@@ -1789,15 +1951,56 @@ impl H3FrameCounter {
         Ok(())
     }
 
-    fn take_decoded_head(&mut self) -> Option<DecodedFieldSection> {
-        match std::mem::take(&mut self.head) {
+    /// The request received through FIN: its field sections, `body` (carrying `lease`)
+    /// and the head decoded on the receive path, if any. `None` when the stream does not
+    /// hold exactly one request (dispatch answers 400).
+    fn finish(
+        self,
+        body: Vec<u8>,
+        lease: Option<hj_core::budget::BodyBufferLease>,
+    ) -> Option<(ParsedH3Request, Option<DecodedFieldSection>)> {
+        let at_frame_boundary = matches!(self.phase, H3FramePhase::Type) && self.varint_len == 0;
+        if self.malformed || !at_frame_boundary {
+            return None;
+        }
+        let field = self.field?;
+        let body = if body.is_empty() {
+            Bytes::new()
+        } else {
+            match lease {
+                // Dispatch consumes the decoded head before its first await; only the
+                // wire bytes stay reserved for the body's lifetime.
+                Some(mut lease) => {
+                    lease.release(self.head_footprint as u64);
+                    lease.into_bytes(body)
+                }
+                None => Bytes::from(body),
+            }
+        };
+        let head = match self.head {
+            H3RequestHead::Decoded { fields, .. } => Some(fields),
+            _ => None,
+        };
+        Some((
+            ParsedH3Request {
+                field,
+                body,
+                trailers: self.trailers,
+            },
+            head,
+        ))
+    }
+
+    #[cfg(test)]
+    fn decoded_head(&self) -> Option<&DecodedFieldSection> {
+        match &self.head {
             H3RequestHead::Decoded { fields, .. } => Some(fields),
             _ => None,
         }
     }
 }
 
-/// Returns the stream's buffered request bytes.
+/// Returns the stream's received bytes, framing included.
 fn append_request_bytes(
     st: &mut H3State,
     id: StreamId,
@@ -1810,30 +2013,36 @@ fn append_request_bytes(
     if total > limits.max_connection_bytes {
         return Err(RequestFrameError::Limit);
     }
-    let buffered = st.req_buf.get(&id).map_or(&[][..], Vec::as_slice);
-    st.req_frames
-        .entry(id)
-        .or_default()
-        .consume(buffered, bytes, limits)?;
-    // (security #263) Reserve against the server-wide budget BEFORE extending, so
+    let frames = st.req_frames.entry(id).or_default();
+    let decoded_before = frames.head_footprint;
+    frames.consume(bytes, st.req_buf.entry(id).or_default(), limits)?;
+    // The head decodes at most once, at the first DATA frame header.
+    let charge = bytes.len() + (frames.head_footprint - decoded_before);
+    let Some(total) = total.checked_add(charge - bytes.len()) else {
+        return Err(RequestFrameError::Limit);
+    };
+    if total > limits.max_connection_bytes {
+        return Err(RequestFrameError::Limit);
+    }
+    // (security #263) Reserve against the server-wide budget before accounting, so
     // pre-dispatch accumulation is bounded by the same cap as H1/H2/LSAPI. The
-    // owned reservation follows the buffer through dispatch and every drop path.
+    // owned reservation follows the body through dispatch and every drop path.
     if let Some(budget) = st.body_budget.clone() {
         let lease = st
             .body_leases
             .entry(id)
             .or_insert_with(|| hj_core::budget::BodyBufferLease::new(budget));
-        if !lease.reserve(bytes.len() as u64) {
+        if !lease.reserve(charge as u64) {
             return Err(RequestFrameError::Limit);
         }
     }
-    let buffer = st.req_buf.entry(id).or_default();
-    buffer.extend_from_slice(bytes);
+    frames.charged += charge;
+    frames.wire_bytes += bytes.len();
     st.total_req_bytes.set(total);
-    if buffer.len() > limits.max_request_wire_bytes {
+    if frames.wire_bytes > limits.max_request_wire_bytes {
         Err(RequestFrameError::Limit)
     } else {
-        Ok(buffer.len())
+        Ok(frames.wire_bytes)
     }
 }
 
@@ -2436,7 +2645,7 @@ fn service_conn(
                 });
                 let eligible = conns.get(&hd).is_some_and(|conn| {
                     h3_client_eligible(
-                        st.require_client_cert,
+                        st.client_auth.required(),
                         leaf.is_some(),
                         conn.remote_address(),
                     )
@@ -2511,7 +2720,7 @@ fn service_conn(
         st.handshake_slot = None;
     }
     for id in readable {
-        if !st.request_cancellations.contains_key(&id) {
+        if st.queue_readable_request(id) || !st.request_cancellations.contains_key(&id) {
             continue;
         }
         let reset = conns.get_mut(&hd).is_some_and(|conn| {
@@ -2528,32 +2737,9 @@ fn service_conn(
                     .send_stream(id)
                     .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             }
-        }
-    }
-    for id in stopped {
-        if let Some(error) = reject_stopped_local_critical_stream(st, id) {
-            if let Some(conn) = conns.get_mut(&hd) {
-                conn.close(
-                    now,
-                    quinn_proto::VarInt::from_u32(error.code),
-                    Bytes::from_static(error.reason),
-                );
-            }
-            return;
-        }
-        let receiving = st.requests.contains(&id);
-        if receiving {
-            reclaim_request(st, id);
-        }
-        cancel_dispatched_request(st, id);
-        if let Some(conn) = conns.get_mut(&hd) {
-            let _ = conn
-                .send_stream(id)
-                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
-            if receiving {
-                let _ = conn
-                    .recv_stream(id)
-                    .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
+            if let Some(error) = charge_request_cancel(st, now) {
+                close_h3_connection(conns, hd, now, error);
+                return;
             }
         }
     }
@@ -2637,6 +2823,52 @@ fn service_conn(
             let _ = c.recv_stream(id).stop(code);
             let _ = c.send_stream(id).reset(code);
         }
+    }
+    if st.rejected {
+        return;
+    }
+    // After the accept loop: a STOP_SENDING that arrived with its request must find the
+    // stream tracked, or the stream would later be dispatched with no cancellation token.
+    for id in stopped {
+        if let Some(error) = reject_stopped_local_critical_stream(st, id) {
+            close_h3_connection(conns, hd, now, error);
+            return;
+        }
+        let receiving = st.requests.contains(&id);
+        let unanswered = receiving || st.request_cancellations.contains_key(&id);
+        if receiving {
+            reclaim_request(st, id);
+        }
+        cancel_dispatched_request(st, id);
+        if let Some(conn) = conns.get_mut(&hd) {
+            let _ = conn
+                .send_stream(id)
+                .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
+            if receiving {
+                let _ = conn
+                    .recv_stream(id)
+                    .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
+            }
+        }
+        if unanswered && let Some(error) = charge_request_cancel(st, now) {
+            close_h3_connection(conns, hd, now, error);
+            return;
+        }
+    }
+}
+
+fn close_h3_connection(
+    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+    hd: ConnectionHandle,
+    now: Instant,
+    error: H3ConnectionError,
+) {
+    if let Some(conn) = conns.get_mut(&hd) {
+        conn.close(
+            now,
+            quinn_proto::VarInt::from_u32(error.code),
+            Bytes::from_static(error.reason),
+        );
     }
 }
 
@@ -2873,6 +3105,9 @@ fn pump_stream(conn: &mut quinn_proto::Connection, st: &mut H3State, id: StreamI
                 acknowledge_front_part(entry);
             }
             Ok(false) | Err(WriteError::Blocked) => break false,
+            // The peer's STOP_SENDING is also queued as `StreamEvent::Stopped`, which
+            // cancels the dispatched work and charges the cancellation budget.
+            Err(WriteError::Stopped(_)) => break true,
             Err(_) => {
                 cancelled = true;
                 break true;
@@ -3009,18 +3244,20 @@ fn receive_request_streams(
     st: &mut H3State,
     now: Instant,
 ) -> Vec<StreamId> {
-    let req_ids: Vec<StreamId> = st.requests.iter().copied().collect();
+    let mut req_ids = std::mem::take(&mut st.readable_requests);
     let mut finished = Vec::new();
-    for id in req_ids {
-        let Some((request_limits, progress)) = st
-            .request_snapshots
-            .get(&id)
-            .map(|snapshot| (snapshot.config.limits, snapshot.progress))
-        else {
-            // Internal invariant failure: never receive under a live-reloaded
-            // policy chosen after this stream began. Reclaim and fail closed.
-            reclaim_request(st, id);
-            refuse_request_stream(c, st, id, RequestFrameError::Limit);
+    for &id in &req_ids {
+        let Some((request_limits, progress)) = st.request_snapshots.get_mut(&id).map(|snapshot| {
+            snapshot.read_queued = false;
+            (snapshot.config.limits, snapshot.progress)
+        }) else {
+            if st.requests.contains(&id) {
+                // Internal invariant failure: never receive under a live-reloaded
+                // policy chosen after this stream began. Reclaim and fail closed.
+                reclaim_request(st, id);
+                refuse_request_stream(c, st, id, RequestFrameError::Limit);
+            }
+            // Otherwise reclaimed (stopped, expired or refused) since it was queued.
             continue;
         };
         let mut buffered = None;
@@ -3042,16 +3279,33 @@ fn receive_request_streams(
             let _ = c
                 .send_stream(id)
                 .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
+            if let Some(error) = charge_request_cancel(st, now) {
+                c.close(
+                    now,
+                    quinn_proto::VarInt::from_u32(error.code),
+                    Bytes::from_static(error.reason),
+                );
+                break;
+            }
             continue;
         }
         match append {
-            Err(RequestFrameError::Unexpected) => {
+            Err(error @ (RequestFrameError::Unexpected | RequestFrameError::ExcessiveLoad)) => {
                 reclaim_request(st, id);
                 st.rejected = true;
+                let (code, reason): (u32, &'static [u8]) = if error == RequestFrameError::Unexpected
+                {
+                    (
+                        H3_FRAME_UNEXPECTED,
+                        b"frame is forbidden on a request stream",
+                    )
+                } else {
+                    (H3_EXCESSIVE_LOAD, b"request stream frames make no progress")
+                };
                 c.close(
                     now,
-                    quinn_proto::VarInt::from_u32(H3_FRAME_UNEXPECTED),
-                    Bytes::from_static(b"frame is forbidden on a request stream"),
+                    quinn_proto::VarInt::from_u32(code),
+                    Bytes::from_static(reason),
                 );
                 break;
             }
@@ -3069,6 +3323,11 @@ fn receive_request_streams(
         {
             st.extend_request_deadline(id, buffered, now);
         }
+    }
+    // Keep the allocation for the next pass.
+    req_ids.clear();
+    if st.readable_requests.is_empty() {
+        st.readable_requests = req_ids;
     }
     finished
 }
@@ -3104,6 +3363,7 @@ fn refuse_request_stream(
             return;
         }
         RequestFrameError::Malformed => H3_MESSAGE_ERROR,
+        RequestFrameError::ExcessiveLoad => H3_EXCESSIVE_LOAD,
         RequestFrameError::Limit | RequestFrameError::Unexpected => H3_REQUEST_CANCELLED,
     };
     let code = quinn_proto::VarInt::from_u32(code);
@@ -3155,7 +3415,7 @@ async fn drive_one_conn(
     }
     let epoch = h3.get(&hd).map(|s| s.epoch).unwrap_or(0);
     let st = h3.entry(hd).or_default();
-    let require_client_cert = st.require_client_cert;
+    let client_auth = st.client_auth;
 
     // A live connection can receive traffic on other streams forever, so QUIC's
     // connection-wide idle timer cannot bound an unfinished request. Expire these
@@ -3190,12 +3450,13 @@ async fn drive_one_conn(
         return flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
     }
     for id in finished {
-        let decoded_head = st
-            .req_frames
-            .get_mut(&id)
-            .and_then(H3FrameCounter::take_decoded_head);
-        let (req_bytes, body_lease, request_snapshot) = take_request_for_dispatch(st, id);
-        let req_charge = req_bytes.len();
+        let TakenRequest {
+            body: req_body,
+            frames: req_frames,
+            lease: body_lease,
+            snapshot: request_snapshot,
+        } = take_request_for_dispatch(st, id);
+        let req_charge = req_frames.charged;
         let Some(request_snapshot) = request_snapshot else {
             release_request_charge(st, req_charge);
             if let Some(c) = conns.get_mut(&hd) {
@@ -3261,16 +3522,16 @@ async fn drive_one_conn(
                 })
             };
             let outcome = handle_h3_request(
-                req_bytes,
+                req_frames,
+                req_body,
                 body_lease,
-                decoded_head,
                 has_client_cert,
                 tls,
                 sni,
                 peer,
                 local,
                 &bridge,
-                require_client_cert,
+                client_auth,
                 request_limits,
                 request_generation,
                 egress_budget.clone(),
@@ -3406,7 +3667,7 @@ async fn recv_drain(
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
-    request_deadlines: &mut RequestDeadlineIndex,
+    deadlines: &mut ConnectionDeadlineIndex,
     epoch_ctr: &mut u64,
     handshakes: &Arc<AtomicU64>,
     runtime: &H3RuntimeConfig,
@@ -3500,7 +3761,7 @@ async fn recv_drain(
             break; // short batch drained the socket; full batches stop at the cooperative cap
         }
     }
-    request_deadlines.extend_due(&mut affected, Instant::now());
+    deadlines.extend_due(&mut affected, Instant::now());
     affected
 }
 
@@ -3521,7 +3782,7 @@ async fn pump(
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
-    request_deadlines: &mut RequestDeadlineIndex,
+    deadlines: &mut ConnectionDeadlineIndex,
     epoch_ctr: &mut u64,
     handshakes: &Arc<AtomicU64>,
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
@@ -3561,7 +3822,7 @@ async fn pump(
                 tx_scratch,
             )
             .await;
-            request_deadlines.sync(hd, h3.get(&hd).and_then(H3State::next_deadline));
+            deadlines.sync(hd, connection_deadline(conns, h3, hd));
             if more_to_send {
                 next.insert(hd); // hit the per-flush datagram cap → more to send
             }
@@ -3569,21 +3830,8 @@ async fn pump(
         // Process ACKs our sends elicited so cwnd/loss-detection stay current.
         let now = Instant::now();
         for hd in recv_drain(
-            udp,
-            udp_state,
-            recv_bufs,
-            recv_metas,
-            scratch,
-            endpoint,
-            conns,
-            h3,
-            request_deadlines,
-            epoch_ctr,
-            handshakes,
-            runtime,
-            policy,
-            accepting,
-            now,
+            udp, udp_state, recv_bufs, recv_metas, scratch, endpoint, conns, h3, deadlines,
+            epoch_ctr, handshakes, runtime, policy, accepting, now,
         )
         .await
         {
@@ -3591,13 +3839,13 @@ async fn pump(
         }
         to_drive = next;
     }
-    // A request deadline can become due in recv_drain() after the final
-    // cooperative round. extend_due() removes its node while adding the handle
-    // to `to_drive`; if the round cap then ends the loop, reinsert that still-due
-    // minimum so the endpoint's outer pre-select check drives it immediately.
-    // Handles retained only for transmit work keep the pre-existing wakeup path.
+    // A deadline can become due in recv_drain() after the final cooperative
+    // round, and that drain's events can move a QUIC timer. extend_due() removes
+    // a due node while adding the handle to `to_drive`; if the round cap then ends
+    // the loop, re-sync every such handle so the endpoint's outer pre-select check
+    // (or its timer) drives it. Transmit work keeps the pre-existing wakeup path.
     for hd in &to_drive {
-        request_deadlines.sync(*hd, h3.get(hd).and_then(H3State::next_deadline));
+        deadlines.sync(*hd, connection_deadline(conns, h3, *hd));
     }
     let mut drained_handles = Vec::new();
     conns.retain(|hd, c| {
@@ -3609,7 +3857,7 @@ async fn pump(
         !drained
     });
     for hd in drained_handles {
-        request_deadlines.remove(hd);
+        deadlines.remove(hd);
     }
 }
 
@@ -3684,7 +3932,7 @@ async fn endpoint_loop_concurrent(
     // overwhelmed the path and caused ~48% loss on large transfers.
     let mut recv_bufs = recv_slots();
     let mut recv_metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
-    let mut request_deadlines = RequestDeadlineIndex::default();
+    let mut deadlines = ConnectionDeadlineIndex::default();
     let mut draining = false;
     let mut drain_deadline: Option<Instant> = None;
     // Socket capability probing and driver allocations belong to preparation,
@@ -3717,10 +3965,10 @@ async fn endpoint_loop_concurrent(
             return Ok(());
         }
         // The select is intentionally biased toward completions and socket input.
-        // Service overdue request streams before re-entering it so traffic on
-        // unrelated connections cannot starve an absolute deadline indefinitely.
+        // Service overdue connections before re-entering it so traffic on unrelated
+        // connections cannot starve a QUIC timer or absolute deadline indefinitely.
         let mut due = std::collections::HashSet::new();
-        request_deadlines.extend_due(&mut due, now);
+        deadlines.extend_due(&mut due, now);
         if !due.is_empty() {
             pump(
                 &udp,
@@ -3732,7 +3980,7 @@ async fn endpoint_loop_concurrent(
                 &mut endpoint,
                 &mut conns,
                 &mut h3,
-                &mut request_deadlines,
+                &mut deadlines,
                 &mut epoch_ctr,
                 &handshakes,
                 &inflight,
@@ -3747,13 +3995,7 @@ async fn endpoint_loop_concurrent(
             .await;
             continue;
         }
-        let next_request_timeout = request_deadlines.next();
-        let next_timeout = conns
-            .values_mut()
-            .filter_map(|c| c.poll_timeout())
-            .chain(next_request_timeout)
-            .chain(drain_deadline)
-            .min();
+        let next_timeout = deadlines.next().into_iter().chain(drain_deadline).min();
         let timer_base = Instant::now();
         let shutdown_wait = async {
             if draining {
@@ -3771,7 +4013,7 @@ async fn endpoint_loop_concurrent(
                 let now = Instant::now();
                 drain_deadline = Some(now + super::URING_DRAIN_GRACE);
                 let handles = conns.keys().copied().collect();
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
             }
             // (1) Finished request(s): write each response into its stream, then pump the
             // sends (the response streams out cooperatively, interleaved with ACK processing).
@@ -3794,25 +4036,22 @@ async fn endpoint_loop_concurrent(
                     to_drive.insert(hd);
                     completed += 1;
                 }
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
             }
             // (2) Socket readable: GRO-drain queued datagrams, then pump (drive affected conns
             // + interleave further ACK processing). `readable()` is a poll op (cancel-safe).
             _ = udp.readable(false) => {
                 let now = Instant::now();
-                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now).await;
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
+                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now).await;
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
             }
             // (3) A QUIC timer (handshake retransmit / idle / pacing) or absolute
-            // request-stream deadline fired — pump every connection now due.
+            // HTTP/3 deadline fired — pump every connection the index holds as due.
             _ = sleep_until_opt(next_timeout, timer_base) => {
                 let now = Instant::now();
-                let mut due: std::collections::HashSet<ConnectionHandle> = conns
-                    .iter_mut()
-                    .filter_map(|(hd, c)| c.poll_timeout().filter(|t| *t <= now).map(|_| *hd))
-                    .collect();
-                request_deadlines.extend_due(&mut due, now);
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut request_deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
+                let mut due = std::collections::HashSet::new();
+                deadlines.extend_due(&mut due, now);
+                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
             }
         }
     }
@@ -3832,6 +4071,7 @@ use hj_core::Proto;
 use tokio_util::sync::CancellationToken;
 
 /// Read a QUIC/HTTP-3 variable-length integer (RFC 9000 §16) at `*pos`.
+#[cfg(test)]
 fn read_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let first = *buf.get(*pos)?;
     let len = 1usize << (first >> 6);
@@ -3850,79 +4090,32 @@ struct ParsedH3Request {
     trailers: Option<Vec<u8>>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum H3RequestParseError {
     Malformed,
     UnexpectedFrame,
 }
 
-/// Parse an HTTP/3 request stream while preserving the initial and trailing field sections.
-/// DATA payloads are compacted into the input allocation as frames are decoded, so a large
-/// request never coexists with a second full-body allocation.
+/// Parse a whole HTTP/3 message stream with the receive path's incremental parser.
 #[cfg(test)]
 fn parse_h3_request(data: Vec<u8>) -> Result<ParsedH3Request, H3RequestParseError> {
-    parse_h3_request_leased(data, None)
-}
-
-fn parse_h3_request_leased(
-    mut data: Vec<u8>,
-    lease: Option<hj_core::budget::BodyBufferLease>,
-) -> Result<ParsedH3Request, H3RequestParseError> {
-    let mut pos = 0usize;
-    let mut field: Option<Vec<u8>> = None;
-    let mut body_len = 0usize;
-    let mut trailers: Option<Vec<u8>> = None;
-    while pos < data.len() {
-        let ty = read_varint(&data, &mut pos).ok_or(H3RequestParseError::Malformed)?;
-        let len =
-            usize::try_from(read_varint(&data, &mut pos).ok_or(H3RequestParseError::Malformed)?)
-                .map_err(|_| H3RequestParseError::Malformed)?;
-        let end = pos
-            .checked_add(len)
-            .filter(|end| *end <= data.len())
-            .ok_or(H3RequestParseError::Malformed)?;
-        match ty {
-            0x01 => {
-                if field.is_none() {
-                    field = Some(data[pos..end].to_vec());
-                } else if trailers.is_none() {
-                    trailers = Some(data[pos..end].to_vec());
-                } else {
-                    return Err(H3RequestParseError::Malformed);
-                }
-            }
-            0x00 => {
-                if field.is_none() || trailers.is_some() {
-                    return Err(H3RequestParseError::Malformed);
-                }
-                let body_end = body_len
-                    .checked_add(len)
-                    .ok_or(H3RequestParseError::Malformed)?;
-                data.copy_within(pos..end, body_len);
-                body_len = body_end;
-            }
-            ty if request_frame_forbidden(ty) => {
-                return Err(H3RequestParseError::UnexpectedFrame);
-            }
-            _ => {} // extension and grease frame types are ignored as required
-        }
-        pos = end;
-    }
-    let field = field.ok_or(H3RequestParseError::Malformed)?;
-    let body = if body_len == 0 {
-        Bytes::new()
-    } else {
-        data.truncate(body_len);
-        match lease {
-            Some(lease) => lease.into_bytes(data),
-            None => Bytes::from(data),
-        }
-    };
-    Ok(ParsedH3Request {
-        field,
-        body,
-        trailers,
-    })
+    let mut frames = H3FrameCounter::default();
+    let mut body = Vec::new();
+    frames
+        .consume(
+            &data,
+            &mut body,
+            H3RequestLimits::new(usize::MAX, usize::MAX),
+        )
+        .map_err(|error| match error {
+            RequestFrameError::Unexpected => H3RequestParseError::UnexpectedFrame,
+            _ => H3RequestParseError::Malformed,
+        })?;
+    frames
+        .finish(body, None)
+        .map(|(parsed, _)| parsed)
+        .ok_or(H3RequestParseError::Malformed)
 }
 
 fn prepare_h3_response_headers(
@@ -4196,27 +4389,26 @@ fn build_h3_request_head(head: H3RequestHeaders) -> Option<http::request::Builde
 /// Decode one io_uring-H3 request, dispatch it through the bridge (real pipeline), and
 /// encode the response. App-layer mTLS mirrors the TCP TLS path.
 async fn handle_h3_request(
-    req_bytes: Vec<u8>,
+    req_frames: H3FrameCounter,
+    req_body: Vec<u8>,
     body_lease: Option<hj_core::budget::BodyBufferLease>,
-    decoded_head: Option<DecodedFieldSection>,
     has_client_cert: bool,
     tls: Option<hj_core::TlsParams>,
     sni: Option<Arc<str>>,
     peer: SocketAddr,
     local: SocketAddr,
     bridge: &Bridge,
-    require_client_cert: bool,
+    client_auth: crate::uring::ClientAuth,
     request_limits: H3RequestLimits,
     request_generation: Option<crate::serving_generation::RequestGeneration>,
     egress_budget: Option<H3EgressBudget>,
     max_field_section_size: std::rc::Rc<std::cell::Cell<Option<u64>>>,
 ) -> H3Outcome {
-    if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
+    if client_auth.required() && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
         return H3Outcome::full(h3_error(http::StatusCode::FORBIDDEN));
     }
-    let parsed = match parse_h3_request_leased(req_bytes, body_lease) {
-        Ok(v) => v,
-        Err(_) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
+    let Some((parsed, decoded_head)) = req_frames.finish(req_body, body_lease) else {
+        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     };
     if parsed.body.len() > request_limits.max_body_bytes {
         return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
@@ -4285,7 +4477,7 @@ async fn handle_h3_request(
         is_tls: true,
         direct_file_egress: false,
         peer_unix: false,
-        mtls_required: require_client_cert,
+        client_auth_requested: client_auth.requested(),
         sni,
         tls,
         request_generation,
@@ -4418,15 +4610,15 @@ pub(crate) fn serve_h3_pipeline(
     workers: usize,
     rustls_cfg: Arc<rustls::ServerConfig>,
     bridge: Bridge,
-    require_client_cert: bool,
+    client_auth: crate::uring::ClientAuth,
     runtime: H3RuntimeConfig,
     inherited: Option<Vec<std::net::UdpSocket>>,
     shutdown: CancellationToken,
 ) -> io::Result<(super::WorkerGroup, QuicReloadHandle)> {
     let serving_view = runtime.serving_view.clone();
     let policy = match serving_view.clone() {
-        Some(view) => PreparedQuicPolicy::prepare(view, rustls_cfg, require_client_cert)?,
-        None => PreparedQuicPolicy::prepare_unscoped(rustls_cfg, require_client_cert)?,
+        Some(view) => PreparedQuicPolicy::prepare(view, rustls_cfg, client_auth)?,
+        None => PreparedQuicPolicy::prepare_unscoped(rustls_cfg, client_auth)?,
     };
     let policy_handle = QuicReloadHandle::new(policy);
     let sockets = h3_udp_sockets(inherited, addr, workers)?;
@@ -4698,10 +4890,11 @@ mod h3_codec_tests {
             wire.extend(fields);
             wire
         };
-        let run = |wire| {
+        let run = |wire: Vec<u8>| {
+            let (frames, body) = received_request(&wire);
             handle_h3_request(
-                wire,
-                None,
+                frames,
+                body,
                 None,
                 false,
                 None,
@@ -4709,7 +4902,7 @@ mod h3_codec_tests {
                 "127.0.0.1:32000".parse().unwrap(),
                 "127.0.0.1:8443".parse().unwrap(),
                 &bridge,
-                false,
+                crate::uring::ClientAuth::None,
                 H3RequestLimits::new(4096, 4096),
                 None,
                 None,
@@ -4765,9 +4958,10 @@ mod h3_codec_tests {
         wire.extend(fields);
         let mut state = H3State::default();
         let limit = state.peer_max_field_section_size.clone();
+        let (frames, body) = received_request(&wire);
         let request = handle_h3_request(
-            wire,
-            None,
+            frames,
+            body,
             None,
             false,
             None,
@@ -4775,7 +4969,7 @@ mod h3_codec_tests {
             "127.0.0.1:32000".parse().unwrap(),
             "127.0.0.1:8443".parse().unwrap(),
             &bridge,
-            false,
+            crate::uring::ClientAuth::None,
             H3RequestLimits::new(4096, 4096),
             None,
             None,
@@ -5185,8 +5379,9 @@ mod h3_codec_tests {
                 .0,
             &application
         ));
-        let (_, _, dispatched_snapshot) = take_request_for_dispatch(&mut early, first_stream);
-        let dispatched_snapshot = dispatched_snapshot.expect("accepted stream keeps its snapshot");
+        let dispatched_snapshot = take_request_for_dispatch(&mut early, first_stream)
+            .snapshot
+            .expect("accepted stream keeps its snapshot");
         assert_eq!(
             dispatched_snapshot.config.limits.max_body_bytes,
             initial.serve_config.max_req_body_size
@@ -5251,9 +5446,10 @@ mod h3_codec_tests {
         write_varint(&mut wire, 1);
         write_varint(&mut wire, fields.len() as u64);
         wire.extend(fields);
+        let (frames, body) = received_request(&wire);
         let _response = handle_h3_request(
-            wire,
-            None,
+            frames,
+            body,
             None,
             false,
             None,
@@ -5261,7 +5457,7 @@ mod h3_codec_tests {
             "127.0.0.1:32000".parse().unwrap(),
             "127.0.0.1:8443".parse().unwrap(),
             &bridge,
-            false,
+            crate::uring::ClientAuth::None,
             request_snapshot.config.limits,
             request_snapshot.generation,
             None,
@@ -5298,7 +5494,7 @@ mod h3_codec_tests {
         let old = PreparedQuicPolicy::prepare(
             ServingView::new(holder.clone()),
             self_signed_config().unwrap(),
-            false,
+            crate::uring::ClientAuth::None,
         )
         .unwrap();
         let old_policy = old.0.clone();
@@ -5310,7 +5506,7 @@ mod h3_codec_tests {
         let replacement = PreparedQuicPolicy::prepare(
             ServingView::candidate(holder.clone(), candidate.clone()),
             self_signed_config().unwrap(),
-            true,
+            crate::uring::ClientAuth::Required,
         )
         .unwrap();
         let replacement_policy = replacement.0.clone();
@@ -5348,7 +5544,7 @@ mod h3_codec_tests {
         handle.publish(replacement);
         let published = handle.load_full();
         assert!(Arc::ptr_eq(&published, &replacement_policy));
-        assert!(published.require_client_cert);
+        assert!(published.client_auth.required());
         assert!(Arc::ptr_eq(
             &published.serving_view.as_ref().unwrap().load_full(),
             &candidate
@@ -5521,12 +5717,21 @@ mod h3_codec_tests {
         chunk: usize,
         limits: H3RequestLimits,
     ) -> Result<(), RequestFrameError> {
-        let mut buffered = 0;
+        let mut body = Vec::new();
         for piece in stream.chunks(chunk) {
-            counter.consume(&stream[..buffered], piece, limits)?;
-            buffered += piece.len();
+            counter.consume(piece, &mut body, limits)?;
         }
         Ok(())
+    }
+
+    /// The receive path's state for a whole request stream delivered at once.
+    fn received_request(wire: &[u8]) -> (H3FrameCounter, Vec<u8>) {
+        let mut frames = H3FrameCounter::default();
+        let mut body = Vec::new();
+        frames
+            .consume(wire, &mut body, H3RequestLimits::new(64 * 1024, 64 * 1024))
+            .expect("a well-framed request stream");
+        (frames, body)
     }
 
     #[test]
@@ -5551,12 +5756,12 @@ mod h3_codec_tests {
 
         let mut header_too_large = H3FrameCounter::default();
         assert_eq!(
-            header_too_large.consume(&[], &[0x01, 5], limits),
+            header_too_large.consume(&[0x01, 5], &mut Vec::new(), limits),
             Err(RequestFrameError::Limit)
         );
         let mut body_too_large = H3FrameCounter::default();
         assert_eq!(
-            body_too_large.consume(&[], &[0x00, 6], limits),
+            body_too_large.consume(&[0x00, 6], &mut Vec::new(), limits),
             Err(RequestFrameError::Limit)
         );
     }
@@ -5586,13 +5791,55 @@ mod h3_codec_tests {
             let split = encoded.len() - 1;
             assert!(consume_in_chunks(&mut counter, &encoded[..split], 1, limits).is_ok());
             assert_eq!(
-                counter.consume(&encoded[..split], &encoded[split..], limits),
+                counter.consume(&encoded[split..], &mut Vec::new(), limits),
                 Err(RequestFrameError::Unexpected)
             );
         }
 
         let extension = vec![0x01, 0x02, 0x00, 0x00, 0x21, 0x00];
         assert!(parse_h3_request(extension).is_ok());
+    }
+
+    #[test]
+    fn frames_without_progress_are_bounded_per_request() {
+        let limits = H3RequestLimits::new(1024, 1 << 20);
+        let head = request_stream(&UPLOAD_HEAD, &[]);
+        let flood = |frame: &[u8], count: usize| {
+            let mut stream = head.clone();
+            for _ in 0..count {
+                stream.extend_from_slice(frame);
+            }
+            let mut counter = H3FrameCounter::default();
+            consume_in_chunks(&mut counter, &stream, 7, limits)
+        };
+        let budget = H3_NO_PROGRESS_FRAMES as usize;
+        // Empty DATA, empty HEADERS (after the head and trailers) and grease frames.
+        for frame in [&[0x00, 0x00][..], &[0x21, 0x01, b'x'], &[0x40, 0x21, 0x00]] {
+            assert_eq!(flood(frame, budget), Ok(()), "{frame:?}");
+            assert_eq!(
+                flood(frame, budget + 1),
+                Err(RequestFrameError::ExcessiveLoad),
+                "{frame:?}"
+            );
+        }
+        let mut headers = head.clone();
+        headers.extend_from_slice(&[0x01, 0x00]);
+        for _ in 0..budget {
+            headers.extend_from_slice(&[0x01, 0x00]);
+        }
+        assert_eq!(
+            H3FrameCounter::default().consume(&headers, &mut Vec::new(), limits),
+            Err(RequestFrameError::ExcessiveLoad)
+        );
+        // DATA payload is progress: many small frames are only bounded by the body cap.
+        let mut body = Vec::new();
+        let mut counter = H3FrameCounter::default();
+        let mut stream = request_stream(&upload_fields(None), &[]);
+        for _ in 0..3 * budget {
+            stream.extend_from_slice(&[0x00, 0x01, b'b']);
+        }
+        assert_eq!(counter.consume(&stream, &mut body, limits), Ok(()));
+        assert_eq!(body.len(), 3 * budget);
     }
 
     #[test]
@@ -5611,7 +5858,7 @@ mod h3_codec_tests {
         write_varint(&mut exact, 0x00);
         write_varint(&mut exact, LIVE_BODY_LIMIT as u64);
         let mut counter = H3FrameCounter::default();
-        assert!(counter.consume(&[], &exact, limits).is_ok());
+        assert!(counter.consume(&exact, &mut Vec::new(), limits).is_ok());
         assert_eq!(counter.header_bytes, 2);
         assert_eq!(counter.body_bytes, LIVE_BODY_LIMIT);
 
@@ -5619,7 +5866,7 @@ mod h3_codec_tests {
         write_varint(&mut body_over, 0x00);
         write_varint(&mut body_over, (LIVE_BODY_LIMIT + 1) as u64);
         assert_eq!(
-            H3FrameCounter::default().consume(&[], &body_over, limits),
+            H3FrameCounter::default().consume(&body_over, &mut Vec::new(), limits),
             Err(RequestFrameError::Limit)
         );
 
@@ -5628,14 +5875,14 @@ mod h3_codec_tests {
         write_varint(&mut header_exact, LIVE_HEADER_LIMIT as u64);
         assert!(
             H3FrameCounter::default()
-                .consume(&[], &header_exact, limits)
+                .consume(&header_exact, &mut Vec::new(), limits)
                 .is_ok()
         );
         let mut header_over = Vec::new();
         write_varint(&mut header_over, 0x01);
         write_varint(&mut header_over, (LIVE_HEADER_LIMIT + 1) as u64);
         assert_eq!(
-            H3FrameCounter::default().consume(&[], &header_over, limits),
+            H3FrameCounter::default().consume(&header_over, &mut Vec::new(), limits),
             Err(RequestFrameError::Limit)
         );
     }
@@ -5698,7 +5945,7 @@ mod h3_codec_tests {
             assert_eq!(counter.body_bytes, 10);
             let parsed = parse_h3_request(exact).unwrap();
             assert_eq!(
-                counter.take_decoded_head(),
+                counter.decoded_head().cloned(),
                 qpack_decode_limited(&parsed.field, limits.max_header_bytes),
                 "dispatch reuses the head decoded while receiving (chunk={chunk})"
             );
@@ -5707,10 +5954,10 @@ mod h3_codec_tests {
         let mut bodiless = H3FrameCounter::default();
         assert!(
             bodiless
-                .consume(&[], &request_stream(&fields, &[]), limits)
+                .consume(&request_stream(&fields, &[]), &mut Vec::new(), limits)
                 .is_ok()
         );
-        assert!(bodiless.take_decoded_head().is_none());
+        assert!(bodiless.decoded_head().is_none());
     }
 
     #[test]
@@ -5839,6 +6086,106 @@ mod h3_codec_tests {
         assert_eq!(st.total_req_bytes.get(), 0);
     }
 
+    /// HEADERS with `refs` one-byte static references (`age: 0`), then `body` in one DATA frame.
+    fn static_ref_request(refs: usize, body: &[u8]) -> Vec<u8> {
+        let mut field = vec![0x00, 0x00];
+        field.extend(std::iter::repeat_n(0xC0 | 2, refs));
+        let mut wire = Vec::new();
+        write_varint(&mut wire, 0x01);
+        write_varint(&mut wire, field.len() as u64);
+        wire.extend(field);
+        write_varint(&mut wire, 0x00);
+        write_varint(&mut wire, body.len() as u64);
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    /// Heap the decoded head of `frames` occupies, at least.
+    fn decoded_heap(frames: &H3FrameCounter) -> usize {
+        let (fields, _) = frames.decoded_head().expect("decoded head");
+        fields.capacity() * std::mem::size_of::<(Vec<u8>, Vec<u8>)>()
+            + fields
+                .iter()
+                .map(|(name, value)| name.capacity() + value.capacity())
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn decoded_request_heads_are_charged_to_every_request_budget() {
+        const REFS: usize = 455;
+        let limits = H3RequestLimits::new(16_380, 1 << 20);
+        let wire = static_ref_request(REFS, b"");
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(1 << 20));
+        let mut connections: Vec<H3State> = Vec::new();
+        let mut accepted = 0usize;
+        let mut decoded = 0usize;
+        // 20 connections of 256 streams: the probe that grew RSS 168 MB on 2.4 MB charged.
+        'probe: for _ in 0..20 {
+            let mut st = H3State {
+                body_budget: Some(budget.clone()),
+                ..Default::default()
+            };
+            for index in 0..256 {
+                let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, index);
+                st.requests.insert(id);
+                if append_request_bytes(&mut st, id, &wire, limits).is_err() {
+                    connections.push(st);
+                    break 'probe;
+                }
+                let frames = &st.req_frames[&id];
+                assert!(frames.head_footprint >= REFS * 80);
+                assert_eq!(frames.charged, wire.len() + frames.head_footprint);
+                decoded += decoded_heap(frames);
+                accepted += 1;
+            }
+            connections.push(st);
+        }
+        assert!(
+            accepted < (1 << 20) / (REFS * 80),
+            "{accepted} decoded heads fit a budget meant for far fewer"
+        );
+        assert!(budget.in_flight() >= (decoded + accepted * wire.len()) as u64);
+        let charged: usize = connections.iter().map(|st| st.total_req_bytes.get()).sum();
+        assert_eq!(charged as u64, budget.in_flight());
+        for st in &mut connections {
+            reclaim_buffered_requests(st);
+            assert_eq!(st.total_req_bytes.get(), 0);
+        }
+        assert_eq!(budget.in_flight(), 0);
+    }
+
+    #[test]
+    fn decoded_head_charge_ends_when_dispatch_consumes_the_head() {
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(1 << 20));
+        let mut st = H3State {
+            body_budget: Some(budget.clone()),
+            ..Default::default()
+        };
+        st.requests.insert(id);
+        let wire = static_ref_request(100, b"body");
+        append_request_bytes(&mut st, id, &wire, H3RequestLimits::new(16_380, 1024)).unwrap();
+        let footprint = st.req_frames[&id].head_footprint;
+        assert_eq!(budget.in_flight(), (wire.len() + footprint) as u64);
+        let taken = take_request_for_dispatch(&mut st, id);
+        let charge = RequestChargeGuard {
+            total: st.total_req_bytes.clone(),
+            bytes: taken.frames.charged,
+        };
+        assert_eq!(st.total_req_bytes.get(), wire.len() + footprint);
+        let (parsed, head) = taken.frames.finish(taken.body, taken.lease).unwrap();
+        assert_eq!(head.map(|(fields, _)| fields.len()), Some(100));
+        assert_eq!(
+            budget.in_flight(),
+            wire.len() as u64,
+            "the body keeps only its wire reservation"
+        );
+        drop(parsed);
+        assert_eq!(budget.in_flight(), 0);
+        drop(charge);
+        assert_eq!(st.total_req_bytes.get(), 0);
+    }
+
     #[test]
     fn finished_request_stays_charged_until_pipeline_task_releases_it() {
         let limits = H3RequestLimits {
@@ -5852,8 +6199,8 @@ mod h3_codec_tests {
         let mut st = H3State::default();
         st.requests.extend([first, second]);
         assert!(append_request_bytes(&mut st, first, &[0x00, 4, 1, 2, 3, 4], limits).is_ok());
-        let (dispatched, _lease, _snapshot) = take_request_for_dispatch(&mut st, first);
-        assert_eq!(dispatched.len(), 6);
+        let dispatched = take_request_for_dispatch(&mut st, first);
+        assert_eq!(dispatched.frames.charged, 6);
         assert_eq!(
             st.total_req_bytes.get(),
             6,
@@ -5863,7 +6210,7 @@ mod h3_codec_tests {
         reclaim_request(&mut st, second);
         let charge = RequestChargeGuard {
             total: st.total_req_bytes.clone(),
-            bytes: dispatched.len(),
+            bytes: dispatched.frames.charged,
         };
         drop(charge);
         assert_eq!(st.total_req_bytes.get(), 0);
@@ -5941,25 +6288,25 @@ mod h3_codec_tests {
         st.requests.insert(id);
         let wire = [0x01, 2, 0, 0, 0x00, 4, 1, 2, 3, 4];
         append_request_bytes(&mut st, id, &wire, H3RequestLimits::new(16, 16)).unwrap();
-        let (bytes, lease, _snapshot) = take_request_for_dispatch(&mut st, id);
-        let allocation = bytes.as_ptr();
+        let allocation = st.req_buf[&id].as_ptr();
+        let taken = take_request_for_dispatch(&mut st, id);
         assert_eq!(
             budget.in_flight(),
             10,
             "dispatch must transfer, never release/reacquire"
         );
         drop(st);
-        let parsed = parse_h3_request_leased(bytes, lease).unwrap();
+        let (parsed, _) = taken.frames.finish(taken.body, taken.lease).unwrap();
         assert_eq!(parsed.body.as_ref(), &[1, 2, 3, 4]);
         assert_eq!(
             parsed.body.as_ptr(),
             allocation,
-            "compaction must retain the allocation"
+            "dispatch must hand over the body the receive path compacted"
         );
         assert_eq!(
             budget.in_flight(),
             10,
-            "wire allocation remains charged after truncation"
+            "the received wire bytes remain charged while the body lives"
         );
         assert!(!budget.try_acquire(7));
         let slice = parsed.body.slice(1..);
@@ -5975,7 +6322,12 @@ mod h3_codec_tests {
         let mut lease = hj_core::budget::BodyBufferLease::new(budget.clone());
         assert!(lease.reserve(3));
         // Truncated field section fails before any body is dispatched.
-        assert!(parse_h3_request_leased(vec![0x01, 4, 0], Some(lease)).is_err());
+        let mut frames = H3FrameCounter::default();
+        let mut body = Vec::new();
+        frames
+            .consume(&[0x01, 4, 0], &mut body, H3RequestLimits::new(16, 16))
+            .unwrap();
+        assert!(frames.finish(body, Some(lease)).is_none());
         assert_eq!(budget.in_flight(), 0);
     }
 
@@ -6029,9 +6381,10 @@ mod h3_codec_tests {
             write_varint(&mut wire, 1);
             write_varint(&mut wire, fields.len() as u64);
             wire.extend(fields);
+            let (frames, body) = received_request(&wire);
             let _ = handle_h3_request(
-                wire,
-                None,
+                frames,
+                body,
                 None,
                 false,
                 None,
@@ -6039,7 +6392,7 @@ mod h3_codec_tests {
                 "127.0.0.1:32000".parse().unwrap(),
                 "127.0.0.1:8443".parse().unwrap(),
                 &bridge,
-                false,
+                crate::uring::ClientAuth::None,
                 H3RequestLimits::new(4096, 4096),
                 None,
                 Some(egress.clone()),
@@ -6318,6 +6671,13 @@ mod h3_codec_tests {
         let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0); // first client bidi stream
         st.requests.insert(id);
         st.req_buf.insert(id, b"partial body".to_vec());
+        st.req_frames.insert(
+            id,
+            H3FrameCounter {
+                charged: b"partial body".len(),
+                ..Default::default()
+            },
+        );
         st.request_snapshots.insert(
             id,
             H3RequestSnapshot::unscoped(H3RequestConfig::new(H3RequestLimits::new(16, 16), None)),
@@ -6326,6 +6686,13 @@ mod h3_codec_tests {
         let other = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
         st.requests.insert(other);
         st.req_buf.insert(other, b"keep".to_vec());
+        st.req_frames.insert(
+            other,
+            H3FrameCounter {
+                charged: b"keep".len(),
+                ..Default::default()
+            },
+        );
         st.request_snapshots.insert(
             other,
             H3RequestSnapshot::unscoped(H3RequestConfig::new(H3RequestLimits::new(16, 16), None)),
@@ -6542,7 +6909,7 @@ mod h3_codec_tests {
         let packet_affected = ConnectionHandle(10);
         let deadline_due = ConnectionHandle(11);
         let deadline_future = ConnectionHandle(12);
-        let mut deadlines = RequestDeadlineIndex::default();
+        let mut deadlines = ConnectionDeadlineIndex::default();
         deadlines.sync(deadline_due, Some(now));
         deadlines.sync(deadline_future, Some(now + Duration::from_secs(1)));
         deadlines.sync(deadline_due, Some(now));
@@ -6600,9 +6967,9 @@ mod h3_codec_tests {
     }
 
     #[test]
-    fn request_body_is_compacted_in_place_without_a_second_full_copy() {
+    fn request_body_is_compacted_as_received_and_dispatched_without_a_copy() {
         let field = [0x00, 0x00];
-        let mut stream = Vec::with_capacity(64 * 1024);
+        let mut stream = Vec::new();
         write_varint(&mut stream, 0x01);
         write_varint(&mut stream, field.len() as u64);
         stream.extend_from_slice(&field);
@@ -6611,14 +6978,30 @@ mod h3_codec_tests {
             write_varint(&mut stream, chunk.len() as u64);
             stream.extend_from_slice(chunk);
         }
-        let allocation = stream.as_ptr();
-        let parsed = parse_h3_request(stream).unwrap();
-        assert_eq!(parsed.body.as_ref(), b"first-second");
-        assert_eq!(
-            parsed.body.as_ptr(),
-            allocation,
-            "body compaction must reuse the request-wire allocation"
-        );
+        // An extension frame between DATA frames is validated and dropped, never kept.
+        write_varint(&mut stream, 0x21);
+        write_varint(&mut stream, 3);
+        stream.extend_from_slice(b"ext");
+        let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        for chunk in [1, 4, usize::MAX] {
+            let mut st = H3State::default();
+            st.requests.insert(id);
+            for piece in stream.chunks(chunk) {
+                append_request_bytes(&mut st, id, piece, H3RequestLimits::new(64, 64)).unwrap();
+            }
+            assert_eq!(st.req_buf[&id], b"first-second", "chunk={chunk}");
+            let allocation = st.req_buf[&id].as_ptr();
+            let taken = take_request_for_dispatch(&mut st, id);
+            assert_eq!(taken.frames.charged, stream.len(), "chunk={chunk}");
+            let (parsed, _) = taken.frames.finish(taken.body, None).unwrap();
+            assert_eq!(parsed.field, field);
+            assert_eq!(parsed.body.as_ref(), b"first-second");
+            assert_eq!(
+                parsed.body.as_ptr(),
+                allocation,
+                "dispatch must reuse the receive-time body allocation (chunk={chunk})"
+            );
+        }
     }
 
     #[test]
@@ -7005,7 +7388,7 @@ mod admission_tests {
             QuicServerPolicy {
                 config: self.server_config.clone(),
                 serving_view: None,
-                require_client_cert: false,
+                client_auth: crate::uring::ClientAuth::None,
             }
         }
 
@@ -7232,7 +7615,7 @@ mod admission_tests {
         let mut scratch = Vec::new();
         let mut conns = HashMap::new();
         let mut h3 = HashMap::new();
-        let mut deadlines = RequestDeadlineIndex::default();
+        let mut deadlines = ConnectionDeadlineIndex::default();
         let mut epoch = 0;
         let mut rt = crate::uring::build_core_runtime().unwrap();
         let affected = rt.block_on(async {
@@ -7400,8 +7783,8 @@ mod admission_tests {
         assert_eq!(receive_request_streams(conn, st, now), vec![ids[3]]);
         assert!(
             st.req_frames
-                .get_mut(&ids[3])
-                .and_then(H3FrameCounter::take_decoded_head)
+                .get(&ids[3])
+                .and_then(H3FrameCounter::decoded_head)
                 .is_some(),
             "the accepted upload carries its decoded head to dispatch"
         );
@@ -7427,6 +7810,314 @@ mod admission_tests {
         assert_eq!(read_response(&mut e.client, ids[2]), Ok(too_large));
         assert_eq!(stopped.get(&ids[2]), Some(&no_error));
         assert!(!stopped.contains_key(&ids[3]));
+    }
+
+    const GET_HEAD: [(&[u8], &[u8]); 4] = [
+        (b":method", b"GET"),
+        (b":scheme", b"https"),
+        (b":authority", b"churn.test"),
+        (b":path", b"/"),
+    ];
+
+    /// The application error code the client saw the server close with, if it has.
+    fn client_close_code(client: &mut quinn_proto::Connection) -> Option<u64> {
+        let mut code = None;
+        while let Some(event) = client.poll() {
+            if let Event::ConnectionLost {
+                reason: quinn_proto::ConnectionError::ApplicationClosed(close),
+            } = event
+            {
+                code = Some(close.error_code.into_inner());
+            }
+        }
+        code
+    }
+
+    /// Drive one server pass in `drive_one_conn`'s order and return the request
+    /// streams that reached dispatch.
+    fn serve_pass(h: &mut Harness, e: &mut Established, now: Instant) -> Vec<StreamId> {
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        service_conn(
+            &mut h.server,
+            &mut e.conns,
+            &mut e.h3,
+            e.hd,
+            now,
+            true,
+            config,
+        );
+        let st = e.h3.get_mut(&e.hd).unwrap();
+        if st.rejected {
+            return Vec::new();
+        }
+        let conn = e.conns.get_mut(&e.hd).unwrap();
+        receive_request_streams(conn, st, now)
+    }
+
+    #[test]
+    fn stop_sending_with_its_request_is_never_dispatched_and_churn_closes() {
+        use super::h3_codec_tests::request_stream;
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let addr = spoofed(21);
+        let mut e = h.establish(addr, now);
+        let wire = request_stream(&GET_HEAD, &[]);
+        let mut rounds = 0;
+        let mut close_code = None;
+        while close_code.is_none() && rounds < 2000 {
+            rounds += 1;
+            // Request, FIN and STOP_SENDING all reach the server in one flight.
+            let id = e.client.streams().open(Dir::Bi).expect("stream credit");
+            let mut send = e.client.send_stream(id);
+            assert_eq!(send.write(&wire).unwrap(), wire.len());
+            send.finish().unwrap();
+            e.client
+                .recv_stream(id)
+                .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED))
+                .unwrap();
+            h.to_server(&mut e.conns, &mut e.client, addr, now);
+            let dispatched = serve_pass(&mut h, &mut e, now);
+            assert!(
+                dispatched.is_empty(),
+                "round {rounds}: a stopped stream was dispatched without a cancellation token"
+            );
+            let st = &e.h3[&e.hd];
+            assert!(!st.requests.contains(&id) && st.request_cancellations.is_empty());
+            h.to_client(
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.client_handle,
+                &mut e.client,
+                now,
+            );
+            close_code = client_close_code(&mut e.client);
+        }
+        assert_eq!(close_code, Some(u64::from(H3_EXCESSIVE_LOAD)));
+        assert_eq!(rounds, H3_CANCEL_BURST as usize + 1);
+        assert!(e.h3[&e.hd].rejected);
+    }
+
+    #[test]
+    fn cancelling_dispatched_requests_exhausts_a_budget_completions_never_refund() {
+        use super::h3_codec_tests::request_stream;
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let addr = spoofed(22);
+        let mut e = h.establish(addr, now);
+        const COMPLETED: usize = 50;
+        let wire = request_stream(&GET_HEAD, &[]);
+        let mut tokens = Vec::new();
+        let mut close_code = None;
+        let mut rounds = 0;
+        while close_code.is_none() && rounds < 2000 {
+            rounds += 1;
+            let id = e.client.streams().open(Dir::Bi).expect("stream credit");
+            let mut send = e.client.send_stream(id);
+            assert_eq!(send.write(&wire).unwrap(), wire.len());
+            send.finish().unwrap();
+            // Requests the same client lets complete must not buy back budget. The
+            // harness never advances time, so total streams stay within one credit.
+            let completed = (rounds <= COMPLETED).then(|| {
+                let completed = e.client.streams().open(Dir::Bi).expect("stream credit");
+                let mut send = e.client.send_stream(completed);
+                assert_eq!(send.write(&wire).unwrap(), wire.len());
+                send.finish().unwrap();
+                completed
+            });
+            h.to_server(&mut e.conns, &mut e.client, addr, now);
+            let mut dispatched = serve_pass(&mut h, &mut e, now);
+            dispatched.sort();
+            assert_eq!(
+                dispatched,
+                [Some(id), completed]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            );
+            let st = e.h3.get_mut(&e.hd).unwrap();
+            for stream in dispatched {
+                drop(take_request_for_dispatch(st, stream));
+                let token = CancellationToken::new();
+                st.request_cancellations.insert(stream, token.clone());
+                tokens.push(token);
+            }
+            if let Some(completed) = completed {
+                st.request_cancellations.remove(&completed);
+                let conn = e.conns.get_mut(&e.hd).unwrap();
+                let mut response = conn.send_stream(completed);
+                response.write(&h3_error(http::StatusCode::OK)).unwrap();
+                response.finish().unwrap();
+            }
+
+            e.client
+                .recv_stream(id)
+                .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED))
+                .unwrap();
+            h.to_server(&mut e.conns, &mut e.client, addr, now);
+            serve_pass(&mut h, &mut e, now);
+            assert!(!e.h3[&e.hd].request_cancellations.contains_key(&id));
+            h.to_client(
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.client_handle,
+                &mut e.client,
+                now,
+            );
+            close_code = client_close_code(&mut e.client);
+        }
+        assert_eq!(close_code, Some(u64::from(H3_EXCESSIVE_LOAD)));
+        assert_eq!(rounds, H3_CANCEL_BURST as usize + 1);
+        // The completed requests' tokens were retired before the close.
+        assert_eq!(
+            tokens.iter().filter(|t| t.is_cancelled()).count(),
+            tokens.len() - COMPLETED,
+            "every cancelled request's work was cancelled"
+        );
+    }
+
+    #[test]
+    fn empty_data_flood_closes_the_connection_with_excessive_load() {
+        use super::h3_codec_tests::{UPLOAD_HEAD, request_stream};
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let addr = spoofed(23);
+        let mut e = h.establish(addr, now);
+        let mut wire = request_stream(&UPLOAD_HEAD, &[]);
+        for _ in 0..=H3_NO_PROGRESS_FRAMES {
+            wire.extend_from_slice(&[0x00, 0x00]);
+        }
+        let id = e.client.streams().open(Dir::Bi).unwrap();
+        let mut send = e.client.send_stream(id);
+        assert_eq!(send.write(&wire).unwrap(), wire.len());
+        // The client's congestion window spreads the stream over several flights.
+        let mut close_code = None;
+        for _ in 0..64 {
+            h.to_server(&mut e.conns, &mut e.client, addr, now);
+            assert!(serve_pass(&mut h, &mut e, now).is_empty());
+            h.to_client(
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.client_handle,
+                &mut e.client,
+                now,
+            );
+            close_code = client_close_code(&mut e.client);
+            if close_code.is_some() {
+                break;
+            }
+        }
+        assert_eq!(close_code, Some(u64::from(H3_EXCESSIVE_LOAD)));
+        let st = &e.h3[&e.hd];
+        assert!(st.rejected && st.requests.is_empty() && st.total_req_bytes.get() == 0);
+    }
+
+    #[test]
+    fn a_receive_pass_reads_only_streams_with_new_data() {
+        use super::h3_codec_tests::{UPLOAD_HEAD, request_stream};
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let addr = spoofed(24);
+        let mut e = h.establish(addr, now);
+        let head = request_stream(&UPLOAD_HEAD, &[]);
+        let ids: Vec<StreamId> = (0..MAX_CONCURRENT_BIDI_STREAMS)
+            .map(|_| {
+                let id = e.client.streams().open(Dir::Bi).unwrap();
+                assert_eq!(e.client.send_stream(id).write(&head).unwrap(), head.len());
+                id
+            })
+            .collect();
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        let mut accepted = 0;
+        for _ in 0..64 {
+            h.to_server(&mut e.conns, &mut e.client, addr, now);
+            service_conn(
+                &mut h.server,
+                &mut e.conns,
+                &mut e.h3,
+                e.hd,
+                now,
+                true,
+                config,
+            );
+            let st = e.h3.get_mut(&e.hd).unwrap();
+            accepted = st.requests.len();
+            let conn = e.conns.get_mut(&e.hd).unwrap();
+            assert!(receive_request_streams(conn, st, now).is_empty());
+            assert!(st.readable_requests.is_empty());
+            h.to_client(conn, e.client_handle, &mut e.client, now);
+            if accepted == ids.len() {
+                break;
+            }
+        }
+        assert_eq!(accepted, ids.len(), "every unfinished stream is tracked");
+
+        // Two separate STREAM frames for one stream, then its FIN: one queued read.
+        let target = ids[ids.len() / 2];
+        for piece in [&[0x00, 0x02, b'o'][..], b"k"] {
+            assert_eq!(
+                e.client.send_stream(target).write(piece).unwrap(),
+                piece.len()
+            );
+            h.to_server(&mut e.conns, &mut e.client, addr, now);
+        }
+        e.client.send_stream(target).finish().unwrap();
+        h.to_server(&mut e.conns, &mut e.client, addr, now);
+        service_conn(
+            &mut h.server,
+            &mut e.conns,
+            &mut e.h3,
+            e.hd,
+            now,
+            true,
+            config,
+        );
+        let st = e.h3.get_mut(&e.hd).unwrap();
+        assert_eq!(st.readable_requests, vec![target]);
+        let conn = e.conns.get_mut(&e.hd).unwrap();
+        assert_eq!(receive_request_streams(conn, st, now), vec![target]);
+        assert_eq!(st.req_buf[&target], b"ok");
+        assert!(st.readable_requests.is_empty());
+        assert!(st.request_snapshots.values().all(|s| !s.read_queued));
+    }
+
+    #[test]
+    fn quic_timers_share_the_connection_deadline_index() {
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let mut e = h.establish(spoofed(25), now);
+        let quic = e.conns.get_mut(&e.hd).unwrap().poll_timeout();
+        assert!(
+            quic.is_some(),
+            "an established connection arms its idle timer"
+        );
+        let mut deadlines = ConnectionDeadlineIndex::default();
+        deadlines.sync(e.hd, connection_deadline(&mut e.conns, &e.h3, e.hd));
+        assert_eq!(deadlines.next(), quic);
+
+        // An earlier HTTP/3 deadline takes over the connection's single node.
+        let request = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
+        let timeout = Duration::from_millis(1);
+        e.h3.get_mut(&e.hd).unwrap().track_request_stream(
+            request,
+            now,
+            H3RequestSnapshot::unscoped(H3RequestConfig::new(
+                H3RequestLimits::new(16, 16),
+                Some(timeout),
+            )),
+        );
+        deadlines.sync(e.hd, connection_deadline(&mut e.conns, &e.h3, e.hd));
+        assert_eq!(deadlines.next(), Some(now + timeout));
+        assert_eq!(deadlines.ordered.len(), 1);
+
+        // Once that deadline is gone the QUIC timer is due on its own.
+        reclaim_request(e.h3.get_mut(&e.hd).unwrap(), request);
+        deadlines.sync(e.hd, connection_deadline(&mut e.conns, &e.h3, e.hd));
+        assert_eq!(deadlines.next(), quic);
+        let mut due = std::collections::HashSet::new();
+        deadlines.extend_due(&mut due, quic.unwrap());
+        assert_eq!(due, std::collections::HashSet::from([e.hd]));
+
+        e.conns.clear();
+        e.h3.clear();
+        deadlines.sync(e.hd, connection_deadline(&mut e.conns, &e.h3, e.hd));
+        assert!(deadlines.ordered.is_empty() && deadlines.by_connection.is_empty());
     }
 
     /// (#1035) How a paced H3 upload ended, measured from stream acceptance on the
@@ -7512,8 +8203,8 @@ mod admission_tests {
             }
             let conn = e.conns.get_mut(&e.hd).unwrap();
             if receive_request_streams(conn, st, now).contains(&id) {
-                let buffered = st.req_buf.get(&id).map_or(0, Vec::len);
-                return PacedUpload::Finished(since_accept, buffered - head);
+                let body = st.req_buf.get(&id).map_or(0, Vec::len);
+                return PacedUpload::Finished(since_accept, body);
             }
             h.to_client(conn, e.client_handle, &mut e.client, now);
             now += STEP;
@@ -7797,6 +8488,35 @@ mod admission_tests {
         st.connected = true;
         assert_eq!(st.next_deadline(), None);
         assert_eq!(H3State::default().next_deadline(), None);
+    }
+
+    #[test]
+    fn cancel_budget_allows_a_burst_then_refills_at_its_rate() {
+        let t0 = Instant::now();
+        let mut budget = CancelBudget::default();
+        for _ in 0..H3_CANCEL_BURST {
+            assert!(!budget.charge(t0));
+        }
+        assert!(budget.charge(t0), "one past the burst is excessive");
+
+        let mut budget = CancelBudget::default();
+        for _ in 0..H3_CANCEL_BURST {
+            assert!(!budget.charge(t0));
+        }
+        let later = t0 + H3_CANCEL_REFILL * 10;
+        for _ in 0..10 {
+            assert!(!budget.charge(later), "elapsed time refills the bucket");
+        }
+        assert!(budget.charge(later));
+
+        // A client cancelling a page's worth of requests now and then never trips it.
+        let mut budget = CancelBudget::default();
+        for page in 0..100u32 {
+            let at = t0 + Duration::from_secs(15) * page;
+            for _ in 0..150 {
+                assert!(!budget.charge(at));
+            }
+        }
     }
 
     #[test]

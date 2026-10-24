@@ -766,6 +766,61 @@ fn ht_access(mask: &str) -> String {
     format!("<docRoot>/srv</docRoot><htAccess><allowOverride>{mask}</allowOverride></htAccess>")
 }
 
+/// Regression (#1141): `subFilterMaxBody` bounds what one request buffers, so it
+/// is clamped to the ceiling rather than taken unbounded.
+#[test]
+fn sub_filter_max_body_is_clamped() {
+    for (i, (value, expect)) in [
+        ("1M", 1024 * 1024),
+        ("64M", 64 * 1024 * 1024),
+        ("65M", 64 * 1024 * 1024),
+        ("100G", 64 * 1024 * 1024),
+        ("18446744073709551615", 64 * 1024 * 1024),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = context(
+            "/",
+            &format!("<subFilter>a => b</subFilter><subFilterMaxBody>{value}</subFilterMaxBody>"),
+        );
+        let cfg = load_vhost(&format!("1141-{i}"), &body).unwrap();
+        let plan = vhost(&cfg).contexts[0]
+            .sub_filter
+            .as_deref()
+            .expect("sub_filter plan");
+        assert_eq!(plan.max_body, expect, "{value}");
+    }
+}
+
+/// Regression (#1137): a vhost `accessFileName` is joined onto each request
+/// directory, so only a bare file name loads; a path, a dot entry or a NUL
+/// refuses the load.
+#[test]
+fn vhost_access_file_name_must_be_a_bare_file_name() {
+    for (i, name) in [
+        "../../etc/passwd",
+        "/etc/shadow",
+        "sub/.htaccess",
+        ".",
+        "..",
+        "a\u{0}b",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = format!(
+            "<docRoot>/srv</docRoot><htAccess><accessFileName>{name}</accessFileName></htAccess>"
+        );
+        let (directive, value) = invalid(load_vhost(&format!("1137-{i}"), &body));
+        assert_eq!((directive, value.as_str()), ("accessFileName", name));
+    }
+    let body =
+        "<docRoot>/srv</docRoot><htAccess><accessFileName>.acl..</accessFileName></htAccess>";
+    let cfg = load_vhost("1137-ok", body).unwrap();
+    assert_eq!(vhost(&cfg).access_file_name, ".acl..");
+}
+
 /// #1028: LSWS gates `.htaccess` directives per category at server, vhost and
 /// context level; httpjet implements only all-or-nothing per vhost, so any other
 /// mask refuses the load. 0 and 31 behave as before.

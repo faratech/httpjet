@@ -981,6 +981,166 @@ async fn data_past_declared_content_length_resets_on_the_first_overrunning_frame
     let _ = srv.await;
 }
 
+/// Rejects every body-carrying request under `/gated` with a 301, counting each call.
+fn early_reject_config(consulted: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Config {
+    let hook = move |head: &hj_h2::server::RequestHead<'_>| {
+        consulted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if !head.uri.path().starts_with("/gated") {
+            return None;
+        }
+        let host = head.authority.and_then(|a| a.to_str().ok()).unwrap_or("");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::LOCATION,
+            format!("https://{host}{}", head.uri.path())
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(http::header::CONNECTION, "close".parse().unwrap());
+        headers.insert(http::header::CONTENT_LENGTH, "99".parse().unwrap());
+        Some((http::StatusCode::MOVED_PERMANENTLY, headers))
+    };
+    Config {
+        early_reject: Some(hj_h2::server::EarlyReject(std::sync::Arc::new(hook))),
+        ..Config::default()
+    }
+}
+
+#[tokio::test]
+async fn early_reject_answers_a_body_carrying_request_from_its_head() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let consulted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (mut client, srv) =
+        open_client(early_reject_config(consulted.clone()), calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+
+    // The head alone, asking for 100 Continue before the body.
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        1,
+        &encode_get_with(
+            &mut enc,
+            "/gated/upload",
+            &[("expect", "100-continue"), ("content-length", "5")],
+        ),
+    );
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    let mut fields = Vec::new();
+    let mut heads = Vec::new();
+    let mut resets = Vec::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (hdr, payload) = read_frame(&mut client).await;
+            match hdr.kind {
+                frame::kind::GOAWAY => panic!("connection GOAWAYed"),
+                frame::kind::HEADERS => {
+                    let mut block = Vec::new();
+                    dec.decode(&payload, |n, v| block.push((n.to_owned(), v.to_owned())))
+                        .unwrap();
+                    if hdr.stream_id == 1 {
+                        heads.push(hdr.flags & frame::flags::END_STREAM != 0);
+                        fields.extend(block);
+                    }
+                }
+                frame::kind::DATA if hdr.stream_id == 1 => panic!("the refusal carries no body"),
+                frame::kind::RST_STREAM if hdr.stream_id == 1 => {
+                    resets.push(u32::from_be_bytes(payload[..4].try_into().unwrap()));
+                }
+                frame::kind::PING if hdr.flags & frame::flags::ACK != 0 => return,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("PING ACK");
+    assert_eq!(heads, vec![true], "one final HEADERS, no 100 Continue");
+    let field = |name: &str| {
+        fields
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(field(":status"), vec!["301"]);
+    assert_eq!(field("location"), vec!["https://example.com/gated/upload"]);
+    assert_eq!(field("content-length"), vec!["0"]);
+    assert!(
+        field("connection").is_empty(),
+        "hop-by-hop fields are stripped"
+    );
+    assert_eq!(resets, vec![frame::error_code::NO_ERROR]);
+
+    // The body that follows is ignored, not answered again.
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::DATA,
+        frame::flags::END_STREAM,
+        1,
+        b"hello",
+    );
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        stream_events_until_ping_ack(&mut client, &mut dec, 1).await,
+        StreamEvents::default()
+    );
+
+    // A bodiless request is never consulted; an ungated body-carrying one dispatches.
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS | frame::flags::END_STREAM,
+        3,
+        &encode_get(&mut enc, "/gated/page"),
+    );
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        read_response(&mut client, &mut dec, 3).await.0.as_deref(),
+        Some("200")
+    );
+    let mut buf = Vec::new();
+    frame::write_frame(
+        &mut buf,
+        frame::kind::HEADERS,
+        frame::flags::END_HEADERS,
+        5,
+        &encode_get(&mut enc, "/open/upload"),
+    );
+    frame::write_frame(
+        &mut buf,
+        frame::kind::DATA,
+        frame::flags::END_STREAM,
+        5,
+        b"hello",
+    );
+    client.write_all(&buf).await.unwrap();
+    assert_eq!(
+        read_response(&mut client, &mut dec, 5).await.0.as_deref(),
+        Some("200")
+    );
+    assert_eq!(
+        consulted.load(SeqCst),
+        2,
+        "only body-carrying requests are consulted"
+    );
+    assert_eq!(
+        calls.load(SeqCst),
+        2,
+        "the refused request never dispatched"
+    );
+    drop(client);
+    let _ = srv.await;
+}
+
 #[tokio::test]
 async fn no_progress_frame_flood_goaways_enhance_your_calm() {
     // Regression (#87): a flood of frames that make NO forward progress — here empty DATA on an
@@ -4349,4 +4509,463 @@ async fn frame_size_and_window_overflow_goaways_carry_last_client_stream() {
         drop(client);
         let _ = srv.await;
     }
+}
+
+/// A body-pending POST header block whose decoded list sits just under `list_size`:
+/// distinct two-letter names with empty values, the shape whose decoded map is largest
+/// per HPACK-accounted byte.
+fn max_list_pending_block(list_size: usize) -> Vec<u8> {
+    // :method POST, :path /, :scheme https, :authority example.com (not indexed).
+    let mut block = vec![0x83, 0x84, 0x87, 0x01, 0x0b];
+    block.extend_from_slice(b"example.com");
+    let mut listed = (7 + 4 + 32) + (5 + 1 + 32) + (7 + 5 + 32) + (10 + 11 + 32);
+    'names: for a in b'a'..=b'z' {
+        for b in b'a'..=b'z' {
+            if [a, b] == *b"te" {
+                continue;
+            }
+            if listed + 2 + 32 > list_size {
+                break 'names;
+            }
+            listed += 2 + 32;
+            // Literal without indexing, new name "ab", empty value.
+            block.extend_from_slice(&[0x00, 0x02, a, b, 0x00]);
+        }
+    }
+    block
+}
+
+/// Read frames until a PING ACK; return the streams refused (RST_STREAM REFUSED_STREAM)
+/// and the streams that received a response HEADERS. Panics on GOAWAY or any other reset.
+async fn refusals_until_ping_ack<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    dec: &mut Decoder,
+) -> (Vec<u32>, Vec<u32>) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (mut refused, mut answered) = (Vec::new(), Vec::new());
+        loop {
+            let (hdr, payload) = read_frame(r).await;
+            match hdr.kind {
+                frame::kind::GOAWAY => panic!("connection GOAWAYed"),
+                frame::kind::HEADERS => {
+                    dec.decode(&payload, |_, _| {}).unwrap();
+                    answered.push(hdr.stream_id);
+                }
+                frame::kind::RST_STREAM => {
+                    let code = u32::from_be_bytes(payload[..4].try_into().unwrap());
+                    assert_eq!(code, frame::error_code::REFUSED_STREAM, "{}", hdr.stream_id);
+                    refused.push(hdr.stream_id);
+                }
+                frame::kind::PING if hdr.flags & frame::flags::ACK != 0 => {
+                    return (refused, answered);
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for the PING ACK")
+}
+
+/// Open `count` body-pending streams from `first_sid` with `block`; return the admitted ids.
+async fn open_pending_streams<R: AsyncReadExt + AsyncWriteExt + Unpin>(
+    client: &mut R,
+    dec: &mut Decoder,
+    first_sid: u32,
+    count: u32,
+    block: &[u8],
+) -> Vec<u32> {
+    let mut buf = Vec::new();
+    for i in 0..count {
+        let sid = first_sid + 2 * i;
+        frame::write_frame(
+            &mut buf,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS,
+            sid,
+            block,
+        );
+    }
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    let (refused, answered) = refusals_until_ping_ack(client, dec).await;
+    assert!(answered.is_empty(), "body-pending streams answered early");
+    (0..count)
+        .map(|i| first_sid + 2 * i)
+        .filter(|sid| !refused.contains(sid))
+        .collect()
+}
+
+/// End each stream with an empty DATA(END_STREAM) and read every response.
+async fn finish_pending_streams<R: AsyncReadExt + AsyncWriteExt + Unpin>(
+    client: &mut R,
+    dec: &mut Decoder,
+    sids: &[u32],
+) {
+    let mut buf = Vec::new();
+    for &sid in sids {
+        frame::write_frame(
+            &mut buf,
+            frame::kind::DATA,
+            frame::flags::END_STREAM,
+            sid,
+            b"",
+        );
+    }
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    let mut answered = Vec::new();
+    while answered.len() < sids.len() {
+        let (refused, more) = refusals_until_ping_ack(client, dec).await;
+        assert!(refused.is_empty(), "finished streams refused: {refused:?}");
+        answered.extend(more);
+        if answered.len() < sids.len() {
+            let mut ping = Vec::new();
+            write_ping(&mut ping);
+            client.write_all(&ping).await.unwrap();
+        }
+    }
+    answered.sort_unstable();
+    assert_eq!(answered, sids, "every finished stream is answered");
+}
+
+#[tokio::test]
+async fn body_pending_header_maps_are_capped_per_connection() {
+    // HEADERS without END_STREAM leave a fully decoded header map waiting for the body.
+    // 256 of them at the prod 16380-byte list cap held ~24 MiB per connection; past the
+    // per-connection decoded-header budget a new stream is refused (retry-safe), its
+    // block still decoded so HPACK stays in sync, and finishing the admitted streams
+    // returns their budget.
+    const LIST: usize = 16380;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = Config {
+        header_list_size: LIST as u32,
+        ..Config::default()
+    };
+    let (mut client, srv) = open_client(config, calls.clone()).await;
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let block = max_list_pending_block(LIST);
+
+    let admitted = open_pending_streams(&mut client, &mut dec, 1, 256, &block).await;
+    // Each such stream holds ~85 KB of decoded map, so a budget of a few MiB admits tens.
+    assert!(
+        (8..=64).contains(&admitted.len()),
+        "{} of 256 max-size body-pending streams admitted",
+        admitted.len()
+    );
+    let lowest: Vec<u32> = (0..admitted.len() as u32).map(|i| 1 + 2 * i).collect();
+    assert_eq!(admitted, lowest, "only streams past the cap are refused");
+
+    finish_pending_streams(&mut client, &mut dec, &admitted).await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        admitted.len()
+    );
+    let again = open_pending_streams(&mut client, &mut dec, 513, 256, &block).await;
+    assert_eq!(
+        again.len(),
+        admitted.len(),
+        "dispatch must return the streams' header budget"
+    );
+    drop(client);
+    let _ = srv.await;
+}
+
+/// ~6 KiB of request headers in 30 fields, the shape of a browser POST relayed by Cloudflare.
+fn realistic_pending_block(enc: &mut Encoder, path: &str) -> Vec<u8> {
+    let cookie = format!(
+        "xf_csrf=AbCdEfGhIjKlMnOp; xf_session={}; xf_user=12345%2Cabcdef; _ga={}",
+        "s".repeat(32),
+        "g".repeat(3000)
+    );
+    let fields: [(&str, String); 26] = [
+        (
+            "user-agent",
+            format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) {}",
+                "u".repeat(90)
+            ),
+        ),
+        (
+            "accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".into(),
+        ),
+        ("accept-language", "en-US,en;q=0.9".into()),
+        ("accept-encoding", "gzip, br, zstd".into()),
+        (
+            "referer",
+            format!("https://example.com/threads/{}", "r".repeat(70)),
+        ),
+        ("cookie", cookie),
+        ("x-forwarded-for", "203.0.113.7".into()),
+        ("x-forwarded-proto", "https".into()),
+        ("cf-ray", "8f0e1d2c3b4a5968-IAD".into()),
+        ("cf-connecting-ip", "203.0.113.7".into()),
+        ("cf-ipcountry", "US".into()),
+        ("cf-visitor", "{\"scheme\":\"https\"}".into()),
+        ("cdn-loop", "cloudflare; loops=1".into()),
+        (
+            "sec-ch-ua",
+            format!("\"Chromium\";v=\"130\", {}", "\"Not?A_Brand\";v=\"99\""),
+        ),
+        ("sec-ch-ua-mobile", "?0".into()),
+        ("sec-ch-ua-platform", "\"Windows\"".into()),
+        ("sec-fetch-site", "same-origin".into()),
+        ("sec-fetch-mode", "navigate".into()),
+        ("sec-fetch-dest", "document".into()),
+        ("sec-fetch-user", "?1".into()),
+        ("priority", "u=0, i".into()),
+        (
+            "content-type",
+            format!("multipart/form-data; boundary={}", "b".repeat(40)),
+        ),
+        ("origin", "https://example.com".into()),
+        ("x-requested-with", "XMLHttpRequest".into()),
+        ("upgrade-insecure-requests", "1".into()),
+        ("cache-control", format!("max-age=0, {}", "c".repeat(1500))),
+    ];
+    let mut block = Vec::new();
+    enc.encode_header(&mut block, ":method", "POST");
+    enc.encode_header(&mut block, ":path", path);
+    enc.encode_header(&mut block, ":scheme", "https");
+    enc.encode_header(&mut block, ":authority", "example.com");
+    for (name, value) in &fields {
+        enc.encode_header(&mut block, name, value);
+    }
+    block
+}
+
+#[tokio::test]
+async fn normal_multiplexed_body_pending_burst_is_not_refused() {
+    // The decoded-header budget must leave browser headroom: 100 concurrent uploads with a
+    // few KiB of real headers each are all admitted and answered.
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = Config {
+        header_list_size: 16380,
+        ..Config::default()
+    };
+    let (mut client, srv) = open_client(config, calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let mut buf = Vec::new();
+    let sids: Vec<u32> = (0..100).map(|i| 1 + 2 * i).collect();
+    for &sid in &sids {
+        let block = realistic_pending_block(&mut enc, &format!("/upload/{sid}"));
+        frame::write_frame(
+            &mut buf,
+            frame::kind::HEADERS,
+            frame::flags::END_HEADERS,
+            sid,
+            &block,
+        );
+    }
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    client.flush().await.unwrap();
+    let (refused, answered) = refusals_until_ping_ack(&mut client, &mut dec).await;
+    assert!(
+        refused.is_empty(),
+        "browser-shaped uploads refused: {refused:?}"
+    );
+    assert!(answered.is_empty());
+    finish_pending_streams(&mut client, &mut dec, &sids).await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 100);
+    drop(client);
+    let _ = srv.await;
+}
+
+#[tokio::test]
+async fn body_pending_headers_draw_on_the_server_wide_budget() {
+    // Connection count must not multiply the per-connection cap: body-pending header maps
+    // reserve from the server-wide buffered-request budget, a stream that cannot reserve is
+    // refused, and the reservation is returned once the request is dispatched and dropped.
+    let budget = std::sync::Arc::new(hj_core::budget::BodyBufferBudget::new(1 << 20));
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = Config {
+        body_budget: Some(budget.clone()),
+        ..Config::default()
+    };
+    let (mut client, srv) = open_client(config, calls.clone()).await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+
+    let block = encode_get_with(&mut enc, "/pending", &[("x-a", "1")]);
+    assert_eq!(
+        open_pending_streams(&mut client, &mut dec, 1, 1, &block).await,
+        [1]
+    );
+    let held = budget.in_flight();
+    assert!(
+        held > 0,
+        "a body-pending header map holds no server-wide budget"
+    );
+
+    let mut hog = hj_core::budget::BodyBufferLease::new(budget.clone());
+    assert!(hog.reserve(budget.capacity() - held));
+    let block = encode_get_with(&mut enc, "/pending", &[("x-a", "1")]);
+    assert_eq!(
+        open_pending_streams(&mut client, &mut dec, 3, 1, &block).await,
+        [] as [u32; 0],
+        "a stream that cannot reserve from an exhausted budget must be refused"
+    );
+    drop(hog);
+    assert_eq!(
+        budget.in_flight(),
+        held,
+        "the refused stream holds no budget"
+    );
+
+    finish_pending_streams(&mut client, &mut dec, &[1]).await;
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while budget.in_flight() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the dispatched stream must return its header reservation");
+    drop(client);
+    let _ = srv.await;
+}
+
+/// Immediate 200 for every path except `/slow`, whose handler never completes.
+fn fast_or_never(
+    req: Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    if req.uri().path() == "/slow" {
+        Box::pin(std::future::pending())
+    } else {
+        Box::pin(async { hj_core::text_response(http::StatusCode::OK, "") })
+    }
+}
+
+async fn open_fast_or_never() -> (
+    tokio::io::DuplexStream,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let (mut client, server) = tokio::io::duplex(256 * 1024);
+    let srv =
+        tokio::spawn(async move { serve(server, fast_or_never, Config::default(), None).await });
+    client.write_all(hj_h2::conn::PREFACE).await.unwrap();
+    let mut s = Vec::new();
+    frame::write_settings(&mut s, &[]);
+    client.write_all(&s).await.unwrap();
+    for _ in 0..3 {
+        let _ = read_frame(&mut client).await; // SETTINGS, WINDOW_UPDATE, SETTINGS ACK
+    }
+    (client, srv)
+}
+
+#[tokio::test]
+async fn cheap_completions_do_not_refund_the_rapid_reset_budget() {
+    // (CVE-2023-44487) Each pair dispatches one cheap request that completes and one
+    // expensive request the client then resets. A net reset-minus-completion counter
+    // never moves, so the backend work discarded by the resets was unbounded; the
+    // reset budget refills with time only, so the pairs are cut off near its burst.
+    let (mut client, srv) = open_fast_or_never().await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let mut tripped_at = None;
+    'pairs: for pair in 0..1000u32 {
+        let fast = 1 + 4 * pair;
+        let slow = fast + 2;
+        let end = frame::flags::END_HEADERS | frame::flags::END_STREAM;
+        let mut buf = Vec::new();
+        frame::write_frame(
+            &mut buf,
+            frame::kind::HEADERS,
+            end,
+            fast,
+            &encode_get(&mut enc, "/fast"),
+        );
+        frame::write_frame(
+            &mut buf,
+            frame::kind::HEADERS,
+            end,
+            slow,
+            &encode_get(&mut enc, "/slow"),
+        );
+        frame::write_rst_stream(&mut buf, slow, frame::error_code::CANCEL);
+        client.write_all(&buf).await.unwrap();
+        loop {
+            let (hdr, payload) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(&mut client))
+                    .await
+                    .expect("server stalled");
+            match hdr.kind {
+                frame::kind::GOAWAY => {
+                    let code = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    assert_eq!(code, frame::error_code::ENHANCE_YOUR_CALM);
+                    tripped_at = Some(pair);
+                    break 'pairs;
+                }
+                frame::kind::HEADERS => {
+                    dec.decode(&payload, |_, _| {}).unwrap();
+                    if hdr.stream_id == fast {
+                        continue 'pairs;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let pairs = tripped_at.expect("1:1 cancel:complete pairs never exhausted the reset budget");
+    assert!(
+        (190..=300).contains(&pairs),
+        "cut off after {pairs} pairs; the burst is 200 plus slow refill"
+    );
+    drop(client);
+    srv.abort();
+}
+
+#[tokio::test]
+async fn browser_cancel_burst_then_normal_traffic_keeps_the_connection() {
+    // Navigating away cancels a burst of dispatched requests at once; that must stay well
+    // inside the reset budget, and the requests that follow are served normally.
+    let (mut client, srv) = open_fast_or_never().await;
+    let mut enc = Encoder::new();
+    let mut dec = Decoder::new(4096, 1 << 20);
+    let end = frame::flags::END_HEADERS | frame::flags::END_STREAM;
+    let mut sid = 1u32;
+    let mut buf = Vec::new();
+    for _ in 0..150 {
+        frame::write_frame(
+            &mut buf,
+            frame::kind::HEADERS,
+            end,
+            sid,
+            &encode_get(&mut enc, "/slow"),
+        );
+        sid += 2;
+    }
+    for cancelled in (1..sid).step_by(2) {
+        frame::write_rst_stream(&mut buf, cancelled, frame::error_code::CANCEL);
+    }
+    write_ping(&mut buf);
+    client.write_all(&buf).await.unwrap();
+    let (refused, answered) = refusals_until_ping_ack(&mut client, &mut dec).await;
+    assert!(refused.is_empty() && answered.is_empty());
+
+    for _ in 0..6 {
+        let mut buf = Vec::new();
+        let first = sid;
+        for _ in 0..50 {
+            frame::write_frame(
+                &mut buf,
+                frame::kind::HEADERS,
+                end,
+                sid,
+                &encode_get(&mut enc, "/fast"),
+            );
+            sid += 2;
+        }
+        client.write_all(&buf).await.unwrap();
+        for expect in (first..sid).step_by(2) {
+            let (status, _) = read_response(&mut client, &mut dec, expect).await;
+            assert_eq!(status.as_deref(), Some("200"));
+        }
+    }
+    drop(client);
+    srv.abort();
 }

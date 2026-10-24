@@ -60,9 +60,9 @@ pub(super) async fn roundtrip() -> (hj_core::Response, String) {
                 let slot = unknown_at + i * 16;
                 let name = &raw[rd(slot)..rd(slot) + rd(slot + 4)];
                 let value = &raw[rd(slot + 8)..rd(slot + 8) + rd(slot + 12)];
-                assert_ne!(name, b"baggage");
-                assert_ne!(name, b"tracestate");
-                if name == b"traceparent" {
+                assert!(!name.eq_ignore_ascii_case(b"baggage"));
+                assert!(!name.eq_ignore_ascii_case(b"tracestate"));
+                if name.eq_ignore_ascii_case(b"traceparent") {
                     assert!(trace.is_none(), "exactly one propagated parent");
                     trace = Some(String::from_utf8(value.to_vec()).unwrap());
                 }

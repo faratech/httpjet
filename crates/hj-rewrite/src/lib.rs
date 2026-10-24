@@ -70,16 +70,19 @@ pub use directives::{HeaderOpKind, PreparedHeaderOp, chain_prepared_headers};
 pub use error::RewriteError;
 pub use htaccess::{
     AccessMatcher, AccessOrder, AccessRule, AccessSubject, CacheDirectives, CacheKeyModifier,
-    HostAccess, HostEntry, Htaccess, LimitedAccess, MemoClass, ResolvedPhp, Scope, ScopeIndex,
-    ScopeKind, cache_directives, chain_cacheable_for_default, content_type_override,
-    default_charset, php_directives, php_handler_forced, php_handler_forced_iter,
-    set_env_assignments,
+    ExpiresDecision, ExpiresRuleKind, HostAccess, HostEntry, Htaccess, LimitedAccess, MemoClass,
+    ResolvedPhp, Scope, ScopeIndex, ScopeKind, cache_directives, chain_cacheable_for_default,
+    content_type_override, default_charset, expires_decision, php_directives, php_handler_forced,
+    php_handler_forced_iter, set_env_assignments,
 };
 pub use htaccess::{
     AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request, resolve_auth_for_request_paths,
 };
 pub use input::{FileTests, HeaderLookup, RewriteInput, StatSource};
-pub use rules::{CacheKeyVar, RewriteOutcome, RuleSet, evaluate, evaluate_with_engine};
+pub use rules::{
+    CacheKeyVar, RewriteOutcome, RuleSet, evaluate, evaluate_with_engine,
+    proxy_authority_substituted,
+};
 
 #[cfg(test)]
 mod tests;

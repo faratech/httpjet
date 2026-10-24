@@ -205,6 +205,8 @@ struct MemoEntry {
     vary: Vec<VaryItem>,
     status: http::StatusCode,
     headers: http::HeaderMap,
+    /// `headers` ends with a placeholder `Date` that each replay overwrites in place.
+    stamp_date: bool,
     body: Bytes,
     expires: Instant,
 }
@@ -322,6 +324,10 @@ pub(super) fn probe(
         let mut resp = http::Response::new(Body::Full(e.body.clone()));
         *resp.status_mut() = e.status;
         *resp.headers_mut() = e.headers.clone();
+        if e.stamp_date {
+            resp.headers_mut()
+                .insert(http::header::DATE, hj_core::http_date_now());
+        }
         Some(resp)
     })
 }
@@ -356,6 +362,14 @@ pub(super) fn store_until(
         return;
     }
     let h = key_hash(k);
+    // A cloned HeaderMap has no spare entry capacity, so stamping Date on each replay
+    // regrew the whole header array (a ~6 KiB realloc + copy on the forum, re-faulting
+    // fresh pages under MIMALLOC_PURGE_DELAY=0). Store the slot; a replay overwrites it.
+    let mut headers = resp.headers().clone();
+    let stamp_date = !headers.contains_key(http::header::DATE);
+    if stamp_date {
+        headers.insert(http::header::DATE, hj_core::http_date_now());
+    }
     let entry = MemoEntry {
         generation: k.generation,
         listener: k.listener.to_owned(),
@@ -369,7 +383,8 @@ pub(super) fn store_until(
         ae: k.ae.to_owned(),
         vary,
         status: resp.status(),
-        headers: resp.headers().clone(),
+        headers,
+        stamp_date,
         body: body.clone(),
         expires,
     };
@@ -446,6 +461,36 @@ mod tests {
 
     fn ua_cache() -> UaClassifyCache {
         UaClassifyCache::new()
+    }
+
+    #[test]
+    fn replays_stamp_a_fresh_date_in_place_and_keep_a_backend_date() {
+        let now = Instant::now();
+        let request = req(&[]);
+        let cache = ua_cache();
+        let undated = key("/undated", b"");
+        store(&undated, Vec::new(), &resp(b"x"), now);
+        let hit = probe(&undated, &request, &cache, now).unwrap();
+        let names: Vec<_> = hit.headers().keys().map(|n| n.as_str()).collect();
+        assert_eq!(
+            names,
+            ["content-type", "date"],
+            "Date stays last, as stamp_date appends it"
+        );
+        assert_eq!(hit.headers()[http::header::DATE], hj_core::http_date_now());
+
+        let dated = key("/dated", b"");
+        let mut backend = resp(b"y");
+        backend.headers_mut().insert(
+            http::header::DATE,
+            http::HeaderValue::from_static("Mon, 01 Jan 2024 00:00:00 GMT"),
+        );
+        store(&dated, Vec::new(), &backend, now);
+        let hit = probe(&dated, &request, &cache, now).unwrap();
+        assert_eq!(
+            hit.headers()[http::header::DATE],
+            "Mon, 01 Jan 2024 00:00:00 GMT"
+        );
     }
 
     #[test]

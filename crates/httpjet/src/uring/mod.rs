@@ -193,7 +193,7 @@ impl CoreHandler {
             ctx.local,
             ctx.peer.port(),
             ctx.is_tls,
-            ctx.mtls_required,
+            ctx.client_auth_requested,
             ctx.peer_unix,
             ctx.proto,
             ctx.tls.clone(),
@@ -898,7 +898,7 @@ fn build_pipeline_bridge(
                 ctx.peer.port(),
                 ctx.is_tls,
                 ctx.peer_unix,
-                ctx.mtls_required,
+                ctx.client_auth_requested,
                 ctx.tls,
                 ctx.proto,
                 ctx.sni.as_deref(),
@@ -918,6 +918,43 @@ pub(crate) fn pipeline_admission(
     })
 }
 
+/// A TLS listener's client-certificate policy (its `clientVerify`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ClientAuth {
+    /// `clientVerify` 0 (or `--no-mtls`): no certificate is requested.
+    #[default]
+    None,
+    /// 1 and 3: a certificate is requested and validated when presented; a peer
+    /// without one is still served.
+    Optional,
+    /// 2: an external peer that presents no certificate is refused.
+    Required,
+}
+
+impl ClientAuth {
+    pub(crate) fn from_client_verify(client_verify: u8) -> Self {
+        match client_verify {
+            0 => ClientAuth::None,
+            2 => ClientAuth::Required,
+            _ => ClientAuth::Optional,
+        }
+    }
+
+    pub(crate) fn for_listener(listener: &hj_core::config::Listener) -> Self {
+        Self::from_client_verify(listener.tls.as_ref().map_or(0, |tls| tls.client_verify))
+    }
+
+    pub(crate) fn required(self) -> bool {
+        self == ClientAuth::Required
+    }
+
+    /// A listener that asks for a certificate lets only a presented one vouch for
+    /// forwarded client identity, whether or not it refuses peers without one.
+    pub(crate) fn requested(self) -> bool {
+        self != ClientAuth::None
+    }
+}
+
 /// Spawn the io_uring HTTP/3 transport on `https_addr` (UDP): per-core monoio runtimes
 /// driving quinn-proto, each dispatching requests through the SAME pipeline bridge as the
 /// H1/H2 paths. This is the sole production H3 transport.
@@ -928,7 +965,7 @@ pub(crate) fn spawn_uring_h3(
     https_addr: SocketAddr,
     workers: usize,
     rustls_cfg: Arc<rustls::ServerConfig>,
-    require_client_cert: bool,
+    client_auth: ClientAuth,
     inherited: Option<Vec<std::net::UdpSocket>>,
     admission: bridge::BridgeAdmission,
 ) -> anyhow::Result<(WorkerGroup, h3::QuicReloadHandle)> {
@@ -970,7 +1007,7 @@ pub(crate) fn spawn_uring_h3(
         workers,
         rustls_cfg,
         bridge,
-        require_client_cert,
+        client_auth,
         runtime,
         inherited,
         shutdown,
@@ -992,7 +1029,7 @@ pub(crate) fn spawn_uring_https(
     https_addr: SocketAddr,
     workers: usize,
     tls_config: Arc<rustls::ServerConfig>,
-    require_client_cert: bool,
+    client_auth: ClientAuth,
     ktls_template: Option<Arc<hj_tls::KtlsConfigTemplate>>,
     inherited: Option<Vec<std::net::TcpListener>>,
     admission: bridge::BridgeAdmission,
@@ -1038,7 +1075,7 @@ pub(crate) fn spawn_uring_https(
                     https_addr,
                     core,
                     acceptor,
-                    require_client_cert,
+                    client_auth,
                     ktls_template,
                     shutdown,
                     active_conns,
@@ -1061,7 +1098,7 @@ fn per_core_https(
     local: SocketAddr,
     core: CoreHandler,
     acceptor: monoio_rustls::TlsAcceptor,
-    require_client_cert: bool,
+    client_auth: ClientAuth,
     ktls_template: Option<Arc<hj_tls::KtlsConfigTemplate>>,
     shutdown: CancellationToken,
     _active_conns: Arc<std::sync::atomic::AtomicU64>,
@@ -1093,7 +1130,7 @@ fn per_core_https(
         tracing::info!(core = core_idx, "uring tls: per-core runtime serving (H1/H2 over TLS → real pipeline)");
         accept_drain_loop(core_idx, listener, shutdown.clone(), true, core.clone(), accept_stopped, activation.raced_connections(), move |stream, peer| {
             let local = connection_local_addr(&stream, local);
-            handle_tls_bridged(stream, peer, local, core.pin_connection(), acceptor.clone(), require_client_cert, ktls_template.clone(), shutdown.clone(), binding)
+            handle_tls_bridged(stream, peer, local, core.pin_connection(), acceptor.clone(), client_auth, ktls_template.clone(), shutdown.clone(), binding)
         })
         .await;
     });
@@ -1111,7 +1148,7 @@ async fn handle_tls_bridged(
     local: SocketAddr,
     core: CoreHandler,
     acceptor: monoio_rustls::TlsAcceptor,
-    require_client_cert: bool,
+    client_auth: ClientAuth,
     ktls_template: Option<Arc<hj_tls::KtlsConfigTemplate>>,
     shutdown: CancellationToken,
     binding: ListenerBinding,
@@ -1246,7 +1283,7 @@ async fn handle_tls_bridged(
     // presented no valid client cert — mirrors server.rs::mtls_refused exactly.
     // Client-auth listeners never resume sessions (hj-tls listener_session_storage),
     // so `peer_certificates` is always this handshake's own verifier verdict.
-    if require_client_cert && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
+    if client_auth.required() && !has_client_cert && !hj_core::is_trusted_internal_peer(peer.ip()) {
         tracing::debug!(%peer, "uring tls: mTLS required, no client cert from non-internal peer; refusing");
         return;
     }
@@ -1273,7 +1310,7 @@ async fn handle_tls_bridged(
         is_tls: true,
         direct_file_egress: false,
         peer_unix: false,
-        mtls_required: require_client_cert,
+        client_auth_requested: client_auth.requested(),
         sni,
         tls: tls_params,
         request_generation: None,
@@ -1446,6 +1483,22 @@ fn release_intake_capacity(acc: &mut Vec<u8>) {
         kept.extend_from_slice(acc);
         *acc = kept;
     }
+}
+
+/// Remove a fixed-length request from the keep-alive accumulator without allocating a
+/// second body-sized buffer. The body keeps `acc`'s existing allocation; only bytes for a
+/// pipelined successor, when present, move into the replacement accumulator.
+fn take_fixed_body(acc: &mut Vec<u8>, head_len: usize, body_len: usize) -> Vec<u8> {
+    debug_assert!(head_len.saturating_add(body_len) <= acc.len());
+    acc.drain(..head_len);
+    if body_len == 0 {
+        release_intake_capacity(acc);
+        return Vec::new();
+    }
+    let pipelined = acc.split_off(body_len);
+    let body = std::mem::replace(acc, pipelined);
+    release_intake_capacity(acc);
+    body
 }
 
 /// The accepted socket's own address when the listener is bound to a wildcard:
@@ -1663,6 +1716,23 @@ async fn serve_h2_bridged<S>(
     // (Tier 2) Per-connection egress pacing (h2 streams share one pipe, so the
     // rate is connection-wide here; the per-context override is an H1 refinement).
     h2_cfg.bandwidth_limit = state.serve_config.bandwidth_limit;
+    // h2c to an mTLS-gated vhost: refuse a body-carrying request from its head, as the H1
+    // transport does, instead of buffering the body the pipeline gate then discards. Only
+    // a non-exempt plaintext peer on a server with a gated vhost gets the hook at all.
+    if !ctx.is_tls
+        && !ctx.peer_unix
+        && !state.mtls_required_vhosts.is_empty()
+        && !hj_core::is_trusted_internal_peer(ctx.peer.ip())
+    {
+        let holder = core.holder.clone();
+        let listener = core.listener_name.clone();
+        let (peer_ip, proto) = (ctx.peer.ip(), ctx.proto);
+        h2_cfg.early_reject = Some(hj_h2::server::EarlyReject(Arc::new(
+            move |head: &hj_h2::server::RequestHead<'_>| {
+                h2c_mtls_redirect(&holder.load_full(), &listener, peer_ip, proto, head)
+            },
+        )));
+    }
 
     // H2 clones its service captures for every stream.  Keep the connection-local
     // handler behind one Arc so that does not clone every Arc-bearing field in
@@ -1706,6 +1776,32 @@ async fn serve_h2_bridged<S>(
     {
         tracing::debug!(error = %e, "uring serve: h2 connection ended");
     }
+}
+
+/// The plaintext mTLS-gate redirect for an h2c request head, as a bodiless response: hj-h2
+/// sends it before accepting any DATA. The request the pipeline would see carries
+/// `:authority` as its Host header, so the probe does too.
+fn h2c_mtls_redirect(
+    state: &Arc<ServerState>,
+    listener: &str,
+    peer_ip: std::net::IpAddr,
+    proto: Proto,
+    head: &hj_h2::server::RequestHead<'_>,
+) -> Option<(http::StatusCode, http::HeaderMap)> {
+    let mut probe = http::Request::new(hj_core::empty_incoming());
+    *probe.method_mut() = head.method.clone();
+    *probe.uri_mut() = head.uri.clone();
+    *probe.headers_mut() = head.headers.clone();
+    if let Some(authority) = head.authority {
+        probe
+            .headers_mut()
+            .insert(http::header::HOST, authority.clone());
+    }
+    let response = crate::pipeline::plaintext_mtls_redirect(
+        state, listener, peer_ip, proto, &mut probe, true,
+    )?;
+    let (parts, _) = hj_core::stamp_date(response).into_parts();
+    Some((parts.status, parts.headers))
 }
 
 /// LiteSpeed `maxKeepAliveReq`: the keep-alive connection closes once it has SERVED `max`
@@ -1888,8 +1984,16 @@ async fn handle_h1_bridged<S>(
                 }
             }
         };
-        let (method, uri, mut headers, head_len, framing, mut keep_alive, expect_continue, http10) =
-            parsed;
+        let (
+            method,
+            mut uri,
+            mut headers,
+            head_len,
+            framing,
+            mut keep_alive,
+            expect_continue,
+            http10,
+        ) = parsed;
         // The body gets `connTimeout` from here. Restarting it on every read would let a
         // slow client retain a connection and body-budget lease indefinitely by trickling
         // data, so only BODY_MIN_PROGRESS per window extends it, up to the ceiling (#509,
@@ -1904,6 +2008,55 @@ async fn handle_h1_bridged<S>(
         served = served.saturating_add(1);
         if keepalive_exhausted(served, max_keepalive) {
             keep_alive = false;
+        }
+        // A plaintext request the mTLS gate will refuse is answered from its head:
+        // reserving body budget, sending 100 Continue or reading the body first would
+        // spend all three on a request that is redirected regardless. The body stays
+        // unread, so the connection closes after the redirect.
+        let carries_body = match framing {
+            BodyFraming::Length(len) => len > 0 && len <= max_body,
+            BodyFraming::Chunked => true,
+            BodyFraming::Reject => false,
+        };
+        if carries_body && !ctx.is_tls && !state.mtls_required_vhosts.is_empty() {
+            let mut probe = http::Request::new(hj_core::empty_incoming());
+            *probe.method_mut() = method.clone();
+            *probe.uri_mut() = uri;
+            *probe.version_mut() = http::Version::HTTP_11;
+            *probe.headers_mut() = headers;
+            if http10 {
+                probe.extensions_mut().insert(hj_core::Http10Request);
+            }
+            let refused = crate::pipeline::plaintext_mtls_redirect(
+                &state,
+                &core.listener_name,
+                ctx.peer.ip(),
+                ctx.proto,
+                &mut probe,
+                false,
+            );
+            let (parts, _) = probe.into_parts();
+            uri = parts.uri;
+            headers = parts.headers;
+            if let Some(response) = refused {
+                let response = bridge::fast_response(hj_core::stamp_date(response), false).await;
+                let outcome = write_h1_response(
+                    &mut stream,
+                    response,
+                    method == http::Method::HEAD,
+                    false,
+                    http10,
+                    &mut throttle,
+                    None,
+                    header_read_timeout,
+                    &shutdown,
+                )
+                .await;
+                if !outcome.failed {
+                    lingering_close(&mut stream, &shutdown).await;
+                }
+                return;
+            }
         }
         // The reservation follows the allocation into dispatch, including body
         // frames retained by a backend writer after the response completes.
@@ -1993,10 +2146,7 @@ async fn handle_h1_bridged<S>(
                         _ => return,
                     }
                 }
-                let bb = acc[head_len..total].to_vec();
-                acc.drain(..total);
-                release_intake_capacity(&mut acc);
-                bb
+                take_fixed_body(&mut acc, head_len, content_length)
             }
             BodyFraming::Chunked => {
                 // Decode the chunked body framing so the keep-alive buffer stays aligned
@@ -2204,6 +2354,7 @@ async fn handle_h1_bridged<S>(
             http10,
             &mut throttle,
             sendfile_fd,
+            header_read_timeout,
             &shutdown,
         )
         .await;
@@ -2585,6 +2736,21 @@ fn push_h1_status_line(out: &mut Vec<u8>, status: http::StatusCode, reason: &str
     out.extend_from_slice(b"\r\n");
 }
 
+/// Status line plus the framing and connection lines an H1 head adds beyond the
+/// response's own headers (a 20-digit content-length at most).
+const H1_HEAD_FIXED_BYTES: usize = 128;
+
+/// One exactly sized head buffer: growing from a fixed guess reallocated a large header
+/// set (1.6 KiB on the forum) through three size classes per response, and under
+/// `MIMALLOC_PURGE_DELAY=0` those sparsely used classes re-faulted their pages.
+fn h1_head_capacity(headers: &http::HeaderMap) -> usize {
+    H1_HEAD_FIXED_BYTES
+        + headers
+            .iter()
+            .map(|(n, v)| n.as_str().len() + v.len() + 4)
+            .sum::<usize>()
+}
+
 fn serialize_h1_response_head(
     status: http::StatusCode,
     headers: &http::HeaderMap,
@@ -2593,7 +2759,7 @@ fn serialize_h1_response_head(
     keep_alive: bool,
 ) -> Vec<u8> {
     let reason = status.canonical_reason().unwrap_or("");
-    let mut out: Vec<u8> = Vec::with_capacity(256);
+    let mut out: Vec<u8> = Vec::with_capacity(h1_head_capacity(headers));
     push_h1_status_line(&mut out, status, reason);
     for (n, v) in headers.iter() {
         if n == http::header::CONTENT_LENGTH || is_hop_by_hop_response(n) {
@@ -2622,15 +2788,6 @@ fn serialize_h1_response_head(
         b"connection: close\r\n\r\n"
     });
     out
-}
-
-async fn write_h1_vectored<S>(stream: &mut S, parts: Vec<bytes::Bytes>) -> io::Result<()>
-where
-    S: AsyncWriteRent,
-{
-    let buffer = hj_h2::owned_iovec::OwnedIoVec::from_bytes(parts)?;
-    hj_h2::owned_iovec::write_all_owned(stream, buffer).await?;
-    Ok(())
 }
 
 fn serialize_h1_upgrade_response(status: http::StatusCode, headers: &http::HeaderMap) -> Vec<u8> {
@@ -2924,6 +3081,7 @@ mod early_hints_tests {
                 http10,
                 &mut None,
                 None,
+                None,
                 &CancellationToken::new(),
             )
             .await;
@@ -3001,6 +3159,154 @@ mod early_hints_tests {
     }
 }
 
+/// Bytes an H1 response must deliver per send-progress window while its writes are
+/// blocked on the client (~273 B/s at 60 s, the H2/H3 rule). Without it any byte of
+/// progress restarted the write timers, so a reader draining a few bytes per interval
+/// pinned its connection permit, and the upstream or PHP worker of a streamed body.
+const H1_SEND_MIN_PROGRESS: u64 = 16 * 1024;
+
+/// Most bytes one write call may report at once: a userspace-TLS write returns only
+/// after flushing every record rustls accepted (its 64 KiB buffer limit), so progress
+/// inside that call is invisible until it completes.
+const H1_WRITE_PROGRESS_GRAIN: u64 = 64 * 1024;
+
+/// A complete response at most this large is written without the send-progress timer:
+/// it fits the socket send buffer, so its write blocks only behind bytes the client left
+/// unread, while arming a timer for every small response cost the hot H1 cache-hit and
+/// static paths several percent CPU. Larger bodies, files and streams stay timed.
+const H1_UNTIMED_FULL_MAX: usize = 64 * 1024;
+
+/// Read buffer for a file body that cannot `sendfile` (a unix-socket peer, or a
+/// descriptor/filesystem `sendfile` refuses). One buffer per response, reused per
+/// chunk: a slow reader holds at most this much heap.
+const H1_FILE_READ_CHUNK: usize = 256 * 1024;
+
+/// One H1 response's send-progress clock, shared by the Full, File and Stream paths.
+/// Only time spent blocked writing to the client counts: bandwidth-throttle sleeps and
+/// waits on a streaming backend happen between writes, so neither a configured rate
+/// nor a slow backend can trip it. `window: None` (`connTimeout` disarmed) never fires.
+struct SendProgress {
+    window: Option<std::time::Duration>,
+    blocked: std::time::Duration,
+    progressed: u64,
+}
+
+impl SendProgress {
+    fn new(window: Option<std::time::Duration>) -> Self {
+        Self {
+            window,
+            blocked: std::time::Duration::ZERO,
+            progressed: 0,
+        }
+    }
+
+    /// How long a write of `len` bytes may stay blocked: the rest of this window, plus
+    /// one window for each further [`H1_SEND_MIN_PROGRESS`] the call could report.
+    fn budget(&self, len: usize) -> Option<std::time::Duration> {
+        let window = self.window?;
+        let owed = H1_SEND_MIN_PROGRESS - self.progressed;
+        let reportable = (len as u64).min(H1_WRITE_PROGRESS_GRAIN);
+        let extra = (reportable.saturating_sub(owed) / H1_SEND_MIN_PROGRESS) as u32;
+        Some(window.saturating_sub(self.blocked) + window.saturating_mul(extra))
+    }
+
+    /// Account one write attempt that moved `sent` bytes after `blocked` waiting. Each
+    /// [`H1_SEND_MIN_PROGRESS`] earns one window back; credit never banks past zero.
+    fn record(&mut self, sent: usize, blocked: std::time::Duration) -> io::Result<()> {
+        let Some(window) = self.window else {
+            return Ok(());
+        };
+        self.progressed = self.progressed.saturating_add(sent as u64);
+        self.blocked = self.blocked.saturating_add(blocked);
+        let earned = self.progressed / H1_SEND_MIN_PROGRESS;
+        if earned > 0 {
+            self.progressed %= H1_SEND_MIN_PROGRESS;
+            self.blocked = self
+                .blocked
+                .saturating_sub(window.saturating_mul(earned.min(u64::from(u32::MAX)) as u32));
+        }
+        if self.blocked >= window {
+            return Err(send_progress_timeout());
+        }
+        Ok(())
+    }
+
+    /// Run one write of `len` bytes under its [`Self::budget`].
+    async fn timed<F: std::future::Future>(
+        &self,
+        len: usize,
+        write: F,
+    ) -> io::Result<(F::Output, std::time::Duration)> {
+        let Some(budget) = self.budget(len) else {
+            return Ok((write.await, std::time::Duration::ZERO));
+        };
+        let started = monoio::time::Instant::now();
+        match monoio::time::timeout_at(started + budget, write).await {
+            Ok(out) => Ok((out, started.elapsed())),
+            Err(_) => Err(send_progress_timeout()),
+        }
+    }
+
+    /// `write_all` under the progress rule; hands the buffer back for reuse.
+    async fn write_all<S, B>(&mut self, stream: &mut S, mut buf: B) -> io::Result<B>
+    where
+        S: AsyncWriteRent,
+        B: monoio::buf::IoBuf,
+    {
+        let len = buf.bytes_init();
+        let mut written = 0;
+        while written < len {
+            let ((result, slice), blocked) = self
+                .timed(len - written, stream.write(buf.slice(written..len)))
+                .await?;
+            buf = slice.into_inner();
+            let n = match result {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => 0,
+                Err(e) => return Err(e),
+            };
+            written += n;
+            self.record(n, blocked)?;
+        }
+        Ok(buf)
+    }
+
+    /// One vectored `write_all` of `parts` under the progress rule.
+    async fn write_vectored<S>(
+        &mut self,
+        stream: &mut S,
+        parts: Vec<bytes::Bytes>,
+    ) -> io::Result<()>
+    where
+        S: AsyncWriteRent,
+    {
+        let mut buffer = hj_h2::owned_iovec::OwnedIoVec::from_bytes(parts)?;
+        while !buffer.is_empty() {
+            let ((result, returned), blocked) = self
+                .timed(buffer.remaining(), stream.writev(buffer))
+                .await?;
+            buffer = returned;
+            let n = match result {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => 0,
+                Err(e) => return Err(e),
+            };
+            buffer.consume(n)?;
+            self.record(n, blocked)?;
+        }
+        Ok(())
+    }
+}
+
+fn send_progress_timeout() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "response send fell below the minimum progress rate",
+    )
+}
+
 struct WriteOutcome {
     close: bool,
     #[allow(dead_code)] // observed by optional telemetry
@@ -3023,12 +3329,14 @@ async fn write_h1_response<S>(
     http10: bool,
     throttle: &mut Option<hj_http::BandwidthThrottle>,
     sendfile_fd: Option<std::os::fd::RawFd>,
+    send_window: Option<std::time::Duration>,
     shutdown: &CancellationToken,
 ) -> WriteOutcome
 where
     S: AsyncWriteRent,
 {
     let completion = resp.completion.take();
+    let mut progress = SendProgress::new(send_window);
     // (Tier 2) 103 Early Hints over HTTP/1.1 — parity with the h2 emitter: the backend's
     // preload/preconnect Link headers go out as an interim response ahead of the final
     // head, in the same write (the final response is already complete). Upgrades (101)
@@ -3051,12 +3359,20 @@ where
                 ),
             );
             let body_forbidden = hj_core::response_body_forbidden(is_head, resp.status);
-            let result = if body_forbidden || body.is_empty() {
-                stream.write_all(head).await.0.map(|_| ())
-            } else if let Some(t) = throttle.as_mut() {
-                paced_h1_body(stream, head, body, t).await
+            let sent = head.len() + if body_forbidden { 0 } else { body.len() };
+            let mut progress = if sent <= H1_UNTIMED_FULL_MAX && throttle.is_none() {
+                SendProgress::new(None)
             } else {
-                write_h1_vectored(stream, vec![bytes::Bytes::from(head), body]).await
+                progress
+            };
+            let result = if body_forbidden || body.is_empty() {
+                progress.write_all(stream, head).await.map(drop)
+            } else if let Some(t) = throttle.as_mut() {
+                paced_h1_body(stream, head, body, t, &mut progress).await
+            } else {
+                progress
+                    .write_vectored(stream, vec![bytes::Bytes::from(head), body])
+                    .await
             };
             WriteOutcome::new(result.is_err(), keep_alive)
         }
@@ -3071,6 +3387,7 @@ where
                 keep_alive,
                 throttle,
                 sendfile_fd,
+                &mut progress,
             )
             .await;
             WriteOutcome::new(result.is_err(), keep_alive)
@@ -3087,6 +3404,7 @@ where
                 keep_alive,
                 http10,
                 throttle,
+                &mut progress,
                 shutdown,
             )
             .await
@@ -3116,10 +3434,12 @@ async fn write_h1_file<S>(
     keep_alive: bool,
     throttle: &mut Option<hj_http::BandwidthThrottle>,
     sendfile_fd: Option<std::os::fd::RawFd>,
+    progress: &mut SendProgress,
 ) -> io::Result<()>
 where
     S: AsyncWriteRent,
 {
+    use monoio::buf::{IoBuf, IoBufMut};
     use std::os::fd::BorrowedFd;
 
     let (start, len) = body.range.map_or((0, body.len), |(start, end)| {
@@ -3129,7 +3449,7 @@ where
         interim,
         serialize_h1_stream_head(status, headers, Some(len), is_head, keep_alive),
     );
-    stream.write_all(head).await.0?;
+    progress.write_all(stream, head).await?;
     if hj_core::response_body_forbidden(is_head, status) || len == 0 {
         return Ok(());
     }
@@ -3146,13 +3466,11 @@ where
     const CHUNK: usize = 1024 * 1024;
     // A reader that stops draining (zero-window peer) keeps `sendfile` returning
     // EAGAIN. Retry with an exponential backoff so that cannot busy-poll the pinned
-    // worker core, and close the connection after this long with ZERO progress —
-    // a transfer that moves any byte resets the clock, so only a truly stalled
-    // reader (or a wedged peer) is cut off.
-    const SENDFILE_STALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+    // worker core; the backoff sleeps are time blocked on the client, so a reader
+    // below the minimum progress rate is cut off like any other slow H1 reader.
     const SENDFILE_BACKOFF_MAX_US: u64 = 12_800;
     let mut backoff_us: u64 = 100;
-    let mut last_progress = std::time::Instant::now();
+    let mut read_buf: Vec<u8> = Vec::new();
 
     while offset < end {
         let chunk = if throttle.is_some() { 64 * 1024 } else { CHUNK };
@@ -3177,7 +3495,7 @@ where
                 Ok(written) => {
                     observe_h1_sendfile(written);
                     backoff_us = 100;
-                    last_progress = std::time::Instant::now();
+                    progress.record(written, std::time::Duration::ZERO)?;
                     if let Some(bucket) = throttle.as_mut() {
                         let wait = bucket.acquire(written as u64);
                         if wait > 0 {
@@ -3188,13 +3506,9 @@ where
                 }
                 Err(error) if error == rustix::io::Errno::INTR => continue,
                 Err(error) if error == rustix::io::Errno::AGAIN => {
-                    if last_progress.elapsed() >= SENDFILE_STALL_DEADLINE {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "sendfile stalled: no egress progress",
-                        ));
-                    }
+                    let started = std::time::Instant::now();
                     monoio::time::sleep(std::time::Duration::from_micros(backoff_us)).await;
+                    progress.record(0, started.elapsed())?;
                     backoff_us = (backoff_us.saturating_mul(2)).min(SENDFILE_BACKOFF_MAX_US);
                     continue;
                 }
@@ -3210,7 +3524,12 @@ where
             }
         }
 
-        let (read, buffer) = file.read_at(vec![0u8; want], offset).await;
+        let want = want.min(H1_FILE_READ_CHUNK);
+        if read_buf.capacity() < want {
+            read_buf = Vec::with_capacity(want);
+        }
+        let (read, buffer) = file.read_at(read_buf.slice_mut(0..want), offset).await;
+        read_buf = buffer.into_inner();
         let read = read?;
         if read == 0 {
             return Err(io::Error::new(
@@ -3224,13 +3543,410 @@ where
                 monoio::time::sleep(std::time::Duration::from_micros(wait)).await;
             }
         }
-        stream
-            .write_all(bytes::Bytes::from(buffer).slice(..read))
-            .await
-            .0?;
+        read_buf = progress
+            .write_all(stream, read_buf.slice(..read))
+            .await?
+            .into_inner();
         offset += read as u64;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod send_progress_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const WINDOW: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn progress_below_the_floor_fails_at_one_window_and_credit_never_banks() {
+        let window = Duration::from_secs(60);
+        let mut p = SendProgress::new(Some(window));
+        p.record(1000, Duration::from_secs(30)).unwrap();
+        assert!(p.record(1000, Duration::from_secs(30)).is_err());
+
+        let mut p = SendProgress::new(Some(window));
+        p.record(8 * 1024, Duration::from_secs(50)).unwrap();
+        p.record(8 * 1024, Duration::from_secs(5)).unwrap();
+        p.record(100, Duration::from_secs(59))
+            .expect("16 KiB within the window starts a fresh one");
+
+        let mut p = SendProgress::new(Some(window));
+        p.record(1 << 20, Duration::ZERO).unwrap();
+        assert!(
+            p.record(0, window).is_err(),
+            "a fast burst must not bank credit for a later stall"
+        );
+
+        let mut p = SendProgress::new(None);
+        assert_eq!(p.budget(1 << 20), None);
+        p.record(0, Duration::from_secs(1 << 20)).unwrap();
+    }
+
+    #[test]
+    fn one_write_may_wait_for_the_windows_its_reportable_bytes_earn() {
+        let window = Duration::from_secs(60);
+        let p = SendProgress::new(Some(window));
+        assert_eq!(p.budget(100), Some(window));
+        assert_eq!(p.budget(16 * 1024), Some(window));
+        assert_eq!(p.budget(64 * 1024), Some(window * 4));
+        assert_eq!(
+            p.budget(1 << 20),
+            Some(window * 4),
+            "capped at the TLS grain"
+        );
+
+        let mut p = SendProgress::new(Some(window));
+        p.record(64 * 1024, window * 7 / 2)
+            .expect("64 KiB in 3.5 windows is above 16 KiB per window");
+        assert_eq!(p.blocked, Duration::ZERO);
+        assert_eq!(p.budget(100), Some(window));
+    }
+
+    /// Accepts at most `per_write` bytes per call, after `delay`: a reader that drains
+    /// the socket at a fixed slow rate.
+    struct Trickle {
+        per_write: usize,
+        delay: Duration,
+        wire: Vec<u8>,
+    }
+
+    impl Trickle {
+        fn new(per_write: usize, delay: Duration) -> Self {
+            Self {
+                per_write,
+                delay,
+                wire: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncWriteRent for Trickle {
+        async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            monoio::time::sleep(self.delay).await;
+            let n = buf.bytes_init().min(self.per_write);
+            // SAFETY: an IoBuf guarantees `bytes_init` initialized bytes at `read_ptr`,
+            // and `n` never exceeds that.
+            let bytes = unsafe { std::slice::from_raw_parts(buf.read_ptr(), n) };
+            self.wire.extend_from_slice(bytes);
+            (Ok(n), buf)
+        }
+
+        async fn writev<T: monoio::buf::IoVecBuf>(
+            &mut self,
+            buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            monoio::time::sleep(self.delay).await;
+            let mut n = 0;
+            for index in 0..buf.read_iovec_len() {
+                // SAFETY: an IoVecBuf guarantees `read_iovec_len` valid iovecs over
+                // initialized bytes at `read_iovec_ptr`.
+                let slice = unsafe {
+                    let iov = &*buf.read_iovec_ptr().add(index);
+                    std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
+                };
+                let take = slice.len().min(self.per_write - n);
+                self.wire.extend_from_slice(&slice[..take]);
+                n += take;
+                if n == self.per_write {
+                    break;
+                }
+            }
+            (Ok(n), buf)
+        }
+
+        async fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const BODY_LEN: usize = 256 * 1024;
+
+    fn temp_file(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "httpjet-send-progress-{tag}-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, vec![b'f'; BODY_LEN]).unwrap();
+        path
+    }
+
+    /// Every body shape the H1 writer serves, each `BODY_LEN` bytes.
+    fn bodies(file: &std::path::Path) -> Vec<(&'static str, bridge::BridgeBody)> {
+        let stream = |len: Option<u64>| {
+            let (tx, rx) = tokio::sync::mpsc::channel(BODY_LEN / 8192);
+            for _ in 0..BODY_LEN / 8192 {
+                tx.try_send(Ok(bytes::Bytes::from(vec![b's'; 8192])))
+                    .unwrap();
+            }
+            bridge::BridgeBody::Stream { rx, len }
+        };
+        vec![
+            (
+                "full",
+                bridge::BridgeBody::Full(bytes::Bytes::from(vec![b'b'; BODY_LEN])),
+            ),
+            ("stream", stream(Some(BODY_LEN as u64))),
+            ("chunked", stream(None)),
+            (
+                "file",
+                bridge::BridgeBody::File(hj_core::FileBody {
+                    path: file.to_path_buf(),
+                    file: Some(std::fs::File::open(file).unwrap()),
+                    len: BODY_LEN as u64,
+                    range: None,
+                    cached: None,
+                }),
+            ),
+        ]
+    }
+
+    /// Write one response through `writer` under `WINDOW`, bounded by a deadline long
+    /// enough for any correct outcome. Returns (failed, elapsed, writer).
+    fn send<W: AsyncWriteRent>(
+        mut writer: W,
+        body: bridge::BridgeBody,
+        throttle: Option<hj_http::BandwidthThrottle>,
+    ) -> (bool, Duration, W) {
+        let response = bridge::BridgeResp {
+            completion: None,
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body,
+            bw_rate: None,
+        };
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let mut throttle = throttle;
+            let started = Instant::now();
+            let outcome = monoio::time::timeout(
+                Duration::from_secs(5),
+                write_h1_response(
+                    &mut writer,
+                    response,
+                    false,
+                    true,
+                    false,
+                    &mut throttle,
+                    None,
+                    Some(WINDOW),
+                    &CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("the response must finish or fail, never hang");
+            (outcome.failed, started.elapsed(), writer)
+        })
+    }
+
+    #[test]
+    fn a_reader_below_the_minimum_rate_is_cut_off_for_every_body_shape() {
+        let file = temp_file("slow");
+        for (shape, body) in bodies(&file) {
+            // ~5 KiB per 200 ms window, a third of the floor (and slower under load).
+            let (failed, elapsed, writer) =
+                send(Trickle::new(256, Duration::from_millis(10)), body, None);
+            assert!(failed, "{shape}: a trickling reader must fail the response");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "{shape}: cut off after one window, not after the whole body ({elapsed:?})"
+            );
+            assert!(writer.wire.len() < BODY_LEN, "{shape}");
+        }
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn a_reader_above_the_minimum_rate_receives_every_body_shape() {
+        let file = temp_file("fast");
+        for (shape, body) in bodies(&file) {
+            // ~160 KiB per 200 ms window: ten times the floor.
+            let (failed, _, writer) =
+                send(Trickle::new(8192, Duration::from_millis(10)), body, None);
+            assert!(!failed, "{shape}: a reader above the floor must be served");
+            assert!(writer.wire.len() >= BODY_LEN, "{shape}");
+        }
+        let _ = std::fs::remove_file(file);
+    }
+
+    #[test]
+    fn throttle_sleeps_and_backend_waits_do_not_count_against_the_window() {
+        // Pacing 768 KiB at 512 KiB/s sleeps ~1 s, five windows, with an instant reader.
+        let body = bridge::BridgeBody::Full(bytes::Bytes::from(vec![b'p'; 768 * 1024]));
+        let (failed, elapsed, _) = send(
+            Trickle::new(usize::MAX, Duration::ZERO),
+            body,
+            hj_http::BandwidthThrottle::new(512 * 1024),
+        );
+        assert!(
+            !failed,
+            "a configured bandwidth limit must not trip the rule"
+        );
+        assert!(
+            elapsed >= WINDOW * 2,
+            "the throttle really paced ({elapsed:?})"
+        );
+
+        // A backend that pauses longer than the window between chunks.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let producer = std::thread::spawn(move || {
+            for _ in 0..3 {
+                std::thread::sleep(WINDOW + Duration::from_millis(100));
+                tx.blocking_send(Ok(bytes::Bytes::from_static(b"event")))
+                    .unwrap();
+            }
+        });
+        let (failed, _, writer) = send(
+            Trickle::new(usize::MAX, Duration::ZERO),
+            bridge::BridgeBody::Stream { rx, len: None },
+            None,
+        );
+        producer.join().unwrap();
+        assert!(!failed, "a slow backend must not trip the client rule");
+        assert!(writer.wire.ends_with(b"0\r\n\r\n"));
+    }
+
+    /// Records each write call's length.
+    #[derive(Default)]
+    struct WriteSizes(Vec<usize>);
+
+    impl AsyncWriteRent for WriteSizes {
+        async fn write<T: monoio::buf::IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+            let n = buf.bytes_init();
+            self.0.push(n);
+            (Ok(n), buf)
+        }
+
+        async fn writev<T: monoio::buf::IoVecBuf>(
+            &mut self,
+            buf: T,
+        ) -> monoio::BufResult<usize, T> {
+            let n = (0..buf.read_iovec_len())
+                // SAFETY: an IoVecBuf guarantees `read_iovec_len` valid iovecs.
+                .map(|index| unsafe { (*buf.read_iovec_ptr().add(index)).iov_len })
+                .sum();
+            self.0.push(n);
+            (Ok(n), buf)
+        }
+
+        async fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn file_fallback_reads_into_one_bounded_buffer() {
+        let path = std::env::temp_dir().join(format!(
+            "httpjet-send-progress-fallback-{}.bin",
+            std::process::id()
+        ));
+        let len = 3 * H1_FILE_READ_CHUNK + 123;
+        std::fs::write(&path, vec![b'x'; len]).unwrap();
+        let body = bridge::BridgeBody::File(hj_core::FileBody {
+            path: path.clone(),
+            file: Some(std::fs::File::open(&path).unwrap()),
+            len: len as u64,
+            range: None,
+            cached: None,
+        });
+        let (failed, _, writes) = send(WriteSizes::default(), body, None);
+        let _ = std::fs::remove_file(path);
+        assert!(!failed);
+        let body_writes = &writes.0[1..];
+        assert_eq!(body_writes.iter().sum::<usize>(), len);
+        assert!(
+            body_writes.iter().all(|&n| n <= H1_FILE_READ_CHUNK),
+            "no fallback chunk may exceed the bounded read buffer: {body_writes:?}"
+        );
+    }
+
+    #[test]
+    fn sendfile_to_a_stalled_reader_fails_after_one_window() {
+        use std::io::Read;
+
+        let path = std::env::temp_dir().join(format!(
+            "httpjet-send-progress-sendfile-{}.bin",
+            std::process::id()
+        ));
+        let len = 64 * 1024 * 1024;
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(len as u64)
+            .unwrap();
+        let response = bridge::BridgeResp {
+            completion: None,
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::File(hj_core::FileBody {
+                path: path.clone(),
+                file: Some(std::fs::File::open(&path).unwrap()),
+                len,
+                range: None,
+                cached: None,
+            }),
+            bw_rate: None,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        // Accepted sockets inherit the small send buffer, so the reader stalls quickly.
+        socket2::SockRef::from(&listener)
+            .set_send_buffer_size(16 * 1024)
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            socket.set_recv_buffer_size(16 * 1024).unwrap();
+            socket.connect(&address.into()).unwrap();
+            let mut socket: std::net::TcpStream = socket.into();
+            let mut byte = [0u8; 1];
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            // Stop reading but hold the connection open until the server gives up.
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+        });
+        let mut runtime = build_core_runtime().unwrap();
+        let (failed, elapsed) = runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let fd = socket.as_raw_fd();
+            let started = Instant::now();
+            let outcome = monoio::time::timeout(
+                Duration::from_secs(5),
+                write_h1_response(
+                    &mut socket,
+                    response,
+                    false,
+                    false,
+                    false,
+                    &mut None,
+                    Some(fd),
+                    Some(WINDOW),
+                    &CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("a stalled sendfile must fail within the window, not the old 60 s");
+            (outcome.failed, started.elapsed())
+        });
+        let _ = done_tx.send(());
+        client.join().unwrap();
+        let _ = std::fs::remove_file(path);
+        assert!(failed, "a stalled reader must fail the file response");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    }
 }
 
 #[cfg(test)]
@@ -3267,11 +3983,12 @@ async fn paced_h1_body<S>(
     head: Vec<u8>,
     body: bytes::Bytes,
     throttle: &mut hj_http::BandwidthThrottle,
+    progress: &mut SendProgress,
 ) -> io::Result<()>
 where
     S: AsyncWriteRent,
 {
-    stream.write_all(head).await.0?;
+    progress.write_all(stream, head).await?;
     const SLICE: usize = 64 * 1024;
     let mut off = 0usize;
     while off < body.len() {
@@ -3281,7 +3998,7 @@ where
         if wait > 0 {
             monoio::time::sleep(std::time::Duration::from_micros(wait)).await;
         }
-        stream.write_all(chunk).await.0?;
+        progress.write_all(stream, chunk).await?;
         off = end;
     }
     Ok(())
@@ -3304,6 +4021,7 @@ async fn write_h1_stream<S>(
     keep_alive: bool,
     http10: bool,
     throttle: &mut Option<hj_http::BandwidthThrottle>,
+    progress: &mut SendProgress,
     shutdown: &CancellationToken,
 ) -> WriteOutcome
 where
@@ -3319,8 +4037,11 @@ where
     } else {
         serialize_h1_stream_head(status, headers, len, is_head, keep_alive)
     };
-    let (wres, _h) = stream.write_all(with_interim(interim, head)).await;
-    if wres.is_err() {
+    if progress
+        .write_all(stream, with_interim(interim, head))
+        .await
+        .is_err()
+    {
         return WriteOutcome::new(true, keep_alive);
     }
     if hj_core::response_body_forbidden(is_head, status) {
@@ -3352,17 +4073,18 @@ where
                     let mut prefix = Vec::with_capacity(20);
                     push_u64_hex(&mut prefix, b.len() as u64);
                     prefix.extend_from_slice(b"\r\n");
-                    write_h1_vectored(
-                        stream,
-                        vec![
-                            bytes::Bytes::from(prefix),
-                            b,
-                            bytes::Bytes::from_static(b"\r\n"),
-                        ],
-                    )
-                    .await
+                    progress
+                        .write_vectored(
+                            stream,
+                            vec![
+                                bytes::Bytes::from(prefix),
+                                b,
+                                bytes::Bytes::from_static(b"\r\n"),
+                            ],
+                        )
+                        .await
                 } else {
-                    stream.write_all(b).await.0.map(|_| ())
+                    progress.write_all(stream, b).await.map(drop)
                 };
                 if result.is_err() {
                     return WriteOutcome::new(true, keep_alive);
@@ -3371,13 +4093,13 @@ where
             Err(()) => return WriteOutcome::new(true, keep_alive), // upstream abort
         }
     }
-    if chunked {
-        let (w, _b) = stream
-            .write_all(bytes::Bytes::from_static(b"0\r\n\r\n"))
-            .await;
-        if w.is_err() {
-            return WriteOutcome::new(true, keep_alive);
-        }
+    if chunked
+        && progress
+            .write_all(stream, bytes::Bytes::from_static(b"0\r\n\r\n"))
+            .await
+            .is_err()
+    {
+        return WriteOutcome::new(true, keep_alive);
     }
     WriteOutcome::new(false, keep_alive)
 }
@@ -3407,7 +4129,7 @@ fn serialize_h1_head_framed(
     keep_alive: bool,
 ) -> Vec<u8> {
     let reason = status.canonical_reason().unwrap_or("");
-    let mut out: Vec<u8> = Vec::with_capacity(256);
+    let mut out: Vec<u8> = Vec::with_capacity(h1_head_capacity(headers));
     push_h1_status_line(&mut out, status, reason);
     for (n, v) in headers.iter() {
         if n == http::header::CONTENT_LENGTH || is_hop_by_hop_response(n) {
@@ -3420,7 +4142,9 @@ fn serialize_h1_head_framed(
     }
     match framing {
         H1ResponseFraming::ContentLength(n) => {
-            out.extend_from_slice(format!("content-length: {n}\r\n").as_bytes())
+            out.extend_from_slice(b"content-length: ");
+            push_u64_decimal(&mut out, n);
+            out.extend_from_slice(b"\r\n");
         }
         H1ResponseFraming::Chunked => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
         H1ResponseFraming::None => {}
@@ -4936,6 +5660,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 http10,
                 throttle,
                 sendfile_fd,
+                None,
                 &CancellationToken::new(),
             )
             .await;
@@ -5067,6 +5792,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 false,
                 &mut None,
                 Some(fd),
+                None,
                 &CancellationToken::new(),
             )
             .await;
@@ -5407,6 +6133,50 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
     }
 
     #[test]
+    fn fixed_body_reuses_intake_allocation_and_preserves_pipeline() {
+        let head = b"POST /upload HTTP/1.1\r\ncontent-length: 1048576\r\n\r\n";
+        let body = vec![b'x'; 1 << 20];
+        let pipelined = b"GET /next HTTP/1.1\r\nhost: example.test\r\n\r\n";
+        let mut acc = Vec::with_capacity(head.len() + body.len() + pipelined.len());
+        acc.extend_from_slice(head);
+        acc.extend_from_slice(&body);
+        acc.extend_from_slice(pipelined);
+        let intake_allocation = acc.as_ptr();
+
+        let extracted = take_fixed_body(&mut acc, head.len(), body.len());
+
+        assert_eq!(extracted, body);
+        assert_eq!(acc, pipelined);
+        assert_eq!(
+            extracted.as_ptr(),
+            intake_allocation,
+            "the body keeps the intake allocation instead of allocating a second body copy"
+        );
+    }
+
+    #[test]
+    fn empty_fixed_body_keeps_pipeline_without_pinning_intake_allocation() {
+        let head = b"GET /first HTTP/1.1\r\nhost: example.test\r\n\r\n";
+        let pipelined = b"GET /next HTTP/1.1\r\nhost: example.test\r\n\r\n";
+        let mut acc = Vec::with_capacity(1 << 20);
+        acc.extend_from_slice(head);
+        acc.extend_from_slice(pipelined);
+        let oversized_intake = acc.as_ptr();
+
+        let extracted = take_fixed_body(&mut acc, head.len(), 0);
+
+        assert!(extracted.is_empty());
+        assert_eq!(extracted.capacity(), 0);
+        assert_eq!(acc, pipelined);
+        assert!(acc.capacity() <= INTAKE_RETAIN_CAP);
+        assert_ne!(
+            acc.as_ptr(),
+            oversized_intake,
+            "the pipeline must not retain the oversized intake allocation"
+        );
+    }
+
+    #[test]
     fn wildcard_listener_reports_the_accepted_interface_as_local() {
         let std_listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
         std_listener.set_nonblocking(true).unwrap();
@@ -5586,7 +6356,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 local,
                 core,
                 acceptor,
-                false,
+                ClientAuth::None,
                 None,
                 CancellationToken::new(),
                 ListenerBinding::default(),
@@ -5594,6 +6364,143 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .await;
         });
         client.join().unwrap();
+    }
+
+    /// clientVerify=1/3 listeners request a client certificate without refusing a
+    /// peer that has none: forwarded client identity must then need a presented
+    /// one, through the real transport, bridge and pipeline.
+    #[test]
+    fn optional_client_auth_trusts_forwarded_identity_only_with_a_presented_cert() {
+        use std::io::{Read, Write};
+
+        hj_tls::install_crypto_provider().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (doc_root, state) = runtime
+            .block_on(async { crate::pipeline::e2e::forwarded_deny_state("uring-optional-cert") });
+        let holder = Arc::new(arc_swap::ArcSwap::from(state));
+        let core = runtime.block_on(async {
+            CoreHandler {
+                bridge: build_pipeline_bridge(
+                    ServingView::new(holder.clone()),
+                    Arc::from("http"),
+                    pipeline_admission(holder.clone()),
+                ),
+                holder: ServingView::new(holder.clone()),
+                listener_name: Arc::from("http"),
+            }
+        });
+
+        let server = rcgen::generate_simple_self_signed(vec!["canon.test".into()]).unwrap();
+        let server_cert = server.cert.der().clone();
+        let client = rcgen::generate_simple_self_signed(vec!["client.test".into()]).unwrap();
+        let client_cert = client.cert.der().clone();
+        let client_key = client.signing_key.serialize_der();
+        let mut client_roots = rustls::RootCertStore::empty();
+        client_roots.add(client_cert.clone()).unwrap();
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(
+                rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+                    .allow_unauthenticated()
+                    .build()
+                    .unwrap(),
+            )
+            .with_single_cert(
+                vec![server_cert.clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(server.signing_key.serialize_der())
+                    .unwrap(),
+            )
+            .unwrap();
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let acceptor = monoio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        // 203.0.113.0/24 is denied; the loopback peer itself is allowed.
+        for (present_cert, expected) in [(false, "200"), (true, "403")] {
+            let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let local = std_listener.local_addr().unwrap();
+            std_listener.set_nonblocking(true).unwrap();
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(server_cert.clone()).unwrap();
+            let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+            let mut client_config = if present_cert {
+                builder
+                    .with_client_auth_cert(
+                        vec![client_cert.clone()],
+                        rustls::pki_types::PrivateKeyDer::try_from(client_key.clone()).unwrap(),
+                    )
+                    .unwrap()
+            } else {
+                builder.with_no_client_auth()
+            };
+            client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let client = std::thread::spawn(move || {
+                let socket = std::net::TcpStream::connect(local).unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let connection = rustls::ClientConnection::new(
+                    Arc::new(client_config),
+                    "canon.test".try_into().unwrap(),
+                )
+                .unwrap();
+                let mut stream = rustls::StreamOwned::new(connection, socket);
+                stream
+                    .write_all(
+                        b"GET /page.html HTTP/1.1\r\nHost: canon.test\r\n\
+                          CF-Connecting-IP: 203.0.113.9\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response);
+                String::from_utf8_lossy(&response).into_owned()
+            });
+            let core = core.clone();
+            let acceptor = acceptor.clone();
+            let mut uring = build_core_runtime().unwrap();
+            uring.block_on(async move {
+                let listener = TcpListener::from_std(std_listener).unwrap();
+                let (stream, peer) = listener.accept().await.unwrap();
+                handle_tls_bridged(
+                    stream,
+                    peer,
+                    local,
+                    core,
+                    acceptor,
+                    ClientAuth::Optional,
+                    None,
+                    CancellationToken::new(),
+                    ListenerBinding::default(),
+                )
+                .await;
+            });
+            let response = client.join().unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected}")),
+                "client cert presented={present_cert}: {response}"
+            );
+        }
+        drop(runtime);
+        std::fs::remove_dir_all(doc_root).ok();
+    }
+
+    #[test]
+    fn client_verify_maps_to_requested_and_required_client_auth() {
+        for (client_verify, requested, required) in [
+            (0, false, false),
+            (1, true, false),
+            (2, true, true),
+            (3, true, false),
+        ] {
+            let auth = ClientAuth::from_client_verify(client_verify);
+            assert_eq!(
+                (auth.requested(), auth.required()),
+                (requested, required),
+                "clientVerify={client_verify}"
+            );
+        }
     }
 
     #[test]
@@ -5695,7 +6602,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 local,
                 core,
                 acceptor,
-                false,
+                ClientAuth::None,
                 None,
                 CancellationToken::new(),
                 ListenerBinding::default(),
@@ -6629,7 +7536,7 @@ Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n
                         local,
                         core,
                         acceptor,
-                        false,
+                        ClientAuth::None,
                         None,
                         shutdown,
                         active,
@@ -7080,6 +7987,532 @@ Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n
         let waited = returned - signalled;
         assert!(waited < LINGER_TIME, "{waited:?}");
         assert!(waited < SHUTDOWN_IDLE_GRACE + GRACE_SLACK, "{waited:?}");
+    }
+
+    // ---- plaintext mTLS gate at the request head ----
+
+    /// Both H1 head serializers write into one exactly sized allocation.
+    #[test]
+    fn h1_response_heads_are_allocated_once() {
+        let mut headers = http::HeaderMap::new();
+        for i in 0..40 {
+            headers.append(
+                http::HeaderName::from_bytes(format!("x-forum-header-{i}").as_bytes()).unwrap(),
+                http::HeaderValue::from_static("value-padding-value-padding-value-padding"),
+            );
+        }
+        let needed = h1_head_capacity(&headers);
+        for (status, body_len, is_head, keep_alive) in [
+            (http::StatusCode::OK, 12_345_678_901usize, false, true),
+            (http::StatusCode::NOT_FOUND, 0, true, false),
+            (http::StatusCode::from_u16(599).unwrap(), 1, false, false),
+        ] {
+            let head = serialize_h1_response_head(status, &headers, body_len, is_head, keep_alive);
+            assert_eq!(head.capacity(), needed, "{status}: the head regrew");
+        }
+        for framing in [
+            H1ResponseFraming::ContentLength(u64::MAX),
+            H1ResponseFraming::Chunked,
+            H1ResponseFraming::None,
+        ] {
+            let head = serialize_h1_head_framed(http::StatusCode::OK, &headers, framing, false);
+            assert_eq!(head.capacity(), needed, "framed head regrew");
+        }
+    }
+
+    /// The h2c head-time refusal sends a bodiless 301, so the shared gate must build (and
+    /// access-log) it without the HTML body the H1 path writes.
+    #[test]
+    fn bodiless_plaintext_redirect_carries_no_body() {
+        let (_tokio_runtime, core) = mtls_gated_core();
+        let state = core.holder.load_full();
+        let peer: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        let probe = |bodiless| {
+            let mut req = http::Request::builder()
+                .method("POST")
+                .uri("/upload")
+                .header(http::header::HOST, "gated.test")
+                .body(hj_core::empty_incoming())
+                .unwrap();
+            crate::pipeline::plaintext_mtls_redirect(
+                &state,
+                &core.listener_name,
+                peer,
+                Proto::Http2,
+                &mut req,
+                bodiless,
+            )
+            .expect("a gated vhost redirects a non-exempt plaintext peer")
+        };
+        let h1 = probe(false);
+        assert_eq!(h1.status(), http::StatusCode::MOVED_PERMANENTLY);
+        assert!(h1.body().content_length().is_some_and(|len| len > 0));
+        let h2c = probe(true);
+        assert_eq!(h2c.status(), http::StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(h2c.body().content_length(), Some(0));
+        assert_eq!(h2c.headers()[http::header::CONTENT_LENGTH], "0");
+        assert!(h2c.headers().get(http::header::CONTENT_TYPE).is_none());
+        assert_eq!(
+            h2c.headers()[http::header::LOCATION],
+            h1.headers()[http::header::LOCATION]
+        );
+    }
+
+    /// `gated.test` requires a client certificate on the secure listener; `open.test`
+    /// does not. Both are mapped on the plaintext `test` listener.
+    fn mtls_gated_core() -> (tokio::runtime::Runtime, CoreHandler) {
+        use hj_core::config::{Listener, ListenerTls, VHostConfig, VHostDecl, VhostMap};
+
+        websocket_test_core_config(|config| {
+            let root = config.server_root.clone();
+            for name in ["gated", "open"] {
+                config.vhosts.insert(
+                    name.into(),
+                    VHostDecl {
+                        name: name.into(),
+                        vh_root: root.clone(),
+                        config_file: std::path::PathBuf::new(),
+                        allow_symbol_link: Some(true),
+                        restrained: false,
+                        enable_script: true,
+                        config: Some(Arc::new(VHostConfig {
+                            doc_root: root.clone(),
+                            ..VHostConfig::default()
+                        })),
+                    },
+                );
+                config.vhost_order.push(name.into());
+            }
+            let map = |vhost: &str| VhostMap {
+                vhost: vhost.into(),
+                domains: vec![format!("{vhost}.test")],
+            };
+            config.listeners = vec![
+                Listener {
+                    name: "test".into(),
+                    address: "127.0.0.1:0".into(),
+                    secure: false,
+                    vhost_map: vec![map("gated"), map("open")],
+                    tls: None,
+                    uds_path: None,
+                    proxy_protocol: false,
+                    proxy_protocol_peers: vec![],
+                },
+                Listener {
+                    name: "mtls".into(),
+                    address: "127.0.0.1:0".into(),
+                    secure: true,
+                    vhost_map: vec![map("gated")],
+                    tls: Some(ListenerTls {
+                        key_file: std::path::PathBuf::new(),
+                        cert_file: std::path::PathBuf::new(),
+                        cert_chain: false,
+                        ca_cert_file: None,
+                        client_verify: 2,
+                        verify_depth: 1,
+                        enable_stapling: false,
+                        crl_file: None,
+                    }),
+                    uds_path: None,
+                    proxy_protocol: false,
+                    proxy_protocol_peers: vec![],
+                },
+            ];
+        })
+    }
+
+    const DIRECT_PEER: ([u8; 4], u16) = ([198, 51, 100, 20], 40000);
+
+    /// [`serve_h1_once`] with the connection attributed to `peer` (the test socket
+    /// itself is loopback, which the gate exempts).
+    fn serve_h1_once_from(
+        core: CoreHandler,
+        peer: Option<SocketAddr>,
+    ) -> (SocketAddr, std::sync::mpsc::Receiver<std::time::Instant>) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut runtime = build_core_runtime().unwrap();
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(std_listener).unwrap();
+                let (stream, real_peer) = listener.accept().await.unwrap();
+                handle_h1_bridged(
+                    stream,
+                    Vec::new(),
+                    BridgeCtx::plain(peer.unwrap_or(real_peer), local, Proto::Http1),
+                    core,
+                    CancellationToken::new(),
+                    None,
+                )
+                .await;
+                let _ = done.send(std::time::Instant::now());
+            });
+        });
+        (local, finished)
+    }
+
+    fn upload_head(host: &str, chunked: bool) -> String {
+        let framing = if chunked {
+            "Transfer-Encoding: chunked".to_owned()
+        } else {
+            "Content-Length: 1048576".to_owned()
+        };
+        format!(
+            "POST /upload-len?x=1 HTTP/1.1\r\nHost: {host}\r\nExpect: 100-continue\r\n{framing}\r\n\r\n"
+        )
+    }
+
+    fn without_date(wire: &[u8]) -> String {
+        String::from_utf8_lossy(wire)
+            .split("\r\n")
+            .filter(|line| !line.to_ascii_lowercase().starts_with("date:"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    #[test]
+    fn gated_plaintext_upload_is_redirected_before_100_continue_or_its_body() {
+        use std::io::{Read, Write};
+
+        for chunked in [false, true] {
+            let (tokio_runtime, core) = mtls_gated_core();
+            let state = core.holder.load_full();
+            assert!(state.mtls_required_vhosts.contains("gated"));
+            let (address, finished) = serve_h1_once_from(core, Some(SocketAddr::from(DIRECT_PEER)));
+            let mut stream = connect(address);
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .unwrap();
+            // The head only: a client honoring Expect waits for 100 before its body.
+            stream
+                .write_all(upload_head("gated.test", chunked).as_bytes())
+                .unwrap();
+            let mut wire = Vec::new();
+            stream
+                .read_to_end(&mut wire)
+                .expect("the redirect arrives without waiting for a body");
+            let text = String::from_utf8_lossy(&wire).to_ascii_lowercase();
+            assert!(
+                text.starts_with("http/1.1 301 moved permanently\r\n"),
+                "chunked={chunked}: no 100 Continue precedes the redirect: {text:?}"
+            );
+            assert!(
+                text.contains("\r\nlocation: https://gated.test/upload-len?x=1\r\n"),
+                "{text:?}"
+            );
+            assert!(text.contains("\r\nconnection: close\r\n"), "{text:?}");
+            drop(stream);
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the connection closes after the redirect");
+
+            // Byte-identical to the full pipeline's own gate response, framed for close.
+            let mut req = http::Request::new(hj_core::empty_incoming());
+            *req.method_mut() = http::Method::POST;
+            *req.uri_mut() = "/upload-len?x=1".parse().unwrap();
+            req.headers_mut().insert(
+                http::header::HOST,
+                http::HeaderValue::from_static("gated.test"),
+            );
+            let expected = tokio_runtime.block_on(async {
+                let response = crate::pipeline::handle(
+                    state.clone(),
+                    "test",
+                    SocketAddr::from(DIRECT_PEER).ip(),
+                    address,
+                    DIRECT_PEER.1,
+                    false,
+                    false,
+                    false,
+                    None,
+                    Proto::Http1,
+                    None,
+                    req,
+                )
+                .await;
+                let response = bridge::fast_response(hj_core::stamp_date(response), false).await;
+                let bridge::BridgeBody::Full(body) = response.body else {
+                    panic!("the redirect is a full body");
+                };
+                let mut expected = serialize_h1_response_head(
+                    response.status,
+                    &response.headers,
+                    body.len(),
+                    false,
+                    false,
+                );
+                expected.extend_from_slice(&body);
+                expected
+            });
+            assert_eq!(without_date(&wire), without_date(&expected));
+        }
+    }
+
+    #[test]
+    fn exempt_or_ungated_plaintext_uploads_still_get_100_continue_and_dispatch() {
+        use std::io::{Read, Write};
+
+        for (host, peer) in [
+            ("gated.test", None),
+            ("open.test", Some(SocketAddr::from(DIRECT_PEER))),
+        ] {
+            let (_tokio_runtime, core) = mtls_gated_core();
+            let (address, _finished) = serve_h1_once_from(core, peer);
+            let mut stream = connect(address);
+            stream
+                .write_all(
+                    format!(
+                        "POST /upload-len HTTP/1.1\r\nHost: {host}\r\nExpect: 100-continue\r\n\
+                         Connection: close\r\nContent-Length: 5\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let interim = read_h1_head(&mut stream);
+            assert_eq!(interim, b"HTTP/1.1 100 Continue\r\n\r\n", "{host}");
+            stream.write_all(b"hello").unwrap();
+            let mut reply = Vec::new();
+            stream.read_to_end(&mut reply).unwrap();
+            let reply = String::from_utf8(reply).unwrap();
+            assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{host}: {reply}");
+            assert!(reply.ends_with("\r\n\r\n5"), "{host}: {reply}");
+        }
+    }
+
+    /// An h2c connection served by [`serve_h2_bridged`], attributed to `peer`.
+    fn serve_h2c_once_from(core: CoreHandler, peer: Option<SocketAddr>) -> SocketAddr {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            let mut runtime = build_core_runtime().unwrap();
+            runtime.block_on(async move {
+                let listener = TcpListener::from_std(std_listener).unwrap();
+                let (stream, real_peer) = listener.accept().await.unwrap();
+                serve_h2_bridged(
+                    stream,
+                    Vec::new(),
+                    BridgeCtx::plain(peer.unwrap_or(real_peer), local, Proto::Http2),
+                    core,
+                    CancellationToken::new(),
+                    None,
+                )
+                .await;
+            });
+        });
+        local
+    }
+
+    /// Request HEADERS (without END_STREAM) for a 5-byte POST to `host`/upload-len.
+    fn h2c_upload_head(
+        encoder: &mut hj_h2::hpack::Encoder,
+        wire: &mut Vec<u8>,
+        sid: u32,
+        host: &str,
+    ) {
+        let mut block = Vec::new();
+        for (name, value) in [
+            (":method", "POST"),
+            (":path", "/upload-len"),
+            (":scheme", "http"),
+            (":authority", host),
+            ("expect", "100-continue"),
+            ("content-length", "5"),
+        ] {
+            encoder.encode_header(&mut block, name, value);
+        }
+        hj_h2::frame::write_frame(
+            wire,
+            hj_h2::frame::kind::HEADERS,
+            hj_h2::frame::flags::END_HEADERS,
+            sid,
+            &block,
+        );
+    }
+
+    /// Reads server frames until a PING ACK, returning every `sid` frame as (kind, flags,
+    /// decoded header fields, payload). Decodes every HEADERS block to keep `decoder` in sync.
+    fn h2c_frames_until_ping_ack(
+        stream: &mut std::net::TcpStream,
+        decoder: &mut hj_h2::hpack::Decoder,
+        sid: u32,
+    ) -> Vec<(u8, u8, Vec<(String, String)>, Vec<u8>)> {
+        use std::io::Read;
+
+        let mut frames = Vec::new();
+        loop {
+            let mut head = [0u8; hj_h2::frame::FrameHeader::LEN];
+            stream.read_exact(&mut head).unwrap();
+            let header = hj_h2::frame::FrameHeader::parse(&head).unwrap();
+            let mut payload = vec![0u8; header.length as usize];
+            stream.read_exact(&mut payload).unwrap();
+            let mut fields = Vec::new();
+            if header.kind == hj_h2::frame::kind::HEADERS {
+                decoder
+                    .decode(&payload, |n, v| fields.push((n.to_owned(), v.to_owned())))
+                    .unwrap();
+            }
+            assert_ne!(header.kind, hj_h2::frame::kind::GOAWAY, "{frames:?}");
+            if header.kind == hj_h2::frame::kind::PING
+                && header.flags & hj_h2::frame::flags::ACK != 0
+            {
+                return frames;
+            }
+            if header.stream_id == sid {
+                frames.push((header.kind, header.flags, fields, payload));
+            }
+        }
+    }
+
+    fn h2c_client(address: SocketAddr) -> std::net::TcpStream {
+        use std::io::Write;
+
+        let mut stream = connect(address);
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut wire = H2_PREFACE.to_vec();
+        hj_h2::frame::write_settings(&mut wire, &[]);
+        stream.write_all(&wire).unwrap();
+        stream
+    }
+
+    #[test]
+    fn gated_h2c_upload_is_redirected_from_its_head_before_any_data() {
+        use std::io::Write;
+
+        let (_tokio_runtime, core) = mtls_gated_core();
+        let address = serve_h2c_once_from(core, Some(SocketAddr::from(DIRECT_PEER)));
+        let mut stream = h2c_client(address);
+        let mut encoder = hj_h2::hpack::Encoder::new();
+        let mut decoder = hj_h2::hpack::Decoder::new(4096, 1 << 20);
+        let mut wire = Vec::new();
+        h2c_upload_head(&mut encoder, &mut wire, 1, "gated.test");
+        hj_h2::frame::write_frame(&mut wire, hj_h2::frame::kind::PING, 0, 0, &[1; 8]);
+        stream.write_all(&wire).unwrap();
+        let frames = h2c_frames_until_ping_ack(&mut stream, &mut decoder, 1);
+        let kinds: Vec<u8> = frames.iter().map(|f| f.0).collect();
+        assert_eq!(
+            kinds,
+            [hj_h2::frame::kind::HEADERS, hj_h2::frame::kind::RST_STREAM],
+            "one final HEADERS (no 100 Continue, no DATA), then the reset: {frames:?}"
+        );
+        let (_, flags, fields, _) = &frames[0];
+        assert_ne!(flags & hj_h2::frame::flags::END_STREAM, 0);
+        let field = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(field(":status"), Some("301"));
+        assert_eq!(field("location"), Some("https://gated.test/upload-len"));
+        assert_eq!(field("content-length"), Some("0"));
+        assert_eq!(field("cache-control"), Some("private, no-store"));
+        assert_eq!(field("content-type"), None, "the redirect is bodiless");
+        assert_eq!(
+            u32::from_be_bytes(frames[1].3[..4].try_into().unwrap()),
+            hj_h2::frame::error_code::NO_ERROR
+        );
+
+        // The withheld body is ignored and the connection still serves an ungated upload.
+        let mut wire = Vec::new();
+        hj_h2::frame::write_frame(
+            &mut wire,
+            hj_h2::frame::kind::DATA,
+            hj_h2::frame::flags::END_STREAM,
+            1,
+            b"hello",
+        );
+        h2c_upload_head(&mut encoder, &mut wire, 3, "open.test");
+        hj_h2::frame::write_frame(
+            &mut wire,
+            hj_h2::frame::kind::DATA,
+            hj_h2::frame::flags::END_STREAM,
+            3,
+            b"hello",
+        );
+        stream.write_all(&wire).unwrap();
+        let mut body = Vec::new();
+        let mut status = None;
+        while body != b"5" {
+            let mut wire = Vec::new();
+            hj_h2::frame::write_frame(&mut wire, hj_h2::frame::kind::PING, 0, 0, &[2; 8]);
+            stream.write_all(&wire).unwrap();
+            for (kind, _, fields, payload) in
+                h2c_frames_until_ping_ack(&mut stream, &mut decoder, 3)
+            {
+                if let Some((_, v)) = fields.iter().find(|(n, _)| n == ":status")
+                    && v != "100"
+                {
+                    status = Some(v.clone());
+                }
+                if kind == hj_h2::frame::kind::DATA {
+                    body.extend_from_slice(&payload);
+                }
+            }
+        }
+        assert_eq!(status.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn exempt_or_ungated_h2c_uploads_still_get_100_continue_and_dispatch() {
+        use std::io::Write;
+
+        for (host, peer) in [
+            ("gated.test", None),
+            ("open.test", Some(SocketAddr::from(DIRECT_PEER))),
+        ] {
+            let (_tokio_runtime, core) = mtls_gated_core();
+            let address = serve_h2c_once_from(core, peer);
+            let mut stream = h2c_client(address);
+            let mut encoder = hj_h2::hpack::Encoder::new();
+            let mut decoder = hj_h2::hpack::Decoder::new(4096, 1 << 20);
+            let mut wire = Vec::new();
+            h2c_upload_head(&mut encoder, &mut wire, 1, host);
+            hj_h2::frame::write_frame(&mut wire, hj_h2::frame::kind::PING, 0, 0, &[1; 8]);
+            stream.write_all(&wire).unwrap();
+            let frames = h2c_frames_until_ping_ack(&mut stream, &mut decoder, 1);
+            assert_eq!(frames.len(), 1, "{host}: {frames:?}");
+            assert_eq!(
+                frames[0]
+                    .2
+                    .iter()
+                    .find(|(n, _)| n == ":status")
+                    .map(|f| f.1.as_str()),
+                Some("100"),
+                "{host}"
+            );
+            let mut wire = Vec::new();
+            hj_h2::frame::write_frame(
+                &mut wire,
+                hj_h2::frame::kind::DATA,
+                hj_h2::frame::flags::END_STREAM,
+                1,
+                b"hello",
+            );
+            stream.write_all(&wire).unwrap();
+            let mut body = Vec::new();
+            let mut status = None;
+            while body != b"5" {
+                let mut wire = Vec::new();
+                hj_h2::frame::write_frame(&mut wire, hj_h2::frame::kind::PING, 0, 0, &[2; 8]);
+                stream.write_all(&wire).unwrap();
+                for (kind, _, fields, payload) in
+                    h2c_frames_until_ping_ack(&mut stream, &mut decoder, 1)
+                {
+                    if let Some((_, v)) = fields.iter().find(|(n, _)| n == ":status") {
+                        status = Some(v.clone());
+                    }
+                    if kind == hj_h2::frame::kind::DATA {
+                        body.extend_from_slice(&payload);
+                    }
+                }
+            }
+            assert_eq!(status.as_deref(), Some("200"), "{host}");
+        }
     }
 }
 

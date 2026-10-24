@@ -71,6 +71,15 @@ pub fn send_stall_resets() -> u64 {
     SEND_STALL_RESETS.load(Ordering::Relaxed)
 }
 
+/// Connections sent GOAWAY(ENHANCE_YOUR_CALM) for exhausting the rapid-reset budget.
+pub(super) static RAPID_RESET_GOAWAYS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Connections closed for exhausting the rapid-reset budget (both serve loops).
+pub fn rapid_reset_goaways() -> u64 {
+    RAPID_RESET_GOAWAYS.load(Ordering::Relaxed)
+}
+
 /// `(closed by our idle timer, closed by the peer)` for the io_uring (monoio) loop.
 pub fn connection_close_counts() -> (u64, u64) {
     (
@@ -228,6 +237,32 @@ impl Drop for ConnGuard {
     }
 }
 
+/// The head of a request whose body is still to come, as offered to
+/// [`Config::early_reject`].
+pub struct RequestHead<'a> {
+    pub method: &'a http::Method,
+    pub uri: &'a http::Uri,
+    /// `:authority`, which the dispatched request carries as its `Host` header.
+    pub authority: Option<&'a http::HeaderValue>,
+    pub headers: &'a http::HeaderMap,
+}
+
+/// Decides from its head whether a body-carrying request is refused outright. A
+/// `Some((status, headers))` is sent as a complete bodiless response before any DATA is
+/// accepted or `100 Continue` is sent; the stream is then reset with NO_ERROR and its
+/// remaining DATA discarded.
+pub type EarlyRejectFn =
+    dyn Fn(&RequestHead<'_>) -> Option<(http::StatusCode, http::HeaderMap)> + Send + Sync;
+
+#[derive(Clone)]
+pub struct EarlyReject(pub std::sync::Arc<EarlyRejectFn>);
+
+impl std::fmt::Debug for EarlyReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EarlyReject(..)")
+    }
+}
+
 /// Server-side HTTP/2 connection parameters we advertise + enforce.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -246,7 +281,14 @@ pub struct Config {
     pub max_request_body: usize,
     /// Server-wide buffered-body budget shared with the other transports (#236 residual).
     /// `None` (default) skips global accounting — per-stream/per-connection caps still apply.
+    /// Body-pending streams also reserve their decoded request headers from it.
     pub body_budget: Option<std::sync::Arc<hj_core::budget::BodyBufferBudget>>,
+    /// Per-connection cap on the decoded request headers held by streams whose body is
+    /// still arriving (each field charged at name + value + its map overhead). A new
+    /// body-pending stream past it is refused with REFUSED_STREAM. The 4 MiB default
+    /// leaves 100 concurrent uploads with ~6 KiB of headers each well under it, while 256
+    /// streams at a 16 KiB list cap would otherwise pin ~22 MB per connection.
+    pub pending_header_mem: usize,
     /// Connection-idle timeout: if no frame arrives within this window, send a graceful GOAWAY
     /// and drain (defense-in-depth against slowloris-style holds — e.g. a HEADERS block left
     /// open without END_STREAM pinning its decoded map). `None` disables the timer.
@@ -294,6 +336,9 @@ pub struct Config {
     /// Responses still producing, window-blocked bodies and handlers that have not
     /// answered are unaffected. `None` keeps every response until the drain bound.
     pub shutdown_idle_stream_timeout: Option<std::time::Duration>,
+    /// Consulted only for a request whose header block completes without END_STREAM;
+    /// `None` (default) never inspects a request before its body.
+    pub early_reject: Option<EarlyReject>,
 }
 
 impl Default for Config {
@@ -306,6 +351,7 @@ impl Default for Config {
             header_list_size: 131072,
             max_request_body: 64 * 1024 * 1024,
             body_budget: None,
+            pending_header_mem: 4 << 20,
             conn_idle_timeout: Some(std::time::Duration::from_secs(60)),
             preface_timeout: None,
             frame_read_timeout: Some(std::time::Duration::from_secs(15)),
@@ -315,6 +361,7 @@ impl Default for Config {
             send_stall_timeout: Some(std::time::Duration::from_secs(60)),
             goaway_drain_timeout: GOAWAY_DRAIN_TIMEOUT,
             shutdown_idle_stream_timeout: Some(SHUTDOWN_IDLE_STREAM_TIMEOUT),
+            early_reject: None,
         }
     }
 }
@@ -402,8 +449,9 @@ pub(super) struct Tagged<F> {
 
 pub(super) enum TaggedInner<F> {
     /// Polled inline on the connection task (the at/above-worker-count case: spawning would
-    /// only add a cross-thread hop).
-    Inline(F),
+    /// only add a cross-thread hop). The handler future is several KiB; a recycled slot keeps
+    /// the per-stream `FuturesUnordered` node small and its memory resident across streams.
+    Inline(hj_core::Recycled<F>),
     /// Work-stolen onto an idle worker (`spare_cores()`), so one heavily-multiplexed
     /// connection fans across cores instead of pinning ~1. Wrapped in [`AbortOnDrop`] so
     /// cancelling this stream also aborts the spawned task rather than detaching backend work.
@@ -437,14 +485,8 @@ impl<F: Future<Output = Response>> Future for TaggedInner<F> {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        // SAFETY: structural pin projection. `self` is never moved out of; the `Inline`
-        // future is re-pinned in place, and the `Spawned` handle is `Unpin`. This enum has
-        // no Drop impl, so no destructor observes a moved pinned field.
-        let this = unsafe { self.get_unchecked_mut() };
-        match this {
-            TaggedInner::Inline(f) => unsafe { std::pin::Pin::new_unchecked(f) }
-                .poll(cx)
-                .map(|resp| resp),
+        match self.get_mut() {
+            TaggedInner::Inline(f) => std::pin::Pin::new(f).poll(cx),
             TaggedInner::Spawned(h) => std::pin::Pin::new(h).poll(cx).map(|r| {
                 // A panic in ONE spawned handler must not tear down the whole connection (every
                 // other multiplexed stream): on a JoinError, isolate it to this stream with a 500.
@@ -598,12 +640,15 @@ where
         // default 65535, raised to initial_window_size via the stream-0 WINDOW_UPDATE sent above).
         conn_recv_window: (config.initial_window_size.max(65535)) as i64,
         our_initial_window: config.initial_window_size as i64,
-        rst_unanswered: 0,
+        reset_debt_until: None,
         total_buffered: 0,
         max_request_body: config.max_request_body,
         per_conn_request_body: config.max_request_body.saturating_mul(4),
+        pending_header_bytes: 0,
+        pending_header_mem: config.pending_header_mem,
         body_budget: config.body_budget.clone(),
         no_progress_frames: 0,
+        early_reject: config.early_reject.clone(),
     };
     // The per-stream maps start EMPTY and grow with the first streams. Pre-sizing them to 32
     // streams saved a few early reallocations on busy connections but made every connection
@@ -943,7 +988,6 @@ where
             if cancelled.remove(&sid) {
                 continue;
             }
-            recv.rst_unanswered = recv.rst_unanswered.saturating_sub(1); // a stream completed → earn back reset budget
             begin_response(
                 sid,
                 is_head,
@@ -1029,7 +1073,6 @@ where
             Some((sid, is_head, resp)) = inflight.next(), if !inflight.is_empty() => {
                 inflight_sids.remove(&sid);
                 if let Some(resp) = resp && !cancelled.remove(&sid) {
-                    recv.rst_unanswered = recv.rst_unanswered.saturating_sub(1); // a stream completed → earn back reset budget
                     begin_response(sid, is_head, resp, &mut enc, &mut out, &mut outstreams, &mut send_schedule, &mut pending_window, &peer, &mut block_scratch);
                 } else {
                     cancelled.remove(&sid);
@@ -1676,12 +1719,15 @@ where
         max_concurrent: config.max_concurrent_streams as usize,
         conn_recv_window: (config.initial_window_size.max(65535)) as i64,
         our_initial_window: config.initial_window_size as i64,
-        rst_unanswered: 0,
+        reset_debt_until: None,
         total_buffered: 0,
         max_request_body: config.max_request_body,
         per_conn_request_body: config.max_request_body.saturating_mul(4),
+        pending_header_bytes: 0,
+        pending_header_mem: config.pending_header_mem,
         body_budget: config.body_budget.clone(),
         no_progress_frames: 0,
+        early_reject: config.early_reject.clone(),
     };
     // Empty until the first streams arrive (see the tokio loop above).
     let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
@@ -1967,7 +2013,6 @@ where
             if cancelled.remove(&sid) {
                 continue;
             }
-            recv.rst_unanswered = recv.rst_unanswered.saturating_sub(1); // a stream completed → earn back reset budget
             begin_response(
                 sid,
                 is_head,
@@ -2074,7 +2119,6 @@ where
             Some((sid, is_head, resp)) = inflight.next(), if !inflight.is_empty() => {
                 inflight_sids.remove(&sid);
                 if let Some(resp) = resp && !cancelled.remove(&sid) {
-                    recv.rst_unanswered = recv.rst_unanswered.saturating_sub(1); // a stream completed → earn back reset budget
                     begin_response(sid, is_head, resp, &mut enc, &mut out, &mut outstreams, &mut send_schedule, &mut pending_window, &peer, &mut block_scratch);
                 } else {
                     cancelled.remove(&sid);
@@ -3358,13 +3402,190 @@ mod tests {
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
-            rst_unanswered: 0,
+            reset_debt_until: None,
             total_buffered: 0,
             max_request_body: 1 << 20,
             per_conn_request_body: 4 << 20,
+            pending_header_bytes: 0,
+            pending_header_mem: 4 << 20,
             body_budget: None,
             no_progress_frames: 0,
+            early_reject: None,
         }
+    }
+
+    /// The rapid-reset budget is a burst refilled by time alone: nothing but elapsed time
+    /// pays reset debt back, the refill never banks more than one burst, and a steady
+    /// cancel rate at the refill rate is sustainable indefinitely.
+    #[test]
+    fn rapid_reset_budget_refills_with_time_only() {
+        let t0 = tokio::time::Instant::now();
+        let mut recv = recv_for_header_test(0);
+        for n in 1..=200 {
+            assert!(
+                !recv.charge_inflight_reset_at(t0),
+                "reset {n} is in the burst"
+            );
+        }
+        assert!(
+            recv.charge_inflight_reset_at(t0),
+            "reset 201 exceeds the burst"
+        );
+
+        let mut recv = recv_for_header_test(0);
+        for _ in 0..200 {
+            recv.charge_inflight_reset_at(t0);
+        }
+        let t1 = t0 + Duration::from_secs(1);
+        for n in 1..=10 {
+            assert!(
+                !recv.charge_inflight_reset_at(t1),
+                "credit {n} refilled in 1 s"
+            );
+        }
+        assert!(
+            recv.charge_inflight_reset_at(t1),
+            "only 10 credits refill per second"
+        );
+
+        let t2 = t1 + Duration::from_secs(3600);
+        for _ in 0..200 {
+            assert!(!recv.charge_inflight_reset_at(t2));
+        }
+        assert!(
+            recv.charge_inflight_reset_at(t2),
+            "idle time banks one burst, no more"
+        );
+
+        let mut recv = recv_for_header_test(0);
+        let mut t = t0;
+        for _ in 0..10_000 {
+            assert!(!recv.charge_inflight_reset_at(t));
+            t += Duration::from_millis(100);
+        }
+    }
+
+    /// Every way a body-pending stream leaves the receive map returns its decoded-header
+    /// charge; a leak would refuse uploads on a long-lived connection.
+    #[tokio::test]
+    async fn pending_header_charge_is_returned_on_every_teardown() {
+        use super::recv::process_frame;
+        use crate::frame::{flags, kind};
+
+        let mut streams: FxHashMap<u32, StreamState> = FxHashMap::default();
+        let mut dec = Decoder::new(4096, 8192);
+        let mut enc = Encoder::new();
+        let mut client = Encoder::new();
+        let mut out = OutQueue::default();
+        let mut peer = PeerSettings::default();
+        let mut recv = recv_for_header_test(0);
+        recv.max_request_body = 8;
+        let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
+        let mut cancelled: FxHashSet<u32> = FxHashSet::default();
+        let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
+        let service = |_req: Request| std::future::ready(Response::new(hj_core::Body::Empty));
+        macro_rules! send {
+            ($kind:expr, $flags:expr, $sid:expr, $payload:expr) => {{
+                let payload: &[u8] = $payload;
+                process_frame(
+                    FrameHeader {
+                        length: payload.len() as u32,
+                        kind: $kind,
+                        flags: $flags,
+                        stream_id: $sid,
+                    },
+                    payload,
+                    &mut streams,
+                    &mut dec,
+                    &mut enc,
+                    &mut out,
+                    &mut peer,
+                    &mut recv,
+                    0,
+                    true,
+                    &service,
+                    &mut inflight,
+                    &mut cancelled,
+                    &mut inflight_sids,
+                )
+            }};
+        }
+        let open = |client: &mut Encoder, extra: &[(&str, &str)]| {
+            let mut block = Vec::new();
+            for (name, value) in [
+                (":method", "POST"),
+                (":path", "/upload"),
+                (":scheme", "https"),
+                (":authority", "example.com"),
+            ]
+            .iter()
+            .chain(extra)
+            {
+                client.encode_header(&mut block, name, value);
+            }
+            block
+        };
+
+        let teardowns: [(&str, u32); 8] = [
+            ("peer RST_STREAM", 1),
+            ("dispatch", 3),
+            ("413 past max_request_body", 5),
+            ("provoked reset", 7),
+            ("body deadline", 9),
+            ("malformed trailers", 11),
+            ("content-length mismatch", 13),
+            ("unterminated trailers", 15),
+        ];
+        for (how, sid) in teardowns {
+            let extra: &[(&str, &str)] = if sid == 13 {
+                &[("content-length", "2")]
+            } else {
+                &[]
+            };
+            let block = open(&mut client, extra);
+            send!(kind::HEADERS, flags::END_HEADERS, sid, &block);
+            assert!(streams.contains_key(&sid), "{how}: stream admitted");
+            assert!(recv.pending_header_bytes > 0, "{how}: headers charged");
+            match sid {
+                1 => {
+                    send!(kind::RST_STREAM, 0, sid, &error_code::CANCEL.to_be_bytes());
+                }
+                3 | 13 => {
+                    send!(kind::DATA, flags::END_STREAM, sid, b"x");
+                }
+                5 => {
+                    send!(kind::DATA, 0, sid, b"123456789");
+                }
+                7 => {
+                    send!(kind::WINDOW_UPDATE, 0, sid, &[0, 0, 0, 0]);
+                }
+                9 => {
+                    recv.expire_receiving(&mut streams, sid);
+                }
+                11 => {
+                    let mut trailers = Vec::new();
+                    client.encode_header(&mut trailers, ":path", "/");
+                    send!(
+                        kind::HEADERS,
+                        flags::END_HEADERS | flags::END_STREAM,
+                        sid,
+                        &trailers
+                    );
+                }
+                _ => {
+                    let mut trailers = Vec::new();
+                    client.encode_header(&mut trailers, "x-trailer", "1");
+                    send!(kind::HEADERS, flags::END_HEADERS, sid, &trailers);
+                }
+            }
+            assert!(!streams.contains_key(&sid), "{how}: stream left the map");
+            assert_eq!(recv.pending_header_bytes, 0, "{how}: charge returned");
+        }
+        assert_eq!(
+            inflight.len(),
+            1,
+            "only the dispatched stream reached a handler"
+        );
     }
 
     fn request_block_referencing_first_dynamic_entry() -> Vec<u8> {
@@ -3704,12 +3925,15 @@ mod tests {
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
-            rst_unanswered: 0,
+            reset_debt_until: None,
             total_buffered: body_len,
             max_request_body: 1 << 20,
             per_conn_request_body: 4 << 20,
+            pending_header_bytes: 0,
+            pending_header_mem: 4 << 20,
             body_budget: None,
             no_progress_frames: 0,
+            early_reject: None,
         };
         let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
         let mut cancelled: FxHashSet<u32> = FxHashSet::default();
@@ -3790,12 +4014,15 @@ mod tests {
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
-            rst_unanswered: 0,
+            reset_debt_until: None,
             total_buffered: 10,
             max_request_body: 1 << 20,
             per_conn_request_body: 4 << 20,
+            pending_header_bytes: 0,
+            pending_header_mem: 4 << 20,
             body_budget: None,
             no_progress_frames: 0,
+            early_reject: None,
         };
         let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
         let mut cancelled: FxHashSet<u32> = FxHashSet::default();
@@ -3898,12 +4125,15 @@ mod tests {
             max_concurrent: 256,
             conn_recv_window: 65535,
             our_initial_window: 65535,
-            rst_unanswered: 0,
+            reset_debt_until: None,
             total_buffered: 0,
             max_request_body: 1 << 20,
             per_conn_request_body: 4 << 20,
+            pending_header_bytes: 0,
+            pending_header_mem: 4 << 20,
             body_budget: None,
             no_progress_frames: 0,
+            early_reject: None,
         };
         for sid in (1..2 * RESETS).step_by(2) {
             recv.teardown_receiving(&mut streams, sid);
@@ -4013,12 +4243,15 @@ mod tests {
             max_concurrent: 100,
             conn_recv_window: 65535,
             our_initial_window: 65535,
-            rst_unanswered: 0,
+            reset_debt_until: None,
             total_buffered: 8,
             max_request_body: 1 << 20,
             per_conn_request_body: 4 << 20,
+            pending_header_bytes: 0,
+            pending_header_mem: 4 << 20,
             body_budget: Some(budget.clone()),
             no_progress_frames: 0,
+            early_reject: None,
         };
         let mut inflight: Inflight<std::future::Ready<Response>> = Inflight::new();
         let mut cancelled: FxHashSet<u32> = FxHashSet::default();
@@ -4066,9 +4299,7 @@ mod tests {
         );
     }
 
-    fn body_budget_request_wire(end_stream: bool) -> Vec<u8> {
-        let mut wire = crate::conn::PREFACE.to_vec();
-        frame::write_settings(&mut wire, &[]);
+    fn body_budget_request_block() -> Vec<u8> {
         let mut block = Vec::new();
         let mut encoder = Encoder::new();
         for (name, value) in [
@@ -4080,12 +4311,25 @@ mod tests {
         ] {
             encoder.encode_header(&mut block, name, value);
         }
+        block
+    }
+
+    /// The server-wide reservation the body-pending request's decoded headers hold.
+    fn body_budget_header_charge() -> u64 {
+        u64::from(super::recv::pending_header_charge_of(
+            &body_budget_request_block(),
+        ))
+    }
+
+    fn body_budget_request_wire(end_stream: bool) -> Vec<u8> {
+        let mut wire = crate::conn::PREFACE.to_vec();
+        frame::write_settings(&mut wire, &[]);
         frame::write_frame(
             &mut wire,
             frame::kind::HEADERS,
             frame::flags::END_HEADERS,
             1,
-            &block,
+            &body_budget_request_block(),
         );
         frame::write_frame(
             &mut wire,
@@ -4126,7 +4370,8 @@ mod tests {
             "protocol_error",
             "idle_timeout",
         ] {
-            let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+            let headers = body_budget_header_charge();
+            let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16 + headers));
             let (mut client, server) = tokio::io::duplex(16 * 1024);
             let config = Config {
                 body_budget: Some(budget.clone()),
@@ -4146,7 +4391,7 @@ mod tests {
                 .write_all(&body_budget_request_wire(false))
                 .await
                 .unwrap();
-            wait_for_body_budget(&budget, 8).await;
+            wait_for_body_budget(&budget, headers + 8).await;
 
             match exit {
                 "eof" => drop(client),
@@ -4194,10 +4439,10 @@ mod tests {
             }
             assert_eq!(budget.in_flight(), 0, "{exit} leaked a reservation");
             assert!(
-                budget.try_acquire(16),
+                budget.try_acquire(budget.capacity()),
                 "an unrelated upload must still fit after {exit}"
             );
-            budget.release(16);
+            budget.release(budget.capacity());
         }
     }
 
@@ -4206,7 +4451,9 @@ mod tests {
         use http_body_util::BodyExt;
         use tokio::io::AsyncWriteExt;
 
-        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(16));
+        let budget = Arc::new(hj_core::budget::BodyBufferBudget::new(
+            16 + body_budget_header_charge(),
+        ));
         let (mut client, server) = tokio::io::duplex(16 * 1024);
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let config = Config {
@@ -4236,10 +4483,10 @@ mod tests {
         assert_eq!(
             budget.in_flight(),
             8,
-            "END_STREAM must not release retained bytes"
+            "dispatch returns the header charge; END_STREAM must not release retained bytes"
         );
         assert!(
-            !budget.try_acquire(9),
+            !budget.try_acquire(budget.capacity() - 7),
             "retained handler bodies count against admission"
         );
         task.abort();
@@ -4404,12 +4651,16 @@ mod tests {
                 stream,
                 Vec::new(),
                 |req: Request| {
-                    let body = if req.uri().path() == "/body" {
-                        "0123456789"
-                    } else {
-                        ""
+                    use futures_util::future::Either;
+                    let body = match req.uri().path() {
+                        "/slow" => return Either::Right(std::future::pending()),
+                        "/body" => "0123456789",
+                        _ => "",
                     };
-                    std::future::ready(hj_core::text_response(http::StatusCode::OK, body))
+                    Either::Left(std::future::ready(hj_core::text_response(
+                        http::StatusCode::OK,
+                        body,
+                    )))
                 },
                 config,
                 None,
@@ -4749,6 +5000,70 @@ mod tests {
                 .iter()
                 .any(|&(kind, _, sid, _)| kind == frame::kind::HEADERS && sid == 3),
             "the next request on the same connection must still be answered"
+        );
+    }
+
+    /// The production loop: one cheap completed request per cancelled dispatched one must
+    /// not keep paying the rapid-reset budget back.
+    #[cfg(feature = "monoio")]
+    #[test]
+    fn monoio_cheap_completions_do_not_refund_the_rapid_reset_budget() {
+        use std::io::Write;
+
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+
+        let client = std::thread::spawn(move || {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            let mut wire = crate::conn::PREFACE.to_vec();
+            frame::write_settings(&mut wire, &[]);
+            stream.write_all(&wire).unwrap();
+            let mut encoder = Encoder::new();
+            let mut seen = Vec::new();
+            for pair in 0..1000u32 {
+                let (fast, slow) = (1 + 4 * pair, 3 + 4 * pair);
+                let mut wire = Vec::new();
+                get_headers(&mut encoder, fast, "/", &mut wire);
+                get_headers(&mut encoder, slow, "/slow", &mut wire);
+                frame::write_rst_stream(&mut wire, slow, error_code::CANCEL);
+                stream.write_all(&wire).unwrap();
+                let frames =
+                    read_frames_until(&mut stream, &mut seen, Duration::from_secs(3), |f| {
+                        f.iter().any(|&(kind, _, sid, _)| {
+                            kind == frame::kind::GOAWAY
+                                || (kind == frame::kind::HEADERS && sid == fast)
+                        })
+                    });
+                if let Some((.., payload)) = frames
+                    .iter()
+                    .find(|&&(kind, ..)| kind == frame::kind::GOAWAY)
+                {
+                    let code = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    return Some((pair, code));
+                }
+                assert!(
+                    frames
+                        .iter()
+                        .any(|&(kind, _, sid, _)| kind == frame::kind::HEADERS && sid == fast),
+                    "pair {pair}: the cheap request must be answered"
+                );
+            }
+            None
+        });
+
+        let goaways_before = rapid_reset_goaways();
+        serve_one_monoio_connection(std_listener, Config::default());
+
+        let (pairs, code) = client
+            .join()
+            .unwrap()
+            .expect("1:1 cancel:complete pairs never exhausted the reset budget");
+        assert_eq!(code, error_code::ENHANCE_YOUR_CALM);
+        assert!(rapid_reset_goaways() > goaways_before);
+        assert!(
+            (190..=300).contains(&pairs),
+            "cut off after {pairs} pairs; the burst is 200 plus slow refill"
         );
     }
 

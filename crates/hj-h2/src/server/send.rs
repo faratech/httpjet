@@ -40,6 +40,7 @@ async fn pull_next(
     cancel: tokio_util::sync::CancellationToken,
 ) -> PullResult {
     use http_body_util::BodyExt;
+    let mut skipped_frames = 0usize;
     loop {
         let frame = tokio::select! {
             biased;
@@ -47,10 +48,36 @@ async fn pull_next(
             frame = body.frame() => frame,
         };
         match frame {
-            Some(Ok(frame)) => match frame.into_data() {
-                Ok(data) => return (sid, body, Some(Ok(data))),
-                Err(_non_data) => continue, // trailers/metadata: skip
-            },
+            Some(Ok(frame)) => {
+                match frame.into_data() {
+                    // Empty DATA carries no wire progress. Returning it would make
+                    // `apply_pull` install an empty pending buffer and `pump_streams`
+                    // immediately schedule another pull; an always-ready source of
+                    // empty frames could therefore spin this connection task at 100%
+                    // CPU without producing a byte. The H1 bridge and H3 forwarders
+                    // discard the same frames before handing them to their writers.
+                    Ok(data) if !data.is_empty() => return (sid, body, Some(Ok(data))),
+                    Ok(_) | Err(_) => {}
+                }
+                skipped_frames += 1;
+                if skipped_frames == 64 {
+                    skipped_frames = 0;
+                    // A custom body can be permanently ready with empty DATA or
+                    // metadata frames. Yield independently of the executor so one
+                    // pull cannot keep a monoio core inside this loop forever.
+                    let mut yielded = false;
+                    std::future::poll_fn(|cx| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+            }
             Some(Err(e)) => return (sid, body, Some(Err(e))),
             None => return (sid, body, None),
         }
@@ -94,7 +121,7 @@ pub fn is_early_hint_link(v: &http::HeaderValue) -> bool {
 /// §4.3: a field block too large for one frame is continued in CONTINUATION frames). The
 /// leading HEADERS frame carries `lead_flags` (e.g. END_STREAM); END_HEADERS rides the last
 /// frame of the run. The common single-frame case keeps the original one-write fast path.
-fn write_field_block(
+pub(super) fn write_field_block(
     b: &mut Vec<u8>,
     stream_id: u32,
     lead_flags: u8,
@@ -776,6 +803,64 @@ fn body_to_bytes(body: Body) -> Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pull_next_skips_empty_data_before_payload() {
+        use http_body_util::BodyExt;
+
+        let source = futures_util::stream::iter([
+            Ok::<_, hj_core::BoxError>(http_body::Frame::data(Bytes::new())),
+            Ok(http_body::Frame::data(Bytes::new())),
+            Ok(http_body::Frame::data(Bytes::from_static(b"payload"))),
+        ]);
+        let body = BodyExt::boxed(http_body_util::StreamBody::new(source));
+        let (sid, body, result) =
+            pull_next(7, body, tokio_util::sync::CancellationToken::new()).await;
+
+        assert_eq!(sid, 7);
+        assert_eq!(result.unwrap().unwrap(), Bytes::from_static(b"payload"));
+        let (_, _, eof) = pull_next(sid, body, tokio_util::sync::CancellationToken::new()).await;
+        assert!(eof.is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_next_many_empty_frames_reaches_eof_in_one_pull() {
+        use http_body_util::BodyExt;
+
+        let source = futures_util::stream::iter(
+            (0..10_000).map(|_| Ok::<_, hj_core::BoxError>(http_body::Frame::data(Bytes::new()))),
+        );
+        let body = BodyExt::boxed(http_body_util::StreamBody::new(source));
+        let (sid, _, result) = pull_next(9, body, tokio_util::sync::CancellationToken::new()).await;
+
+        assert_eq!(sid, 9);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn pull_next_yields_during_a_long_ready_empty_run() {
+        use futures_util::FutureExt;
+        use http_body_util::BodyExt;
+
+        let empty =
+            (0..65).map(|_| Ok::<_, hj_core::BoxError>(http_body::Frame::data(Bytes::new())));
+        let payload = std::iter::once(Ok(http_body::Frame::data(Bytes::from_static(b"done"))));
+        let source = futures_util::stream::iter(empty.chain(payload));
+        let body = BodyExt::boxed(http_body_util::StreamBody::new(source));
+        let mut pull = Box::pin(pull_next(
+            11,
+            body,
+            tokio_util::sync::CancellationToken::new(),
+        ));
+
+        assert!(
+            pull.as_mut().now_or_never().is_none(),
+            "a long ready run must yield to the connection loop"
+        );
+        let (sid, _, result) = pull.await;
+        assert_eq!(sid, 11);
+        assert_eq!(result.unwrap().unwrap(), Bytes::from_static(b"done"));
+    }
 
     #[test]
     fn early_hint_link_matcher_semantics() {

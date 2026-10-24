@@ -113,7 +113,10 @@ impl PageDict {
             None => self.new_encoder()?,
         };
         // A failed frame may leave the context mid-stream, so only a clean one goes back.
-        let mut out = c.compress(input).ok()?;
+        let mut out =
+            crate::encoding::exact_output(zstd::zstd_safe::compress_bound(input.len()), |out| {
+                c.compress_to_buffer(input, out).ok().map(drop)
+            })?;
         {
             let mut pool = self.encoders.lock().unwrap_or_else(PoisonError::into_inner);
             if pool.len() < ENCODE_POOL_CAP {

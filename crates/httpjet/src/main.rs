@@ -278,10 +278,14 @@ struct ServeArgs {
     /// Allowed existing filesystem root for submitted resources; repeatable.
     #[arg(long, requires = "admin_write_addr")]
     admin_resource_root: Vec<PathBuf>,
-    /// Opt-in loopback HTTP request-inspection sidecar. The sidecar must return
-    /// 204 to allow or 403 to block; absent keeps the WAF seam completely inert.
-    #[arg(long, value_parser = admin::parse_addr)]
-    waf_sidecar_addr: Option<SocketAddr>,
+    /// Opt-in HTTP request-inspection sidecar: `unix:/path` (its listener's uid
+    /// is verified) or a loopback `ip:port` (unauthenticated). The sidecar must
+    /// return 204 to allow or 403 to block; absent keeps the WAF seam inert.
+    #[arg(long, value_parser = waf::parse_sidecar_addr)]
+    waf_sidecar_addr: Option<waf::SidecarAddr>,
+    /// The uid a `unix:` sidecar must run as. Default: root or this process's uid.
+    #[arg(long, requires = "waf_sidecar_addr")]
+    waf_sidecar_uid: Option<u32>,
     #[arg(long, default_value = "/inspect", requires = "waf_sidecar_addr")]
     waf_sidecar_path: String,
     #[arg(long, default_value_t = 100, requires = "waf_sidecar_addr")]
@@ -1580,7 +1584,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         };
         let state = {
             let mut state = state;
-            if let Some(address) = args.waf_sidecar_addr {
+            if let Some(address) = args.waf_sidecar_addr.clone() {
                 let policy = if args.waf_fail_open {
                     waf::FailurePolicy::Open
                 } else {
@@ -1588,6 +1592,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 };
                 let sidecar = waf::Sidecar::new(
                     address,
+                    args.waf_sidecar_uid,
                     args.waf_sidecar_path.clone(),
                     std::time::Duration::from_millis(args.waf_timeout_ms),
                     args.waf_body_max,
@@ -1741,7 +1746,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 addr,
                 workers,
                 tls_config,
-                mtls == 2,
+                uring::ClientAuth::from_client_verify(mtls),
                 ktls_template.clone(),
                 inh_https_std,
                 bridge_admission.clone(),
@@ -1764,7 +1769,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 addr,
                 workers,
                 h3cfg,
-                mtls == 2,
+                uring::ClientAuth::from_client_verify(mtls),
                 inh_quic.take(),
                 bridge_admission.clone(),
             ) {
@@ -3135,6 +3140,18 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
             }
         }
 
+        if config.rewrite.enable
+            && let Ok(rules) = hj_rewrite::RuleSet::parse(&config.rewrite.rules)
+        {
+            for subst in rules.substituted_proxy_authorities() {
+                warnings.push(substituted_proxy_warning(
+                    name,
+                    "inline rewrite rules",
+                    subst,
+                ));
+            }
+        }
+
         // Lint parsed auth groups: comments are not directives and sibling
         // metadata is not guaranteed to match the same resource.
         let htaccess = config.doc_root.join(config.access_file_name_or_default());
@@ -3153,6 +3170,13 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
                         warnings.push(format!(
                             "vhost {name}: {} reads User-Agent in a way the page cache cannot classify; UA-conditional responses (Header ... env=, [E=]) would be cached without a UA dimension",
                             htaccess.display()
+                        ));
+                    }
+                    for subst in ht.rules.substituted_proxy_authorities() {
+                        warnings.push(substituted_proxy_warning(
+                            name,
+                            &htaccess.display().to_string(),
+                            subst,
                         ));
                     }
                     for lineno in ht.auth_warnings() {
@@ -3183,6 +3207,14 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
     }
 
     warnings
+}
+
+/// A `[P]` rule whose upstream host comes from a substitution is an open proxy by
+/// construction; the pipeline withholds Cookie/Authorization from it.
+fn substituted_proxy_warning(vhost: &str, source: &str, subst: &str) -> String {
+    format!(
+        "vhost {vhost}: {source} [P] target {subst} takes its scheme/host from a substitution; the request can choose the upstream, so Cookie and Authorization are not forwarded to it (use a literal upstream host)"
+    )
 }
 
 /// One-line `fast_memo` verdict for a docroot `.htaccess` (the on-core static
@@ -4301,6 +4333,59 @@ mod tests {
         );
         std::fs::write(doc_root.join("users"), "Admin:password\n").unwrap();
         assert!(!lint(std::path::Path::new("users")), "inside the docroot");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `check` names a `[P]` rule (docroot `.htaccess` or inline) whose upstream host
+    /// comes from a substitution; a literal upstream is not flagged.
+    #[test]
+    fn substituted_proxy_authorities_are_linted() {
+        let dir = std::env::temp_dir().join(format!("hj-p-authority-lint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let doc_root = dir.join("docroot");
+        std::fs::create_dir_all(&doc_root).unwrap();
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let vhost_xml = dir.join("conf/vhost.xml");
+        std::fs::write(&vhost_xml, b"<vhost></vhost>").unwrap();
+        let lint = |htaccess: &str, inline: &str| {
+            std::fs::write(doc_root.join(".htaccess"), htaccess).unwrap();
+            let mut vhost = hj_config::VHostConfig::default();
+            vhost.doc_root = doc_root.clone();
+            vhost.rewrite.auto_load_htaccess = true;
+            vhost.rewrite.enable = !inline.is_empty();
+            vhost.rewrite.rules = inline.to_string();
+            let mut cfg = hj_config::ServerConfig {
+                server_root: dir.clone(),
+                ..Default::default()
+            };
+            cfg.vhosts.insert(
+                "t.example".into(),
+                hj_config::VHostDecl {
+                    name: "t.example".into(),
+                    vh_root: dir.clone(),
+                    config_file: vhost_xml.clone(),
+                    allow_symbol_link: None,
+                    restrained: false,
+                    enable_script: true,
+                    config: Some(Arc::new(vhost)),
+                },
+            );
+            lint_unsupported_features(&cfg, &dir)
+                .into_iter()
+                .any(|w| w.contains("[P] target") && w.contains("from a substitution"))
+        };
+        assert!(lint(
+            "RewriteEngine On\nRewriteRule ^p/(.*)$ http://$1 [P]\n",
+            ""
+        ));
+        assert!(lint(
+            "",
+            "RewriteEngine On\nRewriteRule ^/p$ http://%{HTTP:X-Up}/x [P]\n"
+        ));
+        assert!(!lint(
+            "RewriteEngine On\nRewriteRule ^p/(.*)$ http://127.0.0.1:8002/$1 [P]\n",
+            "RewriteEngine On\nRewriteRule ^/m(.*)$ http://localhost:2812/$1 [P]\n"
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

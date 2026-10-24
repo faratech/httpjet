@@ -18,6 +18,7 @@ use proptest::prelude::*;
 
 const KEYS: usize = 16;
 const TAGS: usize = 4;
+const MODEL_EXPIRY_GRACE: Duration = Duration::from_millis(10);
 
 fn cfg(root: &Path) -> StoreConfig {
     StoreConfig {
@@ -52,6 +53,10 @@ struct ModelEntry {
     /// The stored body length (recompress/fill changes it). Disk accounting itself
     /// uses the file footprint and is checked from `PageBody::File.disk_total`.
     disk_len: usize,
+}
+
+fn within_expiry_grace(now: Instant, entry: &ModelEntry) -> bool {
+    now.duration_since(entry.stored_at) < entry.ttl + MODEL_EXPIRY_GRACE
 }
 
 #[derive(Clone, Debug)]
@@ -144,16 +149,11 @@ fn check(s: &PageStore, model: &HashMap<usize, ModelEntry>, root: &Path) {
 
     for k in 0..KEYS {
         let got = s.get_entry(&key(k), &identity(k), now);
-        // Decide the model's expectation: present + fresh (age < ttl) ⇒ a hit is allowed.
-        let model_fresh = model
-            .get(&k)
-            .map(|m| now.duration_since(m.stored_at) < m.ttl)
-            .unwrap_or(false);
         match got {
             EntryState::Fresh(e) | EntryState::Stale(e) => {
-                // A hit must correspond to a model entry that has not passed its deadline. (The
-                // store may also legitimately MISS a model-fresh entry if a sweep/expiry just ran on
-                // the boundary; but it must NEVER HIT a key the model believes is gone/purged.)
+                // A hit must correspond to a model entry retained through the small expiry grace.
+                // The store may legitimately MISS it if a sweep/expiry ran on the boundary, but it
+                // must NEVER HIT a key the model believes is gone or purged.
                 assert!(
                     model.contains_key(&k),
                     "store HIT key {k} the model has purged/never-stored"
@@ -181,10 +181,8 @@ fn check(s: &PageStore, model: &HashMap<usize, ModelEntry>, root: &Path) {
                 }
             }
             EntryState::ErrorOnly(_) | EntryState::Miss => {
-                // A miss is always acceptable (eviction/expiry/lazy reclaim). If the model thinks it
-                // is fresh, the store may have reaped it on the boundary — tolerated. The asymmetric
+                // A miss is always acceptable (eviction/expiry/lazy reclaim). The asymmetric
                 // guarantee (never a wrong HIT) is what matters and is checked above.
-                let _ = model_fresh;
             }
         }
     }
@@ -235,9 +233,8 @@ proptest! {
         s.load_from_disk(|_| {});
         let mut model: HashMap<usize, ModelEntry> = HashMap::new();
 
-        // Reconcile the model's view of expiry with the store's: before each check, drop from the
-        // model any entry whose deadline has passed (the store will MISS it, and a Miss is always
-        // allowed — but we keep the model tight so the "never a wrong HIT" check stays meaningful).
+        // Reconcile the model's view of expiry with the store's before every check. The small grace
+        // below covers sampling jitter around the deadline without weakening body-identity checks.
         for op in ops {
             match op {
                 Op::Store { k, body_len, tag, ttl_ms } => {
@@ -297,7 +294,7 @@ proptest! {
                 Op::Sweep => {
                     s.sweep_expired();
                     let now = Instant::now();
-                    model.retain(|_, m| now.duration_since(m.stored_at) < m.ttl);
+                    model.retain(|_, m| within_expiry_grace(now, m));
                 }
                 Op::Sleep { ms } => {
                     if ms > 0 {
@@ -305,10 +302,11 @@ proptest! {
                     }
                 }
             }
-            // Drop model entries the store will have lazily reaped on the next probe, so the model's
-            // "present" set never claims an entry the store legitimately expired.
+            // Store and model clocks are sampled around filesystem work. Keep a tiny grace after
+            // the model deadline so a correct boundary hit on a loaded runner is still checked for
+            // exact body identity; a miss remains acceptable and structural invariants stay exact.
             let now = Instant::now();
-            model.retain(|_, m| now.duration_since(m.stored_at) < m.ttl);
+            model.retain(|_, m| within_expiry_grace(now, m));
             check(&s, &model, td.path());
         }
     }

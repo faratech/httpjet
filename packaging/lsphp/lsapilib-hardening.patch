@@ -1,0 +1,42 @@
+--- a/sapi/litespeed/lsapilib.c
++++ b/sapi/litespeed/lsapilib.c
+@@ -646,7 +646,7 @@
+ {
+     struct LSAPI_key_value_pair * pEnvEnd;
+         int keyLen = 0, valLen = 0;
+-    if ( count > 8192 )
++    if ( count < 0 || count > 8192 )
+         return -1;
+     pEnvEnd = pEnvList + count;
+     while( pEnvList != pEnvEnd )
+@@ -1372,7 +1372,8 @@
+ 
+     while ( pReq->m_bufRead < LSAPI_PACKET_HEADER_LEN )
+     {
+-        len = lsapi_read( pReq->m_fd, pReq->m_pReqBuf, pReq->m_reqBufSize );
++        len = lsapi_read( pReq->m_fd, pReq->m_pReqBuf + pReq->m_bufRead,
++                          pReq->m_reqBufSize - pReq->m_bufRead );
+         if ( len <= 0 )
+             return -1;
+         pReq->m_bufRead += len;
+@@ -1612,11 +1613,18 @@
+                 Flush_RespBuf_r( pReq );
+             }
+ 
++            /* Request body bytes the script left unread would be parsed as the
++             * next request on this connection: end it like LSAPI_End_Response_r
++             * (RESP_END + CONN_CLOSE) instead of reusing it. */
++            int unread_body = ( pReq->m_reqBodyLen != pReq->m_reqBodyRead );
+             pReq->m_pIovecCur->iov_base = (void *)finish_close;
+-            pReq->m_pIovecCur->iov_len  = LSAPI_PACKET_HEADER_LEN;
+-            pReq->m_totalLen += LSAPI_PACKET_HEADER_LEN;
++            pReq->m_pIovecCur->iov_len  = unread_body
++                ? LSAPI_PACKET_HEADER_LEN << 1 : LSAPI_PACKET_HEADER_LEN;
++            pReq->m_totalLen += pReq->m_pIovecCur->iov_len;
+             ++pReq->m_pIovecCur;
+             LSAPI_Flush_r( pReq );
++            if ( unread_body )
++                lsapi_close_connection( pReq );
+         }
+         LSAPI_Reset_r( pReq );
+     }

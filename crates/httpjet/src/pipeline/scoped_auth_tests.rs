@@ -525,3 +525,36 @@ async fn repeated_authorization_is_refused() {
     }
     std::fs::remove_dir_all(root).ok();
 }
+
+/// A valid credential for a name outside `Require user` is hashed and charged
+/// like a wrong password: no instant, uncharged 401 tells members apart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unlisted_user_is_hashed_and_charged_like_a_failure() {
+    let root = fixture(
+        "auth_unlisted_charged",
+        "AuthType Basic\nAuthUserFile users\nRequire user Admin\n",
+    );
+    std::fs::write(root.join("x.txt"), b"x").unwrap();
+    let state = build_state_htaccess(root.clone());
+    for _ in 0..40 {
+        assert_eq!(status(&state, "/x.txt", Some(ADMIN)).await, 200);
+    }
+    let mut refused = false;
+    for _ in 0..200 {
+        match status(&state, "/x.txt", Some(VISITOR)).await {
+            401 => {}
+            503 => {
+                refused = true;
+                break;
+            }
+            other => panic!("unexpected {other}"),
+        }
+    }
+    assert!(refused, "unlisted-user attempts were never charged");
+    assert_eq!(
+        status(&state, "/x.txt", Some(ADMIN)).await,
+        503,
+        "a client over its failure budget is refused before any hash"
+    );
+    std::fs::remove_dir_all(root).ok();
+}

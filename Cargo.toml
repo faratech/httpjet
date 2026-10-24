@@ -19,7 +19,7 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.4"
 edition = "2024"
 publish = false
 rust-version = "1.99.1"
@@ -88,7 +88,7 @@ webpki-roots = "1.0"
 # config / parsing
 quick-xml = "0.42"
 serde = { version = "1", features = ["derive"] }
-fancy-regex = "0.19"
+fancy-regex = "0.20"
 regex = "1"
 regex-automata = "0.4"
 ipnet = "2"
@@ -122,7 +122,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["s
 # default-features off drops color/suggestions (anstream/anstyle/strsim) — the server is
 # non-interactive; keep help/usage/error-context so `--help` + arg errors still render.
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # global allocator — cuts glibc arena lock/futex contention across the per-core
 # monoio workers + the tokio side-runtime (Pingora ships jemalloc for the same

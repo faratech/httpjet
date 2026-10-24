@@ -99,6 +99,13 @@ pub use writer::RollConfig;
 /// logging). Control messages (Reopen/Shutdown) are never counted and never shed.
 const MAX_QUEUED_LINES: u64 = 65_536;
 
+/// Byte budget for the same backlog, charged with each message's owned heap
+/// capacity. Lines alone let oversized records (an 8 KiB URI plus 16 KiB of
+/// logged headers, more once obs-text is `\xNN`-escaped) hold over 1.5 GiB per
+/// logger. 64 MiB is twice what the line cap holds at a typical ~500 bytes per
+/// record, so ordinary traffic still sheds on the line cap first.
+const MAX_QUEUED_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Per-logger state shared between the logger handle and any supervisory code:
 /// the in-flight line depth counter and a gone-flag that fires exactly once when
 /// the writer task disappears. Stored per-logger (not process-wide) so that two
@@ -106,16 +113,49 @@ const MAX_QUEUED_LINES: u64 = 65_536;
 /// error-log writer does not suppress the gone warning for the access-log writer.
 pub(crate) struct LoggerStateInner {
     pub depth: AtomicU64,
+    /// Owned bytes of the queued messages ([`Msg::queued_bytes`]).
+    pub queued_bytes: AtomicU64,
     pub gone: AtomicBool,
     pub dropped: AtomicU64,
 }
 
 impl LoggerStateInner {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LoggerStateInner {
             depth: AtomicU64::new(0),
+            queued_bytes: AtomicU64::new(0),
             gone: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Admit `lines` lines holding `bytes` owned bytes, or shed them (counted
+    /// in `dropped`) when either budget would be exceeded.
+    fn admit(&self, lines: u64, bytes: u64) -> bool {
+        if self.depth.load(Ordering::Relaxed) + lines > MAX_QUEUED_LINES
+            || self.queued_bytes.load(Ordering::Relaxed) + bytes > MAX_QUEUED_BYTES
+        {
+            self.dropped.fetch_add(lines, Ordering::Relaxed);
+            return false;
+        }
+        self.depth.fetch_add(lines, Ordering::Relaxed);
+        self.queued_bytes.fetch_add(bytes, Ordering::Relaxed);
+        true
+    }
+
+    /// Undo an [`admit`](Self::admit) whose send failed because the writer is
+    /// gone; warns once.
+    fn writer_gone(&self, lines: u64, bytes: u64, what: &str) {
+        self.depth.fetch_sub(lines, Ordering::Relaxed);
+        self.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.dropped.fetch_add(lines, Ordering::Relaxed);
+        if !self.gone.swap(true, Ordering::Relaxed) {
+            // The writer will never drain again, so any lines that were still queued
+            // when it died keep their never-released charge. Reset the gauges the
+            // first time we notice — else stale charge can pin them at the shed cap.
+            self.depth.store(0, Ordering::Relaxed);
+            self.queued_bytes.store(0, Ordering::Relaxed);
+            eprintln!("hj-log: {what} writer task gone; subsequent {what} lines are dropped");
         }
     }
 }
@@ -128,27 +168,16 @@ pub(crate) type LoggerState = Arc<LoggerStateInner>;
 /// (Logging must not take the request path down — so this only warns; it does not
 /// retry or error out.)
 ///
-/// `state.0` tracks the in-flight line backlog: count BEFORE sending (so the
-/// writer's per-line decrement can never underflow it), and shed past
-/// `MAX_QUEUED_LINES` so a stalled writer can't grow the queue without bound.
-/// `state.1` is set once when the channel send fails (writer gone).
+/// The backlog is charged BEFORE sending (so the writer's release can never
+/// underflow it) and shed past `MAX_QUEUED_LINES` lines or `MAX_QUEUED_BYTES`
+/// bytes, so a stalled writer can't grow the queue without bound.
 fn send_or_warn(tx: &mpsc::UnboundedSender<Msg>, state: &LoggerState, msg: Msg, what: &str) {
-    if state.depth.load(Ordering::Relaxed) >= MAX_QUEUED_LINES {
-        state.dropped.fetch_add(1, Ordering::Relaxed);
-        return; // shed: writer backlogged at the cap — drop rather than risk OOM
+    let bytes = msg.queued_bytes();
+    if !state.admit(1, bytes) {
+        return; // shed: writer backlogged at a cap — drop rather than risk OOM
     }
-    state.depth.fetch_add(1, Ordering::Relaxed);
     if tx.send(msg).is_err() {
-        state.depth.fetch_sub(1, Ordering::Relaxed);
-        state.dropped.fetch_add(1, Ordering::Relaxed);
-        if !state.gone.swap(true, Ordering::Relaxed) {
-            // The writer will never drain again, so any lines that were still queued
-            // when it died keep their never-decremented `depth` charge. Reset the
-            // gauge to 0 the first time we notice — else stale charge can pin `depth`
-            // at the shed cap and the count stops reflecting reality.
-            state.depth.store(0, Ordering::Relaxed);
-            eprintln!("hj-log: {what} writer task gone; subsequent {what} lines are dropped");
-        }
+        state.writer_gone(1, bytes, what);
     }
 }
 
@@ -598,6 +627,36 @@ enum Msg {
     Shutdown(oneshot::Sender<()>),
 }
 
+impl Msg {
+    /// Heap bytes the message owns while queued; the writer releases the same
+    /// amount when it takes the message.
+    fn queued_bytes(&self) -> u64 {
+        let owned = |bytes: &Option<Vec<u8>>| bytes.as_ref().map_or(0, Vec::capacity);
+        let text = |text: &Option<String>| text.as_ref().map_or(0, String::capacity);
+        let bytes = match self {
+            Msg::Line(line) => line.capacity(),
+            Msg::Chunk(chunk, _) => chunk.capacity(),
+            Msg::Record(record, _, extra) => {
+                let method = match &record.method {
+                    Cow::Owned(method) => method.capacity(),
+                    Cow::Borrowed(_) => 0,
+                };
+                std::mem::size_of::<AccessRecord>()
+                    + method
+                    + record.uri.capacity()
+                    + owned(&record.referer)
+                    + owned(&record.user_agent)
+                    + owned(&record.host)
+                    + text(&record.remote_user)
+                    + text(&record.request_id)
+                    + text(extra)
+            }
+            Msg::Reopen | Msg::Shutdown(_) => 0,
+        };
+        bytes as u64
+    }
+}
+
 /// Non-blocking access logger handle. Cheap to [`Clone`]; all clones feed the
 /// same writer task.
 #[derive(Clone)]
@@ -704,18 +763,13 @@ impl AccessLogger {
             return;
         }
         let lines64 = u64::from(lines);
-        if self.state.depth.load(Ordering::Relaxed) + lines64 > MAX_QUEUED_LINES {
-            self.state.dropped.fetch_add(lines64, Ordering::Relaxed);
+        let msg = Msg::Chunk(chunk, lines);
+        let bytes = msg.queued_bytes();
+        if !self.state.admit(lines64, bytes) {
             return;
         }
-        self.state.depth.fetch_add(lines64, Ordering::Relaxed);
-        if self.tx.send(Msg::Chunk(chunk, lines)).is_err() {
-            self.state.depth.fetch_sub(lines64, Ordering::Relaxed);
-            self.state.dropped.fetch_add(lines64, Ordering::Relaxed);
-            if !self.state.gone.swap(true, Ordering::Relaxed) {
-                self.state.depth.store(0, Ordering::Relaxed);
-                eprintln!("hj-log: access-log writer task gone; subsequent lines are dropped");
-            }
+        if self.tx.send(msg).is_err() {
+            self.state.writer_gone(lines64, bytes, "access-log");
         }
     }
 
@@ -1060,6 +1114,74 @@ mod tests {
             rx.try_recv().is_err(),
             "shed line must not enter the writer queue"
         );
+    }
+
+    /// Regression (#1142): the backlog is bounded in bytes as well as lines, so
+    /// oversized records stop queueing at the byte budget long before the line
+    /// cap, and every shed record is counted.
+    #[test]
+    fn byte_budget_sheds_oversized_backlog() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let state = Arc::new(LoggerStateInner::new());
+        // An 8 KiB URI and 16 KiB of logged headers, as a hostile request can send.
+        let big = || {
+            let mut record = sample();
+            record.uri = String::with_capacity(8 * 1024);
+            record.uri.push('/');
+            record.user_agent = Some(Vec::with_capacity(16 * 1024));
+            Msg::Record(Box::new(record), LogFormat::Combined, None)
+        };
+        let charge = big().queued_bytes();
+        assert!(charge > 24 * 1024, "{charge}");
+        let sent = 4096_u64;
+        for _ in 0..sent {
+            send_or_warn(&tx, &state, big(), "access-log");
+        }
+        let mut queued = 0_u64;
+        while rx.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(queued, MAX_QUEUED_BYTES / charge);
+        assert_eq!(state.depth.load(Ordering::Relaxed), queued);
+        assert_eq!(state.queued_bytes.load(Ordering::Relaxed), queued * charge);
+        assert_eq!(state.dropped.load(Ordering::Relaxed), sent - queued);
+
+        // A chunk is charged by its capacity and shed whole, line-accurately.
+        let state = Arc::new(LoggerStateInner::new());
+        let logger = AccessLogger {
+            tx,
+            format: LogFormat::Common,
+            state: state.clone(),
+        };
+        let chunk = 4 * 1024 * 1024;
+        for _ in 0..MAX_QUEUED_BYTES / chunk as u64 {
+            logger.log_chunk(vec![0; chunk], 7);
+        }
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 0);
+        logger.log_chunk(vec![0; chunk], 7);
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 7);
+        assert_eq!(state.queued_bytes.load(Ordering::Relaxed), MAX_QUEUED_BYTES);
+    }
+
+    /// The writer releases exactly what was charged, so a drained backlog reads 0.
+    #[tokio::test]
+    async fn writer_releases_the_byte_charge() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("hj-log-bytes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let logger = AccessLogger::spawn(dir.join("access.log"), LogFormat::Combined, 0, 0, false);
+        let state = logger.state.clone();
+        for _ in 0..100 {
+            logger.log(sample());
+            logger.log_line("pre-rendered");
+            logger.log_with_extra(sample(), Some("continuation".into()));
+            logger.log_chunk(b"one\ntwo\n".to_vec(), 2);
+        }
+        logger.shutdown().await;
+        assert_eq!(state.queued_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.depth.load(Ordering::Relaxed), 0);
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// (#349) The borrowed chunk renderer must produce BYTE-IDENTICAL lines to

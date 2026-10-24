@@ -41,35 +41,130 @@ async fn auth_permit_from(
     .map_err(|_| auth_busy())?
     .map_err(|_| auth_busy())
 }
-static AUTH_RATE: std::sync::LazyLock<std::sync::Mutex<AuthRate>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(AuthRate::default()));
+const AUTH_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+/// Unverified attempts (failures plus those still in flight) one client may hold
+/// per window.
+const AUTH_RATE_ATTEMPTS: u32 = 32;
+const AUTH_RATE_CLIENTS: usize = 1024;
+/// A browser fetching a protected page's assets in parallel queues behind its own
+/// slot rather than failing; beyond this many it is refused.
+const AUTH_PENDING_PER_CLIENT: u32 = 16;
+const AUTH_CLIENT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Per-client Basic-auth accounting. An attempt is charged when admitted, before
+/// any work permit or hash, and refunded only when it authenticates. A client
+/// verifies one credential at a time, so it never holds more than one of the
+/// shared work permits.
+#[derive(Default)]
+pub(crate) struct AuthLimiter(std::sync::Mutex<AuthRate>);
 
 #[derive(Default)]
 struct AuthRate {
-    clients: std::collections::HashMap<std::net::IpAddr, (std::time::Instant, u32)>,
+    clients: std::collections::HashMap<std::net::IpAddr, ClientAttempts>,
 }
+
+struct ClientAttempts {
+    start: std::time::Instant,
+    attempts: u32,
+    pending: u32,
+    slot: Arc<tokio::sync::Semaphore>,
+}
+
 impl AuthRate {
-    fn blocked(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
+    /// Charge one attempt by `ip`; `None` refuses it. The returned slot admits one
+    /// verification per client at a time.
+    fn admit(
+        &mut self,
+        ip: std::net::IpAddr,
+        now: std::time::Instant,
+    ) -> Option<Arc<tokio::sync::Semaphore>> {
         let ip = ip.to_canonical();
-        self.clients
-            .retain(|_, (start, _)| now.duration_since(*start) < std::time::Duration::from_secs(1));
-        self.clients
-            .get(&ip)
-            .map_or(self.clients.len() >= 1024, |(_, count)| *count >= 32)
+        self.clients.retain(|_, client| {
+            if now.duration_since(client.start) < AUTH_RATE_WINDOW {
+                return true;
+            }
+            client.start = now;
+            client.attempts = client.pending;
+            client.pending > 0
+        });
+        if !self.clients.contains_key(&ip) && self.clients.len() >= AUTH_RATE_CLIENTS {
+            // A full table evicts its stalest idle client instead of refusing every
+            // client it has not seen yet.
+            let idle = self
+                .clients
+                .iter()
+                .filter(|(_, client)| client.pending == 0)
+                .min_by_key(|(_, client)| client.start)
+                .map(|(ip, _)| *ip)?;
+            self.clients.remove(&idle);
+        }
+        let client = self.clients.entry(ip).or_insert_with(|| ClientAttempts {
+            start: now,
+            attempts: 0,
+            pending: 0,
+            slot: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        if client.attempts >= AUTH_RATE_ATTEMPTS || client.pending >= AUTH_PENDING_PER_CLIENT {
+            return None;
+        }
+        client.attempts += 1;
+        client.pending += 1;
+        Some(client.slot.clone())
     }
-    fn allow(&mut self, ip: std::net::IpAddr, now: std::time::Instant) -> bool {
-        let ip = ip.to_canonical();
-        self.clients
-            .retain(|_, (start, _)| now.duration_since(*start) < std::time::Duration::from_secs(1));
-        if !self.clients.contains_key(&ip) && self.clients.len() >= 1024 {
-            return false;
+
+    fn finish(&mut self, ip: std::net::IpAddr, verified: bool) {
+        if let Some(client) = self.clients.get_mut(&ip.to_canonical()) {
+            client.pending = client.pending.saturating_sub(1);
+            if verified {
+                client.attempts = client.attempts.saturating_sub(1);
+            }
         }
-        let (_, count) = self.clients.entry(ip).or_insert((now, 0));
-        if *count >= 32 {
-            return false;
-        }
-        *count += 1;
-        true
+    }
+}
+
+/// One admitted attempt. However the request ends, dropping it settles the
+/// charge: refunded if it authenticated, kept otherwise.
+struct AuthAttempt {
+    limiter: Arc<AuthLimiter>,
+    ip: std::net::IpAddr,
+    slot: Arc<tokio::sync::Semaphore>,
+    verified: bool,
+}
+
+impl AuthAttempt {
+    fn admit(limiter: &Arc<AuthLimiter>, ip: std::net::IpAddr) -> Option<Self> {
+        let slot = limiter
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .admit(ip, std::time::Instant::now())?;
+        Some(AuthAttempt {
+            limiter: limiter.clone(),
+            ip,
+            slot,
+            verified: false,
+        })
+    }
+
+    fn authenticated(&mut self) {
+        self.verified = true;
+    }
+
+    async fn client_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+        tokio::time::timeout(AUTH_CLIENT_SLOT_WAIT, self.slot.clone().acquire_owned())
+            .await
+            .map_err(|_| auth_busy())?
+            .map_err(|_| auth_busy())
+    }
+}
+
+impl Drop for AuthAttempt {
+    fn drop(&mut self) {
+        self.limiter
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish(self.ip, self.verified);
     }
 }
 fn auth_busy() -> Response {
@@ -82,6 +177,7 @@ fn auth_busy() -> Response {
 }
 
 pub(super) async fn enforce_chain(
+    state: &ServerState,
     ctx: &mut ReqCtx,
     headers: &http::HeaderMap,
     chain: &[Arc<Htaccess>],
@@ -90,6 +186,7 @@ pub(super) async fn enforce_chain(
     authenticated: &mut Vec<AuthRealm>,
 ) -> Result<(), Response> {
     enforce_chain_iter(
+        state,
         ctx,
         headers,
         chain.iter().map(AsRef::as_ref),
@@ -101,6 +198,7 @@ pub(super) async fn enforce_chain(
 }
 
 pub(super) async fn enforce_chain_iter<'a, I>(
+    state: &ServerState,
     ctx: &mut ReqCtx,
     headers: &http::HeaderMap,
     chain: I,
@@ -152,42 +250,42 @@ where
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("basic"))
         .and_then(|(_, value)| hj_rewrite::auth::decode_basic_credentials(value));
     if let Some((user, password)) = credentials {
-        if realm.user_satisfies(&user) {
-            let user_file = realm.user_file.clone();
-            let doc_root = ctx.vhost.doc_root.clone();
-            let roots = auth_user_file_roots();
-            let permit = auth_permit().await?;
-            if AUTH_RATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .blocked(ctx.client_ip, std::time::Instant::now())
-            {
-                return Err(auth_busy());
+        // Every named user pays the same hash and `Require user` applies after it,
+        // so the response time does not reveal whom the realm admits.
+        let member = realm.user_satisfies(&user);
+        let Some(mut attempt) = AuthAttempt::admit(&state.auth_limiter, ctx.client_ip) else {
+            return Err(auth_busy());
+        };
+        let slot = attempt.client_slot().await?;
+        let permit = auth_permit().await?;
+        let user_file = realm.user_file.clone();
+        let doc_root = ctx.vhost.doc_root.clone();
+        let roots = auth_user_file_roots();
+        let checked_user = user.clone();
+        let verdict = tokio::task::spawn_blocking(move || {
+            let _permits = (permit, slot);
+            let verdict =
+                hj_rewrite::auth::open_user_file(&user_file, &doc_root, &roots).and_then(|file| {
+                    hj_rewrite::auth::verify_credentials(&user_file, file, &checked_user, &password)
+                });
+            if member && matches!(verdict, Ok(true)) {
+                attempt.authenticated();
             }
-            let checked_user = user.clone();
-            let verdict = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let file = hj_rewrite::auth::open_user_file(&user_file, &doc_root, &roots)?;
-                hj_rewrite::auth::verify_credentials(&user_file, file, &checked_user, &password)
-            })
-            .await
-            .unwrap_or(Ok(false));
-            let valid = match verdict {
-                Ok(valid) => valid,
-                Err(error) => {
-                    tracing::error!(request_id = %ctx.request_id, %error, "Basic auth refused");
-                    return Err(error_page(StatusCode::INTERNAL_SERVER_ERROR));
-                }
-            };
-            if valid {
-                ctx.set_env(hj_lsapi::cgi::AUTH_USER_ENV, user);
-                authenticated.push(realm);
-                return Ok(());
+            verdict
+        })
+        .await
+        .unwrap_or(Ok(false));
+        let valid = match verdict {
+            Ok(valid) => valid && member,
+            Err(error) => {
+                tracing::error!(request_id = %ctx.request_id, %error, "Basic auth refused");
+                return Err(error_page(StatusCode::INTERNAL_SERVER_ERROR));
             }
-            AUTH_RATE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .allow(ctx.client_ip, std::time::Instant::now());
+        };
+        if valid {
+            ctx.set_env(hj_lsapi::cgi::AUTH_USER_ENV, user);
+            authenticated.push(realm);
+            return Ok(());
         }
     }
     let mut response = error_page(StatusCode::UNAUTHORIZED);
@@ -202,7 +300,7 @@ where
 async fn enforce_resource(
     state: &ServerState,
     ctx: &mut ReqCtx,
-    headers: &http::HeaderMap,
+    request: ResourceRequest<'_>,
     path: &str,
     request_path: &str,
     authenticated: &mut Vec<AuthRealm>,
@@ -225,10 +323,26 @@ async fn enforce_resource(
         .collect();
     // Preserve the loader's deny-all sentinel when malformed auth could not
     // produce an AuthPolicy, as well as the resource's ordinary host ACLs.
-    if access_denied(&chain, path, "GET", ctx) {
+    let denied = match chain_access_ctx(state, ctx, &chain, request, path) {
+        Ok(access_ctx) => access_denied(&chain, path, request.method, &access_ctx),
+        Err(reason) => {
+            tracing::error!(request_id = %ctx.request_id, reason, "target SetEnvIf evaluation failed closed");
+            return Err(error_page(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+    };
+    if denied {
         return Err(error_page(StatusCode::FORBIDDEN));
     }
-    enforce_chain(ctx, headers, &chain, path, request_path, authenticated).await
+    enforce_chain(
+        state,
+        ctx,
+        request.headers,
+        &chain,
+        path,
+        request_path,
+        authenticated,
+    )
+    .await
 }
 
 /// The last resource [`enforce_mapped_resources`] passed, with the realm count it
@@ -243,7 +357,7 @@ impl LastEnforced {
         &mut self,
         state: &ServerState,
         ctx: &mut ReqCtx,
-        headers: &http::HeaderMap,
+        request: ResourceRequest<'_>,
         path: &str,
         request_path: &str,
         authenticated: &mut Vec<AuthRealm>,
@@ -256,7 +370,7 @@ impl LastEnforced {
             return Ok(());
         }
         let realms = authenticated.len();
-        enforce_resource(state, ctx, headers, path, request_path, authenticated).await?;
+        enforce_resource(state, ctx, request, path, request_path, authenticated).await?;
         self.0 = (authenticated.len() == realms).then(|| (path.to_owned(), realms));
         Ok(())
     }
@@ -265,14 +379,14 @@ impl LastEnforced {
         &mut self,
         state: &ServerState,
         ctx: &mut ReqCtx,
-        headers: &http::HeaderMap,
+        request: ResourceRequest<'_>,
         target: &Path,
         request_path: &str,
         authenticated: &mut Vec<AuthRealm>,
     ) -> Result<(), Response> {
         if let Some(relative) = relative_to_doc_root(ctx, target) {
             let path = format!("/{}", relative.to_string_lossy());
-            self.resource(state, ctx, headers, &path, request_path, authenticated)
+            self.resource(state, ctx, request, &path, request_path, authenticated)
                 .await?;
         }
         Ok(())
@@ -293,13 +407,13 @@ fn relative_to_doc_root(ctx: &ReqCtx, target: &Path) -> Option<PathBuf> {
 pub(super) async fn enforce_target(
     state: &ServerState,
     ctx: &mut ReqCtx,
-    headers: &http::HeaderMap,
+    request: ResourceRequest<'_>,
     target: &Path,
     request_path: &str,
     authenticated: &mut Vec<AuthRealm>,
 ) -> Result<(), Response> {
     LastEnforced::default()
-        .target(state, ctx, headers, target, request_path, authenticated)
+        .target(state, ctx, request, target, request_path, authenticated)
         .await
 }
 
@@ -359,10 +473,11 @@ pub(super) struct OpenedScript {
 pub(super) fn target_has_auth(
     state: &ServerState,
     ctx: &ReqCtx,
+    request: ResourceRequest<'_>,
     path: &str,
     chain: &[Arc<Htaccess>],
 ) -> (bool, Option<std::time::Instant>) {
-    let policy = target_policy(state, ctx, path, chain);
+    let policy = target_policy(state, ctx, request, path, chain);
     (policy.protected, policy.deadline)
 }
 
@@ -371,6 +486,7 @@ pub(super) fn target_has_auth(
 pub(super) fn target_policy(
     state: &ServerState,
     ctx: &ReqCtx,
+    request: ResourceRequest<'_>,
     path: &str,
     chain: &[Arc<Htaccess>],
 ) -> TargetPolicy {
@@ -404,7 +520,7 @@ pub(super) fn target_policy(
         let Some(target) = opened else {
             continue;
         };
-        let Some(checked) = opened_target_policy(state, ctx, &target) else {
+        let Some(checked) = opened_target_policy(state, ctx, request, &target) else {
             continue;
         };
         policy.deadline = Some(
@@ -429,6 +545,7 @@ pub(super) fn target_policy(
 pub(super) fn served_target_policy(
     state: &ServerState,
     ctx: &ReqCtx,
+    request: ResourceRequest<'_>,
     path: &str,
     predicted: &[PathBuf],
     response: &Response,
@@ -456,7 +573,7 @@ pub(super) fn served_target_policy(
     }
     // A target outside the docroot has no .htaccess chain: dispatch()'s
     // enforce_target skips it the same way.
-    let checked = opened_target_policy(state, ctx, &target)?;
+    let checked = opened_target_policy(state, ctx, request, &target)?;
     Some(ServedTargetPolicy {
         protected: checked.protected,
         denied: checked.denied,
@@ -484,7 +601,12 @@ struct CheckedTarget {
     until: std::time::Instant,
 }
 
-fn opened_target_policy(state: &ServerState, ctx: &ReqCtx, target: &Path) -> Option<CheckedTarget> {
+fn opened_target_policy(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    request: ResourceRequest<'_>,
+    target: &Path,
+) -> Option<CheckedTarget> {
     let rel = relative_to_doc_root(ctx, target)?;
     let resource = format!("/{}", rel.to_string_lossy());
     let (entries, until) = state.rewrite_cache.load_chain_with_dirs_and_deadline(
@@ -493,9 +615,16 @@ fn opened_target_policy(state: &ServerState, ctx: &ReqCtx, target: &Path) -> Opt
         ctx.vhost.access_file_name_or_default(),
     );
     let chain: Vec<_> = entries.into_iter().map(|(_, ht)| ht).collect();
-    let denied = access_denied(&chain, &resource, "GET", ctx);
+    // A failed env phase bridges: dispatch() renders its 500.
+    let (denied, env_failed) = match chain_access_ctx(state, ctx, &chain, request, &resource) {
+        Ok(access_ctx) => (
+            access_denied(&chain, &resource, request.method, &access_ctx),
+            false,
+        ),
+        Err(_) => (false, true),
+    };
     Some(CheckedTarget {
-        protected: denied || chain.iter().any(|ht| ht.has_auth()),
+        protected: denied || env_failed || chain.iter().any(|ht| ht.has_auth()),
         denied,
         memo_ok: chain.iter().all(|ht| ht.memo.eligible),
         until,
@@ -507,6 +636,7 @@ fn opened_target_policy(state: &ServerState, ctx: &ReqCtx, target: &Path) -> Opt
 pub(super) fn resolved_target_has_auth(
     state: &ServerState,
     ctx: &ReqCtx,
+    request: ResourceRequest<'_>,
     path: &str,
     target: &Path,
 ) -> bool {
@@ -518,7 +648,7 @@ pub(super) fn resolved_target_has_auth(
         // first), so only an aliased target needs its own chain load. This keeps the
         // load off every front-controller cache hit (`/threads/..` -> `/index.php`).
         && target != ctx.vhost.doc_root.join(path.trim_start_matches('/'))
-        && opened_target_policy(state, ctx, target).is_some_and(|checked| checked.protected)
+        && opened_target_policy(state, ctx, request, target).is_some_and(|checked| checked.protected)
 }
 
 /// Prefer the opened inode over a lexical target hint for the final backstop.
@@ -548,7 +678,7 @@ pub(super) fn served_target(response: &Response) -> Option<PathBuf> {
 pub(super) async fn enforce_mapped_resources(
     state: &ServerState,
     ctx: &mut ReqCtx,
-    headers: &http::HeaderMap,
+    request: ResourceRequest<'_>,
     original: &str,
     path: &str,
     chain: &[Arc<Htaccess>],
@@ -569,7 +699,7 @@ pub(super) async fn enforce_mapped_resources(
         last.resource(
             state,
             ctx,
-            headers,
+            request,
             &resolved_rel_path(path),
             original,
             authenticated,
@@ -577,10 +707,10 @@ pub(super) async fn enforce_mapped_resources(
         .await?;
     }
     if let Some(script) = script {
-        last.target(state, ctx, headers, script, original, authenticated)
+        last.target(state, ctx, request, script, original, authenticated)
             .await?;
         if let Some(target) = pinned_script.filter(|target| *target != script) {
-            last.target(state, ctx, headers, target, original, authenticated)
+            last.target(state, ctx, request, target, original, authenticated)
                 .await?;
         }
         return Ok(());
@@ -592,10 +722,10 @@ pub(super) async fn enforce_mapped_resources(
         return Ok(());
     }
     for (resource, target) in static_candidates(state, ctx, path, chain) {
-        last.resource(state, ctx, headers, &resource, original, authenticated)
+        last.resource(state, ctx, request, &resource, original, authenticated)
             .await?;
         if let Ok(resolved) = opened_target_path(&target) {
-            last.target(state, ctx, headers, &resolved, original, authenticated)
+            last.target(state, ctx, request, &resolved, original, authenticated)
                 .await?;
         }
     }
@@ -605,30 +735,76 @@ pub(super) async fn enforce_mapped_resources(
 #[cfg(test)]
 mod admission_tests {
     use super::*;
+    fn ip(text: &str) -> std::net::IpAddr {
+        text.parse().unwrap()
+    }
+
     #[test]
-    fn auth_rate_is_bounded_and_canonical() {
+    fn auth_attempts_are_charged_before_verification_and_refunded_on_success() {
         let mut rate = AuthRate::default();
         let now = std::time::Instant::now();
-        for _ in 0..32 {
-            assert!(rate.allow("192.0.2.1".parse().unwrap(), now));
+        let client = ip("192.0.2.1");
+        for _ in 0..AUTH_PENDING_PER_CLIENT {
+            assert!(rate.admit(client, now).is_some());
         }
-        assert!(!rate.allow("::ffff:192.0.2.1".parse().unwrap(), now));
-        assert!(rate.allow(
-            "192.0.2.1".parse().unwrap(),
-            now + std::time::Duration::from_secs(1)
-        ));
-        for n in 1..=1024u32 {
-            let _ = rate.allow(
-                std::net::IpAddr::V4(n.into()),
-                now + std::time::Duration::from_secs(1),
-            );
+        assert!(
+            rate.admit(client, now).is_none(),
+            "in-flight attempts count before any hash completes"
+        );
+        for _ in 0..AUTH_PENDING_PER_CLIENT {
+            rate.finish(client, false);
         }
-        assert!(rate.clients.len() <= 1024);
-        assert!(!rate.allow(
-            "198.51.100.1".parse().unwrap(),
-            now + std::time::Duration::from_secs(1)
-        ));
+        // Failures stay charged, and the IPv4-mapped form is the same client.
+        for _ in AUTH_PENDING_PER_CLIENT..AUTH_RATE_ATTEMPTS {
+            assert!(rate.admit(ip("::ffff:192.0.2.1"), now).is_some());
+            rate.finish(ip("::ffff:192.0.2.1"), false);
+        }
+        assert!(rate.admit(client, now).is_none());
+        let user = ip("192.0.2.2");
+        for _ in 0..4 * AUTH_RATE_ATTEMPTS {
+            assert!(rate.admit(user, now).is_some(), "successes are refunded");
+            rate.finish(user, true);
+        }
+        assert!(rate.admit(client, now + AUTH_RATE_WINDOW).is_some());
     }
+
+    #[test]
+    fn a_full_auth_table_does_not_lock_out_new_clients() {
+        let mut rate = AuthRate::default();
+        let now = std::time::Instant::now();
+        for n in 1..=AUTH_RATE_CLIENTS as u32 {
+            let client = std::net::IpAddr::V4(n.into());
+            for _ in 0..AUTH_RATE_ATTEMPTS {
+                assert!(rate.admit(client, now).is_some());
+                rate.finish(client, false);
+            }
+        }
+        assert_eq!(rate.clients.len(), AUTH_RATE_CLIENTS);
+        assert!(rate.admit(ip("198.51.100.1"), now).is_some());
+        assert!(rate.clients.len() <= AUTH_RATE_CLIENTS);
+        let tracked = *rate
+            .clients
+            .keys()
+            .find(|tracked| **tracked != ip("198.51.100.1"))
+            .unwrap();
+        assert!(
+            rate.admit(tracked, now).is_none(),
+            "a blocked client stays blocked"
+        );
+    }
+
+    #[test]
+    fn one_client_verifies_one_credential_at_a_time() {
+        let mut rate = AuthRate::default();
+        let now = std::time::Instant::now();
+        let first = rate.admit(ip("192.0.2.1"), now).unwrap();
+        let second = rate.admit(ip("::ffff:192.0.2.1"), now).unwrap();
+        let other = rate.admit(ip("192.0.2.9"), now).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(first.available_permits(), 1);
+    }
+
     #[tokio::test]
     async fn cancelled_verification_retains_its_work_reservation() {
         let work = Arc::new(tokio::sync::Semaphore::new(1));

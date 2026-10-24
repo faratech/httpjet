@@ -5,12 +5,12 @@
 //! anything else is closed (fail-closed). A PROXY command's source address overrides
 //! the TCP peer for client-IP resolution, ACLs, and logs; LOCAL/UNKNOWN retain it.
 //!
-//! Security: the listener opt-in IS the trust decision (nginx/HAProxy semantics) —
-//! there is no per-peer list at accept time, so enabling it on a listener reachable
-//! by untrusted clients lets them forge their client address. `check` warns when a
-//! pp-enabled listener binds a wildcard/public address. (OLS models the equivalent
-//! server-level `<proxyProtocol>` as a peer allow-list; httpjet's per-listener form
-//! is deliberate — the flag scopes to exactly one accept path.)
+//! Security: the listener opt-in is necessary but not sufficient. Config validation
+//! requires a non-empty `<proxyProtocolPeers>` allow-list on every pp-enabled
+//! listener, and the accept path closes any connection whose real TCP sender is
+//! not on that list BEFORE a header byte is read, so only those load balancers can
+//! assert a client address. `check` still warns when a pp-enabled listener binds a
+//! wildcard/public address: firewalling it to the listed peers is defense in depth.
 //!
 //! One claim is refused outright: a source that is loopback or unspecified
 //! (127/8, ::1, 0.0.0.0, ::, and v4-mapped forms). Those addresses are how the
@@ -26,28 +26,40 @@ pub use super::proxy_protocol_wire::*;
 
 /// (Tier 1.2 accept-path wiring) Async reader: strips the PROXY header from the
 /// start of a monoio TcpStream and returns the overridden source address.
-/// Reads byte-by-byte (or in exact chunks) to avoid over-reading into TLS data.
-/// Fail-closed: if the header is absent/malformed on a pp-enabled listener,
-/// returns `None` (the caller closes the connection).
+/// Every read asks for at most the bytes the header still owes (exact-size reads
+/// for v2, single bytes for the newline-terminated v1 line), so it never consumes
+/// TLS/HTTP data. Fail-closed: if the header is absent/malformed on a pp-enabled
+/// listener, returns `None` (the caller closes the connection).
 pub(crate) mod reader {
     use super::*;
+    use monoio::buf::IoBufMut;
     use monoio::io::AsyncReadRent;
 
-    /// Read exactly `n` bytes from the stream. Returns the buffer.
-    async fn read_exact<S: AsyncReadRent>(stream: &mut S, n: usize) -> std::io::Result<Vec<u8>> {
-        let mut buf = Vec::with_capacity(n);
-        let mut tmp = vec![0u8; 1];
-        while buf.len() < n {
-            let (res, t) = stream.read(tmp).await;
-            tmp = t;
-            let read_len = res?;
-            if read_len == 0 {
+    /// Buffer growth step for the v2 remainder: memory tracks the bytes that
+    /// have actually arrived rather than the peer's declared u16 length.
+    const V2_READ_CHUNK: usize = 16 * 1024;
+
+    /// Append bytes to `buf` until it holds exactly `total`. Each read targets
+    /// only the unfilled `[len, min(len + chunk, total))` window.
+    async fn read_to<S: AsyncReadRent>(
+        stream: &mut S,
+        mut buf: Vec<u8>,
+        total: usize,
+    ) -> std::io::Result<Vec<u8>> {
+        while buf.len() < total {
+            let filled = buf.len();
+            let want = (total - filled).min(V2_READ_CHUNK);
+            if buf.capacity() - filled < want {
+                buf.reserve_exact(want);
+            }
+            let (res, slice) = stream.read(buf.slice_mut(filled..filled + want)).await;
+            buf = slice.into_inner();
+            if res? == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "connection closed during PROXY header",
                 ));
             }
-            buf.extend_from_slice(&tmp[..read_len]);
         }
         Ok(buf)
     }
@@ -79,28 +91,27 @@ pub(crate) mod reader {
     ) -> std::io::Result<Option<ProxyHeader>> {
         // Twelve bytes distinguish the binary v2 signature from the text v1
         // prefix without over-reading the minimal 15-byte `PROXY UNKNOWN\r\n`.
-        let prefix = read_exact(stream, V2_SIGNATURE.len()).await?;
+        let prefix = read_to(stream, Vec::new(), V2_SIGNATURE.len()).await?;
         if prefix == V2_SIGNATURE {
-            let fixed_tail = read_exact(stream, V2_HEADER_LEN - V2_SIGNATURE.len()).await?;
-            let mut header = prefix;
-            header.extend_from_slice(&fixed_tail);
-            // v2 binary: read the variable-length address block.
+            let header = read_to(stream, prefix, V2_HEADER_LEN).await?;
+            // v2 binary: the fixed header declares the variable-length remainder.
             let len = u16::from_be_bytes([header[14], header[15]]) as usize;
-            let addr = read_exact(stream, len).await?;
-            let mut full = header;
-            full.extend_from_slice(&addr);
+            let full = read_to(stream, header, V2_HEADER_LEN + len).await?;
             Ok(parse_v2(&full))
         } else if prefix.starts_with(b"PROXY ") {
-            // Possibly v1 text: read until \n (max V1_MAX_LINE bytes total).
+            // Possibly v1 text: read until \n (max V1_MAX_LINE bytes total). The
+            // line has no length prefix, so one byte per read is the only way to
+            // stop exactly at its end.
             let mut line = prefix;
+            line.reserve_exact(V1_MAX_LINE - line.len());
             while line.len() < V1_MAX_LINE {
-                let (res, t) = stream.read(vec![0u8; 1]).await;
+                let filled = line.len();
+                let (res, slice) = stream.read(line.slice_mut(filled..filled + 1)).await;
+                line = slice.into_inner();
                 if res? == 0 {
                     break;
                 }
-                let byte = t[0];
-                line.push(byte);
-                if byte == b'\n' {
+                if line[filled] == b'\n' {
                     break;
                 }
             }
@@ -220,6 +231,91 @@ mod accept_tests {
         assert_eq!(h.src, None);
         assert!(peer.ip().is_loopback());
         assert_eq!(rest, tls_prefix);
+    }
+
+    /// Serves `data` in reads of at most `max_read` bytes and counts them.
+    struct CountingReader<'a> {
+        data: &'a [u8],
+        max_read: usize,
+        reads: usize,
+    }
+
+    impl AsyncReadRent for CountingReader<'_> {
+        fn read<T: monoio::buf::IoBufMut>(
+            &mut self,
+            mut buf: T,
+        ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
+            self.reads += 1;
+            let amt = self.data.len().min(self.max_read).min(buf.bytes_total());
+            // SAFETY: `write_ptr` is valid for `bytes_total()` writable bytes and
+            // `amt` never exceeds that; `set_init` then covers exactly those bytes.
+            unsafe {
+                buf.write_ptr()
+                    .copy_from_nonoverlapping(self.data.as_ptr(), amt);
+                buf.set_init(amt);
+            }
+            self.data = &self.data[amt..];
+            std::future::ready((Ok(amt), buf))
+        }
+
+        fn readv<T: monoio::buf::IoVecBufMut>(
+            &mut self,
+            buf: T,
+        ) -> impl std::future::Future<Output = monoio::BufResult<usize, T>> {
+            std::future::ready((Ok(0), buf))
+        }
+    }
+
+    fn strip_counted(payload: &[u8], max_read: usize) -> (Option<ProxyHeader>, usize, Vec<u8>) {
+        let mut rt = build_core_runtime().unwrap();
+        rt.block_on(async {
+            let mut reader = CountingReader {
+                data: payload,
+                max_read,
+                reads: 0,
+            };
+            let stripped = read_and_strip(&mut reader, None).await.unwrap();
+            (stripped, reader.reads, reader.data.to_vec())
+        })
+    }
+
+    #[test]
+    fn v2_max_length_remainder_is_read_in_bulk_without_over_read() {
+        let tls_prefix = [0x16, 0x03, 0x03, 0x00, 0x01];
+        let mut local = v2_header(u16::MAX, 0x00);
+        local[12] = 0x20;
+        local.resize(V2_HEADER_LEN + usize::from(u16::MAX), 0xab);
+        let header_len = local.len();
+        local.extend_from_slice(&tls_prefix);
+
+        let (stripped, reads, rest) = strip_counted(&local, usize::MAX);
+        let h = stripped.expect("max-length LOCAL header stripped");
+        assert_eq!(h.consumed, header_len);
+        assert_eq!(
+            rest, tls_prefix,
+            "bytes past the declared length stay unread"
+        );
+        assert!(
+            reads <= 8,
+            "a 64 KiB remainder must not cost one read per byte (took {reads} reads)"
+        );
+
+        let (stripped, reads, rest) = strip_counted(&local, 1000);
+        assert_eq!(stripped.expect("fragmented header").consumed, header_len);
+        assert_eq!(rest, tls_prefix);
+        assert!(reads <= header_len / 1000 + 8, "took {reads} reads");
+    }
+
+    #[test]
+    fn v1_line_stops_at_its_newline_under_bulk_delivery() {
+        let line = b"PROXY TCP4 198.51.100.22 10.0.0.1 5678 80\r\n";
+        let request = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let mut payload = line.to_vec();
+        payload.extend_from_slice(request);
+
+        let (stripped, _reads, rest) = strip_counted(&payload, usize::MAX);
+        assert_eq!(stripped.expect("v1 header stripped").consumed, line.len());
+        assert_eq!(rest, request);
     }
 
     #[test]

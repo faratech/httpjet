@@ -69,6 +69,9 @@ pub struct PoolStats {
     pub inline_tail_drains: u64,
     /// Response bodies streamed through the body pump.
     pub streamed_bodies: u64,
+    /// Requests refused because their body held bytes lsphp could parse as a
+    /// new BEGIN_REQUEST if the script left them unread.
+    pub embedded_begin_rejects: u64,
 }
 
 /// How the handler delivered a response body, for [`PoolStats`].
@@ -97,6 +100,7 @@ struct PoolCounters {
     inline_bodies: AtomicU64,
     inline_tail_drains: AtomicU64,
     streamed_bodies: AtomicU64,
+    embedded_begin_rejects: AtomicU64,
 }
 
 impl PoolCounters {
@@ -115,6 +119,7 @@ impl PoolCounters {
             inline_bodies: self.inline_bodies.load(Ordering::Relaxed),
             inline_tail_drains: self.inline_tail_drains.load(Ordering::Relaxed),
             streamed_bodies: self.streamed_bodies.load(Ordering::Relaxed),
+            embedded_begin_rejects: self.embedded_begin_rejects.load(Ordering::Relaxed),
         }
     }
 }
@@ -1154,6 +1159,11 @@ impl LsapiPool {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A request body was refused before any of it reached lsphp.
+    pub(crate) fn note_embedded_begin(&self) {
+        note_embedded_begin(&self.counters);
+    }
+
     /// Connections checked out right now (held semaphore permits).
     pub fn inflight(&self) -> u64 {
         self.max_conns.saturating_sub(self.sem.available_permits()) as u64
@@ -1727,6 +1737,7 @@ impl PooledConn {
             external_generation: self.external_generation.clone(),
             counters: self.counters.clone(),
             acquire_gen: self.acquire_gen,
+            embedded_begin: AtomicBool::new(false),
             _permit: Some(permit),
         };
         (read, write, guard)
@@ -1781,6 +1792,9 @@ pub struct ReturnGuard {
     counters: Arc<PoolCounters>,
     /// Generation snapshotted at acquire; re-pool is refused if it advances.
     acquire_gen: u64,
+    /// Set by the body writer when it stopped short of an embedded
+    /// BEGIN_REQUEST; the response side then fails the request.
+    embedded_begin: AtomicBool,
     // `Option` so we can move the permit out in Drop (it is released by drop).
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -1833,8 +1847,9 @@ impl ReturnGuard {
     /// partially leaves client bytes that lsphp parses as the next BEGIN_REQUEST
     /// right after RESP_END. That read dequeues them, so an unsent-bytes check
     /// cannot see it, and the smuggled request's response would reach whichever
-    /// request reuses the socket. Closing it bounds the smuggled response to a
-    /// socket nobody reads; it cannot stop lsphp from executing it.
+    /// request reuses the socket. The handler refuses a body that holds such a
+    /// request (`ScannedBodyWriter`); closing the socket also bounds any
+    /// response lsphp writes after RESP_END to a socket nobody reads.
     pub fn mark_carried_body(&self) {
         self.slot.lock().carried_body = true;
     }
@@ -1845,6 +1860,28 @@ impl ReturnGuard {
     pub fn mark_preread_body(&self) {
         self.slot.lock().preread_body = true;
     }
+
+    /// The body writer stopped before bytes lsphp could parse as a new request:
+    /// the connection is dropped and the request must fail.
+    pub(crate) fn block_embedded_begin(&self) {
+        self.embedded_begin.store(true, Ordering::Release);
+        self.poison();
+        note_embedded_begin(&self.counters);
+    }
+
+    pub(crate) fn embedded_begin_blocked(&self) -> bool {
+        self.embedded_begin.load(Ordering::Acquire)
+    }
+}
+
+fn note_embedded_begin(counters: &PoolCounters) {
+    counters
+        .embedded_begin_rejects
+        .fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        target: "hj_lsapi",
+        "request body holds an LSAPI BEGIN_REQUEST lsphp could execute; request refused"
+    );
 }
 
 /// Bytes this end wrote that the peer has not dequeued yet, or `None` when the

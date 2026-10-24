@@ -1811,16 +1811,21 @@ async fn materialize_multipart(
     Some((Body::Full(body), wire_len))
 }
 
-/// A per-response multipart boundary: entropy comes from the clock plus this
-/// response's stack address; uniqueness only has to hold long enough for one
-/// client to parse one response, so a collision is harmless, not a bug.
+/// A per-response multipart boundary: a counter keyed through SipHash with a
+/// per-process key from the OS, so it reveals nothing about the process and
+/// cannot be predicted.
 fn multipart_boundary() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let addr = &nanos as *const _ as usize;
-    format!("{nanos:016x}{addr:08x}")
+    use std::hash::BuildHasher;
+    static KEY: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = KEY.get_or_init(std::collections::hash_map::RandomState::new);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{:016x}{:016x}",
+        key.hash_one((n, 0u8)),
+        key.hash_one((n, 1u8))
+    )
 }
 
 /// Parse a `Range` header value against a known entity length (single-range

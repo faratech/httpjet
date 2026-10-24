@@ -1016,6 +1016,7 @@ fn apply_rule(
             target_url: target,
             proxy_host,
             env: state.env_vec(),
+            authority_substituted: !no_subst && super::proxy_authority_substituted(&rule.subst),
         }));
     }
 

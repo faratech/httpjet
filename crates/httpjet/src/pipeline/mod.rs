@@ -47,7 +47,7 @@ mod response_util;
 mod rewrite_differential;
 mod rewrite_glue;
 mod scoped_auth;
-pub(crate) use scoped_auth::set_auth_user_file_roots;
+pub(crate) use scoped_auth::{AuthLimiter, set_auth_user_file_roots};
 mod suffix_routing;
 
 pub(crate) use rewrite_glue::{DEFAULT_REWRITE_OUTCOME_TTL, RewriteOutcomeCache, UaClassifyCache};
@@ -55,8 +55,8 @@ pub(crate) use rewrite_glue::{DEFAULT_REWRITE_OUTCOME_TTL, RewriteOutcomeCache, 
 pub(crate) use rewrite_glue::{page_cache_header_vary, page_cache_ua_class};
 
 use htaccess_apply::{
-    access_denied, access_deny_dir, apply_response_headers_for_request, apply_set_env_scoped,
-    seed_server_env,
+    access_denied, access_deny_dir, apply_response_headers_for_request,
+    apply_set_env_iter_with_headers, apply_set_env_scoped, seed_server_env,
 };
 pub(crate) use proxy_glue::UPGRADE_HALF_CLOSE_DRAIN;
 use proxy_glue::{ProxyHandler, matching_proxy_context, proxy_websocket, resolve_proxy_target};
@@ -236,7 +236,7 @@ pub(crate) async fn fast_serve(
     local_addr: std::net::SocketAddr,
     peer_port: u16,
     is_tls: bool,
-    mtls_required: bool,
+    client_auth_requested: bool,
     peer_unix: bool,
     proto: Proto,
     tls: Option<hj_core::TlsParams>,
@@ -333,7 +333,7 @@ pub(crate) async fn fast_serve(
         is_tls: effective_https,
         peer_unix,
         protocol: proto,
-        forwarding_trusted: forwarding_trusted(trusted_proxy, mtls_required, tls.as_ref()),
+        forwarding_trusted: forwarding_trusted(trusted_proxy, client_auth_requested, tls.as_ref()),
         trusted_proxy,
         env: Vec::with_capacity(8),
         local_addr,
@@ -386,7 +386,7 @@ pub(crate) async fn fast_serve(
                 .unwrap_or(b""),
         };
         if let Some(mut resp) = fast_memo::probe(&mk, req, &state.ua_classify, req_start) {
-            let mtls_ok = mtls_ok(mtls_required, is_tls, ctx.tls.as_ref());
+            let mtls_ok = mtls_ok(client_auth_requested, is_tls, ctx.tls.as_ref());
             ctx.client_ip = state.acl.resolve_client_ip(
                 peer_ip,
                 req.headers(),
@@ -529,17 +529,16 @@ pub(crate) async fn fast_serve(
         && chain_with_dirs
             .iter()
             .all(|(_, ht)| ht.memo.eligible && ht.rules.path_cacheable);
-    // (Tier 2) sub_filter paths are memo-ineligible: the memo stores
-    // POST-transform bytes and a memo hit re-runs the transforms, which would
-    // substitute twice whenever a replacement contains its own search string.
-    let mut memo_store_ok =
-        memo_eligible_req && memo_chain_ok && !sub_filter_matches(&ctx, &orig_path);
+    // The memo stores the FINAL post-transform response and replays it directly,
+    // so deterministic sub_filter output is safe to memoize. Page-cache bypass
+    // remains separate because page-cache hits do re-enter response transforms.
+    let mut memo_store_ok = memo_eligible_req && memo_chain_ok;
     // (B5) Resolve the REAL client IP before any IP-sensitive access decision (a
     // `SetEnvIf Remote_Addr …` feeding a `Require`, or an `accessDenyDir`) so the on-core
     // path judges the SAME identity the tokio `handle()` path does — not the raw socket
     // peer (the Cloudflare edge IP). Mirrors `record_fast_serve` / `handle()`; honors
     // the mtls-ok-vs-real-IP invariant (no client cert required under a non-mTLS vhost).
-    let mtls_ok = mtls_ok(mtls_required, is_tls, ctx.tls.as_ref());
+    let mtls_ok = mtls_ok(client_auth_requested, is_tls, ctx.tls.as_ref());
     ctx.client_ip = state.acl.resolve_client_ip(
         peer_ip,
         req.headers(),
@@ -599,6 +598,7 @@ pub(crate) async fn fast_serve(
         return bridge(state, FastBridge::RewriteCrossDir);
     }
     let cache_vary_env;
+    let mut rewritten_query = None;
     let (cache_path, cache_rel, rewrite_unchanged): (Cow<'_, str>, Cow<'_, str>, bool) = match rw {
         RwResult::Unchanged { env } => {
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
@@ -608,13 +608,14 @@ pub(crate) async fn fast_serve(
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
             (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), false)
         }
-        RwResult::Rewritten { path, env, .. } => {
+        RwResult::Rewritten { path, query, env } => {
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
             // A rewrite INTO a non-ancestor directory makes dispatch() reload the
             // destination chain (#8); the on-core path bridges instead of guessing.
             if !url_parent_dir(&orig_path).starts_with(url_parent_dir(&path)) {
                 return bridge(state, FastBridge::RewriteNewDir);
             }
+            rewritten_query = Some(query.unwrap_or_default());
             let rel = resolved_rel_path(&path);
             (Cow::Owned(path), Cow::Owned(rel), false)
         }
@@ -664,7 +665,13 @@ pub(crate) async fn fast_serve(
 
     // A symlinked target's own chain may deny by env or client IP, so it is judged
     // only once both are final (SetEnvIf AND the rewrite's [E=] env, #747), exactly as dispatch()'s target enforcer sees them.
-    let target_policy = scoped_auth::target_policy(state, &ctx, &orig_path, &chain);
+    let target_policy = scoped_auth::target_policy(
+        state,
+        &ctx,
+        ResourceRequest::new(req, &orig_query),
+        &orig_path,
+        &chain,
+    );
     if let Some(deadline) = target_policy.deadline {
         policy_deadline = policy_deadline.min(deadline);
     }
@@ -681,7 +688,7 @@ pub(crate) async fn fast_serve(
             &chain,
             &cache_path,
             &cache_rel,
-            method.as_str(),
+            ResourceRequest::new(req, rewritten_query.as_deref().unwrap_or(&orig_query)),
             *cache_path != *orig_path,
             target_policy.script.as_ref(),
         ) {
@@ -833,6 +840,7 @@ pub(crate) async fn fast_serve(
             scoped_auth::served_target_policy(
                 state,
                 &ctx,
+                ResourceRequest::new(req, &orig_query),
                 &orig_path,
                 &target_policy.targets,
                 &resp,
@@ -1127,10 +1135,11 @@ fn fast_post_rewrite_bridges(
     chain: &[Arc<Htaccess>],
     cur_path: &str,
     cur_rel: &str,
-    method: &str,
+    request: ResourceRequest<'_>,
     rewritten: bool,
     opened: Option<&scoped_auth::OpenedScript>,
 ) -> bool {
+    let method = request.method;
     if access_denied(chain, cur_path, method, ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, cur_rel)
     {
@@ -1158,7 +1167,7 @@ fn fast_post_rewrite_bridges(
     // original chain says nothing about a symlinked or context-aliased target.
     if rewritten
         && script_split.is_none()
-        && scoped_auth::target_has_auth(state, ctx, cur_path, chain).0
+        && scoped_auth::target_has_auth(state, ctx, request, cur_path, chain).0
     {
         return true;
     }
@@ -1177,7 +1186,9 @@ fn fast_post_rewrite_bridges(
         let Some(target) = target else {
             return true;
         };
-        if rewritten && scoped_auth::resolved_target_has_auth(state, ctx, cur_path, &target) {
+        if rewritten
+            && scoped_auth::resolved_target_has_auth(state, ctx, request, cur_path, &target)
+        {
             return true;
         }
         if let Ok(rel) = script_abs.strip_prefix(&ctx.vhost.doc_root) {
@@ -1437,7 +1448,7 @@ pub fn handle<'a>(
     peer_port: u16,
     is_tls: bool,
     peer_unix: bool,
-    mtls_required: bool,
+    client_auth_requested: bool,
     tls: Option<hj_core::TlsParams>,
     proto: Proto,
     sni: Option<&'a str>,
@@ -1451,7 +1462,7 @@ pub fn handle<'a>(
         peer_port,
         is_tls,
         peer_unix,
-        mtls_required,
+        client_auth_requested,
         tls,
         proto,
         sni,
@@ -1469,7 +1480,7 @@ pub async fn handle(
     peer_port: u16,
     is_tls: bool,
     peer_unix: bool,
-    mtls_required: bool,
+    client_auth_requested: bool,
     tls: Option<hj_core::TlsParams>,
     proto: Proto,
     sni: Option<&str>,
@@ -1498,7 +1509,7 @@ pub async fn handle(
             peer_port,
             is_tls,
             peer_unix,
-            mtls_required,
+            client_auth_requested,
             tls,
             proto,
             sni,
@@ -1520,7 +1531,7 @@ pub async fn handle(
         peer_port,
         is_tls,
         peer_unix,
-        mtls_required,
+        client_auth_requested,
         tls,
         proto,
         sni,
@@ -1537,7 +1548,7 @@ async fn handle_inner(
     peer_port: u16,
     is_tls: bool,
     peer_unix: bool,
-    mtls_required: bool,
+    client_auth_requested: bool,
     tls: Option<hj_core::TlsParams>,
     proto: Proto,
     sni: Option<&str>,
@@ -1605,19 +1616,7 @@ async fn handle_inner(
         }
     }
 
-    // Routing key precedence: the request's own authority is authoritative (RFC 9110 §7.4 /
-    // RFC 9113 §8.3.1) — the Host header first, then the URI authority (h2/h3 `:authority`,
-    // which hj-h2/h3 already surface as a Host header), with the TLS SNI only as a fallback
-    // for a request that carries no host at all. For CF-fronted traffic SNI and Host are
-    // identical; this just makes Host authoritative for routing, as HTTP requires (and stops
-    // an SNI/Host mismatch from resolving the wrong vhost).
-    let route_key: Option<String> = req
-        .headers()
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_owned)
-        .or_else(|| req.uri().authority().map(|a| a.host().to_string()))
-        .or_else(|| sni.map(|s| s.to_string()));
+    let route_key = request_route_key(&req, sni);
 
     let resolved = match state.router.resolve(listener, route_key.as_deref()) {
         Some(r) => r,
@@ -1672,69 +1671,23 @@ async fn handle_inner(
     let trusted_proxy = state.acl.is_trusted(peer_ip);
     let effective_https = effective_request_https(is_tls, trusted_proxy, req.headers());
 
-    if mtls_gate_redirects(
-        effective_https,
-        state.mtls_required_vhosts.contains(&resolved.name),
+    match mtls_gate(
+        &state,
+        proto,
         peer_ip,
+        effective_https,
+        route_key.as_deref(),
+        &resolved.name,
+        &req,
+        req_start,
+        false,
     ) {
-        let host = route_key
-            .as_deref()
-            .map(hj_core::host_without_port)
-            .unwrap_or_else(|| resolved.name.clone());
-        if let Some(target) = mtls_https_redirect_target(&host, req.uri().path(), req.uri().query())
-        {
-            // (#13) Route the mTLS 301 through the common funnel instead of a bare
-            // early return: a cleartext proxy / ISP transparent cache between the
-            // client and origin could otherwise cache this HTTP→HTTPS 301 (it carries
-            // no Cache-Control), and :80 probe traffic would be invisible. Apply
-            // deny_redirect_cdn_caching (private, no-store), count it in requests_total,
-            // and access-log it. client_ip is unresolved here (the request is bounced
-            // before trust resolution), so log peer_ip — the literal source of the
-            // probe, which is what an operator wants to see for these.
-            let mut resp = redirect(301, &target);
-            deny_redirect_cdn_caching(&mut resp);
-            state
-                .metrics
-                .requests_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(log) = &state.access_log {
-                let log_uri = match req.uri().query() {
-                    Some(q) => format!("{}?{}", req.uri().path(), q),
-                    None => req.uri().path().to_string(),
-                };
-                let record = hj_log::AccessRecord {
-                    client_ip: peer_ip,
-                    ts: std::time::SystemTime::now(),
-                    method: method_static(req.method()),
-                    uri: log_uri,
-                    protocol: proto.as_str(),
-                    status: resp.status().as_u16(),
-                    bytes: 0, // filled with the REAL bytes by log_access
-                    referer: header_bytes(&req, http::header::REFERER),
-                    user_agent: header_bytes(&req, http::header::USER_AGENT),
-                    host: header_bytes(&req, http::header::HOST),
-                    remote_user: None,
-                    // No `ctx` yet (bounced before trust resolution): mint a fresh id so
-                    // even a :80 mTLS-bounce probe is joinable across the logs.
-                    request_id: Some(hj_core::reqid::next().to_string()),
-                    peer_unix: false,
-                };
-                resp = log_access(log, resp, record, None);
-            }
-            // Mirror the main response funnel (see below): record this 301 in the
-            // per-protocol/status/latency telemetry too, not just `requests_total`
-            // — otherwise the :80 mTLS-bounce probes are invisible to the metrics
-            // endpoint despite being counted and access-logged.
-            state.telemetry.record_request(
-                proto,
-                resp.status().as_u16(),
-                req_start.elapsed(),
-                state.telemetry.vhost_idx(&resolved.name),
-            );
-            return resp;
-        }
+        MtlsGate::Pass => {}
+        MtlsGate::Redirect(resp) => return resp,
         // The cleartext ACME exemption serves a token file and nothing else.
-        req.extensions_mut().insert(AcmePlaintextOnly);
+        MtlsGate::AcmePlaintextOnly => {
+            req.extensions_mut().insert(AcmePlaintextOnly);
+        }
     }
 
     // ---- Access control + trusted-proxy client IP ------------------------
@@ -1747,8 +1700,8 @@ async fn handle_inner(
     // network boundary, so any completed TLS connection counts (the pre-#16 behavior).
     // Requiring a cert UNCONDITIONALLY made mtls_ok false for 100% of --no-mtls traffic, silently
     // disabling CF-Connecting-IP real-IP resolution (every visitor resolved to the CF edge IP).
-    let mtls_ok = mtls_ok(mtls_required, is_tls, tls.as_ref());
-    let forwarding_trusted = forwarding_trusted(trusted_proxy, mtls_required, tls.as_ref());
+    let mtls_ok = mtls_ok(client_auth_requested, is_tls, tls.as_ref());
+    let forwarding_trusted = forwarding_trusted(trusted_proxy, client_auth_requested, tls.as_ref());
     let client_ip = state.acl.resolve_client_ip(
         peer_ip,
         req.headers(),
@@ -1982,6 +1935,11 @@ async fn handle_inner(
 /// header time — which is how Apache/LiteSpeed already behave. Returns the response
 /// (body rewrapped in the streaming case).
 const ACCESS_CHUNK_FLUSH_BYTES: usize = 16 * 1024;
+/// One allocation per chunk: the buffer goes to the writer on flush, so each new chunk
+/// starts from a single reservation instead of regrowing from empty. The regrowth was
+/// ~a dozen reallocs per chunk, and under `MIMALLOC_PURGE_DELAY=0` its larger steps
+/// re-faulted fresh pages on every chunk (~0.4 minor faults/request on a busy vhost).
+const ACCESS_CHUNK_CAPACITY: usize = ACCESS_CHUNK_FLUSH_BYTES + 512;
 const ACCESS_CHUNK_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct PendingChunk {
@@ -2038,13 +1996,14 @@ fn chunk_access_line(
         let mut chunks = chunks.borrow_mut();
         let entry = chunks.entry(key).or_insert_with(|| PendingChunk {
             logger: log.clone(),
-            buf: Vec::with_capacity(ACCESS_CHUNK_FLUSH_BYTES + 512),
+            buf: Vec::new(),
             lines: 0,
             first: std::time::Instant::now(),
         });
         let started = entry.lines == 0;
         if started {
             entry.first = std::time::Instant::now();
+            entry.buf.reserve_exact(ACCESS_CHUNK_CAPACITY);
         }
         render(&mut entry.buf, log.format());
         entry.lines += 1;
@@ -2159,10 +2118,8 @@ fn stamp_sub_filter(ctx: &ReqCtx, path: &str, resp: &mut Response) {
 }
 
 /// Does ANY enabled context with active sub_filter rules match this path?
-/// Gates the fast-memo store and the page cache: the memo stores POST-transform
-/// bytes that a memo hit would re-filter (non-idempotent when a replacement
-/// contains its search string), and the page-cache hot path must not serve
-/// entries the transform vec would have to filter inconsistently.
+/// Gates the decoded-path work and page-cache bypass: page-cache hits re-enter
+/// response transforms and must never receive already-filtered stored bytes.
 fn has_sub_filter_context(vhost: &hj_core::config::VHostConfig) -> bool {
     vhost
         .contexts
@@ -2219,20 +2176,26 @@ impl hj_core::ResponseTransform for SubFilterTransform {
         let body = std::mem::replace(resp.body_mut(), Body::Empty);
         match body {
             Body::Full(bytes) => {
-                let filtered = apply_sub_filter(&plan, bytes);
-                finalize_filtered(resp, &plan, filtered.len());
-                *resp.body_mut() = Body::Full(filtered);
+                let filtered = (bytes.len() as u64 <= plan.max_body)
+                    .then(|| apply_sub_filter(&plan, bytes.clone()))
+                    .flatten();
+                *resp.body_mut() = Body::Full(match filtered {
+                    Some(filtered) => {
+                        finalize_filtered(resp, &plan, filtered.len());
+                        filtered
+                    }
+                    None => bytes,
+                });
             }
             Body::File(f) if f.range.is_none() && f.len <= plan.max_body => {
                 // Buffer the exact representation selected upstream. FileBody may
                 // carry cache bytes or a descriptor pinned before path replacement.
-                match selected_file_bytes(&f) {
-                    Ok(bytes) => {
-                        let filtered = apply_sub_filter(&plan, bytes);
+                match selected_file_bytes(&f).map(|bytes| apply_sub_filter(&plan, bytes)) {
+                    Ok(Some(filtered)) => {
                         finalize_filtered(resp, &plan, filtered.len());
                         *resp.body_mut() = Body::Full(filtered);
                     }
-                    Err(_) => *resp.body_mut() = Body::File(f),
+                    Ok(None) | Err(_) => *resp.body_mut() = Body::File(f),
                 }
             }
             Body::Stream(mut s) => {
@@ -2305,15 +2268,24 @@ impl hj_core::ResponseTransform for SubFilterTransform {
                         .boxed(),
                     );
                 } else {
-                    let filtered = apply_sub_filter(&plan, buf.freeze());
-                    finalize_filtered(resp, &plan, filtered.len());
+                    let raw = buf.freeze();
+                    let filtered = match apply_sub_filter(&plan, raw.clone()) {
+                        Some(filtered) => {
+                            finalize_filtered(resp, &plan, filtered.len());
+                            if !trailers.is_empty() {
+                                // HTTP/1 trailers require chunked framing: leave the
+                                // filtered length unknown to the transport.
+                                resp.headers_mut().remove(CONTENT_LENGTH);
+                            }
+                            filtered
+                        }
+                        // The output would pass the cap: replay the entity unfiltered.
+                        None => raw,
+                    };
                     if trailers.is_empty() {
                         *resp.body_mut() = Body::Full(filtered);
                     } else {
-                        // HTTP/1 trailers require chunked framing. Preserve the
-                        // original trailers after the filtered data and leave the
-                        // response length unknown to the transport.
-                        resp.headers_mut().remove(CONTENT_LENGTH);
+                        // Preserve the original trailers after the data.
                         let prefix_len = filtered.len() as u64;
                         let mut prefix = std::collections::VecDeque::new();
                         if !filtered.is_empty() {
@@ -2367,7 +2339,10 @@ fn head_sub_filter(plan: &hj_core::config::SubFilterConfig, resp: &mut Response)
     let Ok(bytes) = read_regular_file_exact(&target.0, declared) else {
         return; // the GET fails the same read and passes through unfiltered
     };
-    let filtered = apply_sub_filter(plan, bytes);
+    // Past the output cap the GET also serves the unfiltered entity.
+    let Some(filtered) = apply_sub_filter(plan, bytes) else {
+        return;
+    };
     finalize_filtered(resp, plan, filtered.len());
 }
 
@@ -2459,52 +2434,63 @@ impl http_body::Body for PrefixBody {
 }
 
 /// Apply the rules in order (all occurrences, or the first only under `once`).
-fn apply_sub_filter(plan: &hj_core::config::SubFilterConfig, body: bytes::Bytes) -> bytes::Bytes {
+/// Apply the rules in order, or `None` when an output would exceed
+/// `plan.max_body`; the caller then serves the entity unfiltered. Rules compound,
+/// so each output is checked before it is built.
+fn apply_sub_filter(
+    plan: &hj_core::config::SubFilterConfig,
+    body: bytes::Bytes,
+) -> Option<bytes::Bytes> {
     let mut bytes = body;
     for (search, replace) in &plan.rules {
         if search.is_empty() {
             continue;
         }
-        bytes = replace_bytes(bytes, search.as_bytes(), replace.as_bytes(), plan.once);
+        bytes = replace_bytes(
+            bytes,
+            search.as_bytes(),
+            replace.as_bytes(),
+            plan.once,
+            plan.max_body,
+        )?;
     }
-    bytes
+    Some(bytes)
 }
 
 /// Literal, non-overlapping byte replacement. Rules are configured as UTF-8
 /// strings, but eligible response bodies may use another charset, so bytes
-/// outside the matched tokens must pass through unchanged.
+/// outside the matched tokens must pass through unchanged. `None` when the
+/// output would exceed `max_len`.
 fn replace_bytes(
     body: bytes::Bytes,
     search: &[u8],
     replacement: &[u8],
     once: bool,
-) -> bytes::Bytes {
+    max_len: u64,
+) -> Option<bytes::Bytes> {
     if search.is_empty() {
-        return body;
+        return Some(body);
     }
-    let Some(first) = body
-        .windows(search.len())
-        .position(|window| window == search)
-    else {
-        return body;
-    };
-    let mut out = Vec::with_capacity(body.len());
-    out.extend_from_slice(&body[..first]);
-    out.extend_from_slice(replacement);
-    let mut cursor = first + search.len();
-    if !once {
-        while let Some(relative) = body[cursor..]
-            .windows(search.len())
-            .position(|window| window == search)
-        {
-            let pos = cursor + relative;
-            out.extend_from_slice(&body[cursor..pos]);
-            out.extend_from_slice(replacement);
-            cursor = pos + search.len();
-        }
+    let finder = memchr::memmem::Finder::new(search);
+    let limit = if once { 1 } else { usize::MAX };
+    let matches = finder.find_iter(&body).take(limit).count();
+    if matches == 0 {
+        return Some(body);
     }
-    out.extend_from_slice(&body[cursor..]);
-    out.into()
+    let out_len = (body.len() - matches * search.len())
+        .checked_add(matches.checked_mul(replacement.len())?)?;
+    if out_len as u64 > max_len {
+        return None;
+    }
+    let mut out = Vec::with_capacity(out_len);
+    let mut cursor = 0;
+    for pos in finder.find_iter(&body).take(limit) {
+        out.extend_from_slice(body.get(cursor..pos).unwrap_or_default());
+        out.extend_from_slice(replacement);
+        cursor = pos + search.len();
+    }
+    out.extend_from_slice(body.get(cursor..).unwrap_or_default());
+    Some(out.into())
 }
 
 /// Recompute Content-Length and drop the entity validators: the bytes changed,
@@ -2770,26 +2756,80 @@ fn public_v6(ip: std::net::Ipv6Addr) -> bool {
         && !(s[0] == 0x3fff && s[1] <= 0xfff)
 }
 
+/// `[P]` name lookups running at once. A lookup the request stopped waiting for
+/// keeps its permit until the resolver returns, so slow DNS ties up at most this
+/// many blocking-pool threads.
+const P_RESOLVE_CONCURRENCY: usize = 8;
+/// Requests that may wait for a lookup slot at once.
+const P_RESOLVE_QUEUE: usize = 32;
+const P_RESOLVE_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+const P_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+static P_RESOLVE_WORK: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(P_RESOLVE_CONCURRENCY)));
+static P_RESOLVE_WAITING: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(P_RESOLVE_QUEUE)));
+
+/// Why a `[P]` authority gets no address to dial.
+#[derive(Debug, PartialEq, Eq)]
+enum PTargetRefusal {
+    /// Refused or unresolvable: 403.
+    Refused(String),
+    /// Every lookup slot is taken: 503, retryable.
+    Busy,
+}
+
 /// Resolve a `[P]` authority (bounded), returning the addresses or a refusal.
 /// A literal `ip:port` authority is parsed in place (no blocking-pool hop).
-async fn resolve_p_target_authority(authority: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+async fn resolve_p_target_authority(
+    authority: &str,
+) -> Result<Vec<std::net::SocketAddr>, PTargetRefusal> {
     if let Ok(addr) = authority.parse::<std::net::SocketAddr>() {
         return Ok(vec![addr]);
     }
     let authority = authority.to_string();
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(3),
-        tokio::task::spawn_blocking(move || {
+    resolve_bounded(
+        &P_RESOLVE_WORK,
+        &P_RESOLVE_WAITING,
+        P_RESOLVE_TIMEOUT,
+        move || {
             std::net::ToSocketAddrs::to_socket_addrs(&authority).map(|it| it.collect::<Vec<_>>())
+        },
+    )
+    .await
+}
+
+/// Run `lookup` on the blocking pool under a `work` permit taken before it starts
+/// and released only when it returns, waiting briefly (one of `waiting`) for one.
+async fn resolve_bounded(
+    work: &Arc<tokio::sync::Semaphore>,
+    waiting: &Arc<tokio::sync::Semaphore>,
+    timeout: std::time::Duration,
+    lookup: impl FnOnce() -> std::io::Result<Vec<std::net::SocketAddr>> + Send + 'static,
+) -> Result<Vec<std::net::SocketAddr>, PTargetRefusal> {
+    let permit = {
+        let Ok(_waiting) = waiting.clone().try_acquire_owned() else {
+            return Err(PTargetRefusal::Busy);
+        };
+        match tokio::time::timeout(P_RESOLVE_SLOT_WAIT, work.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            _ => return Err(PTargetRefusal::Busy),
+        }
+    };
+    let refused = |why: String| Err(PTargetRefusal::Refused(why));
+    match tokio::time::timeout(
+        timeout,
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            lookup()
         }),
     )
     .await
     {
         Ok(Ok(Ok(addrs))) if !addrs.is_empty() => Ok(addrs),
-        Ok(Ok(Ok(_))) => Err("resolved to no addresses".into()),
-        Ok(Ok(Err(e))) => Err(format!("does not resolve ({e})")),
-        Ok(Err(e)) => Err(format!("resolution task failed ({e})")),
-        Err(_) => Err("resolution timed out".into()),
+        Ok(Ok(Ok(_))) => refused("resolved to no addresses".into()),
+        Ok(Ok(Err(e))) => refused(format!("does not resolve ({e})")),
+        Ok(Err(e)) => refused(format!("resolution task failed ({e})")),
+        Err(_) => refused("resolution timed out".into()),
     }
 }
 
@@ -2851,7 +2891,7 @@ async fn screen_p_target(
     state: &ServerState,
     ctx: &ReqCtx,
     authority: &str,
-) -> Result<std::net::SocketAddr, String> {
+) -> Result<std::net::SocketAddr, PTargetRefusal> {
     let addrs = resolve_p_target_authority(authority).await?;
     if let Some(addr) = operator_target_addr(
         &state.ext_by_name,
@@ -2863,7 +2903,7 @@ async fn screen_p_target(
         return Ok(addr);
     }
     if let Some(why) = banned_resolved_authority(&addrs) {
-        return Err(why);
+        return Err(PTargetRefusal::Refused(why));
     }
     Ok(addrs[0])
 }
@@ -3085,6 +3125,55 @@ mod proxy_screen_tests {
                 &[addr("10.0.0.7", 8082)]
             ),
             Some(addr("10.0.0.7", 8082))
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_lookups_fail_fast_and_abandoned_ones_keep_their_slot() {
+        let work = Arc::new(tokio::sync::Semaphore::new(1));
+        let waiting = Arc::new(tokio::sync::Semaphore::new(4));
+        let answer = vec![addr("203.0.113.9", 80)];
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let stuck_answer = answer.clone();
+        let abandoned = resolve_bounded(
+            &work,
+            &waiting,
+            std::time::Duration::from_millis(50),
+            move || {
+                let _ = stuck.recv();
+                Ok(stuck_answer)
+            },
+        )
+        .await;
+        assert!(matches!(abandoned, Err(PTargetRefusal::Refused(_))));
+        // The request gave up, but its lookup still holds the only slot.
+        let started = std::time::Instant::now();
+        let quick = answer.clone();
+        assert_eq!(
+            resolve_bounded(&work, &waiting, P_RESOLVE_TIMEOUT, move || Ok(quick)).await,
+            Err(PTargetRefusal::Busy)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(
+            resolve_bounded(
+                &work,
+                &Arc::new(tokio::sync::Semaphore::new(0)),
+                P_RESOLVE_TIMEOUT,
+                || { Ok(Vec::new()) }
+            )
+            .await,
+            Err(PTargetRefusal::Busy),
+            "a full wait queue refuses without waiting"
+        );
+        release.send(()).unwrap();
+        let free = tokio::time::timeout(std::time::Duration::from_secs(5), work.acquire())
+            .await
+            .expect("the abandoned lookup returns its slot");
+        drop(free);
+        let quick = answer.clone();
+        assert_eq!(
+            resolve_bounded(&work, &waiting, P_RESOLVE_TIMEOUT, move || Ok(quick)).await,
+            Ok(answer)
         );
     }
 
@@ -3380,6 +3469,7 @@ async fn dispatch(
     // proxy response, or replace its directory chain with a different one.
     let mut authenticated_realms = Vec::new();
     if let Err(resp) = scoped_auth::enforce_chain(
+        state,
         ctx,
         req.headers(),
         &chain,
@@ -3413,7 +3503,7 @@ async fn dispatch(
     if let Err(resp) = scoped_auth::enforce_mapped_resources(
         state,
         ctx,
-        req.headers(),
+        ResourceRequest::new(&req, &orig_query),
         &orig_path,
         &orig_path,
         &chain,
@@ -3478,6 +3568,7 @@ async fn dispatch(
                     &mut req,
                     &hop_chain,
                     &hop.path,
+                    &hop.query,
                     &orig_path,
                     &mut authenticated_realms,
                 )
@@ -3500,7 +3591,7 @@ async fn dispatch(
     // A terminal `[P]` proxy target is DEFERRED to the dispatch site after the cache context
     // (cc) is built (below) so a cacheable proxied response can participate in the origin page
     // cache, like the proxy-<context>/LSAPI/static paths; `None` for every other outcome.
-    let mut proxy_target: Option<(String, Option<String>)> = None;
+    let mut proxy_target: Option<(String, Option<String>, bool)> = None;
     match rw_result {
         RwResult::Failed { reason } => {
             tracing::error!(request_id = %ctx.request_id, reason, "rewrite evaluation failed closed");
@@ -3523,12 +3614,13 @@ async fn dispatch(
             target_url,
             proxy_host,
             env,
+            authority_substituted,
         } => {
             // Merge the rewrite chain's env (incl. preceding `[E=]` rulesets) into ctx.env so
             // env-gated `Header ... env=` directives fire on the proxied response, and so
             // `[E=no-cache]` is visible to the page-cache lookup at the deferred dispatch below.
             cache_vary_env |= merge_rewrite_env(ctx, env);
-            proxy_target = Some((target_url, proxy_host));
+            proxy_target = Some((target_url, proxy_host, authority_substituted));
         }
         RwResult::Redirect {
             code,
@@ -3615,10 +3707,10 @@ async fn dispatch(
     // internal-redirect re-evaluation. Not triggered by the live config (its directory-crossing
     // rules are all external [R] redirects), so this closes a latent gap with zero hot-path or
     // live-behavior change.
-    let chain: Vec<Arc<Htaccess>> = if rewritten
+    let reloaded = rewritten
         && htaccess_enabled
-        && !url_parent_dir(&orig_path).starts_with(url_parent_dir(&cur_path))
-    {
+        && !url_parent_dir(&orig_path).starts_with(url_parent_dir(&cur_path));
+    let chain: Vec<Arc<Htaccess>> = if reloaded {
         state
             .rewrite_cache
             .load_chain_with_dirs(
@@ -3660,8 +3752,32 @@ async fn dispatch(
 
     // ---- 4. ACCESS enforcement (#1): a denied path is a 403 BEFORE any
     // terminal handler (proxy / LSAPI / static). Fail-safe: any matching
-    // `denied` section anywhere in the chain wins. -------------------------
-    if access_denied(&chain, &cur_path, req.method().as_str(), ctx) {
+    // `denied` section anywhere in the chain wins. A reloaded destination
+    // chain is judged after its own env phase, as an internal redirect. ----
+    let destination_ctx = if reloaded {
+        match chain_access_ctx(
+            state,
+            ctx,
+            &chain,
+            ResourceRequest::new(&req, &cur_query),
+            &cur_path,
+        ) {
+            Ok(Cow::Owned(scoped)) => Some(scoped),
+            Ok(Cow::Borrowed(_)) => None,
+            Err(reason) => {
+                tracing::error!(request_id = %ctx.request_id, reason, "destination SetEnvIf evaluation failed closed");
+                return error_page(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    } else {
+        None
+    };
+    if access_denied(
+        &chain,
+        &cur_path,
+        req.method().as_str(),
+        destination_ctx.as_ref().unwrap_or(ctx),
+    ) {
         return error_doc_or_page(
             state,
             ctx,
@@ -3800,8 +3916,12 @@ async fn dispatch(
             // Re-run BOTH deny mechanisms (the `.htaccess` `<Files>`/`Require` chain AND the
             // `accessDenyDir` glob set) against the resolved script, mirroring the request-path check.
             if script_rel != rel_path
-                && (access_denied(&chain, &script_rel, req.method().as_str(), ctx)
-                    || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel))
+                && (access_denied(
+                    &chain,
+                    &script_rel,
+                    req.method().as_str(),
+                    destination_ctx.as_ref().unwrap_or(ctx),
+                ) || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &script_rel))
             {
                 return error_doc_or_page(
                     state,
@@ -3823,7 +3943,7 @@ async fn dispatch(
     if let Err(resp) = scoped_auth::enforce_mapped_resources(
         state,
         ctx,
-        req.headers(),
+        ResourceRequest::new(&req, &cur_query),
         &orig_path,
         &cur_path,
         &chain,
@@ -4031,7 +4151,7 @@ async fn dispatch(
     // 206- / self-redirect-guarded and no-ops for a non-cacheable response (today's Monit
     // `[P]` is non-cacheable, so this is inert for it). No single-flight: the `[P]` path is
     // low-volume; add it if a high-traffic cacheable `[P]` ever appears.
-    if let Some((target_url, proxy_host)) = proxy_target {
+    if let Some((target_url, proxy_host, authority_substituted)) = proxy_target {
         let is_refresh_p = req.extensions().get::<RefreshMode>().is_some();
         // OLS hands a ws/wss `[P]` target of an upgrade request to its WebSocket
         // handler; that relay is never a cacheable response.
@@ -4066,9 +4186,28 @@ async fn dispatch(
             Ok(mut target) => {
                 match screen_p_target(state, ctx, &target.authority).await {
                     Ok(addr) => target.pin_tcp_addr(addr),
-                    Err(why) => {
+                    Err(PTargetRefusal::Refused(why)) => {
                         tracing::warn!(request_id = %ctx.request_id, target = %target_url, why = %why, "[P] target refused");
                         return error_page(StatusCode::FORBIDDEN);
+                    }
+                    Err(PTargetRefusal::Busy) => {
+                        tracing::warn!(request_id = %ctx.request_id, target = %target_url, "[P] name lookups saturated -> 503");
+                        let mut resp = error_page(StatusCode::SERVICE_UNAVAILABLE);
+                        resp.headers_mut().insert(
+                            http::header::RETRY_AFTER,
+                            http::HeaderValue::from_static("1"),
+                        );
+                        return resp;
+                    }
+                }
+                // A host the request chose must not receive the visitor's credentials.
+                if authority_substituted {
+                    for name in [
+                        http::header::COOKIE,
+                        http::header::AUTHORIZATION,
+                        http::header::PROXY_AUTHORIZATION,
+                    ] {
+                        req.headers_mut().remove(name);
                     }
                 }
                 // After the pin: Proxy-Host renames the Host/SNI, never the dialed address.
@@ -4773,7 +4912,7 @@ async fn dispatch(
             if let Err(auth_resp) = scoped_auth::enforce_target(
                 state,
                 ctx,
-                req.headers(),
+                ResourceRequest::new(&req, &cur_query),
                 &target,
                 &orig_path,
                 &mut authenticated_realms,
@@ -4854,8 +4993,8 @@ async fn dispatch(
     lscache::cache_store(state, ctx, &cc, resp).await
 }
 
-fn mtls_ok(mtls_required: bool, is_tls: bool, tls: Option<&hj_core::TlsParams>) -> bool {
-    if mtls_required {
+fn mtls_ok(client_auth_requested: bool, is_tls: bool, tls: Option<&hj_core::TlsParams>) -> bool {
+    if client_auth_requested {
         tls.is_some_and(|t| t.client_cert.is_some())
     } else {
         is_tls
@@ -4867,10 +5006,10 @@ fn mtls_ok(mtls_required: bool, is_tls: bool, tls: Option<&hj_core::TlsParams>) 
 /// one presented, so a cert-less internal peer exempted at accept never qualifies.
 fn forwarding_trusted(
     trusted_proxy: bool,
-    mtls_required: bool,
+    client_auth_requested: bool,
     tls: Option<&hj_core::TlsParams>,
 ) -> bool {
-    trusted_proxy && (!mtls_required || tls.is_some_and(|t| t.client_cert.is_some()))
+    trusted_proxy && (!client_auth_requested || tls.is_some_and(|t| t.client_cert.is_some()))
 }
 
 fn resolved_static_target_denied(acl: &hj_acl::AccessControl, resp: &Response) -> bool {
@@ -5000,6 +5139,7 @@ async fn finalize_response(
         status,
         resp,
     );
+    htaccess_apply::attach_expires_decision(chain, rel_path, target_basename, request_path, resp);
 }
 
 /// The basename `<Files*>` sections match for a static response to a
@@ -5034,6 +5174,53 @@ fn served_index_basename(request_path: &str, resp: &Response) -> Option<String> 
 /// `PATH_INFO` or `DirectoryIndex` request maps to, else the first existing
 /// `DirectoryIndex` file of a directory request. Computed only when some chain
 /// file carries such a scoped directive.
+/// The inbound request as the access phase of a resource it maps to sees it.
+#[derive(Clone, Copy)]
+pub(super) struct ResourceRequest<'a> {
+    pub(super) method: &'a str,
+    pub(super) headers: &'a http::HeaderMap,
+    pub(super) query: &'a str,
+}
+
+impl<'a> ResourceRequest<'a> {
+    pub(super) fn new(req: &'a Request, query: &'a str) -> Self {
+        ResourceRequest {
+            method: req.method().as_str(),
+            headers: req.headers(),
+            query,
+        }
+    }
+}
+
+/// `ctx` as `chain`'s access rules must judge `path` when the request reached
+/// `chain` without dispatch's env phase having run for it (a symlink target's
+/// directory, an internal-redirect destination): Apache reruns the per-directory
+/// `SetEnv`/`SetEnvIf` for the new resource before its access check. Borrowed
+/// unless that phase can change the verdict; the copy never reaches a backend.
+pub(super) fn chain_access_ctx<'c>(
+    state: &ServerState,
+    ctx: &'c ReqCtx,
+    chain: &[Arc<Htaccess>],
+    request: ResourceRequest<'_>,
+    path: &str,
+) -> Result<Cow<'c, ReqCtx>, &'static str> {
+    if !htaccess_apply::chain_env_feeds_access(chain) {
+        return Ok(Cow::Borrowed(ctx));
+    }
+    let basename = set_env_scope_basename(state, ctx, path, chain);
+    let mut scoped = ctx.clone();
+    apply_set_env_iter_with_headers(
+        &mut scoped,
+        chain.iter().map(AsRef::as_ref),
+        request.method,
+        request.headers,
+        path,
+        request.query,
+        basename.as_deref(),
+    )?;
+    Ok(Cow::Owned(scoped))
+}
+
 fn set_env_scope_basename(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -5464,6 +5651,7 @@ async fn acme_plaintext_static(
     }
     let mut authenticated = Vec::new();
     if let Err(resp) = scoped_auth::enforce_chain(
+        state,
         ctx,
         req.headers(),
         chain,
@@ -5494,7 +5682,7 @@ async fn acme_plaintext_static(
         if let Err(denied) = scoped_auth::enforce_target(
             state,
             ctx,
-            sreq.headers(),
+            ResourceRequest::new(&sreq, sreq.uri().query().unwrap_or("")),
             &target,
             orig_path,
             &mut authenticated,
@@ -5506,6 +5694,170 @@ async fn acme_plaintext_static(
     }
     apply_response_headers_for_request(ctx, chain, &rel, orig_path, &mut resp);
     resp
+}
+
+/// Outcome of the plaintext mTLS trust-boundary gate (#2) for one routed request.
+enum MtlsGate {
+    /// TLS (or a trusted proxy's HTTPS assertion), an exempt peer, or a vhost that
+    /// does not require a client certificate.
+    Pass,
+    /// Gated, but the request is an ACME http-01 challenge: serve only the token file.
+    AcmePlaintextOnly,
+    /// The finished 301 to HTTPS, already counted and access-logged.
+    Redirect(Response),
+}
+
+/// The plaintext mTLS gate shared by [`handle`] and [`plaintext_mtls_redirect`], so the
+/// head-time check the H1 transport runs before reading a body and the full pipeline
+/// produce the same decision and the same redirect.
+#[allow(clippy::too_many_arguments)]
+fn mtls_gate(
+    state: &Arc<ServerState>,
+    proto: Proto,
+    peer_ip: IpAddr,
+    effective_https: bool,
+    route_key: Option<&str>,
+    resolved_name: &str,
+    req: &Request,
+    req_start: std::time::Instant,
+    bodiless: bool,
+) -> MtlsGate {
+    if !mtls_gate_redirects(
+        effective_https,
+        state.mtls_required_vhosts.contains(resolved_name),
+        peer_ip,
+    ) {
+        return MtlsGate::Pass;
+    }
+    let host = route_key
+        .map(hj_core::host_without_port)
+        .unwrap_or_else(|| resolved_name.to_owned());
+    if let Some(target) = mtls_https_redirect_target(&host, req.uri().path(), req.uri().query()) {
+        // (#13) Route the mTLS 301 through the common funnel instead of a bare
+        // early return: a cleartext proxy / ISP transparent cache between the
+        // client and origin could otherwise cache this HTTP→HTTPS 301 (it carries
+        // no Cache-Control), and :80 probe traffic would be invisible. Apply
+        // deny_redirect_cdn_caching (private, no-store), count it in requests_total,
+        // and access-log it. client_ip is unresolved here (the request is bounced
+        // before trust resolution), so log peer_ip — the literal source of the
+        // probe, which is what an operator wants to see for these.
+        let mut resp = redirect(301, &target);
+        deny_redirect_cdn_caching(&mut resp);
+        // The h2c head-time refusal sends no body; log the bytes it actually sends.
+        if bodiless {
+            *resp.body_mut() = Body::Empty;
+            resp.headers_mut().remove(http::header::CONTENT_TYPE);
+            resp.headers_mut().insert(
+                http::header::CONTENT_LENGTH,
+                http::HeaderValue::from_static("0"),
+            );
+        }
+        state
+            .metrics
+            .requests_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(log) = &state.access_log {
+            let log_uri = match req.uri().query() {
+                Some(q) => format!("{}?{}", req.uri().path(), q),
+                None => req.uri().path().to_string(),
+            };
+            let record = hj_log::AccessRecord {
+                client_ip: peer_ip,
+                ts: std::time::SystemTime::now(),
+                method: method_static(req.method()),
+                uri: log_uri,
+                protocol: proto.as_str(),
+                status: resp.status().as_u16(),
+                bytes: 0, // filled with the REAL bytes by log_access
+                referer: header_bytes(req, http::header::REFERER),
+                user_agent: header_bytes(req, http::header::USER_AGENT),
+                host: header_bytes(req, http::header::HOST),
+                remote_user: None,
+                // No `ctx` yet (bounced before trust resolution): mint a fresh id so
+                // even a :80 mTLS-bounce probe is joinable across the logs.
+                request_id: Some(hj_core::reqid::next().to_string()),
+                peer_unix: false,
+            };
+            resp = log_access(log, resp, record, None);
+        }
+        // Mirror the main response funnel (see below): record this 301 in the
+        // per-protocol/status/latency telemetry too, not just `requests_total`
+        // — otherwise the :80 mTLS-bounce probes are invisible to the metrics
+        // endpoint despite being counted and access-logged.
+        state.telemetry.record_request(
+            proto,
+            resp.status().as_u16(),
+            req_start.elapsed(),
+            state.telemetry.vhost_idx(resolved_name),
+        );
+        return MtlsGate::Redirect(resp);
+    }
+    MtlsGate::AcmePlaintextOnly
+}
+
+/// The plaintext mTLS-gate 301 for a request whose head is complete but whose body has
+/// not been read. The H1 transport asks before sending `100 Continue` or reading a body,
+/// so a body the gate refuses is never accepted; `None` defers to [`handle`]. Mirrors
+/// `handle_inner` up to its gate (ACME, empty-query normalization, routing), and applies
+/// that normalization to `req` itself so the later full pipeline sees the same URI.
+pub(crate) fn plaintext_mtls_redirect(
+    state: &Arc<ServerState>,
+    listener: &str,
+    peer_ip: IpAddr,
+    proto: Proto,
+    req: &mut Request,
+    bodiless: bool,
+) -> Option<Response> {
+    // A loopback peer is exempt; only loopback reaches the peer-purge intercept.
+    if state.mtls_required_vhosts.is_empty() || hj_core::is_trusted_internal_peer(peer_ip) {
+        return None;
+    }
+    let req_start = std::time::Instant::now();
+    let proto = effective_proto(proto, req);
+    #[cfg(feature = "acme")]
+    if state
+        .acme
+        .as_ref()
+        .is_some_and(|acme| acme.response(listener, req, false).is_some())
+    {
+        return None;
+    }
+    if let Some(uri) = strip_empty_query(req.uri()) {
+        *req.uri_mut() = uri;
+    }
+    let route_key = request_route_key(req, None);
+    let resolved = state.router.resolve(listener, route_key.as_deref())?;
+    let effective_https =
+        effective_request_https(false, state.acl.is_trusted(peer_ip), req.headers());
+    match mtls_gate(
+        state,
+        proto,
+        peer_ip,
+        effective_https,
+        route_key.as_deref(),
+        &resolved.name,
+        req,
+        req_start,
+        bodiless,
+    ) {
+        MtlsGate::Redirect(resp) => Some(resp),
+        MtlsGate::Pass | MtlsGate::AcmePlaintextOnly => None,
+    }
+}
+
+/// Routing key precedence: the request's own authority is authoritative (RFC 9110 §7.4 /
+/// RFC 9113 §8.3.1) — the Host header first, then the URI authority (h2/h3 `:authority`,
+/// which hj-h2/h3 already surface as a Host header), with the TLS SNI only as a fallback
+/// for a request that carries no host at all. For CF-fronted traffic SNI and Host are
+/// identical; this just makes Host authoritative for routing, as HTTP requires (and stops
+/// an SNI/Host mismatch from resolving the wrong vhost).
+fn request_route_key(req: &Request, sni: Option<&str>) -> Option<String> {
+    req.headers()
+        .get(http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .map(str::to_owned)
+        .or_else(|| req.uri().authority().map(|a| a.host().to_string()))
+        .or_else(|| sni.map(|s| s.to_string()))
 }
 
 /// (#2) Decide the HTTPS redirect target for a plaintext request to an
@@ -5684,22 +6036,36 @@ fn cache_optimizer_allows_redirect_cdn_cache(label: &str) -> bool {
 }
 
 /// (#836) The access phase of one internal-redirect hop: `hop_path` against the
-/// chain that hop entered — `Require`/`<Limit>`/`<Files>` denies, `accessDenyDir`,
-/// the context body cap and the chain's Basic-auth realm. `Err` carries the refusal,
-/// rendered with the hop's chain (ErrorDocument + `Header always`).
+/// chain that hop entered — `Require`/`<Limit>`/`<Files>` denies (after that chain's
+/// own `SetEnv`/`SetEnvIf` for the hop URI), `accessDenyDir`, the context body cap
+/// and the chain's Basic-auth realm. `Err` carries the refusal, rendered with the
+/// hop's chain (ErrorDocument + `Header always`).
+#[allow(clippy::too_many_arguments)]
 async fn enforce_hop_access(
     state: &Arc<ServerState>,
     ctx: &mut ReqCtx,
     req: &mut Request,
     hop_chain: &[Arc<Htaccess>],
     hop_path: &str,
+    hop_query: &str,
     orig_path: &str,
     authenticated_realms: &mut Vec<hj_rewrite::AuthRealm>,
 ) -> Result<(), Response> {
     let hop_rel = resolved_rel_path(hop_path);
-    if access_denied(hop_chain, hop_path, req.method().as_str(), ctx)
-        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &hop_rel)
-    {
+    let denied = match chain_access_ctx(
+        state,
+        ctx,
+        hop_chain,
+        ResourceRequest::new(req, hop_query),
+        hop_path,
+    ) {
+        Ok(access_ctx) => access_denied(hop_chain, hop_path, req.method().as_str(), &access_ctx),
+        Err(reason) => {
+            tracing::error!(request_id = %ctx.request_id, reason, "hop SetEnvIf evaluation failed closed");
+            return Err(error_page(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+    };
+    if denied || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &hop_rel) {
         return Err(error_doc_or_page(
             state,
             ctx,
@@ -5722,6 +6088,7 @@ async fn enforce_hop_access(
         return Err(error_page(status));
     }
     if let Err(resp) = scoped_auth::enforce_chain(
+        state,
         ctx,
         req.headers(),
         hop_chain,
@@ -6149,7 +6516,7 @@ fn mark_auth_sensitive(has_authorization: bool, ctx: &ReqCtx, resp: &mut Respons
     }
 }
 
-pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp: &mut Response) {
+fn apply_selected_expires(rule: Option<hj_compress::ExpiresRule>, now: i64, resp: &mut Response) {
     // RFC 9110 §15.4.5: a 304 carries the Cache-Control/Expires its 200 would
     // (the static 304 keeps the Content-Type and Last-Modified the rule reads).
     if !matches!(
@@ -6170,18 +6537,7 @@ pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp:
         );
         return;
     }
-    if expires.is_empty() {
-        return;
-    }
-    let rule = match resp
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|ct| expires.lookup(ct))
-    {
-        Some(r) => r,
-        None => return,
-    };
+    let Some(rule) = rule else { return };
     let last_mod = resp
         .headers()
         .get(http::header::LAST_MODIFIED)
@@ -6221,6 +6577,16 @@ pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp:
     }
 }
 
+#[cfg(test)]
+pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp: &mut Response) {
+    let rule = resp
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|content_type| expires.lookup(content_type));
+    apply_selected_expires(rule, now, resp);
+}
+
 // ---- Response-transform pipeline (the post-handler stage) ------------------
 // Each transform mutates the outgoing response in order; a future transform plugs into
 // `ServerState::transforms` without touching handle(). The Vec order reproduces the
@@ -6245,9 +6611,11 @@ impl ResponseTransform for CacheStaticTransform {
 /// Apply `expiresByType` Cache-Control/Expires to cacheable static responses.
 pub(crate) struct ExpiresTransform {
     pub expires: std::sync::Arc<hj_compress::ExpiresRules>,
+    pub expires_enabled: bool,
     /// Per-vhost `<expires>` overrides (audit): a vhost with its own enabled block
     /// replaces the server-wide rules for its requests; everyone else falls back.
     pub vhost_expires: std::collections::HashMap<String, std::sync::Arc<hj_compress::ExpiresRules>>,
+    pub vhost_expires_enabled: std::collections::HashMap<String, bool>,
 }
 #[async_trait]
 impl ResponseTransform for ExpiresTransform {
@@ -6259,11 +6627,49 @@ impl ResponseTransform for ExpiresTransform {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or_else(|_| unix_now());
-        let rules = self
+        let native_enabled = self
+            .vhost_expires_enabled
+            .get(&ctx.vhost_name)
+            .copied()
+            .unwrap_or(self.expires_enabled);
+        let native_rules = self
             .vhost_expires
             .get(&ctx.vhost_name)
             .unwrap_or(&self.expires);
-        apply_expires(rules, now, resp);
+        let native_rule = resp
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| native_rules.lookup(content_type));
+        match resp
+            .extensions()
+            .get::<hj_rewrite::ExpiresDecision>()
+            .copied()
+            .unwrap_or(hj_rewrite::ExpiresDecision::Inherit)
+        {
+            hj_rewrite::ExpiresDecision::Off => apply_selected_expires(None, now, resp),
+            hj_rewrite::ExpiresDecision::On => apply_selected_expires(native_rule, now, resp),
+            hj_rewrite::ExpiresDecision::Rule {
+                rule,
+                kind,
+                inherit_active,
+            } => {
+                let selected = (!inherit_active || native_enabled).then(|| match kind {
+                    hj_rewrite::ExpiresRuleKind::ByType => rule,
+                    // OLS selects a MIME setting (including an ExpiresByType
+                    // wildcard) before the context's ExpiresDefault.
+                    hj_rewrite::ExpiresRuleKind::Default => native_rule.unwrap_or(rule),
+                });
+                apply_selected_expires(selected, now, resp)
+            }
+            hj_rewrite::ExpiresDecision::Inherit => {
+                if native_enabled {
+                    apply_selected_expires(native_rule, now, resp);
+                } else {
+                    apply_selected_expires(None, now, resp);
+                }
+            }
+        }
     }
 }
 
@@ -6397,6 +6803,44 @@ mod tests {
 
     /// The per-worker flush ticker parks on `access_chunk_pending` and must be woken by the
     /// first line of a chunk — and only then — or an idle core would either take timer
+    /// A flushed chunk's buffer goes to the writer; the next chunk must start from one
+    /// full reservation, not regrow from empty (which re-faulted pages per chunk).
+    #[tokio::test]
+    async fn every_chunk_starts_from_one_full_reservation() {
+        let dir = std::env::temp_dir().join(format!("hj-chunk-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = Arc::new(hj_log::AccessLogger::spawn(
+            dir.join("access.log"),
+            hj_log::LogFormat::Common,
+            0,
+            0,
+            false,
+        ));
+        let capacity = |log: &Arc<hj_log::AccessLogger>| {
+            ACCESS_CHUNKS.with(|c| c.borrow()[&(Arc::as_ptr(log) as usize)].buf.capacity())
+        };
+        let line = vec![b'x'; 300];
+        chunk_access_line(&log, |buf, _| buf.extend_from_slice(&line));
+        assert!(capacity(&log) >= ACCESS_CHUNK_CAPACITY);
+        // Fill past the size threshold: the chunk flushes inline and hands its buffer off.
+        while ACCESS_CHUNKS.with(|c| c.borrow()[&(Arc::as_ptr(&log) as usize)].lines) > 0 {
+            chunk_access_line(&log, |buf, _| buf.extend_from_slice(&line));
+        }
+        chunk_access_line(&log, |buf, _| buf.extend_from_slice(&line));
+        assert!(
+            capacity(&log) >= ACCESS_CHUNK_CAPACITY,
+            "after a size flush"
+        );
+        flush_access_chunks();
+        chunk_access_line(&log, |buf, _| buf.extend_from_slice(&line));
+        assert!(
+            capacity(&log) >= ACCESS_CHUNK_CAPACITY,
+            "after a ticker flush"
+        );
+        flush_access_chunks();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// wake-ups forever or strand a partial chunk.
     #[tokio::test]
     async fn chunk_ticker_parks_until_a_chunk_starts() {
@@ -7895,14 +8339,15 @@ mod tests {
     #[test]
     fn mtls_ok_depends_on_whether_the_listener_requests_client_auth() {
         // (#16, corrected) mtls_ok gates whether forwarded client-IP headers are honored.
-        // - When the listener REQUESTS client certs (clientVerify>=1, `mtls_required=true`):
+        // - When the listener REQUESTS client certs (clientVerify>=1, `client_auth_requested=true`):
         //   require an ACTUAL presented cert (a cert-less internal TLS peer must not be trusted).
-        // - When it does NOT (--no-mtls / clientVerify=0, the prod topology, `mtls_required=false`):
+        // - When it does NOT (--no-mtls / clientVerify=0, the prod topology, `client_auth_requested=false`):
         //   trust the network boundary — any completed TLS connection counts (pre-#16 behavior).
         // The unconditional cert requirement broke 100% of --no-mtls real-IP resolution.
-        let mtls_ok = |mtls_required: bool, is_tls: bool, tls: &Option<hj_core::TlsParams>| {
-            super::mtls_ok(mtls_required, is_tls, tls.as_ref())
-        };
+        let mtls_ok =
+            |client_auth_requested: bool, is_tls: bool, tls: &Option<hj_core::TlsParams>| {
+                super::mtls_ok(client_auth_requested, is_tls, tls.as_ref())
+            };
         let tls_no_cert = Some(hj_core::TlsParams::new(
             "TLSv1.3",
             "TLS_AES_256_GCM_SHA384".into(),

@@ -696,22 +696,38 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
         }
     }
 
-    /// Remove every node whose key matches `predicate`. Lock-order-safe: each key is
-    /// dispatched to its own shard and torn down through the funnel. (For a simple
-    /// per-key predicate this is O(entries); callers with a reverse index should
-    /// remove keys directly via [`Self::remove`] / [`Self::with_shard`].)
+    /// Remove every node whose key matches `predicate`. Each shard is scanned and
+    /// drained under one lock hold, so a broad selective purge pays at most one
+    /// lock/unlock + [`OnEvict::after_unlock`] per affected shard rather than per
+    /// entry. (For a simple per-key predicate this is O(entries); callers with a
+    /// reverse index should remove keys directly via [`Self::remove`] /
+    /// [`Self::with_shard`].)
     pub fn purge_if(&self, mut predicate: impl FnMut(&K, &V) -> bool) {
-        let mut to_remove: Vec<K> = Vec::new();
         for sh in self.shards.iter() {
-            let s = sh.lock();
-            for (k, n) in s.map.iter() {
-                if predicate(k, &n.value) {
-                    to_remove.push(k.clone());
+            let evicted = {
+                let mut s = sh.lock();
+                let to_remove: Vec<K> = s
+                    .map
+                    .iter()
+                    .filter(|(key, node)| predicate(key, &node.value))
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                let mut acc = ShardAccess {
+                    shard: &mut s,
+                    on_evict: &self.on_evict,
+                    ram_budget_per_shard: self.ram_budget_per_shard,
+                    disk_budget_per_shard: self.disk_budget_per_shard,
+                    global_budget: &self.global_budget,
+                    evicted: false,
+                };
+                for id in to_remove {
+                    acc.teardown(&id, EvictCause::Explicit);
                 }
+                acc.evicted
+            };
+            if evicted {
+                self.on_evict.after_unlock();
             }
-        }
-        for id in to_remove {
-            self.remove(&id);
         }
     }
 

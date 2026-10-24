@@ -22,7 +22,7 @@ jobs:
       matrix:
         target: [h1_chunked_decode, h1_request_framing, hpack_decode, hpack_roundtrip, lsapi_resp_header, qpack_decode, proxy_protocol_parse, lscache_control]
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install pinned fuzz toolchain
@@ -36,7 +36,7 @@ jobs:
         run: bash scripts/fuzz-bounded.sh "$FUZZ_TARGET"
       - name: Preserve corpus and crash artifacts
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-${{ matrix.target }}-${{ github.run_id }}
           path: |

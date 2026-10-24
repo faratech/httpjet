@@ -424,6 +424,44 @@ fn purge_if_removes_matching_keys() {
 }
 
 #[test]
+fn purge_if_drains_once_per_affected_shard() {
+    let (c, hook) = cache(1 << 20, 0);
+    let removed = [
+        TestKey(1),
+        TestKey(257),
+        TestKey(513),
+        TestKey(2),
+        TestKey(258),
+    ];
+    let kept = [TestKey(3), TestKey(259)];
+    for id in removed.iter().chain(&kept) {
+        c.insert(*id, Arc::new(TestValue::ram(10)));
+    }
+
+    let before_drains = hook.after_unlock.load(Ordering::Relaxed);
+    let before_explicit = hook.explicit.load(Ordering::Relaxed);
+    c.purge_if(|key, _| key.0 & 0xff != 3);
+
+    assert_eq!(
+        hook.after_unlock.load(Ordering::Relaxed) - before_drains,
+        2,
+        "three removals in shard 1 and two in shard 2 drain once per shard"
+    );
+    assert_eq!(
+        hook.explicit.load(Ordering::Relaxed) - before_explicit,
+        removed.len() as u64,
+        "every matching node still runs the teardown hook"
+    );
+    for id in removed {
+        assert!(c.get(&id).is_none());
+    }
+    for id in kept {
+        assert!(c.get(&id).is_some());
+    }
+    assert_accounting(&c);
+}
+
+#[test]
 fn with_shard_in_place_mutate() {
     let (c, _hook) = cache(1 << 20, 0);
     c.insert(TestKey(3), Arc::new(TestValue::ram(100)));

@@ -493,14 +493,14 @@ fn proxy_sender_net(text: &str) -> Option<ipnet::IpNet> {
             .ok()
             .map(ipnet::IpNet::from)
     })?;
-    if let ipnet::IpNet::V6(net6) = net {
-        if let Some(ip) = net6.addr().to_ipv4_mapped() {
-            return net6
-                .prefix_len()
-                .checked_sub(96)
-                .and_then(|prefix| ipnet::Ipv4Net::new(ip, prefix).ok())
-                .map(ipnet::IpNet::V4);
-        }
+    if let ipnet::IpNet::V6(net6) = net
+        && let Some(ip) = net6.addr().to_ipv4_mapped()
+    {
+        return net6
+            .prefix_len()
+            .checked_sub(96)
+            .and_then(|prefix| ipnet::Ipv4Net::new(ip, prefix).ok())
+            .map(ipnet::IpNet::V4);
     }
     Some(net)
 }
@@ -715,7 +715,8 @@ pub struct SubFilterConfig {
     /// Keep `Last-Modified` when filtering (ETag is always dropped — the
     /// entity changed, and httpjet's ETag shape is file-identity-derived).
     pub keep_last_modified: bool,
-    /// Buffering cap for streamed bodies (bytes). Default 4 MiB.
+    /// Largest body filtered, before and after substitution (bytes); a larger
+    /// one is served unfiltered. Default 4 MiB, at most [`Self::MAX_BODY_CEILING`].
     pub max_body: u64,
 }
 
@@ -732,6 +733,10 @@ impl Default for SubFilterConfig {
 }
 
 impl SubFilterConfig {
+    /// Ceiling for `subFilterMaxBody`: a filtered body is held whole in memory,
+    /// once for the input and once for the output, per request.
+    pub const MAX_BODY_CEILING: u64 = 64 * 1024 * 1024;
+
     /// True when any rule is configured.
     pub fn is_active(&self) -> bool {
         !self.rules.is_empty()

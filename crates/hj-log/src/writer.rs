@@ -7,16 +7,28 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::Msg;
 use crate::fmt;
+
+const MAX_ARCHIVE_JOBS: usize = 4;
+static ARCHIVE_JOB_SLOTS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_ARCHIVE_JOBS)));
+
+type Archiver = Arc<dyn Fn(&Path) -> io::Result<()> + Send + Sync>;
+
+struct ArchiveOutcome {
+    path: PathBuf,
+    result: io::Result<()>,
+}
 
 /// Rolling/pruning policy for one log file.
 #[derive(Debug, Clone)]
@@ -36,10 +48,16 @@ struct Writer {
     file: BufWriter<File>,
     /// Bytes written to the current file (tracked to avoid stat per line).
     size: u64,
+    archiver: Archiver,
+    archive_jobs: tokio::task::JoinSet<ArchiveOutcome>,
 }
 
 impl Writer {
     async fn open(cfg: RollConfig) -> io::Result<Self> {
+        Self::open_with_archiver(cfg, Arc::new(gzip_file)).await
+    }
+
+    async fn open_with_archiver(cfg: RollConfig, archiver: Archiver) -> io::Result<Self> {
         if let Some(parent) = cfg.path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).await?;
@@ -51,6 +69,8 @@ impl Writer {
             cfg,
             file: BufWriter::new(file),
             size,
+            archiver,
+            archive_jobs: tokio::task::JoinSet::new(),
         })
     }
 
@@ -94,7 +114,7 @@ impl Writer {
     /// `logrotate`, or on an explicit [`Msg::Reopen`]).
     async fn reopen(&mut self) -> io::Result<()> {
         self.file.flush().await?;
-        let next = Writer::open(self.cfg.clone()).await?;
+        let next = Writer::open_with_archiver(self.cfg.clone(), self.archiver.clone()).await?;
         self.file = next.file;
         self.size = next.size;
         Ok(())
@@ -114,13 +134,17 @@ impl Writer {
         self.file = BufWriter::new(fresh);
         self.size = 0;
 
-        if self.cfg.compress_archive {
-            // Compression is CPU/IO heavy; run it on a blocking thread so the
-            // writer task stays responsive to the channel.
-            let src = rolled.clone();
-            tokio::task::spawn_blocking(move || gzip_file(&src))
-                .await
-                .map_err(|e| io::Error::other(e.to_string()))??;
+        if self.cfg.compress_archive
+            && !self.schedule_archive(rolled.clone(), ARCHIVE_JOB_SLOTS.clone())
+        {
+            // Preserve the archive bytes as the already-renamed plain file.
+            // Dropping log lines to wait for gzip would be worse than leaving
+            // one archive uncompressed during a compression backlog.
+            tracing::warn!(
+                target: "hj_log",
+                path = %rolled.display(),
+                "archive compression saturated; leaving rolled log uncompressed"
+            );
         }
 
         if self.cfg.keep_days > 0 {
@@ -133,8 +157,62 @@ impl Writer {
         Ok(())
     }
 
+    fn schedule_archive(&mut self, rolled: PathBuf, slots: Arc<Semaphore>) -> bool {
+        self.reap_archive_jobs();
+        if let Ok(permit) = slots.try_acquire_owned() {
+            let archiver = self.archiver.clone();
+            self.archive_jobs.spawn_blocking(move || {
+                let _permit = permit;
+                let result = archiver(&rolled);
+                ArchiveOutcome {
+                    path: rolled,
+                    result,
+                }
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     async fn flush(&mut self) -> io::Result<()> {
         self.file.flush().await
+    }
+
+    fn report_archive(result: Result<ArchiveOutcome, tokio::task::JoinError>) {
+        match result {
+            Ok(ArchiveOutcome { result: Ok(()), .. }) => {}
+            Ok(ArchiveOutcome {
+                path,
+                result: Err(error),
+            }) => {
+                tracing::warn!(
+                    target: "hj_log",
+                    %error,
+                    path = %path.display(),
+                    "log archive compression failed; plain archive retained"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "hj_log",
+                    %error,
+                    "log archive compression task failed"
+                );
+            }
+        }
+    }
+
+    fn reap_archive_jobs(&mut self) {
+        while let Some(result) = self.archive_jobs.try_join_next() {
+            Self::report_archive(result);
+        }
+    }
+
+    async fn finish_archive_jobs(&mut self) {
+        while let Some(result) = self.archive_jobs.join_next().await {
+            Self::report_archive(result);
+        }
     }
 }
 
@@ -262,12 +340,22 @@ async fn prune_old(cfg: &RollConfig) -> io::Result<()> {
 /// reported via `tracing`.
 pub async fn run(
     cfg: RollConfig,
-    mut rx: mpsc::UnboundedReceiver<Msg>,
+    rx: mpsc::UnboundedReceiver<Msg>,
     state: crate::LoggerState,
     syslog: Option<crate::SyslogTap>,
 ) {
+    run_with_archiver(cfg, rx, state, syslog, Arc::new(gzip_file)).await;
+}
+
+async fn run_with_archiver(
+    cfg: RollConfig,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+    state: crate::LoggerState,
+    syslog: Option<crate::SyslogTap>,
+    archiver: Archiver,
+) {
     let depth = &state.depth;
-    let mut writer = match Writer::open(cfg.clone()).await {
+    let mut writer = match Writer::open_with_archiver(cfg.clone(), archiver).await {
         Ok(w) => Some(w),
         Err(e) => {
             tracing::error!(target: "hj_log", path = %cfg.path.display(), error = %e, "failed to open log file");
@@ -293,6 +381,11 @@ pub async fn run(
             // writer task so the request path never pays for it) uncount the queue
             // depth (#8) and then share the single write path below.
             let mut raw_chunk: Option<Vec<u8>> = None;
+            if let Some(queued) = msg.as_ref() {
+                state
+                    .queued_bytes
+                    .fetch_sub(queued.queued_bytes(), std::sync::atomic::Ordering::Relaxed);
+            }
             let to_write: Option<String> = match msg.take() {
                 Some(Msg::Line(line)) => {
                     depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -328,6 +421,7 @@ pub async fn run(
                 Some(Msg::Shutdown(ack)) => {
                     if let Some(w) = writer.as_mut() {
                         let _ = w.flush().await;
+                        w.finish_archive_jobs().await;
                     }
                     let _ = ack.send(());
                     return;
@@ -357,8 +451,11 @@ pub async fn run(
                             last_write_err = Some(now);
                         }
                         let reopen_cfg = w.cfg.clone();
-                        if let Ok(fresh) = Writer::open(reopen_cfg).await {
-                            *w = fresh;
+                        if let Ok(fresh) =
+                            Writer::open_with_archiver(reopen_cfg, w.archiver.clone()).await
+                        {
+                            w.file = fresh.file;
+                            w.size = fresh.size;
                         }
                     } else {
                         wrote_line = true;
@@ -381,8 +478,11 @@ pub async fn run(
                             // the BufWriter; reopen so the next write starts on a
                             // clean line and does not append after corrupt output.
                             let reopen_cfg = w.cfg.clone();
-                            if let Ok(fresh) = Writer::open(reopen_cfg).await {
-                                *w = fresh;
+                            if let Ok(fresh) =
+                                Writer::open_with_archiver(reopen_cfg, w.archiver.clone()).await
+                            {
+                                w.file = fresh.file;
+                                w.size = fresh.size;
                             }
                         }
                     }
@@ -399,19 +499,23 @@ pub async fn run(
                 let _ = w.flush().await;
             }
         }
+        if let Some(w) = writer.as_mut() {
+            w.reap_archive_jobs();
+        }
     }
 
     // All senders dropped: flush whatever is buffered before exiting.
     if let Some(w) = writer.as_mut() {
         let _ = w.flush().await;
+        w.finish_archive_jobs().await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::oneshot;
 
     /// Build a temp dir under the OS temp root (no extra deps), unique per test.
@@ -436,11 +540,7 @@ mod tests {
     }
 
     fn logger_state() -> crate::LoggerState {
-        Arc::new(crate::LoggerStateInner {
-            depth: AtomicU64::new(0),
-            gone: AtomicBool::new(false),
-            dropped: AtomicU64::new(0),
-        })
+        Arc::new(crate::LoggerStateInner::new())
     }
 
     async fn shutdown(tx: &mpsc::UnboundedSender<Msg>) {
@@ -568,6 +668,132 @@ mod tests {
         std::io::Read::read_to_string(&mut dec, &mut text).unwrap();
         assert!(text.contains("event number"));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_archive_keeps_writer_responsive_and_shutdown_waits() {
+        let dir = temp_dir("async-archive");
+        let path = dir.join("access.log");
+        let cfg = RollConfig {
+            path: path.clone(),
+            rolling_size: 64,
+            keep_days: 0,
+            compress_archive: true,
+        };
+        let (started_tx, started_rx) = oneshot::channel();
+        let started_tx = Arc::new(StdMutex::new(Some(started_tx)));
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let release_rx = Arc::new(StdMutex::new(release_rx));
+        let archiver: Archiver = Arc::new({
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            move |src| {
+                if let Some(started) = started_tx.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("test releases delayed archive job");
+                gzip_file(src)
+            }
+        });
+        let state = logger_state();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let h = tokio::spawn(run_with_archiver(cfg, rx, state.clone(), None, archiver));
+
+        let queue = |line: &str| {
+            state
+                .depth
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tx.send(Msg::Line(line.to_string())).unwrap();
+        };
+        queue(&"trigger".repeat(12));
+        tokio::time::timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("archive job starts")
+            .unwrap();
+
+        // The compressor is blocked, but the writer must keep draining and flush
+        // these lines to the freshly-opened live file.
+        queue("after one");
+        queue("after two");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let live = std::fs::read_to_string(&path).unwrap_or_default();
+                if state.depth.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    && live.contains("after one\nafter two\n")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("writer stays responsive while archive compression is delayed");
+        assert_eq!(state.dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+        let (ack_tx, mut ack_rx) = oneshot::channel();
+        tx.send(Msg::Shutdown(ack_tx)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut ack_rx)
+                .await
+                .is_err(),
+            "orderly shutdown must wait for an admitted archive job"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut ack_rx)
+            .await
+            .expect("shutdown completes after archive job")
+            .unwrap();
+        h.await.unwrap();
+
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "gz")),
+            "the admitted delayed archive is compressed before shutdown returns"
+        );
+        assert_eq!(state.depth.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(state.dropped.load(std::sync::atomic::Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn saturated_archive_slots_leave_the_plain_roll_intact() {
+        let dir = temp_dir("archive-saturated");
+        let live = dir.join("access.log");
+        let rolled = dir.join("access.log.2026_10_23_000000");
+        std::fs::write(&rolled, b"plain archive bytes\n").unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let archiver: Archiver = Arc::new({
+            let calls = calls.clone();
+            move |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+        });
+        let mut writer = Writer::open_with_archiver(
+            RollConfig {
+                path: live,
+                rolling_size: 0,
+                keep_days: 0,
+                compress_archive: true,
+            },
+            archiver,
+        )
+        .await
+        .unwrap();
+
+        assert!(!writer.schedule_archive(rolled.clone(), Arc::new(Semaphore::new(0)),));
+        writer.finish_archive_jobs().await;
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(std::fs::read(&rolled).unwrap(), b"plain archive bytes\n");
+        assert!(!with_gz(&rolled).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

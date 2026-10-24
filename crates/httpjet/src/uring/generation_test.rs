@@ -573,7 +573,7 @@ async fn http_candidate_replacement(
             old_address,
             1,
             tls.server.clone(),
-            false,
+            ClientAuth::None,
             None,
             Some(vec![listener]),
             pipeline_admission(holder.clone()),
@@ -719,7 +719,11 @@ async fn http_candidate_replacement(
                 new_address,
                 1,
                 tls.server.clone(),
-                require_client,
+                if require_client {
+                    ClientAuth::Required
+                } else {
+                    ClientAuth::None
+                },
                 None,
                 Some(vec![listener]),
                 pipeline_admission(holder.clone()),
@@ -989,7 +993,7 @@ async fn quic_owner_survives_trust_publication_and_requires_matching_policy() {
         1,
         Arc::new(initial_tls),
         bridge,
-        false,
+        ClientAuth::None,
         h3::H3RuntimeConfig::new(
             || {
                 (
@@ -1042,7 +1046,9 @@ async fn quic_owner_survives_trust_publication_and_requires_matching_policy() {
     let view = transaction.candidate_view(next.clone()).unwrap();
     let mut replacement_tls = (*FixtureTls::new(false).server).clone();
     replacement_tls.alpn_protocols = vec![b"h3".to_vec()];
-    let policy = h3::PreparedQuicPolicy::prepare(view, Arc::new(replacement_tls), true).unwrap();
+    let policy =
+        h3::PreparedQuicPolicy::prepare(view, Arc::new(replacement_tls), ClientAuth::Required)
+            .unwrap();
     let resources =
         crate::resource_generation::TransportResources::new(next.trust_epoch.clone(), Vec::new())
             .unwrap()
@@ -1129,7 +1135,7 @@ async fn live_quic_reload_pins_established_and_updates_fresh_connections() {
         1,
         h3::self_signed_config().unwrap(),
         bridge,
-        false,
+        ClientAuth::None,
         h3::H3RuntimeConfig::new(
             || {
                 (
@@ -1202,7 +1208,7 @@ async fn live_quic_reload_pins_established_and_updates_fresh_connections() {
     let policy = h3::PreparedQuicPolicy::prepare(
         crate::serving_generation::ServingView::candidate(holder.clone(), next.clone()),
         h3::self_signed_config().unwrap(),
-        false,
+        ClientAuth::None,
     )
     .unwrap();
     holder.store(next);

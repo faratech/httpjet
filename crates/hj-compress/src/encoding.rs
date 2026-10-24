@@ -212,14 +212,14 @@ pub fn encode_bytes(enc: Encoding, input: &[u8], levels: &Levels) -> Option<Vec<
     }
 }
 
-/// Maximum bytes decode_bytes will expand a compressed body to.
+/// Maximum bytes [`decode_bytes`] will expand a compressed body to.
 ///
 /// Set well above a realistic max cacheable object so normal content never
 /// hits the cap, but a decompression bomb (gzip of zeros, etc.) from a
 /// misbehaving upstream is stopped before it can exhaust both nodes' RAM.
-/// The page-cache max_obj_bytes default is 512 KiB; 16 MiB gives ample
-/// headroom for any legitimate object while keeping the worst-case allocation
-/// bounded.
+/// Callers with an independently enforced object limit can use
+/// [`decode_bytes_bounded`] instead. The default stays deliberately conservative
+/// for request bodies and other inputs without that stronger surrounding bound.
 pub const MAX_DECODE: u64 = 16 * 1024 * 1024; // 16 MiB
 
 /// Decompress a buffer encoded with `enc` back to identity bytes. Returns `None`
@@ -227,25 +227,31 @@ pub const MAX_DECODE: u64 = 16 * 1024 * 1024; // 16 MiB
 /// (so the caller can fall back to caching/serving the original encoded body
 /// rather than allocating unbounded memory from a hostile upstream).
 pub fn decode_bytes(enc: Encoding, input: &[u8]) -> Option<Vec<u8>> {
+    decode_bytes_bounded(enc, input, MAX_DECODE)
+}
+
+/// Decompress a buffer with an explicit output limit. `max` is inclusive: an
+/// identity body exactly at the caller's already-enforced object cap is valid,
+/// while one byte more is rejected without materializing the remaining stream.
+pub fn decode_bytes_bounded(enc: Encoding, input: &[u8], max: u64) -> Option<Vec<u8>> {
     use std::io::Read;
-    let cap = MAX_DECODE;
-    let initial = input.len().saturating_mul(3).max(64).min(cap as usize);
+    let cap = usize::try_from(max).unwrap_or(usize::MAX);
+    let read_cap = cap.saturating_add(1);
+    let initial = input.len().saturating_mul(3).max(64).min(cap);
     let mut out = Vec::with_capacity(initial);
     match enc {
         Encoding::Gzip => {
-            let mut decoder = flate2::read::GzDecoder::new(input).take(cap);
+            let mut decoder = flate2::read::GzDecoder::new(input).take(read_cap as u64);
             decoder.read_to_end(&mut out).ok()?;
-            // If we hit the cap, a full read_to_end can succeed but the body
-            // is truncated. Re-check by attempting one more byte.
-            if (out.len() as u64) == cap {
+            if out.len() > cap {
                 return None;
             }
             Some(out)
         }
         Encoding::Brotli => {
-            let mut decoder = brotli::Decompressor::new(input, 4096).take(cap);
+            let mut decoder = brotli::Decompressor::new(input, 4096).take(read_cap as u64);
             decoder.read_to_end(&mut out).ok()?;
-            if (out.len() as u64) == cap {
+            if out.len() > cap {
                 return None;
             }
             Some(out)
@@ -259,9 +265,9 @@ pub fn decode_bytes(enc: Encoding, input: &[u8]) -> Option<Vec<u8>> {
             // default cap (2^27 = 128 MiB) already bounds it, so this is defense-in-depth
             // against a malformed frame declaring an outsized window.
             reader.window_log_max(24).ok()?;
-            let mut decoder = reader.take(cap);
+            let mut decoder = reader.take(read_cap as u64);
             decoder.read_to_end(&mut out).ok()?;
-            if (out.len() as u64) == cap {
+            if out.len() > cap {
                 return None;
             }
             Some(out)
@@ -273,13 +279,21 @@ pub fn decode_bytes(enc: Encoding, input: &[u8]) -> Option<Vec<u8>> {
 /// gzip stream. Thin wrapper over `flate2` used by the buffered (`Body::Full`)
 /// path and tests.
 pub(crate) fn gzip_bytes_level(input: &[u8], level: u32) -> Vec<u8> {
+    let bound = input.len() + input.len() / 8 + 286;
+    exact_output(bound, |out| {
+        gzip_into(input, level, out);
+        Some(())
+    })
+    .unwrap_or_default()
+}
+
+fn gzip_into(input: &[u8], level: u32, out: &mut Vec<u8>) {
     use flate2::{Compress, Compression, FlushCompress, Status};
 
     // (#309) The raw-deflate workspace is pooled per thread (zstd already pooled
     // its context; GzEncoder built a fresh one per call). We emit the 10-byte gzip
     // header ourselves, run a Finish pass against a pre-reserved output bound,
     // then append CRC32 + ISIZE. Output is a standard RFC 1952 stream.
-    let mut out = Vec::with_capacity(input.len() + input.len() / 8 + 286);
     out.extend_from_slice(&[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff]);
     let mut crc = flate2::Crc::new();
     crc.update(input);
@@ -301,7 +315,7 @@ pub(crate) fn gzip_bytes_level(input: &[u8], level: u32) -> Vec<u8> {
         loop {
             let consumed = comp.total_in() as usize;
             let status = comp
-                .compress_vec(&input[consumed..], &mut out, FlushCompress::Finish)
+                .compress_vec(&input[consumed..], out, FlushCompress::Finish)
                 .expect("raw deflate into a Vec cannot fail");
             match status {
                 Status::StreamEnd => break,
@@ -313,7 +327,45 @@ pub(crate) fn gzip_bytes_level(input: &[u8], level: u32) -> Vec<u8> {
     });
     out.extend_from_slice(&crc.sum().to_le_bytes());
     out.extend_from_slice(&(input.len() as u32).to_le_bytes());
-    out
+}
+
+/// Largest output bound [`exact_output`] serves from its per-thread scratch buffer;
+/// bigger outputs allocate their bound directly, as before.
+const SCRATCH_MAX: usize = 512 * 1024;
+
+thread_local! {
+    static OUT_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Run `fill` against an empty buffer with at least `bound` bytes of room and return what it
+/// wrote. Codecs need room for their worst case (about the input size) but write only the
+/// compressed bytes: a fresh bound-sized output faulted in new pages on every response under
+/// prod's immediate mimalloc purge, and the body then pinned the whole bound. A resident
+/// per-thread scratch takes the writes and the result is copied out at its exact size.
+pub(crate) fn exact_output<F>(bound: usize, fill: F) -> Option<Vec<u8>>
+where
+    F: FnOnce(&mut Vec<u8>) -> Option<()>,
+{
+    let mut fill = Some(fill);
+    if bound <= SCRATCH_MAX {
+        let pooled = OUT_SCRATCH
+            .try_with(|cell| {
+                let mut scratch = cell.try_borrow_mut().ok()?;
+                let fill = fill.take()?;
+                scratch.clear();
+                scratch.reserve(bound);
+                Some(fill(&mut scratch).map(|()| scratch.as_slice().to_vec()))
+            })
+            .ok()
+            .flatten();
+        if let Some(out) = pooled {
+            return out;
+        }
+    }
+    let fill = fill.take()?;
+    let mut out = Vec::with_capacity(bound);
+    fill(&mut out)?;
+    Some(out)
 }
 
 thread_local! {
@@ -368,7 +420,9 @@ pub(crate) fn zstd_bytes_level(input: &[u8], level: i32) -> Option<Vec<u8>> {
                 .ok()?;
             *capped = window.is_some();
         }
-        comp.compress(input).ok()
+        exact_output(zstd::zstd_safe::compress_bound(input.len()), |out| {
+            comp.compress_to_buffer(input, out).ok().map(drop)
+        })
     })
 }
 
@@ -395,6 +449,38 @@ mod tests {
     use super::*;
     use flate2::read::GzDecoder;
     use std::io::Read;
+
+    #[test]
+    fn compressed_output_is_exact_sized() {
+        let input = b"<p>hello world</p>".repeat(4000);
+        let z = zstd_bytes_level(&input, 3).unwrap();
+        assert_eq!(z.capacity(), z.len());
+        assert_eq!(decode_bytes(Encoding::Zstd, &z).unwrap(), input);
+        let g = gzip_bytes_level(&input, 6);
+        assert_eq!(g.capacity(), g.len());
+        assert_eq!(decode_bytes(Encoding::Gzip, &g).unwrap(), input);
+    }
+
+    #[test]
+    fn exact_output_nests_and_falls_back_above_the_scratch_cap() {
+        let out = exact_output(64, |outer| {
+            outer.extend_from_slice(b"a");
+            let inner = exact_output(64, |i| {
+                i.extend_from_slice(b"b");
+                Some(())
+            })?;
+            outer.extend_from_slice(&inner);
+            Some(())
+        });
+        assert_eq!(out.as_deref(), Some(&b"ab"[..]));
+        let big = exact_output(SCRATCH_MAX + 1, |o| {
+            o.push(1);
+            Some(())
+        })
+        .unwrap();
+        assert_eq!(big, [1]);
+        assert!(exact_output(8, |_| None).is_none());
+    }
 
     /// (#275) `AcceptEncoding::parse(..).negotiate(..)` (and the
     /// `negotiate_with` wrapper) must agree with a VERBATIM reference copy of

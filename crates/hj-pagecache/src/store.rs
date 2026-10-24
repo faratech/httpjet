@@ -4407,6 +4407,48 @@ mod tests {
     }
 
     #[test]
+    fn page_purge_all_preserves_static_entries() {
+        let source = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(source.path(), b"static-survivor").unwrap();
+        let file_id = FileId::stat(source.path()).unwrap();
+        let store = PageStore::new(cfg());
+        let page_key = PageCacheKey::public(1, true, "example.com", "/page", "");
+        assert!(store.store(
+            page_key.clone(),
+            entry_id(
+                b"page",
+                &["T"],
+                Duration::from_secs(60),
+                "example.com\n/page",
+            ),
+        ));
+        assert!(store.store_static(
+            7,
+            source.path(),
+            file_id,
+            Bytes::from_static(b"static-survivor"),
+            Arc::<str>::from("text/plain"),
+            "\"static\"".to_string(),
+            "Thu, 01 Jan 1970 00:00:00 GMT".to_string(),
+        ));
+
+        store.purge_all();
+
+        assert!(matches!(
+            store.get_entry_uncounted(&page_key, "example.com\n/page", Instant::now()),
+            EntryState::Miss
+        ));
+        let static_entry = store
+            .get_static(7, source.path(), &file_id, Instant::now())
+            .expect("an application page purge must preserve the static cache");
+        assert_eq!(
+            store.static_body_bytes(&static_entry).unwrap().as_ref(),
+            b"static-survivor"
+        );
+        assert_eq!(store.entry_count(), 1);
+    }
+
+    #[test]
     fn static_file_tier_restores_only_when_source_matches() {
         let dir = tempfile::tempdir().unwrap();
         let source = tempfile::NamedTempFile::new().unwrap();

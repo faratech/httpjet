@@ -1,4 +1,4 @@
-use hj_compress::{Encoding, Levels, MAX_DECODE, decode_bytes, encode_bytes};
+use hj_compress::{Encoding, Levels, MAX_DECODE, decode_bytes, decode_bytes_bounded, encode_bytes};
 
 /// Build a highly compressible payload that decodes to more than MAX_DECODE
 /// bytes and verify decode_bytes returns None rather than allocating the full
@@ -61,4 +61,30 @@ fn malformed_input_returns_none() {
     assert!(decode_bytes(Encoding::Gzip, garbage).is_none());
     assert!(decode_bytes(Encoding::Zstd, garbage).is_none());
     assert!(decode_bytes(Encoding::Brotli, garbage).is_none());
+}
+
+#[test]
+fn caller_bound_can_admit_a_larger_prebounded_object() {
+    let data = vec![b'x'; (MAX_DECODE + 1) as usize];
+    let encoded = encode_bytes(Encoding::Gzip, &data, &Levels::default()).expect("encode");
+    assert!(decode_bytes(Encoding::Gzip, &encoded).is_none());
+    assert_eq!(
+        decode_bytes_bounded(Encoding::Gzip, &encoded, MAX_DECODE + 1)
+            .expect("caller-specific cap admits the object"),
+        data
+    );
+}
+
+#[test]
+fn explicit_bound_is_inclusive() {
+    let data = vec![b'x'; 1024];
+    for enc in [Encoding::Gzip, Encoding::Brotli, Encoding::Zstd] {
+        let encoded = encode_bytes(enc, &data, &Levels::default()).expect("encode");
+        assert_eq!(
+            decode_bytes_bounded(enc, &encoded, data.len() as u64).expect("exact cap"),
+            data,
+            "{enc:?}"
+        );
+        assert!(decode_bytes_bounded(enc, &encoded, data.len() as u64 - 1).is_none());
+    }
 }

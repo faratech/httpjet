@@ -212,6 +212,15 @@ where
     Ok(())
 }
 
+/// Whether `chain`'s own env phase can change its access verdict: some file writes
+/// env (`SetEnv`/`UnsetEnv`/`SetEnvIf`) and some `Allow/Deny from env=` reads it.
+pub(super) fn chain_env_feeds_access(chain: &[Arc<Htaccess>]) -> bool {
+    chain.iter().any(|ht| ht.access_reads_env())
+        && chain
+            .iter()
+            .any(|ht| ht.has_set_env() || !ht.set_env_if.is_empty())
+}
+
 /// The `<If "%{REQUEST_URI} …">` subject for `path` whose collapsed form is
 /// `rel`: [`normalized_request_path`](super::rewrite_glue::normalized_request_path)
 /// without collapsing twice, keeping the trailing `/` that `rel` drops (#979).
@@ -371,6 +380,45 @@ pub(super) fn apply_response_headers_for_target(
     }
 }
 
+/// Attach the effective `.htaccess` expiry decision to a static 200/206/304. The
+/// response transform consumes it after authorization sensitivity is known.
+pub(super) fn attach_expires_decision(
+    chain: &[Arc<Htaccess>],
+    rel_path: &str,
+    target_basename: Option<&str>,
+    request_path: &str,
+    resp: &mut Response,
+) {
+    if !matches!(
+        resp.status(),
+        http::StatusCode::OK | http::StatusCode::PARTIAL_CONTENT | http::StatusCode::NOT_MODIFIED
+    ) || resp
+        .extensions()
+        .get::<hj_static::ResolvedTargetPath>()
+        .is_none()
+    {
+        return;
+    }
+    let Some(content_type) = resp
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    let basename = target_basename.unwrap_or_else(|| rel_path.rsplit('/').next().unwrap_or(""));
+    let decision = hj_rewrite::expires_decision(
+        chain.iter().map(AsRef::as_ref),
+        rel_path,
+        request_path,
+        basename,
+        content_type,
+    );
+    if decision != hj_rewrite::ExpiresDecision::Inherit {
+        resp.extensions_mut().insert(decision);
+    }
+}
+
 /// Apache `AddDefaultCharset`: append `; charset=<cs>` to a `text/html` or
 /// `text/plain` `Content-Type` that carries no charset parameter.
 fn apply_default_charset(resp: &mut Response, charset: &str) {
@@ -465,6 +513,48 @@ mod tests {
     use super::super::rewrite_glue::resolved_rel_path;
     use super::*;
     use hj_rewrite::HeaderOp;
+
+    #[test]
+    fn expires_decision_attaches_only_to_static_cacheable_statuses() {
+        let chain = vec![Arc::new(
+            Htaccess::parse("ExpiresActive On\nExpiresDefault \"access 2 days\"\n").unwrap(),
+        )];
+        let response = || {
+            let mut response = Response::new(hj_core::Body::Full(bytes::Bytes::from_static(b"x")));
+            response
+                .headers_mut()
+                .insert(http::header::CONTENT_TYPE, "text/plain".parse().unwrap());
+            response
+        };
+
+        let mut dynamic = response();
+        attach_expires_decision(&chain, "/x.txt", None, "/x.txt", &mut dynamic);
+        assert!(
+            dynamic
+                .extensions()
+                .get::<hj_rewrite::ExpiresDecision>()
+                .is_none()
+        );
+
+        for status in [
+            http::StatusCode::OK,
+            http::StatusCode::PARTIAL_CONTENT,
+            http::StatusCode::NOT_MODIFIED,
+        ] {
+            let mut static_response = response();
+            *static_response.status_mut() = status;
+            static_response
+                .extensions_mut()
+                .insert(hj_static::ResolvedTargetPath("/tmp/x.txt".into()));
+            attach_expires_decision(&chain, "/x.txt", None, "/x.txt", &mut static_response);
+            assert!(matches!(
+                static_response
+                    .extensions()
+                    .get::<hj_rewrite::ExpiresDecision>(),
+                Some(hj_rewrite::ExpiresDecision::Rule { .. })
+            ));
+        }
+    }
 
     /// Fold a string [`HeaderOp`] through [`apply_header`], parsing its name here.
     fn apply_header_op(resp: &mut Response, op: &HeaderOp) {

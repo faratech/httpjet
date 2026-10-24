@@ -142,6 +142,15 @@ impl RuleSet {
         self.reads_user_agent
     }
 
+    /// The substitutions of `[P]` rules whose upstream host the request can choose
+    /// (see [`proxy_authority_substituted`]).
+    pub fn substituted_proxy_authorities(&self) -> impl Iterator<Item = &str> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.flags.proxy && proxy_authority_substituted(&rule.subst))
+            .map(|rule| rule.subst.as_str())
+    }
+
     /// Restart-stable identity of this ruleset's UA conds, for keys that outlive the
     /// process (the persistent page cache). [`Self::id`] is process-local.
     pub fn ua_fingerprint(&self) -> u64 {
@@ -540,7 +549,29 @@ pub enum RewriteOutcome {
         /// upstream leg. Not recorded as an env var.
         proxy_host: Option<String>,
         env: Vec<(String, String)>,
+        /// The upstream's scheme or authority came from a substitution, so the
+        /// request may have chosen the host (see [`proxy_authority_substituted`]).
+        authority_substituted: bool,
     },
+}
+
+/// Whether a `[P]` substitution's scheme or authority is built from a `$N`, `%N`,
+/// `%{…}` or `${…}` expansion rather than literal text, i.e. whether the request
+/// can choose the upstream host.
+pub fn proxy_authority_substituted(subst: &str) -> bool {
+    if subst == "-" {
+        return false;
+    }
+    let Some(scheme_end) = subst.find("://") else {
+        return true;
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = subst[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(subst.len(), |end| authority_start + end);
+    subst.as_bytes()[..authority_end]
+        .windows(2)
+        .any(|pair| matches!(pair[0], b'$' | b'%') && (pair[1].is_ascii_digit() || pair[1] == b'{'))
 }
 
 impl RewriteOutcome {

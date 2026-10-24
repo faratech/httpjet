@@ -360,6 +360,9 @@ impl Htaccess {
                 "cachekeymodify" => {
                     h.cache_key_modifiers.extend(parse_cache_key_modify(rest));
                 }
+                "expiresactive" | "expiresdefault" | "expiresbytype" => {
+                    record_expires(&mut h, &section_stack, &dlow, rest);
+                }
                 "directoryindex" => {
                     // Apache mod_dir: a single `disabled` argument turns the index
                     // search off; next to other names it is a literal file name.
@@ -708,6 +711,7 @@ fn record_legacy_access(
             if entries.iter().any(|e| !matches!(e, HostEntry::All)) {
                 h.memo.block(lineno, "access_ip_or_env");
             }
+            h.access_reads_env |= entries.iter().any(|e| matches!(e, HostEntry::Env { .. }));
             for e in entries.iter().filter(|e| e.is_unevaluable()) {
                 tracing::warn!(
                     line = lineno,
@@ -835,6 +839,44 @@ fn access_matchers<'a>(
     Some(matchers)
 }
 
+fn record_expires(h: &mut Htaccess, stack: &[PendingSection], directive: &str, rest: &str) {
+    let mut kind = match directive {
+        "expiresactive" => match tokenize(rest).as_slice() {
+            [value] if value.eq_ignore_ascii_case("on") => ExpiresDirectiveKind::Active(true),
+            [value] if value.eq_ignore_ascii_case("off") => ExpiresDirectiveKind::Active(false),
+            _ => ExpiresDirectiveKind::Unsafe,
+        },
+        "expiresdefault" => hj_compress::ExpiresRule::parse(&unquote(rest))
+            .map(ExpiresDirectiveKind::Default)
+            .unwrap_or(ExpiresDirectiveKind::Unsafe),
+        "expiresbytype" => {
+            let tokens = tokenize(rest);
+            match tokens.split_first() {
+                Some((mime, spec)) if !spec.is_empty() => ExpiresTypeGlob::parse(mime)
+                    .zip(hj_compress::ExpiresRule::parse(&spec.join(" ")))
+                    .map(|(glob, rule)| ExpiresDirectiveKind::ByType { glob, rule })
+                    .unwrap_or(ExpiresDirectiveKind::Unsafe),
+                _ => ExpiresDirectiveKind::Unsafe,
+            }
+        }
+        _ => ExpiresDirectiveKind::Unsafe,
+    };
+
+    let mut scopes = Vec::new();
+    for section in stack {
+        if let Some(scope) = &section.scope {
+            scopes.push(ExpiresScope::Standard(scope.clone()));
+        } else if let Some(regex) = &section.expires_location {
+            scopes.push(ExpiresScope::LocationMatch(regex.clone()));
+        } else if !section.kind_name.eq_ignore_ascii_case("ifmodule") {
+            kind = ExpiresDirectiveKind::Unsafe;
+            scopes.clear();
+            break;
+        }
+    }
+    h.expires.push(ExpiresDirective { kind, scopes });
+}
+
 // ===========================================================================
 // Section parsing
 // ===========================================================================
@@ -850,6 +892,9 @@ struct PendingSection {
     /// The scope a directive (e.g. `Header`) inside this block inherits. Set for
     /// `<Files*>`/`<Directory*>` and for the common `<If "%{REQUEST_URI} ...">`.
     scope: Option<Scope>,
+    /// A LocationMatch matcher used only by Expires directives. Other
+    /// directives retain their existing treatment of LocationMatch.
+    expires_location: Option<Option<Regex>>,
     /// `<Limit>`/`<LimitExcept>`: the method matcher ANDed into enclosed access rules.
     method: Option<AccessMatcher>,
     /// `<RequireAll>`/`<RequireAny>`/`<RequireNone>`: enclosed `Require` verdicts
@@ -935,6 +980,12 @@ impl PendingSection {
         let (tag, args) = split_first(inner);
         let kind_name = tag.to_string();
         let tag_low = tag.to_ascii_lowercase();
+        let expires_location = (tag_low == "locationmatch").then(|| {
+            let pattern = unquote(args.trim());
+            (!pattern.is_empty())
+                .then(|| Regex::new(&crate::rules::pcre_literal_escapes(&pattern)).ok())
+                .flatten()
+        });
         let kind = match tag_low.as_str() {
             "files" => Some(SectionKind::Files),
             "filesmatch" => Some(SectionKind::FilesMatch),
@@ -1071,6 +1122,7 @@ impl PendingSection {
             auth_matcher: auth_section_matcher(kind, &tag_low, args),
             lineno,
             scope,
+            expires_location,
             method,
             require_kind,
             require_children: Vec::new(),

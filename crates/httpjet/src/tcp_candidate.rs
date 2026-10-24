@@ -13,7 +13,7 @@ pub(crate) struct TcpTlsPolicy {
     listener: crate::uring::worker_group::TcpListenerId,
     config: Arc<rustls::ServerConfig>,
     quic: Option<Arc<rustls::ServerConfig>>,
-    require_client_cert: bool,
+    client_auth: uring::ClientAuth,
     ktls: Option<Arc<hj_tls::KtlsConfigTemplate>>,
     certificates: hj_tls::CertReloadHandle,
     #[cfg(feature = "ocsp")]
@@ -40,7 +40,7 @@ impl TcpTlsPolicy {
         if !identity.tls || matches.next().is_some() {
             anyhow::bail!("candidate TLS listener identity is ambiguous");
         }
-        let require_client_cert = listener.tls.as_ref().is_some_and(|t| t.client_verify == 2);
+        let client_auth = uring::ClientAuth::for_listener(listener);
         let bundle = hj_tls::PreparedListenerTls::prepare(
             &candidate.server,
             listener,
@@ -53,7 +53,7 @@ impl TcpTlsPolicy {
             listener: identity,
             config: bundle.tcp,
             quic: bundle.quic,
-            require_client_cert,
+            client_auth,
             ktls: bundle.ktls.map(Arc::new),
             certificates: bundle.certificates,
             #[cfg(feature = "ocsp")]
@@ -136,11 +136,7 @@ pub(crate) fn prepare(
             .quic
             .clone()
             .map(|config| {
-                uring::h3::PreparedQuicPolicy::prepare(
-                    view.clone(),
-                    config,
-                    policy.require_client_cert,
-                )
+                uring::h3::PreparedQuicPolicy::prepare(view.clone(), config, policy.client_auth)
             })
             .transpose()?,
         None => None,
@@ -179,7 +175,7 @@ pub(crate) fn prepare(
             target.address,
             acquired.listeners.len(),
             tls.config,
-            tls.require_client_cert,
+            tls.client_auth,
             tls.ktls,
             Some(acquired.listeners),
             admission.clone(),

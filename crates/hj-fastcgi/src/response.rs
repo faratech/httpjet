@@ -88,7 +88,8 @@ pub fn parse_cgi_head(
                 | "upgrade"
                 | "te"
                 | "trailer"
-        ) {
+        ) || is_origin_cache_control(&name)
+        {
             continue;
         }
         headers.append(
@@ -108,6 +109,23 @@ pub fn parse_cgi_head(
         headers,
         body_prefix: bytes.slice(head_len..),
     })
+}
+
+/// Origin page-cache and CDN-redirect directives only the trusted LSAPI application may
+/// assert, the same set the reverse proxy strips: a FastCGI application emitting
+/// `X-LiteSpeed-Purge: *` would wipe the shared store, and the opt-in headers would cache
+/// arbitrary responses for every vhost visitor. `.htaccess` `Header set` still applies.
+fn is_origin_cache_control(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "x-litespeed-purge"
+            | "x-litespeed-cache-control"
+            | "x-litespeed-tag"
+            | "x-litespeed-vary"
+            | "x-wf-capsule"
+            | "x-wf-capsule-tags"
+            | "x-cache-optimizer"
+    )
 }
 
 /// Return the application status from a successful END_REQUEST record. The
@@ -134,6 +152,28 @@ mod tests {
         assert_eq!(parsed.status, 201);
         assert_eq!(parsed.headers.get_all("set-cookie").iter().count(), 2);
         assert_eq!(parsed.body_prefix, "body");
+    }
+
+    #[test]
+    fn origin_cache_control_headers_are_dropped() {
+        let parsed = parse_cgi_head(
+            Bytes::from_static(
+                b"Content-Type: text/html\r\n\
+                  X-LiteSpeed-Purge: *\r\n\
+                  X-LiteSpeed-Cache-Control: public,max-age=3600\r\n\
+                  X-LiteSpeed-Tag: T1\r\n\
+                  X-LiteSpeed-Vary: cookie=a\r\n\
+                  X-WF-Capsule: public-shell\r\n\
+                  X-WF-Capsule-Tags: t\r\n\
+                  X-Cache-Optimizer: redirect\r\n\
+                  Cache-Control: public, max-age=60\r\n\r\n",
+            ),
+            4096,
+            16,
+        )
+        .unwrap();
+        let names: Vec<&str> = parsed.headers.keys().map(|n| n.as_str()).collect();
+        assert_eq!(names, ["content-type", "cache-control"]);
     }
 
     #[test]

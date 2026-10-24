@@ -398,8 +398,11 @@ fn body_bytes(body: Body) -> bytes::Bytes {
     }
 }
 
-async fn run(state: &Arc<ServerState>, req: Request) -> Response {
-    handle(
+fn run(
+    state: &Arc<ServerState>,
+    req: Request,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    Box::pin(handle(
         state.clone(),
         LISTENER,
         IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -407,13 +410,12 @@ async fn run(state: &Arc<ServerState>, req: Request) -> Response {
         40000,
         false, // is_tls
         false, // peer_unix
-        false, // mtls_required
+        false, // client_auth_requested
         None,  // tls
         Proto::Http1,
         None, // sni
         req,
-    )
-    .await
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1314,6 +1316,76 @@ fn register_upstream(server: &mut ServerConfig, address: SocketAddr) {
     });
 }
 
+/// A `[P]` whose upstream host the request chose (a substitution in the authority)
+/// never receives the visitor's Cookie or Authorization; a literal upstream does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn substituted_proxy_authority_withholds_credentials() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let echo = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{echo}",
+                echo.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        }
+    });
+
+    let root = temp_root("p-substituted-authority");
+    std::fs::write(
+        root.join(".htaccess"),
+        format!(
+            "RewriteEngine On\n\
+             RewriteRule ^lit$ http://{address}/lit [P,L]\n\
+             RewriteCond %{{HTTP:X-Up}} (.+)\n\
+             RewriteRule ^dyn$ http://%1/dyn [P,L]\n"
+        ),
+    )
+    .unwrap();
+    let state = build_state_inner(root, Vec::new(), Vec::new(), true, None, None, |server| {
+        register_upstream(server, address)
+    });
+    let upstream_host = address.to_string();
+    for (path, forwarded) in [("/lit", true), ("/dyn", false)] {
+        let request = get_with(
+            CANON_HOST,
+            path,
+            &[
+                ("Cookie", "sid=secret"),
+                ("Authorization", "Basic dXNlcjpwYXNz"),
+                ("Proxy-Authorization", "Basic dXNlcjpwYXNz"),
+                ("X-Up", &upstream_host),
+            ],
+        );
+        let response = run(&state, request).await;
+        assert_eq!(response.status(), http::StatusCode::OK, "{path}");
+        let echo = response_text(response).await;
+        assert!(echo.starts_with(&format!("get {path} ")), "{echo}");
+        assert_eq!(echo.contains("sid=secret"), forwarded, "{path}: {echo}");
+        assert_eq!(
+            echo.contains("\r\nauthorization:"),
+            forwarded,
+            "{path}: {echo}"
+        );
+        assert!(!echo.contains("proxy-authorization"), "{path}: {echo}");
+    }
+    upstream.abort();
+}
+
 /// Regression (#658): a cached redirect is never answered 304 (RFC 9110 §13.2.1), and an
 /// empty-body redirect gets no synthesized body-hash ETag that every redirect would share.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1386,6 +1458,120 @@ async fn cached_redirect_ignores_if_none_match() {
     let response = run(&state, get(CANON_HOST, "/plain", Some("*"))).await;
     assert_eq!(response.status(), http::StatusCode::MOVED_PERMANENTLY);
     upstream.abort();
+}
+
+/// An Origin whose vary digest collides with a legitimate one must render its own entry: under
+/// the former unkeyed FNV-1a-64 fold the victim Origin was a HIT on the attacker's render and
+/// received the attacker's reflected `Access-Control-Allow-Origin`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn colliding_origins_never_share_a_page_cache_entry() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let origin = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("origin")
+                        .then(|| value.trim().to_owned())
+                })
+                .unwrap_or_default();
+            let body = format!("render for {origin}");
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: text/html\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        }
+    });
+    let root = temp_root("pc-origin-collision");
+    std::fs::write(
+        root.join(".htaccess"),
+        format!(
+            "CacheLookup public on\n\
+             SetEnvIf Origin \"^https://(windowsforum\\.com|.*\\.windowsforum\\.com|www\\.google\\.com)$\" ORIGIN_ALLOWED=$0\n\
+             Header set Access-Control-Allow-Origin \"%{{ORIGIN_ALLOWED}}e\" env=ORIGIN_ALLOWED\n\
+             RewriteEngine On\n\
+             RewriteRule ^/?(.*)$ http://{address}/$1 [P,L]\n\
+             Header set X-LiteSpeed-Cache-Control public,max-age=60\n"
+        ),
+    )
+    .unwrap();
+    let store = Arc::new(hj_pagecache::PageStore::new(
+        hj_pagecache::StoreConfig::default(),
+    ));
+    let state = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(store.clone()),
+        None,
+        |server| register_upstream(server, address),
+    );
+    let fetch = |path: &'static str, origin: &'static str| {
+        let state = state.clone();
+        async move {
+            let response = run(&state, get_with(CANON_HOST, path, &[("origin", origin)])).await;
+            assert_eq!(response.status(), http::StatusCode::OK, "{origin}");
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            let (cache, acao) = (
+                header("x-litespeed-cache"),
+                header("access-control-allow-origin"),
+            );
+            let body = String::from_utf8(hop_body(response.into_body()).await).unwrap();
+            (cache, acao, body)
+        }
+    };
+    for (path, (attacker, victim)) in ["/a", "/b"]
+        .into_iter()
+        .zip(crate::lscache::FNV_COLLIDING_ORIGINS)
+    {
+        for _ in 0..2 {
+            let (_, acao, body) = fetch(path, attacker).await;
+            assert_eq!(acao.as_deref(), Some(attacker));
+            assert_eq!(body, format!("render for {attacker}"));
+        }
+        let (cache, _, _) = fetch(path, attacker).await;
+        assert_eq!(
+            cache.as_deref(),
+            Some("hit"),
+            "the attacker render is stored"
+        );
+        let (cache, acao, body) = fetch(path, victim).await;
+        assert_ne!(
+            cache.as_deref(),
+            Some("hit"),
+            "{victim} hit {attacker}'s entry"
+        );
+        assert_eq!(acao.as_deref(), Some(victim));
+        assert_eq!(body, format!("render for {victim}"));
+    }
+    upstream.abort();
+    std::fs::remove_dir_all(root).ok();
 }
 
 /// Regression (#938): two exact vhostMap aliases of one vhost whose backend renders the request
@@ -2020,6 +2206,7 @@ async fn waf_runs_before_static_cache_and_can_block_a_previously_allowed_path() 
     Arc::get_mut(&mut state).unwrap().waf = Some(Arc::new(
         crate::waf::Sidecar::new(
             address,
+            None,
             "/inspect".into(),
             std::time::Duration::from_secs(1),
             1024,
@@ -2056,6 +2243,7 @@ async fn waf_sidecar_failure_policy_is_closed_unless_explicitly_opened() {
         Arc::get_mut(&mut state).unwrap().waf = Some(Arc::new(
             crate::waf::Sidecar::new(
                 unavailable,
+                None,
                 "/inspect".into(),
                 std::time::Duration::from_millis(100),
                 1024,
@@ -3720,9 +3908,17 @@ RewriteRule ^.*$ index.php [NC,L]
         let second = serve(&state, req("/a.css", &[ua])).await;
         assert_eq!((stores(&state), hits(&state)), (1, 1), "repeat key replays");
         assert_eq!(second.status(), first.status());
+        // fast_serve's caller stamps Date on the original; a replay carries its own.
+        let mut first_headers = first.headers().clone();
+        first_headers.remove(http::header::DATE);
+        let mut second_headers = second.headers().clone();
         assert_eq!(
-            second.headers(),
-            first.headers(),
+            second_headers.remove(http::header::DATE),
+            Some(hj_core::http_date_now()),
+            "a replay carries a fresh Date"
+        );
+        assert_eq!(
+            second_headers, first_headers,
             "replayed headers are identical"
         );
         let (a, b) = (
@@ -3970,7 +4166,7 @@ async fn geo_acl_denies_by_resolved_client_ip() {
     });
 
     // Mode-2 real-IP resolution only honors forwarded headers on the TLS path
-    // (run_tls sets is_tls=true, mtls_required=false — the CF-over-TLS shape).
+    // (run_tls sets is_tls=true, client_auth_requested=false — the CF-over-TLS shape).
     let denied = get_with(
         CANON_HOST,
         "/page.html",
@@ -4040,7 +4236,7 @@ async fn client_throttle_uses_resolved_forwarded_identity() {
     );
 }
 
-fn forwarded_deny_state(tag: &str) -> (PathBuf, Arc<ServerState>) {
+pub(crate) fn forwarded_deny_state(tag: &str) -> (PathBuf, Arc<ServerState>) {
     let doc_root = temp_root(tag);
     std::fs::write(doc_root.join("page.html"), b"<html>ok</html>").unwrap();
     std::fs::write(doc_root.join("other.html"), b"<html>other</html>").unwrap();
@@ -4231,7 +4427,7 @@ async fn run_tls(state: &Arc<ServerState>, req: Request) -> Response {
         40000,
         true,  // is_tls
         false, // peer_unix
-        false, // mtls_required
+        false, // client_auth_requested
         None,  // tls
         Proto::Http1,
         None, // sni
@@ -4330,11 +4526,9 @@ async fn sub_filter_once_replaces_first_occurrence_only() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sub_filter_paths_never_memoize_and_stay_consistent() {
-    // The memo stores POST-transform bytes and a memo hit re-runs the
-    // transforms — a replacement containing its own search string would
-    // substitute twice on the second serve. sub_filter paths must therefore
-    // never enter the memo, and every serve must produce identical bytes.
+async fn sub_filter_paths_memoize_final_bytes_without_double_substitution() {
+    // The memo stores the final response and replays it without transforms. A
+    // non-idempotent replacement proves a hit cannot apply the filter twice.
     let doc_root = temp_root("subfilter-memo");
     std::fs::create_dir_all(doc_root.join("sub")).unwrap();
     std::fs::write(doc_root.join("sub/index.html"), b"a b a").unwrap();
@@ -4354,17 +4548,29 @@ async fn sub_filter_paths_never_memoize_and_stay_consistent() {
             .fast_memo_stores
             .load(std::sync::atomic::Ordering::Relaxed)
     };
+    let hits = || {
+        state
+            .metrics
+            .fast_memo_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let stores_before = stores();
+    let hits_before = hits();
     let first = fast_serve_get(&state, "/sub/").await;
     let first = first.expect("first serve");
     assert_eq!(body_bytes(first.into_body()), "ab b ab");
-    assert_eq!(stores(), 0, "a sub_filter path must never enter the memo");
+    assert!(
+        stores() > stores_before,
+        "filtered response was not memoized"
+    );
     let second = fast_serve_get(&state, "/sub/").await;
     let second = second.expect("second serve");
     assert_eq!(
         body_bytes(second.into_body()),
         "ab b ab",
-        "byte-identical re-serve"
+        "memo hit must replay final bytes without filtering twice"
     );
+    assert!(hits() > hits_before, "second serve did not hit fast memo");
 }
 
 #[test]
@@ -4382,23 +4588,121 @@ fn apply_sub_filter_rules_are_ordered_and_literal() {
     let out = apply_sub_filter(
         &plan(&[("aaa", "aba"), ("aba", "XYZ")], false),
         "aaa".into(),
-    );
+    )
+    .unwrap();
     assert_eq!(&out[..], b"XYZ");
 
     // once replaces only the first occurrence.
-    let out = apply_sub_filter(&plan(&[("a", "b")], true), "aa".into());
+    let out = apply_sub_filter(&plan(&[("a", "b")], true), "aa".into()).unwrap();
     assert_eq!(&out[..], b"ba");
 
     // An empty search string would insert everywhere — skipped by design.
-    let out = apply_sub_filter(&plan(&[("", "x")], false), "ab".into());
+    let out = apply_sub_filter(&plan(&[("", "x")], false), "ab".into()).unwrap();
     assert_eq!(&out[..], b"ab");
 
-    // Non-idempotent shapes are exactly why sub_filter paths never memoize:
-    // a replacement containing its own search would grow on every re-apply.
+    // Matches never overlap.
+    let out = apply_sub_filter(&plan(&[("aa", "b")], false), "aaaaa".into()).unwrap();
+    assert_eq!(&out[..], b"bba");
+
+    // A non-idempotent shape proves memo hits must replay finalized bytes without
+    // rerunning transforms: a replacement containing its search grows if reapplied.
     let plan = plan(&[("a", "ab")], false);
-    let once = apply_sub_filter(&plan, "a".into());
-    let twice = apply_sub_filter(&plan, once.clone());
+    let once = apply_sub_filter(&plan, "a".into()).unwrap();
+    let twice = apply_sub_filter(&plan, once.clone()).unwrap();
     assert_ne!(&once[..], &twice[..]);
+}
+
+/// Regression (#1141): every rule's output is sized before it is built, so an
+/// expanding rule (or rules compounding) past `max_body` yields `None` and the
+/// entity is served unfiltered instead of growing without bound.
+#[test]
+fn apply_sub_filter_refuses_output_past_the_cap() {
+    use super::apply_sub_filter;
+    let plan = |rules: &[(&str, &str)], max_body: u64| hj_core::config::SubFilterConfig {
+        rules: rules
+            .iter()
+            .map(|(s, r)| (s.to_string(), r.to_string()))
+            .collect(),
+        max_body,
+        ..hj_core::config::SubFilterConfig::default()
+    };
+    let expand = plan(&[("a", "aaaa")], 16);
+    assert_eq!(
+        &apply_sub_filter(&expand, "aaaa".into()).unwrap()[..],
+        b"aaaaaaaaaaaaaaaa"
+    );
+    assert!(apply_sub_filter(&expand, "aaaaa".into()).is_none());
+    // Each rule fits on its own; together they would pass the cap.
+    let compound = plan(&[("a", "aa"), ("a", "aa")], 10);
+    assert!(apply_sub_filter(&compound, "aaa".into()).is_none());
+    assert_eq!(
+        &apply_sub_filter(&compound, "aa".into()).unwrap()[..],
+        b"aaaaaaaa"
+    );
+    // A shrinking rule is never refused.
+    let shrink = plan(&[("aaaa", "")], 4);
+    assert_eq!(
+        &apply_sub_filter(&shrink, "aaaab".into()).unwrap()[..],
+        b"b"
+    );
+}
+
+/// Regression (#1141): a Full body over `max_body`, or one whose filtered output
+/// would pass it, is served unfiltered with its headers untouched.
+#[tokio::test]
+async fn sub_filter_full_body_past_the_cap_is_served_raw() {
+    use hj_core::ResponseTransform;
+    for (body, max_body, expect) in [
+        (&b"SEND"[..], 8, &b"RECEIVED"[..]),
+        (&b"SEND SEND"[..], 8, &b"SEND SEND"[..]),
+        (&b"SEND"[..], 7, &b"SEND"[..]),
+        (&b"xxxxxxxxxxSEND"[..], 8, &b"xxxxxxxxxxSEND"[..]),
+    ] {
+        let mut resp = http::Response::builder()
+            .status(200)
+            .header(header::CONTENT_TYPE, "text/html")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .header(header::ETAG, "\"e\"")
+            .body(hj_core::Body::Full(bytes::Bytes::copy_from_slice(body)))
+            .unwrap();
+        resp.extensions_mut().insert(html_plan(max_body));
+        crate::pipeline::SubFilterTransform
+            .transform(&ctx_for_transform(), &mut resp)
+            .await;
+        let filtered = expect != body;
+        assert_eq!(
+            resp.headers().contains_key(header::ETAG),
+            !filtered,
+            "{body:?}"
+        );
+        assert_eq!(
+            resp.headers()[header::CONTENT_LENGTH],
+            expect.len().to_string()
+        );
+        assert_eq!(
+            frames_of(resp.into_body()),
+            expect,
+            "{body:?} cap {max_body}"
+        );
+    }
+}
+
+/// Regression (#1141): a stream buffered within the cap whose filtered output
+/// would pass it replays unfiltered.
+#[tokio::test]
+async fn sub_filter_stream_expanding_past_the_cap_is_served_raw() {
+    use hj_core::ResponseTransform;
+    use http_body_util::BodyExt;
+    let mut resp = stream_response(hj_core::StreamBody::boxed(
+        http_body_util::Full::new(bytes::Bytes::from_static(b"SEND SEND"))
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed(),
+    ));
+    resp.extensions_mut().insert(html_plan(12));
+    crate::pipeline::SubFilterTransform
+        .transform(&ctx_for_transform(), &mut resp)
+        .await;
+    assert_eq!(frames_of(resp.into_body()), b"SEND SEND");
 }
 
 // ─── (Tier 2) SubFilterTransform stream handling: filter-within-cap, raw past it ───
@@ -4749,11 +5053,12 @@ fn apply_sub_filter_preserves_non_utf8_bytes() {
     let out = apply_sub_filter(
         &plan,
         bytes::Bytes::from_static(b"\xff prefix SEND suffix \xfe"),
-    );
+    )
+    .unwrap();
     assert_eq!(&out[..], b"\xff prefix RECEIVED suffix \xfe");
 
     let untouched = bytes::Bytes::from_static(b"\xff no match \xfe");
-    assert_eq!(apply_sub_filter(&plan, untouched.clone()), untouched);
+    assert_eq!(apply_sub_filter(&plan, untouched.clone()), Some(untouched));
 }
 
 fn body_limit_context(uri: &str, max_body: u64) -> Context {
@@ -8629,6 +8934,323 @@ async fn static_304_keeps_expires_by_type_headers() {
             assert!(resp.headers().contains_key(header::EXPIRES));
         }
     }
+    std::fs::remove_dir_all(root).ok();
+}
+
+fn assert_expiry_headers(response: &Response, status: u16, cache_control: &str) {
+    assert_eq!(response.status(), status);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], cache_control);
+    assert!(response.headers().contains_key(header::EXPIRES));
+}
+
+async fn assert_htaccess_expiring_responses(state: Arc<ServerState>) {
+    {
+        let response = run(&state, get(CANON_HOST, "/robots.txt", None)).await;
+        assert_expiry_headers(&response, 200, "public, max-age=172800");
+    }
+    {
+        let response = run(&state, get(CANON_HOST, "/default.webmanifest", None)).await;
+        assert_expiry_headers(&response, 200, "public, max-age=172800");
+    }
+    {
+        let response = run(
+            &state,
+            get_with(
+                CANON_HOST,
+                "/default.webmanifest",
+                &[("range", "bytes=0-1")],
+            ),
+        )
+        .await;
+        assert_expiry_headers(&response, 206, "public, max-age=172800");
+    }
+
+    let etag = {
+        let response = run(&state, get(CANON_HOST, "/logo.png", None)).await;
+        assert_expiry_headers(&response, 200, "public, max-age=31536000");
+        response.headers()[header::ETAG]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    {
+        let response = run(&state, get(CANON_HOST, "/logo.png", Some(&etag))).await;
+        assert_expiry_headers(&response, 304, "public, max-age=31536000");
+    }
+    {
+        let request = get(CANON_HOST, "/logo.png", Some(&etag));
+        let response = fast_serve_from(&state, IpAddr::V4(Ipv4Addr::LOCALHOST), &request)
+            .await
+            .expect("static 304 serves on-core");
+        assert_expiry_headers(&response, 304, "public, max-age=31536000");
+    }
+    {
+        let response = run(&state, get(CANON_HOST, "/pinned.txt", None)).await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "public, max-age=7"
+        );
+        assert!(!response.headers().contains_key(header::EXPIRES));
+    }
+    {
+        let response = run(
+            &state,
+            get_with(
+                CANON_HOST,
+                "/robots.txt",
+                &[("authorization", "Basic eA==")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert!(!response.headers().contains_key(header::EXPIRES));
+    }
+    {
+        let response = run(
+            &state,
+            get_with(CANON_HOST, "/robots.txt", &[("range", "bytes=0-1")]),
+        )
+        .await;
+        assert_expiry_headers(&response, 206, "public, max-age=172800");
+    }
+    {
+        let response = run(
+            &state,
+            get_with(CANON_HOST, "/logo.png", &[("range", "bytes=0-1")]),
+        )
+        .await;
+        assert_expiry_headers(&response, 206, "public, max-age=31536000");
+    }
+}
+
+async fn assert_htaccess_off_responses_and_memo(state: Arc<ServerState>) {
+    for path in ["/admin/tokens/app.txt", "/builds/bg.webp"] {
+        {
+            let response = run(&state, get(CANON_HOST, path, None)).await;
+            assert_eq!(response.status(), 200, "{path}");
+            assert!(
+                !response.headers().contains_key(header::CACHE_CONTROL),
+                "{path}"
+            );
+            assert!(!response.headers().contains_key(header::EXPIRES), "{path}");
+        }
+        {
+            let response = run(
+                &state,
+                get_with(CANON_HOST, path, &[("range", "bytes=0-1")]),
+            )
+            .await;
+            assert_eq!(response.status(), 206, "{path}");
+            assert!(
+                !response.headers().contains_key(header::CACHE_CONTROL),
+                "{path}"
+            );
+            assert!(!response.headers().contains_key(header::EXPIRES), "{path}");
+        }
+    }
+
+    let hits_before = state
+        .metrics
+        .fast_memo_hits
+        .load(std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..2 {
+        let response = fast_serve_get(&state, "/admin/tokens/app.txt")
+            .await
+            .expect("static child serves on-core");
+        assert!(!response.headers().contains_key(header::CACHE_CONTROL));
+        assert!(!response.headers().contains_key(header::EXPIRES));
+    }
+    assert!(
+        state
+            .metrics
+            .fast_memo_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > hits_before,
+        "the ExpiresActive Off response was not replayed through fast memo"
+    );
+}
+
+fn htaccess_expires_fixture() -> (PathBuf, Arc<ServerState>) {
+    let root = temp_root("htaccess-expires");
+    std::fs::create_dir_all(root.join("admin/tokens")).unwrap();
+    std::fs::create_dir_all(root.join("builds")).unwrap();
+    for (path, body) in [
+        ("robots.txt", b"robots".as_slice()),
+        ("logo.png", b"png"),
+        ("pinned.txt", b"pinned"),
+        ("default.webmanifest", b"manifest"),
+        ("admin/tokens/app.txt", b"private"),
+        ("builds/bg.webp", b"background"),
+    ] {
+        std::fs::write(root.join(path), body).unwrap();
+    }
+    std::fs::write(
+        root.join(".htaccess"),
+        r#"
+<IfModule mod_expires.c>
+ExpiresActive On
+ExpiresByType image/png "access 1 year"
+ExpiresByType text/plain "access 2 days"
+ExpiresDefault "access 2 days"
+</IfModule>
+<LocationMatch "^/builds/">
+ExpiresActive Off
+</LocationMatch>
+<Files "pinned.txt">
+Header set Cache-Control "public, max-age=7"
+</Files>
+"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("admin/tokens/.htaccess"), "ExpiresActive Off\n").unwrap();
+    let state = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        None,
+        None,
+        |config| {
+            config.expires = hj_core::config::ExpiresConfig {
+                enabled: true,
+                enable_declared: true,
+                by_type: vec![("text/plain".into(), "A60".into())],
+            };
+            config
+                .mime
+                .by_suffix
+                .insert("png".into(), "image/png".into());
+            config
+                .mime
+                .by_suffix
+                .insert("webp".into(), "image/webp".into());
+            config
+                .mime
+                .by_suffix
+                .insert("webmanifest".into(), "application/manifest+json".into());
+        },
+    );
+
+    (root, state)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn htaccess_expires_is_static_scoped_and_survives_fast_memo() {
+    let (root, state) = htaccess_expires_fixture();
+    tokio::spawn(assert_htaccess_off_responses_and_memo(state))
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn htaccess_expires_applies_default_type_status_and_precedence() {
+    let (root, state) = htaccess_expires_fixture();
+    tokio::spawn(assert_htaccess_expiring_responses(state))
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn htaccess_expires_rule_inherits_native_activation() {
+    // Native exact and wildcard entries are both ExpiresByType MIME settings,
+    // so each outranks the lower-level context's ExpiresDefault in OLS.
+    for (server_enabled, vhost_enabled, native_glob, expected_age) in [
+        (true, None, None, Some(172800)),
+        (true, None, Some("text/plain"), Some(60)),
+        (true, None, Some("*/*"), Some(60)),
+        (false, None, None, None),
+        (false, Some(true), None, Some(172800)),
+    ] {
+        let root = temp_root("htaccess-expires-native-parent");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::fs::write(root.join("child/a.txt"), b"body").unwrap();
+        std::fs::write(root.join(".htaccess"), "# parent\n").unwrap();
+        std::fs::write(
+            root.join("child/.htaccess"),
+            "ExpiresDefault \"access 2 days\"\n",
+        )
+        .unwrap();
+        let state = build_state_inner(
+            root.clone(),
+            Vec::new(),
+            Vec::new(),
+            true,
+            None,
+            None,
+            |config| {
+                config.expires = hj_core::config::ExpiresConfig {
+                    enabled: server_enabled,
+                    enable_declared: true,
+                    by_type: native_glob
+                        .map(|glob| (glob.to_string(), "A60".into()))
+                        .into_iter()
+                        .collect(),
+                };
+                if let Some(enabled) = vhost_enabled {
+                    let vhost = config
+                        .vhosts
+                        .get_mut(VHOST)
+                        .unwrap()
+                        .config
+                        .as_mut()
+                        .unwrap();
+                    Arc::make_mut(vhost).expires = Some(hj_core::config::ExpiresConfig {
+                        enabled,
+                        enable_declared: true,
+                        by_type: Vec::new(),
+                    });
+                }
+            },
+        );
+        let response = run(&state, get(CANON_HOST, "/child/a.txt", None)).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            expected_age
+                .map(|age| format!("public, max-age={age}"))
+                .as_deref(),
+            "server_enabled={server_enabled} vhost_enabled={vhost_enabled:?} native_glob={native_glob:?}"
+        );
+        assert_eq!(
+            response.headers().contains_key(header::EXPIRES),
+            expected_age.is_some()
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    let root = temp_root("htaccess-expires-turns-native-on");
+    std::fs::create_dir_all(root.join("child")).unwrap();
+    std::fs::write(root.join("child/a.txt"), b"body").unwrap();
+    std::fs::write(root.join(".htaccess"), "# parent\n").unwrap();
+    std::fs::write(root.join("child/.htaccess"), "ExpiresActive On\n").unwrap();
+    let state = build_state_inner(
+        root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        None,
+        None,
+        |config| {
+            config.expires = hj_core::config::ExpiresConfig {
+                enabled: false,
+                enable_declared: true,
+                by_type: vec![("text/plain".into(), "A60".into())],
+            };
+        },
+    );
+    let response = run(&state, get(CANON_HOST, "/child/a.txt", None)).await;
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "public, max-age=60"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

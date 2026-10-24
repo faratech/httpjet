@@ -81,7 +81,7 @@ fn traced_fast_and_bridged_requests() {
         is_tls: false,
         direct_file_egress: false,
         peer_unix: false,
-        mtls_required: false,
+        client_auth_requested: false,
         sni: None,
         tls: None,
         request_generation: None,

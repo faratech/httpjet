@@ -452,6 +452,10 @@ pub(super) fn server_allow_override(
     }
 }
 
+fn is_bare_file_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..") && !name.contains(['/', '\0'])
+}
+
 /// OLS builds a vhost's own SSL context with `clientVerify` (applied on SNI);
 /// httpjet verifies client certificates per listener only, so a vhost that asks
 /// for one refuses the load instead of serving every client (#1029).
@@ -794,15 +798,14 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
             .as_deref()
             .map(str::trim)
             .and_then(|s| s.parse::<i64>().ok())
+            && !(0..=2).contains(&v)
         {
-            if !(0..=2).contains(&v) {
-                return Err(ConfigError::InvalidValue {
-                    path: config_path.clone(),
-                    directive: directive,
-                    value: v.to_string(),
-                    reason: "must be 0 (none), 1, or 2".to_string(),
-                });
-            }
+            return Err(ConfigError::InvalidValue {
+                path: config_path.clone(),
+                directive,
+                value: v.to_string(),
+                reason: "must be 0 (none), 1, or 2".to_string(),
+            });
         }
     }
 
@@ -826,6 +829,20 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
         && !allow_override_is(mask, &[0, 31])
     {
         return Err(partial_allow_override(&config_path, "vhost", mask));
+    }
+    // The name is joined onto each request directory: a path would load a file
+    // outside the docroot as that directory's rules.
+    if let Some(name) = ht_access
+        .as_ref()
+        .and_then(|h| nonempty(h.access_file_name.clone()))
+        && !is_bare_file_name(&name)
+    {
+        return Err(ConfigError::InvalidValue {
+            path: config_path.clone(),
+            directive: "accessFileName",
+            value: name,
+            reason: "must be a bare file name, not a path".to_string(),
+        });
     }
     let allow_override_explicit = ht_access
         .as_ref()
@@ -1033,7 +1050,15 @@ fn convert_sub_filter(c: &super::raw::RawContext) -> Option<Box<crate::SubFilter
         }
     }
     if let Some(n) = c.sub_filter_max_body.as_deref().and_then(parse_bytes) {
-        cfg.max_body = n;
+        let ceiling = crate::SubFilterConfig::MAX_BODY_CEILING;
+        if n > ceiling {
+            tracing::warn!(
+                subFilterMaxBody = n,
+                ceiling,
+                "subFilterMaxBody above the ceiling; clamped"
+            );
+        }
+        cfg.max_body = n.min(ceiling);
     }
     Some(Box::new(cfg))
 }

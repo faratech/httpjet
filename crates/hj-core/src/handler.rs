@@ -15,6 +15,8 @@ pub type Response = http::Response<Body>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HandlerError {
+    #[error("bad request")]
+    BadRequest,
     #[error("not found")]
     NotFound,
     #[error("forbidden")]
@@ -40,6 +42,7 @@ impl HandlerError {
     pub fn status(&self) -> http::StatusCode {
         use http::StatusCode as S;
         match self {
+            HandlerError::BadRequest => S::BAD_REQUEST,
             HandlerError::NotFound => S::NOT_FOUND,
             HandlerError::Forbidden => S::FORBIDDEN,
             HandlerError::BadGateway(_) => S::BAD_GATEWAY,

@@ -124,6 +124,35 @@ impl UriExpr {
             UriExpr::Not(inner) => inner.first_cond(),
         }
     }
+
+    fn matches_result(&self, path: &str) -> Result<bool, ()> {
+        match self {
+            UriExpr::Cond(test) => test
+                .regex
+                .as_ref()
+                .ok_or(())?
+                .is_match(path)
+                .map(|matched| matched != test.negate)
+                .map_err(|_| ()),
+            UriExpr::And(parts) => {
+                for part in parts {
+                    if !part.matches_result(path)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            UriExpr::Or(parts) => {
+                for part in parts {
+                    if part.matches_result(path)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            UriExpr::Not(inner) => inner.matches_result(path).map(|matched| !matched),
+        }
+    }
 }
 
 impl PartialEq for UriCond {
@@ -391,6 +420,118 @@ pub(crate) struct CharsetDirective {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiresDecision {
+    Inherit,
+    On,
+    Off,
+    Rule {
+        rule: hj_compress::ExpiresRule,
+        kind: ExpiresRuleKind,
+        inherit_active: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiresRuleKind {
+    Default,
+    ByType,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ExpiresDirectiveKind {
+    Active(bool),
+    Default(hj_compress::ExpiresRule),
+    ByType {
+        glob: ExpiresTypeGlob,
+        rule: hj_compress::ExpiresRule,
+    },
+    Unsafe,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ExpiresScope {
+    Standard(Scope),
+    LocationMatch(Option<Regex>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExpiresDirective {
+    pub(crate) kind: ExpiresDirectiveKind,
+    pub(crate) scopes: Vec<ExpiresScope>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ExpiresTypeGlob {
+    Any,
+    Prefix(Box<str>),
+    Exact(Box<str>),
+}
+
+impl ExpiresTypeGlob {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value == "*" || value == "*/*" {
+            return Some(Self::Any);
+        }
+        if let Some(prefix) = value.strip_suffix("/*")
+            && !prefix.is_empty()
+            && !prefix.contains('*')
+        {
+            return Some(Self::Prefix(prefix.to_ascii_lowercase().into_boxed_str()));
+        }
+        if value.contains('/') && !value.contains('*') {
+            return Some(Self::Exact(value.to_ascii_lowercase().into_boxed_str()));
+        }
+        None
+    }
+
+    fn matches(&self, content_type: &str) -> bool {
+        let content_type = content_type.split(';').next().unwrap_or("").trim();
+        match self {
+            Self::Any => !content_type.is_empty(),
+            Self::Prefix(prefix) => {
+                content_type
+                    .get(..prefix.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+                    && content_type.as_bytes().get(prefix.len()) == Some(&b'/')
+            }
+            Self::Exact(exact) => content_type.eq_ignore_ascii_case(exact),
+        }
+    }
+}
+
+impl ExpiresScope {
+    fn matches(&self, rel_path: &str, request_path: &str, basename: &str) -> Result<bool, ()> {
+        match self {
+            Self::LocationMatch(regex) => regex
+                .as_ref()
+                .ok_or(())?
+                .is_match(request_path)
+                .map_err(|_| ()),
+            Self::Standard(scope) => match scope.kind {
+                ScopeKind::Files | ScopeKind::FilesMatch => scope
+                    .regex
+                    .as_ref()
+                    .ok_or(())?
+                    .is_match(basename)
+                    .map_err(|_| ()),
+                ScopeKind::Directory | ScopeKind::DirectoryMatch => scope
+                    .regex
+                    .as_ref()
+                    .ok_or(())?
+                    .is_match(rel_path)
+                    .map_err(|_| ()),
+                ScopeKind::If => scope
+                    .uri_expr
+                    .as_ref()
+                    .ok_or(())?
+                    .matches_result(request_path),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SectionKind {
     Files,
     FilesMatch,
@@ -606,6 +747,9 @@ pub struct Htaccess {
     /// Some `set_env_if` attribute reads the client/server address or the host,
     /// so the caller must format them for [`ReqAttrs`](crate::ReqAttrs).
     pub(crate) set_env_if_reads_conn: bool,
+    /// Some `Allow from`/`Deny from` operand is `env=NAME`, so this file's access
+    /// verdict depends on the request env.
+    pub(crate) access_reads_env: bool,
     /// `eval_cookie_env(None)`: a pure function of the parsed rules, computed
     /// once (`None` = not computed, evaluate live).
     pub(crate) cookie_env_absent: Option<Result<Vec<(String, String)>, &'static str>>,
@@ -637,6 +781,9 @@ pub struct Htaccess {
     pub(crate) set_env: Vec<EnvDirective>,
     /// `AddDefaultCharset` in source order (each carries its scope).
     pub(crate) default_charset: Vec<CharsetDirective>,
+    /// Parsed `ExpiresActive`/`ExpiresDefault`/`ExpiresByType` operations in
+    /// source order. Values are compiled once when this file is loaded.
+    pub(crate) expires: Vec<ExpiresDirective>,
     /// True iff some `handler_ops` entry names a non-PHP MIME type, so a static
     /// response may need its `Content-Type` overridden.
     pub has_type_override: bool,
@@ -664,6 +811,85 @@ pub struct Htaccess {
     pub(crate) access_memo_useful: bool,
 }
 
+/// Resolve `.htaccess` expiry policy across a root-to-leaf chain for one
+/// response. No declaration leaves the server/vhost XML policy in force, while
+/// an explicit `Off` suppresses it. A matching MIME rule always outranks
+/// `ExpiresDefault`, regardless of their textual order.
+pub fn expires_decision<'a, I>(
+    chain: I,
+    rel_path: &str,
+    request_path: &str,
+    basename: &str,
+    content_type: &str,
+) -> ExpiresDecision
+where
+    I: IntoIterator<Item = &'a Htaccess>,
+{
+    let mut active = None;
+    let mut default = None;
+    let mut by_type = None;
+
+    for htaccess in chain {
+        for directive in &htaccess.expires {
+            let mut applies = true;
+            for scope in &directive.scopes {
+                match scope.matches(rel_path, request_path, basename) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        applies = false;
+                        break;
+                    }
+                    Err(()) => return ExpiresDecision::Off,
+                }
+            }
+            if !applies {
+                continue;
+            }
+            match &directive.kind {
+                ExpiresDirectiveKind::Active(enabled) => active = Some(*enabled),
+                ExpiresDirectiveKind::Default(rule) => default = Some(*rule),
+                ExpiresDirectiveKind::ByType { glob, rule } if glob.matches(content_type) => {
+                    by_type = Some(*rule)
+                }
+                ExpiresDirectiveKind::ByType { .. } => {}
+                ExpiresDirectiveKind::Unsafe => return ExpiresDecision::Off,
+            }
+        }
+    }
+
+    match active {
+        Some(false) => ExpiresDecision::Off,
+        Some(true) => by_type
+            .map(|rule| ExpiresDecision::Rule {
+                rule,
+                kind: ExpiresRuleKind::ByType,
+                inherit_active: false,
+            })
+            .or_else(|| {
+                default.map(|rule| ExpiresDecision::Rule {
+                    rule,
+                    kind: ExpiresRuleKind::Default,
+                    inherit_active: false,
+                })
+            })
+            .unwrap_or(ExpiresDecision::On),
+        None => by_type
+            .map(|rule| ExpiresDecision::Rule {
+                rule,
+                kind: ExpiresRuleKind::ByType,
+                inherit_active: true,
+            })
+            .or_else(|| {
+                default.map(|rule| ExpiresDecision::Rule {
+                    rule,
+                    kind: ExpiresRuleKind::Default,
+                    inherit_active: true,
+                })
+            })
+            .unwrap_or(ExpiresDecision::Inherit),
+    }
+}
+
 impl Htaccess {
     /// Whether this file carries any `AddDefaultCharset`.
     pub fn has_default_charset(&self) -> bool {
@@ -673,6 +899,11 @@ impl Htaccess {
     /// Whether this file carries any `SetEnv`/`UnsetEnv`.
     pub fn has_set_env(&self) -> bool {
         !self.set_env.is_empty()
+    }
+
+    /// Whether some `Allow from`/`Deny from env=…` operand reads the request env.
+    pub fn access_reads_env(&self) -> bool {
+        self.access_reads_env
     }
 
     /// This directory's `DirectoryIndex` override: `None` when the file sets none

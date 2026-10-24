@@ -42,7 +42,10 @@
 //! Only an exact match deposits the write half, and even then a connection that
 //! carried body bytes is closed rather than re-pooled after RESP_END (#833): a
 //! body tail the script left unread is parsed by lsphp as a new request, whose
-//! response would otherwise reach the next request on the socket.
+//! response would otherwise reach the next request on the socket. Any body PHP
+//! is not known to read whole is written through `ScannedBodyWriter`, and one
+//! that holds a request lsphp could run is refused with 400 before that request
+//! is sent.
 //!
 //! ## Retry contract
 //! [`Lsapi::handle`] reports a request as non-replayable once any byte has been
@@ -75,6 +78,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use hj_core::{Body, BoxError, Handler, HandlerError, ReqCtx, Request, Response};
 
+use crate::body_writer::{BodyWriteError, ScannedBodyWriter};
 use crate::cgi::CgiEnvBuilder;
 use crate::monitor::{InFlightGuard, Monitor};
 use crate::pool::{DialAdmission, LsapiPool, ResponseBodyPath, ReturnGuard, TrialGuard};
@@ -144,6 +148,9 @@ fn inline_body(chunks: Vec<Bytes>, len: usize) -> Bytes {
     }
     body.freeze()
 }
+
+/// Headers the pipeline typically adds to a PHP response after it is read.
+const RESPONSE_HEADER_SLACK: usize = 12;
 
 /// Short backoff before each idempotent-reset retry. During a recycle BURST the
 /// first retry's fresh dial can ALSO re-hit a pool still mid-respawn; a brief pause
@@ -687,6 +694,18 @@ impl Lsapi {
                     || name.eq_ignore_ascii_case("post_max_size")
             });
         let (parts, body) = req.into_parts();
+        // Any other body may be left partly unread, and lsphp runs an unread tail
+        // as its next request: refuse a body that holds one before dispatch. A
+        // streamed body is checked by the pump as it arrives.
+        if !body_preread
+            && buffered
+                .as_ref()
+                .is_some_and(|b| !b.is_empty() && crate::proto::body_embeds_begin_request(b))
+        {
+            self.pool.note_embedded_begin();
+            return_begin_buf(begin);
+            return (Err(HandlerError::BadRequest), parts);
+        }
 
         // `begin` is owned here and only borrowed (`&[u8]`) by the dispatch/retry
         // path, so it can be recycled to the per-thread freelist once dispatch
@@ -739,49 +758,57 @@ impl Handler for Lsapi {
     }
 }
 
-// Recycled BEGIN_REQUEST encode buffer, one per worker thread. Reused across
-// requests on the same thread so the framed packet encode does not allocate (and
-// page-fault) a fresh ~1-2 KB buffer every PHP request. `build_begin_request_framed_into`
-// clears it before each encode, so a recycled buffer leaks nothing of the prior
-// request. Capacity is bounded on return so one giant-header request can't bloat
-// the cached buffer permanently.
+// Recycled BEGIN_REQUEST encode buffers. Reused across requests so the framed
+// packet encode does not allocate (and page-fault) a fresh ~1-2 KB buffer every
+// PHP request. `build_begin_request_framed_into` clears it before each encode, so
+// a recycled buffer leaks nothing of the prior request. Capacity is bounded on
+// return so one giant-header request can't bloat the cached buffer permanently.
 thread_local! {
-    static BEGIN_BUF: std::cell::RefCell<Option<bytes::BytesMut>> =
-        const { std::cell::RefCell::new(None) };
+    static BEGIN_LOCAL: std::cell::RefCell<Vec<bytes::BytesMut>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
+static BEGIN_BUFS: hj_core::TieredPool<bytes::BytesMut> =
+    hj_core::TieredPool::new(&BEGIN_LOCAL, BUF_POOL_LOCAL, BUF_POOL_SHARED);
 
 /// Largest recycled begin-buffer capacity we keep between requests (a request that
 /// grew it past this is encoded then the oversized buffer is dropped, not cached).
 const BEGIN_BUF_KEEP_CAP: usize = 16 * 1024;
 
-// (#280) Spare `PacketReader` read buffer for THIS thread. A fresh
-// `BytesMut::with_capacity(64 KiB)` per dispatch zeroed 64 KiB on every PHP render's
-// TTFB path; recycling via Drop hands the allocation to the next reader on this
-// thread instead (same pattern as BEGIN_BUF).
+// (#280) Spare `PacketReader` read buffers. A fresh `BytesMut::with_capacity(64 KiB)`
+// per dispatch zeroed 64 KiB on every PHP render's TTFB path; recycling via Drop
+// hands the allocation to the next reader instead. Several PHP requests are in
+// flight per runtime thread and a reader often drops on another thread than it
+// started on (a migrated task, the tail drain), so a single per-thread spare left
+// most readers allocating, and with prod's immediate mimalloc purge faulting in,
+// a fresh 64 KiB.
 thread_local! {
-    static PACKET_BUF: std::cell::RefCell<Option<bytes::BytesMut>> =
-        const { std::cell::RefCell::new(None) };
+    static PACKET_LOCAL: std::cell::RefCell<Vec<bytes::BytesMut>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
+static PACKET_BUFS: hj_core::TieredPool<bytes::BytesMut> =
+    hj_core::TieredPool::new(&PACKET_LOCAL, BUF_POOL_LOCAL, BUF_POOL_SHARED);
+
+/// Spare buffers one thread keeps in each pool above, and the shared overflow.
+const BUF_POOL_LOCAL: usize = 8;
+const BUF_POOL_SHARED: usize = 32;
 
 fn take_packet_buf(alloc: usize) -> bytes::BytesMut {
-    PACKET_BUF
-        .with(|b| b.borrow_mut().take())
+    PACKET_BUFS
+        .take()
         .unwrap_or_else(|| bytes::BytesMut::with_capacity(alloc))
 }
 
-/// Take the thread-local begin buffer (or a fresh one). The borrow is synchronous
+/// Take a pooled begin buffer (or a fresh one). The borrow is synchronous
 /// (never held across an `.await`), so it cannot conflict with another task that
 /// the runtime parks onto this thread.
 fn take_begin_buf() -> bytes::BytesMut {
-    BEGIN_BUF
-        .with(|b| b.borrow_mut().take())
-        .unwrap_or_default()
+    BEGIN_BUFS.take().unwrap_or_default()
 }
 
 /// Return the begin buffer for reuse, dropping it if it grew oversized.
 fn return_begin_buf(buf: bytes::BytesMut) {
     if buf.capacity() <= BEGIN_BUF_KEEP_CAP {
-        BEGIN_BUF.with(|b| *b.borrow_mut() = Some(buf));
+        BEGIN_BUFS.give(buf);
     }
 }
 
@@ -1116,6 +1143,7 @@ impl Lsapi {
 
         let (read_half, mut write_half, guard) = conn.into_split();
         let guard = Arc::new(guard);
+        let scanned_body = (body_len > 0 && !body_preread).then(|| guard.clone());
 
         // Cancellation shared between the two halves. The response side notifies
         // it when it finishes (clean RESP_END, error, client disconnect, timeout)
@@ -1168,6 +1196,7 @@ impl Lsapi {
                     body_len: body_len as i64,
                     max_body,
                     idle_timeout: write_timeout,
+                    scan: !body_preread,
                 })
                 .await;
                 pump_done.notify_one();
@@ -1179,12 +1208,17 @@ impl Lsapi {
         //     hand the read half + guard to the streaming body pump. The body pump
         //     observes `cancel` once the response side is done.
         let sent_at = Instant::now();
-        match self
+        let response = self
             .read_response(
                 read_half, guard, cancel, body_done, inflight, acquire, sent_at, is_head,
             )
-            .await
-        {
+            .await;
+        // The pump flags the guard before it shuts the socket down, so a response
+        // or read failure caused by that shutdown already sees the flag.
+        if scanned_body.is_some_and(|guard| guard.embedded_begin_blocked()) {
+            return Attempt::Done(Err(HandlerError::BadRequest));
+        }
+        match response {
             Ok(resp) => Attempt::Done(Ok(resp)),
             Err(ReadFail { err, retryable }) => {
                 // IDEMPOTENT-RESET RETRY: a connection reset/closed before any
@@ -1329,12 +1363,23 @@ impl Lsapi {
             // Post-flush this is NON-REPLAYABLE, so on expiry poison + terminal 502.
             let write_body = async {
                 let s = conn.stream_mut();
-                s.write_all(&body).await?;
-                s.flush().await
+                if body_preread {
+                    s.write_all(&body).await.map_err(BodyWriteError::Io)?;
+                } else {
+                    ScannedBodyWriter::new(body.len() as u64)
+                        .push(s, body.clone())
+                        .await?;
+                }
+                s.flush().await.map_err(BodyWriteError::Io)
             };
             match tokio::time::timeout(self.read_timeout, write_body).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => {
+                Ok(Err(BodyWriteError::EmbeddedBegin)) => {
+                    conn.poison();
+                    self.pool.note_embedded_begin();
+                    return Attempt::Done(Err(HandlerError::BadRequest));
+                }
+                Ok(Err(BodyWriteError::Io(e))) => {
                     conn.poison();
                     return Attempt::Done(Err(HandlerError::BadGateway(format!(
                         "lsapi write body: {e}"
@@ -1539,10 +1584,12 @@ impl Lsapi {
         };
 
         // Build the response head straight into a pre-sized map, consuming the
-        // parsed header list (no per-field clone).
+        // parsed header list (no per-field clone). The slack covers the fields the
+        // response transforms add (Date, `.htaccess` Header ops, Content-Encoding,
+        // Vary, cache status), which otherwise regrew an exactly sized map.
         let status = http::StatusCode::from_u16(resp_header.status).unwrap_or(http::StatusCode::OK);
         let mut head = http::HeaderMap::with_capacity(
-            resp_header.headers.len() + usize::from(declared_len.is_some()),
+            resp_header.headers.len() + usize::from(declared_len.is_some()) + RESPONSE_HEADER_SLACK,
         );
         let mut has_status_header = None;
         for (name, value) in resp_header.headers {
@@ -1800,6 +1847,9 @@ struct PumpArgs {
     /// Idle ceiling: if no body frame arrives / no write completes within this
     /// window, abandon the upload so the permit + fd are not leaked.
     idle_timeout: Duration,
+    /// PHP may leave the body partly unread: write it through a
+    /// `ScannedBodyWriter`.
+    scan: bool,
 }
 
 /// Why the body pump stopped, deciding whether the write half is re-poolable.
@@ -1809,6 +1859,9 @@ enum PumpEnd {
     /// Anything else (short body, over-delivery, cap, IO/body error, cancel,
     /// idle timeout): the socket is desynced/dead and must NOT be re-pooled.
     Abort,
+    /// The body holds bytes lsphp could run as a new request; they were not
+    /// written and the request must fail.
+    EmbeddedBegin,
 }
 
 /// Pump the REQUEST body to lsphp on the owned write half.
@@ -1839,8 +1892,10 @@ async fn pump_request_body(args: PumpArgs) {
         body_len,
         max_body,
         idle_timeout,
+        scan,
     } = args;
     let cap = (max_body as i64).min(body_len.max(0));
+    let mut scanned = scan.then(|| ScannedBodyWriter::new(body_len.max(0) as u64));
     let mut written: i64 = 0;
 
     // (LST1) One pinned idle timer, reused (reset per use) for both the frame-read
@@ -1886,14 +1941,15 @@ async fn pump_request_body(args: PumpArgs) {
                     let wrote = tokio::select! {
                         biased;
                         _ = cancel.notified() => break PumpEnd::Abort,
-                        w = write_half.write_all(&data) => w,
+                        w = write_body_data(&mut write_half, scanned.as_mut(), data) => w,
                         _ = timer.as_mut() => break PumpEnd::Abort, // write idle timeout
                     };
                     match wrote {
                         Ok(()) => {}
+                        Err(BodyWriteError::EmbeddedBegin) => break PumpEnd::EmbeddedBegin,
                         // (item 7) Surface a broken-pipe/closed-socket write to lsphp
                         // instead of silently aborting the upload with no trace.
-                        Err(e) => {
+                        Err(BodyWriteError::Io(e)) => {
                             tracing::warn!(target: "hj_lsapi", error = %e, "lsphp request-body write failed; aborting upload");
                             break PumpEnd::Abort;
                         }
@@ -1943,6 +1999,26 @@ async fn pump_request_body(args: PumpArgs) {
             let _ = write_half.shutdown().await;
             guard.poison();
         }
+        PumpEnd::EmbeddedBegin => {
+            guard.block_embedded_begin();
+            // Both directions: lsphp's body read ends at what was already written,
+            // and its response writes fail, so the response side ends promptly.
+            let _ = rustix::net::shutdown(write_half.as_ref(), rustix::net::Shutdown::Both);
+        }
+    }
+}
+
+async fn write_body_data(
+    write_half: &mut OwnedWriteHalf,
+    scanned: Option<&mut ScannedBodyWriter>,
+    data: Bytes,
+) -> Result<(), BodyWriteError> {
+    match scanned {
+        Some(writer) => writer.push(write_half, data).await,
+        None => write_half
+            .write_all(&data)
+            .await
+            .map_err(BodyWriteError::Io),
     }
 }
 
@@ -2039,6 +2115,14 @@ async fn pump_body(
                 }
                 PacketType::StderrStream => log_stderr(&frame.body),
                 PacketType::RespEnd => {
+                    if guard.embedded_begin_blocked() {
+                        if let Some(tx) = tx.take() {
+                            tx.abort("request body held an LSAPI request".into());
+                        }
+                        guard.poison();
+                        cancel.notify_one();
+                        return;
+                    }
                     if declared_len.is_some_and(|total| sent < total) {
                         if let Some(tx) = tx.take() {
                             tx.abort("lsapi response body ended before Content-Length".into());
@@ -2373,10 +2457,12 @@ impl PacketReader {
     /// Clear + park the read buffer for reuse on this thread. Runs on EVERY drop
     /// path (inline drain, pump completion, client abort): clearing guarantees no
     /// cross-request byte survives into the next reader.
+    /// A buffer still shared with a live body slice cannot be written again without
+    /// reallocating, so only a reclaimable one is kept.
     fn recycle_buf(&mut self) {
-        if self.buf.capacity() <= Self::READ_CHUNK {
-            self.buf.clear();
-            PACKET_BUF.with(|slot| *slot.borrow_mut() = Some(std::mem::take(&mut self.buf)));
+        self.buf.clear();
+        if self.buf.capacity() <= Self::READ_CHUNK && self.buf.try_reclaim(Self::READ_CHUNK) {
+            PACKET_BUFS.give(std::mem::take(&mut self.buf));
         }
     }
 
@@ -2390,6 +2476,19 @@ impl PacketReader {
     /// pump (a spawn + per-chunk channel hops). Also the initial capacity: 8 KiB
     /// was outgrown by nearly every page render, costing a realloc per request.
     const READ_CHUNK: usize = 64 * 1024;
+
+    /// Spare room below which a read first makes more: reserving a full
+    /// [`Self::READ_CHUNK`] while bytes are buffered always doubled the buffer, so
+    /// it could no longer be recycled.
+    const MIN_READ_ROOM: usize = 16 * 1024;
+
+    fn ensure_read_room(&mut self) {
+        if self.buf.capacity() - self.buf.len() < Self::MIN_READ_ROOM
+            && !self.buf.try_reclaim(Self::MIN_READ_ROOM)
+        {
+            self.buf.reserve(Self::READ_CHUNK);
+        }
+    }
 
     fn with_deadline(timeout: Duration, deadline: Option<Instant>) -> Self {
         PacketReader {
@@ -2407,7 +2506,7 @@ impl PacketReader {
         if self.parked.is_some() {
             return false;
         }
-        self.buf.reserve(Self::READ_CHUNK);
+        self.ensure_read_room();
         match r.try_read_buf(&mut self.buf) {
             Ok(n) => n > 0,
             Err(e)
@@ -2482,8 +2581,8 @@ impl PacketReader {
                 .reset(tokio::time::Instant::from_std(effective));
             // Read straight into `buf`'s spare capacity — one copy, no tmp-then-
             // extend memcpy of every byte. `read_buf` is cancel-safe (a timer win
-            // means nothing was appended), and 0 means EOF since we just reserved.
-            self.buf.reserve(Self::READ_CHUNK);
+            // means nothing was appended), and 0 means EOF since there is spare room.
+            self.ensure_read_room();
             let n = tokio::select! {
                 // Prefer making read progress over firing the timer (matches the
                 // old `timeout(wait, read)`, which polled the read first).
@@ -2577,7 +2676,9 @@ mod inline_body_tests {
     use bytes::Bytes;
     use tokio::io::AsyncWriteExt;
 
-    use super::{INLINE_COPY_MAX, PACKET_BUF, PacketReader, inline_body, take_packet_buf};
+    use super::{
+        BUF_POOL_LOCAL, INLINE_COPY_MAX, PACKET_LOCAL, PacketReader, inline_body, take_packet_buf,
+    };
     use crate::proto::{HOST_LSAPI_ENDIAN, PACKET_HEADER_LEN, PacketType, VERSION_B0, VERSION_B1};
 
     fn stream_packet(body: &[u8]) -> Vec<u8> {
@@ -2629,7 +2730,7 @@ mod inline_body_tests {
     // allocating a fresh 64 KiB.
     #[test]
     fn single_chunk_inline_body_leaves_the_read_buffer_reusable() {
-        PACKET_BUF.with(|slot| *slot.borrow_mut() = None);
+        PACKET_LOCAL.with(|pool| pool.borrow_mut().clear());
         let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
         let base = reader.buf.as_ptr();
         reader.buf.extend_from_slice(&stream_packet(b"hello"));
@@ -2643,6 +2744,63 @@ mod inline_body_tests {
         buf.reserve(PacketReader::READ_CHUNK);
         assert_eq!(buf.as_ptr(), base, "the recycled buffer was reallocated");
         drop(body);
+    }
+
+    // Concurrent readers on one thread each park their buffer, so the next wave
+    // reuses all of them instead of allocating (and faulting in) fresh ones.
+    #[test]
+    fn concurrent_readers_recycle_every_buffer_up_to_the_pool_size() {
+        PACKET_LOCAL.with(|pool| pool.borrow_mut().clear());
+        let readers: Vec<_> = (0..BUF_POOL_LOCAL)
+            .map(|_| PacketReader::with_deadline(Duration::from_secs(1), None))
+            .collect();
+        let mut bases: Vec<_> = readers.iter().map(|r| r.buf.as_ptr()).collect();
+        drop(readers);
+        assert_eq!(
+            PACKET_LOCAL.with(|pool| pool.borrow().len()),
+            BUF_POOL_LOCAL
+        );
+
+        let again: Vec<_> = (0..BUF_POOL_LOCAL)
+            .map(|_| PacketReader::with_deadline(Duration::from_secs(1), None))
+            .collect();
+        for reader in &again {
+            let at = bases.iter().position(|&b| b == reader.buf.as_ptr());
+            assert!(
+                at.is_some(),
+                "a reader allocated instead of reusing a parked buffer"
+            );
+            bases.swap_remove(at.unwrap());
+        }
+    }
+
+    // A buffer whose bytes still back a live body cannot be written in place, so
+    // parking it would only make the next reader reallocate.
+    #[test]
+    fn a_buffer_shared_with_a_live_body_is_not_parked() {
+        PACKET_LOCAL.with(|pool| pool.borrow_mut().clear());
+        let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
+        reader.buf.extend_from_slice(&stream_packet(&[1u8; 128]));
+        let frame = reader.try_parse().unwrap().unwrap();
+        drop(reader);
+        assert_eq!(PACKET_LOCAL.with(|pool| pool.borrow().len()), 0);
+        drop(frame);
+    }
+
+    // A read with buffered bytes and room to spare reads into that room instead of
+    // doubling the buffer past the recyclable size.
+    #[test]
+    fn a_read_with_room_left_does_not_grow_the_buffer() {
+        let mut reader = PacketReader::with_deadline(Duration::from_secs(1), None);
+        let base = reader.buf.as_ptr();
+        reader.buf.extend_from_slice(&[0u8; 20 * 1024]);
+        reader.ensure_read_room();
+        assert_eq!(reader.buf.as_ptr(), base);
+        assert_eq!(reader.buf.capacity(), PacketReader::READ_CHUNK);
+
+        reader.buf.extend_from_slice(&vec![0u8; 40 * 1024]);
+        reader.ensure_read_room();
+        assert!(reader.buf.capacity() - reader.buf.len() >= PacketReader::MIN_READ_ROOM);
     }
 
     #[tokio::test]

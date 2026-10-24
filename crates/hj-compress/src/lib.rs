@@ -64,8 +64,8 @@ use hj_core::{Body, ReqCtx, Response, ResponseTransform};
 
 pub use dict::{DEFAULT_DICT_LEVEL, PageDict, PageDictRegistry};
 pub use encoding::{
-    AcceptEncoding, DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, decode_bytes, encode_bytes,
-    negotiate_with,
+    AcceptEncoding, DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, decode_bytes,
+    decode_bytes_bounded, encode_bytes, negotiate_with,
 };
 pub use expires::{ExpiresBase, ExpiresHeaders, ExpiresRule, ExpiresRules};
 pub(crate) use stream::CompressStream;

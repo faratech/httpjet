@@ -1,9 +1,14 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use http_body::Body as _;
 use http_body_util::{BodyExt, Full};
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use hj_core::{BoxError, ReqCtx, Request};
 
@@ -21,6 +26,40 @@ fn process_serialization_budget() -> Arc<tokio::sync::Semaphore> {
     BUDGET
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(SERIALIZATION_BUDGET)))
         .clone()
+}
+
+/// Where the sidecar listens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SidecarAddr {
+    /// Loopback TCP. Unauthenticated: while the sidecar is down any local user
+    /// can bind the port, read request secrets and answer with verdicts.
+    Tcp(SocketAddr),
+    /// A unix socket whose listener must be an expected user (SO_PEERCRED).
+    Unix(PathBuf),
+}
+
+impl From<SocketAddr> for SidecarAddr {
+    fn from(address: SocketAddr) -> Self {
+        SidecarAddr::Tcp(address)
+    }
+}
+
+/// `--waf-sidecar-addr`: `unix:/absolute/path` or a loopback `ip:port`.
+pub(crate) fn parse_sidecar_addr(value: &str) -> Result<SidecarAddr, String> {
+    if let Some(path) = value.strip_prefix("unix:") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err("a unix WAF sidecar address must be an absolute path".into());
+        }
+        return Ok(SidecarAddr::Unix(path));
+    }
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| "expected unix:/path or a loopback socket address")?;
+    if !address.ip().is_loopback() {
+        return Err("a TCP WAF sidecar must be on loopback".into());
+    }
+    Ok(SidecarAddr::Tcp(address))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,10 +86,15 @@ pub(crate) enum InspectError {
     Capacity,
     #[error("WAF sidecar response is malformed")]
     Protocol,
+    #[error("WAF sidecar socket is held by an unexpected user")]
+    Identity,
 }
 
 pub(crate) struct Sidecar {
-    address: SocketAddr,
+    address: SidecarAddr,
+    /// The only uid a unix-socket sidecar may run as; `None` accepts root or
+    /// this process's effective uid.
+    peer_uid: Option<u32>,
     path: String,
     timeout: Duration,
     inspect_body_max: u64,
@@ -60,16 +104,28 @@ pub(crate) struct Sidecar {
 }
 
 impl Sidecar {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        address: SocketAddr,
+        address: impl Into<SidecarAddr>,
+        peer_uid: Option<u32>,
         path: String,
         timeout: Duration,
         inspect_body_max: u64,
         max_concurrency: usize,
         policy: FailurePolicy,
     ) -> Result<Self, InspectError> {
-        if !address.ip().is_loopback() || address.port() == 0 {
-            return Err(InspectError::Configuration("address must be loopback"));
+        let address = address.into();
+        match &address {
+            SidecarAddr::Tcp(address) => {
+                if !address.ip().is_loopback() || address.port() == 0 {
+                    return Err(InspectError::Configuration("address must be loopback"));
+                }
+                tracing::warn!(
+                    %address,
+                    "WAF sidecar over TCP loopback is unauthenticated; prefer unix:/path"
+                );
+            }
+            SidecarAddr::Unix(socket) => check_socket_dir(socket, peer_uid)?,
         }
         if !path.starts_with('/')
             || path.len() > 1024
@@ -91,6 +147,7 @@ impl Sidecar {
         }
         Ok(Self {
             address,
+            peer_uid,
             path,
             timeout,
             inspect_body_max,
@@ -178,29 +235,79 @@ impl Sidecar {
                 body_omitted: !include_body,
             })
             .map_err(|_| InspectError::Protocol)?;
-            let mut stream = tokio::net::TcpStream::connect(self.address)
-                .await
-                .map_err(|_| InspectError::Io)?;
-            let head = format!(
-                "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                self.path,
-                self.address,
-                payload.len()
-            );
-            stream
-                .write_all(head.as_bytes())
-                .await
-                .map_err(|_| InspectError::Io)?;
-            stream
-                .write_all(&payload)
-                .await
-                .map_err(|_| InspectError::Io)?;
-            stream.flush().await.map_err(|_| InspectError::Io)?;
-            read_verdict(&mut stream).await
+            match &self.address {
+                SidecarAddr::Tcp(address) => {
+                    let stream = tokio::net::TcpStream::connect(address)
+                        .await
+                        .map_err(|_| InspectError::Io)?;
+                    exchange(stream, &self.path, &address.to_string(), &payload).await
+                }
+                SidecarAddr::Unix(socket) => {
+                    let stream = tokio::net::UnixStream::connect(socket)
+                        .await
+                        .map_err(|_| InspectError::Io)?;
+                    // Before any request byte is sent: a squatter reads nothing.
+                    let peer = stream.peer_cred().map_err(|_| InspectError::Io)?;
+                    if !uid_allowed(peer.uid(), self.peer_uid) {
+                        return Err(InspectError::Identity);
+                    }
+                    exchange(stream, &self.path, "localhost", &payload).await
+                }
+            }
         })
         .await
         .map_err(|_| InspectError::Timeout)?
     }
+}
+
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    path: &str,
+    host: &str,
+    payload: &[u8],
+) -> Result<Verdict, InspectError> {
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        payload.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .map_err(|_| InspectError::Io)?;
+    stream
+        .write_all(payload)
+        .await
+        .map_err(|_| InspectError::Io)?;
+    stream.flush().await.map_err(|_| InspectError::Io)?;
+    read_verdict(&mut stream).await
+}
+
+fn uid_allowed(uid: u32, expected: Option<u32>) -> bool {
+    match expected {
+        Some(expected) => uid == expected,
+        None => uid == 0 || uid == rustix::process::geteuid().as_raw(),
+    }
+}
+
+/// The socket's directory must be a real directory owned by root or an allowed
+/// user and not writable by others, so no other user can plant or swap the
+/// socket. The listener itself is checked on every connection.
+fn check_socket_dir(socket: &Path, peer_uid: Option<u32>) -> Result<(), InspectError> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = socket.parent().ok_or(InspectError::Configuration(
+        "unix socket path has no directory",
+    ))?;
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|_| InspectError::Configuration("unix socket directory is missing"))?;
+    if !meta.is_dir()
+        || meta.mode() & 0o002 != 0
+        || !(meta.uid() == 0 || uid_allowed(meta.uid(), peer_uid))
+    {
+        return Err(InspectError::Configuration(
+            "unix socket directory must be owned by root or the sidecar user and not world-writable",
+        ));
+    }
+    Ok(())
 }
 
 /// Conservative upper bound for allocations retained through sidecar I/O.
@@ -301,7 +408,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-async fn read_verdict(stream: &mut tokio::net::TcpStream) -> Result<Verdict, InspectError> {
+async fn read_verdict<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Verdict, InspectError> {
     let mut head = Vec::with_capacity(512);
     let mut byte = [0_u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -370,7 +477,8 @@ mod tests {
     fn configuration_is_loopback_absolute_and_bounded() {
         assert!(
             Sidecar::new(
-                "127.0.0.1:9000".parse().unwrap(),
+                "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+                None,
                 "/inspect".into(),
                 Duration::from_millis(50),
                 1024,
@@ -381,7 +489,8 @@ mod tests {
         );
         assert!(
             Sidecar::new(
-                "192.0.2.1:9000".parse().unwrap(),
+                "192.0.2.1:9000".parse::<SocketAddr>().unwrap(),
+                None,
                 "/inspect".into(),
                 Duration::from_millis(50),
                 1024,
@@ -392,7 +501,8 @@ mod tests {
         );
         assert!(
             Sidecar::new(
-                "127.0.0.1:9000".parse().unwrap(),
+                "127.0.0.1:9000".parse::<SocketAddr>().unwrap(),
+                None,
                 "bad\r\npath".into(),
                 Duration::from_millis(50),
                 1024,
@@ -401,6 +511,112 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn sidecar_addresses_are_unix_paths_or_loopback() {
+        assert_eq!(
+            parse_sidecar_addr("unix:/run/waf/waf.sock"),
+            Ok(SidecarAddr::Unix("/run/waf/waf.sock".into()))
+        );
+        assert_eq!(
+            parse_sidecar_addr("127.0.0.1:9000"),
+            Ok(SidecarAddr::Tcp("127.0.0.1:9000".parse().unwrap()))
+        );
+        for bad in ["unix:waf.sock", "unix:", "192.0.2.1:9000", "localhost:9000"] {
+            assert!(parse_sidecar_addr(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn socket_dir(tag: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hj-waf-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        dir
+    }
+
+    fn unix_sidecar(socket: &Path, peer_uid: Option<u32>) -> Result<Sidecar, InspectError> {
+        Sidecar::new(
+            SidecarAddr::Unix(socket.to_path_buf()),
+            peer_uid,
+            "/inspect".into(),
+            Duration::from_secs(2),
+            1024,
+            2,
+            FailurePolicy::Open,
+        )
+    }
+
+    /// Regression (#1132): a unix-socket sidecar answers only after its
+    /// listener's uid checks out, and an unexpected listener is sent nothing.
+    #[tokio::test]
+    async fn unix_sidecar_verifies_the_listener_before_sending() {
+        let dir = socket_dir("peer", 0o700);
+        let socket = dir.join("waf.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let stub = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0_u8; 4096];
+                let mut got = 0;
+                while let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf)).await
+                {
+                    if n == 0 {
+                        break;
+                    }
+                    got += n;
+                }
+                let _ = sock
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+                received.push(got);
+            }
+            received
+        });
+        let ctx = context();
+        let allowed = unix_sidecar(&socket, None).unwrap();
+        let result = allowed
+            .inspect(&ctx, &mut request(5), "/inspect", true)
+            .await;
+        assert!(matches!(result, Ok(Verdict::Allow)), "{result:?}");
+        let me = rustix::process::geteuid().as_raw();
+        let stranger = unix_sidecar(&socket, Some(me.wrapping_add(4242))).unwrap();
+        let result = stranger
+            .inspect(&ctx, &mut request(5), "/inspect", true)
+            .await;
+        assert!(matches!(result, Err(InspectError::Identity)), "{result:?}");
+        let received = stub.await.unwrap();
+        assert!(received[0] > 0, "the verified sidecar got the request");
+        assert_eq!(
+            received[1], 0,
+            "an unexpected listener must receive nothing"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression (#1132): the socket's directory may not let other users plant
+    /// or swap the socket.
+    #[test]
+    fn unix_sidecar_directory_must_be_private() {
+        let open = socket_dir("open", 0o777);
+        assert!(unix_sidecar(&open.join("waf.sock"), None).is_err());
+        let private = socket_dir("private", 0o755);
+        assert!(unix_sidecar(&private.join("waf.sock"), None).is_ok());
+        assert!(unix_sidecar(Path::new("/nonexistent-hj-waf/waf.sock"), None).is_err());
+        if rustix::process::geteuid().is_root() {
+            let foreign = socket_dir("foreign", 0o755);
+            let owner = rustix::process::Uid::from_raw(4242);
+            rustix::fs::chown(&foreign, Some(owner), None).unwrap();
+            assert!(unix_sidecar(&foreign.join("waf.sock"), Some(4242)).is_ok());
+            assert!(unix_sidecar(&foreign.join("waf.sock"), Some(4343)).is_err());
+            std::fs::remove_dir_all(&foreign).ok();
+        }
+        std::fs::remove_dir_all(&open).ok();
+        std::fs::remove_dir_all(&private).ok();
     }
 
     #[test]
@@ -469,6 +685,7 @@ mod tests {
             });
             let sidecar = Sidecar::new(
                 addr,
+                None,
                 "/inspect".into(),
                 Duration::from_secs(2),
                 1024,
@@ -497,6 +714,7 @@ mod tests {
         });
         let sidecar = Sidecar::new(
             addr,
+            None,
             "/inspect".into(),
             Duration::from_millis(100),
             1024,
@@ -516,7 +734,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn body_is_not_hex_encoded_while_waiting_for_a_permit() {
         let sidecar = Sidecar::new(
-            "127.0.0.1:19092".parse().unwrap(),
+            "127.0.0.1:19092".parse::<SocketAddr>().unwrap(),
+            None,
             "/inspect".into(),
             Duration::from_millis(50),
             MAX_INSPECT_BODY,
@@ -577,7 +796,8 @@ mod tests {
     #[test]
     fn reload_generations_share_the_process_serialization_budget() {
         let first = Sidecar::new(
-            "127.0.0.1:19090".parse().unwrap(),
+            "127.0.0.1:19090".parse::<SocketAddr>().unwrap(),
+            None,
             "/inspect".into(),
             Duration::from_millis(100),
             64 * 1024,
@@ -586,7 +806,8 @@ mod tests {
         )
         .unwrap();
         let second = Sidecar::new(
-            "127.0.0.1:19091".parse().unwrap(),
+            "127.0.0.1:19091".parse::<SocketAddr>().unwrap(),
+            None,
             "/inspect".into(),
             Duration::from_millis(100),
             64 * 1024,

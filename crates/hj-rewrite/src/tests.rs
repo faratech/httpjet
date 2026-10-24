@@ -334,6 +334,41 @@ fn proxy_qsa_appends_to_substitution_query() {
 }
 
 #[test]
+fn proxy_outcome_flags_an_upstream_host_chosen_by_substitution() {
+    for (subst, substituted) in [
+        ("http://127.0.0.1:8002/$1", false),
+        ("http://localhost:2812/%{REQUEST_URI}", false),
+        ("h2s://backend.internal?x=$1", false),
+        ("-", false),
+        ("$1", true),
+        ("http://$1", true),
+        ("http://%{HTTP:X-Up}/x", true),
+        ("https://backend-%1.internal/", true),
+        ("http://${map:%1}/", true),
+        ("$1://fixed.example/", true),
+    ] {
+        assert_eq!(proxy_authority_substituted(subst), substituted, "{subst}");
+    }
+    let rs = RuleSet::parse(
+        "RewriteEngine On\nRewriteRule ^p/(.*)$ http://$1 [P]\nRewriteRule ^q/(.*)$ http://127.0.0.1:8002/$1 [P]",
+    )
+    .unwrap();
+    let flagged = |uri: &str| match evaluate(&rs, &input(uri)) {
+        RewriteOutcome::Proxy {
+            authority_substituted,
+            ..
+        } => authority_substituted,
+        other => panic!("expected proxy, got {other:?}"),
+    };
+    assert!(flagged("/p/evil.example/x"));
+    assert!(!flagged("/q/x"));
+    assert_eq!(
+        rs.substituted_proxy_authorities().collect::<Vec<_>>(),
+        ["http://$1"]
+    );
+}
+
+#[test]
 fn proxy_flag_yields_proxy_outcome() {
     let rs = RuleSet::parse(
         "RewriteEngine On\nRewriteRule ^/tools\\.json$ http://127.0.0.1:8002/tools.json [P,L]",

@@ -157,6 +157,7 @@ async fn render_path_error_document(
     }
     let mut authenticated = Vec::new();
     super::scoped_auth::enforce_chain_iter(
+        state,
         ctx,
         request_headers,
         target_chain(),
@@ -238,7 +239,11 @@ async fn render_path_error_document(
             super::scoped_auth::enforce_target(
                 state,
                 ctx,
-                request_headers,
+                super::ResourceRequest {
+                    method: "GET",
+                    headers: request_headers,
+                    query: "",
+                },
                 &target,
                 rel,
                 &mut authenticated,
@@ -292,7 +297,11 @@ async fn render_path_error_document(
             super::scoped_auth::enforce_target(
                 state,
                 ctx,
-                request_headers,
+                super::ResourceRequest {
+                    method: "GET",
+                    headers: request_headers,
+                    query: "",
+                },
                 &target,
                 rel,
                 &mut authenticated,

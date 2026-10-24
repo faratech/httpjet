@@ -51,6 +51,7 @@
 //! # }
 //! ```
 
+mod body_writer;
 pub mod cgi;
 pub mod handler;
 pub mod jail;
@@ -74,7 +75,7 @@ pub use proto::{
     HEADER_INDEX_LEN, HEADER_OFFSET_LEN, KNOWN_HEADER_COUNT, KNOWN_HEADER_NAMES, LsapiCodec,
     LsapiFrame, MAX_DATA_PACKET_LEN, PACKET_HEADER_LEN, PacketType, REQ_HEADER_LEN, RespHeader,
     SOCK_FILENO, SpecialEnvType, WireHeader, build_begin_request, build_begin_request_body,
-    build_begin_request_framed, known_header_index, parse_resp_header,
+    build_begin_request_framed, known_header_index, may_be_lsapi_begin_request, parse_resp_header,
 };
 pub use registry::{LsapiRegistry, PoolKey};
 pub use supervisor::{

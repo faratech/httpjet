@@ -30,6 +30,10 @@ pub enum Disposition {
     Bypass(&'static str),
 }
 
+/// Bypass reason for an `X-LiteSpeed-Cache-Control` / `Cache-Control` value that is not
+/// visible ASCII (obs-text): unparseable cache policy fails closed.
+const NON_TEXT_CACHE_CONTROL: &str = "non-text-cache-control";
+
 /// TTL ceiling for a status admitted only through [`StoreConfig::opt_in_status`] (404/410, an
 /// allowlisted 303): the app may ask for longer, but its own freshness for these relies on CDN
 /// URL purges the origin cannot mirror.
@@ -84,11 +88,11 @@ pub fn classify_response(
     let mut ls_private_ttl: Option<u32> = None;
     let mut decl_stale: u32 = 0;
     let mut decl_sie: u32 = 0;
-    for v in headers
-        .get_all("x-litespeed-cache-control")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-    {
+    for v in headers.get_all("x-litespeed-cache-control") {
+        // A value this parser cannot read may carry a veto; never treat it as absent.
+        let Ok(v) = v.to_str() else {
+            return Disposition::Bypass(NON_TEXT_CACHE_CONTROL);
+        };
         match parse_lscache_control(v) {
             LsCacheControl::NoStore => forbid = forbid.or(Some("no-store")),
             LsCacheControl::NoCache => forbid = forbid.or(Some("no-cache")),
@@ -133,11 +137,10 @@ pub fn classify_response(
     // Parse the STANDARD `Cache-Control` once (folding repeated lines): it is the
     // backstop AND the `stale-*` source AND — for a non-LiteSpeed app — the opt-in.
     let mut std = crate::proto::StdCacheControl::default();
-    for cc in headers
-        .get_all(http::header::CACHE_CONTROL)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-    {
+    for cc in headers.get_all(http::header::CACHE_CONTROL) {
+        let Ok(cc) = cc.to_str() else {
+            return Disposition::Bypass(NON_TEXT_CACHE_CONTROL);
+        };
         let one = parse_std_cache_control(cc);
         std.public |= one.public;
         std.private |= one.private;
@@ -254,6 +257,31 @@ mod tests {
 
     fn cfg() -> StoreConfig {
         StoreConfig::default()
+    }
+
+    #[test]
+    fn non_text_cache_control_values_fail_closed() {
+        let c = cfg();
+        let obs = |v: &[u8]| HeaderValue::from_bytes(v).unwrap();
+        for (name, veto) in [
+            ("x-litespeed-cache-control", &b"no-cache\xe9"[..]),
+            ("x-litespeed-cache-control", b"private\xa0"),
+            ("cache-control", b"no-store\xff"),
+        ] {
+            let mut h = hdrs(&[("x-litespeed-cache-control", "public,max-age=60")]);
+            h.append(HeaderName::from_static(name), obs(veto));
+            assert_eq!(
+                classify_response(&Method::GET, 200, &h, false, &c, true),
+                Disposition::Bypass(NON_TEXT_CACHE_CONTROL),
+                "{name}: an unreadable veto must not read as absent"
+            );
+        }
+        let mut std_only = hdrs(&[("cache-control", "public, max-age=60")]);
+        std_only.append(http::header::CACHE_CONTROL, obs(b"private\xe9"));
+        assert_eq!(
+            classify_response(&Method::GET, 200, &std_only, false, &c, true),
+            Disposition::Bypass(NON_TEXT_CACHE_CONTROL)
+        );
     }
 
     fn hdrs(pairs: &[(&'static str, &str)]) -> HeaderMap {

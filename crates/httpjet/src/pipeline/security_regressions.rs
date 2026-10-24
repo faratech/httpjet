@@ -117,7 +117,12 @@ async fn inline_memo_keeps_every_header_dependency_after_user_agent() {
                 state.metrics.fast_memo_hits.load(Ordering::Relaxed),
                 hits + 1
             );
-            assert_eq!(warm.headers(), replay.headers());
+            let without_date = |h: &http::HeaderMap| {
+                let mut h = h.clone();
+                h.remove(header::DATE);
+                h
+            };
+            assert_eq!(without_date(warm.headers()), without_date(replay.headers()));
             assert_eq!(body_bytes(warm.into_body()), body_bytes(replay.into_body()));
             for (origin, accept) in [
                 (Some("https://bad.test"), Some("text/plain")),

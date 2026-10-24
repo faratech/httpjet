@@ -3166,6 +3166,238 @@ async fn smuggled_response_after_resp_end_never_reaches_next_request() {
     }
 }
 
+/// A BEGIN_REQUEST forged into a request body, as lsphp would run it.
+fn forged_begin_request() -> Bytes {
+    let env = [
+        ("SCRIPT_FILENAME", "/web/test/evil.php"),
+        ("SCRIPT_NAME", "/evil.php"),
+        ("REQUEST_METHOD", "GET"),
+        ("QUERY_STRING", ""),
+        ("REMOTE_ADDR", "127.0.0.1"),
+    ];
+    hj_lsapi::build_begin_request_framed::<_, _, (&str, &str)>(&env, &[], &[("Host", "x")], 0)
+}
+
+/// A request body fed as separate frames, split at `cuts`.
+fn framed_body(body: &[u8], cuts: &[usize]) -> hj_core::IncomingBody {
+    let (mut tx, channel) = Channel::<Bytes, hj_core::BoxError>::new(1);
+    let mut chunks = Vec::new();
+    let mut at = 0;
+    for &cut in cuts.iter().chain([&body.len()]) {
+        if cut > at {
+            chunks.push(Bytes::copy_from_slice(&body[at..cut]));
+            at = cut;
+        }
+    }
+    tokio::spawn(async move {
+        for chunk in chunks {
+            if tx.send_data(chunk).await.is_err() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    });
+    BoxBody::new(channel)
+}
+
+/// A fake lsphp that records the body bytes it receives (up to the declared
+/// length or EOF), then tries to answer. Returns the bytes, or `None` if no
+/// connection arrived.
+async fn recording_lsphp(listener: UnixListener) -> Option<Vec<u8>> {
+    let (mut stream, _) = tokio::time::timeout(Duration::from_millis(500), listener.accept())
+        .await
+        .ok()?
+        .unwrap();
+    let (ptype, begin) = read_packet(&mut stream).await.unwrap();
+    assert_eq!(ptype, PacketType::BeginRequest as u8);
+    let declared = read_i32_le(&begin, 4) as usize;
+    let mut received = vec![0u8; declared];
+    let mut filled = 0;
+    while filled < declared {
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut received[filled..]))
+            .await
+            .expect("httpjet must deliver or end the body")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    received.truncate(filled);
+    let mut out = BytesMut::new();
+    put_packet(
+        &mut out,
+        PacketType::RespHeader,
+        &resp_header_body(200, &[("Content-Length", "2")]),
+    );
+    put_packet(&mut out, PacketType::RespStream, b"ok");
+    put_packet(&mut out, PacketType::RespEnd, b"");
+    let _ = stream.write_all(&out).await;
+    Some(received)
+}
+
+/// Regression (#1117): a forged BEGIN_REQUEST in a body PHP may leave unread is
+/// never delivered to lsphp, whether the body is buffered (refused before
+/// dispatch) or streamed (the upload stops short of the frame), including a frame
+/// split across body frames.
+#[tokio::test]
+async fn embedded_begin_request_never_reaches_lsphp() {
+    let frame = forged_begin_request();
+    struct Case {
+        tag: &'static str,
+        method: &'static str,
+        content_type: Option<&'static str>,
+        frame_at: usize,
+        declare_length: bool,
+        cuts: Vec<usize>,
+    }
+    let cases = [
+        Case {
+            tag: "buffered-inline",
+            method: "PUT",
+            content_type: None,
+            frame_at: 8192,
+            declare_length: false,
+            cuts: vec![],
+        },
+        Case {
+            tag: "buffered-large",
+            method: "PATCH",
+            content_type: None,
+            frame_at: 100 * 1024,
+            declare_length: false,
+            cuts: vec![4096],
+        },
+        Case {
+            tag: "streamed",
+            method: "PUT",
+            content_type: Some("application/octet-stream"),
+            frame_at: 8192,
+            declare_length: true,
+            cuts: vec![],
+        },
+        Case {
+            tag: "streamed-straddle",
+            method: "PUT",
+            content_type: None,
+            frame_at: 24576,
+            declare_length: true,
+            cuts: vec![16384, 24576 + 20],
+        },
+        Case {
+            tag: "streamed-drip",
+            method: "DELETE",
+            content_type: None,
+            frame_at: 3072,
+            declare_length: true,
+            cuts: (3000..3200).collect(),
+        },
+        Case {
+            tag: "streamed-multipart-post",
+            method: "POST",
+            content_type: Some("multipart/form-data; boundary=x"),
+            frame_at: 8192,
+            declare_length: true,
+            cuts: vec![8192 + 43],
+        },
+    ];
+    for case in cases {
+        let tag = case.tag;
+        let mut body = vec![b'A'; case.frame_at];
+        body.extend_from_slice(&frame);
+        body.extend_from_slice(&[b'z'; 512]);
+        let path = tmp_sock(tag);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server_task = tokio::spawn(recording_lsphp(listener));
+        let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(1)));
+        let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(5));
+        let mut builder = http::Request::builder()
+            .method(case.method)
+            .uri("/upload.php")
+            .header("Host", "test");
+        if case.declare_length {
+            builder = builder.header("Content-Length", body.len().to_string());
+        }
+        if let Some(content_type) = case.content_type {
+            builder = builder.header("Content-Type", content_type);
+        }
+        let request = builder.body(framed_body(&body, &case.cuts)).unwrap();
+        let result = handler.handle(&mut ctx("/web/test"), request).await;
+        assert!(
+            matches!(result, Err(HandlerError::BadRequest)),
+            "{tag}: {:?}",
+            result.map(|r| r.status())
+        );
+        let received = server_task.await.unwrap();
+        if !case.declare_length {
+            assert!(received.is_none(), "{tag}: a buffered body was dispatched");
+        }
+        let received = received.unwrap_or_default();
+        assert!(
+            received.len() < case.frame_at + 44,
+            "{tag}: lsphp got {} body bytes, frame at {}",
+            received.len(),
+            case.frame_at
+        );
+        assert_eq!(&received[..], &body[..received.len()], "{tag}");
+        assert_eq!(pool.stats().embedded_begin_rejects, 1, "{tag}");
+        assert_eq!(pool.idle_count(), 0, "{tag}");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The scan is skipped for a POST PHP reads whole before the script runs, and a
+/// clean PUT body reaches lsphp byte for byte.
+#[tokio::test]
+async fn preread_post_and_clean_put_bodies_are_delivered_whole() {
+    let frame = forged_begin_request();
+    let mut with_frame = vec![b'A'; 1000];
+    with_frame.extend_from_slice(&frame);
+    let mut clean = Vec::with_capacity(200_000);
+    for i in 0..200_000_u32 {
+        clean.push((i.wrapping_mul(2_654_435_761) >> 13) as u8);
+    }
+    for (tag, method, content_type, body, cuts) in [
+        (
+            "preread-post",
+            "POST",
+            "application/x-www-form-urlencoded",
+            with_frame.clone(),
+            vec![1010],
+        ),
+        (
+            "clean-put",
+            "PUT",
+            "application/octet-stream",
+            clean.clone(),
+            (0..clean.len()).step_by(7919).collect::<Vec<_>>(),
+        ),
+    ] {
+        let path = tmp_sock(tag);
+        let listener = UnixListener::bind(&path).unwrap();
+        let server_task = tokio::spawn(recording_lsphp(listener));
+        let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(1)));
+        let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(5));
+        let request = http::Request::builder()
+            .method(method)
+            .uri("/upload.php")
+            .header("Host", "test")
+            .header("Content-Type", content_type)
+            .header("Content-Length", body.len().to_string())
+            .body(framed_body(&body, &cuts))
+            .unwrap();
+        let response = handler
+            .handle(&mut ctx("/web/test"), request)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: {e:?}"));
+        assert_eq!(&collect_body(response).await[..], b"ok", "{tag}");
+        let received = server_task.await.unwrap().expect("dispatched");
+        assert_eq!(received, body, "{tag}");
+        assert_eq!(pool.stats().embedded_begin_rejects, 0, "{tag}");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 fn live_php_config(
     lsphp: &std::path::Path,
     children: &str,
@@ -3195,43 +3427,37 @@ fn live_php_config(
     }
 }
 
-/// LIVE (#833): a script that reads `php://input` partially leaves a body tail
-/// that the real lsphp parses as a new request. Its response must never reach
-/// the next GET. (lsphp still EXECUTES the smuggled request; httpjet cannot
-/// prevent that, only its delivery.)
-///   cargo test -p hj-lsapi --test dispatch -- --ignored live_smuggled --nocapture
-#[tokio::test]
-#[ignore = "spawns the real lsphp; run manually on an R&D box"]
-async fn live_smuggled_request_response_never_reaches_next_get() {
+/// Runs `script` under the real lsphp with a request whose body carries a
+/// forged BEGIN_REQUEST for `evil.php` at `frame_at`, then three GETs. Returns
+/// each request's outcome and whether `evil.php` ran.
+async fn live_smuggle_probe(
+    tag: &str,
+    method: &str,
+    content_type: Option<&str>,
+    script: &str,
+    frame_at: usize,
+    rounds: usize,
+) -> (
+    Vec<Result<String, HandlerError>>,
+    Vec<String>,
+    bool,
+    hj_lsapi::PoolStats,
+) {
     use hj_lsapi::{LsphpSupervisor, SupervisorConfig, build_begin_request_framed};
 
     let lsphp = PathBuf::from("/usr/local/lsws/lsphp8/bin/lsphp");
-    if !lsphp.exists() {
-        eprintln!("lsphp not found at {lsphp:?}; skipping");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("hj-lsapi-smuggle-{}", std::process::id()));
+    assert!(lsphp.exists(), "lsphp not found at {lsphp:?}");
+    let dir = std::env::temp_dir().join(format!("hj-lsapi-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // One php://input chunk: the script dequeues exactly this much, leaving the
-    // forged packet on the socket. PUT, because PHP swallows a POST body whose
-    // Content-Type has no handler at request startup.
-    let pad: usize = 8192;
-    std::fs::write(
-        dir.join("partial.php"),
-        format!(
-            "<?php $f = fopen('php://input', 'r'); $x = fread($f, {pad}); echo 'partial:', strlen($x);\n"
-        ),
-    )
-    .unwrap();
+    std::fs::write(dir.join("partial.php"), script).unwrap();
     std::fs::write(dir.join("hello.php"), b"<?php echo 'hello';\n").unwrap();
     std::fs::write(
         dir.join("evil.php"),
         b"<?php file_put_contents(__DIR__ . '/evil-ran', '1'); echo 'EVIL-RESPONSE';\n",
     )
     .unwrap();
-    let sock =
-        std::env::temp_dir().join(format!("php8-httpjet-smuggle-{}.sock", std::process::id()));
+    let sock = std::env::temp_dir().join(format!("php8-httpjet-{tag}-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
     let php = live_php_config(&lsphp, "1", 1);
     let sup = LsphpSupervisor::new(SupervisorConfig::from_php_config(&php, &sock, "", ""));
@@ -3252,128 +3478,31 @@ async fn live_smuggled_request_response_never_reaches_next_get() {
         ("DOCUMENT_ROOT", dir.to_string_lossy().into_owned()),
     ];
     let forged = build_begin_request_framed(&env, &[], &[("Host", "localhost")], 0);
-    let mut body = vec![b'A'; pad];
+    let mut body = vec![b'A'; frame_at];
     body.extend_from_slice(&forged);
 
-    let put = http::Request::builder()
-        .method("PUT")
-        .uri("/partial.php")
-        .header("Host", "localhost")
-        .header("Content-Length", body.len().to_string())
-        .body(owned_incoming(Bytes::from(body)))
-        .unwrap();
-    let response = handler.handle(&mut ctx(dir.to_str().unwrap()), put).await;
-    let put_body = collect_body(response.expect("PUT dispatch")).await;
+    let mut outcomes = Vec::new();
     let mut gets = Vec::new();
-    for _ in 0..3 {
-        let get = http::Request::builder()
-            .method("GET")
-            .uri("/hello.php")
-            .header("Host", "localhost")
-            .body(empty_incoming())
-            .unwrap();
-        let response = handler.handle(&mut ctx(dir.to_str().unwrap()), get).await;
-        gets.push(
-            String::from_utf8_lossy(&collect_body(response.expect("GET")).await).into_owned(),
-        );
-    }
-    let stats = pool.stats();
-    let evil_ran = dir.join("evil-ran").exists();
-    sup.drain().await.unwrap();
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_dir_all(&dir);
-    eprintln!(
-        "put={:?} gets={gets:?} evil_ran={evil_ran} body_conn_closes={} unread_body_drops={}",
-        String::from_utf8_lossy(&put_body),
-        stats.body_conn_closes,
-        stats.unread_body_drops
-    );
-    assert_eq!(String::from_utf8_lossy(&put_body), format!("partial:{pad}"));
-    // The scenario reproduced: lsphp ran the smuggled request, which httpjet
-    // cannot prevent. Only its response delivery is closed off.
-    assert!(evil_ran, "body tail was not parsed as a request");
-    for get in &gets {
-        assert_eq!(get, "hello", "a GET received the smuggled response");
-    }
-}
-
-/// LIVE (#835): a small multipart POST without a boundary is NOT pre-read by PHP
-/// (rfc1867 exits early), so it must close like a PUT. The TIOCOUTQ check races
-/// lsphp's next read, so loop: no GET may ever see the smuggled response.
-///   cargo test -p hj-lsapi --test dispatch -- --ignored live_multipart --nocapture
-#[tokio::test]
-#[ignore = "spawns the real lsphp; run manually on an R&D box"]
-async fn live_multipart_without_boundary_never_leaks_a_smuggled_response() {
-    use hj_lsapi::{LsphpSupervisor, SupervisorConfig, build_begin_request_framed};
-
-    let lsphp = PathBuf::from("/usr/local/lsws/lsphp8/bin/lsphp");
-    if !lsphp.exists() {
-        eprintln!("lsphp not found at {lsphp:?}; skipping");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("hj-lsapi-mpsmuggle-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    // One php://input chunk: the script dequeues exactly this much, leaving the
-    // forged packet on the socket. PUT, because PHP swallows a POST body whose
-    // Content-Type has no handler at request startup.
-    let pad: usize = 8192;
-    std::fs::write(
-        dir.join("partial.php"),
-        format!(
-            "<?php $f = fopen('php://input', 'r'); $x = fread($f, {pad}); echo 'partial:', strlen($x);\n"
-        ),
-    )
-    .unwrap();
-    std::fs::write(dir.join("hello.php"), b"<?php echo 'hello';\n").unwrap();
-    std::fs::write(
-        dir.join("evil.php"),
-        b"<?php file_put_contents(__DIR__ . '/evil-ran', '1'); echo 'EVIL-RESPONSE';\n",
-    )
-    .unwrap();
-    let sock = std::env::temp_dir().join(format!(
-        "php8-httpjet-mpsmuggle-{}.sock",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&sock);
-    let php = live_php_config(&lsphp, "1", 1);
-    let sup = LsphpSupervisor::new(SupervisorConfig::from_php_config(&php, &sock, "", ""));
-    sup.start().await.expect("lsphp should start");
-    let pool = Arc::new(LsapiPool::new(&sock, 1, Duration::from_secs(10)));
-    let handler = Lsapi::new(pool.clone())
-        .script_root(&dir)
-        .read_timeout(Duration::from_secs(10));
-
-    let evil = dir.join("evil.php").to_string_lossy().into_owned();
-    let env: Vec<(&str, String)> = vec![
-        ("SCRIPT_FILENAME", evil),
-        ("SCRIPT_NAME", "/evil.php".into()),
-        ("REQUEST_URI", "/evil.php".into()),
-        ("REQUEST_METHOD", "GET".into()),
-        ("QUERY_STRING", String::new()),
-        ("SERVER_PROTOCOL", "HTTP/1.1".into()),
-        ("DOCUMENT_ROOT", dir.to_string_lossy().into_owned()),
-    ];
-    let forged = build_begin_request_framed(&env, &[], &[("Host", "localhost")], 0);
-    let mut body = vec![b'A'; pad];
-    body.extend_from_slice(&forged);
-
-    for round in 0..40 {
-        let post = http::Request::builder()
-            .method("POST")
+    for _ in 0..rounds {
+        let mut builder = http::Request::builder()
+            .method(method)
             .uri("/partial.php")
             .header("Host", "localhost")
-            .header("Content-Type", "multipart/form-data")
-            .header("Content-Length", body.len().to_string())
+            .header("Content-Length", body.len().to_string());
+        if let Some(content_type) = content_type {
+            builder = builder.header("Content-Type", content_type);
+        }
+        let request = builder
             .body(owned_incoming(Bytes::from(body.clone())))
             .unwrap();
-        let response = handler.handle(&mut ctx(dir.to_str().unwrap()), post).await;
-        let post_body = collect_body(response.expect("POST dispatch")).await;
-        assert_eq!(
-            String::from_utf8_lossy(&post_body),
-            format!("partial:{pad}"),
-            "round {round}: response desync"
-        );
+        let outcome = match handler
+            .handle(&mut ctx(dir.to_str().unwrap()), request)
+            .await
+        {
+            Ok(response) => Ok(String::from_utf8_lossy(&collect_body(response).await).into_owned()),
+            Err(e) => Err(e),
+        };
+        outcomes.push(outcome);
         for _ in 0..3 {
             let get = http::Request::builder()
                 .method("GET")
@@ -3382,22 +3511,124 @@ async fn live_multipart_without_boundary_never_leaks_a_smuggled_response() {
                 .body(empty_incoming())
                 .unwrap();
             let response = handler.handle(&mut ctx(dir.to_str().unwrap()), get).await;
-            let got = collect_body(response.expect("GET")).await;
-            assert_eq!(
-                &got[..],
-                b"hello",
-                "round {round}: a GET received the smuggled response"
+            gets.push(
+                String::from_utf8_lossy(&collect_body(response.expect("GET")).await).into_owned(),
             );
         }
     }
+    // lsphp runs a smuggled request right after RESP_END; give it time to land.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let stats = pool.stats();
+    let evil_ran = dir.join("evil-ran").exists();
     sup.drain().await.unwrap();
     let _ = std::fs::remove_file(&sock);
     let _ = std::fs::remove_dir_all(&dir);
     eprintln!(
-        "body_conn_closes={} unread_body_drops={}",
-        stats.body_conn_closes, stats.unread_body_drops
+        "{tag}: outcomes={outcomes:?} evil_ran={evil_ran} embedded_begin_rejects={} \
+         body_conn_closes={} unread_body_drops={}",
+        stats.embedded_begin_rejects, stats.body_conn_closes, stats.unread_body_drops
     );
+    (outcomes, gets, evil_ran, stats)
+}
+
+/// Asserts a live smuggle probe was refused before lsphp could run the forged
+/// request.
+fn assert_smuggle_refused(
+    tag: &str,
+    rounds: usize,
+    (outcomes, gets, evil_ran, stats): (
+        Vec<Result<String, HandlerError>>,
+        Vec<String>,
+        bool,
+        hj_lsapi::PoolStats,
+    ),
+) {
+    for outcome in &outcomes {
+        assert!(
+            matches!(outcome, Err(HandlerError::BadRequest)),
+            "{tag}: {outcome:?}"
+        );
+    }
+    assert!(!evil_ran, "{tag}: lsphp ran the forged request");
+    assert_eq!(stats.embedded_begin_rejects, rounds as u64, "{tag}");
+    for get in &gets {
+        assert_eq!(get, "hello", "{tag}: a GET received the smuggled response");
+    }
+}
+
+/// LIVE (#833, #1117): a script that reads `php://input` partially leaves a body
+/// tail that the real lsphp parses as a new request and runs. httpjet now refuses
+/// the body before the forged request reaches lsphp.
+///   TMPDIR=/var/tmp/... cargo test -p hj-lsapi --test dispatch -- --ignored live_smuggled --nocapture
+#[tokio::test]
+#[ignore = "spawns the real lsphp; run manually on an R&D box"]
+async fn live_smuggled_request_response_never_reaches_next_get() {
+    // One php://input chunk: the script dequeues exactly this much. PUT, because
+    // PHP swallows a POST body whose Content-Type has no handler at startup.
+    let probe = live_smuggle_probe(
+        "smuggle-fread",
+        "PUT",
+        None,
+        "<?php $f = fopen('php://input', 'r'); $x = fread($f, 8192); echo 'partial:', strlen($x);\n",
+        8192,
+        1,
+    )
+    .await;
+    assert_smuggle_refused("smuggle-fread", 1, probe);
+}
+
+/// LIVE (#1117): a bounded `file_get_contents` read consumes whole 8 KiB chunks,
+/// so a 3072-byte read leaves a tail at 8192.
+#[tokio::test]
+#[ignore = "spawns the real lsphp; run manually on an R&D box"]
+async fn live_smuggled_request_after_bounded_file_get_contents_is_refused() {
+    let probe = live_smuggle_probe(
+        "smuggle-fgc",
+        "PUT",
+        None,
+        "<?php $x = file_get_contents('php://input', false, null, 0, 3072); echo 'partial:', strlen($x);\n",
+        8192,
+        1,
+    )
+    .await;
+    assert_smuggle_refused("smuggle-fgc", 1, probe);
+}
+
+/// LIVE (#1117): `stream_get_contents($s, 16385)` leaves a tail at the next 8 KiB
+/// boundary past the read, 24576.
+#[tokio::test]
+#[ignore = "spawns the real lsphp; run manually on an R&D box"]
+async fn live_smuggled_request_after_stream_get_contents_is_refused() {
+    let probe = live_smuggle_probe(
+        "smuggle-sgc",
+        "PUT",
+        None,
+        "<?php $s = fopen('php://input', 'r'); $x = stream_get_contents($s, 16385); echo 'partial:', strlen($x);\n",
+        24576,
+        1,
+    )
+    .await;
+    assert_smuggle_refused("smuggle-sgc", 1, probe);
+}
+
+/// LIVE (#835, #1117): a small multipart POST without a boundary is NOT pre-read
+/// by PHP (rfc1867 exits early), so its body is scanned like a PUT's and the
+/// forged request is refused every round; no GET ever sees a smuggled response.
+///   cargo test -p hj-lsapi --test dispatch -- --ignored live_multipart --nocapture
+#[tokio::test]
+#[ignore = "spawns the real lsphp; run manually on an R&D box"]
+async fn live_multipart_without_boundary_never_leaks_a_smuggled_response() {
+    let rounds = 40;
+    let probe = live_smuggle_probe(
+        "smuggle-multipart",
+        "POST",
+        Some("multipart/form-data"),
+        "<?php $f = fopen('php://input', 'r'); $x = fread($f, 8192); echo 'partial:', strlen($x);\n",
+        8192,
+        rounds,
+    )
+    .await;
+    assert_smuggle_refused("smuggle-multipart", rounds, probe);
 }
 
 /// LIVE perf probe (#833): POST cost now that every bodied connection is closed

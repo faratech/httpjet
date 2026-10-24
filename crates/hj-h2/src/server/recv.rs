@@ -25,24 +25,60 @@ use crate::frame::{self, FrameHeader, error_code, flags, kind, settings};
 /// shared). The per-stream + per-connection request-BODY caps are config-driven (LiteSpeed
 /// `maxReqBodySize`) and live on [`Recv`] (`max_request_body` / `per_conn_request_body`).
 const MAX_HEADER_BLOCK: usize = 64 * 1024; // assembled HEADERS + CONTINUATION, per stream
-/// (CVE-2023-44487) Max net "reset-while-in-flight minus completed" imbalance before we
-/// treat the connection as a rapid-reset flood and GOAWAY. Generous so a client that
-/// cancels a burst of requests (e.g. a browser navigating away) while completing others
-/// never trips it; an attacker doing only open→reset churn hits it fast.
-const RAPID_RESET_BUDGET: u32 = 200;
+/// (CVE-2023-44487) Resets of dispatched streams a connection may make at once before it
+/// is treated as a rapid-reset flood and GOAWAYed: a browser navigating away cancels a
+/// burst of dozens, never hundreds.
+const RAPID_RESET_BURST: u32 = 200;
+/// One reset credit returns per interval (10/s), and only time returns it: a completed
+/// request must not pay for a cancelled one, or alternating the two never trips.
+const RAPID_RESET_REFILL: std::time::Duration = std::time::Duration::from_millis(100);
 /// (CVE-2019-9512/9515/9518 class) Max frames processed since the last forward progress before
 /// we treat the connection as a no-progress flood and GOAWAY. Generous: real traffic resets
 /// this to 0 on any progress (a dispatched request, a non-empty DATA byte, or a window grant),
 /// so a legitimate client never approaches it; pure empty-DATA / PING / SETTINGS / PRIORITY
 /// churn hits it in a fraction of a second.
 const NO_PROGRESS_BUDGET: u32 = 10_000;
+/// Heap a decoded request field holds beyond its name and value bytes: its `HeaderMap`
+/// bucket, index slot and growth slack (measured 131-176 B for distinct short names).
+const DECODED_FIELD_OVERHEAD: usize = 192;
+
+/// What a stream's decoded headers cost while they wait for the request body: every
+/// field plus the pseudo-headers, the stream entry and the map's minimum allocation.
+fn pending_header_charge(st: &StreamState) -> u32 {
+    let fields = st.headers.iter().fold(0usize, |sum, (name, value)| {
+        sum.saturating_add(name.as_str().len() + value.len() + DECODED_FIELD_OVERHEAD)
+    });
+    let path = st
+        .path
+        .as_ref()
+        .and_then(http::Uri::path_and_query)
+        .map_or(0, |pq| pq.as_str().len());
+    let authority = st.authority.as_ref().map_or(0, http::HeaderValue::len);
+    let charge = fields
+        .saturating_add(path + authority + 4 * DECODED_FIELD_OVERHEAD)
+        .saturating_add(std::mem::size_of::<StreamState>());
+    u32::try_from(charge).unwrap_or(u32::MAX)
+}
 
 impl Recv {
     /// Charge one reset of a stream whose handler was still in flight against the
     /// rapid-reset budget, whichever side sent the RST_STREAM. True once exceeded.
     pub(super) fn charge_inflight_reset(&mut self) -> bool {
-        self.rst_unanswered = self.rst_unanswered.saturating_add(1);
-        self.rst_unanswered > RAPID_RESET_BUDGET
+        let exhausted = self.charge_inflight_reset_at(tokio::time::Instant::now());
+        if exhausted {
+            super::RAPID_RESET_GOAWAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        exhausted
+    }
+
+    /// Each reset pushes the debt one refill interval further out, starting from `now`
+    /// once earlier debt has been repaid; more than a burst of intervals ahead of `now`
+    /// is exhausted.
+    pub(super) fn charge_inflight_reset_at(&mut self, now: tokio::time::Instant) -> bool {
+        let from = self.reset_debt_until.filter(|&t| t > now).unwrap_or(now);
+        let until = from + RAPID_RESET_REFILL;
+        self.reset_debt_until = Some(until);
+        until - now > RAPID_RESET_REFILL * RAPID_RESET_BURST
     }
 }
 
@@ -210,12 +246,38 @@ where
             if client_open {
                 rst!($sid, error_code::NO_ERROR);
             }
-            if let Some(s) = streams.remove(&$sid) {
-                recv.buffer_sub(s.body.len());
-            }
+            recv.drop_receiving(streams, $sid);
             // Both sides have ended the stream: nothing is reset, but its pre-response
             // window credit must still be dropped.
             return FrameOutcome::ResetStream($sid);
+        }};
+    }
+    // A body-carrying request that `Config::early_reject` refuses from its head gets that
+    // bodiless response before any DATA is accepted or 100 Continue is sent, then
+    // RST_STREAM(NO_ERROR) so the client stops sending without error (§8.1); its remaining
+    // DATA is ignored unbuffered while still crediting the connection window (§5.1).
+    macro_rules! reject_early {
+        ($sid:expr_2021) => {{
+            if recv.early_reject.is_some()
+                && let Some((status, mut headers)) = streams
+                    .get(&$sid)
+                    .filter(|st| !st.end_stream)
+                    .and_then(|st| early_reject_response(recv, st))
+            {
+                hj_core::strip_hop_by_hop_response(&mut headers);
+                headers.remove(http::header::CONTENT_LENGTH);
+                let mut block = Vec::with_capacity(128);
+                enc.encode_header(&mut block, ":status", status.as_str());
+                for (name, value) in &headers {
+                    enc.encode_header(&mut block, name.as_str(), value.as_bytes());
+                }
+                enc.encode_header(&mut block, "content-length", "0");
+                let max_frame = peer.max_frame_size as usize;
+                out.frames(|b| {
+                    super::send::write_field_block(b, $sid, flags::END_STREAM, &block, max_frame)
+                });
+                rst!($sid, error_code::NO_ERROR);
+            }
         }};
     }
     // A stream marked `refused` (over the concurrency cap) is reset only AFTER its header block
@@ -230,12 +292,24 @@ where
             }
         }};
     }
+    // A stream whose request headers completed without END_STREAM holds its decoded map
+    // until the body arrives. Charge it against the connection's decoded-header cap and
+    // the server-wide budget, or refuse it (retry-safe, §8.7) once either is exhausted.
+    // Its block was already decoded in full, so HPACK stays in sync.
+    macro_rules! admit_or_refuse {
+        ($sid:expr_2021, $st:expr_2021) => {{
+            let charge = pending_header_charge($st);
+            if !recv.admit_pending_headers($st, charge) {
+                rst!($sid, error_code::REFUSED_STREAM);
+            }
+        }};
+    }
     // Build the request for a completed stream and push its handler future.
     macro_rules! complete {
         ($sid:expr_2021) => {{
             if let Some(st) = streams.remove(&$sid) {
                 recv.no_progress_frames = 0; // a dispatched request is forward progress
-                recv.buffer_sub(st.body.len());
+                recv.release_stream(&st);
                 if st.content_length.is_some_and(|cl| cl != st.body.len() as u64) {
                     // §8.1.2.6: declared content-length must equal the DATA bytes received.
                     // `rst!` also drops the stream's early WINDOW_UPDATE credit.
@@ -265,6 +339,7 @@ where
                             // CPU-bound connection's backlog hides in the kernel socket buffer — it
                             // never shows up in `streams`/`inflight` — so a per-connection depth
                             // check can't detect this; only the global connection count can.
+                            let fut = hj_core::Recycled::new(fut);
                             let inner = if super::spare_cores() {
                                 super::TaggedInner::Spawned(super::AbortOnDrop(tokio::spawn(fut)))
                             } else {
@@ -504,9 +579,7 @@ where
                 if block.len() > MAX_HEADER_BLOCK {
                     goaway!(error_code::COMPRESSION_ERROR);
                 }
-                if let Some(s) = streams.remove(&sid) {
-                    recv.buffer_sub(s.body.len());
-                }
+                recv.drop_receiving(streams, sid);
                 if hdr.flags & flags::END_HEADERS != 0 {
                     if !decode_discard_header_block(dec, block) {
                         goaway!(error_code::COMPRESSION_ERROR);
@@ -568,7 +641,11 @@ where
                         if declared_body_too_large(streams.get(&sid), recv.max_request_body) {
                             reject_too_large!(sid, "413", true);
                         }
-                        if let Some(st) = streams.get(&sid) {
+                        reject_early!(sid);
+                        if let Some(st) = streams.get_mut(&sid)
+                            && !st.end_stream
+                        {
+                            admit_or_refuse!(sid, st);
                             maybe_send_100_continue(st, sid, out, enc);
                         }
                         if streams.get(&sid).is_some_and(|s| s.end_stream) {
@@ -586,9 +663,7 @@ where
                         // (mirror the other removal sites) — else `total_buffered` leaks by the body
                         // length for the connection's life, eventually tripping a spurious
                         // GOAWAY(ENHANCE_YOUR_CALM) on a later legitimate DATA byte.
-                        if let Some(s) = streams.remove(&sid) {
-                            recv.buffer_sub(s.body.len());
-                        }
+                        recv.drop_receiving(streams, sid);
                         rst!(sid, error_code::PROTOCOL_ERROR);
                     }
                 }
@@ -631,7 +706,11 @@ where
                         if declared_body_too_large(streams.get(&sid), recv.max_request_body) {
                             reject_too_large!(sid, "413", true);
                         }
-                        if let Some(st) = streams.get(&sid) {
+                        reject_early!(sid);
+                        if let Some(st) = streams.get_mut(&sid)
+                            && !st.end_stream
+                        {
+                            admit_or_refuse!(sid, st);
                             maybe_send_100_continue(st, sid, out, enc);
                         }
                         if streams.get(&sid).is_some_and(|s| s.end_stream) {
@@ -647,9 +726,7 @@ where
                     Decoded::Malformed => {
                         // Same as the HEADERS arm: un-account any buffered body before dropping the
                         // stream so a CONTINUATION-spanning malformed trailer can't leak the budget.
-                        if let Some(s) = streams.remove(&sid) {
-                            recv.buffer_sub(s.body.len());
-                        }
+                        recv.drop_receiving(streams, sid);
                         rst!(sid, error_code::PROTOCOL_ERROR);
                     }
                 }
@@ -701,9 +778,7 @@ where
             };
             st.recv_window -= flow;
             if st.recv_window < 0 {
-                if let Some(s) = streams.remove(&sid) {
-                    recv.buffer_sub(s.body.len());
-                }
+                recv.drop_receiving(streams, sid);
                 rst!(sid, error_code::FLOW_CONTROL_ERROR);
             }
             let body_len = st.body.len() + data.len();
@@ -761,9 +836,7 @@ where
             if sid.is_multiple_of(2) || sid > recv.last_client_stream {
                 goaway!(error_code::PROTOCOL_ERROR);
             }
-            if let Some(s) = streams.remove(&sid) {
-                recv.buffer_sub(s.body.len());
-            }
+            recv.drop_receiving(streams, sid);
             // (#357) Record the peer's reset UNCONDITIONALLY — even on an id already
             // cleanly closed or fully drained. §5.1 makes ANY later frame on an id that
             // saw a RST_STREAM a stream error (STREAM_CLOSED), so the HEADERS-reuse
@@ -814,6 +887,34 @@ fn declared_body_too_large(st: Option<&StreamState>, max_request_body: usize) ->
                 .content_length
                 .is_some_and(|cl| cl > max_request_body as u64)
     })
+}
+
+/// Ask `Config::early_reject` about a stream whose request headers are complete and
+/// whose body is still to come.
+fn early_reject_response(
+    recv: &Recv,
+    st: &StreamState,
+) -> Option<(http::StatusCode, http::HeaderMap)> {
+    let hook = recv.early_reject.as_ref()?;
+    let head = super::RequestHead {
+        method: st.method.as_ref()?,
+        uri: st.path.as_ref()?,
+        authority: st.authority.as_ref(),
+        headers: &st.headers,
+    };
+    (hook.0)(&head)
+}
+
+/// What a body-pending stream opened with the request header `block` is charged.
+#[cfg(test)]
+pub(super) fn pending_header_charge_of(block: &[u8]) -> u32 {
+    let mut st = StreamState::default();
+    let mut dec = Decoder::new(4096, usize::MAX);
+    assert!(matches!(
+        decode_block_from(&mut dec, &mut st, block),
+        Decoded::Ok
+    ));
+    pending_header_charge(&st)
 }
 
 /// Outcome of decoding a header block.
@@ -1293,7 +1394,11 @@ fn build_request(mut st: StreamState) -> Option<Request> {
         hj_core::empty_incoming()
     } else {
         let bytes = match st.body_lease.take() {
-            Some(lease) => lease.into_bytes(st.body),
+            Some(mut lease) => {
+                // The decoded headers move into the request here; only the body stays charged.
+                lease.release(u64::from(st.header_charge));
+                lease.into_bytes(st.body)
+            }
             None => Bytes::from(st.body),
         };
         http_body_util::Full::new(bytes)

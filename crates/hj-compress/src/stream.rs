@@ -41,6 +41,10 @@ use crate::encoding::{Encoding, Levels, zstd_window_log};
 /// (ratio) and the worst-case latency added while a slow upstream fills the
 /// buffer; the terminal `finish()` always flushes whatever remains.
 const FLUSH_THRESHOLD: usize = 32 * 1024;
+/// Always-ready empty DATA frames make no compression or wire progress. Return
+/// `Pending` after this many so a faulty producer cannot monopolize one runtime
+/// thread inside a single [`Body::poll_frame`] call.
+const READY_EMPTY_YIELD_INTERVAL: usize = 64;
 
 /// A codec-agnostic incremental encoder over a `Vec<u8>` sink. Each call to
 /// [`BlockEncoder::write_block`] compresses + flushes a chunk and returns the
@@ -193,6 +197,8 @@ pub struct CompressStream {
     /// Emit the pending block every time the upstream stalls (see
     /// [`CompressStream::flush_when_idle`]).
     flush_when_idle: bool,
+    /// Consecutive always-ready empty DATA frames skipped since real payload.
+    skipped_empty_frames: usize,
 }
 
 impl CompressStream {
@@ -224,6 +230,7 @@ impl CompressStream {
             pending_in: Vec::new(),
             flush_first_when_idle: false,
             flush_when_idle: false,
+            skipped_empty_frames: 0,
         }
     }
 
@@ -333,8 +340,15 @@ impl Body for CompressStream {
                                 }
                             };
                             if data.is_empty() {
+                                self.skipped_empty_frames += 1;
+                                if self.skipped_empty_frames == READY_EMPTY_YIELD_INTERVAL {
+                                    self.skipped_empty_frames = 0;
+                                    cx.waker().wake_by_ref();
+                                    return Poll::Pending;
+                                }
                                 continue;
                             }
+                            self.skipped_empty_frames = 0;
                             // (#326) Accumulate upstream frames; only compress + flush a block
                             // once FLUSH_THRESHOLD is reached, the upstream stalls on a
                             // `flush_when_idle` feed, or at EOF/trailers. SSE is never routed here.
@@ -488,6 +502,42 @@ mod tests {
         let inner = into_stream_body(iter_body(chunks));
         let comp = compress(enc, inner).await;
         assert_eq!(decode(enc, &comp), expected, "multi-frame {enc:?}");
+    }
+
+    #[tokio::test]
+    async fn ready_empty_frames_yield_before_payload() {
+        use futures_like::iter_body;
+        use std::task::Waker;
+
+        for enc in [Encoding::Gzip, Encoding::Zstd, Encoding::Brotli] {
+            let payload = Bytes::from_static(b"payload after ready empty frames");
+            let mut frames = vec![Bytes::new(); READY_EMPTY_YIELD_INTERVAL + 1];
+            frames.push(payload.clone());
+            let inner = into_stream_body(iter_body(frames));
+            let mut body = CompressStream::new(inner, enc, &Levels::default()).boxed_stream();
+            let mut cx = Context::from_waker(Waker::noop());
+
+            assert!(
+                matches!(Pin::new(&mut body).poll_frame(&mut cx), Poll::Pending),
+                "{enc:?}: a long ready empty run must yield before its payload"
+            );
+            let compressed = body.collect().await.unwrap().to_bytes();
+            assert_eq!(decode(enc, &compressed), payload, "{enc:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn many_ready_empty_frames_reach_clean_eof() {
+        use futures_like::iter_body;
+
+        for enc in [Encoding::Gzip, Encoding::Zstd, Encoding::Brotli] {
+            let inner = into_stream_body(iter_body(vec![Bytes::new(); 10_000]));
+            let compressed =
+                tokio::time::timeout(std::time::Duration::from_secs(2), compress(enc, inner))
+                    .await
+                    .expect("finite empty stream must reach EOF");
+            assert!(decode(enc, &compressed).is_empty(), "{enc:?}");
+        }
     }
 
     #[tokio::test]

@@ -57,8 +57,9 @@ pub enum BodyFraming {
 /// length, so without this a malicious endless stream would grow unbounded). Far
 /// above any legitimate upload; an over-cap body is rejected (400 + close).
 const MAX_BRIDGED_CHUNKED_BODY: usize = 256 * 1024 * 1024;
-/// Cap on the RAW chunked bytes (framing + data) accumulated for one request body,
-/// independent of the decoded size. Bounds the read buffer against tiny-chunk
+/// Cap on the RAW chunked bytes (framing + data) belonging to one request body,
+/// independent of the decoded size. Bytes after its terminating trailer line belong to
+/// a pipelined successor and do not count. Bounds the read buffer against tiny-chunk
 /// amplification (~5x raw:body) and an endless trailer section, which would otherwise
 /// grow memory far past the decoded-body cap. = body cap + 1 MiB framing headroom.
 const MAX_CHUNKED_RAW: usize = MAX_BRIDGED_CHUNKED_BODY + (1 << 20);
@@ -151,12 +152,20 @@ pub fn classify_framing<'a>(
     }
 }
 
-fn find_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\r\n")
+/// Absolute offset of the first CRLF in `buf` at or after `from`.
+fn find_crlf_from(buf: &[u8], from: usize) -> Option<usize> {
+    let mut at = from;
+    loop {
+        let cr = at + buf.get(at..)?.iter().position(|&b| b == b'\r')?;
+        if buf.get(cr + 1) == Some(&b'\n') {
+            return Some(cr);
+        }
+        at = cr + 1;
+    }
 }
 
 /// A framing line (chunk-size + extension, or trailer field) must be free of
-/// bare CR/LF and other controls (HTAB aside): `find_crlf` only locates the first
+/// bare CR/LF and other controls (HTAB aside): `find_crlf_from` only locates the first
 /// CRLF, so `0\r\n\nGET /x` would otherwise be swallowed as one "line" here while
 /// an LF-lenient intermediary sees a second request (#684).
 fn framing_line_clean(line: &[u8]) -> bool {
@@ -213,11 +222,18 @@ pub enum ChunkStep {
 }
 
 /// Resumable, allocation-light HTTP/1.1 chunked-body decoder over a growing buffer.
-/// `advance` parses every byte exactly once across calls (the `pos` cursor and the
-/// trailer phase persist), so a body delivered across many reads stays O(n).
+/// `advance` parses every byte exactly once across calls (the `pos` cursor, the
+/// line-scan resume point, the parsed pending chunk and the trailer phase all
+/// persist), so a body delivered across many reads stays O(n).
 pub struct ChunkedDecoder {
     pub body: Vec<u8>,
     pos: usize,
+    /// Where the CRLF search for the line starting at `pos` resumes: no CRLF
+    /// begins in `pos..scan`. Only meaningful while `scan > pos`.
+    scan: usize,
+    /// `(data_start, size)` of a chunk whose size line is parsed but whose data
+    /// has not fully arrived, so a slow chunk never re-parses its size line.
+    pending: Option<(usize, usize)>,
     in_trailers: bool,
     /// Buffer offset where the chunked body begins (after the request head).
     start: usize,
@@ -236,6 +252,8 @@ impl ChunkedDecoder {
         ChunkedDecoder {
             body: Vec::new(),
             pos: start,
+            scan: start,
+            pending: None,
             in_trailers: false,
             start,
             max_body: MAX_BRIDGED_CHUNKED_BODY,
@@ -244,47 +262,77 @@ impl ChunkedDecoder {
         }
     }
 
-    pub fn advance(&mut self, buf: &[u8]) -> ChunkStep {
-        // Bound the RAW bytes accumulated for this body (framing + data + trailers),
-        // independent of the decoded size — otherwise tiny-chunk amplification or an
-        // endless trailer section grows the read buffer unbounded while the body cap is
-        // still far away.
-        if buf.len().saturating_sub(self.start) > self.max_raw {
-            return ChunkStep::Bad;
+    /// Find the CRLF ending the line at `pos`, resuming where the previous call's
+    /// search stopped. On a miss, remember the last byte (it may be a CR whose LF
+    /// is still in flight) and report the line's buffered length.
+    fn next_line_end(&mut self, buf: &[u8]) -> Result<usize, usize> {
+        match find_crlf_from(buf, self.scan.max(self.pos)) {
+            Some(cr) => Ok(cr),
+            None => {
+                self.scan = buf.len().saturating_sub(1).max(self.pos);
+                Err(buf.len().saturating_sub(self.pos))
+            }
         }
+    }
+
+    /// `NeedMore` for an unterminated line unless it already broke the line or
+    /// whole-body raw bound.
+    fn unterminated(&self, buf: &[u8], line_len: usize) -> ChunkStep {
+        if line_len > MAX_CHUNK_LINE || buf.len().saturating_sub(self.start) > self.max_raw {
+            ChunkStep::Bad
+        } else {
+            ChunkStep::NeedMore
+        }
+    }
+
+    pub fn advance(&mut self, buf: &[u8]) -> ChunkStep {
         loop {
-            if self.in_trailers {
-                // Consume optional trailer lines until the terminating empty line.
-                let rest = &buf[self.pos.min(buf.len())..];
-                let Some(rel) = find_crlf(rest) else {
-                    return if rest.len() > MAX_CHUNK_LINE {
-                        ChunkStep::Bad
-                    } else {
-                        ChunkStep::NeedMore
-                    };
-                };
-                if rel == 0 {
-                    return ChunkStep::Done(self.pos + 2);
+            if let Some((data_start, size)) = self.pending {
+                let need = data_start.saturating_add(size).saturating_add(2);
+                if buf.len() < need {
+                    return ChunkStep::NeedMore;
                 }
-                if !rest.get(..rel).is_some_and(trailer_line_valid) {
+                if &buf[data_start + size..need] != b"\r\n" {
                     return ChunkStep::Bad;
                 }
-                self.pos += rel + 2;
+                self.body
+                    .extend_from_slice(&buf[data_start..data_start + size]);
+                self.pending = None;
+                self.pos = need;
                 continue;
             }
-            let rest = &buf[self.pos.min(buf.len())..];
-            let Some(rel) = find_crlf(rest) else {
-                return if rest.len() > MAX_CHUNK_LINE {
-                    ChunkStep::Bad
-                } else {
-                    ChunkStep::NeedMore
+            if self.in_trailers {
+                // Consume optional trailer lines until the terminating empty line.
+                // With no terminating CRLF, every buffered byte is still part of
+                // this request. Enforce both the line and whole-body raw bounds.
+                let line_end = match self.next_line_end(buf) {
+                    Ok(line_end) => line_end,
+                    Err(line_len) => return self.unterminated(buf, line_len),
                 };
+                let next = line_end + 2;
+                if next.saturating_sub(self.start) > self.max_raw {
+                    return ChunkStep::Bad;
+                }
+                if line_end == self.pos {
+                    return ChunkStep::Done(next);
+                }
+                if !trailer_line_valid(&buf[self.pos..line_end]) {
+                    return ChunkStep::Bad;
+                }
+                self.pos = next;
+                continue;
+            }
+            let line_end = match self.next_line_end(buf) {
+                Ok(line_end) => line_end,
+                Err(line_len) => return self.unterminated(buf, line_len),
             };
-            let line_end = self.pos + rel;
+            let data_start = line_end + 2;
+            if data_start.saturating_sub(self.start) > self.max_raw {
+                return ChunkStep::Bad;
+            }
             let Some(size) = parse_chunk_size(&buf[self.pos..line_end]) else {
                 return ChunkStep::Bad;
             };
-            let data_start = line_end + 2;
             if size == 0 {
                 self.pos = data_start;
                 self.in_trailers = true;
@@ -295,15 +343,10 @@ impl ChunkedDecoder {
                 return ChunkStep::Bad;
             }
             let need = data_start.saturating_add(size).saturating_add(2);
-            if buf.len() < need {
-                return ChunkStep::NeedMore;
-            }
-            if &buf[data_start + size..data_start + size + 2] != b"\r\n" {
+            if need.saturating_sub(self.start) > self.max_raw {
                 return ChunkStep::Bad;
             }
-            self.body
-                .extend_from_slice(&buf[data_start..data_start + size]);
-            self.pos = need;
+            self.pending = Some((data_start, size));
         }
     }
 }
@@ -366,6 +409,67 @@ mod tests {
     }
 
     #[test]
+    fn byte_at_a_time_lines_resume_their_scan_instead_of_restarting() {
+        let mut size_line = b"1;".to_vec();
+        size_line.resize(MAX_CHUNK_LINE - 1, b'a');
+        let mut trailer = b"X-Pad: ".to_vec();
+        trailer.resize(MAX_CHUNK_LINE - 1, b'b');
+        let mut wire = size_line.clone();
+        wire.extend_from_slice(b"\r\nx\r\n0\r\n");
+        wire.extend_from_slice(&trailer);
+        wire.extend_from_slice(b"\r\n\r\n");
+
+        let mut dec = ChunkedDecoder::new(0);
+        let mut buf = Vec::new();
+        let mut done = None;
+        for &byte in &wire {
+            buf.push(byte);
+            match dec.advance(&buf) {
+                ChunkStep::Done(end) => {
+                    done = Some(end);
+                    break;
+                }
+                ChunkStep::Bad => panic!("valid wire rejected at {}", buf.len()),
+                ChunkStep::NeedMore if dec.pending.is_none() => assert!(
+                    dec.scan.max(dec.pos) >= buf.len() - 1,
+                    "an unterminated line must resume at its last byte ({}), not at {}",
+                    buf.len() - 1,
+                    dec.scan.max(dec.pos)
+                ),
+                ChunkStep::NeedMore => {}
+            }
+        }
+        assert_eq!(done, Some(wire.len()));
+        assert_eq!(dec.body, b"x");
+    }
+
+    #[test]
+    fn crlf_split_across_reads_and_slow_chunk_data_decode_once() {
+        let mut dec = ChunkedDecoder::new(0);
+        let mut buf = b"5\r".to_vec();
+        assert!(matches!(dec.advance(&buf), ChunkStep::NeedMore));
+        buf.extend_from_slice(b"\nhe");
+        assert!(matches!(dec.advance(&buf), ChunkStep::NeedMore));
+        assert_eq!(dec.pending, Some((3, 5)), "size line parsed once");
+        buf.extend_from_slice(b"llo\r");
+        assert!(matches!(dec.advance(&buf), ChunkStep::NeedMore));
+        buf.extend_from_slice(b"\n0\r\n\r");
+        assert!(matches!(dec.advance(&buf), ChunkStep::NeedMore));
+        buf.extend_from_slice(b"\nNEXT");
+        assert!(matches!(dec.advance(&buf), ChunkStep::Done(end) if end == buf.len() - 4));
+        assert_eq!(dec.body, b"hello");
+
+        let mut dec = ChunkedDecoder::new(0);
+        let mut buf = b"2\r\nab\r".to_vec();
+        assert!(matches!(dec.advance(&buf), ChunkStep::NeedMore));
+        buf.push(b'X');
+        assert!(
+            matches!(dec.advance(&buf), ChunkStep::Bad),
+            "a pending chunk still requires its CRLF"
+        );
+    }
+
+    #[test]
     fn chunked_accounting_covers_raw_and_decoded_heap() {
         let head = 32usize;
         // Before any body arrives the accumulator is just the head: nothing charged.
@@ -376,6 +480,42 @@ mod tests {
         assert_eq!(chunked_accounted_bytes(17_345, head, head), 17_345);
         // A head_len past the accumulator (defensive) clamps, never wraps.
         assert_eq!(chunked_accounted_bytes(4, 2, 8), 4);
+    }
+
+    #[test]
+    fn chunked_raw_cap_excludes_a_pipelined_successor() {
+        let head = b"HEAD";
+        let body = b"1\r\na\r\n0\r\nX-T: ok\r\n\r\n";
+        let next = b"GET /next HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let mut wire = Vec::new();
+        wire.extend_from_slice(head);
+        wire.extend_from_slice(body);
+        wire.extend_from_slice(next);
+
+        let mut decoder = ChunkedDecoder::new(head.len());
+        decoder.max_raw = body.len();
+        assert!(matches!(
+            decoder.advance(&wire),
+            ChunkStep::Done(end) if end == head.len() + body.len()
+        ));
+        assert_eq!(decoder.body, b"a");
+    }
+
+    #[test]
+    fn chunked_raw_cap_still_rejects_an_incomplete_or_overlong_body() {
+        let mut oversized_chunk = ChunkedDecoder::new(0);
+        oversized_chunk.max_raw = 8;
+        assert!(matches!(
+            oversized_chunk.advance(b"8\r\n12345678"),
+            ChunkStep::Bad
+        ));
+
+        let mut endless_trailers = ChunkedDecoder::new(0);
+        endless_trailers.max_raw = 10;
+        assert!(matches!(
+            endless_trailers.advance(b"0\r\nX: a\r\nY: b\r\n"),
+            ChunkStep::Bad
+        ));
     }
 
     #[test]

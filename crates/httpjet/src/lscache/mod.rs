@@ -29,7 +29,8 @@ use http_body_util::BodyExt;
 
 use std::borrow::Cow;
 
-use hj_compress::{ACCEPT_ENCODING_ENV, AcceptEncoding, Encoding, decode_bytes};
+use hj_compress::{ACCEPT_ENCODING_ENV, AcceptEncoding, Encoding, decode_bytes_bounded};
+use hj_core::budget::{BodyBufferBudget, BodyBufferLease};
 use hj_core::{Body, FileBody, ReqCtx, Request, Response};
 use hj_pagecache::{
     CachedResponse, Disposition, PageBody, PageScope, Purge, QsStrip, classify_response,
@@ -102,6 +103,36 @@ fn cookie_value<'a>(cookie: Option<&'a str>, name: &str) -> Option<&'a str> {
     // private cookie here too.
     hj_pagecache::php_cookie_lookup(cookie?, name).map(|(_, _, v)| v)
 }
+
+/// Append the SHA-256 of a request-header value (lowercase hex) to a cache-key vary fragment.
+/// The vary key is compared exactly, so it must be collision resistant: an attacker who can
+/// choose a header value (Origin, a SetEnvIf-read header, a cookie) must not be able to land on
+/// a legitimate visitor's entry. Unkeyed so persisted file-tier keys stay valid across restarts;
+/// a digest rather than the raw value keeps cookie contents out of stored keys.
+pub(crate) fn push_vary_digest(out: &mut String, value: &[u8]) {
+    use sha2::{Digest, Sha256};
+    let nibble = |n: u8| char::from(if n < 10 { b'0' + n } else { b'a' + n - 10 });
+    let digest = Sha256::digest(value);
+    out.reserve(digest.len() * 2);
+    for &byte in digest.iter() {
+        out.push(nibble(byte >> 4));
+        out.push(nibble(byte & 0x0f));
+    }
+}
+
+/// Attacker/victim Origin pairs that collide under unkeyed FNV-1a-64, the former vary fold;
+/// each attacker value passes a `*.windowsforum.com` allowlist.
+#[cfg(test)]
+pub(crate) const FNV_COLLIDING_ORIGINS: [(&str, &str); 2] = [
+    (
+        "https://6ot4baaa9zazf2bmbyfaa.windowsforum.com",
+        "https://www.google.com",
+    ),
+    (
+        "https://5bu2aaa0dcd0wsareh6aa.windowsforum.com",
+        "https://windowsforum.com",
+    ),
+];
 
 /// FNV-1a 64 with a caller-chosen basis — the private tier derives TWO
 /// independent hashes of the session value (different bases) so the effective
@@ -1138,8 +1169,8 @@ fn spawn_variant_fill(
         let body = if entry.dict_gen == 0 {
             stored
         } else {
-            match matching_dict(&state, entry.dict_gen)
-                .and_then(|d| d.decode(stored.as_ref(), hj_compress::MAX_DECODE as usize))
+            let max = usize::try_from(store.config().max_obj_bytes).unwrap_or(usize::MAX);
+            match matching_dict(&state, entry.dict_gen).and_then(|d| d.decode(stored.as_ref(), max))
             {
                 Some(v) => Bytes::from(v),
                 None => return,
@@ -1178,7 +1209,10 @@ fn spawn_variant_fill(
             .then(|| {
                 variants
                     .iter()
-                    .find_map(|(tok, b)| Encoding::from_token(tok).and_then(|e| decode_bytes(e, b)))
+                    .find_map(|(tok, b)| {
+                        Encoding::from_token(tok)
+                            .and_then(|e| decode_bytes_bounded(e, b, store.config().max_obj_bytes))
+                    })
                     .filter(|id| id.as_slice() == body.as_ref())
                     .and(u32::try_from(body.len()).ok())
             })
@@ -1626,7 +1660,7 @@ pub(crate) fn build_cache_key(
 /// responses — typically a reflected `Access-Control-Allow-Origin` — but a
 /// stored entry replays whatever headers the FIRST storer's render produced,
 /// so every later visitor would receive that request's CORS verdict. When the
-/// chain reads `Origin`, fold a bounded hash of the value into the vary
+/// chain reads `Origin`, fold a collision-resistant digest of the value into the vary
 /// discriminant (applied identically at lookup, store, stale-if-error, and
 /// the capsule keys — they all thread this `CacheCtx`). Absent/empty Origin
 /// keeps the historic base key, so caches populated before this fold stay
@@ -1642,12 +1676,14 @@ fn request_vary_suffix(cc: &CacheCtx<'_>) -> String {
         .chain
         .iter()
         .any(|h| h.memo.vary_headers.iter().any(|v| v == "origin"));
-    let mut suffix = match cc.origin {
-        Some(o) if reads_origin && !o.is_empty() => {
-            format!("\0origin:{:016x}", fnv64(o.as_bytes(), OWNER_BASIS_A))
-        }
-        _ => String::new(),
-    };
+    let mut suffix = String::new();
+    if let Some(o) = cc.origin
+        && reads_origin
+        && !o.is_empty()
+    {
+        suffix.push_str("\0origin:");
+        push_vary_digest(&mut suffix, o.as_bytes());
+    }
     if let Some(class) = cc.ua_class {
         suffix.push_str("\0ua:");
         suffix.push_str(class);
@@ -1861,8 +1897,10 @@ fn declared_vary(env: Vec<&str>, headers: &HeaderMap, global: &[String]) -> Decl
     let mut all_cookie = true;
     let mut names: Vec<String> = env.iter().map(|s| s.to_string()).collect();
     for line in lines {
-        // A non-UTF-8 line was skipped by the historic gate too (`filter_map(to_str)`).
-        let Ok(v) = line.to_str() else { continue };
+        // An unreadable line may name any dimension: never store it, publicly or privately.
+        let Ok(v) = line.to_str() else {
+            return DeclaredVary::Unsupported { extra_cookie: true };
+        };
         let (n, cookie_only) = parse_vary(v);
         all_cookie &= cookie_only;
         names.extend(n);
@@ -3737,6 +3775,11 @@ pub async fn cache_store_leading(
             strip_control_headers(&mut parts.headers);
             return Response::from_parts(parts, Body::Stream(inner));
         };
+        let mut lease = BodyBufferLease::new(state.body_budget.clone());
+        if !lease.reserve(COLLECT_DEFAULT_CAPACITY as u64) {
+            strip_control_headers(&mut parts.headers);
+            return Response::from_parts(parts, Body::Stream(inner));
+        }
         parts.headers.remove(CONTENT_ENCODING);
         let commit = FillCommit {
             state: state.clone(),
@@ -3777,10 +3820,38 @@ pub async fn cache_store_leading(
         let body = StreamFill {
             inner,
             buf: BytesMut::with_capacity(COLLECT_DEFAULT_CAPACITY),
+            lease: Some(lease),
             max_bytes: cfg.max_obj_bytes,
             commit: Some(commit),
         };
         return Response::from_parts(parts, Body::Stream(body.boxed()));
+    }
+
+    // A static file public admission would reject is served zero-copy: reading it into RAM
+    // first made every sighting of an opted-in asset an in-memory copy, and a large one needs
+    // several sightings to meet its size-weighted bar. The private tier and the dedicated
+    // capsule entry store without that bar, so they still collect.
+    let mut admitted_key: Option<StoreKey> = None;
+    if let (Body::File(f), Some(len)) = (&body, known_len)
+        && f.cached.is_none()
+        && matches!(scope, PageScope::Public)
+        && !(capsule_control.is_some() && state.xf_capsule.dedicated_store)
+    {
+        let key = store_cache_key(state, ctx, cc, store, &route, url_vary_names);
+        match key {
+            Some(k) if admission_bar_met(state, k.key_hash, len) => admitted_key = Some(k),
+            key => {
+                if let Some(k) = key {
+                    retire_superseded_url_vary(store, &k.url_vary);
+                    state.telemetry.record_cache_admission(false);
+                }
+                strip_control_headers(&mut parts.headers);
+                parts
+                    .headers
+                    .insert(HDR_CACHE_STATUS, HeaderValue::from_static("miss"));
+                return Response::from_parts(parts, body);
+            }
+        }
     }
 
     // (#9) A `Body::File` CAN be eligible (an `.htaccess` `Header set
@@ -3800,8 +3871,17 @@ pub async fn cache_store_leading(
     let capacity_hint = known_len.map_or(COLLECT_DEFAULT_CAPACITY, |n| {
         n.min(COLLECT_PRESIZE_CAP).min(cfg.max_obj_bytes) as usize
     });
-    let mut bytes = match collect_body(body, cfg.max_obj_bytes, capacity_hint).await {
-        Collected::Buffered(b) => b,
+    // The fill lease lives until the store decision below; the served copy is charged by the
+    // transport bridge, which skips bytes the store now shares.
+    let (mut bytes, _fill_lease) = match collect_body(
+        body,
+        cfg.max_obj_bytes,
+        capacity_hint,
+        &state.body_budget,
+    )
+    .await
+    {
+        Collected::Buffered(b, lease) => (b, lease),
         Collected::Passthrough(passthrough) => {
             // An unknown-length (chunked) stream exceeded the cap mid-buffer: serve it through,
             // or a selected File could not be read to its advertised length. Preserve the exact
@@ -3849,7 +3929,8 @@ pub async fn cache_store_leading(
             parts.headers.remove(CONTENT_ENCODING);
         } else if let Some(enc) = Encoding::from_token(&ce) {
             let raw = bytes.clone();
-            match tokio::task::block_in_place(|| decode_bytes(enc, &raw)) {
+            match tokio::task::block_in_place(|| decode_bytes_bounded(enc, &raw, cfg.max_obj_bytes))
+            {
                 Some(identity) => {
                     bytes = Bytes::from(identity);
                     parts.headers.remove(CONTENT_ENCODING);
@@ -3976,7 +4057,11 @@ pub async fn cache_store_leading(
         // bounded to the finite set of configured vhosts (no Host-header key inflation).
         // The PageScope owner equals the route owner by construction (the eligibility
         // match binds them from the same PrivateRoute), so the shared builder covers it.
-        let entry = store_cache_key(state, ctx, cc, store, &route, url_vary_names).map(
+        let entry = match admitted_key.take() {
+            Some(k) => Some(k),
+            None => store_cache_key(state, ctx, cc, store, &route, url_vary_names),
+        }
+        .map(
             |StoreKey {
                  key,
                  key_hash,
@@ -4107,22 +4192,9 @@ fn store_admitted(
     // Private entries skip the W-TinyLFU frequency bar: per-session keys are
     // near-unique so the sketch never accumulates reuse for them, and the
     // whole point is serving the SAME session's next request.
-    // (per-URL vary) The vary decision acts BEFORE admission where it only retires: a
-    // response that stopped varying drops the spec and its variants, and one that varies on
-    // a non-global cookie retires the un-varied base entry it supersedes — whatever happens
-    // to this variant below. The spec itself is recorded only for an admitted variant, so
-    // one-hit renders (cache-buster queries) cannot grow the spec map.
-    if let Some(uv) = &entry.url_vary {
-        if uv.names.is_empty() {
-            store.url_vary_drop(&uv.base, uv.base_hash);
-        } else {
-            store.invalidate_key(&uv.base);
-        }
-    }
+    retire_superseded_url_vary(store, &entry.url_vary);
     let is_private = matches!(entry.scope, PageScope::Private { .. });
-    let admitted = is_private
-        || state.page_cache_admission.estimate(entry.key_hash)
-            >= admission_threshold(state.page_cache_admit_base, bytes.len() as u64);
+    let admitted = is_private || admission_bar_met(state, entry.key_hash, bytes.len() as u64);
     state.telemetry.record_cache_admission(admitted);
     if !admitted {
         return None;
@@ -4183,6 +4255,27 @@ fn store_admitted(
     })
 }
 
+/// (per-URL vary) The vary decision acts BEFORE admission where it only retires: a
+/// response that stopped varying drops the spec and its variants, and one that varies on
+/// a non-global cookie retires the un-varied base entry it supersedes — whatever happens
+/// to this variant. The spec itself is recorded only for an admitted variant, so
+/// one-hit renders (cache-buster queries) cannot grow the spec map.
+fn retire_superseded_url_vary(store: &hj_pagecache::PageStore, url_vary: &Option<UrlVaryCommit>) {
+    if let Some(uv) = url_vary {
+        if uv.names.is_empty() {
+            store.url_vary_drop(&uv.base, uv.base_hash);
+        } else {
+            store.invalidate_key(&uv.base);
+        }
+    }
+}
+
+/// Whether a PUBLIC entry of `len` bytes under `key_hash` has shown the reuse its size needs.
+fn admission_bar_met(state: &ServerState, key_hash: u64, len: u64) -> bool {
+    state.page_cache_admission.estimate(key_hash)
+        >= admission_threshold(state.page_cache_admit_base, len)
+}
+
 /// What a streamed miss needs to store itself once the backend has finished.
 struct FillCommit {
     state: Arc<ServerState>,
@@ -4203,10 +4296,13 @@ struct FillCommit {
 impl FillCommit {
     /// Store off the response's task: the client's end-of-stream never waits for the
     /// tmpfs write.
-    fn finish(self, bytes: Bytes) {
+    fn finish(self, bytes: Bytes, lease: Option<BodyBufferLease>) {
         match tokio::runtime::Handle::try_current() {
             Ok(rt) => {
-                rt.spawn(async move { self.store(bytes) });
+                rt.spawn(async move {
+                    self.store(bytes);
+                    drop(lease);
+                });
             }
             Err(_) => self.store(bytes),
         }
@@ -4257,6 +4353,8 @@ impl FillCommit {
 struct StreamFill {
     inner: hj_core::StreamBody,
     buf: BytesMut,
+    /// The fill budget charged for `buf`, held until the store is done.
+    lease: Option<BodyBufferLease>,
     max_bytes: u64,
     commit: Option<FillCommit>,
 }
@@ -4265,6 +4363,7 @@ impl StreamFill {
     fn abandon(&mut self) {
         self.commit = None;
         self.buf = BytesMut::new();
+        self.lease = None;
     }
 }
 
@@ -4284,7 +4383,12 @@ impl http_body::Body for StreamFill {
                 if let Some(data) = frame.data_ref()
                     && this.commit.is_some()
                 {
-                    if (this.buf.len() + data.len()) as u64 > this.max_bytes {
+                    let need = (this.buf.len() + data.len()) as u64;
+                    let fits = this.lease.as_mut().is_some_and(|lease| {
+                        let held = lease.held();
+                        need <= held || lease.reserve(need - held)
+                    });
+                    if need > this.max_bytes || !fits {
                         this.abandon();
                     } else {
                         this.buf.extend_from_slice(data);
@@ -4294,7 +4398,7 @@ impl http_body::Body for StreamFill {
             Poll::Ready(Some(Err(_))) => this.abandon(),
             Poll::Ready(None) => {
                 if let Some(commit) = this.commit.take() {
-                    commit.finish(std::mem::take(&mut this.buf).freeze());
+                    commit.finish(std::mem::take(&mut this.buf).freeze(), this.lease.take());
                 }
             }
             Poll::Pending => {}
@@ -4332,16 +4436,15 @@ fn is_event_stream(content_type: &str) -> bool {
 /// fold into the cache key, so storing would under-key the entry and serve one variant to
 /// all clients; such a response is refused. Absent / encoding-only `Vary` ⇒ supported.
 fn standard_vary_supported(headers: &HeaderMap) -> bool {
-    headers
-        .get_all(http::header::VARY)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .all(|v| {
+    headers.get_all(http::header::VARY).iter().all(|v| {
+        // A non-text value names dimensions we cannot read: refuse rather than under-key.
+        v.to_str().is_ok_and(|v| {
             v.split(',')
                 .map(|t| t.trim())
                 .filter(|t| !t.is_empty())
                 .all(|t| t.eq_ignore_ascii_case("accept-encoding"))
         })
+    })
 }
 
 /// Defense-in-depth: a public response must not be cached if it sets a cookie
@@ -4352,7 +4455,8 @@ fn sets_private_cookie(headers: &HeaderMap, private_cookies: &[String]) -> bool 
         return false;
     }
     headers.get_all(SET_COOKIE).iter().any(|v| {
-        let Ok(s) = v.to_str() else { return false };
+        // Unreadable: it may name a private cookie, so it counts as one.
+        let Ok(s) = v.to_str() else { return true };
         let name = s.split('=').next().unwrap_or("").trim();
         private_cookies
             .iter()
@@ -4409,11 +4513,13 @@ impl http_body::Body for PrefixedBody {
 
 /// Outcome of buffering a response body for the page cache.
 enum Collected {
-    /// Fully buffered within `max_obj_bytes` — eligible to cache.
-    Buffered(Bytes),
+    /// Fully buffered within `max_obj_bytes` — eligible to cache. The lease charges the
+    /// buffer this collect allocated (`None` for a body that was already in memory).
+    Buffered(Bytes, Option<BodyBufferLease>),
     /// The body must be served uncached: either an unknown-length stream exceeded
-    /// `max_obj_bytes` (with its consumed prefix reattached), or an exact File read failed
-    /// (with the original descriptor/cache lease retained).
+    /// `max_obj_bytes` (with its consumed prefix reattached), the fill budget had no room
+    /// for it, or an exact File read failed (with the original descriptor/cache lease
+    /// retained).
     Passthrough(Body),
     /// Stream read error mid-buffer, or a blocking worker failure (unrecoverable here).
     Error,
@@ -4432,10 +4538,18 @@ const COLLECT_PRESIZE_CAP: u64 = 1 << 20;
 /// Starting capacity when no length is declared.
 const COLLECT_DEFAULT_CAPACITY: usize = 64 * 1024;
 
-async fn collect_body(body: Body, max_obj_bytes: u64, capacity_hint: usize) -> Collected {
+/// Every byte a fill allocates is reserved from the server-wide body budget first
+/// (`budget`), so concurrent misses cannot materialize unbounded memory before the
+/// admission check; without room the body is served through uncached.
+async fn collect_body(
+    body: Body,
+    max_obj_bytes: u64,
+    capacity_hint: usize,
+    budget: &Arc<BodyBufferBudget>,
+) -> Collected {
     match body {
-        Body::Full(b) => Collected::Buffered(b),
-        Body::Empty => Collected::Buffered(Bytes::new()),
+        Body::Full(b) => Collected::Buffered(b, None),
+        Body::Empty => Collected::Buffered(Bytes::new(), None),
         Body::File(mut f) => {
             let (start, len) = match f.range {
                 Some((start, end)) => (start, end.saturating_sub(start) + 1),
@@ -4445,10 +4559,14 @@ async fn collect_body(body: Body, max_obj_bytes: u64, capacity_hint: usize) -> C
             // FileBody's single-sourced helper, then require the exact advertised size.
             if let Some(bytes) = f.cached_ranged() {
                 return if bytes.len() as u64 == len {
-                    Collected::Buffered(bytes)
+                    Collected::Buffered(bytes, None)
                 } else {
                     Collected::Passthrough(Body::File(f))
                 };
+            }
+            let mut lease = BodyBufferLease::new(budget.clone());
+            if !lease.reserve(len) {
+                return Collected::Passthrough(Body::File(f));
             }
             match tokio::task::spawn_blocking(move || {
                 if f.file.is_none() {
@@ -4467,12 +4585,16 @@ async fn collect_body(body: Body, max_obj_bytes: u64, capacity_hint: usize) -> C
             })
             .await
             {
-                Ok((Some(bytes), _)) => Collected::Buffered(bytes),
+                Ok((Some(bytes), _)) => Collected::Buffered(bytes, Some(lease)),
                 Ok((None, f)) => Collected::Passthrough(Body::File(f)),
                 Err(_) => Collected::Error,
             }
         }
         Body::Stream(mut s) => {
+            let mut lease = BodyBufferLease::new(budget.clone());
+            if !lease.reserve(capacity_hint as u64) {
+                return Collected::Passthrough(Body::Stream(s));
+            }
             let mut buf = BytesMut::with_capacity(capacity_hint);
             loop {
                 match s.frame().await {
@@ -4480,6 +4602,21 @@ async fn collect_body(body: Body, max_obj_bytes: u64, capacity_hint: usize) -> C
                         // Trailers (non-data frames) are not part of the cached body — skip them,
                         // mirroring the old `Collected::to_bytes()` which dropped them too.
                         if let Ok(data) = frame.into_data() {
+                            let need = (buf.len() + data.len()) as u64;
+                            let held = lease.held();
+                            if need <= max_obj_bytes && need > held && !lease.reserve(need - held) {
+                                // No fill budget left: serve what was read, then the rest,
+                                // uncached; the bridge charges the frames it queues.
+                                let rest = PrefixedBody {
+                                    prefix: Some(data),
+                                    rest: s,
+                                };
+                                let passthrough = PrefixedBody {
+                                    prefix: Some(buf.freeze()),
+                                    rest: rest.boxed(),
+                                };
+                                return Collected::Passthrough(Body::Stream(passthrough.boxed()));
+                            }
                             buf.extend_from_slice(&data);
                             if buf.len() as u64 > max_obj_bytes {
                                 // Over cap: re-attach what we've read ahead of the unread
@@ -4494,7 +4631,7 @@ async fn collect_body(body: Body, max_obj_bytes: u64, capacity_hint: usize) -> C
                         }
                     }
                     Some(Err(_)) => return Collected::Error,
-                    None => return Collected::Buffered(buf.freeze()),
+                    None => return Collected::Buffered(buf.freeze(), Some(lease)),
                 }
             }
         }
@@ -4511,6 +4648,10 @@ fn error_502() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unlimited_fill_budget() -> Arc<BodyBufferBudget> {
+        Arc::new(BodyBufferBudget::new(0))
+    }
 
     // (CORS vary) A chain that reads `Origin` (SetEnvIf Origin — the forum's
     // reflected-ACAO rule) must key origin-conditional renders per origin, or
@@ -4566,6 +4707,77 @@ mod tests {
             key_for(&silent_chain, Some(&origin_b), "i"),
             "a chain that does not read Origin ignores Origin entirely"
         );
+    }
+
+    #[tokio::test]
+    async fn second_preimage_header_values_get_distinct_vary_keys() {
+        let (state, ctx, store) = cache_test_ctx();
+        for (attacker, victim) in FNV_COLLIDING_ORIGINS {
+            assert_eq!(
+                fnv64(attacker.as_bytes(), OWNER_BASIS_A),
+                fnv64(victim.as_bytes(), OWNER_BASIS_A),
+                "fixture must collide under FNV-1a-64"
+            );
+        }
+        let chain: Vec<Arc<hj_rewrite::Htaccess>> = vec![Arc::new(
+            hj_rewrite::Htaccess::parse("SetEnvIf Origin ^https:// CORS=1\n").expect("parse"),
+        )];
+        let ran = vec![(
+            std::path::PathBuf::from("/"),
+            Arc::new(
+                hj_rewrite::Htaccess::parse(concat!(
+                    "SetEnvIf Origin ^https:// CORS=1\n",
+                    "SetEnvIf X-Partner . PARTNER=1\n",
+                    "SetEnvIf Cookie ab=([^;]+) AB=$1\n",
+                ))
+                .expect("parse"),
+            ),
+        )];
+        let key_for = |origin: &str| {
+            let cc = CacheCtx {
+                enabled: true,
+                method: &Method::GET,
+                host: "forum.example",
+                cookie: None,
+                identity: "i",
+                req_path: "/config",
+                req_query: "",
+                chain: &chain,
+                render_epoch: store.purge_epoch(),
+                has_range: false,
+                vary_value: None,
+                host_foreign: false,
+                origin: Some(origin),
+                ua_class: None,
+                header_vary: None,
+                env_vary: false,
+            };
+            build_cache_key(&ctx, &cc, &store, &PrivateRoute::Public)
+        };
+        let vary = |name: &'static str, value: &str| {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(name, value.parse().unwrap());
+            crate::pipeline::page_cache_header_vary(&state, &ctx, &ran, &headers)
+                .expect("a read header varies")
+        };
+        for (attacker, victim) in FNV_COLLIDING_ORIGINS {
+            assert_ne!(key_for(attacker), key_for(victim), "\\0origin: dimension");
+            for name in ["origin", "x-partner"] {
+                assert_ne!(vary(name, attacker), vary(name, victim), "{name} dimension");
+            }
+            assert_ne!(
+                vary("cookie", &format!("ab={attacker}")),
+                vary("cookie", &format!("ab={victim}")),
+                "@cookie-env dimension"
+            );
+        }
+        let digest = vary("x-partner", "a");
+        let hex = digest
+            .strip_prefix("x-partner:")
+            .and_then(|d| d.strip_suffix(';'))
+            .unwrap();
+        assert_eq!(hex.len(), 64, "a full SHA-256 digest: {digest}");
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 
     // Regression (#617/#618): a chain reading a non-Origin/UA header (Accept
@@ -5367,6 +5579,30 @@ mod tests {
     }
 
     #[test]
+    fn non_text_vary_and_set_cookie_values_refuse_the_store() {
+        let obs = |name: HeaderName, value: &[u8]| {
+            let mut h = hdrs(&[]);
+            h.append(name, HeaderValue::from_bytes(value).unwrap());
+            h
+        };
+        assert!(sets_private_cookie(
+            &obs(SET_COOKIE, b"xf_session=s\xe9cret; path=/"),
+            &["xf_session".to_string()]
+        ));
+        let mut vary = obs(http::header::VARY, b"User-Agent\xe9");
+        vary.append(
+            http::header::VARY,
+            HeaderValue::from_static("Accept-Encoding"),
+        );
+        assert!(!standard_vary_supported(&vary));
+        let ls_vary = obs(HeaderName::from_static(HDR_VARY), b"cookie=xf_style_id\xe9");
+        assert!(matches!(
+            declared(&ls_vary),
+            DeclaredVary::Unsupported { extra_cookie: true }
+        ));
+    }
+
+    #[test]
     fn strip_removes_control_headers_only() {
         let mut h = hdrs(&[
             ("x-litespeed-cache-control", "public,max-age=60"),
@@ -6068,6 +6304,61 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn streamed_fill_copy_stops_at_the_fill_budget() {
+        let (mut state, ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                cfg.stream_fill_vhosts = vec!["forum.example".into()];
+            });
+        let budget = Arc::new(BodyBufferBudget::new(COLLECT_DEFAULT_CAPACITY as u64 + 10));
+        Arc::get_mut(&mut state)
+            .expect("the test state is unshared")
+            .body_budget = budget.clone();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/moon".to_string();
+        let cc = page_cc(&method, "/moon", &identity, store.purge_epoch());
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        let (feed, resp) = fed_page(None);
+        let resp = cache_store(&state, &ctx, &cc, resp).await;
+        assert_eq!(resp.headers().get(HDR_CACHE_STATUS).unwrap(), "miss");
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a no-Content-Length miss streams");
+        };
+        assert_eq!(budget.in_flight(), COLLECT_DEFAULT_CAPACITY as u64);
+        let frame = Bytes::from(vec![b'm'; COLLECT_DEFAULT_CAPACITY]);
+        for _ in 0..2 {
+            feed.send(Ok(frame.clone())).unwrap();
+            assert_eq!(next_data(&mut body).await.unwrap(), frame);
+        }
+        assert_eq!(
+            budget.in_flight(),
+            0,
+            "the abandoned copy releases its lease"
+        );
+        drop(feed);
+        assert!(next_data(&mut body).await.is_none());
+        assert_eq!(store.entry_count(), 0);
+
+        let mut hog = BodyBufferLease::new(budget.clone());
+        assert!(hog.reserve(budget.capacity()));
+        let (feed, resp) = fed_page(None);
+        let resp = cache_store(&state, &ctx, &cc, resp).await;
+        assert!(resp.headers().get(HDR_CACHE_STATUS).is_none());
+        assert!(resp.headers().get(HDR_CACHE_CONTROL).is_none());
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a fill without budget streams through");
+        };
+        feed.send(Ok(Bytes::from_static(b"<p>"))).unwrap();
+        drop(feed);
+        assert_eq!(next_data(&mut body).await.unwrap(), "<p>");
+        assert!(next_data(&mut body).await.is_none());
+        drop(hog);
+        assert_eq!(budget.in_flight(), 0);
     }
 
     /// Regression (#949): a cacheable streamed response sent with `X-Accel-Buffering: no`
@@ -8067,8 +8358,8 @@ mod tests {
             range: None,
             cached: None,
         });
-        match collect_body(fb, 1024, 0).await {
-            Collected::Buffered(b) => assert_eq!(b.as_ref(), b"static-file-body"),
+        match collect_body(fb, 1024, 0, &unlimited_fill_budget()).await {
+            Collected::Buffered(b, _) => assert_eq!(b.as_ref(), b"static-file-body"),
             _ => panic!("file body must buffer to its bytes"),
         }
         // A missing file is returned unchanged for uncached pass-through, not a 502.
@@ -8081,7 +8372,7 @@ mod tests {
             cached: None,
         });
         assert!(matches!(
-            collect_body(missing, 1024, 0).await,
+            collect_body(missing, 1024, 0, &unlimited_fill_budget()).await,
             Collected::Passthrough(Body::File(_))
         ));
     }
@@ -8101,7 +8392,7 @@ mod tests {
             range: None,
             cached: None,
         });
-        match collect_body(body, 1024, 0).await {
+        match collect_body(body, 1024, 0, &unlimited_fill_budget()).await {
             Collected::Passthrough(Body::File(f)) => {
                 assert!(
                     f.file.is_some(),
@@ -8134,8 +8425,8 @@ mod tests {
             range: None,
             cached: None,
         });
-        match collect_body(body, 1024, 0).await {
-            Collected::Buffered(bytes) => assert_eq!(bytes.as_ref(), b"OLD-BODY"),
+        match collect_body(body, 1024, 0, &unlimited_fill_budget()).await {
+            Collected::Buffered(bytes, _) => assert_eq!(bytes.as_ref(), b"OLD-BODY"),
             _ => panic!("the selected descriptor is exact and must buffer"),
         }
         let _ = std::fs::remove_file(path);
@@ -8161,7 +8452,7 @@ mod tests {
             range: None,
             cached: None,
         });
-        let fallback = match collect_body(body, 1024, 0).await {
+        let fallback = match collect_body(body, 1024, 0, &unlimited_fill_budget()).await {
             Collected::Passthrough(Body::File(f)) => f,
             _ => panic!("short selected inode must pass through uncached"),
         };
@@ -8183,8 +8474,8 @@ mod tests {
             range: Some((2, 5)),
             cached: Some(Bytes::from_static(b"01234567")),
         });
-        match collect_body(body, 1024, 0).await {
-            Collected::Buffered(bytes) => assert_eq!(bytes.as_ref(), b"2345"),
+        match collect_body(body, 1024, 0, &unlimited_fill_budget()).await {
+            Collected::Buffered(bytes, _) => assert_eq!(bytes.as_ref(), b"2345"),
             _ => panic!("a complete cached range must buffer without reopening"),
         }
     }
@@ -8510,13 +8801,20 @@ mod tests {
     #[tokio::test]
     async fn collect_stream_under_and_at_cap_buffers() {
         // Under the cap: fully buffered.
-        match collect_body(stream_of(&[b"ab", b"cd", b"ef"]), 1024, 0).await {
-            Collected::Buffered(b) => assert_eq!(b.as_ref(), b"abcdef"),
+        match collect_body(
+            stream_of(&[b"ab", b"cd", b"ef"]),
+            1024,
+            0,
+            &unlimited_fill_budget(),
+        )
+        .await
+        {
+            Collected::Buffered(b, _) => assert_eq!(b.as_ref(), b"abcdef"),
             _ => panic!("under-cap stream must buffer"),
         }
         // Exactly at the cap (6 bytes, cap 6): buffered (the store guard is `<= max_obj_bytes`).
-        match collect_body(stream_of(&[b"abc", b"def"]), 6, 0).await {
-            Collected::Buffered(b) => assert_eq!(b.as_ref(), b"abcdef"),
+        match collect_body(stream_of(&[b"abc", b"def"]), 6, 0, &unlimited_fill_budget()).await {
+            Collected::Buffered(b, _) => assert_eq!(b.as_ref(), b"abcdef"),
             _ => panic!("at-cap stream must buffer"),
         }
     }
@@ -8525,7 +8823,14 @@ mod tests {
     async fn collect_stream_over_cap_serves_through_uncached() {
         // 10 bytes over a 4-byte cap: Passthrough, and the body must reproduce the
         // FULL original bytes (prefix read so far + the unread remainder), never truncated.
-        match collect_body(stream_of(&[b"abcd", b"efgh", b"ij"]), 4, 0).await {
+        match collect_body(
+            stream_of(&[b"abcd", b"efgh", b"ij"]),
+            4,
+            0,
+            &unlimited_fill_budget(),
+        )
+        .await
+        {
             Collected::Passthrough(Body::Stream(s)) => {
                 let bytes = s.collect().await.expect("pass-through collects").to_bytes();
                 assert_eq!(
@@ -8536,6 +8841,147 @@ mod tests {
             }
             _ => panic!("over-cap stream must be Passthrough(Stream), not buffered"),
         }
+    }
+
+    #[tokio::test]
+    async fn collect_charges_the_fill_budget_and_serves_through_without_room() {
+        let budget = Arc::new(BodyBufferBudget::new(6));
+        let Collected::Buffered(bytes, Some(lease)) =
+            collect_body(stream_of(&[b"abc", b"def"]), 1024, 4, &budget).await
+        else {
+            panic!("a stream within the budget buffers");
+        };
+        assert_eq!(bytes.as_ref(), b"abcdef");
+        assert_eq!((lease.held(), budget.in_flight()), (6, 6));
+        drop(lease);
+        assert_eq!(budget.in_flight(), 0);
+
+        match collect_body(stream_of(&[b"abcd", b"efgh", b"ij"]), 1024, 4, &budget).await {
+            Collected::Passthrough(Body::Stream(s)) => {
+                assert_eq!(
+                    budget.in_flight(),
+                    0,
+                    "a served-through fill holds no lease"
+                );
+                let bytes = s.collect().await.expect("pass-through collects").to_bytes();
+                assert_eq!(bytes.as_ref(), b"abcdefghij");
+            }
+            _ => panic!("a stream past the fill budget is served through"),
+        }
+        assert!(matches!(
+            collect_body(stream_of(&[b"a"]), 1024, 7, &budget).await,
+            Collected::Passthrough(Body::Stream(_))
+        ));
+
+        let path = std::env::temp_dir().join(format!(
+            "httpjet_collect_budget_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let file = Body::File(hj_core::FileBody {
+            path: path.clone(),
+            file: None,
+            len: 10,
+            range: None,
+            cached: None,
+        });
+        assert!(matches!(
+            collect_body(file, 1024, 0, &budget).await,
+            Collected::Passthrough(Body::File(f)) if f.file.is_none()
+        ));
+        assert_eq!(budget.in_flight(), 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn opted_in_file(path: &std::path::Path, len: u64) -> Response {
+        http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "application/javascript")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .body(Body::File(hj_core::FileBody {
+                path: path.to_path_buf(),
+                file: None,
+                len,
+                range: None,
+                cached: None,
+            }))
+            .unwrap()
+    }
+
+    // An opted-in static asset admission rejects keeps zero-copy instead of being
+    // read into RAM on every sighting; once admitted it fills, and its fill lease
+    // ends with the store.
+    #[tokio::test]
+    async fn unadmitted_static_file_miss_is_not_materialized() {
+        let (state, ctx, store) = cache_test_ctx();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/asset.js";
+        let cc = page_cc(&method, "/asset.js", identity, store.purge_epoch());
+        let body = vec![b'j'; 64 * 1024];
+        let path = std::env::temp_dir().join(format!(
+            "httpjet_unadmitted_file_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, &body).unwrap();
+        let len = body.len() as u64;
+
+        let rejected = cache_store(&state, &ctx, &cc, opted_in_file(&path, len)).await;
+        assert!(
+            matches!(rejected.body(), Body::File(f) if f.cached.is_none()),
+            "an unadmitted file miss stays a file"
+        );
+        assert_eq!(rejected.headers().get(HDR_CACHE_STATUS).unwrap(), "miss");
+        assert!(rejected.headers().get(HDR_CACHE_CONTROL).is_none());
+        assert_eq!(store.entry_count(), 0);
+
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        let fill = cache_store(&state, &ctx, &cc, opted_in_file(&path, len)).await;
+        assert!(matches!(fill.body(), Body::Full(b) if b.as_ref() == &body[..]));
+        assert_eq!(store.entry_count(), 1);
+        assert_eq!(
+            state.body_budget.in_flight(),
+            0,
+            "the fill lease ends with the store"
+        );
+        let CacheOutcome::Hit(_) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("the admitted file was stored");
+        };
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn admitted_fill_without_budget_serves_through_uncached() {
+        let (mut state, ctx, store) = cache_test_ctx();
+        Arc::get_mut(&mut state)
+            .expect("the test state is unshared")
+            .body_budget = Arc::new(BodyBufferBudget::new(8 * 1024));
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/big";
+        let cc = page_cc(&method, "/big", identity, store.purge_epoch());
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        let chunk = [b'x'; 4 * 1024];
+        let resp = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/html")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .body(stream_of(&[&chunk, &chunk, &chunk]))
+            .unwrap();
+        let resp = cache_store(&state, &ctx, &cc, resp).await;
+        assert_eq!(store.entry_count(), 0);
+        assert!(resp.headers().get(HDR_CACHE_CONTROL).is_none());
+        let Body::Stream(s) = resp.into_body() else {
+            panic!("a fill without budget streams through");
+        };
+        assert_eq!(s.collect().await.unwrap().to_bytes().len(), 12 * 1024);
+        assert_eq!(state.body_budget.in_flight(), 0);
     }
 
     #[test]

@@ -74,12 +74,12 @@ pub(super) struct Recv {
     /// The per-stream receive window we grant on a new stream = our advertised
     /// SETTINGS_INITIAL_WINDOW_SIZE (§6.9.2). Stamped into each `StreamState` at open.
     pub(super) our_initial_window: i64,
-    /// (CVE-2023-44487 rapid-reset) Running imbalance: streams the peer RST'd *while their
-    /// handler was still in flight* minus streams that completed a response. An open→reset
-    /// flood (each reset triggers a full backend render that is then discarded) drives this
-    /// up monotonically; a healthy client that cancels some requests while completing others
-    /// keeps it near zero. Over `RAPID_RESET_BUDGET` ⇒ GOAWAY(ENHANCE_YOUR_CALM) + close.
-    pub(super) rst_unanswered: u32,
+    /// (CVE-2023-44487 rapid-reset) Debt of the reset budget: resets of streams whose
+    /// handler was still in flight (backend work started, then discarded), whoever sent the
+    /// RST_STREAM. The budget refills with time only, so completed requests cannot pay for
+    /// cancelled ones; `None` or a past instant means it is full. See
+    /// `Recv::charge_inflight_reset`.
+    pub(super) reset_debt_until: Option<tokio::time::Instant>,
     /// (per-connection request-body bound) Running sum of buffered request-body bytes across
     /// all streams. The per-stream 64 MiB cap alone permits max_concurrent x 64 MiB (~16 GiB)
     /// resident on one connection; this bounds the aggregate. Incremented as DATA buffers,
@@ -90,6 +90,13 @@ pub(super) struct Recv {
     pub(super) max_request_body: usize,
     /// Per-connection SUM cap = `4 × max_request_body`; over it ⇒ GOAWAY(ENHANCE_YOUR_CALM).
     pub(super) per_conn_request_body: usize,
+    /// Decoded request-header bytes charged by streams whose headers are complete but
+    /// whose body is still arriving ([`StreamState::header_charge`]); returned when the
+    /// stream is dispatched or torn down.
+    pub(super) pending_header_bytes: usize,
+    /// Cap on `pending_header_bytes` (`Config::pending_header_mem`). A stream that would
+    /// exceed it is refused, unless it is the only one charged.
+    pub(super) pending_header_mem: usize,
     /// Server-wide buffered-body budget shared with the H1/H3 transports (#236 residual).
     /// Each stream owns its reservation and transfers it with the body at dispatch.
     /// Unlike `total_buffered`, global accounting lasts until the body allocation dies.
@@ -100,6 +107,8 @@ pub(super) struct Recv {
     /// work without ever advancing a request. Reset to 0 on any progress (a dispatched request,
     /// a non-empty DATA byte, a window grant); over `NO_PROGRESS_BUDGET` ⇒ GOAWAY.
     pub(super) no_progress_frames: u32,
+    /// `Config::early_reject`, consulted at END_HEADERS for a stream with a body to come.
+    pub(super) early_reject: Option<super::EarlyReject>,
 }
 
 impl Recv {
@@ -121,11 +130,46 @@ impl Recv {
             .insert(sid, self.max_concurrent.saturating_mul(2));
     }
 
-    /// Stop counting `n` bytes against the connection's unfinished-body limit.
-    /// The stream/body's owned lease independently retains global accounting until
-    /// its bytes are freed, including after dispatch and on connection teardown.
-    pub(super) fn buffer_sub(&mut self, n: usize) {
-        self.total_buffered = self.total_buffered.saturating_sub(n);
+    /// Stop counting a stream's buffered body and decoded headers against the
+    /// connection's limits. The stream/body's owned lease independently retains global
+    /// accounting until its bytes are freed, including after dispatch and on connection
+    /// teardown.
+    pub(super) fn release_stream(&mut self, st: &StreamState) {
+        self.total_buffered = self.total_buffered.saturating_sub(st.body.len());
+        self.pending_header_bytes = self
+            .pending_header_bytes
+            .saturating_sub(st.header_charge as usize);
+    }
+
+    /// Drop `sid`'s half-received request, if any, and its connection accounting.
+    pub(super) fn drop_receiving(
+        &mut self,
+        streams: &mut rustc_hash::FxHashMap<u32, StreamState>,
+        sid: u32,
+    ) {
+        if let Some(s) = streams.remove(&sid) {
+            self.release_stream(&s);
+        }
+    }
+
+    /// Charge the decoded headers of a stream that now waits for its body against this
+    /// connection's cap and the server-wide budget. False ⇒ refuse it; nothing is charged.
+    pub(super) fn admit_pending_headers(&mut self, st: &mut StreamState, charge: u32) -> bool {
+        let total = self.pending_header_bytes.saturating_add(charge as usize);
+        if self.pending_header_bytes != 0 && total > self.pending_header_mem {
+            return false;
+        }
+        if let Some(b) = &self.body_budget {
+            let lease = st
+                .body_lease
+                .get_or_insert_with(|| hj_core::budget::BodyBufferLease::new(b.clone()));
+            if !lease.reserve(u64::from(charge)) {
+                return false;
+            }
+        }
+        st.header_charge = charge;
+        self.pending_header_bytes = total;
+        true
     }
 
     /// Receive-side teardown after WE reset `sid`: drop any half-received request
@@ -136,9 +180,7 @@ impl Recv {
         streams: &mut rustc_hash::FxHashMap<u32, StreamState>,
         sid: u32,
     ) {
-        if let Some(s) = streams.remove(&sid) {
-            self.buffer_sub(s.body.len());
-        }
+        self.drop_receiving(streams, sid);
         self.note_reset(sid);
         self.sent_reset_ids
             .insert(sid, self.max_concurrent.saturating_mul(2));
@@ -214,6 +256,9 @@ pub(super) struct StreamState {
     /// this stream; the RST_STREAM(REFUSED_STREAM) is deferred to the END_HEADERS decode-complete
     /// site (`refuse_if_marked` in recv.rs) instead of firing when the HEADERS frame first arrives.
     pub(super) refused: bool,
+    /// Bytes this stream charged to `Recv::pending_header_bytes` (and to the server-wide
+    /// budget through `body_lease`) while its decoded headers wait for the body.
+    pub(super) header_charge: u32,
     pub(super) body: Vec<u8>,
     /// Own the global reservation while buffering; move it into the body Bytes at
     /// dispatch so every clone/slice keeps the allocation charged until final drop.

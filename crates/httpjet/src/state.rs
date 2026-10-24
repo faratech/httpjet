@@ -251,6 +251,8 @@ pub struct ServerState {
     /// Shared across reloads that keep the same limits, so a SIGHUP neither resets
     /// per-IP windows nor runs the counters backwards (#933).
     pub client_throttle: Arc<hj_acl::ClientThrottle>,
+    /// Per-client Basic-auth attempt accounting; carried across reloads.
+    pub auth_limiter: Arc<crate::pipeline::AuthLimiter>,
     /// (Tier 2) Resolved GeoIP/ASN rules (empty/inert unless <geoipDBFile> plus
     /// label lists are configured). Judged against the RESOLVED client IP.
     pub geo: Arc<hj_acl::GeoRules>,
@@ -740,17 +742,13 @@ fn build_config_derived(
     let acl = Arc::new(AccessControl::from_security(&server.security)?);
     let client_throttle = hj_acl::ClientThrottle::from_tuning(&server.tuning);
     let compress = Arc::new(Compress::from_tuning(&server.tuning).with_cf_send_zstd(cf_send_zstd));
-    let expires = Arc::new(if server.expires.enabled {
-        ExpiresRules::from_pairs(
-            server
-                .expires
-                .by_type
-                .iter()
-                .map(|(t, v)| (t.clone(), v.clone())),
-        )
-    } else {
-        ExpiresRules::from_pairs(std::iter::empty::<(String, String)>())
-    });
+    let expires = Arc::new(ExpiresRules::from_pairs(
+        server
+            .expires
+            .by_type
+            .iter()
+            .map(|(t, v)| (t.clone(), v.clone())),
+    ));
 
     Ok(ConfigDerived {
         router,
@@ -904,7 +902,9 @@ fn configured_fastcgi_handlers(
 fn build_transforms(
     static_cache: &Arc<hj_pagecache::PageStore>,
     expires: &Arc<ExpiresRules>,
+    expires_enabled: bool,
     vhost_expires: &HashMap<String, Arc<ExpiresRules>>,
+    vhost_expires_enabled: &HashMap<String, bool>,
     compress: &Arc<Compress>,
     alt_svc: &Option<http::HeaderValue>,
 ) -> Vec<Arc<dyn hj_core::ResponseTransform>> {
@@ -918,7 +918,9 @@ fn build_transforms(
         }),
         Arc::new(ExpiresTransform {
             expires: expires.clone(),
+            expires_enabled,
             vhost_expires: vhost_expires.clone(),
+            vhost_expires_enabled: vhost_expires_enabled.clone(),
         }),
         // (Tier 2) sub_filter runs BEFORE compress so the filtered body is then
         // compressed by the ordinary transform (nginx's filter order).
@@ -933,10 +935,14 @@ fn build_transforms(
 
 /// Per-vhost `<expires>` blocks, resolved the way OLS does: `enableExpires`
 /// inherits the server value unless the vhost declares it, and the vhost's
-/// `expiresByType` entries override per type on top of the server's. A disabled
-/// vhost gets an explicit empty rule set so the server rules cannot apply.
-fn build_vhost_expires(server: &ServerConfig) -> HashMap<String, Arc<ExpiresRules>> {
+/// `expiresByType` entries override per type on top of the server's. Rules stay
+/// compiled independently of the enabled bit so a descendant `.htaccess`
+/// `ExpiresActive On` can inherit them.
+fn build_vhost_expires(
+    server: &ServerConfig,
+) -> (HashMap<String, Arc<ExpiresRules>>, HashMap<String, bool>) {
     let mut out = HashMap::new();
+    let mut enabled_out = HashMap::new();
     for (name, decl) in &server.vhosts {
         let Some(cfg) = &decl.config else { continue };
         let Some(ex) = &cfg.expires else { continue };
@@ -945,22 +951,20 @@ fn build_vhost_expires(server: &ServerConfig) -> HashMap<String, Arc<ExpiresRule
         } else {
             server.expires.enabled
         };
-        let rules = if enabled {
-            // Server rules first: the vhost's entries override them (last match wins).
-            ExpiresRules::from_pairs(
-                server
-                    .expires
-                    .by_type
-                    .iter()
-                    .chain(ex.by_type.iter())
-                    .map(|(t, v)| (t.clone(), v.clone())),
-            )
-        } else {
-            ExpiresRules::from_pairs(std::iter::empty::<(String, String)>())
-        };
+        // Keep MIME rules even while this level is disabled: a descendant
+        // `.htaccess` may explicitly turn expiry back on and inherit them.
+        let rules = ExpiresRules::from_pairs(
+            server
+                .expires
+                .by_type
+                .iter()
+                .chain(ex.by_type.iter())
+                .map(|(t, v)| (t.clone(), v.clone())),
+        );
         out.insert(name.clone(), Arc::new(rules));
+        enabled_out.insert(name.clone(), enabled);
     }
-    out
+    (out, enabled_out)
 }
 
 fn static_store_config(server: &ServerConfig) -> hj_pagecache::StoreConfig {
@@ -1099,11 +1103,13 @@ impl ServerState {
 
         // Parse Alt-Svc once (unparseable degrades to none) and build the transform pipeline.
         let alt_svc = alt_svc.and_then(|s| http::HeaderValue::from_str(&s).ok());
-        let vhost_expires = build_vhost_expires(&server);
+        let (vhost_expires, vhost_expires_enabled) = build_vhost_expires(&server);
         let transforms = build_transforms(
             &static_cache,
             &cd.expires,
+            server.expires.enabled,
             &vhost_expires,
+            &vhost_expires_enabled,
             &cd.compress,
             &alt_svc,
         );
@@ -1177,6 +1183,7 @@ impl ServerState {
             php_suffixes: cd.php_suffixes,
             acl: cd.acl,
             client_throttle: Arc::new(cd.client_throttle),
+            auth_limiter: Arc::default(),
             geo,
             compress: cd.compress,
             transforms,
@@ -1229,11 +1236,14 @@ impl ServerState {
         let cd = build_config_derived(&server, old.compress.cf_send_zstd())?;
         // Rebuild the transform pipeline from the NEW expires/compress + carried-over
         // static cache/alt_svc, so the reloaded generation behaves identically.
+        let (vhost_expires, vhost_expires_enabled) = build_vhost_expires(&server);
         let transforms = build_transforms(
             &old.static_cache,
             &cd.expires,
+            server.expires.enabled,
             // Per-vhost <expires> is config-derived: a SIGHUP re-reads it live.
-            &build_vhost_expires(&server),
+            &vhost_expires,
+            &vhost_expires_enabled,
             &cd.compress,
             &old.alt_svc,
         );
@@ -1315,6 +1325,7 @@ impl ServerState {
             ext_by_name: cd.ext_by_name,
             php_suffixes: cd.php_suffixes,
             acl: cd.acl,
+            auth_limiter: old.auth_limiter.clone(),
             client_throttle: if old.client_throttle.same_limits(&cd.client_throttle) {
                 old.client_throttle.clone()
             } else {
@@ -1482,12 +1493,13 @@ mod tests {
             ),
         ]);
         let cfg = hj_config::parse_bundle(Path::new("/tmp"), server, &docs, "").unwrap();
-        let map = build_vhost_expires(&cfg);
+        let (map, enabled) = build_vhost_expires(&cfg);
 
         let off = map
             .get("off")
             .expect("disabled vhost must suppress server rules");
-        assert!(off.lookup("image/png").is_none());
+        assert_eq!(off.lookup("image/png").unwrap().age_secs, 604800);
+        assert_eq!(enabled.get("off"), Some(&false));
 
         let typed = map
             .get("typed")
@@ -1495,6 +1507,7 @@ mod tests {
         assert_eq!(typed.lookup("image/png").unwrap().age_secs, 60);
         assert_eq!(typed.lookup("image/jpeg").unwrap().age_secs, 604800);
         assert_eq!(typed.lookup("text/css").unwrap().age_secs, 3600);
+        assert_eq!(enabled.get("typed"), Some(&true));
 
         assert!(!map.contains_key("plain"));
     }

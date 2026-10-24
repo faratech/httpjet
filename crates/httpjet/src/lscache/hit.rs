@@ -9,8 +9,8 @@ use http::header::{AGE, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, ETAG, V
 use http::{HeaderMap, HeaderValue, StatusCode};
 
 use hj_compress::{
-    AcceptEncoding, Compress, Encoding, Levels, MAX_DECODE, PageDict, decode_bytes, encode_bytes,
-    etag_variant,
+    AcceptEncoding, Compress, Encoding, Levels, MAX_DECODE, PageDict, decode_bytes_bounded,
+    encode_bytes, etag_variant,
 };
 use hj_core::{Body, FileBody, Response};
 use hj_pagecache::CachedResponse;
@@ -223,11 +223,16 @@ fn resolve_identity(
     stored: impl FnOnce() -> Option<Bytes>,
     stored_file: impl FnOnce() -> Option<FileBody>,
 ) -> Option<HitBody> {
+    let decode_limit = store
+        .map(|store| store.config().max_obj_bytes)
+        .unwrap_or(MAX_DECODE);
     if entry.is_derived() {
         return entry
             .variants
             .iter()
-            .find_map(|(tok, b)| Encoding::from_token(tok).and_then(|e| decode_bytes(e, b)))
+            .find_map(|(tok, b)| {
+                Encoding::from_token(tok).and_then(|e| decode_bytes_bounded(e, b, decode_limit))
+            })
             .map(Bytes::from)
             .map(HitBody::Bytes);
     }
@@ -263,7 +268,11 @@ fn identity_body(
     }
     // Fetched only now: a warm decoded identity above needs no compressed bytes at all.
     let stored = stored()?;
-    match dict.and_then(|d| d.decode(stored.as_ref(), MAX_DECODE as usize)) {
+    let decode_limit = store
+        .map(|store| store.config().max_obj_bytes)
+        .unwrap_or(MAX_DECODE);
+    let decode_limit = usize::try_from(decode_limit).unwrap_or(usize::MAX);
+    match dict.and_then(|d| d.decode(stored.as_ref(), decode_limit)) {
         Some(v) => {
             let identity = Bytes::from(v);
             if let (Some(id), Some(store)) = (body_id, store) {
@@ -470,7 +479,10 @@ fn store_encoding(accept_encoding: AcceptEncoding, priority: &[Encoding]) -> Opt
 /// coding plus — when zstd egress to Cloudflare is forced — zstd. Without the
 /// union, a non-zstd first hitter (a deploy-gate curl, a gzip-only monitor)
 /// pins the entry's single variant to its own coding, and every subsequent CF
-/// hit pays a dict-decode + full recompress for the entry's whole TTL.
+/// hit pays a dict-decode + full recompress for the entry's whole TTL. Under
+/// forced zstd egress an internal refresh (no Accept-Encoding, e.g. the tag
+/// cache warmer) takes zstd alone: its brotli default could only ever serve a
+/// direct client, and each fill zero-filled brotli's ~32 MiB quality-9 hasher.
 fn add_encoding_once(encs: &mut Vec<Encoding>, enc: Encoding) {
     if !encs.contains(&enc) {
         encs.push(enc);
@@ -484,7 +496,10 @@ fn fill_encodings(
     priority: &[Encoding],
 ) -> Vec<Encoding> {
     let mut encs = Vec::with_capacity(if capsule_shell { 3 } else { 2 });
-    if let Some(e) = store_encoding(accept_encoding, priority) {
+    let internal_refresh = accept_encoding.is_empty();
+    if !(cf_zstd_egress && internal_refresh && priority.contains(&Encoding::Zstd))
+        && let Some(e) = store_encoding(accept_encoding, priority)
+    {
         add_encoding_once(&mut encs, e);
     }
     if cf_zstd_egress && priority.contains(&Encoding::Zstd) {
@@ -575,7 +590,7 @@ pub(super) fn precompress_variants(
 mod tests {
     use super::*;
     use hj_compress::DEFAULT_PRIORITY;
-    use hj_pagecache::{PageBody, PageScope};
+    use hj_pagecache::{PageBody, PageScope, PageStore, StoreConfig};
     use http::header::CONTENT_TYPE;
     use std::time::Duration;
 
@@ -706,10 +721,20 @@ mod tests {
             ),
             vec![Encoding::Zstd]
         );
-        // Empty AE (internal refresh) defaults to brotli, plus zstd under CF egress.
+        // Empty AE (internal refresh, e.g. the tag cache warmer) under CF egress fills
+        // zstd alone: a brotli variant could only serve a direct client.
         assert_eq!(
             fill_encodings(true, AcceptEncoding::parse(""), false, DEFAULT_PRIORITY),
-            vec![Encoding::Brotli, Encoding::Zstd]
+            vec![Encoding::Zstd]
+        );
+        assert_eq!(
+            fill_encodings(true, AcceptEncoding::parse(""), true, DEFAULT_PRIORITY),
+            vec![Encoding::Zstd]
+        );
+        // Without CF egress an internal refresh keeps the brotli default.
+        assert_eq!(
+            fill_encodings(false, AcceptEncoding::parse(""), false, DEFAULT_PRIORITY),
+            vec![Encoding::Brotli]
         );
         // identity-only client alone yields nothing — but CF egress still fills zstd.
         assert_eq!(
@@ -973,6 +998,47 @@ mod tests {
         match r2.body() {
             Body::Full(b) => assert_eq!(b.as_ref(), identity, "identity reconstructed losslessly"),
             _ => panic!("expected a full body"),
+        }
+    }
+
+    #[test]
+    fn dict_hit_uses_the_page_cache_object_cap() {
+        let identity = vec![b'x'; (MAX_DECODE + 1) as usize];
+        let dict = PageDict::new(b"repeated html body dictionary ".repeat(32), 1)
+            .expect("non-empty dictionary");
+        let compressed = dict.encode(&identity).expect("dict encode");
+        assert!(
+            dict.decode(&compressed, MAX_DECODE as usize).is_none(),
+            "the generic decoder ceiling reproduces the old failed-hit path"
+        );
+
+        let store = PageStore::new(StoreConfig {
+            max_obj_bytes: identity.len() as u64,
+            ..StoreConfig::default()
+        });
+        let mut entry = entry_with_variants(&identity, &[]);
+        entry.body = PageBody::InMem(Bytes::from(compressed.clone()));
+        entry.dict_gen = dict.generation();
+
+        let response = build_hit_response(
+            &entry,
+            Instant::now(),
+            AcceptEncoding::parse(""),
+            &Compress::default(),
+            false,
+            Some(&dict),
+            Some(&store),
+            || Some(Bytes::from(compressed)),
+            || None,
+        )
+        .expect("a configured-valid large cache object remains a hit");
+        assert_eq!(
+            response.headers().get(CONTENT_LENGTH).unwrap(),
+            identity.len().to_string().as_str()
+        );
+        match response.body() {
+            Body::Full(body) => assert_eq!(body.as_ref(), identity),
+            _ => panic!("expected a decoded full body"),
         }
     }
 

@@ -133,6 +133,7 @@ fn proxy(out: RewriteOutcome) -> (String, Option<String>, Vec<(String, String)>)
             target_url,
             proxy_host,
             env,
+            ..
         } => (target_url, proxy_host, env),
         other => panic!("expected Proxy, got {other:?}"),
     }

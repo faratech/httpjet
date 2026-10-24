@@ -619,6 +619,11 @@ fn append_lsapi_pool_metrics(out: &mut String, stats: Option<hj_lsapi::PoolStats
             "PHP response bodies streamed through the LSAPI body pump.",
             stats.streamed_bodies,
         ),
+        (
+            "httpjet_lsapi_embedded_begin_rejects_total",
+            "PHP requests refused because their body held bytes lsphp could run as a new request.",
+            stats.embedded_begin_rejects,
+        ),
     ] {
         out.push_str(&format!("# HELP {name} {help}\n"));
         out.push_str(&format!("# TYPE {name} counter\n"));
@@ -724,6 +729,9 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
          # HELP httpjet_h2_send_stall_resets_total HTTP/2 responses reset because they made too little progress while waiting on withheld flow-control credit.\n\
          # TYPE httpjet_h2_send_stall_resets_total counter\n\
          httpjet_h2_send_stall_resets_total {}\n\
+         # HELP httpjet_h2_rapid_reset_goaways_total HTTP/2 connections closed with ENHANCE_YOUR_CALM for cancelling dispatched requests faster than the rapid-reset budget refills.\n\
+         # TYPE httpjet_h2_rapid_reset_goaways_total counter\n\
+         httpjet_h2_rapid_reset_goaways_total {}\n\
          # HELP httpjet_h2_send_blocked_total HTTP/2 responses that entered a flow-control-blocked state with bytes pending, once per transition, by the window that ran out (conn = connection, stream = the stream's own).\n\
          # TYPE httpjet_h2_send_blocked_total counter\n\
          httpjet_h2_send_blocked_total{{kind=\"conn\"}} {}\n\
@@ -734,6 +742,7 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
         crate::uring::trusted_proxy_idle_secs(),
         metrics.tls_handshakes_hello_retry.load(Ordering::Relaxed),
         hj_h2::server::send_stall_resets(),
+        hj_h2::server::rapid_reset_goaways(),
         send_blocked_conn,
         send_blocked_stream,
         hj_tls::CERT_RELOAD_RETAINED.load(Ordering::Relaxed),
@@ -1923,6 +1932,7 @@ mod tests {
                 inline_bodies: 12,
                 inline_tail_drains: 13,
                 streamed_bodies: 14,
+                embedded_begin_rejects: 15,
             }),
         );
         for expected in [
@@ -1939,6 +1949,7 @@ mod tests {
             "httpjet_lsapi_inline_bodies_total 12\n",
             "httpjet_lsapi_inline_tail_drains_total 13\n",
             "httpjet_lsapi_streamed_bodies_total 14\n",
+            "httpjet_lsapi_embedded_begin_rejects_total 15\n",
         ] {
             assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
         }

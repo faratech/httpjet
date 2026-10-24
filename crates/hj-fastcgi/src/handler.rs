@@ -192,6 +192,7 @@ impl Handler for FastCgi {
 
         let mut wire = BytesMut::with_capacity(16 * 1024);
         let mut header = BytesMut::new();
+        let mut header_boundary = CgiHeadBoundary::default();
         let mut stderr_seen = 0_usize;
         let parsed = loop {
             let record = next_record(conn.reader(), &mut wire, self.read_timeout).await?;
@@ -209,15 +210,19 @@ impl Handler for FastCgi {
                         ));
                     }
                     header.extend_from_slice(&record.content);
-                    match parse_cgi_head(
-                        header.clone().freeze(),
-                        self.max_response_header,
-                        self.max_response_headers,
-                    ) {
-                        Ok(parsed) => break parsed,
-                        Err(crate::ResponseError::Incomplete)
-                            if header.len() <= self.max_response_header => {}
-                        Err(error) => return Err(bad_response(error)),
+                    if header_boundary.find(&header).is_some() {
+                        match parse_cgi_head(
+                            header.freeze(),
+                            self.max_response_header,
+                            self.max_response_headers,
+                        ) {
+                            Ok(parsed) => break parsed,
+                            Err(error) => return Err(bad_response(error)),
+                        }
+                    } else if header.len() > self.max_response_header {
+                        // Preserve the prior error classification: an over-bound
+                        // buffer with no terminator is still an incomplete head.
+                        return Err(bad_response(crate::ResponseError::Incomplete));
                     }
                 }
                 RecordType::Stderr => {
@@ -235,13 +240,19 @@ impl Handler for FastCgi {
         let headers = parsed.headers;
         let prefix = parsed.body_prefix;
         let is_head = req.method() == http::Method::HEAD;
-        let expected = if is_head {
+        // Keep validating an application's Content-Length on non-HEAD responses,
+        // but do not enforce it against statuses whose wire response has no body.
+        // A 304 may legitimately carry the selected representation's length even
+        // though it sends zero body bytes.
+        let declared = if is_head {
             None
         } else {
             response_content_length(&headers)?
         };
+        let body_forbidden = hj_core::response_body_forbidden(is_head, status);
+        let expected = if body_forbidden { None } else { declared };
 
-        let body = if is_head {
+        let body = if body_forbidden {
             tokio::spawn(pump_response(
                 conn,
                 wire,
@@ -519,6 +530,30 @@ fn require_response_record(record: &Record) -> Result<(), HandlerError> {
     Ok(())
 }
 
+#[derive(Default)]
+struct CgiHeadBoundary {
+    scanned: usize,
+    #[cfg(test)]
+    examined: usize,
+}
+
+impl CgiHeadBoundary {
+    /// Search only bytes appended since the previous call, plus the three-byte
+    /// overlap in which `\r\n\r\n` can straddle two FastCGI records.
+    fn find(&mut self, bytes: &[u8]) -> Option<usize> {
+        let start = self.scanned.saturating_sub(3).min(bytes.len());
+        #[cfg(test)]
+        {
+            self.examined += bytes.len() - start;
+        }
+        self.scanned = bytes.len();
+        bytes[start..]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|offset| start + offset + 4)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn pump_response(
     mut conn: Conn,
@@ -762,6 +797,31 @@ mod tests {
             }
             assert_ne!(stream.read_buf(wire).await.unwrap(), 0);
         }
+    }
+
+    #[test]
+    fn response_header_boundary_search_is_linear_across_one_byte_fragments() {
+        let mut payload = b"X-Test: ".to_vec();
+        payload.extend(std::iter::repeat_n(b'a', 32 * 1024));
+        payload.extend_from_slice(b"\r\n\r\nbody");
+        let expected_end = payload.len() - b"body".len();
+        let mut accumulated = Vec::with_capacity(payload.len());
+        let mut search = CgiHeadBoundary::default();
+        let mut found = None;
+        for byte in payload {
+            accumulated.push(byte);
+            if let Some(end) = search.find(&accumulated) {
+                found = Some(end);
+                break;
+            }
+        }
+        assert_eq!(found, Some(expected_end));
+        assert!(search.examined <= expected_end * 4);
+
+        let mut one_record = CgiHeadBoundary::default();
+        let response = b"Content-Type: text/plain\r\n\r\nbody";
+        assert_eq!(one_record.find(response), Some(response.len() - 4));
+        assert_eq!(one_record.examined, response.len());
     }
 
     fn decode_len(input: &mut &[u8]) -> usize {
@@ -1115,6 +1175,36 @@ mod tests {
             );
         }
         // One accept served both requests: the first connection was re-pooled.
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn body_forbidden_304_drains_and_reuses_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut wire = BytesMut::new();
+            for _ in 0..2 {
+                let (keep, _) = read_whole_request(&mut stream, &mut wire).await;
+                assert!(keep);
+                write_php_response(
+                    &mut stream,
+                    "Status: 304 Not Modified\r\nContent-Length: 123\r\nETag: \"v1\"\r\n\r\n",
+                )
+                .await;
+            }
+        });
+        let handler = FastCgi::new(fastcgi_pool(address));
+        for _ in 0..2 {
+            let response = handler
+                .handle(&mut context(), get_request("/index.php"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), http::StatusCode::NOT_MODIFIED);
+            assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "123");
+            assert!(matches!(response.body(), Body::Empty));
+        }
         server.await.unwrap();
     }
 

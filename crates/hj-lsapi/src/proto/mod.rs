@@ -119,8 +119,14 @@
 //! accepts on fd 0; if that fd is stdin it `dup()`s it and reopens `/dev/null` on
 //! fd 0. So the supervisor must `dup2(listen_fd, 0)` before `exec`.
 
+mod begin_scan;
 mod builder;
 mod frame;
+
+pub use begin_scan::may_be_lsapi_begin_request;
+pub(crate) use begin_scan::{
+    BeginVerdict, body_embeds_begin_request, classify_begin_request, magic_offsets,
+};
 
 pub use builder::{
     SpecialEnvType, WireHeader, build_begin_request, build_begin_request_body,

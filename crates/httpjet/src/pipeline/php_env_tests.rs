@@ -259,3 +259,129 @@ async fn php_error_document_sees_original_request() {
     let resp = run(&state, with_headers("POST", "/present.txt", b"a=b")).await;
     assert_eq!(resp.status(), http::StatusCode::METHOD_NOT_ALLOWED);
 }
+
+fn ua_req(method: &str, uri: &str, ua: &str) -> Request {
+    use http_body_util::BodyExt;
+    http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::HOST, CANON_HOST)
+        .header(header::USER_AGENT, ua)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::CONTENT_LENGTH, 3)
+        .body(
+            http_body_util::Full::new(bytes::Bytes::from_static(b"a=b"))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
+        .unwrap()
+}
+
+const BAD_BOT_DENY: &str =
+    "SetEnvIf User-Agent BadBot bad_bot\nOrder Allow,Deny\nAllow from all\nDeny from env=bad_bot\n";
+
+/// A symlinked resource's target-directory chain is judged with
+/// the request's real method and with that chain's own SetEnvIf, on the dispatch
+/// path and on the on-core static path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn symlinked_target_chain_sees_real_method_and_its_own_setenvif() {
+    let root = temp_root("mapped-target-env");
+    std::fs::create_dir(root.join("private")).unwrap();
+    std::fs::write(root.join("private/real.php"), b"<?php\n").unwrap();
+    std::fs::write(
+        root.join("private/.htaccess"),
+        "<LimitExcept GET>\nRequire all denied\n</LimitExcept>\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(root.join("private/real.php"), root.join("alias.php")).unwrap();
+    std::fs::create_dir(root.join("private2")).unwrap();
+    std::fs::write(root.join("private2/real.php"), b"<?php\n").unwrap();
+    std::fs::write(root.join("private2/real.txt"), b"static").unwrap();
+    std::fs::write(root.join("private2/.htaccess"), BAD_BOT_DENY).unwrap();
+    std::os::unix::fs::symlink(root.join("private2/real.php"), root.join("alias2.php")).unwrap();
+    std::os::unix::fs::symlink(root.join("private2/real.txt"), root.join("alias2.txt")).unwrap();
+    let (state, _peer) = php_state(root.clone());
+
+    for (method, uri, ua, expected) in [
+        ("POST", "/private/real.php", "x", 403),
+        ("GET", "/private/real.php", "x", 200),
+        ("GET", "/alias.php", "x", 200),
+        ("POST", "/alias.php", "x", 403),
+        ("PUT", "/alias.php", "x", 403),
+        ("GET", "/private2/real.php", "BadBot", 403),
+        ("GET", "/alias2.php", "BadBot", 403),
+        ("POST", "/alias2.php", "BadBot", 403),
+        ("GET", "/alias2.php", "good", 200),
+        ("GET", "/alias2.txt", "BadBot", 403),
+        ("GET", "/alias2.txt", "good", 200),
+    ] {
+        let (status, env) = echoed_any(run(&state, ua_req(method, uri, ua)).await).await;
+        assert_eq!(status.as_u16(), expected, "{method} {uri} UA={ua}: {env:?}");
+    }
+    // The on-core path must not serve what dispatch() denies.
+    let probe = |ua: &str| {
+        http::Request::builder()
+            .uri("/alias2.txt")
+            .header(header::HOST, CANON_HOST)
+            .header(header::USER_AGENT, ua)
+            .body(hj_core::empty_incoming())
+            .unwrap()
+    };
+    assert!(
+        fast_serve_req(&state, &probe("BadBot")).await.is_none(),
+        "on-core served a target its own SetEnvIf denies"
+    );
+    let served = fast_serve_req(&state, &probe("good")).await;
+    assert_eq!(served.map(|r| r.status().as_u16()), Some(200));
+}
+
+/// A per-directory rewrite into another directory runs that
+/// destination chain's SetEnvIf before its env-based deny (Apache's internal
+/// redirect reruns mod_setenvif before access).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_directory_rewrite_runs_destination_setenvif_before_access() {
+    let root = temp_root("rewrite-dest-env");
+    std::fs::create_dir(root.join("protected")).unwrap();
+    std::fs::write(root.join("protected/x.php"), b"<?php\n").unwrap();
+    std::fs::write(root.join("protected/.htaccess"), BAD_BOT_DENY).unwrap();
+    // An intermediate hop: /relay's own rules move the request on to /pub, whose
+    // chain has no deny, so only the hop's access phase can refuse it.
+    std::fs::create_dir(root.join("relay")).unwrap();
+    std::fs::create_dir(root.join("pub")).unwrap();
+    std::fs::write(root.join("pub/y.php"), b"<?php\n").unwrap();
+    std::fs::write(
+        root.join("relay/.htaccess"),
+        format!("{BAD_BOT_DENY}RewriteEngine On\nRewriteRule ^x\\.php$ /pub/y.php [L]\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".htaccess"),
+        "RewriteEngine On\nRewriteRule ^go$ /protected/x.php [L]\nRewriteRule ^hop$ /relay/x.php [L]\n",
+    )
+    .unwrap();
+    let (state, _peer) = php_state(root.clone());
+    for (method, uri, ua, expected, script) in [
+        ("GET", "/protected/x.php", "BadBot", 403, ""),
+        ("GET", "/protected/x.php", "good", 200, "/protected/x.php"),
+        ("GET", "/go", "BadBot", 403, ""),
+        ("POST", "/go", "BadBot", 403, ""),
+        ("GET", "/go", "good", 200, "/protected/x.php"),
+        ("GET", "/hop", "BadBot", 403, ""),
+        ("POST", "/hop", "BadBot", 403, ""),
+        ("GET", "/hop", "good", 200, "/pub/y.php"),
+    ] {
+        let (status, env) = echoed_any(run(&state, ua_req(method, uri, ua)).await).await;
+        assert_eq!(status.as_u16(), expected, "{method} {uri} UA={ua}: {env:?}");
+        if expected == 200 {
+            assert!(env["SCRIPT_FILENAME"].ends_with(script), "{uri}: {env:?}");
+        }
+    }
+}
+
+/// [`echoed`] for a response that may be a static file or an error page.
+async fn echoed_any(resp: Response) -> (http::StatusCode, BTreeMap<String, String>) {
+    if matches!(resp.body(), Body::File(_)) {
+        return (resp.status(), BTreeMap::new());
+    }
+    echoed(resp).await
+}

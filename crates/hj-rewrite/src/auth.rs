@@ -231,8 +231,8 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Verify `user`/`pass` against an htpasswd file: the matching entry's hash decides
 /// (file read per verification — auth'd trees are low-traffic admin surfaces). An
-/// unknown user still pays one bcrypt at the file's cost, so response time does not
-/// reveal which users exist.
+/// unknown user, or one whose entry is cheaper, still pays the file's costliest hash,
+/// so response time does not reveal which users exist.
 pub fn verify_credentials(
     user_file: &Path,
     file: std::fs::File,
@@ -253,17 +253,25 @@ pub fn verify_credentials(
             cost,
         });
     }
-    let mut matched = false;
+    // Every verification pays for the file's most expensive scheme (its highest
+    // bcrypt cost, else MD5-crypt) whichever entry matched, so neither an unknown
+    // user nor a cheaper entry stands out by response time.
+    let max_cost = entries.iter().filter_map(|e| bcrypt_cost(&e.hash)).max();
+    let any_md5 = entries.iter().any(|e| md5_crypt_parts(&e.hash).is_some());
+    let mut paid = false;
     let mut valid = false;
     for entry in entries.iter().filter(|e| ct_eq_str(e.user.as_str(), user)) {
-        matched = true;
         valid |= verify_hash(pass, &entry.hash);
+        paid |= match max_cost {
+            Some(cost) => bcrypt_cost(&entry.hash) == Some(cost),
+            None => md5_crypt_parts(&entry.hash).is_some(),
+        };
     }
-    if !matched {
-        if let Some(cost) = entries.iter().find_map(|e| bcrypt_cost(&e.hash)) {
+    if !paid {
+        if let Some(cost) = max_cost {
             let _ = bcrypt::hash_with_salt(pass, cost, [0u8; 16]);
-        } else if let Some(entry) = entries.iter().find(|e| md5_crypt_parts(&e.hash).is_some()) {
-            let _ = verify_hash(pass, &entry.hash);
+        } else if any_md5 {
+            let _ = md5_crypt(pass.as_bytes(), b"$apr1$", b"hjdummy0");
         }
     }
     Ok(valid)
@@ -448,6 +456,42 @@ mod tests {
             "an unknown user must pay a comparable bcrypt: known {known:?}, unknown {unknown:?}"
         );
         assert_eq!(bcrypt_cost(&hash), Some(8));
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn mixed_hash_file_charges_every_user_the_costliest_hash() {
+        let base = scratch("mixed-cost");
+        let file = base.join("users");
+        // The cheap bcrypt entry comes first: an unknown user must still pay the
+        // file's highest cost, and a {SHA} user must not answer faster.
+        let cheap = bcrypt::hash("password", 4).unwrap();
+        let costly = bcrypt::hash("password", 8).unwrap();
+        std::fs::write(
+            &file,
+            format!("cheap:{cheap}\nsha:{{SHA}}W6ph5Mm5Pz8GgiULbPgzG37mj9g=\ncostly:{costly}\n"),
+        )
+        .unwrap();
+        let verify = |user: &str, pass: &str| {
+            verify_credentials(&file, std::fs::File::open(&file).unwrap(), user, pass).unwrap()
+        };
+        assert!(verify("sha", "password"));
+        assert!(verify("cheap", "password"));
+        let time = |user: &str| {
+            let started = std::time::Instant::now();
+            for _ in 0..3 {
+                assert!(!verify(user, "wrong"));
+            }
+            started.elapsed()
+        };
+        let costly_time = time("costly");
+        for user in ["nobody", "sha", "cheap"] {
+            let elapsed = time(user);
+            assert!(
+                elapsed * 3 > costly_time,
+                "{user} must pay the costliest hash: {elapsed:?} vs {costly_time:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(base);
     }
 

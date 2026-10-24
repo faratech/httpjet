@@ -8,6 +8,6 @@ permissions:
 
 jobs:
   policy:
-    uses: faratech/ci-standards/.github/workflows/actions-policy.yml@main
+    uses: faratech/ci-standards/.github/workflows/actions-policy.yml@d8b20db88c1ef0093f82040aabf4b80d64452f90 # main 2026-10-22
     with:
       policy_strict: false
