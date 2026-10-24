@@ -63,7 +63,7 @@ fn traced_quic_roundtrip() {
         1,
         h3::self_signed_config().unwrap(),
         bridge,
-        false,
+        crate::uring::ClientAuth::None,
         h3::H3RuntimeConfig::new(
             || {
                 (
