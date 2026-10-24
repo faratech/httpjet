@@ -25,7 +25,8 @@ publish = false
 rust-version = "1.99.1"
 license = "GPL-3.0-only"
 repository = "https://github.com/faratech/httpjet"
-homepage = "https://github.com/faratech/httpjet"
+homepage = "https://httpjet.net"
+documentation = "https://httpjet.net/docs/"
 
 # Shared dependency versions. Crates opt in with `dep = { workspace = true }`.
 # Entries listed here but unreferenced are NOT resolved or built.
