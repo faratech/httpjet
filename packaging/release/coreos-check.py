@@ -260,7 +260,7 @@ def negative_probe(guest, image, work):
     guest.script('mkdir -p ' + REMOTE + '/negative-ready && chown 10001:10001 ' + REMOTE + '/negative-ready && chmod 0750 ' + REMOTE + '/negative-ready')
     command = ['run', '--rm', '--network', 'host', '--read-only', '--cap-drop', 'ALL',
         '--security-opt', 'no-new-privileges', '--security-opt', 'seccomp=' + REMOTE + '/seccomp.json',
-        '--ulimit', 'memlock=8388608:8388608', '--tmpfs', '/var/log/httpjet:mode=0750,uid=10001,gid=10001',
+        '--ulimit', 'memlock=8388608:8388608', '--mount', 'type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev',
         '--volume', REMOTE + '/negative-ready:/run/httpjet:rw,z',
         '--volume', REMOTE + '/configuration:/etc/httpjet:ro,z', '--volume', REMOTE + '/site:/site:ro,z',
         '--volume', REMOTE + '/certs:/certs:ro,z', '--entrypoint', image['probe_path'], image['image_id'],

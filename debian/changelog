@@ -1,3 +1,10 @@
+httpjet (0.1.10-4) stable; urgency=medium
+
+  * Select one canonical noarch RPM keyring across native builds.
+  * Use Podman-compatible owned tmpfs mounts for CoreOS qualification.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Mon, 26 Oct 2026 00:00:00 +0000
+
 httpjet (0.1.10-3) stable; urgency=medium
 
   * Correct source timestamp resolution for annotated release tags.

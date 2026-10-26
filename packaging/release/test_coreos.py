@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import lzma
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -37,6 +38,19 @@ class CoreOS(unittest.TestCase):
         self.assertIn('/var/lib/httpjet-qualification',body)
         self.assertNotIn('python',body);self.assertNotIn('rpm-ostree',body)
         self.assertIn({'name':'zincati.service','mask':True},value['systemd']['units'])
+
+    def test_tmpfs_mounts_use_podman_container_ownership(self):
+        definition=coreos.ignition('ssh-ed25519 AAAA fixture',self.name)
+        unit=next(item['contents'] for item in definition['systemd']['units'] if item['name']==coreos.UNIT)
+        command=shlex.split(next(line.removeprefix('ExecStart=') for line in unit.splitlines() if line.startswith('ExecStart=')))
+        mounts=[item.removeprefix('--mount=') for item in command if item.startswith('--mount=')]
+        self.assertEqual(len(mounts),2)
+        self.assertFalse(any(item.startswith('--tmpfs') for item in command))
+        for destination,mount in zip(('/run/httpjet','/var/log/httpjet'),mounts):
+            options=mount.split(',')
+            for item in ('type=tmpfs','dst='+destination,'tmpfs-size=16m','tmpfs-mode=0750','U','noexec','nosuid','nodev'):
+                self.assertIn(item,options)
+            self.assertFalse(any(item.startswith(('uid=','gid=')) for item in options))
 
     def test_ignition_does_not_allow_injected_key_or_container_name(self):
         with self.assertRaises(ValueError):coreos.ignition('ssh-ed25519 AAAA\nother','bad')
@@ -104,6 +118,10 @@ class CoreOS(unittest.TestCase):
         guest=self.denied_guest('failed to build monoio runtime: Operation not permitted (os error 1)\n')
         value=coreos.negative_probe(guest,{'probe_path':'/probe','binary_path':'/server','image_id':'sha256:fixture'},self.work)
         self.assertEqual(value['status'],'expected_failure');self.assertEqual(value['errno'],1)
+        command=guest.podman.call_args.args
+        self.assertIn('--mount',command)
+        self.assertIn('type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev',command)
+        self.assertNotIn('--tmpfs',command)
 
     def test_denial_rejects_port_collision(self):
         guest=self.denied_guest('failed to build monoio runtime: Address already in use (os error 98)\n')

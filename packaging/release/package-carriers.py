@@ -48,6 +48,20 @@ def archive(directory, destination, epoch):
                 else: tar.addfile(info)
 
 
+def copy_rpm_carriers(rpm_top, output, arch, release_id):
+    rpm_arch = {'amd64': 'x86_64', 'arm64': 'aarch64'}[arch]
+    rpm_name = f'httpjet-{release_id}.{rpm_arch}.rpm'
+    copy(rpm_top / 'RPMS' / rpm_arch / rpm_name, output / rpm_name)
+    # RPM embeds the build platform even in a noarch package. Choose one
+    # canonical producer so the two native builds do not emit conflicting bytes
+    # under the same name; the resulting noarch keyring is used on both arches.
+    rpm_key = None
+    if arch == 'amd64':
+        rpm_key = f'httpjet-archive-keyring-{release_id}.noarch.rpm'
+        copy(rpm_top / 'RPMS/noarch' / rpm_key, output / rpm_key)
+    return rpm_name, rpm_key
+
+
 def build(root, session, output, arch, release_id):
     root = root.resolve(); output = output.resolve(); output.mkdir(parents=True, exist_ok=True)
     if any(name in os.environ for name in ('HTTPJET_PACKAGE_TEST', 'HTTPJET_TEST_PREBUILT')):
@@ -108,10 +122,7 @@ def build(root, session, output, arch, release_id):
             '--define', 'use_source_date_epoch_as_buildtime 1',
             '--define', 'clamp_mtime_to_source_date_epoch 1',
             root / 'packaging/rpm/httpjet.spec', env=env)
-        rpm_name = f'httpjet-{release_id}.{rpm_arch}.rpm'
-        rpm_key = f'httpjet-archive-keyring-{release_id}.noarch.rpm'
-        for name, directory in ((rpm_name, rpm_arch), (rpm_key, 'noarch')):
-            copy(rpm_top / 'RPMS' / directory / name, output / name)
+        rpm_name, rpm_key = copy_rpm_carriers(rpm_top, output, arch, release_id)
         inspection.verify_carrier_binary(output / rpm_name, 'rpm', binary_sha)
         session_tool.consume(session, receipt_path, root, arch, release_id, verified)
         result = {'package': deb, 'rpm_package': rpm_name, 'keyring_deb': deb_key,

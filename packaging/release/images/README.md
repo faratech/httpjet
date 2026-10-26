@@ -29,7 +29,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=-/usr/bin/podman rm --ignore --force httpjet
-ExecStart=/usr/bin/podman run --name httpjet --pull=never --user=10001:10001 --publish=80:8080/tcp --read-only --cap-drop=ALL --security-opt=no-new-privileges --security-opt=seccomp=/etc/httpjet/seccomp.json --ulimit=memlock=8388608:8388608 --tmpfs=/run/httpjet:rw,noexec,nosuid,nodev,size=16m,mode=0750,uid=10001,gid=10001 --tmpfs=/var/log/httpjet:rw,noexec,nosuid,nodev,size=16m,mode=0750,uid=10001,gid=10001 --volume=/var/lib/httpjet/site:/var/www/httpjet:ro,z sha256:APPROVED_IMAGE_CONFIG_ID
+ExecStart=/usr/bin/podman run --name httpjet --pull=never --user=10001:10001 --publish=80:8080/tcp --read-only --cap-drop=ALL --security-opt=no-new-privileges --security-opt=seccomp=/etc/httpjet/seccomp.json --ulimit=memlock=8388608:8388608 --mount=type=tmpfs,dst=/run/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --mount=type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --volume=/var/lib/httpjet/site:/var/www/httpjet:ro,z sha256:APPROVED_IMAGE_CONFIG_ID
 ExecStop=/usr/bin/podman stop --ignore --time=25 httpjet
 ExecStopPost=-/usr/bin/podman rm --ignore --force httpjet
 Restart=on-failure
@@ -40,6 +40,9 @@ KillMode=none
 [Install]
 WantedBy=multi-user.target
 ```
+
+The tmpfs `U` option assigns each mount to the container UID/GID while retaining
+mode 0750 and the size and execution restrictions.
 
 Replace the image ID with the verified manifest value. Run
 `sudo systemctl daemon-reload` and `sudo systemctl enable --now httpjet.service`.

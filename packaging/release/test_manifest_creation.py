@@ -22,8 +22,9 @@ class ManifestCreation(unittest.TestCase):
                        f'httpjet_1.2.3-1_{arch}.deb':('deb',arch,'musl'),
                        f'httpjet-1.2.3-1.{machine}.rpm':('rpm',arch,'musl'),
                        'httpjet-archive-keyring_1.2.3-1_all.deb':('keyring-deb','all','none'),
-                       'httpjet-archive-keyring-1.2.3-1.noarch.rpm':('keyring-rpm','all','none'),
                        f'httpjet-1.2.3-1-linux-{arch}-oci.tar':('oci-image',arch,'musl')}
+                if arch=='amd64':
+                    names['httpjet-archive-keyring-1.2.3-1.noarch.rpm']=('keyring-rpm','all','none')
                 artifacts={}
                 for name,(kind,architecture,libc) in names.items():
                     path=directory/name;path.write_bytes(binary)

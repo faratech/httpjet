@@ -97,13 +97,25 @@ def make_fixture(work, uid, gid, certificate=None, key=None):
     (work / 'output').chmod(0o750)
 
 
-def runtime_options(work, uid, gid, security_profile):
-    return ['--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-            '--security-opt', 'seccomp=' + str(security_profile), '--ulimit', 'memlock=8388608:8388608',
-            '--cpus', '2', '--memory', '2g',
-            '--tmpfs', f'/run/httpjet:rw,noexec,nosuid,nodev,size=16m,mode=0750,uid={uid},gid={gid}',
-            '--tmpfs', f'/var/log/httpjet:rw,noexec,nosuid,nodev,size=16m,mode=0750,uid={uid},gid={gid}',
-            '--env', 'RUST_LOG=warn']
+def owned_tmpfs(engine, destination, uid, gid):
+    if engine == 'podman':
+        # Podman rejects uid/gid in --tmpfs. U assigns the mount to the
+        # already verified image user, including when the probe is PID1.
+        return ['--mount', f'type=tmpfs,dst={destination},tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev']
+    return ['--tmpfs', f'{destination}:rw,noexec,nosuid,nodev,size=16m,mode=0750,uid={uid},gid={gid}']
+
+
+def runtime_options(work, uid, gid, security_profile, engine='docker', readiness_directory=None):
+    options = ['--network', 'none', '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
+               '--security-opt', 'seccomp=' + str(security_profile), '--ulimit', 'memlock=8388608:8388608',
+               '--cpus', '2', '--memory', '2g']
+    if readiness_directory is None:
+        options += owned_tmpfs(engine, '/run/httpjet', uid, gid)
+    options += owned_tmpfs(engine, '/var/log/httpjet', uid, gid)
+    options += ['--env', 'RUST_LOG=warn']
+    if readiness_directory is not None:
+        options += ['--volume', str(readiness_directory) + ':/run/httpjet:rw,z']
+    return options
 
 
 def verify_process(engine, container, metadata):
@@ -187,7 +199,7 @@ def qualify(metadata, work, engine='docker', client=None, certificate=None, key=
         'no_multishot_accept': True}))
     (work / 'server.json').chmod(0o644)
     security_profile = ROOT / 'packaging/oci/seccomp-httpjet.json'
-    options = runtime_options(work, uid, gid, security_profile)
+    options = runtime_options(work, uid, gid, security_profile, engine=engine)
     shared = ['--volume', str(work / 'configuration') + ':/etc/httpjet:ro,z',
               '--volume', str(work / 'site') + ':/site:ro,z',
               '--volume', str(work / 'certs') + ':/certs:ro,z']
@@ -245,15 +257,8 @@ def qualify(metadata, work, engine='docker', client=None, certificate=None, key=
         negative_ready.mkdir(mode=0o750)
         os.chown(negative_ready, uid, gid)
         negative_ready.chmod(0o750)
-        negative_options = []
-        index = 0
-        while index < len(options):
-            if options[index] == '--tmpfs' and options[index+1].startswith('/run/httpjet:'):
-                index += 2
-                continue
-            negative_options.append(options[index])
-            index += 1
-        negative_options += ['--volume', str(negative_ready) + ':/run/httpjet:rw,z']
+        negative_options = runtime_options(work, uid, gid, security_profile, engine=engine,
+                                           readiness_directory=negative_ready)
         denied = command(engine, 'run','--rm',*negative_options,*shared,'--entrypoint',metadata['probe_path'],
                          image['Id'],'--deny-exec',metadata['binary_path'],*args,check=False)
         text = denied.stdout + denied.stderr
