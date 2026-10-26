@@ -7,6 +7,20 @@ def call(command,**kwargs):return subprocess.run([str(x) for x in command],check
 def digest(path):
     with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
 
+def slackware_packages(listing):
+    libraries={'libffi','expat','libxml2','libxslt','libidn2','libunistring','libpsl','nghttp2','brotli','sqlite','readline','libgcrypt','libgpg-error','gmp','nettle','p11-kit','libtasn1','gnutls','libassuan','npth','libksba','pinentry','libssh2','libcap-ng','libseccomp','libtirpc','libnsl','python2'}
+    packages=[]
+    for name in listing:
+        match=re.fullmatch(r'(?:\./)?slackware64/(a|ap|n|l|d)/([^/]+\.t[xg]z)',name)
+        if not match:continue
+        series,filename=match.groups();package=filename.rsplit('-',3)[0]
+        if ((series in ('a','n') and not package.startswith(('kernel-','kernel_')))
+            or series=='l' and package in libraries or series=='d' and package=='python3'
+            or series=='ap' and package=='slackpkg'):
+            packages.append((name,filename))
+    if not packages:raise ValueError('official Slackware ISO has no packages')
+    return packages
+
 def slackware_bootstrap(root,scripts):
     # The temporary host filesystem may be mounted nodev. A regular temporary
     # sink lets package scripts redirect output until the guest mounts devtmpfs.
@@ -63,15 +77,7 @@ def inside_tree(kind,source,output,work,root):
         with squash.open('wb') as stream:call(['bsdtar','-xOf',source,matches[0]],stdout=stream)
         root.rmdir();call(['unsquashfs','-no-progress','-d',root,squash])
     elif kind=='slackware-sysv':
-        libraries={'libffi','expat','libxml2','libxslt','libidn2','libunistring','libpsl','nghttp2','brotli','sqlite','readline','libgcrypt','libgpg-error','gmp','nettle','p11-kit','libtasn1','gnutls','libassuan','npth','libksba','pinentry','libssh2','libcap-ng','libseccomp','libtirpc','libnsl','python2'}
-        packages=[]
-        for name in listing:
-            match=re.fullmatch(r'(?:\./)?slackware64/(a|n|l|d)/([^/]+\.t[xg]z)',name)
-            if not match:continue
-            series,filename=match.groups();package=filename.rsplit('-',3)[0]
-            if ((series in ('a','n') and not package.startswith(('kernel-','kernel_'))) or series=='l' and package in libraries or series=='d' and package=='python3'):
-                packages.append((name,filename))
-        if not packages:raise ValueError('official Slackware ISO has no packages')
+        packages=slackware_packages(listing)
         scripts=root/'bootstrap-scripts';scripts.mkdir()
         for index,(member,name) in enumerate(sorted(packages)):
             archive=work/name

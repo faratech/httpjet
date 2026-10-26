@@ -108,9 +108,13 @@ class InstallerTests(unittest.TestCase):
         text = text.replace("FILESYSTEM_ROOT=''", f"FILESYSTEM_ROOT='{self.root}'")
         text = text.replace("PATH='/usr/sbin:/usr/bin:/sbin:/bin'", f"PATH='{self.bin}:/usr/sbin:/usr/bin:/sbin:/bin'")
         if state.get("busybox_shell"):
-            # Some BusyBox ash builds resolve `id` as an applet builtin before
-            # PATH. Keep the fixture's mock UID usable on non-root CI runners.
-            text = text.replace('$(id -u)', f'$("{self.bin}/id" -u)')
+            # Some BusyBox ash builds resolve applets (such as id and dpkg)
+            # before PATH. Explicit functions keep every mocked operation in
+            # the fixture while exercising the real BusyBox shell parser.
+            names = sorted(path.name for path in self.bin.iterdir()
+                           if path.is_symlink() and path.name.isidentifier())
+            functions = ''.join(f'{name}() {{ "{self.bin / name}" "$@"; }}\n' for name in names)
+            text = text.replace('#!/bin/sh\n', '#!/bin/sh\n' + functions, 1)
         if state.get("missing_ss"):
             text = text.replace("command -v ss >/dev/null 2>&1", "false")
         self.script_path.write_text(text)
