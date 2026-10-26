@@ -2,6 +2,7 @@
 """Project a qualified snapshot onto static Pages without discarding history."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -38,7 +39,7 @@ def bootstrap(output):
         (output / name).write_text(body)
 
 
-def probe_bootstrap(base=ORIGIN):
+def probe_bootstrap(base=ORIGIN, read_only=False):
     for method in ('GET', 'HEAD'):
         request = urllib.request.Request(base + '/', method=method)
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -56,21 +57,31 @@ def probe_bootstrap(base=ORIGIN):
                 if error.code != 404 or error.url != base + path: raise
                 error.close()
             else: raise ValueError('bootstrap missing object must return actual 404')
-    try:
-        urllib.request.urlopen(urllib.request.Request(base + missing, data=b'bootstrap-readonly-test', method='PUT'), timeout=30).close()
-    except urllib.error.HTTPError as error:
-        if error.code not in (403, 404, 405): raise
-        write_status = error.code; error.close()
-    else: raise ValueError('static Pages origin accepted a public write')
-    try:
-        urllib.request.urlopen(base + missing, timeout=30).close()
-    except urllib.error.HTTPError as error:
-        if error.code != 404: raise
-        error.close()
-    else: raise ValueError('public write created a Pages object')
+    write_status = None
+    if not read_only:
+        try:
+            urllib.request.urlopen(urllib.request.Request(base + missing, data=b'bootstrap-readonly-test', method='PUT'), timeout=30).close()
+        except urllib.error.HTTPError as error:
+            if error.code not in (403, 404, 405): raise
+            write_status = error.code; error.close()
+        else: raise ValueError('static Pages origin accepted a public write')
+        try:
+            urllib.request.urlopen(base + missing, timeout=30).close()
+        except urllib.error.HTTPError as error:
+            if error.code != 404: raise
+            error.close()
+        else: raise ValueError('public write created a Pages object')
     return {'status': 'passed', 'scope': 'empty-pages-bootstrap-only', 'origin': base,
             'index_sha256': hashlib.sha256(BOOTSTRAP.encode()).hexdigest(), 'missing_status': 404,
-            'write_status': write_status, 'package_release_live': False}
+            'write_status': write_status, 'write_tested': not read_only, 'package_release_live': False}
+
+
+def public_http_diagnostic(error):
+    """Bounded public-response evidence; never print cookies or request secrets."""
+    allowed = {'server', 'cf-ray', 'cf-mitigated', 'content-type', 'cache-control', 'location', 'www-authenticate'}
+    headers = {name: value[:2048] for name, value in error.headers.items() if name.lower() in allowed}
+    return {'status': error.code, 'url': error.url, 'headers': headers,
+            'body_prefix': error.read(4096).decode('utf-8', errors='replace')}
 
 
 def descriptor(path):
@@ -304,6 +315,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__); sub = parser.add_subparsers(dest='command', required=True)
     blank = sub.add_parser('bootstrap'); blank.add_argument('--output', type=Path, required=True)
     probe = sub.add_parser('probe-bootstrap'); probe.add_argument('--receipt', type=Path, required=True)
+    probe.add_argument('--read-only', action='store_true')
     create = sub.add_parser('project'); create.add_argument('--snapshot', type=Path, required=True)
     create.add_argument('--output', type=Path, required=True); create.add_argument('--previous', type=Path)
     create.add_argument('--repository', default='faratech/httpjet')
@@ -317,7 +329,12 @@ def main():
     if args.command == 'bootstrap':
         bootstrap(args.output)
     elif args.command == 'probe-bootstrap':
-        result = probe_bootstrap(); release.write_json(args.receipt, result); print(result)
+        try:
+            result = probe_bootstrap(read_only=args.read_only)
+        except urllib.error.HTTPError as error:
+            print(json.dumps(public_http_diagnostic(error), sort_keys=True), file=sys.stderr)
+            raise
+        release.write_json(args.receipt, result); print(result)
     elif args.command == 'project':
         project(args.snapshot, args.output, args.public_key, args.fingerprint, args.previous, args.repository)
     elif args.command == 'verify':

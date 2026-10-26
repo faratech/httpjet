@@ -63,6 +63,14 @@ class DeploymentLease(unittest.TestCase):
 
 
 class EmptyBootstrap(unittest.TestCase):
+    def test_public_diagnostics_are_bounded_and_do_not_print_cookies(self):
+        error=urllib.error.HTTPError(pages.ORIGIN+'/',403,'forbidden',
+            {'CF-Ray':'fixture-ray','CF-Mitigated':'challenge','Set-Cookie':'DO NOT LOG'},io.BytesIO(b'x'*10000))
+        result=pages.public_http_diagnostic(error)
+        self.assertEqual(result['status'],403);self.assertEqual(len(result['body_prefix']),4096)
+        self.assertEqual(result['headers'],{'CF-Ray':'fixture-ray','CF-Mitigated':'challenge'})
+        error.close()
+
     def test_bootstrap_contains_exactly_three_harmless_files(self):
         with tempfile.TemporaryDirectory(prefix='httpjet-empty-pages-unit-') as temporary:
             output=Path(temporary)/'site'; pages.bootstrap(output)
@@ -82,6 +90,10 @@ class EmptyBootstrap(unittest.TestCase):
             report=pages.probe_bootstrap()
         self.assertEqual(report['write_status'],405);self.assertEqual(report['missing_status'],404)
         self.assertFalse(report['package_release_live'])
+        with mock.patch.object(pages.urllib.request,'urlopen',side_effect=opened) as requests:
+            report=pages.probe_bootstrap(read_only=True)
+        self.assertFalse(report['write_tested']);self.assertIsNone(report['write_status'])
+        self.assertEqual({call.args[0].get_method() for call in requests.call_args_list},{'GET','HEAD'})
 
 
 if __name__=='__main__':unittest.main()
