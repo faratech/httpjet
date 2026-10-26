@@ -385,9 +385,18 @@ pub(super) fn store_until(
         status: resp.status(),
         headers,
         stamp_date,
-        // Held for the memo's TTL: an exact copy, never a slice of a pooled egress buffer
-        // the entry would pin whole while the byte budget counted only its length.
-        body: Bytes::copy_from_slice(body),
+        // Held for the memo's TTL. A pooled egress buffer (marked `FreshBody` by its producer)
+        // is copied out, or the entry would pin it whole while the byte budget counted only
+        // its length; any other body (the static cache's exact-size bytes) is shared.
+        body: if resp
+            .extensions()
+            .get::<hj_core::FreshBody>()
+            .is_some_and(|fresh| fresh.names(body))
+        {
+            Bytes::copy_from_slice(body)
+        } else {
+            body.clone()
+        },
         expires,
     };
     MEMO.with(|m| {

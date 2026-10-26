@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<httpServerConfig>
+  <serverName>localhost</serverName>
+  <user>httpjet</user>
+  <group>httpjet</group>
+  <indexFiles>index.html</indexFiles>
+  <tuning>
+    <maxConnections>256</maxConnections>
+    <keepAliveTimeout>5</keepAliveTimeout>
+    <maxKeepAliveReq>100</maxKeepAliveReq>
+  </tuning>
+  <virtualHostList>
+    <virtualHost>
+      <name>localhost</name>
+      <vhRoot>/var/www/httpjet</vhRoot>
+      <configFile>$SERVER_ROOT/conf/vhosts/default.xml</configFile>
+      <allowSymbolLink>0</allowSymbolLink>
+      <enableScript>0</enableScript>
+    </virtualHost>
+  </virtualHostList>
+  <listenerList>
+    <listener>
+      <name>http</name>
+      <address>0.0.0.0:80</address>
+      <secure>0</secure>
+      <vhostMapList>
+        <vhostMap>
+          <vhost>localhost</vhost>
+          <domain>localhost,www.localhost,*</domain>
+        </vhostMap>
+      </vhostMapList>
+    </listener>
+  </listenerList>
+</httpServerConfig>

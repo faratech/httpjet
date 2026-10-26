@@ -14,6 +14,7 @@ static files, proxying, rewrites, compression, and an opt-in page cache.
 
 - [Documentation](#documentation)
 - [Features at a glance](#features-at-a-glance)
+- [Install on Linux](#install-on-linux)
 - [Build and try it](#build-and-try-it)
 - [Configuration](#configuration)
 - [Capability limits](#capability-limits)
@@ -58,6 +59,128 @@ The `httpjet` binary is under `crates/httpjet`; reusable components are the
 default: `acme`, `ocsp`, `otel`, `profiling`, `allocount`, and the staged
 `ktls`.
 
+## Install on Linux
+
+> **Installer availability:** The download becomes available when the first
+> qualified stable release is published. Before then, use
+> [Build and try it](#build-and-try-it).
+
+The installer is designed for fresh Linux servers on **amd64 or arm64**. The
+kernel and service sandbox must allow **io_uring**; there is no epoll fallback.
+The installer reports startup failures caused by io_uring restrictions and does
+not change the host's global kernel policy. A Rust toolchain, LiteSpeed, PHP and
+a domain name are not required on the target server.
+
+### Install a published release
+
+Once a qualified release is published, download the installer:
+
+```bash
+curl -fsSLo install.sh https://github.com/faratech/httpjet/releases/latest/download/install.sh
+```
+
+The published script contains the archive's public key and release URLs. The
+repository's [`install.sh.in`](packaging/installer/install.sh.in) is a template
+with placeholders; it cannot install a release until the publisher renders it.
+Published release assets also carry GitHub Actions build attestations. To check
+the downloaded installer with the optional GitHub CLI before running it:
+
+```bash
+gh attestation verify ./install.sh --repo faratech/httpjet \
+  --signer-workflow faratech/httpjet/.github/workflows/installer-publish.yml
+```
+
+Then run it as root:
+
+```bash
+sudo sh ./install.sh
+```
+
+The default `--method auto` chooses a native DEB/APT or RPM package on recognized
+Debian/Ubuntu or Fedora/RHEL/SUSE family systems running systemd with the matching
+package manager. It otherwise uses a signed portable archive and detects systemd,
+OpenRC, runit or a supported SysV layout. You can choose the portable archive and
+service adapter explicitly:
+
+```bash
+sudo sh ./install.sh --method binary --init openrc
+```
+
+If the host uses an unrecognized supervisor, use `--init none` to install without
+enabling or starting a service, then run it in the foreground:
+
+```bash
+sudo sh ./install.sh --method binary --init none
+sudo httpjetctl run
+```
+
+Use `--version X.Y.Z-N` to select a specific published release; without it the
+installer selects the signed stable release. See the
+[installer notes](packaging/installer/README.md) for all options and prerequisites.
+NixOS and Guix use the [NixOS module](packaging/nix/README.md) and
+[Guix service](packaging/guix/README.md); immutable systems such as CoreOS use
+the [container route](packaging/release/images/README.md).
+
+### What the installer does
+
+1. Checks the architecture, package manager and init system. It refuses an
+   unmanaged httpjet installation or an occupied HTTP port rather than taking
+   over an existing server.
+2. Installs missing prerequisites through supported package managers. Portable
+   installations need CA certificates, curl, GPG, Python 3.8+ and util-linux
+   `setpriv`; Python and `setpriv` remain required to manage the service.
+3. Verifies signed repository metadata and packages, or the portable release
+   manifest and archive hash, before installing the selected payload.
+4. Creates a dedicated non-root `httpjet` account and installs a static welcome
+   page at `/var/www/httpjet`. It validates the configuration and starts and
+   enables the service on a fresh installation when an init adapter is selected.
+
+The default listens on HTTP port 80. HTTPS, PHP execution, page caching, metrics
+and automatic `.htaccess` loading are disabled. PHP-shaped source paths are
+denied by the default rewrite rules. Configure application features explicitly
+before using them.
+
+### Configure and manage the server
+
+Put static content in `/var/www/httpjet`. The default LiteSpeed-compatible XML
+configuration is under `/etc/httpjet/conf/`; logs are under `/var/log/httpjet`.
+After editing configuration, validate it before restarting:
+
+```bash
+httpjet --root /etc/httpjet check --strict
+```
+
+For a native systemd installation, manage the service with systemd:
+
+```bash
+sudo systemctl restart httpjet
+systemctl status httpjet
+journalctl -u httpjet -n 50
+```
+
+For a portable installation, `httpjetctl` uses the recorded service adapter:
+
+```bash
+sudo httpjetctl status
+sudo httpjetctl restart
+sudo httpjetctl update
+sudo httpjetctl rollback
+sudo httpjetctl uninstall
+```
+
+Portable rollback uses a previous release retained locally; versioned payloads
+live under `/opt/httpjet`. Native installations use their package manager for
+updates and removal. Reruns and updates preserve administrator configuration,
+website content and stopped or disabled service states. Portable uninstall
+preserves configuration, content, logs, the account and its ownership record;
+on Debian, `apt purge` removes packaged configuration and empty disposable
+directories. Installation ownership prevents a silent switch between methods.
+
+The [release operations guide](packaging/release/README.md) explains signing,
+hosting and qualification. The matrix defines the distributions and environments
+that must be tested for a release; installation on an untested distribution is
+not evidence that it has been qualified.
+
 ## Build and try it
 
 Requires Linux with io_uring and Rust 1.99.1 or newer (the workspace
@@ -73,8 +196,10 @@ target/release/httpjet --root "$PWD/examples/litespeed" serve \
 curl -H 'Host: example.test' http://127.0.0.1:8080/
 ```
 
-Use `--root` with an existing LiteSpeed configuration tree (default
-`/usr/local/lsws`). With no subcommand, `httpjet` runs `check`. Run
+Use `--root` with an existing LiteSpeed configuration tree. Root selection is
+explicit `--root`, then `HTTPJET_ROOT`, then an installed `/etc/httpjet` tree
+when its main configuration exists, then `/usr/local/lsws`. With no subcommand,
+`httpjet` runs `check`. Run
 `httpjet serve --help` for runtime options.
 
 ## Configuration
@@ -112,8 +237,8 @@ surface:
   microcache are not yet exposed.
 - The page cache is opt-in and additionally gated per vhost and per
   response; it is inert unless enabled.
-- FastCGI primitives exist (`hj-fastcgi`) but are deliberately not wired
-  into request routing yet.
+- FastCGI supports explicit named processors and CGI suffix mappings to an
+  independently supervised backend. It does not spawn application processes.
 
 ## Operations
 

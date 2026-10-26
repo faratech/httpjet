@@ -61,6 +61,9 @@ pub struct CgiEnvBuilder<'a> {
     /// still wins last). Empty by default.
     extra_ref: &'a [(String, String)],
     server_software: String,
+    /// The request also travels as an LSAPI header block, so header copies that
+    /// lsphp already registers from that block are left out of the env table.
+    header_block: bool,
 }
 
 impl<'a> CgiEnvBuilder<'a> {
@@ -73,7 +76,19 @@ impl<'a> CgiEnvBuilder<'a> {
             extra: Vec::new(),
             extra_ref: &[],
             server_software: "LiteSpeed".to_string(),
+            header_block: false,
         }
+    }
+
+    /// Leave out each `HTTP_*` copy that lsphp registers from the LSAPI header block
+    /// with the same name and value ([`header_block_registers_copy`]). lsphp fills
+    /// `$_SERVER` from the block before the env table (`LSAPI_ForeachHeader`, then
+    /// `LSAPI_ForeachEnv`), and a later write to an existing key keeps its position,
+    /// so `$_SERVER` is unchanged; `getenv("HTTP_*")` reads only the block. Only for
+    /// a backend that receives that block: FastCGI has none.
+    pub fn header_block(mut self, enabled: bool) -> Self {
+        self.header_block = enabled;
+        self
     }
 
     /// Override SCRIPT_NAME (the URL path of the script, before PATH_INFO).
@@ -335,6 +350,7 @@ impl<'a> CgiEnvBuilder<'a> {
             // Common case: a single value -> use as-is (borrowed). Repeated header
             // -> join with ", " like CGI does (allocates only then).
             let value: Cow<'r, str> = match values.next() {
+                None if self.header_block && header_block_registers_copy(nm) => continue,
                 None => first,
                 Some(second_hv) => {
                     // Cookie crumbs join with `; ` (RFC 9113 §8.2.3), the form every
@@ -620,6 +636,26 @@ fn set_default<'r>(
     }
 }
 
+/// Whether lsphp registers a single-valued, forwardable header's `HTTP_*` key with
+/// the env copy's exact value from the LSAPI header block. The exceptions:
+/// - `Host`: the env copy drops the scheme-default port;
+/// - `Content-Type` / `Content-Length`: the block registers them as `CONTENT_TYPE` /
+///   `CONTENT_LENGTH`, so `HTTP_CONTENT_*` exist only in the env;
+/// - `Transfer-Encoding`: `LSAPI_ForeachHeader` skips that index slot;
+/// - a name over 250 bytes: lsphp truncates an unknown header's name there.
+///
+/// A repeated header never gets here: the env joins its values, while the block
+/// keeps the last value of a well-known header and registers each other one in turn.
+fn header_block_registers_copy(header: &str) -> bool {
+    const ENV_ONLY: [&str; 4] = [
+        "host",
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+    ];
+    header.len() <= 250 && !ENV_ONLY.iter().any(|n| header.eq_ignore_ascii_case(n))
+}
+
 /// `Content-Type` -> `HTTP_CONTENT_TYPE`, `X-Forwarded-For` -> `HTTP_X_FORWARDED_FOR`.
 fn http_var_name(header: &str) -> String {
     let mut s = String::with_capacity(header.len() + 5);
@@ -691,7 +727,7 @@ fn host_without_default_port(host: &str, is_tls: bool) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::net::IpAddr;
@@ -743,7 +779,7 @@ mod tests {
         })
     }
 
-    fn ctx(is_tls: bool) -> ReqCtx {
+    pub(crate) fn ctx(is_tls: bool) -> ReqCtx {
         let vh = VHostConfig {
             doc_root: PathBuf::from("/web/public_html"),
             ..Default::default()

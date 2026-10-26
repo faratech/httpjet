@@ -15,6 +15,7 @@ mod admin_resources;
 mod admin_submission;
 mod admin_write;
 mod allocount;
+mod config_root;
 mod config_transaction;
 mod extensions;
 mod listener_plan;
@@ -28,6 +29,7 @@ mod otel;
 mod peer_purge;
 mod phpslow;
 mod pipeline;
+mod readiness;
 mod resource_generation;
 mod secret_file;
 mod server;
@@ -75,9 +77,10 @@ use crate::state::{ServerState, XfCapsuleSafeGetMode};
     about = "Rust drop-in replacement for LiteSpeed"
 )]
 struct Cli {
-    /// Server root containing conf/httpd_config.xml (LiteSpeed-compatible).
-    #[arg(long, default_value = "/usr/local/lsws")]
-    root: PathBuf,
+    /// Server root containing conf/httpd_config.xml. Defaults to HTTPJET_ROOT,
+    /// the installed /etc/httpjet tree, or the legacy /usr/local/lsws tree.
+    #[arg(long)]
+    root: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -147,6 +150,10 @@ struct LsphpReloadArgs {
 
 #[derive(Parser, Debug)]
 struct ServeArgs {
+    /// Atomically publish this process's PID after worker activation. The absolute
+    /// path must be fresh and its parent directory owned by root or this account.
+    #[arg(long)]
+    ready_file: Option<PathBuf>,
     #[cfg(feature = "ocsp")]
     #[command(flatten)]
     ocsp: ocsp_runtime::OcspArgs,
@@ -212,6 +219,13 @@ struct ServeArgs {
     /// `pipeline::fast_memo`). Env `HJ_FAST_MEMO=0` is equivalent.
     #[arg(long)]
     no_fast_memo: bool,
+    /// Bridge a cookieless request to the full pipeline before the on-core prefix when nothing
+    /// on-core can serve it: the page cache cannot answer the path and the static branch would
+    /// decline. `off` (default) is today's path; `shadow` only counts what `on` would do
+    /// (`httpjet_fast_early_predicted_total`, `httpjet_fast_early_forfeit_total`). Env
+    /// `HJ_FAST_EARLY_BRIDGE` is equivalent.
+    #[arg(long, default_value = "off")]
+    fast_early_bridge: String,
     /// (Tier 1.1) Per-client-IP request throttle: max requests per client IP per
     /// second. 0 (default) = disabled — overrides the `<perIpRate>` tuning field
     /// when set. Protects the origin from single-source floods; a shared NAT
@@ -486,6 +500,16 @@ struct PageCacheArgs {
     /// past the object cap is served but never stored. Empty = off.
     #[arg(long = "page-cache-stream-fill-vhosts", default_value = "")]
     stream_fill_vhosts: String,
+    /// Comma-separated vhost names whose stored misses keep a dictionary-less zstd body
+    /// (plain zstd) instead of being re-encoded against the vhost dictionary in the
+    /// background. A miss answered with zstd (Cloudflare) stores the encode made for its own
+    /// response, one encode instead of two; any other miss stores the identity and encodes it
+    /// plain in the background. A zstd hit is served the stored bytes until the entry is hot
+    /// enough for its L9 variant. The stored copy is larger than a dictionary-compressed one.
+    /// Buffered misses only (not --page-cache-stream-fill-vhosts); with --xf-capsule dedicated
+    /// storage, capsule renders keep the dictionary path. Empty = off.
+    #[arg(long = "page-cache-egress-at-rest-vhosts", default_value = "")]
+    egress_at_rest_vhosts: String,
     /// (W-TinyLFU) Base admission bar: minimum frequency a cacheable response must show before it
     /// is STORED. 2 = store on the 2nd sighting (miss-miss-hit; rejects the long-tail of
     /// one-hit-wonders — the default). 1 = store on the 1st sighting (miss-hit; cache everything —
@@ -754,18 +778,23 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    let root = config_root::resolve(
+        cli.root,
+        std::env::var_os("HTTPJET_ROOT"),
+        std::path::Path::new("/etc/httpjet"),
+    )?;
     match cli.command.unwrap_or(Command::Check { strict: false }) {
         Command::Check { strict } => {
             // One-shot config dump: plain stdout logging is enough.
             tracing_subscriber::fmt()
                 .with_env_filter(default_env_filter())
                 .init();
-            check(&cli.root, strict)
+            check(&root, strict)
         }
         // `serve` installs its own layered subscriber (stdout + persistent error
         // log) inside the runtime — see `init_logging`.
-        Command::Serve(args) => serve(&cli.root, args),
-        Command::Lsphp(args) => lsphp(&cli.root, args),
+        Command::Serve(args) => serve(&root, args),
+        Command::Lsphp(args) => lsphp(&root, args),
         Command::LsphpReload(args) => lsphp_reload(args),
     }
 }
@@ -948,6 +977,9 @@ fn parse_opt_in_status(spec: &str) -> Result<Vec<u16>, String> {
 /// `.pc` files it finds anywhere under its root.
 const DEFAULT_PAGE_CACHE_STORE_PATH: &str = "/dev/shm/jetcache";
 const PAGE_CACHE_MAX_OBJECT_BYTES: u64 = 100 * 1024 * 1024;
+/// Level of the dictionary-less page-cache codec. Its bodies arrive already encoded for
+/// egress (`--page-cache-egress-at-rest-vhosts`), so it only ever decodes.
+const PLAIN_AT_REST_LEVEL: i32 = 3;
 pub(crate) const RUNTIME_THREAD_STACK_BYTES: usize = 2 * 1024 * 1024;
 
 /// Resolve the file-tier root from the CLI value. Empty/`none`/`off`/`ram` keep the
@@ -1061,6 +1093,23 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
     if args.no_multishot_accept {
         uring::MULTISHOT_ACCEPT.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("--no-multishot-accept: single-shot accept SQE per connection");
+    }
+
+    let early_bridge_mode = std::env::var("HJ_FAST_EARLY_BRIDGE")
+        .ok()
+        .unwrap_or_else(|| args.fast_early_bridge.clone());
+    let early_bridge_mode =
+        pipeline::early_bridge::Mode::parse(&early_bridge_mode).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--fast-early-bridge: expected off, shadow or on, got {early_bridge_mode:?}"
+            )
+        })?;
+    pipeline::early_bridge::DEFAULT_MODE.store(
+        early_bridge_mode as u8,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    if early_bridge_mode != pipeline::early_bridge::Mode::Off {
+        tracing::info!(mode = ?early_bridge_mode, "fast early bridge enabled (--fast-early-bridge)");
     }
 
     if args.no_fast_memo || std::env::var("HJ_FAST_MEMO").is_ok_and(|v| v == "0") {
@@ -1382,9 +1431,12 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                     _ => tracing::warn!(entry = %entry, "page-cache-dict-vhost entry malformed (expected vhost=path); skipping"),
                 }
             }
-            Arc::new(hj_compress::PageDictRegistry::new(by_vhost, fallback))
+            Arc::new(
+                hj_compress::PageDictRegistry::new(by_vhost, fallback)
+                    .with_plain(PLAIN_AT_REST_LEVEL),
+            )
         } else {
-            Arc::new(hj_compress::PageDictRegistry::empty())
+            Arc::new(hj_compress::PageDictRegistry::empty().with_plain(PLAIN_AT_REST_LEVEL))
         };
 
         // (shared-paths) Parsed unconditionally so a malformed spec aborts startup even
@@ -1435,6 +1487,8 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 private_cookies: split_csv(&args.page_cache.private_cookies),
                 standard_cc_vhosts: split_csv(&args.page_cache.standard_vhosts),
                 stream_fill_vhosts: split_csv(&args.page_cache.stream_fill_vhosts),
+                egress_at_rest_vhosts: split_csv(&args.page_cache.egress_at_rest_vhosts),
+                path_presence: early_bridge_mode != pipeline::early_bridge::Mode::Off,
                 default_stale_secs: args.page_cache.stale_default_secs,
                 default_sie_secs: args.page_cache.stale_if_error_default_secs,
                 max_stale_secs: args.page_cache.stale_max_secs,
@@ -1898,9 +1952,14 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         let resources = if let Some(manager) = ocsp {
             resources.with_ocsp(manager, &state.shutdown)?
         } else { resources };
+        let mut ready_file = args.ready_file.as_deref().map(readiness::ReadyFile::prepare).transpose()?;
         transactions
             .install_initial_resources_with_quic(resources, quic_resources)
             .map_err(|_| anyhow::anyhow!("resource ownership installation rejected"))?;
+        if let Some(marker) = ready_file.as_mut() {
+            marker.publish()?;
+        }
+        systemd_notify("READY=1\nSTATUS=HTTP listeners ready")?;
         let mut resource_reaper = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut debug_on = false;
         loop {
@@ -1944,6 +2003,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                     reason,
                                     "SIGHUP: change requires a restart — keeping current config (hot-reload covers vhost/rewrite/access/expires/tuning only)"
                                 );
+                                refresh_current_certificates(&transaction);
                             } else if let Some(vhosts) = reload_would_brick_vhosts(&cur.server, &new_server) {
                                 // A per-vhost file that now fails to parse/read would regress a live
                                 // host to a silent 404 (config==None passes hard_config_change since
@@ -1953,6 +2013,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                     vhosts = %vhosts,
                                     "SIGHUP: reload would 404 mapped vhost(s) whose per-vhost config file failed to load — keeping current config"
                                 );
+                                refresh_current_certificates(&transaction);
                             } else {
                                 // Complete fallible application-state construction
                                 // before touching independent certificate resolvers.
@@ -1961,6 +2022,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                                     Ok(next) => next,
                                     Err(error) => {
                                         tracing::error!(%error, "SIGHUP: reload rejected, keeping the current generation");
+                                        refresh_current_certificates(&transaction);
                                         continue;
                                     }
                                 };
@@ -1995,6 +2057,17 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             tracing::error!(error = %e, "SIGHUP: config reload FAILED — keeping current config");
+                            match tokio::time::timeout(
+                                config_transaction::BEGIN_TIMEOUT,
+                                transactions.begin(),
+                            )
+                            .await
+                            {
+                                Ok(transaction) => refresh_current_certificates(&transaction),
+                                Err(_) => tracing::warn!(
+                                    "SIGHUP: a configuration transaction is in progress; certificates not re-read"
+                                ),
+                            }
                         }
                     }
                 }
@@ -2040,6 +2113,8 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // grace, which `finish_shutdown` below joins on — so this wait uses that same
         // bound (a shorter one only moved the wait into the join, #1034), kept under
         // the unit's TimeoutStopSec=20 with headroom for the lsphp drain below.
+        drop(ready_file);
+        let _ = systemd_notify("STOPPING=1\nSTATUS=Draining HTTP connections");
         tracing::info!("shutdown signal received; draining connections");
         transactions.close();
         state.shutdown.cancel();
@@ -2628,6 +2703,21 @@ fn apply_no_mtls(cfg: &mut hj_core::config::ServerConfig, no_mtls: bool) {
                 tls.client_verify = 0;
             }
         }
+    }
+}
+
+/// A rejected reload still re-reads the CURRENT config's certificate files: certbot's renewal
+/// hook sends SIGHUP, and an unrelated config problem must not leave a renewed certificate
+/// unloaded until the old one expires. Same paths, so no candidate's certificate is published.
+fn refresh_current_certificates(transaction: &config_transaction::Transaction<'_>) {
+    match transaction.reload_certificates(&transaction.current.server) {
+        Ok(()) => tracing::info!(
+            "SIGHUP: certificates re-read from the current config; the config change was rejected"
+        ),
+        Err(error) => tracing::error!(
+            %error,
+            "SIGHUP: re-reading certificates from the current config failed; keeping the loaded ones"
+        ),
     }
 }
 
@@ -3925,6 +4015,7 @@ mod tests {
             enabled: true,
             allow_browse: true,
             extra_headers: Vec::new(),
+            inherit_extra_headers: true,
             add_default_charset: None,
             charset: None,
             cache_policy: None,

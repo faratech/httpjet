@@ -178,6 +178,31 @@ fn php_preread_content_type(value: &[u8]) -> bool {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"multipart/"))
 }
 
+/// Whether PHP reads this POST's `body_len`-byte body in full before the script runs
+/// (the form handlers, or php_default_post_reader for any other type) while
+/// enable_post_data_reading is on and the body is under post_max_size, so no unread
+/// tail can follow RESP_END and the socket may be reused. Any other bodied request
+/// closes its connection: lsphp would parse an unread tail as a new request (#833).
+/// PHP pre-reads only a POST that carries a Content-Type (sapi_activate), and only
+/// through sapi_read_standard_form_data: multipart is consumed lazily by rfc1867,
+/// which reads nothing on an early exit (no boundary, too many parts), so it never
+/// qualifies (#835). An operator .user.ini/php.ini turning enable_post_data_reading
+/// off is not visible here and must not be deployed alongside this rule.
+fn php_prereads_post(
+    req: &Request,
+    body_len: u64,
+    special_env: &[(SpecialEnvType, String, String)],
+) -> bool {
+    req.method() == http::Method::POST
+        && body_len <= PREREAD_POST_MAX as u64
+        && single_header(req.headers(), http::header::CONTENT_TYPE)
+            .is_some_and(|v| php_preread_content_type(v.as_bytes()))
+        && !special_env.iter().any(|(_, name, _)| {
+            name.eq_ignore_ascii_case("enable_post_data_reading")
+                || name.eq_ignore_ascii_case("post_max_size")
+        })
+}
+
 /// The header's value when it occurs exactly once: a repeated field could make
 /// this gate and the value lsphp receives disagree.
 fn single_header(
@@ -261,6 +286,16 @@ enum RetryKind {
     /// up to `IDEMPOTENT_RETRY_MAX` times with a short backoff so a burst can
     /// resolve, bounded so a real outage can't amplify load.
     IdempotentReset,
+    /// A reset BEFORE any response packet on a request of any method that is bodiless
+    /// or whose body PHP reads in full before the script runs (and is still in hand),
+    /// or the worker closing before it took the whole of such a body.
+    /// On a unix socket a reset means the worker closed with our bytes unread: lsphp's
+    /// accept loop drops the next request of a worker its master marked to retire
+    /// (excess idle children) without reading it, so the script never started. A
+    /// worker that read the request and then died yields EOF instead, which stays
+    /// terminal. Replayed like `IdempotentReset` (OLS `ExtConn::connError` resends any
+    /// method in this state too).
+    UnreadReset,
     /// BEGIN_REQUEST could not be written to a REUSED idle socket on a bodiless
     /// idempotent request: lsphp closed that keep-alive (idle/max-requests exit)
     /// and nothing was delivered. The backend is not implicated, so retry on a
@@ -277,11 +312,17 @@ fn begin_failure_kind(bodiless_idempotent: bool, reused: bool) -> RetryKind {
 }
 
 impl RetryKind {
+    /// A post-flush reset replayed on a fresh dial after a short backoff.
+    fn is_reset_replay(self) -> bool {
+        matches!(self, RetryKind::IdempotentReset | RetryKind::UnreadReset)
+    }
+
     /// Stable label for the php-slow log's retry column (#133).
     fn as_log_str(self) -> &'static str {
         match self {
             RetryKind::PreFlush => "preflush",
             RetryKind::IdempotentReset => "idempotent_reset",
+            RetryKind::UnreadReset => "unread_reset",
             RetryKind::StaleReuse => "stale_reuse",
         }
     }
@@ -331,6 +372,9 @@ enum Attempt<B> {
 struct ReadFail {
     err: HandlerError,
     retryable: bool,
+    /// A reset before any packet arrived: the worker never read the request
+    /// (see [`RetryKind::UnreadReset`]).
+    unread: bool,
 }
 
 impl ReadFail {
@@ -338,12 +382,29 @@ impl ReadFail {
         ReadFail {
             err,
             retryable: false,
+            unread: false,
         }
     }
     fn retryable(err: HandlerError) -> Self {
         ReadFail {
             err,
             retryable: true,
+            unread: false,
+        }
+    }
+
+    /// The replay this failure allows, if any. `bodiless` = nothing follows
+    /// BEGIN_REQUEST; `preread_body` = a body PHP reads whole before the script runs,
+    /// retained for the replay.
+    fn replay(&self, idempotent: bool, bodiless: bool, preread_body: bool) -> Option<RetryKind> {
+        if !self.retryable {
+            None
+        } else if idempotent && bodiless {
+            Some(RetryKind::IdempotentReset)
+        } else if self.unread && (bodiless || preread_body) {
+            Some(RetryKind::UnreadReset)
+        } else {
+            None
         }
     }
 }
@@ -417,6 +478,24 @@ pub struct Lsapi {
     /// Server-wide cap on heap currently held by buffered (chunked / no-CL)
     /// request bodies (#236). Shared by every handler built from the registry.
     body_budget: Arc<BodyBufferBudget>,
+    /// Send every header's `HTTP_*` copy in the env table too, not only the ones
+    /// lsphp cannot take from the header block ([`CgiEnvBuilder::header_block`]).
+    full_header_env: bool,
+}
+
+/// `HJ_LSAPI_FULL_HEADER_ENV=1` restores every header's `HTTP_*` env copy: the kill
+/// switch for leaving out the copies lsphp already registers from the header block.
+fn full_header_env_from_env() -> bool {
+    static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FULL.get_or_init(|| {
+        let full = std::env::var("HJ_LSAPI_FULL_HEADER_ENV").is_ok_and(|v| v == "1");
+        if full {
+            tracing::info!(
+                "lsapi: sending every header's HTTP_* env copy (HJ_LSAPI_FULL_HEADER_ENV=1)"
+            );
+        }
+        full
+    })
 }
 
 /// Server-wide byte budget for request bodies that must be fully buffered into
@@ -438,7 +517,14 @@ impl Lsapi {
             retry: true,
             max_process_time: None,
             body_budget: Arc::new(BodyBufferBudget::new(DEFAULT_BODY_BUFFER_MEM)),
+            full_header_env: full_header_env_from_env(),
         }
+    }
+
+    /// Override the `HJ_LSAPI_FULL_HEADER_ENV` kill switch for this handler.
+    pub fn full_header_env(mut self, full: bool) -> Self {
+        self.full_header_env = full;
+        self
     }
 
     /// Share a server-wide buffered-body [`BodyBufferBudget`] (the registry wires
@@ -548,7 +634,9 @@ impl Lsapi {
 
         // Resolve a pipeline-supplied SCRIPT_NAME / PATH_INFO split + the php.ini
         // special-env (owned — cloned out of the extension so no borrow lingers).
-        let mut builder = CgiEnvBuilder::new(&script).extra_ref(&self.base_env);
+        let mut builder = CgiEnvBuilder::new(&script)
+            .extra_ref(&self.base_env)
+            .header_block(!self.full_header_env);
         let mut special_env: Vec<(SpecialEnvType, String, String)> = Vec::new();
         if let Some(ls) = req.extensions().get::<LsapiScript>() {
             if let Some(sn) = &ls.script_name {
@@ -582,21 +670,33 @@ impl Lsapi {
         // Held to the END of this fn: the RAII lease keeps the server-wide
         // buffered-body reservation alive while the buffer is handed to lsphp. A
         // concurrent body pump holds a clone until it finishes writing (#806).
+        // A declared body PHP reads whole before the script runs is small; it is
+        // collected too, so a reset the worker left unread can replay it (UnreadReset).
         let body_lease: Option<Arc<BodyBufferLease>>;
         let buffered: Option<Bytes> = match declared_len {
-            Some(_) => {
+            Some(len) if !php_prereads_post(&req, len, &special_env) => {
                 body_lease = None;
                 None
             }
-            None => {
-                let (b, lease) =
-                    match collect_to_cap(req.body_mut(), self.max_body, &self.body_budget).await {
-                        Ok(collected) => collected,
-                        Err(error) => {
-                            let (parts, _) = req.into_parts();
-                            return (Err(error), parts);
-                        }
-                    };
+            _ => {
+                let (b, lease) = match collect_to_cap(
+                    req.body_mut(),
+                    self.max_body,
+                    declared_len,
+                    &self.body_budget,
+                )
+                .await
+                {
+                    Ok(collected) => collected,
+                    Err(error) => {
+                        let (parts, _) = req.into_parts();
+                        return (Err(error), parts);
+                    }
+                };
+                if declared_len.is_some_and(|len| len != b.len() as u64) {
+                    let (parts, _) = req.into_parts();
+                    return (Err(HandlerError::BadRequest), parts);
+                }
                 body_lease = Some(Arc::new(lease));
                 Some(b)
             }
@@ -674,25 +774,7 @@ impl Lsapi {
         build_begin_request_framed_into(&mut begin, &env, &special_env, &headers, body_len);
         drop(env);
         drop(headers);
-        // PHP reads a POST body in full before the script runs (the form handlers,
-        // or php_default_post_reader for any other type) while enable_post_data_reading
-        // is on and the body is under post_max_size, so no unread tail can follow
-        // RESP_END and the socket may be reused. Any other bodied request closes its
-        // connection: lsphp would parse an unread tail as a new request (#833).
-        // PHP pre-reads only a POST that carries a Content-Type (sapi_activate), and
-        // only through sapi_read_standard_form_data: multipart is consumed lazily by
-        // rfc1867, which reads nothing on an early exit (no boundary, too many
-        // parts), so it never qualifies (#835). An operator .user.ini/php.ini turning
-        // enable_post_data_reading off is not visible here and must not be deployed
-        // alongside this rule.
-        let body_preread = req.method() == http::Method::POST
-            && (0..=PREREAD_POST_MAX).contains(&body_len)
-            && single_header(req.headers(), http::header::CONTENT_TYPE)
-                .is_some_and(|v| php_preread_content_type(v.as_bytes()))
-            && !special_env.iter().any(|(_, name, _)| {
-                name.eq_ignore_ascii_case("enable_post_data_reading")
-                    || name.eq_ignore_ascii_case("post_max_size")
-            });
+        let body_preread = body_len >= 0 && php_prereads_post(&req, body_len as u64, &special_env);
         let (parts, body) = req.into_parts();
         // Any other body may be left partly unread, and lsphp runs an unread tail
         // as its next request: refuse a body that holds one before dispatch. A
@@ -914,7 +996,7 @@ impl Lsapi {
     /// `attempt` is the number of failures so far (1 = the first dispatch failed).
     async fn proceed_with_retry(&self, kind: RetryKind, attempt: u32) -> bool {
         match kind {
-            RetryKind::IdempotentReset => {
+            RetryKind::IdempotentReset | RetryKind::UnreadReset => {
                 attempt <= IDEMPOTENT_RETRY_MAX && !self.supervisor_is_bad()
             }
             RetryKind::StaleReuse => {
@@ -952,6 +1034,7 @@ impl Lsapi {
         let mut body = body;
         let mut attempt: u32 = 0;
         let mut last_retry: Option<RetryKind> = None;
+        let mut fresh = false;
         loop {
             match self
                 .dispatch_streaming(
@@ -962,6 +1045,7 @@ impl Lsapi {
                     body_len,
                     body,
                     &mut *inflight,
+                    fresh,
                 )
                 .await
             {
@@ -972,12 +1056,17 @@ impl Lsapi {
                     kind,
                 } => {
                     attempt += 1;
-                    if !self.proceed_with_retry(kind, attempt).await {
+                    let proceed = self.proceed_with_retry(kind, attempt).await;
+                    if kind.is_reset_replay() {
+                        self.pool.note_reset_replay(!proceed);
+                    }
+                    if !proceed {
                         // Exhausted/blocked: 503 if the worker is bad, else the reason.
                         return Err(self.retry_exhausted(reason));
                     }
-                    if matches!(kind, RetryKind::IdempotentReset) {
+                    if kind.is_reset_replay() {
                         tokio::time::sleep(IDEMPOTENT_RETRY_BACKOFF).await;
+                        fresh = true;
                     }
                     last_retry = Some(kind);
                     body = b; // replay the body for the next attempt
@@ -1008,6 +1097,7 @@ impl Lsapi {
         let mut body = body;
         let mut attempt: u32 = 0;
         let mut last_retry: Option<RetryKind> = None;
+        let mut fresh = false;
         loop {
             match self
                 .dispatch_buffered(
@@ -1018,6 +1108,7 @@ impl Lsapi {
                     body,
                     lease,
                     &mut *inflight,
+                    fresh,
                 )
                 .await
             {
@@ -1028,11 +1119,16 @@ impl Lsapi {
                     kind,
                 } => {
                     attempt += 1;
-                    if !self.proceed_with_retry(kind, attempt).await {
+                    let proceed = self.proceed_with_retry(kind, attempt).await;
+                    if kind.is_reset_replay() {
+                        self.pool.note_reset_replay(!proceed);
+                    }
+                    if !proceed {
                         return Err(self.retry_exhausted(reason));
                     }
-                    if matches!(kind, RetryKind::IdempotentReset) {
+                    if kind.is_reset_replay() {
                         tokio::time::sleep(IDEMPOTENT_RETRY_BACKOFF).await;
+                        fresh = true;
                     }
                     last_retry = Some(kind);
                     body = b;
@@ -1066,13 +1162,16 @@ impl Lsapi {
         body_len: i32,
         body: hj_core::IncomingBody,
         inflight: &mut Option<InFlightGuard>,
+        fresh: bool,
     ) -> Attempt<hj_core::IncomingBody> {
         // PRE-FLUSH (replayable): pool acquire. On failure, hand the (untouched)
         // body back so the caller can retry on a fresh connection.
         let acq_start = Instant::now();
         // (#315) GET/HEAD with no body: skip the pool's reuse probe — the
-        // IdempotentReset replay below covers a dead reuse.
-        let mut conn = match if idempotent && body_len == 0 {
+        // IdempotentReset replay below covers a dead reuse, on a fresh dial.
+        let mut conn = match if fresh {
+            self.pool.acquire_fresh().await
+        } else if idempotent && body_len == 0 {
             self.pool.acquire_unprobed().await
         } else {
             self.pool.acquire().await
@@ -1214,21 +1313,21 @@ impl Lsapi {
         }
         match response {
             Ok(resp) => Attempt::Done(Ok(resp)),
-            Err(ReadFail { err, retryable }) => {
-                // IDEMPOTENT-RESET RETRY: a connection reset/closed before any
-                // response byte, for an idempotent request with NO body to replay
-                // (body_len == 0). The client has seen nothing; replay on a fresh dial
+            Err(fail) => {
+                // RESET RETRY: a connection reset/closed before any response byte, with
+                // NO body to replay (body_len == 0): an idempotent request, or an unread
+                // one of any method. The client has seen nothing; replay on a fresh dial
                 // (the first attempt's empty pump finishes on its own). Covers both a
                 // stale reused socket and a fresh dial that reset during a recycle
-                // burst — the retry loop bounds + backs off either way.
-                if retryable && idempotent && body_len == 0 {
-                    Attempt::Retry {
+                // burst — the retry loop bounds + backs off either way. A body streamed
+                // from the client is gone, so it is never replayed here.
+                match fail.replay(idempotent, body_len == 0, false) {
+                    Some(kind) => Attempt::Retry {
                         body: empty_incoming_body(),
-                        reason: err,
-                        kind: RetryKind::IdempotentReset,
-                    }
-                } else {
-                    Attempt::Done(Err(err))
+                        reason: fail.err,
+                        kind,
+                    },
+                    None => Attempt::Done(Err(fail.err)),
                 }
             }
         }
@@ -1250,6 +1349,7 @@ impl Lsapi {
         body: Bytes,
         lease: Option<&Arc<BodyBufferLease>>,
         inflight: &mut Option<InFlightGuard>,
+        fresh: bool,
     ) -> Attempt<Bytes> {
         // A large buffered body written in full before any response read deadlocks
         // against a script that writes a large response before draining its input
@@ -1269,6 +1369,7 @@ impl Lsapi {
                     body_len,
                     full_incoming_body(body.clone(), lease.cloned()),
                     inflight,
+                    fresh,
                 )
                 .await
             {
@@ -1280,7 +1381,9 @@ impl Lsapi {
         // failure so the caller can replay it on a fresh connection.
         let acq_start = Instant::now();
         // (#315) Same skip as dispatch_streaming for a BUFFERED empty body.
-        let mut conn = match if idempotent && body.is_empty() {
+        let mut conn = match if fresh {
+            self.pool.acquire_fresh().await
+        } else if idempotent && body.is_empty() {
             self.pool.acquire_unprobed().await
         } else {
             self.pool.acquire().await
@@ -1375,9 +1478,23 @@ impl Lsapi {
                 }
                 Ok(Err(BodyWriteError::Io(e))) => {
                     conn.poison();
-                    return Attempt::Done(Err(HandlerError::BadGateway(format!(
-                        "lsapi write body: {e}"
-                    ))));
+                    let reason = HandlerError::BadGateway(format!("lsapi write body: {e}"));
+                    // The worker closed before taking a body PHP reads whole before the
+                    // script runs, so the script never started (a retiring worker drops
+                    // the request as soon as its first bytes arrive).
+                    if body_preread
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                        )
+                    {
+                        return Attempt::Retry {
+                            body,
+                            reason,
+                            kind: RetryKind::UnreadReset,
+                        };
+                    }
+                    return Attempt::Done(Err(reason));
                 }
                 Err(_) => {
                     conn.poison();
@@ -1418,19 +1535,19 @@ impl Lsapi {
             .await
         {
             Ok(resp) => Attempt::Done(Ok(resp)),
-            Err(ReadFail { err, retryable }) => {
-                // IDEMPOTENT-RESET RETRY: a connection reset/closed before any
-                // response byte, for an idempotent request with no body. A buffered
-                // payload is byte-replayable, but after BEGIN+body are flushed the PHP
-                // worker may already have acted on it, so keep post-flush replay bodyless.
-                if retryable && idempotent && body.is_empty() {
-                    Attempt::Retry {
+            Err(fail) => {
+                // RESET RETRY: a connection reset/closed before any response byte, for
+                // an idempotent request with no body, or a reset the worker left unread.
+                // After BEGIN+body are flushed the worker may already have acted on a
+                // body, so a bodied replay needs both the unread reset and a body PHP
+                // reads whole before the script starts.
+                match fail.replay(idempotent, body.is_empty(), body_preread) {
+                    Some(kind) => Attempt::Retry {
                         body,
-                        reason: err,
-                        kind: RetryKind::IdempotentReset,
-                    }
-                } else {
-                    Attempt::Done(Err(err))
+                        reason: fail.err,
+                        kind,
+                    },
+                    None => Attempt::Done(Err(fail.err)),
                 }
             }
         }
@@ -1478,6 +1595,7 @@ impl Lsapi {
             },
         );
         let mut accept_worker_pid = true;
+        let mut saw_packet = false;
         let resp_header = loop {
             let next = match &body_done {
                 None => reader.next(&mut read_half).await,
@@ -1492,6 +1610,9 @@ impl Lsapi {
                     }
                 },
             };
+            if matches!(next, Ok(Some(_))) {
+                saw_packet = true;
+            }
             match next {
                 Ok(Some(frame)) => match frame.ptype {
                     PacketType::RespHeader => {
@@ -1552,11 +1673,16 @@ impl Lsapi {
                 }
                 Err(e) => {
                     // Connection reset before any response byte (e.g. ECONNRESET):
-                    // the stale-reuse race → retryable on a fresh dial.
+                    // the stale-reuse race → retryable on a fresh dial. Before any
+                    // packet, a reset also proves the request went unread.
                     fail(&guard, &cancel);
-                    return Err(ReadFail::retryable(HandlerError::BadGateway(format!(
-                        "lsapi read: {e}"
-                    ))));
+                    let unread = !saw_packet
+                        && reader.unparsed().is_empty()
+                        && e.kind() == std::io::ErrorKind::ConnectionReset;
+                    let mut fail =
+                        ReadFail::retryable(HandlerError::BadGateway(format!("lsapi read: {e}")));
+                    fail.unread = unread;
+                    return Err(fail);
                 }
             }
         };
@@ -2268,25 +2394,24 @@ fn parse_response_content_length(
 async fn collect_to_cap(
     body: &mut hj_core::IncomingBody,
     max_body: u64,
+    declared: Option<u64>,
     budget: &Arc<BodyBufferBudget>,
 ) -> Result<(Bytes, BodyBufferLease), HandlerError> {
     use http_body_util::BodyExt;
     let mut lease = BodyBufferLease::new(Arc::clone(budget));
-    // (L8) Pre-size the collector instead of growing an empty BytesMut frame by frame: an 8 KiB
-    // floor covers the common small chunked POST without the 0→8→…→8 KiB realloc chain, bounded
-    // by `max_body` so a tiny cap can't over-allocate. (This is the chunked / no-Content-Length
-    // path, so there is no declared length to size from — a modest fixed floor is the lever.)
-    // (#317b) Allocate on the FIRST data frame instead of up front: this path also runs
-    // for bodyless GET/HEAD (no Content-Length), which previously paid an unused 8 KiB.
+    // The body is copied out frame by frame: a transport frame carries its own lease on
+    // the same budget, so keeping it would charge the body twice for the whole request.
+    // (L8) The buffer is sized once from the declared length, else an 8 KiB floor that
+    // covers the common small chunked POST, bounded by `max_body`; it is allocated on the
+    // first data frame (#317b: this path also runs for bodyless GET/HEAD).
     let mut buf = bytes::BytesMut::new();
     while let Some(frame) = body.frame().await {
         let frame =
             frame.map_err(|e| HandlerError::BadGateway(format!("read request body: {e}")))?;
         if let Some(data) = frame.data_ref() {
             if buf.is_empty() && !data.is_empty() {
-                // (L8 floor, deferred) 8 KiB covers the common small chunked POST without
-                // the 0->8->... realloc chain; still bounded by `max_body`.
-                buf.reserve((8 * 1024).min(max_body.max(1)) as usize);
+                let want = declared.unwrap_or(8 * 1024).max(data.len() as u64);
+                buf.reserve(want.min(max_body.max(1)) as usize);
             }
             if (buf.len() as u64) + (data.len() as u64) > max_body {
                 return Err(HandlerError::PayloadTooLarge);
@@ -2359,7 +2484,7 @@ fn collect_wire_headers<'r>(
             });
             let known = crate::proto::known_header_index(name.as_str());
             WireField {
-                name: wire_header_name(name.as_str(), known),
+                name: Cow::Borrowed(name.as_str()),
                 value,
                 known,
             }
@@ -2393,30 +2518,17 @@ impl WireHeader for WireField<'_> {
     fn known_index(&self) -> Option<usize> {
         self.known
     }
-}
-
-/// The name lsphp reports for a header (`getallheaders()`, #950). A well-known
-/// header is sent by index slot, so the SAPI names it from its own table and the
-/// name text is never read. Any other name is reported verbatim; the h1 case is
-/// gone by now (the `http` crate lower-cases), so restore the conventional
-/// Title-Case FPM/Apache present (`x-hub-signature-256` -> `X-Hub-Signature-256`).
-/// Only `[A-Za-z0-9-]` names get here ([`crate::cgi::header_forwardable`]), so the
-/// mapping is case-only: `HTTP_*` names and duplicate grouping are unchanged.
-fn wire_header_name(name: &str, known: Option<usize>) -> Cow<'_, str> {
-    if known.is_some() {
-        return Cow::Borrowed(name);
+    /// The name lsphp reports for a header (`getallheaders()`, #950). A well-known
+    /// header is sent by index slot, so the SAPI names it from its own table and the
+    /// name text is never read. Any other name is reported verbatim; the h1 case is
+    /// gone by now (the `http` crate lower-cases), so restore the conventional
+    /// Title-Case FPM/Apache present (`x-hub-signature-256` -> `X-Hub-Signature-256`).
+    /// Only `[A-Za-z0-9-]` names get here ([`crate::cgi::header_forwardable`]), so the
+    /// mapping is case-only: `HTTP_*` names and duplicate grouping are unchanged. The
+    /// builder applies it while copying the name, so no per-header String is built.
+    fn title_case(&self) -> bool {
+        self.known.is_none()
     }
-    let mut out = String::with_capacity(name.len());
-    let mut start = true;
-    for c in name.chars() {
-        out.push(if start {
-            c.to_ascii_uppercase()
-        } else {
-            c.to_ascii_lowercase()
-        });
-        start = c == '-';
-    }
-    Cow::Owned(out)
 }
 
 fn log_stderr(body: &[u8]) {
@@ -2450,8 +2562,8 @@ struct PacketReader {
     /// `frozen` holds the current buffer.
     buf: Vec<u8>,
     start: usize,
-    /// The current buffer once a body frame was sliced from it; the unparsed bytes
-    /// are then `frozen[start..]`.
+    /// The current buffer once a response head or body frame was sliced from it; the
+    /// unparsed bytes are then `frozen[start..]`.
     frozen: Option<Bytes>,
     /// Per-read idle ceiling: no progress within this window -> `TimedOut`.
     timeout: Duration,
@@ -2685,7 +2797,11 @@ impl PacketReader {
         let ptype = PacketType::from_u8(header[2]).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "lsapi unknown packet type")
         })?;
-        let body = if ptype == PacketType::RespStream && total > PACKET_HEADER_LEN {
+        // The response head is parsed straight out of the read buffer, like body frames;
+        // the frames that never carry much (end, stderr, notifications) are copied out.
+        let body = if matches!(ptype, PacketType::RespStream | PacketType::RespHeader)
+            && total > PACKET_HEADER_LEN
+        {
             let body_at = self.start + PACKET_HEADER_LEN..self.start + total;
             let buf = &mut self.buf;
             self.frozen
@@ -3005,6 +3121,31 @@ mod body_budget_tests {
             .boxed()
     }
 
+    /// A transport frame carries its own lease on the same budget; the collected copy
+    /// must not keep it alive, or the body is charged twice for the whole request.
+    #[tokio::test]
+    async fn a_lease_backed_body_is_charged_once() {
+        let budget = Arc::new(BodyBufferBudget::new(1 << 20));
+        let mut transport = hj_core::budget::BodyBufferLease::new(budget.clone());
+        assert!(transport.reserve(4096));
+        let frame = transport.into_bytes(vec![7u8; 4096]);
+        let mut body: IncomingBody = http_body_util::Full::<Bytes>::new(frame)
+            .map_err(|e| Box::new(e) as hj_core::BoxError)
+            .boxed();
+        let (collected, lease) = collect_to_cap(&mut body, 1 << 20, Some(4096), &budget)
+            .await
+            .unwrap();
+        drop(body);
+        assert_eq!(collected.len(), 4096);
+        assert_eq!(
+            budget.in_flight(),
+            4096,
+            "charged once, by the collect lease"
+        );
+        drop(lease);
+        assert_eq!(budget.in_flight(), 0);
+    }
+
     // (#236) Concurrent chunked uploads must be bounded by the server-wide
     // budget, not by connections x max_body.
     #[tokio::test]
@@ -3016,7 +3157,7 @@ mod body_budget_tests {
             tasks.push(tokio::spawn(async move {
                 // Each upload wants 512 KiB against a 1 MiB shared budget: at
                 // most two can ever be resident at once.
-                collect_to_cap(&mut body_of(512 * 1024), 16 * 1024 * 1024, &b).await
+                collect_to_cap(&mut body_of(512 * 1024), 16 * 1024 * 1024, None, &b).await
             }));
         }
         let (mut ok, mut unavailable) = (0usize, 0usize);
@@ -3041,7 +3182,7 @@ mod body_budget_tests {
     #[tokio::test]
     async fn small_body_admits_and_releases() {
         let budget = Arc::new(BodyBufferBudget::new(64 * 1024));
-        let (buf, lease) = collect_to_cap(&mut body_of(16 * 1024), 1024 * 1024, &budget)
+        let (buf, lease) = collect_to_cap(&mut body_of(16 * 1024), 1024 * 1024, None, &budget)
             .await
             .unwrap();
         assert_eq!(buf.len(), 16 * 1024);
@@ -3053,7 +3194,7 @@ mod body_budget_tests {
     #[tokio::test]
     async fn per_request_cap_still_wins_over_budget() {
         let budget = Arc::new(BodyBufferBudget::new(u64::MAX));
-        let err = collect_to_cap(&mut body_of(2 * 1024 * 1024), 1024 * 1024, &budget)
+        let err = collect_to_cap(&mut body_of(2 * 1024 * 1024), 1024 * 1024, None, &budget)
             .await
             .unwrap_err();
         assert!(matches!(err, HandlerError::PayloadTooLarge));
@@ -3070,6 +3211,293 @@ mod body_budget_tests {
 #[cfg(test)]
 mod wire_header_tests {
     use super::{collect_wire_headers, empty_incoming_body};
+
+    /// `$_SERVER` as lsphp registers it (lsapi_main.c `sapi_lsapi_register_variables`):
+    /// the header block first, well-known slots in index order with the last value per
+    /// slot and Transfer-Encoding skipped, then each other header in order as
+    /// `HTTP_<NAME>` with the name capped at 250 bytes; then the env table. Writing an
+    /// existing key keeps its position.
+    fn lsphp_server_vars(
+        headers: &[super::WireField<'_>],
+        env: &[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>)],
+    ) -> Vec<(String, String)> {
+        use crate::proto::{KNOWN_HEADER_COUNT, KNOWN_HEADER_NAMES};
+        let mut vars: Vec<(String, String)> = Vec::new();
+        let mut set = |key: String, value: &str| match vars.iter_mut().find(|(k, _)| *k == key) {
+            Some(entry) => entry.1 = value.to_string(),
+            None => vars.push((key, value.to_string())),
+        };
+        let cgi = |name: &str| format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_"));
+        let mut slots: [Option<&str>; KNOWN_HEADER_COUNT] = [None; KNOWN_HEADER_COUNT];
+        for header in headers {
+            if let Some(i) = header.known {
+                slots[i] = Some(&header.value);
+            }
+        }
+        for (name, value) in KNOWN_HEADER_NAMES.iter().zip(slots) {
+            let Some(value) = value else { continue };
+            match *name {
+                "transfer-encoding" => {}
+                "content-type" => set("CONTENT_TYPE".into(), value),
+                "content-length" => set("CONTENT_LENGTH".into(), value),
+                name => set(cgi(name), value),
+            }
+        }
+        for header in headers.iter().filter(|h| h.known.is_none()) {
+            let name: String = header.name.chars().take(250).collect();
+            set(cgi(&name), &header.value);
+        }
+        for (key, value) in env {
+            set(key.to_string(), value);
+        }
+        vars
+    }
+
+    #[test]
+    fn leaving_out_block_registered_copies_keeps_server_vars_identical() {
+        let long_name = format!("x-{}", "a".repeat(255));
+        let cases: Vec<(&str, Vec<(&str, &[u8])>, bool, Option<&str>)> = vec![
+            (
+                "typical CF GET",
+                vec![
+                    ("host", b"forum.example:443"),
+                    ("user-agent", b"Mozilla/5.0"),
+                    ("accept", b"text/html"),
+                    ("accept-language", b"en-US,en;q=0.9"),
+                    ("accept-encoding", b"gzip, br, zstd"),
+                    ("cookie", b"xf_csrf=a; xf_session=b"),
+                    ("referer", b"https://www.google.com/"),
+                    ("cf-ray", b"8d6f2e9a-ORD"),
+                    ("cf-connecting-ip", b"203.0.113.9"),
+                    ("x-forwarded-for", b"203.0.113.9"),
+                    ("cf-ipcountry", b"US"),
+                    ("cdn-loop", b"cloudflare"),
+                    ("sec-ch-ua", b"\"Chromium\";v=\"131\""),
+                    ("if-none-match", b"\"abc\""),
+                ],
+                true,
+                None,
+            ),
+            (
+                "alias Host with the default port",
+                vec![
+                    ("host", b"www.forum.example:443"),
+                    ("user-agent", b"curl/8"),
+                ],
+                true,
+                None,
+            ),
+            (
+                "repeated known and unknown headers",
+                vec![
+                    ("host", b"forum.example"),
+                    ("accept", b"text/html"),
+                    ("accept", b"*/*"),
+                    ("x-dup", b"one"),
+                    ("x-dup", b"two"),
+                    ("cookie", b"a=1"),
+                    ("cookie", b"b=2"),
+                ],
+                false,
+                None,
+            ),
+            (
+                "POST body headers and transfer coding",
+                vec![
+                    ("host", b"forum.example"),
+                    ("content-type", b"application/x-www-form-urlencoded"),
+                    ("content-length", b"11"),
+                    ("transfer-encoding", b"chunked"),
+                    ("x-requested-with", b"XMLHttpRequest"),
+                ],
+                true,
+                None,
+            ),
+            (
+                "synthesized length for a buffered body",
+                vec![
+                    ("host", b"forum.example"),
+                    ("content-type", b"text/plain"),
+                    ("transfer-encoding", b"chunked"),
+                ],
+                true,
+                Some("3"),
+            ),
+            (
+                "no Host (h2 authority only) and a prefetch",
+                vec![
+                    ("sec-purpose", b"prefetch;prerender"),
+                    ("user-agent", b"Chrome"),
+                ],
+                true,
+                None,
+            ),
+            (
+                "dropped names, long name, non-UTF-8 and empty values",
+                vec![
+                    ("host", b"forum.example"),
+                    ("proxy", b"http://evil/"),
+                    ("x_under", b"v"),
+                    (long_name.as_str(), b"long"),
+                    ("x-latin1", b"caf\xe9"),
+                    ("x-empty", b""),
+                    ("authorization", b"Basic YWxhZGRpbjpvcGVuc2VzYW1l"),
+                    ("range", b"bytes=0-1"),
+                    ("cache-control", b"no-cache"),
+                    ("pragma", b"no-cache"),
+                    ("via", b"1.1 cf"),
+                    ("keep-alive", b"300"),
+                    ("connection", b"keep-alive"),
+                    ("cookie2", b"$Version=1"),
+                    ("accept-charset", b"utf-8"),
+                    ("if-modified-since", b"Sun, 25 Oct 2026 00:00:00 GMT"),
+                    ("if-match", b"\"x\""),
+                    ("if-range", b"\"x\""),
+                    ("if-unmodified-since", b"Sun, 25 Oct 2026 00:00:00 GMT"),
+                ],
+                true,
+                None,
+            ),
+        ];
+        for (label, headers, tls, buffered_len) in cases {
+            for (trusted, uri) in [
+                (true, "https://forum.example/x.php?a=1"),
+                (false, "https://forum.example/x.php?a=1"),
+                (true, "/x.php?a=1"),
+            ] {
+                let mut builder = http::Request::builder().method("POST").uri(uri);
+                for (name, value) in &headers {
+                    builder = builder.header(*name, http::HeaderValue::from_bytes(value).unwrap());
+                }
+                let req = builder.body(empty_incoming_body()).unwrap();
+                let mut ctx = crate::cgi::tests::ctx(tls);
+                ctx.forwarding_trusted = trusted;
+                ctx.env = vec![
+                    ("HTTP_X_FROM_REWRITE".into(), "rw".into()),
+                    ("HTTP_USER_AGENT".into(), "rewritten-ua".into()),
+                ];
+                let script = std::path::Path::new("/web/public_html/x.php");
+                let wire = collect_wire_headers(&req, buffered_len, trusted);
+                let full = crate::cgi::CgiEnvBuilder::new(script).build_with_content_length(
+                    &req,
+                    &ctx,
+                    buffered_len,
+                );
+                let lean = crate::cgi::CgiEnvBuilder::new(script)
+                    .header_block(true)
+                    .build_with_content_length(&req, &ctx, buffered_len);
+                assert_eq!(
+                    lsphp_server_vars(&wire, &lean),
+                    lsphp_server_vars(&wire, &full),
+                    "{label} (forwarding trusted: {trusted}, uri {uri})"
+                );
+                assert!(lean.len() <= full.len(), "{label}");
+            }
+        }
+    }
+
+    /// Cost of the env table and BEGIN_REQUEST encode for a Cloudflare-shaped GET,
+    /// with and without the header copies the block already carries.
+    ///   cargo test --release -p hj-lsapi --lib begin_request_cost -- --ignored --nocapture
+    #[test]
+    #[ignore = "timing measurement, not a check"]
+    fn begin_request_cost_with_and_without_block_registered_copies() {
+        let mut builder = http::Request::builder()
+            .uri("/threads/windows-11-24h2-update-fails.345678/page-3")
+            .header("host", "windowsforum.com");
+        for (name, value) in [
+            (
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            ),
+            (
+                "accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            ),
+            ("accept-language", "en-US,en;q=0.9"),
+            ("accept-encoding", "gzip, br, zstd"),
+            (
+                "cookie",
+                "xf_csrf=Qm3pX9aL2bT7vK1c; cf_clearance=Zx8Y.3kLmN0pQrStUvWxYz-1729812345-1.2.1.1-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+            ),
+            ("referer", "https://www.google.com/"),
+            ("cf-ray", "8d6f2e9a1b3c4d5e-ORD"),
+            ("cf-connecting-ip", "203.0.113.42"),
+            ("x-forwarded-for", "203.0.113.42"),
+            ("x-forwarded-proto", "https"),
+            ("cf-ipcountry", "US"),
+            ("cf-visitor", "{\"scheme\":\"https\"}"),
+            ("cdn-loop", "cloudflare; loops=1"),
+            (
+                "sec-ch-ua",
+                "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+            ),
+            ("sec-ch-ua-mobile", "?0"),
+            ("sec-ch-ua-platform", "\"Windows\""),
+            ("sec-fetch-dest", "document"),
+            ("sec-fetch-mode", "navigate"),
+            ("sec-fetch-site", "cross-site"),
+            ("upgrade-insecure-requests", "1"),
+            ("priority", "u=0, i"),
+        ] {
+            builder = builder.header(name, value);
+        }
+        let req = builder.body(empty_incoming_body()).unwrap();
+        let ctx = crate::cgi::tests::ctx(true);
+        let script = std::path::Path::new("/web/public_html/index.php");
+        let mut out = bytes::BytesMut::new();
+        for lean in [false, true, false, true] {
+            let n = 200_000;
+            let started = std::time::Instant::now();
+            let mut size = 0;
+            let mut pairs = 0;
+            for _ in 0..n {
+                let env = crate::cgi::CgiEnvBuilder::new(script)
+                    .header_block(lean)
+                    .build(&req, &ctx);
+                let headers = collect_wire_headers(&req, None, true);
+                crate::proto::build_begin_request_framed_into(&mut out, &env, &[], &headers, 0);
+                size = out.len();
+                pairs = env.len();
+                std::hint::black_box(&out);
+            }
+            let per = started.elapsed().as_nanos() as f64 / n as f64;
+            eprintln!(
+                "lean={lean}: {per:.0} ns/request, {pairs} env pairs, BEGIN_REQUEST {size} B"
+            );
+        }
+    }
+
+    #[test]
+    fn typical_request_env_drops_its_block_registered_copies() {
+        let req = http::Request::builder()
+            .uri("/index.php")
+            .header("Host", "forum.example:443")
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Accept", "text/html")
+            .header("Cookie", "a=1")
+            .header("Content-Type", "text/plain")
+            .header("X-Dup", "1")
+            .header("X-Dup", "2")
+            .body(empty_incoming_body())
+            .unwrap();
+        let ctx = crate::cgi::tests::ctx(true);
+        let env = crate::cgi::CgiEnvBuilder::new(std::path::Path::new("/web/x.php"))
+            .header_block(true)
+            .build(&req, &ctx);
+        let has = |k: &str| env.iter().any(|(key, _)| key == k);
+        for kept in [
+            "HTTP_HOST",
+            "HTTP_CONTENT_TYPE",
+            "HTTP_X_DUP",
+            "HTTP_ACCEPT_ENCODING",
+        ] {
+            assert!(has(kept), "{kept} must stay in the env table");
+        }
+        for dropped in ["HTTP_USER_AGENT", "HTTP_ACCEPT", "HTTP_COOKIE"] {
+            assert!(!has(dropped), "{dropped} comes from the header block");
+        }
+    }
 
     // (#8 httpoxy / CVE-2016-5385) The client `Proxy` header must never reach
     // lsphp's wire header index, where it would become HTTP_PROXY in $_SERVER.
@@ -3134,9 +3562,28 @@ mod wire_header_tests {
             .body(empty_incoming_body())
             .unwrap();
         let fields = collect_wire_headers(&req, Some("3"), true);
+        let title = |name: &str| {
+            name.split('-')
+                .map(|part| {
+                    let mut part = part.to_ascii_lowercase();
+                    if let Some(first) = part.get_mut(..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    part
+                })
+                .collect::<Vec<_>>()
+                .join("-")
+        };
         let tuples: Vec<(String, String)> = fields
             .iter()
-            .map(|h| (h.name.to_string(), h.value.to_string()))
+            .map(|h| {
+                let name = if h.known.is_none() {
+                    title(&h.name)
+                } else {
+                    h.name.to_string()
+                };
+                (name, h.value.to_string())
+            })
             .collect();
         let env = [("REQUEST_METHOD", "POST"), ("SCRIPT_NAME", "/index.php")];
         assert_eq!(

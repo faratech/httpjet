@@ -12,6 +12,7 @@ README.md
 SECURITY.md
 THIRD_PARTY_NOTICES.md
 crates
+debian
 examples
 fuzz
 packaging

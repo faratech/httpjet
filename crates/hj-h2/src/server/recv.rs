@@ -41,6 +41,9 @@ const NO_PROGRESS_BUDGET: u32 = 10_000;
 /// Heap a decoded request field holds beyond its name and value bytes: its `HeaderMap`
 /// bucket, index slot and growth slack (measured 131-176 B for distinct short names).
 const DECODED_FIELD_OVERHEAD: usize = 192;
+/// Bound on the header-map pre-size carried between requests, so one request with many
+/// headers does not make every later stream on the connection pre-allocate for them.
+const HEADER_COUNT_HINT_MAX: usize = 64;
 
 /// What a stream's decoded headers cost while they wait for the request body: every
 /// field plus the pseudo-headers, the stream entry and the map's minimum allocation.
@@ -318,6 +321,8 @@ where
                     // §8.3.1: a HEAD response carries the GET's headers but never a body — captured
                     // here so the writer sends headers-only regardless of what the handler returns.
                     let is_head = st.method.as_ref() == Some(&http::Method::HEAD);
+                    recv.header_count_hint =
+                        (st.headers.len() + usize::from(st.authority.is_some())).min(HEADER_COUNT_HINT_MAX);
                     match build_request(st) {
                         Some(req) => {
                             let fut = service(req);
@@ -610,8 +615,10 @@ where
             };
             // New streams open with the per-stream receive window we advertise (§6.9.2).
             let iw = recv.our_initial_window;
+            let hint = recv.header_count_hint;
             let st = streams.entry(sid).or_insert_with(|| StreamState {
                 recv_window: iw,
+                headers: http::HeaderMap::with_capacity(hint),
                 ..Default::default()
             });
             if refuse_new_stream {

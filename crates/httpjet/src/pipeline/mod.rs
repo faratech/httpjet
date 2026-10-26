@@ -36,6 +36,7 @@ use fast_bridge::FastBridge;
 
 #[cfg(test)]
 pub(crate) mod e2e;
+pub(crate) mod early_bridge;
 #[cfg(test)]
 mod expires_tests;
 pub(crate) mod fast_bridge;
@@ -265,10 +266,18 @@ pub(crate) async fn fast_serve(
     // any GET/HEAD probe could be answered by vhost content instead of the
     // endpoint contract (`classify()` accepts every method by design).
     if let Some(pp) = state.peer_purge.as_ref() {
-        if let Some(resp) = pp.handle_inbound(req, peer_ip, state) {
-            return Some(record_unrouted(
-                state, proto, peer_ip, peer_unix, req, req_start, resp,
-            ));
+        match pp.handle_inbound(req, peer_ip, state) {
+            Some(crate::peer_purge::Inbound::Respond(resp)) => {
+                return Some(record_unrouted(
+                    state, proto, peer_ip, peer_unix, req, req_start, resp,
+                ));
+            }
+            // A purge holds the store's commit lock and unlinks files: never on a
+            // serving core. `handle()` runs it on the blocking pool.
+            Some(crate::peer_purge::Inbound::Purge(_)) => {
+                return bridge(state, FastBridge::Method);
+            }
+            None => {}
         }
     }
     let method = req.method().clone();
@@ -491,6 +500,19 @@ pub(crate) async fn fast_serve(
     {
         return bridge(state, FastBridge::CookiedNoTarget);
     }
+    // (--fast-early-bridge) The same certainty for a cookieless request, once the page cache
+    // provably cannot answer it either.
+    let mut early_predicted = false;
+    if state.early_bridge.mode() != early_bridge::Mode::Off
+        && !req.headers().contains_key(http::header::COOKIE)
+        && let Some(why) = early_bridge_reason(state, &ctx, &orig_path, host_foreign)
+    {
+        if state.early_bridge.mode() == early_bridge::Mode::On {
+            return bridge(state, why);
+        }
+        state.early_bridge.predict(why);
+        early_predicted = true;
+    }
 
     // ---- SYNC PREFIX (shared by both branches): reproduce dispatch()'s pre-backend
     // state with the SAME helpers in the SAME order — per-dir `.htaccess` chain
@@ -622,8 +644,8 @@ pub(crate) async fn fast_serve(
         RwResult::Failed { .. }
         | RwResult::Redirect { .. }
         | RwResult::Status { .. }
-        | RwResult::Forbidden
-        | RwResult::Gone
+        | RwResult::Forbidden { .. }
+        | RwResult::Gone { .. }
         | RwResult::InvalidTarget => {
             return bridge(state, FastBridge::RewriteTerminal);
         }
@@ -762,6 +784,9 @@ pub(crate) async fn fast_serve(
             state
                 .telemetry
                 .record_cache_hit(peer_ip.is_loopback(), &ctx.vhost_name);
+            if early_predicted {
+                state.early_bridge.forfeit(early_bridge::Branch::PageCache);
+            }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
     }
@@ -966,7 +991,37 @@ pub(crate) async fn fast_serve(
         state.serve_config.bandwidth_limit,
         &mut resp,
     );
+    if early_predicted {
+        state.early_bridge.forfeit(early_bridge::Branch::Static);
+    }
     Some(record_fast_serve(state, &ctx, proto, req, req_start, resp))
+}
+
+/// (`--fast-early-bridge`) Why a cookieless request can be bridged before the prefix, if it can:
+/// the page cache cannot answer it (there is none, the host is foreign, or no entry can be
+/// resident for the path) and the static branch is certain to decline (the cookied gates'
+/// test). Reads no `.htaccess` chain. A path that may be cached returns at the filter probe,
+/// so an on-core hit pays one hash and one atomic load for the check.
+fn early_bridge_reason(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    orig_path: &str,
+    host_foreign: bool,
+) -> Option<FastBridge> {
+    let why = match state.page_cache.as_ref() {
+        None => FastBridge::EarlyNoCache,
+        Some(_) if host_foreign => FastBridge::EarlyNoCache,
+        Some(store) if !store.may_hold_path(lscache::vhost_id_hash(&ctx.vhost_name), orig_path) => {
+            FastBridge::EarlyCacheAbsent
+        }
+        Some(_) => return None,
+    };
+    let static_declines = host_foreign
+        || suffix_routing::last_segment_is_script(state, ctx, orig_path)
+        || (looks_like_route(orig_path)
+            && matching_static_context(ctx, orig_path).is_none()
+            && !docroot_target_may_exist(state, &ctx.vhost.doc_root, orig_path));
+    static_declines.then_some(why)
 }
 
 /// (#349) The vary-set a memo entry for this request must carry: the raw value
@@ -1367,14 +1422,6 @@ fn buffer_static_file(
         }
         return None;
     }
-    let ct = resp
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let etag = header_value_string(resp.headers(), http::header::ETAG);
-    let last_modified = header_value_string(resp.headers(), http::header::LAST_MODIFIED);
     let selected = match resp.body() {
         Body::File(f) => f,
         _ => return Some(resp),
@@ -1383,9 +1430,7 @@ fn buffer_static_file(
         &state.static_cache,
         vhost_id,
         selected,
-        ct,
-        etag,
-        last_modified,
+        resp.headers(),
         StaticReadMode::Direct,
     ) {
         Some(bytes) => {
@@ -1611,7 +1656,14 @@ async fn handle_inner(
     // single path comparison; anything not from loopback or a configured peer
     // (incl. CF-sourced probes) falls through to normal handling.
     if let Some(pp) = state.peer_purge.as_ref() {
-        if let Some(resp) = pp.handle_inbound(&req, peer_ip, &state) {
+        let resp = match pp.handle_inbound(&req, peer_ip, &state) {
+            Some(crate::peer_purge::Inbound::Respond(resp)) => Some(resp),
+            Some(crate::peer_purge::Inbound::Purge(purge)) => {
+                Some(crate::peer_purge::apply(purge, &state).await)
+            }
+            None => None,
+        };
+        if let Some(resp) = resp {
             return record_unrouted(&state, proto, peer_ip, peer_unix, &req, req_start, resp);
         }
     }
@@ -1935,8 +1987,7 @@ async fn handle_inner(
 /// header time — which is how Apache/LiteSpeed already behave. Returns the response
 /// (body rewrapped in the streaming case).
 const ACCESS_CHUNK_FLUSH_BYTES: usize = 16 * 1024;
-/// One allocation per chunk: the buffer goes to the writer on flush, so each new chunk
-/// starts from a single reservation instead of regrowing from empty. The regrowth was
+/// Each thread's chunk buffer is reserved once and reused: regrowing it from empty was
 /// ~a dozen reallocs per chunk, and under `MIMALLOC_PURGE_DELAY=0` its larger steps
 /// re-faulted fresh pages on every chunk (~0.4 minor faults/request on a busy vhost).
 const ACCESS_CHUNK_CAPACITY: usize = ACCESS_CHUNK_FLUSH_BYTES + 512;
@@ -1947,6 +1998,26 @@ struct PendingChunk {
     buf: Vec<u8>,
     lines: u32,
     first: std::time::Instant,
+}
+
+impl PendingChunk {
+    /// The chunk as an exact-size copy; the reservation stays on this thread. Most chunks
+    /// age out holding a line or two, and the writer's byte budget charges a chunk by its
+    /// capacity: handing over the whole reservation charged ~16.9 KiB per line.
+    fn take(&mut self) -> (Vec<u8>, u32) {
+        let buf = self.buf.as_slice().to_vec();
+        if self.buf.capacity() > 2 * ACCESS_CHUNK_CAPACITY {
+            self.buf = Vec::with_capacity(ACCESS_CHUNK_CAPACITY);
+        } else {
+            self.buf.clear();
+        }
+        (buf, std::mem::replace(&mut self.lines, 0))
+    }
+
+    fn ship(&mut self) {
+        let (buf, lines) = self.take();
+        self.logger.log_chunk(buf, lines);
+    }
 }
 
 thread_local! {
@@ -1996,23 +2067,20 @@ fn chunk_access_line(
         let mut chunks = chunks.borrow_mut();
         let entry = chunks.entry(key).or_insert_with(|| PendingChunk {
             logger: log.clone(),
-            buf: Vec::new(),
+            buf: Vec::with_capacity(ACCESS_CHUNK_CAPACITY),
             lines: 0,
             first: std::time::Instant::now(),
         });
         let started = entry.lines == 0;
         if started {
             entry.first = std::time::Instant::now();
-            entry.buf.reserve_exact(ACCESS_CHUNK_CAPACITY);
         }
         render(&mut entry.buf, log.format());
         entry.lines += 1;
         if entry.buf.len() >= ACCESS_CHUNK_FLUSH_BYTES
             || entry.first.elapsed() >= ACCESS_CHUNK_MAX_AGE
         {
-            let buf = std::mem::take(&mut entry.buf);
-            let lines = std::mem::replace(&mut entry.lines, 0);
-            entry.logger.log_chunk(buf, lines);
+            entry.ship();
         } else if started {
             access_chunk_started();
         }
@@ -2026,9 +2094,7 @@ pub(crate) fn flush_access_chunks() {
         let mut chunks = chunks.borrow_mut();
         for entry in chunks.values_mut() {
             if entry.lines > 0 {
-                let buf = std::mem::take(&mut entry.buf);
-                let lines = std::mem::replace(&mut entry.lines, 0);
-                entry.logger.log_chunk(buf, lines);
+                entry.ship();
             }
         }
     });
@@ -3660,7 +3726,8 @@ async fn dispatch(
             apply_response_headers_for_request(ctx, outcome_chain, &rel, &orig_path, &mut resp);
             return resp;
         }
-        RwResult::Forbidden => {
+        RwResult::Forbidden { env } => {
+            merge_rewrite_env(ctx, env);
             return error_doc_or_page(
                 state,
                 ctx,
@@ -3672,7 +3739,8 @@ async fn dispatch(
             )
             .await;
         }
-        RwResult::Gone => {
+        RwResult::Gone { env } => {
+            merge_rewrite_env(ctx, env);
             return error_doc_or_page(
                 state,
                 ctx,
@@ -4367,7 +4435,8 @@ async fn dispatch(
                     .record_cache_miss(ctx.peer_ip.is_loopback(), &ctx.vhost_name);
             }
             lscache::CacheOutcome::Miss(key_hash) => {
-                match state.page_cache_inflight.enter(key_hash) {
+                let tag = lscache::identity_tag(&cache_identity);
+                match state.page_cache_inflight.enter(key_hash, tag) {
                     lscache::Enter::Leader(guard) => {
                         // Genuine miss: this request renders (and maybe stores).
                         state
@@ -5066,7 +5135,9 @@ fn opened_target_path(path: &Path) -> std::io::Result<PathBuf> {
     // walk failed at a component every earlier one of which was a real directory, exactly
     // as a following open would. Anything else (ELOOP = a symlink, ENOSYS, …) takes the
     // original path unchanged.
-    if let Some(lexical) = hj_static::symlink_free_candidate(path) {
+    if let Some(lexical) = hj_static::symlink_free_candidate(path)
+        && !hj_static::openat2_unavailable()
+    {
         match rustix::fs::openat2(
             rustix::fs::CWD,
             path,
@@ -5081,7 +5152,7 @@ fn opened_target_path(path: &Path) -> std::io::Result<PathBuf> {
             Err(e) if e == rustix::io::Errno::NOENT || e == rustix::io::Errno::NOTDIR => {
                 return Err(std::io::Error::from(e));
             }
-            Err(_) => {}
+            Err(e) => hj_static::note_openat2_error(e),
         }
     }
     let file =
@@ -6341,14 +6412,6 @@ pub(super) fn maybe_cache_static(
     if len > static_cache.config().max_static_obj_bytes {
         return;
     }
-    let ct = resp
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let etag = header_value_string(resp.headers(), http::header::ETAG);
-    let last_modified = header_value_string(resp.headers(), http::header::LAST_MODIFIED);
     let selected = match resp.body() {
         Body::File(f) => f,
         _ => return,
@@ -6357,9 +6420,7 @@ pub(super) fn maybe_cache_static(
         static_cache,
         vhost_id,
         selected,
-        ct,
-        etag,
-        last_modified,
+        resp.headers(),
         StaticReadMode::TokioBlocking,
     ) {
         if ranged {
@@ -6378,14 +6439,13 @@ enum StaticReadMode {
     TokioBlocking,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The cached body of `selected`, read and stored on a miss. `headers` are the response's,
+/// recorded with a stored entry.
 fn static_cached_bytes(
     cache: &hj_pagecache::PageStore,
     vhost_id: u32,
     selected: &hj_core::FileBody,
-    content_type: String,
-    etag: String,
-    last_modified: String,
+    headers: &http::HeaderMap,
     read_mode: StaticReadMode,
 ) -> Option<bytes::Bytes> {
     let path = &selected.path;
@@ -6422,14 +6482,12 @@ fn static_cached_bytes(
         cache.invalidate_static(vhost_id, path);
         return None;
     }
-    if let Some(entry) = cache.get_static(vhost_id, path, &fresh_id, std::time::Instant::now()) {
-        match cache.static_body_bytes(&entry) {
-            Some(bytes) if bytes.len() as u64 == len => return Some(bytes),
-            _ => {
-                cache.invalidate_static(vhost_id, path);
-                return None;
-            }
+    if let Some(body) = cache.get_static_body(vhost_id, path, &fresh_id) {
+        if body.len() as u64 == len {
+            return Some(body);
         }
+        cache.invalidate_static(vhost_id, path);
+        return None;
     }
     let read = || {
         let size = usize::try_from(len).ok()?;
@@ -6446,14 +6504,18 @@ fn static_cached_bytes(
         return None;
     }
     let bytes = bytes::Bytes::from(bytes);
+    let content_type = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
     let _ = cache.store_static(
         vhost_id,
         path,
         fresh_id,
         bytes.clone(),
         Arc::<str>::from(content_type),
-        etag,
-        last_modified,
+        header_value_string(headers, http::header::ETAG),
+        header_value_string(headers, http::header::LAST_MODIFIED),
     );
     Some(bytes)
 }
@@ -6801,10 +6863,8 @@ fn error_page(status: StatusCode) -> Response {
 mod tests {
     use super::*;
 
-    /// The per-worker flush ticker parks on `access_chunk_pending` and must be woken by the
-    /// first line of a chunk — and only then — or an idle core would either take timer
-    /// A flushed chunk's buffer goes to the writer; the next chunk must start from one
-    /// full reservation, not regrow from empty (which re-faulted pages per chunk).
+    /// The thread keeps one full reservation across flushes (regrowing from empty
+    /// re-faulted pages per chunk), and ships each chunk at its exact size.
     #[tokio::test]
     async fn every_chunk_starts_from_one_full_reservation() {
         let dir = std::env::temp_dir().join(format!("hj-chunk-cap-{}", std::process::id()));
@@ -6837,10 +6897,24 @@ mod tests {
             capacity(&log) >= ACCESS_CHUNK_CAPACITY,
             "after a ticker flush"
         );
-        flush_access_chunks();
+        let (shipped, lines) = ACCESS_CHUNKS.with(|c| {
+            c.borrow_mut()
+                .get_mut(&(Arc::as_ptr(&log) as usize))
+                .unwrap()
+                .take()
+        });
+        assert_eq!((shipped.len(), lines), (line.len(), 1));
+        assert_eq!(
+            shipped.capacity(),
+            line.len(),
+            "a one-line chunk ships at its size"
+        );
+        assert!(capacity(&log) >= ACCESS_CHUNK_CAPACITY, "after a take");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The per-worker flush ticker parks on `access_chunk_pending` and must be woken by the
+    /// first line of a chunk — and only then — or an idle core would either take timer
     /// wake-ups forever or strand a partial chunk.
     #[tokio::test]
     async fn chunk_ticker_parks_until_a_chunk_starts() {
@@ -7235,6 +7309,7 @@ mod tests {
             enabled,
             allow_browse: true,
             extra_headers: vec![],
+            inherit_extra_headers: true,
             add_default_charset: None,
             charset: None,
             cache_policy: None,

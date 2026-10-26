@@ -25,6 +25,7 @@ pub(crate) mod request_body;
 mod tls_write_test;
 mod unix_path;
 pub(crate) mod worker_group;
+mod write_watch;
 pub(crate) use worker_group::WorkerGroup;
 
 use std::io;
@@ -547,6 +548,9 @@ async fn accept_drain_loop<F, Fut>(
     } else {
         tracing::info!(core = core_idx, secure, "uring core: drained cleanly");
     }
+    // The flush ticker stopped with the shutdown signal, but connections answered
+    // fast-path requests while draining: ship their buffered access lines.
+    crate::pipeline::flush_access_chunks();
 }
 
 /// A resource error (EMFILE/ENFILE/ENOBUFS/ENOMEM) persists while the connection
@@ -2245,6 +2249,8 @@ async fn handle_h1_bridged<S>(
             }
         };
 
+        let decode_tried =
+            request_body::finish_body_decodes(&headers, &body_bytes, state.request_decompression);
         let body_bytes = match request_body::finish_body(
             &mut headers,
             body_bytes,
@@ -2285,6 +2291,9 @@ async fn handle_h1_bridged<S>(
         *req.uri_mut() = uri;
         *req.version_mut() = http::Version::HTTP_11;
         *req.headers_mut() = headers;
+        if decode_tried {
+            req.extensions_mut().insert(request_body::DecodeTried);
+        }
         if http10 {
             req.extensions_mut().insert(hj_core::Http10Request);
             // RFC 9110 §7.8: a server MUST ignore Upgrade in an HTTP/1.0 request, and a
@@ -3175,12 +3184,6 @@ const H1_SEND_MIN_PROGRESS: u64 = 16 * 1024;
 /// inside that call is invisible until it completes.
 const H1_WRITE_PROGRESS_GRAIN: u64 = 64 * 1024;
 
-/// A complete response at most this large is written without the send-progress timer:
-/// it fits the socket send buffer, so its write blocks only behind bytes the client left
-/// unread, while arming a timer for every small response cost the hot H1 cache-hit and
-/// static paths several percent CPU. Larger bodies, files and streams stay timed.
-const H1_UNTIMED_FULL_MAX: usize = 64 * 1024;
-
 /// Read buffer for a file body that cannot `sendfile` (a unix-socket peer, or a
 /// descriptor/filesystem `sendfile` refuses). One buffer per response, reused per
 /// chunk: a slow reader holds at most this much heap.
@@ -3236,7 +3239,10 @@ impl SendProgress {
         Ok(())
     }
 
-    /// Run one write of `len` bytes under its [`Self::budget`].
+    /// Run one write of `len` bytes under its [`Self::budget`], watched by the core's
+    /// [`write_watch`] sweeper rather than a timer of its own. Every write is bounded:
+    /// even a small one can block on a client that left earlier responses unread or
+    /// shrank its receive window.
     async fn timed<F: std::future::Future>(
         &self,
         len: usize,
@@ -3245,11 +3251,22 @@ impl SendProgress {
         let Some(budget) = self.budget(len) else {
             return Ok((write.await, std::time::Duration::ZERO));
         };
-        let started = monoio::time::Instant::now();
-        match monoio::time::timeout_at(started + budget, write).await {
-            Ok(out) => Ok((out, started.elapsed())),
-            Err(_) => Err(send_progress_timeout()),
-        }
+        let started = std::time::Instant::now();
+        let mut write = std::pin::pin!(write);
+        let mut deadline = write_watch::Deadline::new(started + budget);
+        std::future::poll_fn(|cx| {
+            if deadline.expired() {
+                return std::task::Poll::Ready(Err(send_progress_timeout()));
+            }
+            match write.as_mut().poll(cx) {
+                std::task::Poll::Ready(out) => std::task::Poll::Ready(Ok((out, started.elapsed()))),
+                std::task::Poll::Pending => {
+                    deadline.arm(cx.waker());
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     /// `write_all` under the progress rule; hands the buffer back for reuse.
@@ -3364,12 +3381,6 @@ where
                 ),
             );
             let body_forbidden = hj_core::response_body_forbidden(is_head, resp.status);
-            let sent = head.len() + if body_forbidden { 0 } else { body.len() };
-            let mut progress = if sent <= H1_UNTIMED_FULL_MAX && throttle.is_none() {
-                SendProgress::new(None)
-            } else {
-                progress
-            };
             let result = if body_forbidden || body.is_empty() {
                 progress.write_all(stream, head).await.map(drop)
             } else if let Some(t) = throttle.as_mut() {
@@ -3872,6 +3883,64 @@ mod send_progress_tests {
             body_writes.iter().all(|&n| n <= H1_FILE_READ_CHUNK),
             "no fallback chunk may exceed the bounded read buffer: {body_writes:?}"
         );
+    }
+
+    /// A small complete response is bounded too: a client that reads nothing and
+    /// shrinks its receive window can leave even a 60 KiB write unable to finish
+    /// (fb8bdd8 wrote these with no deadline at all).
+    #[test]
+    fn a_small_response_to_a_reader_that_never_reads_fails_after_its_windows() {
+        use socket2::{Domain, Socket, Type};
+
+        let response = |len: usize| bridge::BridgeResp {
+            completion: None,
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: bridge::BridgeBody::Full(bytes::Bytes::from(vec![b'x'; len])),
+            bw_rate: None,
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        socket2::SockRef::from(&listener)
+            .set_send_buffer_size(4 * 1024)
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            socket.set_recv_buffer_size(4 * 1024).unwrap();
+            socket.connect(&address.into()).unwrap();
+            // Read nothing; hold the connection open until the server gives up.
+            let _ = done_rx.recv_timeout(Duration::from_secs(10));
+            drop(socket);
+        });
+        let mut runtime = build_core_runtime().unwrap();
+        let (failed, elapsed) = runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let started = Instant::now();
+            let outcome = monoio::time::timeout(
+                Duration::from_secs(5),
+                write_h1_response(
+                    &mut socket,
+                    response(60 * 1024),
+                    false,
+                    true,
+                    false,
+                    &mut None,
+                    None,
+                    Some(WINDOW),
+                    &CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("a small response must not wait on a client that never reads");
+            (outcome.failed, started.elapsed())
+        });
+        let _ = done_tx.send(());
+        client.join().unwrap();
+        assert!(failed, "a reader that never reads must fail the response");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
@@ -8726,6 +8795,7 @@ async fn accept_drain_loop_unix(
             "uring UDS: drain grace elapsed; abandoning in-flight connections"
         );
     }
+    crate::pipeline::flush_access_chunks();
 }
 
 #[cfg(test)]

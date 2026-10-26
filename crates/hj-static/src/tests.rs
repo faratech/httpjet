@@ -2829,3 +2829,72 @@ async fn precompressed_sibling_is_marked() {
     assert!(!resp.headers().contains_key(CONTENT_ENCODING));
     fs::remove_dir_all(&root).ok();
 }
+
+/// Where `openat2` is unavailable (seccomp sandboxes return ENOSYS), a vhost that
+/// does not follow symlinks still serves its files: the component-by-component walk
+/// refuses a symlink anywhere (ELOOP, mapped to 403) and `..` (EXDEV), like
+/// RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS.
+#[test]
+fn no_follow_walk_matches_resolve_beneath_without_openat2() {
+    let root = std::env::temp_dir().join(format!("hj-static-walk-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/file.txt"), b"hi").unwrap();
+    fs::write(root.join("top.txt"), b"top").unwrap();
+    std::os::unix::fs::symlink(root.join("a"), root.join("link_dir")).unwrap();
+    std::os::unix::fs::symlink(root.join("top.txt"), root.join("a/link_file")).unwrap();
+    let root_fd = rustix::fs::open(
+        &root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let walk = |rel: &str| open_beneath_no_symlinks(&root_fd, rel, flags).map(|_| ());
+
+    assert_eq!(walk("a/b/file.txt"), Ok(()));
+    assert_eq!(walk("./a//b/./file.txt"), Ok(()));
+    assert_eq!(walk("top.txt"), Ok(()));
+    assert_eq!(walk("a/b/"), Ok(()));
+    assert_eq!(walk("."), Ok(()));
+    assert_eq!(walk(""), Err(rustix::io::Errno::NOENT));
+    assert_eq!(walk("/top.txt"), Err(rustix::io::Errno::XDEV));
+    assert_eq!(walk("link_dir/b/file.txt"), Err(rustix::io::Errno::LOOP));
+    assert_eq!(walk("a/link_file"), Err(rustix::io::Errno::LOOP));
+    assert_eq!(walk("a/../top.txt"), Ok(()));
+    assert_eq!(walk("a/b/../../top.txt"), Ok(()));
+    assert_eq!(walk("../top.txt"), Err(rustix::io::Errno::XDEV));
+    assert_eq!(walk("a/../../x"), Err(rustix::io::Errno::XDEV));
+    assert_eq!(walk("a/missing.txt"), Err(rustix::io::Errno::NOENT));
+    assert_eq!(walk("top.txt/x"), Err(rustix::io::Errno::NOTDIR));
+    // The same verdicts the kernel's own resolution gives where openat2 exists.
+    for rel in [
+        "a/b/file.txt",
+        "./a//b/./file.txt",
+        "a/b/",
+        ".",
+        "",
+        "/top.txt",
+        "a/b/../../top.txt",
+        "a/../../x",
+        "link_dir/b/file.txt",
+        "a/link_file",
+        "a/../top.txt",
+        "../top.txt",
+        "a/missing.txt",
+        "top.txt/x",
+    ] {
+        let kernel = rustix::fs::openat2(
+            &root_fd,
+            rel,
+            flags,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        )
+        .map(|_| ());
+        if kernel != Err(rustix::io::Errno::NOSYS) {
+            assert_eq!(walk(rel), kernel, "{rel}");
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}

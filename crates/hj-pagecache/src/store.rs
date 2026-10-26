@@ -490,6 +490,16 @@ fn body_ram_bytes(body: &PageBody) -> u64 {
     }
 }
 
+/// The version sequence of a file body, read from its file name: a purge needs only
+/// that, and reading it from the file meant an open, a read, an HMAC check and a full
+/// metadata parse per purged entry under its shard lock.
+fn file_body_version_seq(body: &PageBody) -> Option<u64> {
+    match body {
+        PageBody::File { path, .. } => crate::diskstore::page_file_seq(path),
+        PageBody::InMem(_) | PageBody::Derived { .. } => None,
+    }
+}
+
 fn file_body_disk_version(disk: Option<&DiskStore>, body: &PageBody) -> Option<(u64, u64)> {
     match body {
         PageBody::File { path, .. } => disk?
@@ -636,6 +646,8 @@ struct Node {
     variants: Vec<(String, Bytes)>,
     variants_filled: bool,
     dict_gen: u32,
+    /// [`crate::urlvary::path_filter_hash`] of the key, for rebuilding the path-presence filter.
+    path_hash: u64,
     /// Purge clock captured before the render/fetch that produced this node.
     /// A tag purge must not tear down a replacement whose render began at or
     /// after that purge's own epoch.
@@ -707,6 +719,7 @@ impl Node {
             variants: entry.variants,
             variants_filled: entry.variants_filled,
             dict_gen: entry.dict_gen,
+            path_hash: crate::urlvary::path_filter_hash(key.vhost_id, &key.path),
             render_epoch,
             stored_at: entry.stored_at,
             ttl: entry.ttl,
@@ -811,7 +824,9 @@ struct HotTier {
 }
 
 struct HotShard {
-    map: HashMap<u64, HotNode>,
+    /// FxHash: keys are process-local body ids, never client input, and a hit pays
+    /// several probes (the #273 reasoning for the main cache's shards).
+    map: HashMap<u64, HotNode, rustc_hash::FxBuildHasher>,
     head: u64,
     tail: u64,
     bytes: u64,
@@ -833,7 +848,7 @@ impl HotTier {
         let shards = (0..SHARDS)
             .map(|_| {
                 Mutex::new(HotShard {
-                    map: HashMap::new(),
+                    map: HashMap::default(),
                     head: HOT_NIL,
                     tail: HOT_NIL,
                     bytes: 0,
@@ -865,11 +880,9 @@ impl HotTier {
 
     fn get(&self, body_id: u64, now: Instant) -> Option<Bytes> {
         let mut s = self.shards[Self::shard_idx(body_id)].lock();
-        if !s.map.contains_key(&body_id) {
-            return None;
-        }
+        let body = s.map.get(&body_id)?.body.clone();
         s.touch(body_id, now);
-        s.map.get(&body_id).map(|n| n.body.clone())
+        Some(body)
     }
 
     fn insert(&self, body_id: u64, body: Bytes, now: Instant) {
@@ -1116,6 +1129,13 @@ pub struct StoreConfig {
     /// forwarded as the backend produces them and stored once the body completes. Elsewhere a
     /// miss is buffered whole before its first byte goes out. Empty = off.
     pub stream_fill_vhosts: Vec<String>,
+    /// Keep a filter of which (vhost, path) pairs may have a resident page entry
+    /// ([`PageStore::may_hold_path`]). Off: no filter is allocated and every path may.
+    pub path_presence: bool,
+    /// Canonical vhost names (lowercase) whose stored misses persist the zstd encode made for
+    /// egress (plain zstd, `PLAIN_GENERATION`) instead of the identity body plus a later
+    /// background dictionary re-encode. Empty = off.
+    pub egress_at_rest_vhosts: Vec<String>,
     /// Stale-while-revalidate window applied when the app declares none (0 ⇒ off).
     pub default_stale_secs: u32,
     /// Stale-if-error window applied when the app declares none (0 ⇒ off): how
@@ -1171,6 +1191,8 @@ impl Default for StoreConfig {
             private_cookies: Vec::new(),
             standard_cc_vhosts: Vec::new(),
             stream_fill_vhosts: Vec::new(),
+            path_presence: false,
+            egress_at_rest_vhosts: Vec::new(),
             default_stale_secs: 0,
             default_sie_secs: 0,
             max_stale_secs: 86_400,
@@ -1189,6 +1211,13 @@ impl StoreConfig {
     /// default cache policy, `CacheLookup` default-on). Case-insensitive.
     pub fn is_standards_vhost(&self, vhost_name: &str) -> bool {
         self.standard_cc_vhosts
+            .iter()
+            .any(|v| v.eq_ignore_ascii_case(vhost_name))
+    }
+
+    /// True if `vhost_name` stores misses in their egress encoding (see `egress_at_rest_vhosts`).
+    pub fn stores_egress_at_rest(&self, vhost_name: &str) -> bool {
+        self.egress_at_rest_vhosts
             .iter()
             .any(|v| v.eq_ignore_ascii_case(vhost_name))
     }
@@ -1616,6 +1645,9 @@ pub struct PageStore {
     /// and the under-lock install, to deterministically drive the boot-scan/purge race.
     #[cfg(test)]
     scan_insert_probe: Mutex<Option<Box<dyn FnOnce(&PageStore) + Send>>>,
+    /// Test hook run between a path-presence rebuild's walk and its install.
+    #[cfg(test)]
+    presence_walk_probe: Mutex<Option<Box<dyn FnOnce(&PageStore) + Send>>>,
     /// Test-only hook fired after the ordinary store's first purge check but
     /// before tag membership is published.
     #[cfg(test)]
@@ -1666,7 +1698,34 @@ pub struct PageStore {
     key_id_collisions: AtomicU64,
     /// Per-URL (`X-LiteSpeed-Vary: cookie=…`) vary specs, see [`crate::urlvary`].
     url_vary: crate::urlvary::UrlVarySpecs,
+    path_presence: Option<PathPresence>,
 }
+
+/// Which (vhost, path) pairs may have a resident page entry, answered without building a key.
+/// No false negatives: a path is marked before its entry installs, and a rebuild from the
+/// resident set cannot erase a mark whose entry is about to land. A store marks inside its
+/// `page_commit` section, a boot-scan load under `gate` shared, and the rebuild holds
+/// `page_commit` and then `gate` exclusively. Lock order: `page_commit`, `gate`, a shard.
+struct PathPresence {
+    bits: crate::urlvary::BitFilter,
+    gate: parking_lot::RwLock<()>,
+    /// `Some` while a rebuild walks the index without the commit locks: every mark made
+    /// meanwhile is logged here and folded into the rebuilt filter, so a path stored
+    /// mid-walk is never dropped.
+    rebuild_log: parking_lot::Mutex<Option<Vec<u64>>>,
+}
+
+impl PathPresence {
+    fn mark(&self, path_hash: u64) {
+        self.bits.set(path_hash);
+        if let Some(log) = self.rebuild_log.lock().as_mut() {
+            log.push(path_hash);
+        }
+    }
+}
+
+/// 2^22 bits (512 KiB): about 1.5% false positives at 64k resident paths, 4% at 160k.
+const PATH_PRESENCE_LOG2_BITS: u32 = 22;
 
 /// One cache line (64 B) of storage for an [`AtomicU64`], so hot per-request
 /// counters never share a line with each other.
@@ -1683,6 +1742,11 @@ impl std::ops::Deref for CachePaddedAtomic {
 impl PageStore {
     /// Build a store with the given limits.
     pub fn new(config: StoreConfig) -> Self {
+        let path_presence = config.path_presence.then(|| PathPresence {
+            bits: crate::urlvary::BitFilter::with_log2_bits(PATH_PRESENCE_LOG2_BITS),
+            gate: parking_lot::RwLock::new(()),
+            rebuild_log: parking_lot::Mutex::new(None),
+        });
         // A file tier that can't open degrades to in-RAM-only (the server must
         // come up either way); the error is loud because persistence is silently
         // off until an operator fixes the path.
@@ -1815,6 +1879,8 @@ impl PageStore {
             #[cfg(test)]
             scan_insert_probe: Mutex::new(None),
             #[cfg(test)]
+            presence_walk_probe: Mutex::new(None),
+            #[cfg(test)]
             store_commit_probe: Mutex::new(None),
             #[cfg(test)]
             store_publish_probe: Mutex::new(None),
@@ -1841,7 +1907,71 @@ impl PageStore {
             meta_decode_errors: AtomicU64::new(0),
             key_id_collisions: AtomicU64::new(0),
             url_vary: Default::default(),
+            path_presence,
         }
+    }
+
+    /// `false` only when no page entry for `path` under `vhost_id` can be resident (see
+    /// [`StoreConfig::path_presence`]); `true` when one may be, or when no filter is kept.
+    pub fn may_hold_path(&self, vhost_id: u32, path: &str) -> bool {
+        self.path_presence.as_ref().is_none_or(|p| {
+            p.bits
+                .test(crate::urlvary::path_filter_hash(vhost_id, path))
+        })
+    }
+
+    /// Fraction of the path-presence filter's bits set (its false-positive rate), if kept.
+    pub fn path_presence_fill_ratio(&self) -> Option<f64> {
+        self.path_presence.as_ref().map(|p| p.bits.fill_ratio())
+    }
+
+    /// Mark `path_hash` present for a store, whose caller holds `page_commit` through its install.
+    fn mark_stored_path(&self, path_hash: u64) {
+        if let Some(p) = &self.path_presence {
+            p.mark(path_hash);
+        }
+    }
+
+    /// Mark `path_hash` present for a boot-scan load and hold the gate until its install is done.
+    fn mark_scanned_path(&self, path_hash: u64) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        self.path_presence.as_ref().map(|p| {
+            let guard = p.gate.read();
+            p.mark(path_hash);
+            guard
+        })
+    }
+
+    /// Rebuild the path filter from the resident entries. The walk runs without
+    /// `page_commit`, which every miss store and purge takes: holding it across a walk of
+    /// the whole index stalled them every tick. Starting the log under both commit locks
+    /// orders it after every in-flight install (the walk sees those) and before every
+    /// later mark (the log keeps those).
+    fn rebuild_path_presence(&self) {
+        let Some(p) = &self.path_presence else {
+            return;
+        };
+        {
+            let _page_commit = self.page_commit.lock();
+            let _gate = p.gate.write();
+            *p.rebuild_log.lock() = Some(Vec::new());
+        }
+        let mut hashes = Vec::with_capacity(self.inner.entry_count() as usize);
+        self.inner.for_each(|_, v| {
+            if let CacheEntry::Page(n) = v {
+                hashes.push(n.path_hash);
+            }
+        });
+        #[cfg(test)]
+        {
+            if let Some(hook) = self.presence_walk_probe.lock().take() {
+                hook(self);
+            }
+        }
+        let words = p.bits.words_for(hashes.into_iter());
+        let _page_commit = self.page_commit.lock();
+        let _gate = p.gate.write();
+        let marked = p.rebuild_log.lock().take().unwrap_or_default();
+        p.bits.install(words, marked.into_iter());
     }
 
     /// True when a tmpfs file tier is active.
@@ -2554,7 +2684,7 @@ impl PageStore {
         let mut prepared = None;
         if let (Some(disk), PageBody::InMem(bytes)) = (self.disk.as_ref(), &entry.body) {
             let stored_unix_ms = wall_ms_of(entry.stored_at);
-            match disk.prepare_entry(&key, &entry, 0, bytes, stored_unix_ms) {
+            match disk.prepare_entry(&key, &entry, entry.dict_gen, bytes, stored_unix_ms) {
                 Ok(p) => prepared = Some((disk.clone(), p, bytes.len() as u32)),
                 Err(e) => {
                     self.disk_write_errors.fetch_add(1, Ordering::Relaxed);
@@ -2587,6 +2717,7 @@ impl PageStore {
         // store-vs-purge serialization window without a Drop-guard in every path.
         let commit_hold_start = std::time::Instant::now();
         let _page_commit = self.page_commit.lock();
+        self.mark_stored_path(node.path_hash);
 
         // (2) FAST PART, UNDER THE SHARD LOCK (via `with_shard`). Returns `true` on a committed
         // install; `false` (with the caller cleaning up `new_file`) on a veto/collision/bypass.
@@ -2663,7 +2794,6 @@ impl PageStore {
                             disk_total,
                             body_id,
                         };
-                        node.dict_gen = 0;
                         new_file = Some(path);
                         #[cfg(test)]
                         {
@@ -3223,6 +3353,7 @@ impl PageStore {
             }
         };
         let new_stored_at = node.stored_at;
+        let _presence = self.mark_scanned_path(node.path_hash);
         #[cfg(test)]
         {
             if let Some(hook) = self.scan_insert_probe.lock().take() {
@@ -3501,8 +3632,7 @@ impl PageStore {
             Some(node) if node.render_epoch >= purge_epoch => Action::KeepFresh,
             Some(node) => match node.with_decoded(|d| d.key.clone()) {
                 Ok(full_key) => Action::Remove(
-                    file_body_disk_version(self.disk.as_deref(), &node.body)
-                        .map(|(_, version_seq)| (full_key, version_seq)),
+                    file_body_version_seq(&node.body).map(|version_seq| (full_key, version_seq)),
                 ),
                 Err(_) => {
                     self.meta_decode_errors.fetch_add(1, Ordering::Relaxed);
@@ -3539,10 +3669,7 @@ impl PageStore {
                 let live_version = self.inner.with_shard(&CacheKeyId::new(&key), |acc| {
                     acc.get(&CacheKeyId::new(&key))
                         .and_then(CacheEntry::as_page)
-                        .and_then(|node| {
-                            file_body_disk_version(self.disk.as_deref(), &node.body)
-                                .map(|(_, seq)| seq)
-                        })
+                        .and_then(|node| file_body_version_seq(&node.body))
                 });
                 disk.remove_key_versions_through_except(&key, max_version_seq, live_version);
             }
@@ -3667,6 +3794,11 @@ impl PageStore {
         // LSCache entries, so an app/page purge must not flush them. The drain unlinks every
         // current file synchronously.
         self.inner.purge_if(|_, e| matches!(e, CacheEntry::Page(_)));
+        // No page entry is resident now, so no path may be held.
+        if let Some(p) = &self.path_presence {
+            let _gate = p.gate.write();
+            p.bits.clear();
+        }
         self.purges.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3801,7 +3933,34 @@ impl PageStore {
         fresh_id: &FileId,
         _now: Instant,
     ) -> Option<StaticNode> {
-        let path_str = path.display().to_string();
+        self.with_fresh_static(vhost_id, path, fresh_id, StaticNode::clone)
+    }
+
+    /// The body of the fresh static entry for `path` ([`Self::get_static`] then
+    /// [`Self::static_body_bytes`]) without cloning the rest of the entry.
+    pub fn get_static_body(
+        &self,
+        vhost_id: u32,
+        path: &std::path::Path,
+        fresh_id: &FileId,
+    ) -> Option<Bytes> {
+        let body = self.with_fresh_static(vhost_id, path, fresh_id, |entry| entry.body.clone())?;
+        self.body_bytes_inner(&body, true, None)
+    }
+
+    /// `read` of the static entry for `path` if it is still `fresh_id`; a stale entry is torn down.
+    fn with_fresh_static<R>(
+        &self,
+        vhost_id: u32,
+        path: &std::path::Path,
+        fresh_id: &FileId,
+        read: impl FnOnce(&StaticNode) -> R,
+    ) -> Option<R> {
+        // A UTF-8 path keys by its text as `display()` would render it, without the String.
+        let path_str = path.to_str().map_or_else(
+            || std::borrow::Cow::Owned(path.display().to_string()),
+            std::borrow::Cow::Borrowed,
+        );
         let key = CacheKeyId::for_static(vhost_id, &path_str);
 
         self.inner.with_shard(&key, |acc| {
@@ -3819,12 +3978,13 @@ impl PageStore {
                 acc.teardown(&key, EvictCause::Explicit);
                 return None;
             }
-            let cloned = entry.clone();
+            let on_disk = matches!(entry.body, PageBody::File { .. });
+            let out = read(entry);
             acc.touch_ram(&key);
-            if matches!(cloned.body, PageBody::File { .. }) {
+            if on_disk {
                 acc.touch_disk(&key);
             }
-            Some(cloned)
+            Some(out)
         })
     }
 
@@ -3929,6 +4089,7 @@ impl PageStore {
     /// caller's stable signature but ignored (there are no orphans to reconcile).
     pub fn maintenance(&self, _orphan_grace: Duration) {
         self.sweep_expired();
+        self.rebuild_path_presence();
         self.url_vary.prune(
             |hash| self.page_resident(hash),
             |hash| self.invalidate_page_hash(hash),
@@ -5210,6 +5371,138 @@ mod tests {
             1,
             "the boot scan restored the one persisted entry"
         );
+    }
+
+    #[test]
+    fn path_presence_tracks_resident_entries() {
+        let mut c = cfg();
+        c.path_presence = true;
+        let s = PageStore::new(c);
+        let k = PageCacheKey::public(7, true, "forum.example", "/threads/a.1/", "");
+        assert!(!s.may_hold_path(7, "/threads/a.1/"));
+        assert!(s.store(k.clone(), entry(b"page", &[], Duration::from_secs(60))));
+        assert!(s.may_hold_path(7, "/threads/a.1/"));
+        assert!(!s.may_hold_path(8, "/threads/a.1/"), "another vhost");
+        assert!(!s.may_hold_path(7, "/threads/b.2/"), "another path");
+        // A query-string variant of the same path shares the path's bit.
+        let kq = PageCacheKey::public(7, true, "forum.example", "/threads/a.1/", "page=2");
+        assert!(s.store(kq, entry(b"page 2", &[], Duration::from_secs(60))));
+
+        // Teardown leaves the bit set until a rebuild (a stale positive only costs the prefix).
+        s.invalidate_key(&k);
+        assert!(s.may_hold_path(7, "/threads/a.1/"));
+        s.maintenance(Duration::ZERO);
+        assert!(
+            s.may_hold_path(7, "/threads/a.1/"),
+            "the query variant is still resident"
+        );
+        s.purge_all();
+        assert!(
+            !s.may_hold_path(7, "/threads/a.1/"),
+            "a purge-all clears the filter"
+        );
+        assert!(s.path_presence_fill_ratio().is_some_and(|r| r == 0.0));
+    }
+
+    /// A rebuild walks the index without the commit lock, so a store can land mid-walk;
+    /// the path it marked survives the rebuild.
+    #[test]
+    fn a_store_during_a_path_presence_rebuild_keeps_its_path() {
+        let mut c = cfg();
+        c.path_presence = true;
+        let s = PageStore::new(c);
+        let old = PageCacheKey::public(7, true, "forum.example", "/old/", "");
+        assert!(s.store(old, entry(b"old", &[], Duration::from_secs(60))));
+        *s.presence_walk_probe.lock() = Some(Box::new(|s: &PageStore| {
+            let mid = PageCacheKey::public(7, true, "forum.example", "/mid-walk/", "");
+            assert!(s.store(mid, entry(b"mid", &[], Duration::from_secs(60))));
+        }));
+        s.maintenance(Duration::ZERO);
+        assert!(
+            s.presence_walk_probe.lock().is_none(),
+            "the walk ran the probe"
+        );
+        assert!(s.may_hold_path(7, "/old/"));
+        assert!(
+            s.may_hold_path(7, "/mid-walk/"),
+            "a path stored during the walk was dropped by the rebuild"
+        );
+        assert!(
+            s.path_presence
+                .as_ref()
+                .unwrap()
+                .rebuild_log
+                .lock()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn without_path_presence_every_path_may_be_held() {
+        let s = PageStore::new(cfg());
+        assert!(s.may_hold_path(7, "/never/stored/"));
+        assert!(s.path_presence_fill_ratio().is_none());
+    }
+
+    #[test]
+    fn a_boot_scan_marks_restored_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let k = PageCacheKey::public(7, true, "forum.example", "/restored/", "");
+        {
+            let s = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+            s.load_from_disk(|_| {});
+            assert!(s.store(
+                k.clone(),
+                entry(b"persisted", &[], Duration::from_secs(3600))
+            ));
+        }
+        let mut c = disk_cfg(dir.path(), 64 * 1024 * 1024);
+        c.path_presence = true;
+        let s = PageStore::new(c);
+        assert!(!s.may_hold_path(7, "/restored/"));
+        s.load_from_disk(|_| {});
+        assert_eq!(s.scan_loaded(), 1);
+        assert!(s.may_hold_path(7, "/restored/"));
+        s.maintenance(Duration::ZERO);
+        assert!(
+            s.may_hold_path(7, "/restored/"),
+            "a rebuild keeps resident paths"
+        );
+    }
+
+    #[test]
+    fn a_body_stored_compressed_keeps_its_generation_on_disk_and_across_a_boot_scan() {
+        const GEN: u32 = u32::MAX;
+        let dir = tempfile::tempdir().unwrap();
+        let k = PageCacheKey::public(1, true, "forum.example", "/egress/", "");
+        {
+            let s = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+            s.load_from_disk(|_| {});
+            let mut e = entry(b"zstd-at-rest", &[], Duration::from_secs(3600));
+            e.dict_gen = GEN;
+            assert!(s.store(k.clone(), e));
+            let got = s.lookup(&k, "id", Instant::now()).expect("stored");
+            assert!(
+                matches!(got.body, PageBody::File { .. }),
+                "offloaded at birth"
+            );
+            assert_eq!(got.dict_gen, GEN, "the generation survives the publish");
+        }
+        let mut c = disk_cfg(dir.path(), 64 * 1024 * 1024);
+        c.expected_dict_gens = HashSet::from([GEN]);
+        let s = PageStore::new(c);
+        s.load_from_disk(|_| {});
+        let got = s.lookup(&k, "id", Instant::now()).expect("restored");
+        assert_eq!(got.dict_gen, GEN);
+        assert_eq!(&s.body_bytes(&got).unwrap()[..], b"zstd-at-rest");
+        drop(s);
+
+        // A binary that does not decode the generation drops the entry at boot.
+        let mut c = disk_cfg(dir.path(), 64 * 1024 * 1024);
+        c.expected_dict_gens = HashSet::new();
+        let s = PageStore::new(c);
+        s.load_from_disk(|_| {});
+        assert!(s.lookup(&k, "id", Instant::now()).is_none());
     }
 
     #[test]

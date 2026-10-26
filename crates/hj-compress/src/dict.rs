@@ -48,6 +48,10 @@ const DICT_HASH_LOG: u32 = 18;
 /// encode runs on tokio's blocking pool, whose threads come and go.
 const ENCODE_POOL_CAP: usize = 2;
 
+/// Generation id of the dictionary-less codec ([`PageDict::plain`]): a stored body carrying it is
+/// standard zstd, decodable without any dictionary. Real dictionaries never take this id.
+pub const PLAIN_GENERATION: u32 = u32::MAX;
+
 /// A prepared shared dictionary for page-cache internal storage. Holds the raw dictionary bytes, a
 /// non-zero **generation id** (so a cached body can be tied to the exact dictionary that decodes
 /// it — a different dictionary ⇒ the entry is undecodable and must degrade to a miss), a small
@@ -58,7 +62,8 @@ pub struct PageDict {
     generation: u32,
     level: i32,
     encoders: Mutex<Vec<Compressor<'static>>>,
-    dec: DecoderDictionary<'static>,
+    /// `None` for [`PageDict::plain`].
+    dec: Option<DecoderDictionary<'static>>,
 }
 
 impl PageDict {
@@ -70,7 +75,10 @@ impl PageDict {
         }
         // generation: FNV-1a 32 of the dict bytes, forced non-zero (0 == "not dict-compressed"
         // sentinel on a cached entry).
-        let generation = fnv1a32(&dict).max(1);
+        let generation = match fnv1a32(&dict).max(1) {
+            PLAIN_GENERATION => PLAIN_GENERATION - 1,
+            g => g,
+        };
         // `copy` (vs `new`) owns the dictionary bytes → `'static`, so the prepared dictionary
         // can live in an `Arc<PageDict>` on `ServerState` without borrowing `raw`.
         let dec = DecoderDictionary::copy(&dict);
@@ -79,16 +87,31 @@ impl PageDict {
             generation,
             level,
             encoders: Mutex::new(Vec::with_capacity(ENCODE_POOL_CAP)),
-            dec,
+            dec: Some(dec),
         })
+    }
+
+    /// The dictionary-less codec under [`PLAIN_GENERATION`]: plain zstd at `level`. It lets a body
+    /// stored in the form it was already encoded for egress decode through the same
+    /// generation-keyed paths as a dictionary-compressed one.
+    pub fn plain(level: i32) -> Self {
+        PageDict {
+            raw: Vec::new(),
+            generation: PLAIN_GENERATION,
+            level,
+            encoders: Mutex::new(Vec::with_capacity(ENCODE_POOL_CAP)),
+            dec: None,
+        }
     }
 
     /// A context with the dictionary loaded under [`DICT_HASH_LOG`]. Parameters are set before
     /// the load so zstd builds the context's local dictionary tables at that size.
     fn new_encoder(&self) -> Option<Compressor<'static>> {
         let mut c = Compressor::new(self.level).ok()?;
-        c.set_parameter(CParameter::HashLog(DICT_HASH_LOG)).ok()?;
-        c.set_dictionary(self.level, &self.raw).ok()?;
+        if self.dec.is_some() {
+            c.set_parameter(CParameter::HashLog(DICT_HASH_LOG)).ok()?;
+            c.set_dictionary(self.level, &self.raw).ok()?;
+        }
         Some(c)
     }
 
@@ -147,8 +170,11 @@ impl PageDict {
                     Some(dctx) => dctx,
                     None => slot.insert(DCtx::try_create()?),
                 };
-                dctx.decompress_using_ddict(&mut out, input, self.dec.as_ddict())
-                    .ok()
+                match &self.dec {
+                    Some(dec) => dctx.decompress_using_ddict(&mut out, input, dec.as_ddict()),
+                    None => dctx.decompress(&mut out, input),
+                }
+                .ok()
             })
             .ok()
             .flatten()?;
@@ -217,6 +243,15 @@ impl PageDictRegistry {
             fallback,
             by_generation,
         }
+    }
+
+    /// Also decode bodies stored under [`PLAIN_GENERATION`] (plain zstd, see [`PageDict::plain`]).
+    /// Registered even where nothing stores that form, so entries written while it was enabled
+    /// keep decoding after it is turned off.
+    pub fn with_plain(mut self, level: i32) -> Self {
+        self.by_generation
+            .insert(PLAIN_GENERATION, Arc::new(PageDict::plain(level)));
+        self
     }
 
     /// An empty registry (no dicts configured at all) — dict compression is inert.
@@ -436,6 +471,45 @@ mod tests {
             body_a.len(),
             "sized from the frame header"
         );
+    }
+
+    #[test]
+    fn plain_codec_decodes_standard_zstd_between_dictionary_decodes() {
+        let a = dict();
+        let plain = PageDict::plain(3);
+        assert_eq!(plain.generation(), PLAIN_GENERATION);
+        let body = [CHROME, b"thread a"].concat();
+        let comp_a = a.encode(&body).expect("encode a");
+        let standard = zstd::bulk::compress(&body, 3).expect("plain zstd");
+        for _ in 0..3 {
+            assert_eq!(a.decode(&comp_a, 1 << 20).as_deref(), Some(body.as_slice()));
+            assert_eq!(
+                plain.decode(&standard, 1 << 20).as_deref(),
+                Some(body.as_slice())
+            );
+            assert!(
+                plain.decode(&comp_a, 1 << 20).is_none(),
+                "needs the dictionary"
+            );
+        }
+        assert!(plain.decode(&standard, body.len() - 1).is_none(), "bounded");
+        let own = plain.encode(&body).expect("plain encode");
+        assert_eq!(zstd::decode_all(&own[..]).unwrap(), body);
+    }
+
+    #[test]
+    fn registry_decodes_the_plain_generation_only_when_registered() {
+        let reg = PageDictRegistry::new(HashMap::new(), Some(Arc::new(dict())));
+        assert!(reg.by_generation(PLAIN_GENERATION).is_none());
+        let reg = reg.with_plain(3);
+        assert!(reg.by_generation(PLAIN_GENERATION).is_some());
+        assert!(reg.all_generations().contains(&PLAIN_GENERATION));
+        assert!(
+            reg.for_vhost("any.example").map(|d| d.generation()) != Some(PLAIN_GENERATION),
+            "new bodies still compress against the real dictionary"
+        );
+        assert!(!reg.is_empty());
+        assert!(PageDictRegistry::empty().with_plain(3).is_empty());
     }
 
     fn other_dict() -> PageDict {

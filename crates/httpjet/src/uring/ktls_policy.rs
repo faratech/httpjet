@@ -248,7 +248,8 @@ fn ethtool_ioctl(interface: &str, data: *mut libc::c_void) -> io::Result<()> {
             *slot = byte as libc::c_char;
         }
         request.ifr_ifru.ifru_data = data.cast();
-        let result = libc::ioctl(fd, SIOCETHTOOL, &mut request);
+        // glibc and musl expose different ioctl request argument types.
+        let result = libc::ioctl(fd, SIOCETHTOOL as _, &mut request);
         let error = io::Error::last_os_error();
         libc::close(fd);
         if result < 0 { Err(error) } else { Ok(()) }

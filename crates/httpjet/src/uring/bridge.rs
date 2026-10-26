@@ -1384,10 +1384,11 @@ async fn run_file_blocking<T: Send + 'static>(
 /// takes the process down — the same class as the h2 `file_stream_body` crash loop
 /// (2026-07-12). Positional `read_at` also leaves a pinned descriptor's cursor untouched.
 ///
-/// ONE bounded blocking op per `FILE_CHUNK`, with an await between: on the inline
-/// no-runtime fallback each op runs on the event-loop thread itself, so the per-op
-/// bound — not the file size — is what caps the stall (and lets the loop interleave
-/// with the other connections multiplexed on that core).
+/// On the inline no-runtime fallback each op runs on the event-loop thread itself, so
+/// reads go ONE bounded op per `FILE_CHUNK` with an await between: the per-op bound —
+/// not the file size — caps the stall (and lets the loop interleave with the other
+/// connections multiplexed on that core). On the blocking pool one op reads the range:
+/// each extra op was only another pool round trip.
 async fn read_uncached_file_body(f: hj_core::FileBody) -> (Bytes, bool) {
     use std::sync::Arc;
     let (start, len) = match f.range {
@@ -1415,9 +1416,14 @@ async fn read_uncached_file_body(f: hj_core::FileBody) -> (Bytes, bool) {
             }
         }
     };
+    let op_bytes = if crate::lscache::pipeline_handle().is_some() {
+        u64::MAX
+    } else {
+        FILE_CHUNK as u64
+    };
     let mut out: Vec<u8> = Vec::with_capacity(len.min(FILE_CHUNK as u64) as usize);
     while (out.len() as u64) < len {
-        let want = (len - out.len() as u64).min(FILE_CHUNK as u64) as usize;
+        let want = (len - out.len() as u64).min(op_bytes) as usize;
         let off = start + out.len() as u64;
         let reader = Arc::clone(&file);
         // The accumulator shuttles through the op and back (no per-chunk copy).

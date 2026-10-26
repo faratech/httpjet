@@ -111,7 +111,23 @@ pub(super) fn needs_bridged_decompression(
     req: &hj_core::Request,
     policy: RequestDecompression,
 ) -> bool {
-    enabled_content_coding(req.headers(), policy).is_some()
+    req.extensions().get::<DecodeTried>().is_none()
+        && enabled_content_coding(req.headers(), policy).is_some()
+}
+
+/// Marks an H1 request whose body [`finish_body`] already tried to decode. A body it
+/// leaves encoded (malformed, or over the codec cap) keeps its Content-Encoding, and
+/// the bridge would otherwise run the same full decode again to the same verdict.
+#[derive(Clone, Copy)]
+pub(super) struct DecodeTried;
+
+/// Whether [`finish_body`] will try to decode `data`.
+pub(super) fn finish_body_decodes(
+    headers: &HeaderMap,
+    data: &[u8],
+    policy: RequestDecompression,
+) -> bool {
+    !data.is_empty() && enabled_content_coding(headers, policy).is_some()
 }
 
 /// Decoded output may always grow to this size, whatever the compression ratio,
@@ -420,6 +436,22 @@ fn decode_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An H1 body finish_body already tried (and left encoded) is not decoded again
+    /// on the bridge.
+    #[test]
+    fn a_tried_h1_body_is_not_decoded_again() {
+        let policy = RequestDecompression::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert!(finish_body_decodes(&headers, b"x", policy));
+        assert!(!finish_body_decodes(&headers, b"", policy));
+        let mut req = http::Request::new(hj_core::empty_incoming());
+        *req.headers_mut() = headers;
+        assert!(needs_bridged_decompression(&req, policy));
+        req.extensions_mut().insert(DecodeTried);
+        assert!(!needs_bridged_decompression(&req, policy));
+    }
 
     fn encode(coding: ContentCoding, input: &[u8]) -> Vec<u8> {
         let encoding = match coding {

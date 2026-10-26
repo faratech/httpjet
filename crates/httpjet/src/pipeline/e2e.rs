@@ -1756,6 +1756,7 @@ async fn head_miss_does_not_lead_page_cache_single_flight() {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
         cache_policy: None,
@@ -1854,6 +1855,7 @@ async fn cookied_post_skips_cache_key_inputs_but_still_purges() {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
         cache_policy: None,
@@ -2389,6 +2391,7 @@ async fn static_context_resolved_location_in_access_deny_dir_is_forbidden() {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
     };
@@ -2439,6 +2442,7 @@ async fn static_context_alternate_root_never_serves_or_replays_script_source() {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
     };
@@ -2580,6 +2584,7 @@ async fn static_context_default_charset_applies_without_other_overrides() {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: Some(true),
         charset: Some("ISO-8859-1".into()),
         cache_policy: None,
@@ -2612,6 +2617,7 @@ fn static_ctx(
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset,
         charset: charset.map(str::to_owned),
         cache_policy: None,
@@ -2774,6 +2780,7 @@ async fn context_bandwidth_limit_stamps_per_conn_rate_extension() {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
         cache_policy: None,
@@ -3019,6 +3026,121 @@ async fn cookied_request_for_a_missing_path_bridges_before_the_prefix() {
     assert_eq!(reasons["cookied_no_target"], 2);
     // `/missing.css` (cookied) and the cookieless route both left via the rewrite.
     assert_eq!(reasons["rewritten"], 2);
+    std::fs::remove_dir_all(doc_root).unwrap();
+}
+
+/// (--fast-early-bridge) A cookieless front-controller URL the page cache holds nothing for
+/// bridges before the prefix; the same URL with an entry resident, an extension-bearing path,
+/// and a real file all keep the on-core path. Off is exactly today's behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cookieless_route_the_cache_cannot_hold_bridges_before_the_prefix() {
+    let doc_root = temp_root("fastserve-early");
+    std::fs::write(doc_root.join("real.txt"), b"real").unwrap();
+    std::fs::write(doc_root.join("index.php"), b"<?php").unwrap();
+    std::fs::write(
+        doc_root.join(".htaccess"),
+        "RewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteRule ^ index.php [L]\n",
+    )
+    .unwrap();
+    let mut config = hj_pagecache::StoreConfig::default();
+    config.path_presence = true;
+    config.standard_cc_vhosts = vec![VHOST.to_string()];
+    let store = Arc::new(hj_pagecache::PageStore::new(config));
+    let state = build_state_inner(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        Some(store.clone()),
+        None,
+        |_| {},
+    );
+    let rewrites = |state: &ServerState| {
+        let m = &state.metrics;
+        m.rewrite_outcome_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+            + m.rewrite_outcome_misses
+                .load(std::sync::atomic::Ordering::Relaxed)
+            + m.rewrite_outcome_uncacheable
+                .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let reasons = |state: &ServerState| -> std::collections::HashMap<&'static str, u64> {
+        state.metrics.fast_bridge.snapshot().collect()
+    };
+
+    // Off: the route runs the prefix and bridges as a rewrite.
+    let before = rewrites(&state);
+    assert!(fast_serve_get(&state, "/threads/a.1/").await.is_none());
+    assert!(rewrites(&state) > before, "off runs the prefix");
+    assert_eq!(reasons(&state)["early_cache_absent"], 0);
+
+    // Shadow: same path, the decision is only counted.
+    state
+        .early_bridge
+        .set_mode(crate::pipeline::early_bridge::Mode::Shadow);
+    let before = rewrites(&state);
+    assert!(fast_serve_get(&state, "/threads/a.2/").await.is_none());
+    assert!(rewrites(&state) > before, "shadow still runs the prefix");
+    assert_eq!(state.early_bridge.predicted_snapshot()[1].1, 1);
+    assert_eq!(reasons(&state)["early_cache_absent"], 0);
+
+    // On: nothing on-core can serve it, so it bridges without running the prefix.
+    state
+        .early_bridge
+        .set_mode(crate::pipeline::early_bridge::Mode::On);
+    let before = rewrites(&state);
+    assert!(fast_serve_get(&state, "/threads/a.3/").await.is_none());
+    assert_eq!(rewrites(&state), before, "the prefix never ran");
+    assert_eq!(reasons(&state)["early_cache_absent"], 1);
+
+    // An entry that may be resident for the path keeps the prefix (it may be an on-core hit).
+    let key = hj_pagecache::PageCacheKey::public(
+        crate::lscache::vhost_id_hash(VHOST),
+        false,
+        CANON_HOST,
+        "/threads/a.4/",
+        "",
+    );
+    assert!(store.store(
+        key,
+        hj_pagecache::CachedResponse {
+            status: 200,
+            identity: "unrelated".into(),
+            headers: Vec::new(),
+            body: hj_pagecache::PageBody::InMem(bytes::Bytes::from_static(b"x")),
+            variants: Vec::new(),
+            variants_filled: true,
+            dict_gen: 0,
+            tags: Vec::new(),
+            vary_cookie_name: String::new(),
+            vary_value: String::new(),
+            scope: hj_pagecache::PageScope::Public,
+            stored_at: std::time::Instant::now(),
+            ttl: std::time::Duration::from_secs(60),
+            swr: std::time::Duration::ZERO,
+            sie: std::time::Duration::ZERO,
+        }
+    ));
+    let before = rewrites(&state);
+    assert!(fast_serve_get(&state, "/threads/a.4/").await.is_none());
+    assert!(
+        rewrites(&state) > before,
+        "a possibly cached path runs the prefix"
+    );
+    assert_eq!(reasons(&state)["early_cache_absent"], 1);
+
+    // Paths the static branch could serve are never pre-judged.
+    assert!(
+        fast_serve_get(&state, "/real.txt").await.is_some(),
+        "file serves on-core"
+    );
+    let before = rewrites(&state);
+    assert!(fast_serve_get(&state, "/missing.css").await.is_none());
+    assert!(
+        rewrites(&state) > before,
+        "an extension-bearing path runs the prefix"
+    );
+    assert_eq!(reasons(&state)["early_cache_absent"], 1);
     std::fs::remove_dir_all(doc_root).unwrap();
 }
 
@@ -4458,6 +4580,7 @@ fn sub_filter_context(uri: &str, rules: &[(&str, &str)], once: bool) -> Context 
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
         cache_policy: None,
@@ -5070,6 +5193,7 @@ fn body_limit_context(uri: &str, max_body: u64) -> Context {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
         cache_policy: None,
@@ -5300,6 +5424,7 @@ fn raw_echo_proxy_state(tag: &str, address: SocketAddr) -> Arc<ServerState> {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
         cache_policy: None,
@@ -5399,6 +5524,7 @@ fn plain_context(kind: ContextKind, uri: &str) -> Context {
         enabled: true,
         allow_browse: true,
         extra_headers: Vec::new(),
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
         cache_policy: None,
@@ -6121,6 +6247,33 @@ async fn forbidden_error_page_executes_purge_and_strips_control_headers() {
     let resp = run(&uncached, get(CANON_HOST, "/blocked", None)).await;
     assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
     assert_no_control_headers(&resp, "[F] 403 without page cache");
+    std::fs::remove_dir_all(root).ok();
+}
+
+/// `[F]`/`[G]` keep the `[E=]` env set up to them, from their own rule and from
+/// earlier rulesets: the error response's `Header always ... env=` sees it (OLS
+/// expands env before the action).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forbidden_and_gone_keep_their_rewrite_env_for_header_ops() {
+    let root = temp_root("forbidden-env-headers");
+    std::fs::write(
+        root.join(".htaccess"),
+        "RewriteEngine On
+         RewriteRule ^blocked$ - [F,E=BLOCKED:1]
+         RewriteRule ^old$ - [G,E=RETIRED:1]
+         Header always set X-Blocked yes env=BLOCKED
+         Header always set X-Retired yes env=RETIRED
+",
+    )
+    .unwrap();
+    let state = build_state_htaccess(root.clone());
+    let resp = run(&state, get(CANON_HOST, "/blocked", None)).await;
+    assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+    assert_eq!(resp.headers().get("x-blocked").unwrap(), "yes");
+    let resp = run(&state, get(CANON_HOST, "/old", None)).await;
+    assert_eq!(resp.status(), http::StatusCode::GONE);
+    assert_eq!(resp.headers().get("x-retired").unwrap(), "yes");
+    assert!(resp.headers().get("x-blocked").is_none());
     std::fs::remove_dir_all(root).ok();
 }
 

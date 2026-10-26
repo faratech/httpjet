@@ -314,16 +314,25 @@ pub(super) fn context_kind(s: &Option<String>) -> ContextKind {
     }
 }
 
-/// Parse newline-delimited `extraHeaders` text into (name, value) pairs.
-pub(super) fn parse_extra_headers(s: &str) -> Vec<(String, String)> {
+/// Parse newline-delimited `extraHeaders` text into (name, value) pairs. Only the
+/// `Name: value` form is applied; a line in LiteSpeed's header-operation syntax
+/// (`set Cache-Control no-store`, `Header always set ...`, `unset X`) is refused rather
+/// than silently dropped, which would leave a configured security header unset.
+pub(super) fn parse_extra_headers(s: &str) -> Result<Vec<(String, String)>, String> {
     s.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let unsupported = || {
+                format!("{line:?}: only `Name: value` lines are supported, not header operations")
+            };
+            let (k, v) = line.split_once(':').ok_or_else(unsupported)?;
+            let k = k.trim();
+            let token = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
+            if k.is_empty() || !k.bytes().all(token) {
+                return Err(unsupported());
             }
-            let (k, v) = line.split_once(':')?;
-            Some((k.trim().to_string(), v.trim().to_string()))
+            Ok((k.to_string(), v.trim().to_string()))
         })
         .collect()
 }

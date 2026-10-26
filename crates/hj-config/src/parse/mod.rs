@@ -488,6 +488,23 @@ fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx, path: &Path) -> Resu
         .as_ref()
         .map(|f| follow_symlink_value(&f.follow_symbol_link))
         .unwrap_or(false);
+    // OLS enforces it (getLongValue 0..1, default 0); serving another user's files
+    // without that check must not happen silently.
+    if let Some(strict) = r
+        .file_access_control
+        .as_ref()
+        .map(|f| &f.force_strict_ownership)
+        .filter(|strict| ols_long_value(strict, 0, 1, 0) != 0)
+    {
+        return Err(ConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            directive: "forceStrictOwnership",
+            value: strict.clone().unwrap_or_default(),
+            reason:
+                "file ownership checks are not enforced by httpjet; refusing to serve without them"
+                    .into(),
+        });
+    }
     let cgi_cpu_limit_secs = r.cgi_rlimit.and_then(|rl| {
         let pair = RlimitPair {
             soft: rl.cpu_soft_limit.as_deref().and_then(parse_pos_u64),
@@ -701,7 +718,14 @@ fn convert_php_handlers(
             Some(_) => {}
         }
         if let Some(list) = h.suffixes.as_deref() {
-            listed.get_or_insert_with(Vec::new).extend(split_list(list));
+            // OLS skips leading dots (HttpMime::addUpdateSuffixMimeMap): a hand-written
+            // `.php` must route PHP, not leave every script to the static handler.
+            listed.get_or_insert_with(Vec::new).extend(
+                split_list(list)
+                    .into_iter()
+                    .map(|suffix| suffix.trim_start_matches('.').to_string())
+                    .filter(|suffix| !suffix.is_empty()),
+            );
         }
         ids.push(id);
     }
@@ -2144,6 +2168,147 @@ mod read_limit_tests {
         let cfg = parse_server_text(Path::new("/srv/ls"), Path::new("<test>"), wrapped).unwrap();
         assert_eq!(cfg.security.access_deny_dir, vec!["/a/*".to_string()]);
         assert!(!cfg.security.follow_symlink, "<security> wins");
+    }
+
+    // ----- bug bash 2026-10-25: directives that were silently unenforced -----
+
+    #[test]
+    fn extra_headers_accept_only_name_value_lines() {
+        let ok = parse_vhost_config(
+            &one_context(
+                "static",
+                "<location>/srv/app/</location><extraHeaders>Vary: Accept\nCache-Control: public, max-age=300\n\n</extraHeaders>",
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(ok.contexts[0].extra_headers.len(), 2);
+        for ops in [
+            "set Cache-Control no-store",
+            "Header always set X-Frame-Options DENY",
+            "unset X-Powered-By",
+            "Header set Content-Security-Policy \"default-src https://x\"",
+        ] {
+            let text = one_context(
+                "static",
+                &format!("<location>/srv/app/</location><extraHeaders>{ops}</extraHeaders>"),
+            );
+            let err = parse_vhost_config(&text, &Default::default()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::InvalidValue {
+                        directive: "extraHeaders",
+                        ..
+                    }
+                ),
+                "{ops}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_context_extra_headers_are_refused_unless_empty() {
+        let empty = one_context(
+            "proxy",
+            "<handler>app</handler><extraHeaders>\n\n</extraHeaders>",
+        );
+        assert!(parse_vhost_config(&empty, &Default::default()).is_ok());
+        let set = one_context(
+            "proxy",
+            "<handler>app</handler><extraHeaders>X-Frame-Options: DENY</extraHeaders>",
+        );
+        assert!(matches!(
+            parse_vhost_config(&set, &Default::default()).unwrap_err(),
+            ConfigError::InvalidValue {
+                directive: "extraHeaders",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn enabled_hotlink_control_and_strict_ownership_are_refused() {
+        let vh = |v: &str| {
+            vhost_with(&format!(
+                "<security><hotlinkCtrl><enableHotlinkCtrl>{v}</enableHotlinkCtrl><suffixes>jpg</suffixes></hotlinkCtrl></security>"
+            ))
+        };
+        // OLS getLongValue(0..1, default 0): out of range reads as off.
+        for v in ["0", "", "2", "-1"] {
+            assert!(
+                parse_vhost_config(&vh(v), &Default::default()).is_ok(),
+                "{v:?}"
+            );
+        }
+        let bare = vhost_with("<security><hotlinkCtrl></hotlinkCtrl></security>");
+        assert!(parse_vhost_config(&bare, &Default::default()).is_ok());
+        assert!(matches!(
+            parse_vhost_config(&vh("1"), &Default::default()).unwrap_err(),
+            ConfigError::InvalidValue {
+                directive: "enableHotlinkCtrl",
+                ..
+            }
+        ));
+        let server = |v: &str| {
+            format!(
+                "<httpServerConfig><fileAccessControl><forceStrictOwnership>{v}</forceStrictOwnership></fileAccessControl></httpServerConfig>"
+            )
+        };
+        let parse =
+            |text: String| parse_server_text(Path::new("/srv/ls"), Path::new("<test>"), &text);
+        assert!(parse(server("0")).is_ok());
+        assert!(parse(server("2")).is_ok());
+        assert!(matches!(
+            parse(server("1")).unwrap_err(),
+            ConfigError::InvalidValue {
+                directive: "forceStrictOwnership",
+                ..
+            }
+        ));
+        let declared = "<httpServerConfig><virtualHostList><virtualHost><name>a</name>\
+            <vhRoot>/srv/a</vhRoot><configFile>/srv/a/vhconf.xml</configFile>\
+            <forceStrictOwnership>1</forceStrictOwnership></virtualHost></virtualHostList>\
+            </httpServerConfig>";
+        assert!(matches!(
+            parse(declared.to_string()).unwrap_err(),
+            ConfigError::InvalidValue {
+                directive: "virtualHost.forceStrictOwnership",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn extra_headers_none_means_none_and_stops_inheritance() {
+        for none in ["NONE", "none", " None \n"] {
+            let text = one_context(
+                "static",
+                &format!("<location>/srv/app/</location><extraHeaders>{none}</extraHeaders>"),
+            );
+            let cfg = parse_vhost_config(&text, &Default::default())
+                .unwrap_or_else(|e| panic!("{none:?}: {e}"));
+            assert!(cfg.contexts[0].extra_headers.is_empty());
+            assert!(!cfg.contexts[0].inherit_extra_headers);
+        }
+        let text = one_context(
+            "static",
+            "<location>/srv/app/</location><extraHeaders>X-A: 1</extraHeaders>",
+        );
+        let cfg = parse_vhost_config(&text, &Default::default()).unwrap();
+        assert!(cfg.contexts[0].inherit_extra_headers);
+    }
+
+    #[test]
+    fn dotted_php_suffixes_route_like_bare_ones() {
+        let text = "<httpServerConfig><phpConfig><phpHandler><id>lsphp</id><command>/usr/bin/php</command><suffixes>.php, .html</suffixes></phpHandler></phpConfig></httpServerConfig>";
+        let cfg = parse_server_text(Path::new("/srv/ls"), Path::new("<test>"), text).unwrap();
+        let suffixes = &cfg.php_config.as_ref().unwrap().suffixes;
+        assert!(
+            suffixes.iter().any(|s| s == "php") && suffixes.iter().any(|s| s == "html"),
+            "{suffixes:?}"
+        );
+        assert!(!suffixes.iter().any(|s| s.starts_with('.')), "{suffixes:?}");
     }
 
     // ----- round 9: OLS config forms -----

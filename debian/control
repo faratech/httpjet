@@ -1,0 +1,26 @@
+Source: httpjet
+Section: httpd
+Priority: optional
+Maintainer: Mike Fara <35661811+faratech@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), build-essential, cmake, pkg-config, python3, gnupg, musl-tools
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://httpjet.net
+Vcs-Git: https://github.com/faratech/httpjet.git
+
+Package: httpjet
+Architecture: amd64 arm64
+Depends: ${misc:Depends}, adduser, systemd, util-linux (>= 2.38)
+Description: Rust HTTP server with LiteSpeed-compatible configuration
+ httpjet serves HTTP with a dedicated unprivileged service account and reads
+ LiteSpeed-compatible XML configuration. The default installation serves a
+ static welcome page on port 80. PHP, TLS, page caching and management listeners
+ require explicit administrator configuration.
+
+Package: httpjet-archive-keyring
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}
+Description: public signing keys for the httpjet package archive
+ This package supplies the public archive key used by the httpjet APT source.
+ It can be upgraded independently of the server to support archive key rotation.

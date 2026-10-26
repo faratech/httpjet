@@ -31,7 +31,7 @@ pub(super) async fn roundtrip() -> (hj_core::Response, String) {
             stream.read_exact(&mut head).await.unwrap();
             assert_eq!(&head[..2], b"LS");
             assert_eq!(head[2], hj_lsapi::PacketType::BeginRequest as u8);
-            assert_eq!(head[3] & 1, 0, "fixture expects little-endian framing");
+            assert_eq!(head[3], hj_lsapi::proto::HOST_LSAPI_ENDIAN);
             let size = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
             assert!((44..65536).contains(&size));
             let mut body = vec![0; size - 8];
@@ -68,11 +68,12 @@ pub(super) async fn roundtrip() -> (hj_core::Response, String) {
                 }
             }
             // Empty 200 response, with an explicit RESP_END.
-            let mut out = vec![b'L', b'S', hj_lsapi::PacketType::RespHeader as u8, 0];
+            let flag = hj_lsapi::proto::HOST_LSAPI_ENDIAN;
+            let mut out = vec![b'L', b'S', hj_lsapi::PacketType::RespHeader as u8, flag];
             out.extend_from_slice(&16u32.to_le_bytes());
             out.extend_from_slice(&0i32.to_le_bytes());
             out.extend_from_slice(&200i32.to_le_bytes());
-            out.extend_from_slice(&[b'L', b'S', hj_lsapi::PacketType::RespEnd as u8, 0]);
+            out.extend_from_slice(&[b'L', b'S', hj_lsapi::PacketType::RespEnd as u8, flag]);
             out.extend_from_slice(&8u32.to_le_bytes());
             stream.write_all(&out).await.unwrap();
             trace.expect("LSAPI unknown-header table must carry traceparent")

@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+description="httpjet web server"
+supervisor=supervise-daemon
+command=/opt/httpjet/libexec/launch
+pidfile=/run/httpjet-supervisor.pid
+respawn_delay=2
+respawn_max=3
+respawn_period=60
+depend() { need net; }
+start_pre() { /opt/httpjet/libexec/control prepare; }
+start_post() { /opt/httpjet/libexec/control wait; }

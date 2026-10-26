@@ -37,13 +37,23 @@ pub struct OwnedIoVec {
 impl OwnedIoVec {
     /// Build one full-span iovec per non-empty backing allocation.
     pub fn from_bytes(backings: Vec<Bytes>) -> io::Result<Self> {
-        let spans = backings
-            .iter()
-            .enumerate()
-            .filter(|(_, bytes)| !bytes.is_empty())
-            .map(|(backing, bytes)| IoVecSpan::new(backing, 0, bytes.len()))
-            .collect();
-        Self::from_backings(backings, spans)
+        let mut iovecs = Vec::with_capacity(backings.len());
+        let mut remaining = 0usize;
+        for bytes in backings.iter().filter(|bytes| !bytes.is_empty()) {
+            remaining = remaining.checked_add(bytes.len()).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "vectored payload too large")
+            })?;
+            iovecs.push(libc::iovec {
+                iov_base: bytes.as_ptr().cast_mut().cast(),
+                iov_len: bytes.len(),
+            });
+        }
+        Ok(Self {
+            iovecs,
+            backings,
+            first: 0,
+            remaining,
+        })
     }
 
     /// Build iovecs over validated ranges of owned backing allocations.

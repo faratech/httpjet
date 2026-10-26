@@ -105,8 +105,21 @@ pub(super) fn build_hit_response(
     // allocating the body on the heap; dict/derived/fallback paths use `stored`
     // bytes and still fail closed on a missing/corrupt file.
     let encodable = compress.stored_encodable(&entry.headers);
-    let (body, encoding) = match pick_variant(entry, accept_encoding, compress, encodable) {
+    // A body stored as plain zstd (`--page-cache-egress-at-rest-vhosts`) is served as it is to
+    // a client that would get zstd and has no zstd variant (a cold entry), with no decode.
+    let picked = pick_variant(entry, accept_encoding, compress, encodable);
+    let at_rest_zstd = picked.is_none()
+        && encodable
+        && entry.dict_gen == hj_compress::PLAIN_GENERATION
+        && compress
+            .priority()
+            .iter()
+            .copied()
+            .find(|enc| accept_encoding.accepts(*enc))
+            == Some(Encoding::Zstd);
+    let (body, encoding) = match picked {
         Some((tok, b)) => (HitBody::Bytes(b), Some(tok)),
+        None if at_rest_zstd => (HitBody::Bytes(stored()?), Some(Encoding::Zstd.token())),
         None => {
             // The compress transform skips a ranged File body, so a request it could
             // encode (every Cloudflare request) gets bytes; only a response the
@@ -495,6 +508,7 @@ fn fill_encodings(
     accept_encoding: AcceptEncoding,
     capsule_shell: bool,
     priority: &[Encoding],
+    at_rest_zstd: bool,
 ) -> Vec<Encoding> {
     let mut encs = Vec::with_capacity(if capsule_shell { 3 } else { 2 });
     let internal_refresh = accept_encoding.is_empty();
@@ -510,6 +524,10 @@ fn fill_encodings(
     // (Cloudflare) request is forced to zstd, in which case nothing can ever select it.
     if capsule_shell && !cf_zstd_egress && priority.contains(&Encoding::Gzip) {
         add_encoding_once(&mut encs, Encoding::Gzip);
+    }
+    // A body stored as plain zstd already is the zstd variant (see `build_hit_response`).
+    if at_rest_zstd {
+        encs.retain(|e| *e != Encoding::Zstd);
     }
     encs
 }
@@ -538,6 +556,7 @@ pub(super) fn eligible_for_variants(
     body_len: usize,
     accept_encoding: AcceptEncoding,
     capsule_shell: bool,
+    at_rest_zstd: bool,
 ) -> bool {
     if (body_len as u64) < state.compress.min_size() {
         return false;
@@ -553,6 +572,7 @@ pub(super) fn eligible_for_variants(
         accept_encoding,
         capsule_shell,
         state.compress.priority(),
+        at_rest_zstd,
     )
     .is_empty()
 }
@@ -563,8 +583,16 @@ pub(super) fn precompress_variants(
     body: &Bytes,
     accept_encoding: AcceptEncoding,
     capsule_shell: bool,
+    at_rest_zstd: bool,
 ) -> Vec<(String, Bytes)> {
-    if !eligible_for_variants(state, headers, body.len(), accept_encoding, capsule_shell) {
+    if !eligible_for_variants(
+        state,
+        headers,
+        body.len(),
+        accept_encoding,
+        capsule_shell,
+        at_rest_zstd,
+    ) {
         return Vec::new();
     }
     fill_encodings(
@@ -572,6 +600,7 @@ pub(super) fn precompress_variants(
         accept_encoding,
         capsule_shell,
         state.compress.priority(),
+        at_rest_zstd,
     )
     .into_iter()
     .filter_map(|enc| match encode_bytes(enc, body, &FILL_LEVELS) {
@@ -656,6 +685,103 @@ mod tests {
         }
     }
 
+    /// (--page-cache-egress-at-rest-vhosts) A plain-zstd body serves a zstd client as stored and
+    /// any other client its decoded identity; no zstd variant is ever filled for it.
+    #[test]
+    fn a_plain_zstd_body_serves_zstd_as_stored_and_decodes_for_others() {
+        let identity = b"<p>at rest as plain zstd</p>".repeat(300);
+        let zstd = zstd::bulk::compress(&identity, 3).unwrap();
+        let mut e = entry_with_variants(&zstd, &[]);
+        e.dict_gen = hj_compress::PLAIN_GENERATION;
+        let plain = hj_compress::PageDict::plain(3);
+        let now = Instant::now();
+        let stored = Bytes::from(zstd.clone());
+
+        let r = build_hit_response(
+            &e,
+            now,
+            AcceptEncoding::parse("gzip, br, zstd"),
+            &Compress::default(),
+            false,
+            Some(&plain),
+            None,
+            || Some(stored.clone()),
+            || None,
+        )
+        .expect("zstd hit");
+        assert_eq!(r.headers().get(CONTENT_ENCODING).unwrap(), "zstd");
+        assert_eq!(
+            r.headers().get(CONTENT_LENGTH).unwrap(),
+            zstd.len().to_string().as_str()
+        );
+        match r.body() {
+            Body::Full(b) => assert_eq!(b.as_ptr(), stored.as_ptr(), "the stored bytes, no copy"),
+            _ => panic!("expected a full body"),
+        }
+
+        for ae in ["gzip", "br", ""] {
+            let r = build_hit_response(
+                &e,
+                now,
+                AcceptEncoding::parse(ae),
+                &Compress::default(),
+                false,
+                Some(&plain),
+                None,
+                || Some(stored.clone()),
+                || None,
+            )
+            .expect("identity hit");
+            assert!(r.headers().get(CONTENT_ENCODING).is_none(), "{ae}");
+            match r.body() {
+                Body::Full(b) => assert_eq!(b.as_ref(), identity.as_slice(), "{ae}"),
+                _ => panic!("expected a full body"),
+            }
+        }
+
+        // Once a hot entry has its in-RAM zstd variant, that variant wins.
+        let mut hot = e.clone();
+        hot.variants = vec![("zstd".into(), Bytes::from_static(b"filled variant"))];
+        let r = build_hit_response(
+            &hot,
+            now,
+            AcceptEncoding::parse("zstd"),
+            &Compress::default(),
+            false,
+            Some(&plain),
+            None,
+            || panic!("the stored body is not read when a variant serves"),
+            || None,
+        )
+        .expect("variant hit");
+        match r.body() {
+            Body::Full(b) => assert_eq!(b.as_ref(), b"filled variant"),
+            _ => panic!("expected a full body"),
+        }
+
+        assert!(
+            fill_encodings(
+                true,
+                AcceptEncoding::parse("zstd"),
+                false,
+                DEFAULT_PRIORITY,
+                true
+            )
+            .is_empty(),
+            "a Cloudflare hit on a cold entry needs no fill"
+        );
+        assert_eq!(
+            fill_encodings(
+                false,
+                AcceptEncoding::parse("br"),
+                false,
+                DEFAULT_PRIORITY,
+                true
+            ),
+            vec![Encoding::Brotli]
+        );
+    }
+
     #[test]
     fn pick_variant_honours_server_priority_and_client_accept() {
         let e = entry_with_variants(b"identity-body", &[("br", b"BR"), ("gzip", b"GZ")]);
@@ -709,7 +835,13 @@ mod tests {
         // when zstd egress to CF is forced — later CF hits would recompress every
         // serve for the whole TTL.
         assert_eq!(
-            fill_encodings(true, AcceptEncoding::parse("gzip"), false, DEFAULT_PRIORITY),
+            fill_encodings(
+                true,
+                AcceptEncoding::parse("gzip"),
+                false,
+                DEFAULT_PRIORITY,
+                false
+            ),
             vec![Encoding::Gzip, Encoding::Zstd]
         );
         // Already-zstd hitter: no duplicate.
@@ -718,23 +850,42 @@ mod tests {
                 true,
                 AcceptEncoding::parse("zstd, br, gzip"),
                 false,
-                DEFAULT_PRIORITY
+                DEFAULT_PRIORITY,
+                false
             ),
             vec![Encoding::Zstd]
         );
         // Empty AE (internal refresh, e.g. the tag cache warmer) under CF egress fills
         // zstd alone: a brotli variant could only serve a direct client.
         assert_eq!(
-            fill_encodings(true, AcceptEncoding::parse(""), false, DEFAULT_PRIORITY),
+            fill_encodings(
+                true,
+                AcceptEncoding::parse(""),
+                false,
+                DEFAULT_PRIORITY,
+                false
+            ),
             vec![Encoding::Zstd]
         );
         assert_eq!(
-            fill_encodings(true, AcceptEncoding::parse(""), true, DEFAULT_PRIORITY),
+            fill_encodings(
+                true,
+                AcceptEncoding::parse(""),
+                true,
+                DEFAULT_PRIORITY,
+                false
+            ),
             vec![Encoding::Zstd]
         );
         // Without CF egress an internal refresh keeps the brotli default.
         assert_eq!(
-            fill_encodings(false, AcceptEncoding::parse(""), false, DEFAULT_PRIORITY),
+            fill_encodings(
+                false,
+                AcceptEncoding::parse(""),
+                false,
+                DEFAULT_PRIORITY,
+                false
+            ),
             vec![Encoding::Brotli]
         );
         // identity-only client alone yields nothing — but CF egress still fills zstd.
@@ -743,7 +894,8 @@ mod tests {
                 true,
                 AcceptEncoding::parse("identity"),
                 false,
-                DEFAULT_PRIORITY
+                DEFAULT_PRIORITY,
+                false
             ),
             vec![Encoding::Zstd]
         );
@@ -753,7 +905,8 @@ mod tests {
                 false,
                 AcceptEncoding::parse("gzip"),
                 false,
-                DEFAULT_PRIORITY
+                DEFAULT_PRIORITY,
+                false
             ),
             vec![Encoding::Gzip]
         );
@@ -762,7 +915,8 @@ mod tests {
                 false,
                 AcceptEncoding::parse("identity"),
                 false,
-                DEFAULT_PRIORITY
+                DEFAULT_PRIORITY,
+                false
             ),
             Vec::<Encoding>::new()
         );
@@ -775,7 +929,8 @@ mod tests {
                 true,
                 AcceptEncoding::parse("zstd, br, gzip"),
                 true,
-                DEFAULT_PRIORITY
+                DEFAULT_PRIORITY,
+                false
             ),
             vec![Encoding::Zstd],
             "with forced zstd egress no request can select a gzip variant"
@@ -785,7 +940,8 @@ mod tests {
                 false,
                 AcceptEncoding::parse("br, gzip"),
                 true,
-                DEFAULT_PRIORITY
+                DEFAULT_PRIORITY,
+                false
             ),
             vec![Encoding::Brotli, Encoding::Gzip]
         );
@@ -794,7 +950,8 @@ mod tests {
                 false,
                 AcceptEncoding::parse("identity"),
                 true,
-                DEFAULT_PRIORITY
+                DEFAULT_PRIORITY,
+                false
             ),
             vec![Encoding::Gzip]
         );
@@ -1408,7 +1565,7 @@ mod tests {
         assert!(!off.is_enabled());
         assert!(pick_variant(&e, ae, &off, off.stored_encodable(&e.headers)).is_none());
         assert_eq!(
-            fill_encodings(true, AcceptEncoding::parse(""), true, off.priority()),
+            fill_encodings(true, AcceptEncoding::parse(""), true, off.priority(), false),
             Vec::<Encoding>::new()
         );
     }
@@ -1421,13 +1578,20 @@ mod tests {
                 false,
                 AcceptEncoding::parse("br, gzip"),
                 false,
-                no_br.priority()
+                no_br.priority(),
+                false
             ),
             vec![Encoding::Gzip]
         );
         // Absent AE falls back to the top enabled codec when brotli is off.
         assert_eq!(
-            fill_encodings(false, AcceptEncoding::parse(""), false, no_br.priority()),
+            fill_encodings(
+                false,
+                AcceptEncoding::parse(""),
+                false,
+                no_br.priority(),
+                false
+            ),
             vec![Encoding::Zstd]
         );
         let no_zstd = compress_without(true, true, false);
@@ -1436,13 +1600,20 @@ mod tests {
                 true,
                 AcceptEncoding::parse("gzip"),
                 false,
-                no_zstd.priority()
+                no_zstd.priority(),
+                false
             ),
             vec![Encoding::Gzip]
         );
         let no_gzip = compress_without(true, false, true);
         assert_eq!(
-            fill_encodings(false, AcceptEncoding::parse("br"), true, no_gzip.priority()),
+            fill_encodings(
+                false,
+                AcceptEncoding::parse("br"),
+                true,
+                no_gzip.priority(),
+                false
+            ),
             vec![Encoding::Brotli]
         );
     }

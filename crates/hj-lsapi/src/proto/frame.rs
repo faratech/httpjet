@@ -329,14 +329,15 @@ mod tests {
 
     #[test]
     fn codec_decodes_big_endian_length_flag() {
-        // Hand-build a RESP_STREAM packet that claims big-endian in the flag.
+        // Hand-build a big-endian RESP_STREAM packet from a cross-endian peer. Its flag is the
+        // opposite of this host's LSAPI_ENDIAN, not ENDIAN_BIG: aarch64's own flag is BIG.
         let body = b"BE";
         let total: u32 = 8 + body.len() as u32;
         let mut buf = BytesMut::new();
         buf.put_u8(VERSION_B0);
         buf.put_u8(VERSION_B1);
         buf.put_u8(PacketType::RespStream as u8);
-        buf.put_u8(ENDIAN_BIG);
+        buf.put_u8(HOST_LSAPI_ENDIAN ^ ENDIAN_BIT);
         buf.put_u32(total); // BufMut::put_u32 is big-endian
         buf.extend_from_slice(body);
 

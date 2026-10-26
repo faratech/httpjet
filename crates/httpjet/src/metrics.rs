@@ -435,6 +435,26 @@ fn render(state: &ServerState) -> String {
     );
     append_body_budget_metrics(&mut body, &state.body_budget);
     append_fast_bridge_metrics(&mut body, &state.metrics.fast_bridge);
+    append_pagecache_lookup_metrics(&mut body, &state.metrics.pagecache_lookup);
+    append_early_bridge_metrics(
+        &mut body,
+        &state.early_bridge,
+        state
+            .page_cache
+            .as_ref()
+            .and_then(|pc| pc.path_presence_fill_ratio()),
+    );
+    append_background_inflight_metrics(
+        &mut body,
+        [
+            ("refresh", state.page_cache_refresh.inflight_count()),
+            (
+                "variant_fill",
+                state.page_cache_variant_fill.inflight_count(),
+            ),
+            ("dict_fill", state.page_cache_dict_fill.inflight_count()),
+        ],
+    );
     #[cfg(feature = "otel")]
     {
         let (attempts, failures) = crate::otel::export_stats();
@@ -603,6 +623,16 @@ fn append_lsapi_pool_metrics(out: &mut String, stats: Option<hj_lsapi::PoolStats
             "httpjet_lsapi_eagain_terminal_exhaustions_total",
             "LSAPI fresh-dial EAGAIN failures that exhausted the retry window.",
             stats.eagain_terminal_exhaustions,
+        ),
+        (
+            "httpjet_lsapi_reset_replays_total",
+            "Idempotent PHP requests replayed on a fresh dial after their connection reset before any response byte.",
+            stats.reset_replays,
+        ),
+        (
+            "httpjet_lsapi_reset_replay_exhaustions_total",
+            "Idempotent PHP requests that still reset before any response byte after every replay.",
+            stats.reset_replay_exhaustions,
         ),
         (
             "httpjet_lsapi_inline_bodies_total",
@@ -1426,6 +1456,56 @@ fn append_fast_bridge_metrics(
     }
 }
 
+fn append_pagecache_lookup_metrics(out: &mut String, counters: &crate::lscache::LookupCounters) {
+    out.push_str(
+        "# HELP httpjet_pagecache_lookup_total Page-cache lookups by caller (on-core probe or dispatch) and outcome.\n# TYPE httpjet_pagecache_lookup_total counter\n",
+    );
+    for (path, result, n) in counters.snapshot() {
+        out.push_str(&format!(
+            "httpjet_pagecache_lookup_total{{path=\"{path}\",result=\"{result}\"}} {n}\n"
+        ));
+    }
+}
+
+fn append_early_bridge_metrics(
+    out: &mut String,
+    eb: &crate::pipeline::early_bridge::EarlyBridge,
+    fill_ratio: Option<f64>,
+) {
+    out.push_str(
+        "# HELP httpjet_fast_early_predicted_total Cookieless requests --fast-early-bridge judged unservable on-core, by reason.\n# TYPE httpjet_fast_early_predicted_total counter\n",
+    );
+    for (reason, n) in eb.predicted_snapshot() {
+        out.push_str(&format!(
+            "httpjet_fast_early_predicted_total{{reason=\"{reason}\"}} {n}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP httpjet_fast_early_forfeit_total Predicted requests the on-core path served anyway (shadow mode), by branch.\n# TYPE httpjet_fast_early_forfeit_total counter\n",
+    );
+    for (branch, n) in eb.forfeit_snapshot() {
+        out.push_str(&format!(
+            "httpjet_fast_early_forfeit_total{{branch=\"{branch}\"}} {n}\n"
+        ));
+    }
+    if let Some(r) = fill_ratio {
+        out.push_str(&format!(
+            "# HELP httpjet_pagecache_path_filter_fill_ratio Share of the page-cache path-presence filter's bits set.\n# TYPE httpjet_pagecache_path_filter_fill_ratio gauge\nhttpjet_pagecache_path_filter_fill_ratio {r:.6}\n"
+        ));
+    }
+}
+
+fn append_background_inflight_metrics(out: &mut String, pools: [(&str, usize); 3]) {
+    out.push_str(
+        "# HELP httpjet_pagecache_background_inflight Background page-cache jobs running now, per pool.\n# TYPE httpjet_pagecache_background_inflight gauge\n",
+    );
+    for (pool, n) in pools {
+        out.push_str(&format!(
+            "httpjet_pagecache_background_inflight{{pool=\"{pool}\"}} {n}\n"
+        ));
+    }
+}
+
 /// (OPS3) Loopback purge-endpoint counters, snapshotted for the metrics render.
 #[derive(Clone, Copy, Default)]
 struct PeerPurgeCounters {
@@ -1836,6 +1916,46 @@ mod tests {
     }
 
     #[test]
+    fn pagecache_lookups_render_by_caller_and_outcome() {
+        use crate::lscache::{CacheOutcome, LookupCounters, LookupMode};
+        let counters = LookupCounters::default();
+        counters.record(LookupMode::FastPath, &CacheOutcome::Miss(7));
+        counters.record(LookupMode::FastPath, &CacheOutcome::Miss(8));
+        counters.record(LookupMode::Full, &CacheOutcome::Bypass);
+        let mut body = String::new();
+        append_pagecache_lookup_metrics(&mut body, &counters);
+        assert_eq!(
+            body.matches("# TYPE httpjet_pagecache_lookup_total counter\n")
+                .count(),
+            1
+        );
+        assert!(
+            body.contains("httpjet_pagecache_lookup_total{path=\"on_core\",result=\"miss\"} 2\n")
+        );
+        assert!(
+            body.contains(
+                "httpjet_pagecache_lookup_total{path=\"dispatch\",result=\"bypass\"} 1\n"
+            )
+        );
+        assert!(
+            body.contains("httpjet_pagecache_lookup_total{path=\"dispatch\",result=\"hit\"} 0\n")
+        );
+        assert_eq!(body.matches("httpjet_pagecache_lookup_total{").count(), 6);
+    }
+
+    #[test]
+    fn background_pools_render_as_one_gauge() {
+        let mut body = String::new();
+        append_background_inflight_metrics(
+            &mut body,
+            [("refresh", 0), ("variant_fill", 3), ("dict_fill", 1)],
+        );
+        assert!(body.contains("# TYPE httpjet_pagecache_background_inflight gauge\n"));
+        assert!(body.contains("httpjet_pagecache_background_inflight{pool=\"variant_fill\"} 3\n"));
+        assert!(body.contains("httpjet_pagecache_background_inflight{pool=\"dict_fill\"} 1\n"));
+    }
+
+    #[test]
     fn render_includes_core_counters() {
         let body = render_metrics(
             42,
@@ -1933,6 +2053,8 @@ mod tests {
                 inline_tail_drains: 13,
                 streamed_bodies: 14,
                 embedded_begin_rejects: 15,
+                reset_replays: 16,
+                reset_replay_exhaustions: 17,
             }),
         );
         for expected in [
@@ -1950,6 +2072,8 @@ mod tests {
             "httpjet_lsapi_inline_tail_drains_total 13\n",
             "httpjet_lsapi_streamed_bodies_total 14\n",
             "httpjet_lsapi_embedded_begin_rejects_total 15\n",
+            "httpjet_lsapi_reset_replays_total 16\n",
+            "httpjet_lsapi_reset_replay_exhaustions_total 17\n",
         ] {
             assert!(body.contains(expected), "missing {expected:?} in:\n{body}");
         }

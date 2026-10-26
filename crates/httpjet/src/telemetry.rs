@@ -479,7 +479,7 @@ impl TelemetryShard {
 /// cheap mask. Sized to cover the worker pool + tokio blocking threads with
 /// headroom (prod runs `--workers 8`); past this, threads share shards (still
 /// correct, just re-introduces a little contention for thread #SHARDS and beyond).
-const SHARDS: usize = 64;
+pub(crate) const SHARDS: usize = 64;
 
 /// One [`TelemetryShard`] padded to its own cache line(s) so two shards never
 /// share a line (which would defeat the point). 128 bytes also dodges the x86
@@ -493,6 +493,11 @@ struct PaddedShard(TelemetryShard);
 static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static SHARD_IDX: usize = NEXT_SHARD.fetch_add(1, Relaxed) % SHARDS;
+}
+
+/// The calling thread's shard index, for other per-thread counters sharded the same way.
+pub(crate) fn shard_index() -> usize {
+    SHARD_IDX.with(|i| *i)
 }
 
 /// Per-core sharded telemetry: writes hit the calling thread's shard (no

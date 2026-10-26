@@ -4,3 +4,7 @@ workflows:
   .github/workflows/fuzz.yml: deep
   .github/workflows/interoperability.yml: deep
   .github/workflows/deps-advisory.yml: fast
+  .github/workflows/installer-tests.yml: fast
+  .github/workflows/installer-release.yml: release
+  .github/workflows/installer-publish.yml: release
+  .github/workflows/installer-refresh.yml: release

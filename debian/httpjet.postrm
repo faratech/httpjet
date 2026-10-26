@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" = purge ]; then
+    # The default package creates no persistent page cache. State may contain
+    # administrator certificates or other data; logs may be needed for history.
+    # Remove only empty top-level package directories, never their contents.
+    rmdir /var/lib/httpjet /var/log/httpjet 2>/dev/null || true
+fi
+
+#DEBHELPER#

@@ -1,0 +1,45 @@
+name: Installer and archive contracts
+on:
+  pull_request:
+    paths:
+      - 'packaging/release/**'
+      - 'packaging/installer/**'
+      - 'packaging/debian/**'
+      - 'packaging/services/**'
+      - 'packaging/rpm/**'
+      - 'packaging/nix/**'
+      - 'packaging/guix/**'
+      - 'debian/**'
+      - '.github/workflows/installer-*.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: installer-contracts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install isolated test tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg python3 binutils build-essential
+      - name: Archive trust and publication contracts
+        run: python3 -m unittest discover -s packaging/release -p 'test_*.py'
+      - name: Bootstrap contracts
+        run: python3 -m unittest discover -s packaging/installer -p 'test_*.py'
+      - name: Maintainer-script contracts
+        run: |
+          python3 -m unittest discover -s packaging/debian -p 'test_lifecycle.py'
+          python3 -m unittest discover -s packaging/debian -p 'test_build_key.py'
+      - name: Portable lifecycle and RPM transaction contracts
+        run: |
+          python3 -m unittest discover -s packaging/services -p 'test_*.py'
+          python3 -m unittest discover -s packaging/rpm -p 'test_*.py'
+      - name: Release shell syntax
+        run: |
+          for script in packaging/release/*.sh; do bash -n "$script"; done
+          sh -n packaging/installer/install.sh.in

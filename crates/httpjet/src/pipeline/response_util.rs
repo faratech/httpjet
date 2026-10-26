@@ -651,10 +651,22 @@ fn enclosing_static_contexts<'a>(
 /// header ops to the child's (#816). Feed the result to
 /// [`apply_static_context_headers`] in one call.
 pub(super) fn static_context_extra_headers(ctx: &ReqCtx, path: &str) -> Vec<(String, String)> {
-    enclosing_static_contexts(&ctx.vhost.contexts, path)
-        .into_iter()
-        .flat_map(|c| c.extra_headers.iter().cloned())
-        .collect()
+    inherited_extra_headers(enclosing_static_contexts(&ctx.vhost.contexts, path))
+}
+
+/// The enclosing contexts' extra headers, outermost first; a context set to
+/// `NONE` drops what it would have inherited.
+fn inherited_extra_headers<'a>(
+    enclosing: impl IntoIterator<Item = &'a hj_core::config::Context>,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    for c in enclosing {
+        if !c.inherit_extra_headers {
+            headers.clear();
+        }
+        headers.extend(c.extra_headers.iter().cloned());
+    }
+    headers
 }
 
 /// The effective `addDefaultCharset` for `path`: the innermost enclosing static
@@ -1051,6 +1063,7 @@ mod tests {
                 .iter()
                 .map(|(n, v)| (n.to_string(), v.to_string()))
                 .collect(),
+            inherit_extra_headers: true,
             add_default_charset: None,
             charset: None,
         }
@@ -1069,6 +1082,26 @@ mod tests {
         assert!(selected.last().unwrap().location.is_none());
         let parent = enclosing_static_contexts(&contexts, "/docs/a.txt");
         assert_eq!(parent.last().unwrap().uri, "/docs/");
+    }
+
+    #[test]
+    fn extra_headers_none_drops_the_inherited_headers() {
+        let mut none = static_context("/docs/", None, &[]);
+        none.inherit_extra_headers = false;
+        let contexts = vec![
+            static_context("/", None, &[("X-Root", "r")]),
+            none,
+            static_context("/docs/sub/", None, &[("X-Child", "c")]),
+        ];
+        let names = |path: &str| -> Vec<String> {
+            inherited_extra_headers(enclosing_static_contexts(&contexts, path))
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        assert_eq!(names("/x"), ["X-Root"]);
+        assert!(names("/docs/a").is_empty());
+        assert_eq!(names("/docs/sub/a"), ["X-Child"]);
     }
 
     #[test]
@@ -1231,6 +1264,7 @@ mod tests {
             enabled: true,
             allow_browse: true,
             extra_headers: vec![],
+            inherit_extra_headers: true,
             add_default_charset: charset,
             charset: custom.map(str::to_owned),
             cache_policy: None,

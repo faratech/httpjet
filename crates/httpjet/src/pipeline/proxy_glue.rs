@@ -325,6 +325,7 @@ mod tests {
             enabled,
             allow_browse: true,
             extra_headers: Vec::new(),
+            inherit_extra_headers: true,
             add_default_charset: None,
             charset: None,
             cache_policy: None,

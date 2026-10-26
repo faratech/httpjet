@@ -1,0 +1,29 @@
+#!/bin/sh
+set -eu
+
+# Refuse a first package installation over an independently managed server.
+# An upgrade/reinstall has an old-version argument and retains administrator
+# configuration, service overrides, enablement and content.
+if [ "$1" = install ] && [ -z "${2:-}" ]; then
+    for path in /usr/bin/httpjet /usr/sbin/httpjet /usr/local/bin/httpjet \
+        /usr/local/sbin/httpjet /etc/httpjet/conf/httpd_config.xml \
+        /etc/systemd/system/httpjet.service /lib/systemd/system/httpjet.service \
+        /usr/lib/systemd/system/httpjet.service; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            case "$(dpkg-query -S -- "$path" 2>/dev/null || true)" in
+                httpjet:*) ;;
+                *)
+                    echo "httpjet: refusing unmanaged installation at $path" >&2
+                    echo "Migrate or remove that installation explicitly before installing this package." >&2
+                    exit 1
+                    ;;
+            esac
+        fi
+    done
+    if [ -d /etc/systemd/system/httpjet.service.d ]; then
+        echo "httpjet: refusing existing unmanaged httpjet.service drop-ins" >&2
+        exit 1
+    fi
+fi
+
+#DEBHELPER#

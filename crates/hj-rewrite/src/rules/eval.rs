@@ -219,6 +219,21 @@ fn resolve_request_filename(out: &mut String, input: &RewriteInput, cur_uri: &st
         }
         return;
     }
+    if end < path.len() {
+        // `X/` cannot exist where `X` does not: record that for the file tests on the
+        // slashed path that follow (a front controller's `-f [OR] -l [OR] -d` on every
+        // `/threads/slug.1/` route), which would otherwise stat it again (#899 keeps
+        // the two spellings apart in the stat cache).
+        FS_MEMO.with(|m| {
+            let m = &mut *m.borrow_mut();
+            if m.active {
+                m.test_path.clear();
+                m.test_path.push_str(path);
+                m.test = None;
+                m.test_valid = true;
+            }
+        });
+    }
     // Bounded: a hostile URI of thousands of missing segments must not cost a
     // stat per segment.
     for _ in 0..MAX_PATH_INFO_WALK {

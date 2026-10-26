@@ -78,16 +78,10 @@ fn front_controller_verdict(outcome: &RewriteOutcome) -> &'static str {
 #[test]
 fn front_controller_on_a_missing_path_stats_each_path_once() {
     let (outcome, seen) = counting_eval(FRONT_CONTROLLER, "/threads/x.1/", Some(""), &|_| None);
-    // The PATH_INFO walk's two lookups, then one file test shared by -f/-l/-d
-    // (previously 3 lookups per cond: 9).
-    assert_eq!(
-        seen,
-        [
-            "/docroot/threads/x.1",
-            "/docroot/threads",
-            "/docroot/threads/x.1/"
-        ]
-    );
+    // The PATH_INFO walk's two lookups; the -f/-l/-d file test on the slashed path
+    // reuses the walk's finding that `x.1` is absent (previously 3 lookups per cond: 9,
+    // then 3 with one shared test).
+    assert_eq!(seen, ["/docroot/threads/x.1", "/docroot/threads"]);
     match outcome {
         RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/index.php"),
         other => panic!("front controller must rewrite, got {other:?}"),
@@ -124,8 +118,9 @@ fn passing_prescreen_is_not_re_evaluated() {
     };
     let (outcome, seen) =
         counting_eval(BUILDS, "/builds/windows11/26100.1/", Some("builds/"), &dir);
-    // One cond evaluation: the walk's three lookups plus the `!-f` test (was 8).
-    assert_eq!(seen.len(), 4, "{seen:?}");
+    // One cond evaluation: the walk's three lookups; the `!-f` test on the slashed path
+    // reuses the walk's finding that `26100.1` is absent (was 8, then 4).
+    assert_eq!(seen.len(), 3, "{seen:?}");
     match outcome {
         RewriteOutcome::Rewritten { new_uri, .. } => assert_eq!(new_uri, "/index.php"),
         other => panic!("missing build page must reach the front controller, got {other:?}"),
@@ -225,13 +220,8 @@ fn rule_backref_conds_still_see_the_pattern_captures() {
 #[test]
 fn sequential_evaluations_never_reuse_each_others_stats() {
     let uri = "/threads/x.1/";
-    let walked = |root: &str| {
-        vec![
-            format!("{root}/threads/x.1"),
-            format!("{root}/threads"),
-            format!("{root}/threads/x.1/"),
-        ]
-    };
+    // The walk's lookups; the file test on `x.1/` reuses the walk's own finding.
+    let walked = |root: &str| vec![format!("{root}/threads/x.1"), format!("{root}/threads")];
     let none = |_: &Path| None;
 
     let (outcome, seen) = counting_eval_at(
@@ -387,11 +377,7 @@ fn nested_evaluation_keeps_its_own_memo() {
         // The nested evaluation memoized its own walk for its own file test.
         assert_eq!(
             inner_seen.into_inner(),
-            [
-                "/inner/threads/x.1",
-                "/inner/threads",
-                "/inner/threads/x.1/"
-            ],
+            ["/inner/threads/x.1", "/inner/threads"],
             "{nest:?}"
         );
         let outer_seen = outer_seen.into_inner();

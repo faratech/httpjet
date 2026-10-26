@@ -23,12 +23,14 @@ try:
 except PermissionError:
     pass
 listener = socket.socket(fileno=0)
+# lsphp flags its little-endian packets with its LSAPI_ENDIAN, which is BIG on aarch64.
+FLAG = bytes([{flag}])
 
 while True:
     stream, _ = listener.accept()
     try:
         pid = os.getpid()
-        stream.sendall(b"LS\x06\x00" + struct.pack("=I", 16) + b"\x00PID" + struct.pack("=i", pid))
+        stream.sendall(b"LS\x06" + FLAG + struct.pack("=I", 16) + b"\x00PID" + struct.pack("=i", pid))
         header = b""
         while len(header) < 8:
             chunk = stream.recv(8 - len(header))
@@ -45,12 +47,13 @@ while True:
                 remaining -= len(chunk)
             body = str(pid).encode()
             response_header = struct.pack("=ii", 0, 200)
-            stream.sendall(b"LS\x03\x00" + struct.pack("=I", 8 + len(response_header)) + response_header)
-            stream.sendall(b"LS\x04\x00" + struct.pack("=I", 8 + len(body)) + body)
-            stream.sendall(b"LS\x05\x00" + struct.pack("=I", 8))
+            stream.sendall(b"LS\x03" + FLAG + struct.pack("=I", 8 + len(response_header)) + response_header)
+            stream.sendall(b"LS\x04" + FLAG + struct.pack("=I", 8 + len(body)) + body)
+            stream.sendall(b"LS\x05" + FLAG + struct.pack("=I", 8))
     finally:
         stream.close()
-"#
+"#,
+        flag = hj_lsapi::proto::HOST_LSAPI_ENDIAN,
     );
     std::fs::write(&path, source).unwrap();
     let mut perms = std::fs::metadata(&path).unwrap().permissions();

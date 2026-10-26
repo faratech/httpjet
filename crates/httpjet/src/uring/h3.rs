@@ -597,8 +597,10 @@ fn server_config(rustls_cfg: Arc<rustls::ServerConfig>) -> io::Result<ServerConf
         .try_into()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("idle timeout: {e:?}")))?;
     transport.max_idle_timeout(Some(idle));
-    transport.stream_receive_window((4u32 * 1024 * 1024).into());
-    transport.receive_window((64u32 * 1024 * 1024).into());
+    // quinn holds out-of-order STREAM data up to these windows before httpjet reads (and
+    // budgets) any of it, so they bound what a peer can park per connection.
+    transport.stream_receive_window((1024u32 * 1024).into());
+    transport.receive_window((8u32 * 1024 * 1024).into());
     // No RFC 9297 support: the default advertised max_datagram_frame_size and buffered
     // up to 1.25 MB of DATAGRAM frames nothing reads for the connection's life (#1047).
     // Unadvertised, a peer DATAGRAM is a PROTOCOL_VIOLATION (RFC 9221 §3).
@@ -704,6 +706,9 @@ struct H3State {
     draining: bool,
     next_request_stream_index: u64,
     client_leaf: Option<rustls::pki_types::CertificateDer<'static>>,
+    /// The connection's TLS parameters, built once at `Connected` (as the TCP paths do) and
+    /// shared by every request.
+    tls: Option<hj_core::TlsParams>,
     /// TLS SNI from the QUIC handshake: the routing fallback, like H2's
     /// `server_name()`, never derived from `:authority`.
     server_name: Option<Arc<str>>,
@@ -1763,6 +1768,8 @@ enum PayloadSink {
 enum RequestFrameError {
     Limit,
     Unexpected,
+    /// The request's header section is over `maxReqHeaderSize`: answered 431, as H1/H2.
+    HeadersTooLarge,
     /// The body is over the configured maximum and its head decoded: answered 413.
     TooLarge,
     /// DATA past the declared content-length (RFC 9114 §4.1.2): H3_MESSAGE_ERROR.
@@ -1842,10 +1849,10 @@ impl H3FrameCounter {
                     let sink = match self.frame_type {
                         0x01 => {
                             let Some(total) = self.header_bytes.checked_add(length) else {
-                                return Err(RequestFrameError::Limit);
+                                return Err(RequestFrameError::HeadersTooLarge);
                             };
                             if total > limits.max_header_bytes {
-                                return Err(RequestFrameError::Limit);
+                                return Err(RequestFrameError::HeadersTooLarge);
                             }
                             self.header_bytes = total;
                             if self.field.is_none() {
@@ -2337,10 +2344,9 @@ fn consume_peer_uni(
 
 fn finish_peer_uni(stream: &PeerUniStream) -> Result<(), H3ConnectionError> {
     match stream.kind {
-        PeerUniKind::Pending => Err(H3ConnectionError::new(
-            H3_STREAM_CREATION_ERROR,
-            b"truncated HTTP/3 unidirectional stream type",
-        )),
+        // RFC 9114 §6.2: a receiver MUST tolerate a unidirectional stream closed or reset
+        // before its stream type arrives.
+        PeerUniKind::Pending => Ok(()),
         PeerUniKind::Control if !stream.control.settings_received => Err(H3ConnectionError::new(
             H3_MISSING_SETTINGS,
             b"control stream closed before SETTINGS",
@@ -2671,6 +2677,14 @@ fn service_conn(
                     if permit.is_some() {
                         st._connection_permit = permit;
                     }
+                    // always TLS 1.3 (RFC 9001); quinn-proto exposes the client cert chain but
+                    // not the negotiated cipher, so report the QUIC-mandatory AEAD — same as
+                    // the tokio H3 path — and parse the client leaf for SSL_CLIENT_* CGI vars.
+                    st.tls = Some(hj_tls::tls_params_from_parts(
+                        "TLSv1.3",
+                        "TLS_AES_128_GCM_SHA256".to_string(),
+                        leaf.as_ref(),
+                    ));
                     st.client_leaf = leaf;
                     st.server_name = conns.get(&hd).and_then(h3_handshake_server_name);
                     st.connected = true;
@@ -3144,14 +3158,12 @@ fn reclaim_stalled_sends(st: &mut H3State, now: Instant) -> Vec<StreamId> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn write_completion(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
+/// Queue a finished request's response on its stream. The caller then drives the
+/// connection, whose flush sends every completion of the batch together.
+fn write_completion(
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
     c: Completion,
-    now: Instant,
-    tx_scratch: &mut Vec<u8>,
 ) {
     if !completion_is_live(h3, c.conn, c.epoch)
         || !h3
@@ -3228,12 +3240,10 @@ async fn write_completion(
             let _ = conn
                 .send_stream(stream)
                 .reset(quinn_proto::VarInt::from_u32(code));
-            flush_conn(udp, udp_state, conns, ch, now, tx_scratch).await;
             return;
         }
     }
     pump_stream(conn, st, stream); // write what the window allows; remainder pumps on Writable
-    flush_conn(udp, udp_state, conns, ch, now, tx_scratch).await;
 }
 
 /// Read every unfinished request stream into its buffer, retiring the ones that
@@ -3341,25 +3351,20 @@ fn refuse_request_stream(
     error: RequestFrameError,
 ) {
     let code = match error {
-        RequestFrameError::TooLarge => {
-            // (#1049) As H1/H2 (#1014): a complete 413 rather than a reset the client
-            // may retry with the whole upload, then STOP_SENDING(H3_NO_ERROR) so it
-            // stops sending and keeps the response (RFC 9114 §4.1). Dispatch waits for
-            // FIN, so no response has started on this stream.
+        RequestFrameError::TooLarge | RequestFrameError::HeadersTooLarge => {
+            // (#1049) As H1/H2 (#1014): a complete 413/431 rather than a reset the
+            // client may retry with the whole request, then STOP_SENDING(H3_NO_ERROR) so
+            // it stops sending and keeps the response (RFC 9114 §4.1). Dispatch waits
+            // for FIN, so no response has started on this stream.
             let _ = c
                 .recv_stream(id)
                 .stop(quinn_proto::VarInt::from_u32(H3_NO_ERROR));
-            st.pending.insert(
-                id,
-                PendingSend {
-                    completion: None,
-                    parts: std::iter::once(PendingPart::contiguous(h3_payload_too_large(), None))
-                        .collect(),
-                    fin: true,
-                    stall: None,
-                },
-            );
-            pump_stream(c, st, id);
+            let response = if error == RequestFrameError::TooLarge {
+                h3_payload_too_large()
+            } else {
+                h3_error(http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
+            };
+            queue_final_response(c, st, id, response);
             return;
         }
         RequestFrameError::Malformed => H3_MESSAGE_ERROR,
@@ -3466,10 +3471,7 @@ async fn drive_one_conn(
             }
             continue;
         };
-        // Peer + TLS params captured up front (no connection borrow into the task). QUIC is
-        // always TLS 1.3 (RFC 9001); quinn-proto exposes the client cert chain but not the
-        // negotiated cipher, so report the QUIC-mandatory AEAD — same as the tokio H3 path —
-        // and parse the client leaf cert for SSL_CLIENT_* CGI vars.
+        // Peer + TLS params captured up front (no connection borrow into the task).
         let peer = conns
             .get(&hd)
             .map(|c| c.remote_address())
@@ -3477,20 +3479,13 @@ async fn drive_one_conn(
         // SERVER_ADDR is the interface the client reached, not a wildcard bind (the
         // TCP paths take it from getsockname; QUIC from the datagram's IP_PKTINFO).
         let local = request_local_addr(local, conns.get(&hd).and_then(|c| c.local_ip()));
-        let leaf = st.client_leaf.clone();
         let sni = st.server_name.clone();
-        let has_client_cert = leaf.is_some();
-        let tls = Some(hj_tls::tls_params_from_parts(
-            "TLSv1.3",
-            "TLS_AES_128_GCM_SHA256".to_string(),
-            leaf.as_ref(),
-        ));
+        let has_client_cert = st.client_leaf.is_some();
+        let tls = st.tls.clone();
         if inflight.get() >= MAX_INFLIGHT_PER_CORE {
             // Backpressure: shed inline rather than spawning (bounds RAM under a flood).
             if let Some(c) = conns.get_mut(&hd) {
-                let mut ss = c.send_stream(id);
-                let _ = ss.write(&h3_error(http::StatusCode::SERVICE_UNAVAILABLE));
-                let _ = ss.finish();
+                queue_final_response(c, st, id, h3_error(http::StatusCode::SERVICE_UNAVAILABLE));
             }
             release_request_charge(st, req_charge);
             continue;
@@ -3796,11 +3791,13 @@ async fn pump(
 ) {
     const MAX_PUMP_ROUNDS: usize = 64;
     let mut rounds = 0;
+    let mut touched: Vec<ConnectionHandle> = Vec::new();
     while !to_drive.is_empty() && rounds < MAX_PUMP_ROUNDS {
         rounds += 1;
         let mut next: std::collections::HashSet<ConnectionHandle> =
             std::collections::HashSet::new();
         for hd in to_drive.drain() {
+            touched.push(hd);
             // Earlier handles can await UDP writability. Refresh the clock per
             // handle so QUIC timers and request deadlines never use a stale round
             // timestamp under load.
@@ -3847,18 +3844,41 @@ async fn pump(
     for hd in &to_drive {
         deadlines.sync(*hd, connection_deadline(conns, h3, *hd));
     }
-    let mut drained_handles = Vec::new();
-    conns.retain(|hd, c| {
-        let drained = c.is_drained();
-        if drained {
-            h3.remove(hd);
-            drained_handles.push(*hd);
+    touched.extend(to_drive.iter().copied());
+    // A connection drains only inside a quinn call on its own handle, and this pump made
+    // those calls on the handles it touched; scanning every connection after every event
+    // made each wakeup cost O(connections). A full scan still runs at most once a second.
+    let full = LAST_FULL_REAP.with(|last| {
+        let now = Instant::now();
+        let due = now.duration_since(last.get()) >= FULL_REAP_EVERY;
+        if due {
+            last.set(now);
         }
-        !drained
+        due
     });
-    for hd in drained_handles {
-        deadlines.remove(hd);
+    let drained: Vec<ConnectionHandle> = if full {
+        conns
+            .iter()
+            .filter(|(_, c)| c.is_drained())
+            .map(|(hd, _)| *hd)
+            .collect()
+    } else {
+        touched.retain(|hd| conns.get(hd).is_some_and(|c| c.is_drained()));
+        touched
+    };
+    for hd in drained {
+        if conns.remove(&hd).is_some() {
+            h3.remove(&hd);
+            deadlines.remove(hd);
+        }
     }
+}
+
+/// How often [`pump`] also checks every connection for a drained one (see its end).
+const FULL_REAP_EVERY: Duration = Duration::from_secs(1);
+
+thread_local! {
+    static LAST_FULL_REAP: std::cell::Cell<Instant> = std::cell::Cell::new(Instant::now());
 }
 
 fn h3_drain_complete(
@@ -4018,12 +4038,11 @@ async fn endpoint_loop_concurrent(
             // (1) Finished request(s): write each response into its stream, then pump the
             // sends (the response streams out cooperatively, interleaved with ACK processing).
             comp = comp_rx.recv_async() => {
-                let now = Instant::now();
                 let mut to_drive: std::collections::HashSet<ConnectionHandle> = std::collections::HashSet::new();
                 let mut completed = 0;
                 if let Ok(c) = comp {
                     let hd = c.conn;
-                    write_completion(&udp, &udp_state, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
+                    write_completion(&mut conns, &mut h3, c);
                     to_drive.insert(hd);
                     completed = 1;
                 }
@@ -4032,7 +4051,7 @@ async fn endpoint_loop_concurrent(
                         break;
                     };
                     let hd = c.conn;
-                    write_completion(&udp, &udp_state, &mut conns, &mut h3, c, now, &mut tx_scratch).await;
+                    write_completion(&mut conns, &mut h3, c);
                     to_drive.insert(hd);
                     completed += 1;
                 }
@@ -4187,6 +4206,26 @@ fn encode_h3_response(status: http::StatusCode, headers: &http::HeaderMap, body:
         encode_h3_data_frame(&mut out, body);
     }
     out
+}
+
+/// Send `response` as the stream's whole response through the pending-send machinery, so a
+/// blocked stream drains on Writable instead of being cut short.
+fn queue_final_response(
+    c: &mut quinn_proto::Connection,
+    st: &mut H3State,
+    id: StreamId,
+    response: Vec<u8>,
+) {
+    st.pending.insert(
+        id,
+        PendingSend {
+            completion: None,
+            parts: std::iter::once(PendingPart::contiguous(response, None)).collect(),
+            fin: true,
+            stall: None,
+        },
+    );
+    pump_stream(c, st, id);
 }
 
 /// A minimal HTTP/3 error response (status only).
@@ -5629,6 +5668,9 @@ mod h3_codec_tests {
         let mut extension = PeerUniStream::default();
         consume_peer_uni(&mut state, unknown, &mut extension, &[0x21, 1, 2, 3]).unwrap();
         assert!(finish_peer_uni(&extension).is_ok());
+
+        // RFC 9114 §6.2: closed or reset before its type arrived is not an error.
+        assert!(finish_peer_uni(&PeerUniStream::default()).is_ok());
     }
 
     #[test]
@@ -5757,7 +5799,7 @@ mod h3_codec_tests {
         let mut header_too_large = H3FrameCounter::default();
         assert_eq!(
             header_too_large.consume(&[0x01, 5], &mut Vec::new(), limits),
-            Err(RequestFrameError::Limit)
+            Err(RequestFrameError::HeadersTooLarge)
         );
         let mut body_too_large = H3FrameCounter::default();
         assert_eq!(
@@ -5883,7 +5925,7 @@ mod h3_codec_tests {
         write_varint(&mut header_over, (LIVE_HEADER_LIMIT + 1) as u64);
         assert_eq!(
             H3FrameCounter::default().consume(&header_over, &mut Vec::new(), limits),
-            Err(RequestFrameError::Limit)
+            Err(RequestFrameError::HeadersTooLarge)
         );
     }
 
@@ -7810,6 +7852,57 @@ mod admission_tests {
         assert_eq!(read_response(&mut e.client, ids[2]), Ok(too_large));
         assert_eq!(stopped.get(&ids[2]), Some(&no_error));
         assert!(!stopped.contains_key(&ids[3]));
+    }
+
+    /// An over-limit header section gets a complete 431 and STOP_SENDING(H3_NO_ERROR), as
+    /// H1 and H2 answer, not a stream reset the browser reports as a network error.
+    #[test]
+    fn oversized_request_headers_are_answered_431() {
+        use super::h3_codec_tests::request_stream;
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let addr = spoofed(12);
+        let mut e = h.establish(addr, now);
+        let big = vec![b'a'; 2000];
+        let mut fields = GET_HEAD.to_vec();
+        fields.push((b"x-big", &big));
+        let wire = request_stream(&fields, &[]);
+        let id = e.client.streams().open(Dir::Bi).unwrap();
+        // Left open, like an upload still in flight: STOP_SENDING tells it to stop.
+        let mut send = e.client.send_stream(id);
+        assert_eq!(send.write(&wire).unwrap(), wire.len());
+        h.to_server(&mut e.conns, &mut e.client, addr, now);
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        service_conn(
+            &mut h.server,
+            &mut e.conns,
+            &mut e.h3,
+            e.hd,
+            now,
+            true,
+            config,
+        );
+        let st = e.h3.get_mut(&e.hd).unwrap();
+        let conn = e.conns.get_mut(&e.hd).unwrap();
+        assert!(receive_request_streams(conn, st, now).is_empty());
+        assert!(st.pending.is_empty(), "the 431 was written whole");
+        h.to_client(conn, e.client_handle, &mut e.client, now);
+        let mut stopped = None;
+        while let Some(event) = e.client.poll() {
+            if let Event::Stream(StreamEvent::Stopped {
+                id: stream,
+                error_code,
+            }) = event
+                && stream == id
+            {
+                stopped = Some(error_code.into_inner());
+            }
+        }
+        assert_eq!(
+            read_response(&mut e.client, id),
+            Ok(h3_error(http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE))
+        );
+        assert_eq!(stopped, Some(u64::from(H3_NO_ERROR)));
     }
 
     const GET_HEAD: [(&[u8], &[u8]); 4] = [

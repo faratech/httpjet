@@ -150,30 +150,51 @@ pub fn path_filter_hash(vhost_id: u32, path: &str) -> u64 {
     h
 }
 
-const FILTER_BITS: u64 = 1 << 16;
+const FILTER_LOG2_BITS: u32 = 16;
 
 /// A lock-free membership pre-filter over hashes. A set bit may be stale (a false positive
-/// just costs the map probe it saves); a spec in the map always has its bits set (see
+/// just costs the probe it saves); a member always has its bit set, which callers keep true by
+/// marking under a shared gate that a rebuild or clear takes exclusively (see
 /// `UrlVarySpecs::gate`).
-struct BitFilter {
+pub(crate) struct BitFilter {
     words: Box<[AtomicU64]>,
+    shift: u32,
 }
 
 impl BitFilter {
     fn new() -> Self {
+        Self::with_log2_bits(FILTER_LOG2_BITS)
+    }
+
+    /// A filter of `2^log2_bits` bits (at least 64).
+    pub(crate) fn with_log2_bits(log2_bits: u32) -> Self {
+        let log2_bits = log2_bits.clamp(6, 40);
         BitFilter {
-            words: (0..FILTER_BITS / 64).map(|_| AtomicU64::new(0)).collect(),
+            words: (0..(1u64 << log2_bits) / 64)
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            shift: 64 - log2_bits,
         }
     }
 
     #[inline]
-    fn slot(hash: u64) -> (usize, u64) {
-        let bit = (hash ^ (hash >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 48;
+    fn slot(&self, hash: u64) -> (usize, u64) {
+        let bit = (hash ^ (hash >> 29)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift;
         ((bit >> 6) as usize, 1u64 << (bit & 63))
     }
 
-    fn set(&self, hash: u64) {
-        let (w, mask) = Self::slot(hash);
+    /// Fraction of bits set (the false-positive rate of a single probe).
+    pub(crate) fn fill_ratio(&self) -> f64 {
+        let set: u64 = self
+            .words
+            .iter()
+            .map(|w| u64::from(w.load(Ordering::Relaxed).count_ones()))
+            .sum();
+        set as f64 / (self.words.len() as f64 * 64.0)
+    }
+
+    pub(crate) fn set(&self, hash: u64) {
+        let (w, mask) = self.slot(hash);
         if let Some(word) = self.words.get(w)
             && word.load(Ordering::Relaxed) & mask == 0
         {
@@ -182,29 +203,46 @@ impl BitFilter {
     }
 
     #[inline]
-    fn test(&self, hash: u64) -> bool {
-        let (w, mask) = Self::slot(hash);
+    pub(crate) fn test(&self, hash: u64) -> bool {
+        let (w, mask) = self.slot(hash);
         self.words
             .get(w)
             .is_some_and(|word| word.load(Ordering::Acquire) & mask != 0)
     }
 
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         for word in self.words.iter() {
             word.store(0, Ordering::Release);
         }
     }
 
     /// Replace the contents with exactly `hashes`.
-    fn rebuild(&self, hashes: impl Iterator<Item = u64>) {
+    pub(crate) fn rebuild(&self, hashes: impl Iterator<Item = u64>) {
+        self.install(self.words_for(hashes), std::iter::empty());
+    }
+
+    /// The word array holding exactly `hashes`, for [`Self::install`]; building it
+    /// touches only fresh memory, so it needs none of the caller's locks.
+    pub(crate) fn words_for(&self, hashes: impl Iterator<Item = u64>) -> Vec<u64> {
         let mut fresh = vec![0u64; self.words.len()];
         for hash in hashes {
-            let (w, mask) = Self::slot(hash);
+            let (w, mask) = self.slot(hash);
             if let Some(word) = fresh.get_mut(w) {
                 *word |= mask;
             }
         }
-        for (word, value) in self.words.iter().zip(fresh) {
+        fresh
+    }
+
+    /// Replace the contents with `words` (from [`Self::words_for`]) plus `extra`.
+    pub(crate) fn install(&self, mut words: Vec<u64>, extra: impl Iterator<Item = u64>) {
+        for hash in extra {
+            let (w, mask) = self.slot(hash);
+            if let Some(word) = words.get_mut(w) {
+                *word |= mask;
+            }
+        }
+        for (word, value) in self.words.iter().zip(words) {
             word.store(value, Ordering::Release);
         }
     }

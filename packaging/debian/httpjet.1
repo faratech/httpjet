@@ -1,0 +1,55 @@
+.TH HTTPJET 1 "October 2026" "httpjet" "User Commands"
+.SH NAME
+httpjet \- HTTP server with LiteSpeed-compatible XML configuration
+.SH SYNOPSIS
+.B httpjet
+.RI [ --root " directory" ]
+.RI [ command " [options]" ]
+.SH DESCRIPTION
+httpjet is a Linux web server using io_uring. The packaged service serves
+static files over HTTP on port 80 as the dedicated httpjet system account.
+TLS, PHP, page caching, metrics and management listeners are disabled in the
+default service configuration.
+.SH COMMANDS
+.TP
+.B check --strict
+Validate configuration without serving requests. This is also the default
+command when no command is supplied.
+.TP
+.B serve
+Run the server using the supplied configuration and listener options.
+.TP
+.B doctor
+Report installation and runtime prerequisites without changing system settings.
+.TP
+.B --help
+Show the complete command and option reference. Individual commands also
+accept this option.
+.TP
+.B --version
+Show the server version.
+.SH FILES
+.TP
+.B /etc/httpjet/conf/httpd_config.xml
+Default server configuration.
+.TP
+.B /etc/httpjet/conf/vhosts/default.xml
+Default virtual host configuration and static-only PHP suffix denial.
+.TP
+.B /var/www/httpjet
+Website document root. Existing content is preserved across package operations.
+.TP
+.B /usr/share/httpjet/welcome/index.html
+Canonical welcome template, copied only when the package creates a new document root.
+.TP
+.B /var/log/httpjet
+Packaged service access and error logs. Service diagnostics are also in the journal.
+.SH SERVICE MANAGEMENT
+Use systemctl start, stop, restart or status with httpjet.service. An upgrade
+restarts a running service after strict configuration validation; a stopped
+service remains stopped. Configuration changes take effect on service restart.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR journalctl (1)
+.PP
+https://httpjet.net/docs/

@@ -1,0 +1,308 @@
+name: Installer release qualification
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: httpjet-candidate-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require the public release tag on main
+        run: |
+          test "$GITHUB_REPOSITORY" = faratech/httpjet
+          test "$GITHUB_REF_TYPE" = tag
+          git check-ref-format "$GITHUB_REF"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"
+          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+          sys.path.insert(0, 'packaging/release')
+          import support
+          line = pathlib.Path('debian/changelog').read_text().splitlines()[0]
+          version = re.search(r'\(([^)]+)\)', line)[1]
+          if os.environ['GITHUB_REF'] != 'refs/tags/' + support.identity(version)['tag']:
+              raise SystemExit('release tag must match the canonical package revision')
+          PY
+      - id: matrix
+        run: |
+          python3 - <<'PYCODE'
+          import json,os,sys
+          sys.path.insert(0,'packaging/release')
+          import support
+          rows=[{'row_id':row['id'],'architecture':row['architecture'],'executor':row['executor'],
+                 'runner':'ubuntu-24.04' if row['architecture']=='amd64' else 'ubuntu-24.04-arm'} for row in support.rows()]
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              output.write('matrix='+json.dumps({'include':rows},separators=(',',':'))+'\n')
+          PYCODE
+  images:
+    needs: policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve exact authenticated image inputs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-yaml gnupg libarchive-tools squashfs-tools e2fsprogs
+          python3 packaging/release/resolve-images.py --output image-inputs --cache "$RUNNER_TEMP/httpjet-images"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualification-images
+          path: image-inputs/qualification-images.json
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualification-rootfs-devuan-stable-amd64
+          path: image-inputs/qualification-rootfs-devuan-stable-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualification-rootfs-slackware-15.0-amd64
+          path: image-inputs/qualification-rootfs-slackware-15.0-amd64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+  native:
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Source-build portable release packages
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+        run: |
+          test -n "$ARCHIVE_KEY"
+          printf '%s\n' "$ARCHIVE_KEY" > "$RUNNER_TEMP/archive.asc"
+          docker run --rm \
+            --security-opt "seccomp=$GITHUB_WORKSPACE/packaging/oci/seccomp-httpjet.json" \
+            --ulimit memlock=8388608:8388608 \
+            --volume "$GITHUB_WORKSPACE:/work" --volume "$RUNNER_TEMP/archive.asc:/tmp/archive.asc:ro" \
+            --workdir /work --env RELEASE_TAG --env ARCHIVE_FINGERPRINT --env CARGO_BUILD_JOBS=2 \
+            rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 \
+            bash -c 'apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl python3 build-essential musl-tools rpm cmake pkg-config clang debhelper gnupg ripgrep xz-utils && git config --global --add safe.directory /work && bash packaging/release/build.sh "$RELEASE_TAG" /work/dist /tmp/archive.asc "$ARCHIVE_FINGERPRINT"'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-${{ matrix.architecture }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+  oci:
+    needs: [native, images]
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: native-${{ matrix.architecture }}
+          path: native
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qualification-images
+          path: images
+      - name: Build the exact static payload into its immutable OCI carrier
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          base=$(python3 -c 'import json,os; print(json.load(open("images/qualification-images.json"))["oci_bases"][os.environ["ARCHITECTURE"]]["image"])')
+          python3 packaging/release/build-oci.py native "$ARCHITECTURE" --base "$base"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: carriers-${{ matrix.architecture }}
+          path: native/
+          if-no-files-found: error
+          retention-days: 30
+  candidate:
+    needs: [oci, images]
+    runs-on: ubuntu-24.04
+    environment: httpjet-candidate-signing
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: carriers-*
+          merge-multiple: true
+          path: candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qualification-images
+          path: candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: qualification-rootfs-*
+          merge-multiple: true
+          path: candidate
+      - name: Install archive tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg python3 binutils rpm createrepo-c libarchive-tools
+      - name: Validate identities and sign a local candidate snapshot
+        env:
+          ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          ARCHIVE_PRIVATE_KEY: ${{ secrets.HTTPJET_ARCHIVE_PRIVATE_KEY }}
+          FIRST_RELEASE: ${{ vars.HTTPJET_FIRST_RELEASE }}
+        run: |
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/httpjet-signing.XXXXXX")
+          printf 'GNUPGHOME=%s\n' "$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$ARCHIVE_KEY" > archive.asc
+          printf '%s\n' "$ARCHIVE_PRIVATE_KEY" | gpg --batch --import
+          python3 packaging/release/release.py sign-carriers candidate --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT"
+          python3 packaging/release/release.py manifest candidate
+          python3 - <<'PY'
+          import os,pathlib,sys,shutil,urllib.error
+          sys.path.insert(0,'packaging/release')
+          import release
+          previous=pathlib.Path('previous')
+          try:
+              release.fetch_current(release.REPO_URL,previous,pathlib.Path('archive.asc'),os.environ['ARCHIVE_FINGERPRINT'],True)
+          except urllib.error.HTTPError as error:
+              if error.code != 404 or error.url != 'https://packages.httpjet.net/releases/stable.json' or os.environ.get('FIRST_RELEASE') != 'true':
+                  raise
+              shutil.rmtree(previous)
+              pathlib.Path('first-release-fixture').write_text('No previous stable exists; upgrade baseline is a labelled package fixture.\n')
+          release.stage(pathlib.Path('candidate'),pathlib.Path('snapshot'),pathlib.Path('archive.asc'),
+                        os.environ['ARCHIVE_FINGERPRINT'],pathlib.Path('packaging/installer/install.sh.in'),
+                        candidate=True,previous=previous if previous.exists() else None)
+          if not previous.exists():
+              import fixtures
+              fixtures.create(pathlib.Path('candidate'),pathlib.Path('qualification-fixtures'),pathlib.Path('archive.asc'),os.environ['ARCHIVE_FINGERPRINT'])
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-candidate
+          path: |
+            candidate/
+            !candidate/qualification-rootfs-*.tar.gz
+            snapshot/
+            previous/
+            first-release-fixture
+            qualification-fixtures/
+            archive.asc
+          if-no-files-found: error
+          retention-days: 30
+      - name: Remove ephemeral signing material
+        if: always()
+        run: |
+          gpgconf --kill all || true
+          rm -rf "$GNUPGHOME"
+  lifecycle:
+    needs: [candidate, policy]
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix: ${{ fromJSON(needs.policy.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: matrix.row_id == 'devuan-stable-amd64' || matrix.row_id == 'slackware-15.0-amd64'
+        with:
+          name: qualification-rootfs-${{ matrix.row_id }}
+          path: candidate
+      - name: Install QEMU user-space tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 qemu-system-arm qemu-utils qemu-efi-aarch64 cloud-image-utils openssh-client openssl python3 python3-venv e2fsprogs binutils zstd
+      - name: Qualify the exact support row and native lifecycle
+        env:
+          ROW_ID: ${{ matrix.row_id }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/httpjet-clients"
+          "$RUNNER_TEMP/httpjet-clients/bin/pip" install 'aioquic==1.7.0' 'h2==4.4.1'
+          "$RUNNER_TEMP/httpjet-clients/bin/python" packaging/release/vm.py --row "$ROW_ID" \
+            --artifacts candidate --snapshot snapshot --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT" \
+            --previous previous --fixtures qualification-fixtures --first-release-marker first-release-fixture --output qualification
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: receipt-${{ matrix.row_id }}
+          path: qualification/
+          if-no-files-found: error
+          retention-days: 90
+  qualified:
+    needs: lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: receipt-*
+          merge-multiple: true
+          path: receipts
+      - name: Install RPM verification tools
+        run: sudo apt-get update && sudo apt-get install -y rpm
+      - run: |
+          python3 packaging/release/release.py qualify candidate receipts
+          python3 packaging/release/export-qualified.py candidate release-ready
+          python3 packaging/release/github_assets.py qualified --directory release-ready --output github-qualified-assets
+      - name: Attest final signed software and qualification metadata
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: github-qualified-assets/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: qualified-release
+          path: release-ready/
+          if-no-files-found: error
+          retention-days: 90

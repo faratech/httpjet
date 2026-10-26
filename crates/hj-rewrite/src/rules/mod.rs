@@ -618,6 +618,125 @@ impl RewriteOutcome {
 pub(crate) enum CompiledRegex {
     Fast(FastRegex),
     Fancy(Regex),
+    /// A `fancy_regex` pattern that is only a conjunction of lookaheads, matched with
+    /// the linear-time engine (see [`LookaheadConjunction`]).
+    Lookaheads(LookaheadConjunction),
+}
+
+/// `^(?=.*A)(?=.*B)…` and nothing else: the usual way to AND conditions in one PCRE
+/// (the forum's member-preview cookie `SetEnvIf`). At `^`, `(?=.*A)` holds exactly when
+/// some match of `A` starts within the subject's first line, so each `A` runs as one
+/// linear-time search instead of `fancy_regex`'s backtracking VM walking the subject
+/// per lookahead (~30 µs per evaluation on a 1.3 KB Cookie). Captures, which only the
+/// backtracking engine reports for lookahead groups, still come from `fancy`.
+#[derive(Debug, Clone)]
+pub struct LookaheadConjunction {
+    parts: Box<[FastRegex]>,
+    fancy: Regex,
+}
+
+impl LookaheadConjunction {
+    fn compile(prepared: &str, fancy: &Regex) -> Option<Self> {
+        let parts = lookahead_conjunction_parts(prepared)?
+            .iter()
+            .map(|part| {
+                let re = meta::Regex::new(part).ok()?;
+                let id = FAST_REGEX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(FastRegex { re, id })
+            })
+            .collect::<Option<Box<[_]>>>()?;
+        Some(LookaheadConjunction {
+            parts,
+            fancy: fancy.clone(),
+        })
+    }
+
+    fn is_match(&self, text: &str) -> bool {
+        match text.find('\n') {
+            // Every match starts in the only line (header values never hold a newline),
+            // so the forward search suffices, without the reverse pass a match start costs.
+            None => self.parts.iter().all(|part| part.is_match(text)),
+            Some(first_line_end) => self.parts.iter().all(|part| {
+                part.leftmost_start(text)
+                    .is_some_and(|start| start <= first_line_end)
+            }),
+        }
+    }
+}
+
+/// The parts `A`, `B`, … of a pattern that is exactly `^(?=.*A)(?=.*B)…`, each with the
+/// pattern's leading case-insensitivity flag, or `None` for any other shape (another flag,
+/// a lazy or possessive `.*`, anything outside the lookaheads, or a top-level `|` in a
+/// lookahead: `(?=.*A|B)` is `.*A` or `B` at the start, not `A|B` anywhere).
+fn lookahead_conjunction_parts(prepared: &str) -> Option<Vec<String>> {
+    let mut rest = prepared;
+    let mut flags = "";
+    while let Some(after) = rest.strip_prefix("(?") {
+        let end = after.find(')')?;
+        let group = &after[..end];
+        if group.is_empty() || !group.bytes().all(|b| b == b'i') {
+            return None;
+        }
+        flags = "(?i)";
+        rest = &after[end + 1..];
+    }
+    rest = rest.strip_prefix('^')?;
+    let mut parts = Vec::new();
+    while !rest.is_empty() {
+        let body = rest.strip_prefix("(?=.*")?;
+        if body.starts_with(['?', '+', '*', '{']) {
+            return None;
+        }
+        let close = group_close(body.as_bytes())?;
+        parts.push(format!("{flags}{}", &body[..close]));
+        rest = &body[close + 1..];
+    }
+    (!parts.is_empty()).then_some(parts)
+}
+
+/// Index of the `)` closing a group whose body starts at `b[0]`; `None` when the body
+/// alternates at its top level.
+fn group_close(b: &[u8]) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' => i = class_close(b, i)?,
+            b'(' => depth += 1,
+            b')' if depth == 0 => return Some(i),
+            b')' => depth -= 1,
+            b'|' if depth == 0 => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the `]` closing the bracket class opened at `b[open]`.
+fn class_close(b: &[u8], open: usize) -> Option<usize> {
+    let mut i = open + 1;
+    if b.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    if b.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'[' if b.get(i + 1) == Some(&b':') => {
+                let name_end = b.get(i + 2..)?.windows(2).position(|w| w == b":]")?;
+                i += 2 + name_end + 1;
+            }
+            b'[' => i = class_close(b, i)?,
+            b']' => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The linear-time engine, using `regex_automata::meta::Regex` directly (not the
@@ -655,6 +774,22 @@ thread_local! {
 }
 
 impl FastRegex {
+    /// Start of the leftmost match in `text`.
+    fn leftmost_start(&self, text: &str) -> Option<usize> {
+        FAST_REGEX_CACHES.with(|cell| {
+            let mut map = cell.borrow_mut();
+            if map.len() > FAST_REGEX_CACHE_CAP {
+                map.clear();
+            }
+            let (cache, _) = map
+                .entry(self.id)
+                .or_insert_with(|| (self.re.create_cache(), self.re.create_captures()));
+            self.re
+                .search_with(cache, &Input::new(text))
+                .map(|m| m.start())
+        })
+    }
+
     fn is_match(&self, text: &str) -> bool {
         FAST_REGEX_CACHES.with(|cell| {
             let mut map = cell.borrow_mut();
@@ -811,7 +946,7 @@ pub(crate) fn pcre_literal_escapes(src: &str) -> std::borrow::Cow<'_, str> {
 impl CompiledRegex {
     #[inline]
     pub(crate) fn can_fail_at_match_time(&self) -> bool {
-        matches!(self, CompiledRegex::Fancy(_))
+        matches!(self, CompiledRegex::Fancy(_) | CompiledRegex::Lookaheads(_))
     }
 
     /// Compile `src` (case-insensitive when `nocase`), preferring the linear-time
@@ -835,13 +970,15 @@ impl CompiledRegex {
             let id = FAST_REGEX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(CompiledRegex::Fast(FastRegex { re, id }));
         }
-        Regex::new(&prepared)
-            .map(CompiledRegex::Fancy)
-            .map_err(|e| RewriteError::BadRegex {
-                line,
-                pattern: src.to_string(),
-                source: Box::new(e),
-            })
+        let fancy = Regex::new(&prepared).map_err(|e| RewriteError::BadRegex {
+            line,
+            pattern: src.to_string(),
+            source: Box::new(e),
+        })?;
+        Ok(match LookaheadConjunction::compile(&prepared, &fancy) {
+            Some(conjunction) => CompiledRegex::Lookaheads(conjunction),
+            None => CompiledRegex::Fancy(fancy),
+        })
     }
 
     /// Run the pattern against `text`, returning the captures on a match.
@@ -851,7 +988,10 @@ impl CompiledRegex {
             CompiledRegex::Fast(r) => r.captures(text),
             // fancy_regex returns Result<Option<_>>; a regex *error* at match time
             // is treated as a non-match (matches the prior `.unwrap_or_default()`).
-            CompiledRegex::Fancy(r) => r.captures(text).ok().flatten().map(Caps::Fancy),
+            CompiledRegex::Fancy(r)
+            | CompiledRegex::Lookaheads(LookaheadConjunction { fancy: r, .. }) => {
+                r.captures(text).ok().flatten().map(Caps::Fancy)
+            }
         }
     }
 
@@ -863,6 +1003,7 @@ impl CompiledRegex {
         match self {
             CompiledRegex::Fast(r) => Ok(r.is_match(text)),
             CompiledRegex::Fancy(r) => r.is_match(text).map_err(|_| ()),
+            CompiledRegex::Lookaheads(r) => Ok(r.is_match(text)),
         }
     }
 
@@ -873,7 +1014,8 @@ impl CompiledRegex {
     pub(crate) fn captures_checked<'t>(&self, text: &'t str) -> Result<Option<Caps<'t>>, ()> {
         match self {
             CompiledRegex::Fast(r) => Ok(r.captures(text)),
-            CompiledRegex::Fancy(r) => r
+            CompiledRegex::Fancy(r)
+            | CompiledRegex::Lookaheads(LookaheadConjunction { fancy: r, .. }) => r
                 .captures(text)
                 .map(|caps| caps.map(Caps::Fancy))
                 .map_err(|_| ()),
@@ -1056,6 +1198,124 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
         RewriteOutcome::Unchanged {
             env: state.env_vec(),
             end: ended,
+        }
+    }
+}
+
+#[cfg(test)]
+mod lookahead_conjunction_tests {
+    use super::*;
+
+    /// The forum's member-preview cookie rule, as `SetEnvIfNoCase` compiles it.
+    const PREVIEW: &str = r"^(?=.*(?:^|;[[:space:]]*)xf_(?:user|session)=[^;]+(?:;|$))(?=.*(?:^|;[[:space:]]*)xf_style_id=51(?:;|$))";
+
+    #[test]
+    fn only_a_pure_lookahead_conjunction_is_split() {
+        assert_eq!(
+            lookahead_conjunction_parts("(?i)^(?=.*a(b)[)(]c)(?=.*d)").unwrap(),
+            ["(?i)a(b)[)(]c", "(?i)d"]
+        );
+        assert_eq!(
+            lookahead_conjunction_parts(r"^(?=.*[[:space:]\]]x)").unwrap(),
+            [r"[[:space:]\]]x"]
+        );
+        for other in [
+            "^(?=.*a|b)",
+            "^(?=.*a)(?=.*b|c)",
+            "^(?=.*a)b",
+            "(?=.*a)",
+            "^(?=.*?a)",
+            "^(?=a)",
+            "(?s)^(?=.*a)",
+            "(?m)^(?=.*a)",
+            "^(?!.*a)",
+            "^(?=.*a",
+            "^",
+        ] {
+            assert!(lookahead_conjunction_parts(other).is_none(), "{other}");
+        }
+        assert!(matches!(
+            CompiledRegex::compile(PREVIEW, true, 1).unwrap(),
+            CompiledRegex::Lookaheads(_)
+        ));
+        // A part the linear engine rejects keeps the backtracking engine.
+        assert!(matches!(
+            CompiledRegex::compile(r"^(?=.*(a)\1)", false, 1).unwrap(),
+            CompiledRegex::Fancy(_)
+        ));
+    }
+
+    /// The split engine agrees with `fancy_regex` on every input, including newlines
+    /// (`.` stops at the first one) and case variants.
+    #[test]
+    fn split_conjunctions_match_exactly_what_fancy_regex_matches() {
+        let patterns = [
+            (PREVIEW, true),
+            (PREVIEW, false),
+            (r"^(?=.*foo)(?=.*bar)", false),
+            (r"^(?=.*(?:^|;)a=1(?:;|$))", true),
+            (r"^(?=.*b$)(?=.*^a)", false),
+            (r"^(?=.*a[[:space:]]b)", false),
+            (r"^(?=.*(?:foo|bar))(?=.*[|]x)", false),
+        ];
+        let atoms = [
+            "xf_user=1",
+            "XF_SESSION=ab",
+            "xf_style_id=51",
+            "xf_style_id=5",
+            "xf_style_id=511",
+            "; ",
+            ";",
+            " ",
+            "\n",
+            "\t",
+            "a=1",
+            "A=1",
+            "foo",
+            "BAR",
+            "bar",
+            "a",
+            "b",
+            "a\nb",
+            "=",
+            "é",
+            "x",
+            "|x",
+            "xxbar",
+        ];
+        let compiled: Vec<_> = patterns
+            .iter()
+            .map(|(p, nocase)| {
+                let prepared = if *nocase {
+                    format!("(?i){p}")
+                } else {
+                    p.to_string()
+                };
+                let fancy = Regex::new(&prepared).unwrap();
+                let split = LookaheadConjunction::compile(&prepared, &fancy)
+                    .unwrap_or_else(|| panic!("{p} must split"));
+                (fancy, split)
+            })
+            .collect();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut subject = String::new();
+            let mut y = x;
+            for _ in 0..(x % 9) {
+                subject.push_str(atoms[(y % atoms.len() as u64) as usize]);
+                y = y.rotate_left(7) ^ 0x5851_f42d_4c95_7f2d;
+            }
+            for (fancy, split) in &compiled {
+                assert_eq!(
+                    split.is_match(&subject),
+                    fancy.is_match(&subject).unwrap(),
+                    "{:?} on {subject:?}",
+                    fancy.as_str()
+                );
+            }
         }
     }
 }

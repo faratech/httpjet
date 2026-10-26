@@ -16,15 +16,28 @@ use std::sync::{
 struct InflightState {
     completed: AtomicBool,
     notify: tokio::sync::Notify,
+    /// [`identity_tag`] of the leader's request: the registry is keyed by the page-cache
+    /// key hash, which is unkeyed FNV, so a crafted URL can share a victim page's hash.
+    tag: u64,
 }
 
 impl InflightState {
-    fn new() -> Self {
+    fn new(tag: u64) -> Self {
         Self {
             completed: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
+            tag,
         }
     }
+}
+
+/// A process-keyed hash of a request's cache identity, to tell apart requests whose
+/// key hashes collide.
+pub fn identity_tag(identity: &str) -> u64 {
+    use std::hash::BuildHasher;
+    static KEY: std::sync::OnceLock<std::hash::RandomState> = std::sync::OnceLock::new();
+    KEY.get_or_init(std::hash::RandomState::new)
+        .hash_one(identity)
 }
 
 /// Single-flight registry: collapses concurrent cache MISSES of the same key into a single
@@ -77,6 +90,9 @@ pub struct InflightLeader {
     registry: Arc<InflightRegistry>,
     key_hash: u64,
     state: Arc<InflightState>,
+    /// `false` for a request whose hash collided with another identity's flight: it
+    /// renders on its own and owns no registry slot.
+    registered: bool,
 }
 
 impl InflightRegistry {
@@ -86,19 +102,28 @@ impl InflightRegistry {
     }
 
     /// Become the leader for `key_hash`, or get the leader's notify to wait on as a follower.
-    pub fn enter(self: &Arc<Self>, key_hash: u64) -> Enter {
+    /// Join the flight for `key_hash` as a follower when it carries the same identity
+    /// `tag`, else lead: a request never waits on another page's render.
+    pub fn enter(self: &Arc<Self>, key_hash: u64, tag: u64) -> Enter {
         use dashmap::mapref::entry::Entry;
         match self.map.entry(key_hash) {
-            Entry::Occupied(e) => Enter::Follower(InflightFollower {
+            Entry::Occupied(e) if e.get().tag == tag => Enter::Follower(InflightFollower {
                 state: e.get().clone(),
             }),
+            Entry::Occupied(_) => Enter::Leader(InflightLeader {
+                registry: self.clone(),
+                key_hash,
+                state: Arc::new(InflightState::new(tag)),
+                registered: false,
+            }),
             Entry::Vacant(e) => {
-                let state = Arc::new(InflightState::new());
+                let state = Arc::new(InflightState::new(tag));
                 e.insert(state.clone());
                 Enter::Leader(InflightLeader {
                     registry: self.clone(),
                     key_hash,
                     state,
+                    registered: true,
                 })
             }
         }
@@ -110,7 +135,9 @@ impl Drop for InflightLeader {
         // Remove BEFORE notifying: a woken follower's re-lookup then either hits the
         // now-stored entry or (if nothing was cacheable) starts a fresh leader, never
         // waiting on us again.
-        self.registry.map.remove(&self.key_hash);
+        if self.registered {
+            self.registry.map.remove(&self.key_hash);
+        }
         // Completion is sticky for followers that have not started waiting yet;
         // notify_waiters releases every follower already registered on this state.
         self.state.completed.store(true, Ordering::Release);
@@ -208,6 +235,27 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// Two identities whose key hashes collide never follow each other: the second
+    /// leads on its own and leaves the first's registry slot alone.
+    #[test]
+    fn a_colliding_identity_leads_instead_of_following() {
+        let reg = Arc::new(InflightRegistry::default());
+        let victim = identity_tag("https\nforum.example\n/threads/a.1/");
+        let crafted = identity_tag("https\nforum.example\n/crafted-collision");
+        assert_ne!(victim, crafted);
+        let Enter::Leader(attacker) = reg.enter(7, crafted) else {
+            panic!("first request leads");
+        };
+        let Enter::Leader(independent) = reg.enter(7, victim) else {
+            panic!("a different identity must not wait on another page's render");
+        };
+        assert!(matches!(reg.enter(7, crafted), Enter::Follower(_)));
+        drop(independent);
+        assert_eq!(reg.len(), 1, "the independent leader owns no slot");
+        drop(attacker);
+        assert_eq!(reg.len(), 0);
+    }
+
     #[tokio::test]
     async fn refresh_registry_one_per_key_and_capped() {
         let reg = RefreshRegistry::new(2);
@@ -243,17 +291,17 @@ mod tests {
     async fn inflight_leader_follower_and_reentry() {
         let reg = Arc::new(InflightRegistry::default());
         // First enter for a key → leader.
-        let leader = match reg.enter(7) {
+        let leader = match reg.enter(7, 0) {
             Enter::Leader(g) => g,
             _ => panic!("first enter must be leader"),
         };
         // Concurrent enter, same key → follower with the leader's notify.
-        let follower = match reg.enter(7) {
+        let follower = match reg.enter(7, 0) {
             Enter::Follower(n) => n,
             _ => panic!("second same-key enter must be follower"),
         };
         // A different key → its own leader (different pages never serialize).
-        assert!(matches!(reg.enter(8), Enter::Leader(_)));
+        assert!(matches!(reg.enter(8, 0), Enter::Leader(_)));
 
         // A waiter on the follower's notify is woken when the leader drops.
         let woken = follower.clone();
@@ -266,19 +314,19 @@ mod tests {
             .unwrap();
 
         // Slot is freed → a fresh enter for key 7 is a leader again.
-        assert!(matches!(reg.enter(7), Enter::Leader(_)));
+        assert!(matches!(reg.enter(7, 0), Enter::Leader(_)));
     }
 
     // Lost-wakeup regression: the leader completes before the follower starts waiting.
     #[tokio::test]
     async fn inflight_follower_wakeup_survives_drop_before_wait() {
         let reg = Arc::new(InflightRegistry::default());
-        let leader = match reg.enter(42) {
+        let leader = match reg.enter(42, 0) {
             Enter::Leader(g) => g,
             _ => panic!("first enter must be leader"),
         };
         // Follower enters (mirrors the pre-wait lookup), no waiting yet.
-        let follower = match reg.enter(42) {
+        let follower = match reg.enter(42, 0) {
             Enter::Follower(n) => n,
             _ => panic!("second same-key enter must be follower"),
         };
@@ -293,15 +341,15 @@ mod tests {
     #[tokio::test]
     async fn inflight_all_late_followers_observe_completion() {
         let reg = Arc::new(InflightRegistry::default());
-        let leader = match reg.enter(43) {
+        let leader = match reg.enter(43, 0) {
             Enter::Leader(g) => g,
             _ => panic!("first enter must be leader"),
         };
-        let first = match reg.enter(43) {
+        let first = match reg.enter(43, 0) {
             Enter::Follower(n) => n,
             _ => panic!("same-key enter must be follower"),
         };
-        let second = match reg.enter(43) {
+        let second = match reg.enter(43, 0) {
             Enter::Follower(n) => n,
             _ => panic!("same-key enter must be follower"),
         };
@@ -322,14 +370,14 @@ mod tests {
     #[tokio::test]
     async fn inflight_wakes_all_parked_followers_not_just_one() {
         let reg = Arc::new(InflightRegistry::default());
-        let leader = match reg.enter(99) {
+        let leader = match reg.enter(99, 0) {
             Enter::Leader(g) => g,
             _ => panic!("first enter must be leader"),
         };
         let n = 5;
         let mut handles = Vec::new();
         for _ in 0..n {
-            let notify = match reg.enter(99) {
+            let notify = match reg.enter(99, 0) {
                 Enter::Follower(nf) => nf,
                 _ => panic!("same-key enter must be follower"),
             };
@@ -353,14 +401,14 @@ mod tests {
     #[tokio::test]
     async fn followers_waiting_after_slow_prework_observe_midwork_completion() {
         let reg = Arc::new(InflightRegistry::default());
-        let leader = match reg.enter(123) {
+        let leader = match reg.enter(123, 0) {
             Enter::Leader(g) => g,
             _ => panic!("first enter must be leader"),
         };
         let n = 8;
         let mut handles = Vec::new();
         for _ in 0..n {
-            let notify = match reg.enter(123) {
+            let notify = match reg.enter(123, 0) {
                 Enter::Follower(nf) => nf,
                 _ => panic!("same-key enter must be follower"),
             };

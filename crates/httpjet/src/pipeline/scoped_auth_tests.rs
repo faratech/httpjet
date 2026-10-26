@@ -462,6 +462,7 @@ async fn static_context_location_resolves_its_own_auth_chain() {
         enabled: true,
         allow_browse: true,
         extra_headers: vec![],
+        inherit_extra_headers: true,
         add_default_charset: None,
         charset: None,
     };

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<virtualHostConfig>
+  <docRoot>/var/www/httpjet</docRoot>
+  <indexFiles>index.html</indexFiles>
+  <allowSymbolLink>0</allowSymbolLink>
+  <rewrite>
+    <enable>1</enable>
+    <autoLoadHtaccess>0</autoLoadHtaccess>
+    <rules>RewriteEngine On
+RewriteRule \.(?:php[0-9]*|phtml|pht|phar|phps)(?:\.(?:br|gz))*(?:/|$) - [F,L,NC]
+</rules>
+  </rewrite>
+</virtualHostConfig>

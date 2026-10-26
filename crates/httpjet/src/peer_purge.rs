@@ -73,7 +73,7 @@ impl PurgeForwarder {
         req: &Request,
         peer_ip: IpAddr,
         state: &Arc<ServerState>,
-    ) -> Option<Response> {
+    ) -> Option<Inbound> {
         let path = req.uri().path();
         // Readiness probe: same loopback source gate as the purge endpoint, invisible to
         // anyone else. 200 once the boot warm-scan is done, 503 while warming.
@@ -82,14 +82,14 @@ impl PurgeForwarder {
                 return None; // untrusted source → normal handling (404), endpoint stays invisible
             }
             if !ready_method_allowed(req.method()) {
-                return Some(method_not_allowed("GET, HEAD"));
+                return Some(Inbound::Respond(method_not_allowed("GET, HEAD")));
             }
             let (warm, loaded) = state
                 .page_cache
                 .as_ref()
                 .map(|pc| (pc.is_warm(), pc.scan_loaded()))
                 .unwrap_or((true, 0));
-            return Some(ready_ack(warm, loaded));
+            return Some(Inbound::Respond(ready_ack(warm, loaded)));
         }
         // Honor every X-LiteSpeed-Purge line, not just the first (#589):
         // HTTP list-headers combine with ',' and parse_purge splits on ',',
@@ -97,26 +97,40 @@ impl PurgeForwarder {
         let directive = combined_purge_directive(req.headers());
         match classify(req.method(), path, peer_ip, directive.as_deref()) {
             Verdict::Passthrough => None,
-            Verdict::MethodNotAllowed => Some(method_not_allowed("POST")),
-            Verdict::BadRequest => Some(ack(StatusCode::BAD_REQUEST)),
-            Verdict::Apply(purge) => {
-                if let Some(store) = state.page_cache.as_ref() {
-                    match purge {
-                        Purge::All => store.purge_all(),
-                        Purge::Tags(tags) => {
-                            let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-                            store.purge_tags(&refs);
-                        }
-                    }
-                    state
-                        .metrics
-                        .purges_received
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Some(ack(StatusCode::NO_CONTENT))
-            }
+            Verdict::MethodNotAllowed => Some(Inbound::Respond(method_not_allowed("POST"))),
+            Verdict::BadRequest => Some(Inbound::Respond(ack(StatusCode::BAD_REQUEST))),
+            Verdict::Apply(purge) => Some(Inbound::Purge(purge)),
         }
     }
+}
+
+/// What [`PurgeForwarder::handle_inbound`] decided for a reserved-path request.
+pub enum Inbound {
+    /// Answer with this response.
+    Respond(Response),
+    /// A valid purge, for [`apply`].
+    Purge(Purge),
+}
+
+/// Run `purge` and answer it. A purge holds the store's commit lock and unlinks every
+/// purged file (a `*` over ~100k entries takes about a second), so it runs on the
+/// blocking pool: never on a serving core, whose other connections would stall with it.
+pub async fn apply(purge: Purge, state: &Arc<ServerState>) -> Response {
+    if let Some(store) = state.page_cache.clone() {
+        let _ = tokio::task::spawn_blocking(move || match purge {
+            Purge::All => store.purge_all(),
+            Purge::Tags(tags) => {
+                let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+                store.purge_tags(&refs);
+            }
+        })
+        .await;
+        state
+            .metrics
+            .purges_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    ack(StatusCode::NO_CONTENT)
 }
 
 /// The pure authenticate-and-classify step — no I/O, no store, no `Request` —

@@ -241,6 +241,9 @@ pub(super) struct RawCgiRLimit {
 pub(super) struct RawFileAccessControl {
     #[serde(rename = "followSymbolLink", default)]
     pub(super) follow_symbol_link: Option<String>,
+    /// Read only to refuse it when enabled: httpjet does not enforce ownership.
+    #[serde(rename = "forceStrictOwnership", default)]
+    pub(super) force_strict_ownership: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -421,6 +424,9 @@ pub(super) struct RawVHostDecl {
     pub(super) listeners: Option<String>,
     #[serde(default)]
     pub(super) enabled: Option<String>,
+    /// Read only to refuse it when enabled (see the server-level field).
+    #[serde(rename = "forceStrictOwnership", default)]
+    pub(super) force_strict_ownership: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -756,6 +762,15 @@ pub(super) struct RawVhostSecurity {
     pub(super) access_control: Option<RawScopedAccessControl>,
     #[serde(rename = "realmList", default)]
     pub(super) realm_list: Option<RawRealmList>,
+    /// Read only to refuse it when enabled: httpjet has no hotlink protection.
+    #[serde(rename = "hotlinkCtrl", default)]
+    pub(super) hotlink_ctrl: Option<RawHotlinkCtrl>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(super) struct RawHotlinkCtrl {
+    #[serde(rename = "enableHotlinkCtrl", default)]
+    pub(super) enable: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

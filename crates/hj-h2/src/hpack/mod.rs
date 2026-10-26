@@ -19,7 +19,9 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
+
+use rustc_hash::FxHashMap;
 
 pub mod huffman; // QPACK (RFC 9204) reuses the RFC 7541 Huffman table — exposed for hj-http3/uring
 mod integer;
@@ -56,14 +58,66 @@ fn encode_string(out: &mut Vec<u8>, s: &str) {
     encode_string_bytes(out, s.as_bytes())
 }
 
+/// Shortest string literal [`LONG_LITERALS`] remembers: anything longer is never put
+/// in the dynamic table (see `Encoder::indexable`), so it is re-encoded on every message.
+const LONG_LITERAL_MIN: usize = 257;
+const LONG_LITERAL_SLOTS: usize = 8;
+
+std::thread_local! {
+    /// The encoded form (length prefix included) of the last few long string literals
+    /// this thread emitted, keyed by their raw octets. A page's preload `Link` set runs to
+    /// kilobytes, repeats verbatim on every response of that template (and again in its
+    /// 103), and Huffman coding it is a serial bit-packing chain; comparing and copying
+    /// the remembered encoding costs a small fraction of that.
+    static LONG_LITERALS: std::cell::RefCell<(usize, Vec<(Box<[u8]>, Box<[u8]>)>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
 fn encode_string_bytes(out: &mut Vec<u8>, raw: &[u8]) {
+    if raw.len() < LONG_LITERAL_MIN {
+        return encode_string_literal(out, raw);
+    }
+    LONG_LITERALS.with(|memo| {
+        let Ok(mut memo) = memo.try_borrow_mut() else {
+            return encode_string_literal(out, raw);
+        };
+        if let Some((_, encoded)) = memo.1.iter().find(|(key, _)| key.as_ref() == raw) {
+            out.extend_from_slice(encoded);
+            return;
+        }
+        let start = out.len();
+        encode_string_literal(out, raw);
+        let Some(encoded) = out.get(start..) else {
+            return;
+        };
+        let entry = (Box::from(raw), Box::from(encoded));
+        let (next, slots) = &mut *memo;
+        if let Some(slot) = slots.get_mut(*next) {
+            *slot = entry;
+        } else {
+            slots.push(entry);
+        }
+        *next = (*next + 1) % LONG_LITERAL_SLOTS;
+    })
+}
+
+/// Header values [`LONG_LITERALS`] must not keep: credentials and session cookies are
+/// secrets, and differ per message anyway.
+fn value_is_secret(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization" | "cookie" | "proxy-authorization" | "set-cookie"
+    )
+}
+
+fn encode_string_literal(out: &mut Vec<u8>, raw: &[u8]) {
     // Huffman-encode when it is strictly smaller than the raw literal (what
     // compliant encoders do); otherwise emit the raw bytes. The H bit is the top bit
     // of the 7-bit length prefix.
     let hlen = huffman::encoded_len(raw);
     if hlen < raw.len() {
         integer::encode(out, hlen as u64, 7, 0x80); // H=1
-        huffman::encode(out, raw);
+        huffman::encode_sized(out, raw, hlen);
     } else {
         integer::encode(out, raw.len() as u64, 7, 0x00); // H=0
         out.extend_from_slice(raw);
@@ -142,13 +196,15 @@ pub struct Encoder {
     /// seqno `ins_count - 1`.
     ins_count: u64,
     /// O(1) lookup replacing the per-header linear scan of `dynamic`: header name →
-    /// its LIVE `(value, seqno)` entries in ascending-seqno order (oldest first). The
-    /// `Box<str>` key borrow-looks-up from `&str` with no allocation; the per-name list
-    /// is ~1 entry for distinct-name responses (the heavy-vhost case). Kept exactly in
-    /// sync with `dynamic` by eager delete in [`Self::evict_back`] (so a stale entry can
-    /// never yield a wrong index → no header corruption). `find_dynamic`/`find_dynamic_name`
-    /// are proven equal to the retained linear oracle by a property test.
-    name_index: HashMap<Box<str>, Vec<(Box<[u8]>, u64)>>,
+    /// the seqnos of its LIVE entries in ascending order (oldest first); a value is
+    /// compared in place in `dynamic`. The `Box<str>` key borrow-looks-up from `&str`
+    /// with no allocation; the per-name list is ~1 entry for distinct-name responses
+    /// (the heavy-vhost case). Kept exactly in sync with `dynamic` by eager delete in
+    /// [`Self::evict_back`] (so a stale entry can never yield a wrong index → no header
+    /// corruption). `find_dynamic`/`find_dynamic_name` are proven equal to the retained
+    /// linear oracle by a property test. FxHash: the table holds ~100 entries whose names
+    /// come from our own responses, so there is no flooding to defend against.
+    name_index: FxHashMap<Box<str>, Vec<u64>>,
     size: usize,
     /// The dynamic-table size currently in effect — kept in lock-step with the peer's
     /// decoder (it only changes when a size-update instruction is actually emitted).
@@ -176,7 +232,7 @@ impl Default for Encoder {
             dynamic: VecDeque::new(),
             seqnos: VecDeque::new(),
             ins_count: 0,
-            name_index: HashMap::new(),
+            name_index: FxHashMap::default(),
             size: 0,
             max_size: 4096,
             preferred_max: 4096,
@@ -235,17 +291,16 @@ impl Encoder {
     fn find_dynamic(&self, name: &str, value: &[u8]) -> Option<usize> {
         let list = self.name_index.get(name)?;
         // Ascending seqno order, so reverse = newest-first = front-most.
-        for (v, seqno) in list.iter().rev() {
-            if v.as_ref() == value {
-                return Some(self.hpack_index(*seqno));
-            }
-        }
-        None
+        list.iter().rev().find_map(|&seqno| {
+            let pos = (self.ins_count - 1 - seqno) as usize;
+            let (_, v) = self.dynamic.get(pos)?;
+            (v.as_ref() == value).then(|| self.hpack_index(seqno))
+        })
     }
 
     /// 1-based HPACK index of the front-most (newest) dynamic-table entry with `name`.
     fn find_dynamic_name(&self, name: &str) -> Option<usize> {
-        let (_, seqno) = self.name_index.get(name)?.last()?;
+        let seqno = self.name_index.get(name)?.last()?;
         Some(self.hpack_index(*seqno))
     }
 
@@ -260,7 +315,7 @@ impl Encoder {
         };
         self.size -= n.len() + v.len() + ENTRY_OVERHEAD;
         if let Some(list) = self.name_index.get_mut(&n) {
-            if let Some(pos) = list.iter().position(|(_, s)| *s == seqno) {
+            if let Some(pos) = list.iter().position(|s| *s == seqno) {
                 list.remove(pos);
             }
             if list.is_empty() {
@@ -287,10 +342,9 @@ impl Encoder {
             self.seqnos.push_front(seqno);
             // Borrow-lookup first so an existing name doesn't allocate a throwaway key.
             match self.name_index.get_mut(name) {
-                Some(list) => list.push((value.into(), seqno)),
+                Some(list) => list.push(seqno),
                 None => {
-                    self.name_index
-                        .insert(name.into(), vec![(value.into(), seqno)]);
+                    self.name_index.insert(name.into(), vec![seqno]);
                 }
             }
         }
@@ -395,7 +449,11 @@ impl Encoder {
                 encode_string(out, name);
             }
         }
-        encode_string_bytes(out, value);
+        if value_is_secret(name) {
+            encode_string_literal(out, value);
+        } else {
+            encode_string_bytes(out, value);
+        }
     }
 }
 

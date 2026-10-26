@@ -1,0 +1,4 @@
+#!/bin/sh
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+exec python3 -I /opt/httpjet/libexec/manage.py "$@"

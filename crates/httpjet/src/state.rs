@@ -278,6 +278,8 @@ pub struct ServerState {
     pub static_cache: Arc<hj_pagecache::PageStore>,
     /// TTL-coalesced `-f`/`-d` cache for the rewrite front-controller tests.
     pub stat_cache: Arc<StatCache>,
+    /// (`--fast-early-bridge`) Mode and counters, kept across a reload.
+    pub early_bridge: Arc<crate::pipeline::early_bridge::EarlyBridge>,
     /// TTL-coalesced cache of rewrite outcomes for `path_cacheable` rulesets
     /// (lets repeated requests skip full ruleset evaluation). TTL from
     /// `--rewrite-outcome-ttl-ms` (0 = off).
@@ -422,6 +424,8 @@ pub struct Metrics {
     pub fast_cookie_benign_only: Arc<AtomicU64>,
     /// Why on-core `fast_serve` requests bridged to the tokio pipeline, per reason.
     pub fast_bridge: Arc<crate::pipeline::fast_bridge::FastBridgeCounters>,
+    /// Page-cache lookups split by caller (on-core probe vs dispatch) and outcome.
+    pub pagecache_lookup: Arc<crate::lscache::LookupCounters>,
     /// TLS connections that completed a FULL handshake (rustls `HandshakeKind::Full`
     /// or `FullWithHelloRetryRequest`). Compared against `_resumed` to size the
     /// resumption win the client-verify `NoServerSessions` posture forfeits.
@@ -1192,6 +1196,7 @@ impl ServerState {
             vhost_error_logs,
             static_cache,
             stat_cache: Arc::new(StatCache::new(DEFAULT_STAT_TTL)),
+            early_bridge: Arc::default(),
             rewrite_outcomes: Arc::new(crate::pipeline::RewriteOutcomeCache::new(
                 rewrite_tuning.outcome_ttl,
             )),
@@ -1346,6 +1351,7 @@ impl ServerState {
             rewrite_cache: Arc::new(HtaccessCache::new()),
             static_cache: old.static_cache.clone(),
             stat_cache: old.stat_cache.clone(),
+            early_bridge: old.early_bridge.clone(),
             rewrite_outcomes: Arc::new(old.rewrite_outcomes.empty_generation()),
             rewrite_ua_classify: old.rewrite_ua_classify,
             ua_classify: Arc::new(crate::pipeline::UaClassifyCache::new()),
@@ -1629,6 +1635,7 @@ mod tests {
             enabled,
             allow_browse: true,
             extra_headers: Vec::new(),
+            inherit_extra_headers: true,
             add_default_charset: None,
             charset: None,
             cache_policy: None,

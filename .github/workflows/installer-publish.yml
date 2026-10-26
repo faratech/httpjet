@@ -1,0 +1,172 @@
+name: Promote qualified installer release
+on:
+  workflow_dispatch:
+    inputs:
+      qualification_run_id:
+        description: Successful Installer release qualification run ID
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: httpjet-apt-stable
+  cancel-in-progress: false
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    environment: httpjet-stable
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qualified-release
+          path: candidate
+          run-id: ${{ inputs.qualification_run_id }}
+          github-token: ${{ github.token }}
+      - name: Install archive tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg python3 binutils rpm createrepo-c
+      - name: Verify qualification run and exact release tag
+        env:
+          QUALIFICATION_RUN: ${{ inputs.qualification_run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 packaging/release/verify-run.py "$QUALIFICATION_RUN" candidate
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'packaging/release')
+          import github_assets, release
+          github_assets.validate_tag_context(release.load('candidate/manifest.json'),
+              os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_REF'], os.environ['GITHUB_SHA'])
+          PY
+          release_commit=$(python3 -c 'import json;print(json.load(open("candidate/manifest.json"))["commit"])')
+          git show "$release_commit:packaging/installer/install.sh.in" > approved-installer.in
+          git show "$release_commit:packaging/services/manage.py" > approved-manage.py
+      - name: Stage signed stable snapshot
+        env:
+          ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          ARCHIVE_PRIVATE_KEY: ${{ secrets.HTTPJET_ARCHIVE_PRIVATE_KEY }}
+          FIRST_RELEASE: ${{ vars.HTTPJET_FIRST_RELEASE }}
+        run: |
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/httpjet-signing.XXXXXX")
+          printf 'GNUPGHOME=%s\n' "$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$ARCHIVE_KEY" > archive.asc
+          printf '%s\n' "$ARCHIVE_PRIVATE_KEY" | gpg --batch --import
+          python3 - <<'PY'
+          import os,pathlib,sys,shutil,urllib.error
+          sys.path.insert(0,'packaging/release')
+          import release
+          previous=pathlib.Path('previous')
+          try:
+              release.fetch_current(release.REPO_URL,previous,pathlib.Path('archive.asc'),os.environ['ARCHIVE_FINGERPRINT'],True)
+          except urllib.error.HTTPError as error:
+              if error.code != 404 or error.url != 'https://packages.httpjet.net/releases/stable.json' or os.environ.get('FIRST_RELEASE') != 'true':
+                  raise
+              shutil.rmtree(previous)
+          release.stage(pathlib.Path('candidate'),pathlib.Path('snapshot'),pathlib.Path('archive.asc'),
+                        os.environ['ARCHIVE_FINGERPRINT'],pathlib.Path('approved-installer.in'),
+                        previous=previous if previous.exists() else None,installer_helper=pathlib.Path('approved-manage.py'))
+          PY
+      - name: Publish immutable objects then signed metadata
+        env:
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          HTTPJET_S3_ENDPOINT: ${{ vars.HTTPJET_S3_ENDPOINT }}
+          HTTPJET_S3_BUCKET: ${{ vars.HTTPJET_S3_BUCKET }}
+          HTTPJET_S3_REGION: ${{ vars.HTTPJET_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.HTTPJET_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.HTTPJET_S3_SECRET_ACCESS_KEY }}
+        run: |
+          python3 packaging/release/publish.py snapshot --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT"
+          python3 packaging/release/check-public.py snapshot --without-website-redirect
+      - name: Retain the verified public snapshot for GitHub release
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-publication-snapshot
+          path: snapshot/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Website redirect deployment artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: httpjet-website-installer-redirect
+          path: packaging/release/website-redirects
+          if-no-files-found: error
+      - name: Remove ephemeral signing material
+        if: always()
+        run: |
+          gpgconf --kill all || true
+          rm -rf "$GNUPGHOME"
+
+  github-release:
+    needs: promote
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: verified-publication-snapshot
+          path: snapshot
+      - name: Install archive verification tools
+        run: sudo apt-get update && sudo apt-get install -y rpm gnupg python3
+      - name: Assemble only the verified release assets
+        env:
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+        run: |
+          python3 packaging/release/github_assets.py snapshot --snapshot snapshot \
+            --public-key snapshot/apt/httpjet-archive-keyring.asc --fingerprint "$ARCHIVE_FINGERPRINT" \
+            --output github-release-assets --generated github-promotion-assets
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, 'packaging/release')
+          import github_assets, release
+          github_assets.validate_tag_context(release.load('github-release-assets/manifest.json'),
+              os.environ['GITHUB_REPOSITORY'], os.environ['GITHUB_REF'], os.environ['GITHUB_SHA'])
+          PY
+      - name: Verify build-workflow attestations on the exact signed artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for path in github-release-assets/*; do
+            name=${path##*/}
+            if [ -f "github-promotion-assets/$name" ]; then
+              cmp -s "$path" "github-promotion-assets/$name"
+              continue
+            fi
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/installer-release.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          done
+      - name: Attest the rendered bootstrap and publication signatures
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: github-promotion-assets/*
+      - name: Verify promotion attestations and publish the exact release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for path in github-promotion-assets/*; do
+            name=${path##*/}
+            cmp -s "$path" "github-release-assets/$name"
+            gh attestation verify "$path" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/installer-publish.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+          done
+          python3 packaging/release/github_assets.py publish --directory github-release-assets
+      - name: Verify public GitHub release downloads
+        run: python3 packaging/release/github_assets.py verify-public --directory github-release-assets

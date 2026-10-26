@@ -291,12 +291,13 @@ def run_load(args) -> tuple[LoadStats, float]:
     scheduler = RequestScheduler(args.requests, args.concurrency, max_errors)
     stats = LoadStats(args.requests)
     transfers = {}
-    url = build_url(args.authority, args.port, args.path)
+    paths = args.paths or [args.path]
+    urls = [build_url(args.authority, args.port, p) for p in paths]
     resolve = build_resolve_entry(args.authority, args.port, args.connect_host)
     if args.portless:
         # A `:port` authority bypasses httpjet's page cache (and trips canonical
         # redirects): keep the authority portless and dial the loopback port instead.
-        url = f"https://{args.authority}{args.path}"
+        urls = [f"https://{args.authority}{p}" for p in paths]
         connect_to = f"{_url_host(args.authority)}:443:{args.connect_host}:{args.port}"
     timeout_ms = max(1, round(args.timeout * 1000))
 
@@ -315,7 +316,7 @@ def run_load(args) -> tuple[LoadStats, float]:
         stats.started()
         state = Transfer(request_id=request_id, started_at=time.monotonic())
         handle = pycurl.Curl()
-        handle.setopt(pycurl.URL, url)
+        handle.setopt(pycurl.URL, urls[request_id % len(urls)])
         if args.portless:
             handle.setopt(pycurl.CONNECT_TO, [connect_to])
         else:
@@ -337,6 +338,8 @@ def run_load(args) -> tuple[LoadStats, float]:
         handle.setopt(pycurl.USERAGENT, "httpjet-h3bench/1")
         if args.header:
             handle.setopt(pycurl.HTTPHEADER, args.header)
+        if args.data is not None:
+            handle.setopt(pycurl.POSTFIELDS, args.data)
         transfers[handle] = state
         multi.add_handle(handle)
         return True
@@ -394,8 +397,12 @@ def run_load(args) -> tuple[LoadStats, float]:
 
             fill()
             if transfers and processed == 0:
-                ready = multi.select(1.0)
-                if ready == -1:
+                # libcurl also waits on its own timers, not only on sockets: an unbounded
+                # select sat out the whole second whenever no socket was ready, which a
+                # low-concurrency run hits on almost every request.
+                curl_wait_ms = multi.timeout()
+                wait = 1.0 if curl_wait_ms < 0 else min(curl_wait_ms / 1000.0, 1.0)
+                if wait > 0 and multi.select(wait) == -1:
                     time.sleep(0.001)
     finally:
         for handle in list(transfers):
@@ -441,7 +448,27 @@ def parse_args(argv=None):
         help="portless authority; dial connect_host:port via CONNECT_TO",
     )
     parser.add_argument("-H", "--header", action="append", type=request_header, default=[])
+    parser.add_argument("--data-file", help="POST this file's bytes as every request's body")
+    parser.add_argument(
+        "--paths-file",
+        help="request paths, one per line; request i fetches line i modulo the count "
+        "(the positional path is then ignored)",
+    )
     args = parser.parse_args(argv)
+    args.data = None
+    if args.data_file:
+        with open(args.data_file, "rb") as fh:
+            args.data = fh.read()
+    args.paths = []
+    if args.paths_file:
+        with open(args.paths_file, encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+        try:
+            args.paths = [request_path(ln) for ln in lines]
+        except argparse.ArgumentTypeError as exc:
+            parser.error(f"--paths-file: {exc}")
+        if not args.paths:
+            parser.error("--paths-file has no paths")
     args.concurrency = min(args.concurrency, args.requests)
     if args.connections is None:
         args.connections = min(16, args.concurrency)

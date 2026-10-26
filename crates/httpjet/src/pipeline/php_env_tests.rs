@@ -1,5 +1,5 @@
 //! CGI environment a script sees through the full pipeline, against a synthetic
-//! LSAPI peer that echoes selected env vars (no PHP process, no production socket).
+//! LSAPI peer that echoes selected `$_SERVER` vars (no PHP process, no production socket).
 use super::*;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,7 +28,32 @@ fn echo_body(env: &BTreeMap<String, String>) -> String {
         .collect()
 }
 
-fn parse_env(body: &[u8]) -> BTreeMap<String, String> {
+/// `$_SERVER` as lsphp builds it (`sapi_lsapi_register_variables`): the header block
+/// first, then the env table, whose entries win.
+fn server_vars(body: &[u8]) -> BTreeMap<String, String> {
+    let (env, env_end) = parse_env(body);
+    let i32_at = |at: usize| i32::from_le_bytes(body[at..at + 4].try_into().unwrap()) as usize;
+    let pad = (8 - ((8 + env_end) % 8)) % 8;
+    let raw_at = env_end + pad + hj_lsapi::HEADER_INDEX_LEN + i32_at(24) * 16;
+    let raw = String::from_utf8_lossy(&body[raw_at..raw_at + i32_at(0)]).into_owned();
+    let mut vars = BTreeMap::new();
+    for line in raw.split("\r\n") {
+        let Some((name, value)) = line.split_once(": ") else {
+            continue;
+        };
+        let key = match name.to_ascii_lowercase().as_str() {
+            "transfer-encoding" => continue,
+            "content-type" => "CONTENT_TYPE".to_string(),
+            "content-length" => "CONTENT_LENGTH".to_string(),
+            name => format!("HTTP_{}", name.to_ascii_uppercase().replace('-', "_")),
+        };
+        vars.insert(key, value.to_string());
+    }
+    vars.extend(env);
+    vars
+}
+
+fn parse_env(body: &[u8]) -> (BTreeMap<String, String>, usize) {
     let field = |at: usize| u16::from_be_bytes(body[at..at + 2].try_into().unwrap()) as usize;
     let mut env = BTreeMap::new();
     let mut at = 36;
@@ -47,11 +72,11 @@ fn parse_env(body: &[u8]) -> BTreeMap<String, String> {
             at += k + v;
         }
     }
-    env
+    (env, at)
 }
 
 fn packet(kind: hj_lsapi::PacketType, body: &[u8]) -> Vec<u8> {
-    let mut out = vec![b'L', b'S', kind as u8, 0];
+    let mut out = vec![b'L', b'S', kind as u8, hj_lsapi::proto::HOST_LSAPI_ENDIAN];
     out.extend_from_slice(&((8 + body.len()) as u32).to_le_bytes());
     out.extend_from_slice(body);
     out
@@ -90,7 +115,7 @@ async fn echo_peer(listener: tokio::net::UnixListener) {
                 if head[2] != hj_lsapi::PacketType::BeginRequest as u8 {
                     continue;
                 }
-                let env = parse_env(&body);
+                let env = server_vars(&body);
                 if stream
                     .write_all(&response(echo_body(&env).as_bytes()))
                     .await

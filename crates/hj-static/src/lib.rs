@@ -403,7 +403,7 @@ impl StaticFiles {
                 .symlinked_roots
                 .get(doc_root)
                 .is_some_and(|until| *until > Instant::now());
-        if !symlinked {
+        if !symlinked && !openat2_unavailable() {
             use rustix::io::Errno;
             match rustix::fs::openat2(
                 rustix::fs::CWD,
@@ -429,6 +429,7 @@ impl StaticFiles {
                         || e == Errno::NOSYS
                         || e == Errno::OPNOTSUPP =>
                 {
+                    note_openat2_error(e);
                     admit(
                         &self.hdr.symlinked_roots,
                         &self.hdr.symlinked_roots_count,
@@ -1528,6 +1529,87 @@ pub fn safe_index_name(idx: &str) -> bool {
     !idx.is_empty() && !idx.starts_with('/') && !idx.split(['/', '\\']).any(|seg| seg == "..")
 }
 
+/// Set once `openat2` came back ENOSYS: it is missing, or blocked by a seccomp sandbox
+/// (systemd's `RestrictSUIDSGID=` blocks it outright, since its mode argument cannot be
+/// inspected). Every later call would fail the same way, so callers skip it.
+static OPENAT2_UNAVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has found `openat2` unavailable (see [`note_openat2_error`]).
+pub fn openat2_unavailable() -> bool {
+    OPENAT2_UNAVAILABLE.load(Ordering::Relaxed)
+}
+
+/// Record an `openat2` failure; ENOSYS means no later call can succeed either.
+pub fn note_openat2_error(error: rustix::io::Errno) {
+    if error == rustix::io::Errno::NOSYS && !OPENAT2_UNAVAILABLE.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "openat2 is unavailable (ENOSYS: a seccomp sandbox such as systemd's \
+             RestrictSUIDSGID= blocks it); resolving paths one component at a time"
+        );
+    }
+}
+
+/// `openat2(root, rel, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` for when the syscall is
+/// unavailable: each directory is opened `O_PATH | O_NOFOLLOW` from the descriptor of
+/// the one before (search permission, as the kernel walk needs), and the last name
+/// with `O_NOFOLLOW`, so a symlink anywhere is refused with ELOOP and a `..` that
+/// would leave the root with EXDEV, as those flags refuse them.
+fn open_beneath_no_symlinks(
+    root_fd: &OwnedFd,
+    rel: &str,
+    oflags: OFlags,
+) -> rustix::io::Result<OwnedFd> {
+    use std::os::fd::AsFd;
+    let symlink_or = |at: std::os::fd::BorrowedFd<'_>, name: &str, error: rustix::io::Errno| {
+        match rustix::fs::statat(at, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) if rustix::fs::FileType::from_raw_mode(st.st_mode).is_symlink() => {
+                rustix::io::Errno::LOOP
+            }
+            _ => error,
+        }
+    };
+    if rel.is_empty() {
+        return Err(rustix::io::Errno::NOENT);
+    }
+    if rel.starts_with('/') {
+        return Err(rustix::io::Errno::XDEV);
+    }
+    let mut names = rel
+        .split('/')
+        .filter(|name| !name.is_empty() && *name != ".")
+        .peekable();
+    let mut dirs: Vec<OwnedFd> = Vec::new();
+    while let Some(name) = names.next() {
+        if name == ".." {
+            if dirs.pop().is_none() {
+                return Err(rustix::io::Errno::XDEV);
+            }
+            continue;
+        }
+        let at = dirs.last().map_or(root_fd.as_fd(), |d| d.as_fd());
+        if names.peek().is_none() {
+            let mut flags = oflags | OFlags::NOFOLLOW;
+            if rel.ends_with('/') {
+                flags |= OFlags::DIRECTORY;
+            }
+            return rustix::fs::openat(at, name, flags, Mode::empty()).map_err(|e| {
+                if e == rustix::io::Errno::LOOP {
+                    e
+                } else {
+                    symlink_or(at, name, e)
+                }
+            });
+        }
+        let path_flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let next = rustix::fs::openat(at, name, path_flags, Mode::empty())
+            .map_err(|e| symlink_or(at, name, e))?;
+        dirs.push(next);
+    }
+    let at = dirs.last().map_or(root_fd.as_fd(), |d| d.as_fd());
+    rustix::fs::openat(at, ".", oflags, Mode::empty())
+}
+
 fn open_beneath(
     root_fd: &OwnedFd,
     rel: &str,
@@ -1539,40 +1621,46 @@ fn open_beneath(
     // open(2) by naming a FIFO — one stalled thread per request.
     let oflags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK;
 
+    let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
+    let beneath = if openat2_unavailable() {
+        Err(rustix::io::Errno::NOSYS)
+    } else {
+        rustix::fs::openat2(root_fd, rel, oflags, Mode::empty(), resolve).inspect_err(|e| {
+            note_openat2_error(*e);
+        })
+    };
     let (fd, followed_symlink) = if allow_symlink {
         // Keep ordinary files at one open syscall while learning whether a
         // symlink was traversed. Only the exceptional symlink case falls back
         // to the operator-authorized openat path and pays canonical readlink
         // work; this preserves both names for script classification without
         // slowing normal static files.
-        let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
-        match rustix::fs::openat2(root_fd, rel, oflags, Mode::empty(), resolve) {
+        match beneath {
             Ok(fd) => (fd, false),
-            Err(e) if e == rustix::io::Errno::LOOP || e == rustix::io::Errno::XDEV => (
-                rustix::fs::openat(root_fd, rel, oflags, Mode::empty())?,
-                true,
-            ),
-            Err(e) if e == rustix::io::Errno::NOSYS || e == rustix::io::Errno::OPNOTSUPP => (
-                rustix::fs::openat(root_fd, rel, oflags, Mode::empty())?,
-                true,
-            ),
+            Err(e)
+                if e == rustix::io::Errno::LOOP
+                    || e == rustix::io::Errno::XDEV
+                    || e == rustix::io::Errno::NOSYS
+                    || e == rustix::io::Errno::OPNOTSUPP =>
+            {
+                (
+                    rustix::fs::openat(root_fd, rel, oflags, Mode::empty())?,
+                    true,
+                )
+            }
             Err(e) => return Err(io::Error::from(e)),
         }
     } else {
-        let resolve = ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS;
-        match rustix::fs::openat2(root_fd, rel, oflags, Mode::empty(), resolve) {
+        match beneath {
             Ok(fd) => (fd, false),
+            // openat2 unsupported by this kernel, sandbox *or filesystem* (overlayfs /
+            // Docker, some FUSE/NFS — even on kernels >=5.6). A single openat(O_NOFOLLOW)
+            // would only block a symlink in the FINAL component, so an in-docroot
+            // intermediate symlink (e.g. `/link_to_etc/passwd`, where `link_to_etc` ->
+            // `/etc`) would be traversed and leak files outside the root: walk the path
+            // one no-follow component at a time instead.
             Err(e) if e == rustix::io::Errno::NOSYS || e == rustix::io::Errno::OPNOTSUPP => {
-                // openat2 unsupported by this kernel *or filesystem* (overlayfs /
-                // Docker, some FUSE/NFS — even on kernels >=5.6). We must NOT fall
-                // back to a single openat(O_NOFOLLOW): it only blocks a symlink in
-                // the FINAL component, so an in-docroot intermediate symlink (e.g.
-                // `/link_to_etc/passwd`, where `link_to_etc` -> `/etc`) would be
-                // traversed and leak files outside the root. With followSymbolLink
-                // off, the filesystem can no longer enforce RESOLVE_NO_SYMLINKS, so
-                // fail closed (ENOENT -> 404) rather than serving with a weaker
-                // guarantee than the operator asked for.
-                return Err(io::Error::from(rustix::io::Errno::NOENT));
+                (open_beneath_no_symlinks(root_fd, rel, oflags)?, false)
             }
             Err(e) => return Err(io::Error::from(e)),
         }

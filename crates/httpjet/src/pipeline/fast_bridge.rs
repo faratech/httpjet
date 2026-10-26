@@ -53,10 +53,16 @@ pub(crate) enum FastBridge {
     CookiedScript,
     /// A disabled or suspended vhost (the full pipeline renders the 403).
     VhostDisabled,
+    /// (`--fast-early-bridge`) A cookieless request with no page cache to answer it (none, or a
+    /// foreign host) that the static branch would decline, bridged before the prefix.
+    EarlyNoCache,
+    /// (`--fast-early-bridge`) As `EarlyNoCache`, but because no page entry can be resident for
+    /// the path.
+    EarlyCacheAbsent,
 }
 
 impl FastBridge {
-    pub(crate) const ALL: [FastBridge; 30] = [
+    pub(crate) const ALL: [FastBridge; 32] = [
         FastBridge::PreHandler,
         FastBridge::Acme,
         FastBridge::Method,
@@ -87,6 +93,8 @@ impl FastBridge {
         FastBridge::CookiedNoTarget,
         FastBridge::CookiedScript,
         FastBridge::VhostDisabled,
+        FastBridge::EarlyNoCache,
+        FastBridge::EarlyCacheAbsent,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -121,6 +129,8 @@ impl FastBridge {
             FastBridge::CookiedNoTarget => "cookied_no_target",
             FastBridge::CookiedScript => "cookied_script",
             FastBridge::VhostDisabled => "vhost_disabled",
+            FastBridge::EarlyNoCache => "early_no_cache",
+            FastBridge::EarlyCacheAbsent => "early_cache_absent",
         }
     }
 }
@@ -156,7 +166,7 @@ mod tests {
             assert_eq!(*r as usize, i, "{r:?} out of order");
         }
         assert_eq!(
-            FastBridge::VhostDisabled as usize + 1,
+            FastBridge::EarlyCacheAbsent as usize + 1,
             FastBridge::ALL.len()
         );
     }

@@ -268,19 +268,84 @@ pub(crate) static TABLE: [(u32, u8); 257] = [
     (0x3fffffff, 30),
 ];
 
+/// The code and bit length of octet `b` (the table also holds EOS at 256).
+#[inline(always)]
+fn code_of(b: u8) -> (u32, u8) {
+    TABLE[b as usize]
+}
+
 /// Number of octets `data` would occupy Huffman-encoded (RFC 7541 §5.2 padding).
 pub(crate) fn encoded_len(data: &[u8]) -> usize {
-    let bits: usize = data.iter().map(|&b| TABLE[b as usize].1 as usize).sum();
+    let bits: usize = data.iter().map(|&b| code_of(b).1 as usize).sum();
     bits.div_ceil(8)
 }
 
 /// Append the Huffman encoding of `data` to `out`, padding the last octet with the
 /// EOS prefix (1-bits).
 pub fn encode(out: &mut Vec<u8>, data: &[u8]) {
+    encode_sized(out, data, encoded_len(data));
+}
+
+/// [`encode`] when the caller already has `encoded_len(data)`. The output is sized once
+/// and filled 32 bits at a time: long header values (a page's preload `Link` set runs to
+/// kilobytes and repeats on every response) made a per-octet `push` the bulk of HPACK
+/// encode time. A wrong `encoded_len` falls back to encoding octet by octet; it never
+/// panics.
+pub(crate) fn encode_sized(out: &mut Vec<u8>, data: &[u8], encoded_len: usize) {
+    let start = out.len();
+    out.resize(start + encoded_len, 0);
+    if !fill(out.get_mut(start..).unwrap_or_default(), data) {
+        out.truncate(start);
+        encode_octets(out, data);
+    }
+}
+
+/// Encode `data` into exactly `dst`; `false` when it does not fit exactly.
+#[inline(always)]
+fn fill(mut dst: &mut [u8], data: &[u8]) -> bool {
+    // At most 31 pending bits plus one code of at most 30: never past 61 bits.
     let mut acc: u64 = 0;
     let mut nbits: u32 = 0;
     for &b in data {
-        let (code, len) = TABLE[b as usize];
+        let (code, len) = code_of(b);
+        acc = (acc << len) | code as u64;
+        nbits += len as u32;
+        if nbits >= 32 {
+            nbits -= 32;
+            let Some((word, rest)) = std::mem::take(&mut dst).split_first_chunk_mut::<4>() else {
+                return false;
+            };
+            *word = ((acc >> nbits) as u32).to_be_bytes();
+            dst = rest;
+        }
+    }
+    while nbits >= 8 {
+        nbits -= 8;
+        let Some((octet, rest)) = std::mem::take(&mut dst).split_first_mut() else {
+            return false;
+        };
+        *octet = (acc >> nbits) as u8;
+        dst = rest;
+    }
+    if nbits > 0 {
+        // Pad the remaining bits with 1s (the most-significant bits of EOS).
+        let pad = 8 - nbits;
+        let Some((octet, rest)) = std::mem::take(&mut dst).split_first_mut() else {
+            return false;
+        };
+        *octet = ((acc << pad) | ((1u64 << pad) - 1)) as u8;
+        dst = rest;
+    }
+    dst.is_empty()
+}
+
+#[cold]
+#[inline(never)]
+fn encode_octets(out: &mut Vec<u8>, data: &[u8]) {
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
+    for &b in data {
+        let (code, len) = code_of(b);
         acc = (acc << len) | code as u64;
         nbits += len as u32;
         while nbits >= 8 {
@@ -289,37 +354,85 @@ pub fn encode(out: &mut Vec<u8>, data: &[u8]) {
         }
     }
     if nbits > 0 {
-        // Pad the remaining bits with 1s (the most-significant bits of EOS).
         let pad = 8 - nbits;
-        acc = (acc << pad) | ((1u64 << pad) - 1);
-        out.push(acc as u8);
+        out.push(((acc << pad) | ((1u64 << pad) - 1)) as u8);
     }
 }
 
-/// Root lookup width. A `2^ROOT_BITS` table resolves any code ≤ ROOT_BITS bits in a
-/// single indexed read; all HTTP header characters that matter use ≤ 13-bit codes, so
-/// the slow path (codes 17..=30 bits, for rare control/high bytes) is almost never hit.
-const ROOT_BITS: u32 = 16;
+/// Root lookup width. Every code of at most ROOT_BITS bits resolves in one read of a
+/// 4 KiB table, which stays cache-resident between requests; the flat 2^16-entry
+/// (256 KiB) table it replaced was evicted at production request rates, so a decode
+/// paid a cache miss for nearly every symbol (~3x slower cold).
+const ROOT_BITS: u32 = 11;
+/// Codes of ROOT_BITS+1..=WIN_BITS bits resolve through one small sub table per root
+/// prefix; longer codes (rare control/high bytes) take [`decode_long`].
+const WIN_BITS: u32 = 16;
+const SUB_BITS: u32 = WIN_BITS - ROOT_BITS;
+/// Root entry flag: the low bits index `DecodeTables::sub` instead of naming a symbol.
+const SUB_TABLE: u16 = 0x8000;
 
-/// `(symbol, code_len)` indexed by the next ROOT_BITS bits; `len == 0` means "no code
-/// of length ≤ ROOT_BITS has this prefix" (a long code or padding). Built once.
-fn decode_table() -> &'static [(u16, u8)] {
-    static T: std::sync::OnceLock<Vec<(u16, u8)>> = std::sync::OnceLock::new();
+/// Entries are `code_len << 8 | symbol`. A sub-table entry of 0 means no code of at most
+/// WIN_BITS bits has that prefix (a long code, or padding). Every root entry is non-zero
+/// because the code is complete.
+struct DecodeTables {
+    root: [u16; 1 << ROOT_BITS],
+    sub: Vec<[u16; 1 << SUB_BITS]>,
+}
+
+fn decode_tables() -> &'static DecodeTables {
+    static T: std::sync::OnceLock<DecodeTables> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let mut t = vec![(0u16, 0u8); 1usize << ROOT_BITS];
+        let mut t = DecodeTables {
+            root: [0; 1 << ROOT_BITS],
+            sub: Vec::new(),
+        };
         for (sym, &(code, len)) in TABLE.iter().enumerate() {
             let len = len as u32;
-            if sym == 256 || len > ROOT_BITS {
-                continue; // EOS is never emitted; long codes use the slow path
+            if sym == 256 {
+                continue; // EOS is never emitted; decode_long resolves and rejects it
             }
-            // Left-align the code and fill every index sharing this prefix.
-            let base = (code << (ROOT_BITS - len)) as usize;
-            for slot in &mut t[base..base + (1usize << (ROOT_BITS - len))] {
-                *slot = (sym as u16, len as u8);
+            let entry = (len as u16) << 8 | sym as u16;
+            // Every index below is in range by construction (`code < 2^len`); the unit test
+            // checks all 2^WIN_BITS windows, so a skipped slot cannot go unnoticed.
+            if len <= ROOT_BITS {
+                // Left-align the code and fill every index sharing this prefix.
+                let base = (code << (ROOT_BITS - len)) as usize;
+                if let Some(slots) = t.root.get_mut(base..base + (1 << (ROOT_BITS - len))) {
+                    slots.fill(entry);
+                }
+                continue;
+            }
+            let Some(slot) = t.root.get_mut((code >> (len - ROOT_BITS)) as usize) else {
+                continue;
+            };
+            if *slot & SUB_TABLE == 0 {
+                t.sub.push([0; 1 << SUB_BITS]);
+                *slot = SUB_TABLE | (t.sub.len() - 1) as u16;
+            }
+            if len <= WIN_BITS {
+                let low = (code & ((1 << (len - ROOT_BITS)) - 1)) as usize;
+                let base = low << (WIN_BITS - len);
+                let span = base..base + (1 << (WIN_BITS - len));
+                let sub = t.sub.get_mut((*slot & !SUB_TABLE) as usize);
+                if let Some(slots) = sub.and_then(|sub| sub.get_mut(span)) {
+                    slots.fill(entry);
+                }
             }
         }
         t
     })
+}
+
+/// The next `width` bits of the right-aligned `acc`, padded with 1-bits (the EOS prefix)
+/// when fewer than `width` real bits remain.
+#[inline(always)]
+fn window(acc: u64, nbits: u32, width: u32) -> usize {
+    let mask = (1u64 << width) - 1;
+    if nbits >= width {
+        ((acc >> (nbits - width)) & mask) as usize
+    } else {
+        (((acc << (width - nbits)) | ((1u64 << (width - nbits)) - 1)) & mask) as usize
+    }
 }
 
 /// Decode a complete Huffman bitstream (table-driven). Returns `None` on an invalid
@@ -347,8 +460,7 @@ pub(crate) fn decode_into(out: &mut Vec<u8>, data: &[u8]) -> Option<()> {
 
 fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) -> Option<()> {
     out.clear();
-    let t = decode_table();
-    let mask = (1u64 << ROOT_BITS) - 1;
+    let t = decode_tables();
     let estimate = (data.len().saturating_mul(8) / 5).saturating_add(1);
     out.reserve(estimate.min(max_output));
     let mut acc: u64 = 0;
@@ -356,38 +468,53 @@ fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) -> Opt
     let mut i = 0;
 
     loop {
-        // Keep enough bits buffered to resolve even the longest (30-bit) code, while
-        // staying within u64 (cap at 56 so the next `<<8` never overflows).
-        while nbits <= 48 && i < data.len() {
-            acc = (acc << 8) | data[i] as u64;
-            i += 1;
-            nbits += 8;
+        // While input remains, keep at least 32 bits buffered: enough for the longest
+        // (30-bit) code. Refilling a word at a time keeps the refill branch off most
+        // symbols; a byte-at-a-time refill mispredicted on nearly every one.
+        if nbits <= 32 {
+            if let Some(&[a, b, c, d]) = data.get(i..i + 4) {
+                acc = (acc << 32) | u32::from_be_bytes([a, b, c, d]) as u64;
+                i += 4;
+                nbits += 32;
+            } else {
+                // Cap at 56 so the next `<<8` never overflows.
+                while nbits <= 48
+                    && let Some(&byte) = data.get(i)
+                {
+                    acc = (acc << 8) | byte as u64;
+                    i += 1;
+                    nbits += 8;
+                }
+            }
         }
         if nbits == 0 {
             break;
         }
-        // Form a ROOT_BITS window, padding the tail with 1-bits (the EOS prefix) when
-        // fewer than ROOT_BITS real bits remain.
-        let window = if nbits >= ROOT_BITS {
-            ((acc >> (nbits - ROOT_BITS)) & mask) as usize
-        } else {
-            (((acc << (ROOT_BITS - nbits)) | ((1u64 << (ROOT_BITS - nbits)) - 1)) & mask) as usize
-        };
-        let (sym, len) = t[window];
+        // `window` masks to its width, so the root lookup cannot miss.
+        let mut e = t
+            .root
+            .get(window(acc, nbits, ROOT_BITS))
+            .copied()
+            .unwrap_or(0);
+        if e & SUB_TABLE != 0 {
+            let w = window(acc, nbits, WIN_BITS) & ((1 << SUB_BITS) - 1);
+            let sub = t.sub.get((e & !SUB_TABLE) as usize);
+            e = sub.and_then(|sub| sub.get(w)).copied().unwrap_or(0);
+        }
+        let len = (e >> 8) as u32;
         if len != 0 {
-            let len = len as u32;
             if len > nbits {
                 break; // the matched prefix was padding, not a real code -> done
             }
             if out.len() == max_output {
                 return None;
             }
-            out.push(sym as u8);
+            out.push(e as u8);
             nbits -= len;
-        } else if nbits < ROOT_BITS {
+        } else if nbits < WIN_BITS {
             break; // no full code and out of input -> remaining bits are padding
         } else {
-            // A code longer than ROOT_BITS (rare). Resolve it bit-exactly.
+            // A code longer than WIN_BITS (rare). Resolve it bit-exactly.
             let (sym, len) = decode_long(acc, nbits)?;
             if sym == 256 {
                 return None;
@@ -413,24 +540,24 @@ fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) -> Opt
     Some(())
 }
 
-/// Long codes (length `ROOT_BITS+1..=30`) grouped by bit-length, each group sorted by code,
+/// Long codes (length `WIN_BITS+1..=30`) grouped by bit-length, each group sorted by code,
 /// so [`decode_long`] binary-searches (O(log n)) instead of linear-scanning the whole 257-entry
 /// `TABLE` once per candidate length. The old nested scan was O(162 symbols × 14 lengths) per
 /// long symbol; a crafted all-long-code header block (RFC-conformant input) turned that into a
 /// ~60× HPACK-decode CPU amplification that head-of-line-blocks every stream on the connection.
-/// Index = `code_len - (ROOT_BITS + 1)`. EOS (sym 256) is intentionally INCLUDED so a literal EOS
+/// Index = `code_len - (WIN_BITS + 1)`. EOS (sym 256) is intentionally INCLUDED so a literal EOS
 /// in the data resolves to 256 and is rejected by the caller, matching the old scan. Built once.
 fn long_table() -> &'static [Vec<(u32, u16)>] {
     static T: std::sync::OnceLock<Vec<Vec<(u32, u16)>>> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        let groups_n = (30 - ROOT_BITS) as usize; // lengths ROOT_BITS+1 ..= 30
+        let groups_n = (30 - WIN_BITS) as usize; // lengths WIN_BITS+1 ..= 30
         let mut groups: Vec<Vec<(u32, u16)>> = vec![Vec::new(); groups_n];
         for (sym, &(code, len)) in TABLE.iter().enumerate() {
             let len = len as u32;
-            if len <= ROOT_BITS {
-                continue; // resolved by the root table
+            if len <= WIN_BITS {
+                continue; // resolved by the lookup tables
             }
-            groups[(len - ROOT_BITS - 1) as usize].push((code, sym as u16));
+            groups[(len - WIN_BITS - 1) as usize].push((code, sym as u16));
         }
         // Huffman codes of a given length are unique, so a code-sorted group binary-searches exactly.
         for g in &mut groups {
@@ -443,12 +570,12 @@ fn long_table() -> &'static [Vec<(u32, u16)>] {
 /// Resolve a single code of length 17..=30 bits (the rare long codes) by exact match.
 fn decode_long(acc: u64, nbits: u32) -> Option<(u16, u32)> {
     let groups = long_table();
-    for len in (ROOT_BITS + 1)..=30 {
+    for len in (WIN_BITS + 1)..=30 {
         if nbits < len {
             return None;
         }
         let code = ((acc >> (nbits - len)) & ((1u64 << len) - 1)) as u32;
-        let g = &groups[(len - ROOT_BITS - 1) as usize];
+        let g = &groups[(len - WIN_BITS - 1) as usize];
         if let Ok(idx) = g.binary_search_by_key(&code, |&(c, _)| c) {
             return Some((g[idx].1, len));
         }
@@ -459,6 +586,76 @@ fn decode_long(acc: u64, nbits: u32) -> Option<(u16, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A caller's wrong `encoded_len` (too small or too large) still yields the exact
+    /// encoding, through the octet-by-octet fallback.
+    #[test]
+    fn a_wrong_encoded_len_still_encodes_exactly() {
+        let data = b"</styles/fonts/fa-regular-400.woff2>; rel=preload; as=font; crossorigin";
+        let mut want = Vec::new();
+        encode(&mut want, data);
+        let n = encoded_len(data);
+        for len in [0, 1, n - 1, n + 1, n + 7] {
+            let mut out = vec![0xAA];
+            encode_sized(&mut out, data, len);
+            assert_eq!(&out[1..], &want[..], "encoded_len {len}");
+            assert_eq!(out[0], 0xAA);
+        }
+    }
+
+    /// The octet-at-a-time encoder the word-at-a-time one replaced.
+    fn encode_by_octet(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut acc: u64 = 0;
+        let mut nbits: u32 = 0;
+        for &b in data {
+            let (code, len) = code_of(b);
+            acc = (acc << len) | code as u64;
+            nbits += len as u32;
+            while nbits >= 8 {
+                nbits -= 8;
+                out.push((acc >> nbits) as u8);
+            }
+        }
+        if nbits > 0 {
+            let pad = 8 - nbits;
+            acc = (acc << pad) | ((1u64 << pad) - 1);
+            out.push(acc as u8);
+        }
+        out
+    }
+
+    #[test]
+    fn word_encoder_matches_the_octet_encoder() {
+        let mut inputs: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
+        inputs.push(Vec::new());
+        inputs.push((0..=255u8).collect());
+        inputs.push((0..=255u8).rev().cycle().take(3000).collect());
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for len in 0..600 {
+            let v = (0..len)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    // Mostly printable, sometimes any octet (long 20-30 bit codes).
+                    if x % 7 == 0 {
+                        (x >> 8) as u8
+                    } else {
+                        b' ' + (x >> 8) as u8 % 95
+                    }
+                })
+                .collect();
+            inputs.push(v);
+        }
+        for data in inputs {
+            let mut out = b"prefix".to_vec();
+            encode(&mut out, &data);
+            assert_eq!(&out[..6], b"prefix");
+            assert_eq!(out[6..], encode_by_octet(&data), "input {data:?}");
+            assert_eq!(decode(&out[6..]).unwrap(), data);
+        }
+    }
 
     #[test]
     fn rfc_c4_1_huffman_www_example_com() {
@@ -513,6 +710,113 @@ mod tests {
                 "len mismatch for {sample:?}"
             );
             assert_eq!(&decode(&out).unwrap(), sample, "roundtrip for {sample:?}");
+        }
+    }
+
+    /// The code of at most `width` bits that prefixes the `width`-bit window `w`, by scan.
+    fn scan_prefix(w: u32, width: u32) -> Option<(u16, u32)> {
+        TABLE
+            .iter()
+            .take(256)
+            .enumerate()
+            .find_map(|(sym, &(code, len))| {
+                let len = len as u32;
+                (len <= width && w >> (width - len) == code).then_some((sym as u16, len))
+            })
+    }
+
+    #[test]
+    fn lookup_tables_match_a_scan_of_every_16_bit_window() {
+        let t = decode_tables();
+        assert!(t.root.iter().all(|&e| e != 0), "every root prefix resolves");
+        for w in 0..(1u32 << WIN_BITS) {
+            let mut e = t.root[(w >> SUB_BITS) as usize];
+            if e & SUB_TABLE != 0 {
+                e = t.sub[(e & !SUB_TABLE) as usize][(w & ((1 << SUB_BITS) - 1)) as usize];
+            }
+            let got = (e != 0).then_some((e & 0xff, (e >> 8) as u32));
+            assert_eq!(got, scan_prefix(w, WIN_BITS), "window {w:#06x}");
+        }
+    }
+
+    /// RFC 7541 §5.2 decoded one bit at a time: EOS in the data, more than 7 bits of
+    /// padding, or padding that is not all 1-bits is an error.
+    fn reference_decode(data: &[u8]) -> Option<Vec<u8>> {
+        let (mut out, mut code, mut len) = (Vec::new(), 0u32, 0u32);
+        for &byte in data {
+            for k in (0..8).rev() {
+                code = code << 1 | ((byte >> k) & 1) as u32;
+                len += 1;
+                if let Some(sym) = TABLE
+                    .iter()
+                    .position(|&(c, l)| l as u32 == len && c == code)
+                {
+                    if sym == 256 {
+                        return None;
+                    }
+                    out.push(sym as u8);
+                    (code, len) = (0, 0);
+                }
+            }
+        }
+        (len <= 7 && code == (1 << len) - 1).then_some(out)
+    }
+
+    fn assert_matches_reference(data: &[u8], max_output: usize) {
+        let want = reference_decode(data).filter(|v| v.len() <= max_output);
+        assert_eq!(
+            decode_limited(data, max_output),
+            want,
+            "{data:02x?} limit {max_output}"
+        );
+    }
+
+    #[test]
+    fn decode_matches_a_bitwise_reference_on_every_short_input() {
+        assert_matches_reference(&[], usize::MAX);
+        for x in 0..=0xffffu32 {
+            let [_, _, a, b] = x.to_be_bytes();
+            assert_matches_reference(&[a, b], usize::MAX);
+            assert_matches_reference(&[a, b], 1);
+            if x <= 0xff {
+                assert_matches_reference(&[b], usize::MAX);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_matches_a_bitwise_reference_on_random_encodings() {
+        let mut s: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        const TEXT: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_./=;, ABCXYZ\\\"{}<>#$@[]~^`|";
+        for _ in 0..20_000 {
+            let raw: Vec<u8> = (0..rnd() % 48)
+                .map(|_| match rnd() {
+                    r if r % 6 == 0 => (r >> 8) as u8,
+                    r => TEXT[(r >> 8) as usize % TEXT.len()],
+                })
+                .collect();
+            let mut enc = Vec::new();
+            encode(&mut enc, &raw);
+            let limit = match rnd() % 4 {
+                0 => (rnd() % 50) as usize,
+                _ => usize::MAX,
+            };
+            assert_matches_reference(&enc, limit);
+            if !enc.is_empty() {
+                let mut flipped = enc.clone();
+                let bit = (rnd() % (enc.len() as u64 * 8)) as usize;
+                flipped[bit / 8] ^= 1 << (bit % 8);
+                assert_matches_reference(&flipped, limit);
+                assert_matches_reference(&enc[..(rnd() % enc.len() as u64) as usize], limit);
+            }
+            let junk: Vec<u8> = (0..rnd() % 40).map(|_| rnd() as u8).collect();
+            assert_matches_reference(&junk, usize::MAX);
         }
     }
 

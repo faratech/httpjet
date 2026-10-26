@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+/opt/httpjet/libexec/control prepare-runit
+exec /opt/httpjet/libexec/launch

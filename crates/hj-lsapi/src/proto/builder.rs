@@ -32,6 +32,26 @@ pub trait WireHeader {
     fn known_index(&self) -> Option<usize> {
         known_header_index(self.name())
     }
+    /// Write the name Title-Cased (`x-hub-signature-256` -> `X-Hub-Signature-256`)
+    /// instead of verbatim.
+    fn title_case(&self) -> bool {
+        false
+    }
+}
+
+/// Append `name` Title-Cased: each letter that starts the name or follows a `-` upper,
+/// every other letter lower.
+fn put_title_case(out: &mut BytesMut, name: &[u8]) {
+    let mut start = true;
+    out.extend(name.iter().map(|&b| {
+        let c = if start {
+            b.to_ascii_uppercase()
+        } else {
+            b.to_ascii_lowercase()
+        };
+        start = b == b'-';
+        c
+    }));
 }
 
 impl<N: AsRef<str>, V: AsRef<str>> WireHeader for (N, V) {
@@ -309,7 +329,11 @@ fn build_begin_request_into<K, V, H>(
         let nb = header.name().as_bytes();
         let vb = header.value().as_bytes();
         let name_off = block_rel;
-        out.extend_from_slice(nb);
+        if header.title_case() {
+            put_title_case(out, nb);
+        } else {
+            out.extend_from_slice(nb);
+        }
         out.extend_from_slice(b": ");
         block_rel += (nb.len() + 2) as i32;
         let value_off = block_rel;

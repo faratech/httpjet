@@ -1,0 +1,41 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	@:
+
+override_dh_auto_build:
+	packaging/debian/build-binary.sh
+
+override_dh_auto_test:
+	python3 -B packaging/debian/test_lifecycle.py
+	python3 -B packaging/debian/test_build_key.py
+	python3 -B packaging/debian/test_clean.py
+	python3 -B packaging/release/test_build_session.py
+	if [ "$$HTTPJET_PACKAGE_TEST" != 1 ]; then python3 -B packaging/debian/test_default_config.py --binary debian/build/httpjet; fi
+
+override_dh_auto_clean:
+	rm -rf debian/build
+
+override_dh_clean:
+	# Cargo checksums include legitimate upstream *.orig files in this tree.
+	dh_clean -Xvendor/registry
+
+override_dh_install:
+	dh_install
+	install -D -m 0644 packaging/debian/archive-keyring.asc debian/httpjet-archive-keyring/usr/share/keyrings/httpjet-archive-keyring.asc
+
+override_dh_installsystemd:
+	dh_installsystemd --no-start --restart-after-upgrade
+
+override_dh_strip:
+	# Carrier packaging must retain the exact source-built payload bytes.
+	dh_strip --exclude=httpjet
+
+override_dh_dwz:
+	@:
+
+override_dh_shlibdeps:
+	@:

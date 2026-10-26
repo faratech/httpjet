@@ -673,6 +673,9 @@ pub struct Context {
     pub allow_browse: bool,
     /// Raw `<extraHeaders>` text (newline-delimited header ops).
     pub extra_headers: Vec<(String, String)>,
+    /// `false` for `<extraHeaders>NONE`: the enclosing contexts' extra headers do not
+    /// apply under this one either (OLS `HttpContext::setHeaderOps`).
+    pub inherit_extra_headers: bool,
     /// Per-context `addDefaultCharset` (on/1/true/yes = `Some(true)`, any other
     /// value = `Some(false)`). `None` = absent: the context inherits the enclosing
     /// context's setting, together with its `charset` (OLS `HttpContext::inherit`).

@@ -52,6 +52,7 @@ pub mod expires;
 mod stream;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use http::StatusCode;
 use http::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
@@ -61,7 +62,7 @@ use http::header::{
 use hj_core::config::Tuning;
 use hj_core::{Body, ReqCtx, Response, ResponseTransform};
 
-pub use dict::{DEFAULT_DICT_LEVEL, PageDict, PageDictRegistry};
+pub use dict::{DEFAULT_DICT_LEVEL, PLAIN_GENERATION, PageDict, PageDictRegistry};
 pub use encoding::{
     AcceptEncoding, DEFAULT_PRIORITY, Encoding, Levels, MAX_DECODE, decode_bytes,
     decode_bytes_bounded, decode_bytes_sized, encode_bytes, encode_bytes_transient, negotiate_with,
@@ -120,6 +121,35 @@ pub struct StaticIdentityLength(pub u64);
 /// backend's Content-Length with the length of an encoded nothing.
 #[derive(Clone, Copy, Debug)]
 pub struct HeadResponse;
+
+/// Response extension: `encoded` is `identity` already encoded as `enc` by
+/// [`Compress::encode_full`] — the page cache stores that one encode and hands it on so the
+/// serve does not encode again. [`Compress`] uses it only where it would itself encode exactly
+/// that body with that coding. It holds `identity`, so a body with the same pointer and
+/// length cannot be a different allocation that reused the address.
+#[derive(Clone, Debug)]
+pub struct PreEncoded {
+    enc: Encoding,
+    identity: Bytes,
+    encoded: Bytes,
+}
+
+impl PreEncoded {
+    pub fn new(enc: Encoding, identity: Bytes, encoded: Bytes) -> Self {
+        PreEncoded {
+            enc,
+            identity,
+            encoded,
+        }
+    }
+
+    fn for_body(&self, enc: Encoding, body: &[u8]) -> Option<Bytes> {
+        (self.enc == enc
+            && self.identity.as_ptr() == body.as_ptr()
+            && self.identity.len() == body.len())
+        .then(|| self.encoded.clone())
+    }
+}
 
 /// Response compression transform.
 ///
@@ -223,6 +253,11 @@ impl Compress {
             brotli_q: self.brotli_q,
             brotli_lgwin: self.brotli_lgwin,
         }
+    }
+
+    /// Encode `input` as `enc` exactly as this transform would encode a buffered body.
+    pub fn encode_full(&self, enc: Encoding, input: &[u8]) -> Option<Bytes> {
+        encode_bytes_transient(enc, input, &self.levels())
     }
 
     /// (CF_SEND_ZSTD) Enable forcing zstd egress to trusted-proxy (Cloudflare) peers.
@@ -457,8 +492,16 @@ impl Compress {
         // Swap the body out so we can transform it.
         let body = std::mem::replace(resp.body_mut(), Body::Empty);
 
+        let pre_encoded = resp
+            .extensions_mut()
+            .remove::<PreEncoded>()
+            .and_then(|p| match &body {
+                Body::Full(b) => p.for_body(enc, b),
+                _ => None,
+            });
         let new_body = match body {
-            Body::Full(b) => match encode_bytes_transient(enc, &b, &levels) {
+            Body::Full(b) => match pre_encoded.or_else(|| encode_bytes_transient(enc, &b, &levels))
+            {
                 Some(c) => {
                     resp.extensions_mut().insert(hj_core::FreshBody::of(&c));
                     Body::Full(c)
@@ -1057,6 +1100,74 @@ mod tests {
         };
         let mark = r.extensions().get::<hj_core::FreshBody>().expect("marked");
         assert!(mark.names(body), "the mark names the encoded bytes");
+    }
+
+    #[test]
+    fn a_pre_encoded_body_is_served_with_the_headers_of_a_fresh_encode() {
+        let c = Compress::new();
+        let page = b"<p>pre-encoded page body</p>".repeat(400);
+        let mut fresh = resp_with("text/html", page.clone());
+        c.apply(&mut fresh, Encoding::Zstd);
+
+        let mut pre = resp_with("text/html", page.clone());
+        let Body::Full(identity) = pre.body() else {
+            unreachable!()
+        };
+        let encoded = c.encode_full(Encoding::Zstd, identity).expect("encode");
+        let ext = PreEncoded::new(Encoding::Zstd, identity.clone(), encoded.clone());
+        pre.extensions_mut().insert(ext);
+        c.apply(&mut pre, Encoding::Zstd);
+
+        let (Body::Full(a), Body::Full(b)) = (fresh.body(), pre.body()) else {
+            panic!("Full bodies stay Full");
+        };
+        assert_eq!(a, b, "the same encode of the same body");
+        assert_eq!(
+            b.as_ptr(),
+            encoded.as_ptr(),
+            "the stored encode is served, not redone"
+        );
+        assert_eq!(fresh.headers(), pre.headers());
+        assert!(pre.extensions().get::<PreEncoded>().is_none(), "consumed");
+        assert!(
+            pre.extensions()
+                .get::<hj_core::FreshBody>()
+                .is_some_and(|m| m.names(b)),
+            "still charged by the bridge"
+        );
+    }
+
+    #[test]
+    fn a_pre_encoded_body_is_ignored_for_another_coding_or_another_body() {
+        let c = Compress::new();
+        let page = b"<p>pre-encoded page body</p>".repeat(400);
+        let bogus = Bytes::from_static(b"not the encoding of this page");
+
+        // Another coding: gzip is encoded fresh.
+        let mut r = resp_with("text/html", page.clone());
+        let Body::Full(identity) = r.body() else {
+            unreachable!()
+        };
+        let ext = PreEncoded::new(Encoding::Zstd, identity.clone(), bogus.clone());
+        r.extensions_mut().insert(ext);
+        c.apply(&mut r, Encoding::Gzip);
+        let Body::Full(out) = r.body() else {
+            unreachable!()
+        };
+        assert_ne!(out, &bogus);
+        assert_eq!(gunzip(out), page);
+
+        // Another body with equal bytes (a transform swapped it): encoded fresh.
+        let mut r = resp_with("text/html", page.clone());
+        let other = Bytes::from(page.clone());
+        r.extensions_mut()
+            .insert(PreEncoded::new(Encoding::Zstd, other, bogus.clone()));
+        c.apply(&mut r, Encoding::Zstd);
+        let Body::Full(out) = r.body() else {
+            unreachable!()
+        };
+        assert_ne!(out, &bogus);
+        assert_eq!(zstd::decode_all(&out[..]).unwrap(), page);
     }
 
     #[test]

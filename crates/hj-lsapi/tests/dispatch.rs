@@ -110,7 +110,8 @@ fn put_packet(buf: &mut BytesMut, ptype: PacketType, body: &[u8]) {
     buf.put_u8(b'L');
     buf.put_u8(b'S');
     buf.put_u8(ptype as u8);
-    buf.put_u8(0); // little-endian flag
+    // lsphp flags its little-endian packets with its LSAPI_ENDIAN, which is BIG on aarch64.
+    buf.put_u8(hj_lsapi::proto::HOST_LSAPI_ENDIAN);
     buf.put_u32_le(total as u32);
     buf.extend_from_slice(body);
 }
@@ -2497,22 +2498,24 @@ async fn inline_tail_spanning_a_generation_advance_is_not_repooled() {
     }
 }
 
-/// POST /upload.php declaring a 10-byte form body; the body is whatever `body`
-/// delivers.
-fn upload_request(body: hj_core::IncomingBody) -> hj_core::Request {
-    http::Request::builder()
+/// POST /upload.php declaring a 10-byte body of `content_type`; the body is whatever
+/// `body` delivers.
+fn upload_request(body: hj_core::IncomingBody, content_type: Option<&str>) -> hj_core::Request {
+    let mut req = http::Request::builder()
         .method("POST")
         .uri("/upload.php")
         .header("Host", "test")
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .header("Content-Length", "10")
-        .body(body)
-        .unwrap()
+        .header("Content-Length", "10");
+    if let Some(content_type) = content_type {
+        req = req.header("Content-Type", content_type);
+    }
+    req.body(body).unwrap()
 }
 
 /// (#987) lsphp may answer before the upload finishes, so the inline tail can run
 /// while the request-body pump still waits on the client. RESP_END cancels that
-/// upload (not its idle timer) and the half-uploaded socket is closed.
+/// upload (not its idle timer) and the half-uploaded socket is closed. (A body PHP
+/// does not pre-read: one it pre-reads is collected before dispatch.)
 #[tokio::test]
 async fn inline_tail_cancels_a_stalled_upload_and_closes_the_socket() {
     let path = tmp_sock("tail-upload-stalled");
@@ -2522,7 +2525,7 @@ async fn inline_tail_cancels_a_stalled_upload_and_closes_the_socket() {
         let (mut s, _) = listener.accept().await.unwrap();
         let (ptype, begin) = read_packet(&mut s).await.unwrap();
         assert_eq!(ptype, PacketType::BeginRequest as u8);
-        assert_eq!(req_body_len_from_begin(&begin), 10);
+        assert_eq!(req_body_len_from_begin(&begin), 100);
         let mut first = [0u8; 2];
         s.read_exact(&mut first).await.unwrap();
         let mut out = declared_head(5);
@@ -2539,15 +2542,27 @@ async fn inline_tail_cancels_a_stalled_upload_and_closes_the_socket() {
         (first, ended, rest)
     });
 
-    // The client sends 2 of the 10 declared bytes and then holds the body open.
+    // The client sends 50 of the 100 declared bytes and then holds the body open. The
+    // body has no Content-Type, so PHP does not pre-read it and it streams; its
+    // embedded-request scan holds back only a short tail.
     let (mut upload, body) = Channel::<Bytes, hj_core::BoxError>::new(1);
-    upload.send_data(Bytes::from_static(b"ab")).await.unwrap();
+    upload
+        .send_data(Bytes::from_static(&[b'a'; 50]))
+        .await
+        .unwrap();
     let pool = Arc::new(plain_pool(&path));
     let read_timeout = Duration::from_secs(20);
     let handler = Lsapi::new(pool.clone()).read_timeout(read_timeout);
     let started = std::time::Instant::now();
+    let req = http::Request::builder()
+        .method("POST")
+        .uri("/upload.php")
+        .header("Host", "test")
+        .header("Content-Length", "100")
+        .body(BoxBody::new(body))
+        .unwrap();
     let resp = handler
-        .handle(&mut ctx("/web/test"), upload_request(BoxBody::new(body)))
+        .handle(&mut ctx("/web/test"), req)
         .await
         .expect("response head");
     let hj_core::Body::Full(bytes) = resp.into_body() else {
@@ -2563,56 +2578,70 @@ async fn inline_tail_cancels_a_stalled_upload_and_closes_the_socket() {
     );
     assert_eq!(pool.idle_count(), 0);
     let (first, ended, rest) = server.await.unwrap();
-    assert_eq!(&first, b"ab");
+    assert_eq!(&first, b"aa");
     assert!(ended, "the cancelled upload must shut its write half down");
-    assert!(rest.is_empty(), "{rest:?}");
+    assert!(
+        rest.len() <= 48 && rest.iter().all(|&b| b == b'a'),
+        "only the sent upload bytes may follow: {rest:?}"
+    );
     drop(upload);
     let _ = std::fs::remove_file(&path);
 }
 
-/// (#987) An upload that completes while the inline tail drains leaves a clean
-/// socket: a pre-read form POST lsphp consumed whole re-pools at RESP_END.
+/// A form POST PHP reads whole before its script runs is collected before dispatch, so
+/// a retiring worker's unread reset can replay it: the worker sees BEGIN_REQUEST only
+/// once the upload is complete, gets the body whole, and the socket re-pools.
 #[tokio::test]
-async fn inline_tail_repools_after_an_upload_that_completes_during_it() {
-    let path = tmp_sock("tail-upload-complete");
+async fn preread_post_reaches_the_worker_once_its_upload_completes() {
+    let path = tmp_sock("preread-upload-complete");
     let listener = UnixListener::bind(&path).unwrap();
-    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let (begun_tx, mut begun_rx) = tokio::sync::oneshot::channel::<()>();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
-        let (ptype, _) = read_packet(&mut s).await.unwrap();
+        let (ptype, begin) = read_packet(&mut s).await.unwrap();
         assert_eq!(ptype, PacketType::BeginRequest as u8);
+        assert_eq!(req_body_len_from_begin(&begin), 10);
+        let _ = begun_tx.send(());
         let mut body = [0u8; 10];
-        s.read_exact(&mut body[..2]).await.unwrap();
+        s.read_exact(&mut body).await.unwrap();
         let mut out = declared_head(5);
         put_packet(&mut out, PacketType::RespStream, b"hello");
+        put_packet(&mut out, PacketType::RespEnd, b"");
         s.write_all(&out).await.unwrap();
-        go_rx.await.unwrap();
-        s.read_exact(&mut body[2..]).await.unwrap();
-        let mut end = BytesMut::new();
-        put_packet(&mut end, PacketType::RespEnd, b"");
-        s.write_all(&end).await.unwrap();
         (body, closed_before(&mut s, done_rx).await)
     });
 
     let (mut upload, body) = Channel::<Bytes, hj_core::BoxError>::new(1);
     upload.send_data(Bytes::from_static(b"ab")).await.unwrap();
     let pool = Arc::new(plain_pool(&path));
-    let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(5));
-    let resp = handler
-        .handle(&mut ctx("/web/test"), upload_request(BoxBody::new(body)))
-        .await
-        .expect("response head");
-    let hj_core::Body::Full(bytes) = resp.into_body() else {
-        panic!("the declared body is in hand and must return inline");
+    let handler = Arc::new(Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(5)));
+    let dispatch = {
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            handler
+                .handle(
+                    &mut ctx("/web/test"),
+                    upload_request(
+                        BoxBody::new(body),
+                        Some("application/x-www-form-urlencoded"),
+                    ),
+                )
+                .await
+        })
     };
-    assert_eq!(&bytes[..], b"hello");
-    assert_eq!(pool.stats().inline_tail_drains, 1);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        begun_rx.try_recv().is_err(),
+        "BEGIN_REQUEST went out before the pre-read body was complete"
+    );
     upload
         .send_data(Bytes::from_static(b"cdefghij"))
         .await
         .unwrap();
-    go_tx.send(()).unwrap();
+    drop(upload);
+    let resp = dispatch.await.unwrap().expect("response head");
+    assert_eq!(&collect_body(resp).await[..], b"hello");
     wait_for_settled(&pool, "completed upload").await;
     let _ = done_tx.send(());
     let (received, closed) = server.await.unwrap();
@@ -2621,15 +2650,16 @@ async fn inline_tail_repools_after_an_upload_that_completes_during_it() {
     assert_eq!(pool.idle_count(), 1);
     let stats = pool.stats();
     assert_eq!((stats.body_conn_closes, stats.unread_body_drops), (0, 0));
-    drop(upload);
     let _ = std::fs::remove_file(&path);
 }
 
 /// A minimal lsphp stand-in: answers one request with argv's pre-built packets,
-/// announcing its PID first like lsphp, and sends RESP_END on a stdin line.
+/// announcing its PID first like lsphp, and sends RESP_END on a stdin line. argv[4]
+/// is the packet flag, this host's LSAPI_ENDIAN.
 const FAKE_LSPHP: &str = r#"
 import os, socket, struct, sys
 path, head, end = sys.argv[1], bytes.fromhex(sys.argv[2]), bytes.fromhex(sys.argv[3])
+flag = bytes([int(sys.argv[4])])
 listener = socket.socket(socket.AF_UNIX)
 listener.bind(path)
 listener.listen(16)
@@ -2645,7 +2675,7 @@ def recv_exact(n):
 total = struct.unpack("<I", recv_exact(8)[4:8])[0]
 recv_exact(total - 8)
 pid = b"\0PID" + struct.pack("=i", os.getpid())
-conn.sendall(b"LS\x06\x00" + struct.pack("<I", 8 + len(pid)) + pid + head)
+conn.sendall(b"LS\x06" + flag + struct.pack("<I", 8 + len(pid)) + pid + head)
 sys.stdin.readline()
 conn.sendall(end)
 while conn.recv(4096):
@@ -2693,6 +2723,7 @@ async fn inline_tail_retires_a_worker_superseded_mid_tail() {
             .arg(&socket)
             .arg(hex(&head))
             .arg(hex(&end))
+            .arg(hj_lsapi::proto::HOST_LSAPI_ENDIAN.to_string())
             .env("LSAPI_Z_HTTPJET_GENERATION_MARKER", "family-a")
             .stdin(std::process::Stdio::piped())
             .spawn()
@@ -2775,7 +2806,10 @@ async fn begin_request_for(trusted: bool) -> (BTreeMap<String, String>, String) 
         tokio::time::sleep(Duration::from_millis(50)).await;
     });
     let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(2)));
-    let handler = Lsapi::new(pool).read_timeout(Duration::from_secs(2));
+    // Every HTTP_* copy, so the env table's own forwarding filter is exercised too.
+    let handler = Lsapi::new(pool)
+        .read_timeout(Duration::from_secs(2))
+        .full_header_env(true);
     let req = http::Request::builder()
         .method("GET")
         .uri("/index.php")
@@ -4380,7 +4414,10 @@ async fn unknown_header_names_reach_lsphp_title_cased() {
     });
 
     let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(2)));
-    let handler = Lsapi::new(pool).read_timeout(Duration::from_secs(2));
+    // Every HTTP_* copy, so the env names are checked alongside the block's.
+    let handler = Lsapi::new(pool)
+        .read_timeout(Duration::from_secs(2))
+        .full_header_env(true);
     let req = http::Request::builder()
         .uri("/index.php")
         .header("Host", "test")
@@ -4475,4 +4512,631 @@ async fn accel_buffering_off_stream_is_marked_unbuffered() {
         server_task.await.unwrap();
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// LIVE parity gate for leaving header copies out of the env table: the same
+/// requests through a handler that sends every `HTTP_*` copy and one that leaves
+/// out what lsphp registers from the header block must produce byte-identical
+/// `$_SERVER` (keys, values and order), `$_ENV`, `getallheaders()`, `getenv()` and body.
+///
+///   cargo test -p hj-lsapi --test dispatch -- --ignored live_server_vars_match_without_block_registered_env_copies --nocapture
+#[tokio::test]
+#[ignore = "spawns the real lsphp; run manually on an R&D box"]
+async fn live_server_vars_match_without_block_registered_env_copies() {
+    use hj_lsapi::{LsphpSupervisor, SupervisorConfig};
+
+    let lsphp = PathBuf::from(
+        std::env::var("HJ_TEST_LSPHP")
+            .unwrap_or_else(|_| "/usr/local/lsws/lsphp8/bin/lsphp".into()),
+    );
+    if !lsphp.exists() {
+        eprintln!("lsphp not found at {lsphp:?}; skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("hj-lsapi-parity-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("dump.php"),
+        br#"<?php
+$s = $_SERVER;
+unset($s['REQUEST_TIME'], $s['REQUEST_TIME_FLOAT']);
+// A fresh worker's first request still sees lsphp's own LSAPI_* process env.
+foreach (array_keys($s) as $k) {
+    if (strncmp($k, 'LSAPI_', 6) === 0) unset($s[$k]);
+}
+$g = [];
+foreach (['HTTP_USER_AGENT', 'HTTP_HOST', 'HTTP_ACCEPT', 'HTTP_X_DUP', 'HTTP_COOKIE',
+          'HTTP_CONTENT_TYPE', 'CONTENT_TYPE', 'HTTP_TRANSFER_ENCODING', 'HTTP_X_FROM_REWRITE'] as $k) {
+    $g[$k] = getenv($k);
+}
+$e = $_ENV;
+foreach (array_keys($e) as $k) {
+    if (strncmp($k, 'LSAPI_', 6) === 0) unset($e[$k]);
+}
+echo json_encode(['server' => $s, 'env' => $e, 'headers' => getallheaders(), 'getenv' => $g,
+                  'input' => file_get_contents('php://input')],
+                 JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES);
+"#,
+    )
+    .unwrap();
+
+    let sock =
+        std::env::temp_dir().join(format!("php8-httpjet-parity-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+    let php = hj_core::config::PhpConfig {
+        handler_id: "lsphp".into(),
+        command: lsphp.clone(),
+        suffixes: vec!["php".into()],
+        env: vec![("PHP_LSAPI_CHILDREN".into(), "2".into())],
+        max_conns: 4,
+        init_timeout: Duration::from_secs(10),
+        retry_timeout: Duration::from_secs(0),
+        pc_keep_alive_timeout: Duration::from_secs(0),
+        backlog: 1024,
+        run_on_startup: 1,
+        mem_soft_limit: None,
+        mem_hard_limit: None,
+        detached_mode: false,
+        max_process_time: None,
+        cpu_limit_secs: None,
+        proc_soft_limit: None,
+        proc_hard_limit: None,
+        max_idle_time: None,
+        min_restart_interval: Duration::from_secs(10),
+        max_restart_backoff: Duration::from_secs(30),
+    };
+    let sup = LsphpSupervisor::new(SupervisorConfig::from_php_config(&php, &sock, "", ""));
+    sup.start().await.expect("lsphp should start");
+    let pool = Arc::new(LsapiPool::new(&sock, 4, Duration::from_secs(10)));
+    let full = Lsapi::new(pool.clone())
+        .script_root(&dir)
+        .read_timeout(Duration::from_secs(10))
+        .full_header_env(true);
+    let lean = Lsapi::new(pool)
+        .script_root(&dir)
+        .read_timeout(Duration::from_secs(10))
+        .full_header_env(false);
+
+    let long_name = format!("x-{}", "a".repeat(258));
+    let cf: Vec<(&str, &[u8])> = vec![
+        (
+            "user-agent",
+            b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0",
+        ),
+        ("accept", b"text/html,application/xhtml+xml,*/*;q=0.8"),
+        ("accept-language", b"en-US,en;q=0.9"),
+        ("accept-encoding", b"gzip, br, zstd"),
+        ("cookie", b"xf_csrf=Qm3pX9aL; xf_session=4a1f0c9b"),
+        ("referer", b"https://www.google.com/"),
+        ("cf-ray", b"8d6f2e9a1b3c4d5e-ORD"),
+        ("cf-connecting-ip", b"203.0.113.42"),
+        ("x-forwarded-for", b"203.0.113.42"),
+        ("x-forwarded-proto", b"https"),
+        ("cf-ipcountry", b"US"),
+        ("cf-visitor", b"{\"scheme\":\"https\"}"),
+        ("cdn-loop", b"cloudflare; loops=1"),
+        (
+            "sec-ch-ua",
+            b"\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+        ),
+        ("sec-ch-ua-mobile", b"?0"),
+        ("sec-fetch-site", b"same-origin"),
+        ("if-none-match", b"W/\"abc\""),
+        ("priority", b"u=0, i"),
+    ];
+    struct Case<'a> {
+        label: &'a str,
+        method: &'a str,
+        uri: &'a str,
+        headers: Vec<(&'a str, &'a [u8])>,
+        body: &'static [u8],
+        tls: bool,
+        trusted: bool,
+        env: Vec<(&'a str, &'a str)>,
+    }
+    let case = |label, method, uri, headers, body, tls, trusted| Case {
+        label,
+        method,
+        uri,
+        headers,
+        body,
+        tls,
+        trusted,
+        env: vec![],
+    };
+    let mut cases = vec![
+        case(
+            "CF h2 GET",
+            "GET",
+            "https://forum.example/dump.php?a=1",
+            cf.clone(),
+            b"",
+            true,
+            true,
+        ),
+        case(
+            "CF h2 GET, untrusted peer",
+            "GET",
+            "https://forum.example/dump.php",
+            cf.clone(),
+            b"",
+            true,
+            false,
+        ),
+        case(
+            "h1 Host with default port",
+            "GET",
+            "/dump.php",
+            vec![
+                ("host", b"www.forum.example:443"),
+                ("user-agent", b"curl/8"),
+            ],
+            b"",
+            true,
+            true,
+        ),
+        case(
+            "h1 Host with a non-default port",
+            "GET",
+            "/dump.php?x=%20y",
+            vec![("host", b"forum.example:8443"), ("accept", b"*/*")],
+            b"",
+            true,
+            true,
+        ),
+        case(
+            "repeated headers",
+            "GET",
+            "/dump.php",
+            vec![
+                ("host", b"forum.example"),
+                ("accept", b"text/html"),
+                ("accept", b"*/*"),
+                ("x-dup", b"one"),
+                ("x-dup", b"two"),
+                ("cookie", b"a=1"),
+                ("cookie", b"b=2"),
+                ("via", b"1.1 a"),
+                ("via", b"1.1 b"),
+            ],
+            b"",
+            false,
+            true,
+        ),
+        case(
+            "form POST",
+            "POST",
+            "/dump.php",
+            vec![
+                ("host", b"forum.example"),
+                ("content-type", b"application/x-www-form-urlencoded"),
+                ("content-length", b"7"),
+                ("x-requested-with", b"XMLHttpRequest"),
+                ("origin", b"https://forum.example"),
+            ],
+            b"a=1&b=2",
+            true,
+            true,
+        ),
+        case(
+            "chunked POST (buffered, synthesized length)",
+            "POST",
+            "/dump.php",
+            vec![
+                ("host", b"forum.example"),
+                ("content-type", b"text/plain"),
+                ("transfer-encoding", b"chunked"),
+            ],
+            b"abc",
+            true,
+            true,
+        ),
+        case(
+            "dropped, long, non-UTF-8, empty and every well-known header",
+            "GET",
+            "/dump.php",
+            vec![
+                ("host", b"forum.example"),
+                ("proxy", b"http://evil/"),
+                ("x_under", b"v"),
+                (long_name.as_str(), b"long"),
+                ("x-latin1", b"caf\xe9"),
+                ("x-empty", b""),
+                ("accept-charset", b"utf-8"),
+                ("authorization", b"Basic YWxhZGRpbjpvcGVuc2VzYW1l"),
+                ("connection", b"keep-alive"),
+                ("cookie2", b"$Version=1"),
+                ("pragma", b"no-cache"),
+                ("cache-control", b"no-cache"),
+                ("if-modified-since", b"Sun, 25 Oct 2026 00:00:00 GMT"),
+                ("if-match", b"\"x\""),
+                ("if-range", b"\"x\""),
+                ("if-unmodified-since", b"Sun, 25 Oct 2026 00:00:00 GMT"),
+                ("keep-alive", b"300"),
+                ("range", b"bytes=0-1"),
+                ("x-forwarded-for", b"198.51.100.1, 203.0.113.42"),
+                ("via", b"1.1 cf"),
+                ("x-1-digit-lead", b"1"),
+            ],
+            b"",
+            false,
+            true,
+        ),
+        case(
+            "speculation prefetch",
+            "GET",
+            "https://forum.example/dump.php",
+            vec![
+                ("sec-purpose", b"prefetch;prerender"),
+                ("user-agent", b"Chrome"),
+            ],
+            b"",
+            true,
+            true,
+        ),
+    ];
+    let mut rewritten = case(
+        "rewrite env over header copies",
+        "GET",
+        "https://forum.example/dump.php",
+        cf.clone(),
+        b"",
+        true,
+        true,
+    );
+    rewritten.env = vec![
+        ("HTTP_USER_AGENT", "rewritten-ua"),
+        ("HTTP_X_FROM_REWRITE", "rw"),
+        ("HTTP_ACCEPT_ENCODING", "br"),
+    ];
+    cases.push(rewritten);
+
+    for c in &cases {
+        let mut outputs = Vec::new();
+        for handler in [&full, &lean] {
+            let mut builder = http::Request::builder().method(c.method).uri(c.uri);
+            for (name, value) in &c.headers {
+                builder = builder.header(*name, http::HeaderValue::from_bytes(value).unwrap());
+            }
+            let req = builder.body(full_incoming(c.body)).unwrap();
+            let mut cx = ctx(dir.to_str().unwrap());
+            cx.is_tls = c.tls;
+            cx.forwarding_trusted = c.trusted;
+            cx.trusted_proxy = c.trusted;
+            cx.env = c
+                .env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let resp = handler.handle(&mut cx, req).await.expect(c.label);
+            assert_eq!(resp.status(), 200, "{}", c.label);
+            let text = String::from_utf8(collect_body(resp).await.to_vec()).unwrap();
+            assert!(text.starts_with("{\"server\":"), "{}: {text}", c.label);
+            outputs.push(text);
+        }
+        assert_eq!(outputs[0], outputs[1], "{}: $_SERVER differs", c.label);
+        eprintln!("{}: identical ({} bytes)", c.label, outputs[0].len());
+    }
+
+    sup.drain().await.unwrap();
+    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// lsphp's master retires excess idle workers by marking them (`m_iKillSent`) without a
+/// signal. A marked worker is alive and its socket passes the pool probe, but when its
+/// next request arrives it exits without reading it, so the request resets before any
+/// response byte. The master marks every excess idle worker at once, so the pooled
+/// sockets a retry would reuse are likely marked too: an idempotent retry must take a
+/// fresh dial (a new worker), or three marked sockets in a row turn into a 502.
+#[tokio::test]
+async fn get_retries_on_a_fresh_dial_past_marked_idle_workers() {
+    let path = tmp_sock("marked-idle");
+    let listener = UnixListener::bind(&path).unwrap();
+    const WARM: usize = 3;
+    let warm_ready = Arc::new(tokio::sync::Barrier::new(WARM));
+    let fresh_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served = fresh_served.clone();
+    let server_task = tokio::spawn(async move {
+        let mut accepted = 0usize;
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            accepted += 1;
+            let warm = accepted <= WARM;
+            let ready = warm_ready.clone();
+            let served = served.clone();
+            tokio::spawn(async move {
+                let respond = |tag: &str| {
+                    let mut out = BytesMut::new();
+                    put_packet(
+                        &mut out,
+                        PacketType::RespHeader,
+                        &resp_header_body(200, &[("X-Worker", tag)]),
+                    );
+                    put_packet(&mut out, PacketType::RespStream, tag.as_bytes());
+                    put_packet(&mut out, PacketType::RespEnd, b"");
+                    out
+                };
+                if warm {
+                    // Serve one request once all warm connections exist, then act
+                    // like a marked worker: drop the next request unread.
+                    let _ = read_packet(&mut s).await.unwrap();
+                    ready.wait().await;
+                    s.write_all(&respond("warm")).await.unwrap();
+                    s.flush().await.unwrap();
+                    // Block until the next request's first byte arrives, then close
+                    // with the rest of it unread (readiness alone can be stale).
+                    let mut first = [0u8; 1];
+                    let _ = s.read(&mut first).await;
+                    drop(s);
+                    return;
+                }
+                while read_packet(&mut s).await.is_ok() {
+                    served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if s.write_all(&respond("fresh")).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 8, Duration::from_secs(2)));
+    let handler = Arc::new(Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(2)));
+    let get = |uri: &str| {
+        http::Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("Host", "test")
+            .body(empty_incoming())
+            .unwrap()
+    };
+    let mut warmups = Vec::new();
+    for i in 0..WARM {
+        let handler = handler.clone();
+        let req = get(&format!("/warm{i}.php"));
+        warmups.push(tokio::spawn(async move {
+            let resp = handler
+                .handle(&mut ctx("/web/test"), req)
+                .await
+                .expect("warm-up GET");
+            collect_body(resp).await
+        }));
+    }
+    for w in warmups {
+        assert_eq!(&w.await.unwrap()[..], b"warm");
+    }
+    for _ in 0..200 {
+        if pool.idle_count() == WARM {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(pool.idle_count(), WARM, "every warm connection is pooled");
+
+    let resp = handler
+        .handle(&mut ctx("/web/test"), get("/next.php"))
+        .await
+        .expect("a GET must survive marked idle workers");
+    assert_eq!(
+        resp.extensions()
+            .get::<hj_lsapi::LsapiRetryInfo>()
+            .map(|r| r.kind),
+        Some("idempotent_reset")
+    );
+    assert_eq!(resp.headers().get("x-worker").unwrap(), "fresh");
+    assert_eq!(&collect_body(resp).await[..], b"fresh");
+    assert_eq!(fresh_served.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let stats = pool.stats();
+    assert_eq!(
+        (stats.reset_replays, stats.reset_replay_exhaustions),
+        (1, 0)
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// How the pooled (warm) worker treats the request after the one it served.
+#[derive(Clone, Copy, PartialEq)]
+enum WarmNext {
+    /// A worker its master marked to retire: exits on the first byte, the rest unread.
+    DropUnread,
+    /// Reads the whole request, then dies before answering.
+    ReadThenDie,
+}
+
+/// One warm pooled worker that served a GET, then `next` for the request under test;
+/// every later connection is a fresh worker that reads `body_len` body bytes and
+/// answers. Returns the result, how many fresh workers answered, and the body the
+/// first of them received.
+async fn dispatch_past_warm_worker(
+    name: &str,
+    next: WarmNext,
+    req: hj_core::Request,
+    body_len: usize,
+) -> (
+    Result<hj_core::Response, hj_core::HandlerError>,
+    usize,
+    Vec<u8>,
+    hj_lsapi::PoolStats,
+) {
+    let path = tmp_sock(name);
+    let listener = UnixListener::bind(&path).unwrap();
+    let fresh_served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fresh_body = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (served, seen) = (fresh_served.clone(), fresh_body.clone());
+    let server_task = tokio::spawn(async move {
+        let mut accepted = 0usize;
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            accepted += 1;
+            let warm = accepted == 1;
+            let (served, seen) = (served.clone(), seen.clone());
+            tokio::spawn(async move {
+                let respond = |tag: &str| {
+                    let mut out = BytesMut::new();
+                    put_packet(
+                        &mut out,
+                        PacketType::RespHeader,
+                        &resp_header_body(200, &[("X-Worker", tag)]),
+                    );
+                    put_packet(&mut out, PacketType::RespStream, tag.as_bytes());
+                    put_packet(&mut out, PacketType::RespEnd, b"");
+                    out
+                };
+                if warm {
+                    let _ = read_packet(&mut s).await.unwrap();
+                    s.write_all(&respond("warm")).await.unwrap();
+                    s.flush().await.unwrap();
+                    match next {
+                        WarmNext::DropUnread => {
+                            let mut first = [0u8; 1];
+                            let _ = s.read(&mut first).await;
+                        }
+                        WarmNext::ReadThenDie => {
+                            let _ = read_packet(&mut s).await.unwrap();
+                            let mut body = vec![0u8; body_len];
+                            s.read_exact(&mut body).await.unwrap();
+                        }
+                    }
+                    drop(s);
+                    return;
+                }
+                if read_packet(&mut s).await.is_err() {
+                    return;
+                }
+                let mut body = vec![0u8; body_len];
+                if s.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                if served.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    *seen.lock().unwrap() = body;
+                }
+                let _ = s.write_all(&respond("fresh")).await;
+                let _ = s.flush().await;
+            });
+        }
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 8, Duration::from_secs(2)));
+    let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(2));
+    let warm_get = http::Request::builder()
+        .method("GET")
+        .uri("/warm.php")
+        .header("Host", "test")
+        .body(empty_incoming())
+        .unwrap();
+    let resp = handler
+        .handle(&mut ctx("/web/test"), warm_get)
+        .await
+        .expect("warm-up GET");
+    assert_eq!(&collect_body(resp).await[..], b"warm");
+    for _ in 0..200 {
+        if pool.idle_count() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(pool.idle_count(), 1, "the warm connection is pooled");
+
+    let result = handler.handle(&mut ctx("/web/test"), req).await;
+    let stats = pool.stats();
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+    let served = fresh_served.load(std::sync::atomic::Ordering::SeqCst);
+    let body = fresh_body.lock().unwrap().clone();
+    (result, served, body, stats)
+}
+
+fn post(content_type: Option<&str>, body: &'static [u8]) -> hj_core::Request {
+    let mut req = http::Request::builder()
+        .method("POST")
+        .uri("/sx.php")
+        .header("Host", "test")
+        .header("Content-Length", body.len());
+    if let Some(ct) = content_type {
+        req = req.header("Content-Type", ct);
+    }
+    req.body(full_incoming(body)).unwrap()
+}
+
+/// A POST that a retiring worker dropped unread never reached PHP, so it is replayed on
+/// a fresh dial with its (small, PHP-preread) body, like OLS `ExtConn::connError`.
+#[tokio::test]
+async fn post_dropped_unread_by_a_retiring_worker_is_replayed() {
+    let body: &'static [u8] = b"t=pv&u=%2Fthreads%2Fexample.1%2F";
+    let (result, served, seen, stats) = dispatch_past_warm_worker(
+        "unread-post",
+        WarmNext::DropUnread,
+        post(Some("application/x-www-form-urlencoded"), body),
+        body.len(),
+    )
+    .await;
+    let resp = result.expect("an unread POST must be replayed");
+    assert_eq!(
+        resp.extensions()
+            .get::<hj_lsapi::LsapiRetryInfo>()
+            .map(|r| r.kind),
+        Some("unread_reset")
+    );
+    assert_eq!(resp.headers().get("x-worker").unwrap(), "fresh");
+    assert_eq!((served, &seen[..]), (1, body));
+    assert_eq!(
+        (stats.reset_replays, stats.reset_replay_exhaustions),
+        (1, 0)
+    );
+}
+
+#[tokio::test]
+async fn bodyless_post_dropped_unread_is_replayed() {
+    let (result, served, _, _) =
+        dispatch_past_warm_worker("unread-bodyless", WarmNext::DropUnread, post(None, b""), 0)
+            .await;
+    let resp = result.expect("an unread bodyless POST must be replayed");
+    assert_eq!(resp.headers().get("x-worker").unwrap(), "fresh");
+    assert_eq!(served, 1);
+}
+
+/// A body PHP may read only in part (multipart) is never replayed: an unread tail does
+/// not prove the script never ran.
+#[tokio::test]
+async fn multipart_post_reset_is_not_replayed() {
+    let body: &'static [u8] =
+        b"--zz\r\nContent-Disposition: form-data; name=a\r\n\r\n1\r\n--zz--\r\n";
+    let (result, served, _, _) = dispatch_past_warm_worker(
+        "unread-multipart",
+        WarmNext::DropUnread,
+        post(Some("multipart/form-data; boundary=zz"), body),
+        body.len(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(hj_core::HandlerError::BadGateway(_))),
+        "multipart must not be replayed"
+    );
+    assert_eq!(served, 0);
+}
+
+/// A worker that took the whole request and then died may have run the script: EOF is
+/// not an unread reset, so a POST stays a 502.
+#[tokio::test]
+async fn post_read_in_full_before_the_worker_died_is_not_replayed() {
+    let body: &'static [u8] = b"a=1&b=2";
+    let (result, served, _, _) = dispatch_past_warm_worker(
+        "read-then-die",
+        WarmNext::ReadThenDie,
+        post(Some("application/x-www-form-urlencoded"), body),
+        body.len(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(hj_core::HandlerError::BadGateway(_))),
+        "a POST the worker read must not be replayed"
+    );
+    assert_eq!(served, 0);
 }

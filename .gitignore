@@ -27,3 +27,18 @@ conf/
 # The OCI quick-start uses a second synthetic, non-secret config fixture.
 !packaging/oci/litespeed/conf/
 !packaging/oci/litespeed/conf/**
+# The native package also ships a synthetic, static-only default.
+!packaging/debian/conf/
+!packaging/debian/conf/**
+
+# Release keys are supplied by the protected publisher; package outputs are local.
+/packaging/debian/archive-keyring.asc
+/debian/.debhelper/
+/debian/build/
+/debian/httpjet/
+/debian/httpjet-archive-keyring/
+/debian/files
+/debian/debhelper-build-stamp
+/debian/*.debhelper
+/debian/*.substvars
+/packaging/**/__pycache__/

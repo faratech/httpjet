@@ -229,16 +229,31 @@ impl<T: Send + 'static> TieredPool<T> {
 }
 
 impl TieredPool<Vec<u8>> {
-    /// A cleared buffer with at least `min` bytes of capacity: a pooled one when
-    /// available, else a fresh `max(min, fresh_cap)` allocation.
+    /// A cleared buffer with at least `min` bytes of capacity: the most recently pooled
+    /// one that is large enough, else a fresh `max(min, fresh_cap)` allocation. Growing
+    /// a too-small pooled buffer instead would `realloc`, which copies its whole (dead)
+    /// capacity and leaves a buffer too big to pool again; and one pool can hold
+    /// several sizes (a compressor's sinks and its input batches), so the newest
+    /// buffer alone is not the only candidate.
     pub fn take_buf(&self, min: usize, fresh_cap: usize) -> Vec<u8> {
-        match self.take() {
-            Some(mut buf) => {
-                buf.reserve(min);
-                buf
-            }
-            None => Vec::with_capacity(min.max(fresh_cap)),
-        }
+        let fit = |local: &mut Vec<Vec<u8>>| {
+            let at = local.iter().rposition(|buf| buf.capacity() >= min)?;
+            Some(local.swap_remove(at))
+        };
+        self.local
+            .try_with(|local| {
+                let mut local = local.try_borrow_mut().ok()?;
+                if local.is_empty() {
+                    let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                    let n = (self.local_cap / 2).max(1).min(shared.len());
+                    let at = shared.len() - n;
+                    local.extend(shared.drain(at..));
+                }
+                fit(&mut local)
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Vec::with_capacity(min.max(fresh_cap)))
     }
 
     /// Return an unused buffer: cleared, and kept only if it has capacity and at
@@ -520,6 +535,51 @@ mod tests {
         let back = POOL.take_buf(16, 4096);
         assert_eq!(back.as_ptr() as usize, addr);
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn a_pooled_buffer_too_small_for_the_request_stays_pooled() {
+        thread_local! {
+            static BUFS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+        }
+        static POOL: TieredPool<Vec<u8>> = TieredPool::new(&BUFS, 4, 4);
+        let small = POOL.take_buf(0, 4096);
+        let addr = small.as_ptr() as usize;
+        POOL.give_buf(small, 4096);
+        let big = POOL.take_buf(8192, 4096);
+        assert!(big.capacity() >= 8192);
+        assert_ne!(big.as_ptr() as usize, addr);
+        let back = POOL.take_buf(16, 4096);
+        assert_eq!(
+            back.as_ptr() as usize,
+            addr,
+            "the small buffer was consumed"
+        );
+        assert_eq!(back.capacity(), 4096);
+    }
+
+    #[test]
+    fn a_large_enough_buffer_below_a_small_one_is_reused() {
+        thread_local! {
+            static BUFS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+        }
+        static POOL: TieredPool<Vec<u8>> = TieredPool::new(&BUFS, 4, 4);
+        let big = POOL.take_buf(32 * 1024, 32 * 1024);
+        let big_addr = big.as_ptr() as usize;
+        let small = POOL.take_buf(0, 4096);
+        POOL.give_buf(big, 64 * 1024);
+        POOL.give_buf(small, 64 * 1024);
+        let again = POOL.take_buf(32 * 1024, 32 * 1024);
+        assert_eq!(
+            again.as_ptr() as usize,
+            big_addr,
+            "the pooled 32 KiB buffer"
+        );
+        assert_eq!(
+            POOL.take_buf(16, 4096).capacity(),
+            4096,
+            "the small one stayed"
+        );
     }
 
     #[test]

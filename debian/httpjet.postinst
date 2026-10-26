@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" = configure ]; then
+    account=$(getent passwd httpjet || true)
+    if [ -z "$account" ]; then
+        if getent group httpjet >/dev/null; then
+            adduser --quiet --system --ingroup httpjet --home /var/lib/httpjet \
+                --no-create-home --shell /usr/sbin/nologin httpjet
+        else
+            adduser --quiet --system --group --home /var/lib/httpjet \
+                --no-create-home --shell /usr/sbin/nologin httpjet
+        fi
+    else
+        # A retained package account is reusable after purge/reinstall. A
+        # human or unrelated account with this name must not run the server.
+        IFS=: read -r name password uid gid comment home shell <<EOF
+$account
+EOF
+        group=$(getent group httpjet || true)
+        group_gid=$(printf '%s\n' "$group" | cut -d: -f3)
+        if [ "$uid" -ge 1000 ] || [ "$uid" -eq 0 ] \
+            || [ "$gid" != "$group_gid" ] \
+            || [ "$home" != /var/lib/httpjet ] \
+            || [ "$shell" != /usr/sbin/nologin ]; then
+            echo "httpjet: existing account is not the dedicated httpjet system account" >&2
+            exit 1
+        fi
+    fi
+
+    # mkdir is the ownership decision: even an empty pre-existing docroot or
+    # symlink belongs to the administrator and is never seeded or overwritten.
+    if [ -z "${2:-}" ] && [ ! -e /var/www/httpjet ] && [ ! -L /var/www/httpjet ]; then
+        install -d -m 0755 /var/www
+        if mkdir -m 0755 /var/www/httpjet; then
+            install -m 0644 /usr/share/httpjet/welcome/index.html /var/www/httpjet/index.html
+        fi
+    fi
+
+    # Validate before debhelper can restart an existing service. A failed
+    # upgrade leaves the old running process and its active config in place.
+    env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin runuser -u httpjet -- \
+        /usr/bin/httpjet --root /etc/httpjet check --strict
+fi
+
+# debhelper enables a new service, remembers disabled/masked states and uses
+# try-restart on upgrades. A manually stopped service must remain stopped.
+#DEBHELPER#
+
+if [ "$1" = configure ] && [ -z "${2:-}" ] \
+    && [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    # Fresh install only; the Debian helper respects policy-rc.d and masks.
+    deb-systemd-invoke start httpjet.service
+fi

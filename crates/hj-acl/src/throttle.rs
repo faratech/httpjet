@@ -38,10 +38,19 @@ struct Window {
     count: u32,
 }
 
+#[derive(Default)]
+struct Shard {
+    map: HashMap<IpAddr, Window>,
+    /// When a full shard's earliest window expires. Until then an expiry sweep frees
+    /// nothing, and sweeping on every new address of a distinct-IP flood would cost a
+    /// full pass under the lock per request.
+    sweep_after: Option<Instant>,
+}
+
 pub struct ClientThrottle {
     rate: u32,
     window: Duration,
-    shards: Vec<Mutex<HashMap<IpAddr, Window>>>,
+    shards: Vec<Mutex<Shard>>,
     rejected: AtomicU64,
     allowed: AtomicU64,
 }
@@ -61,7 +70,7 @@ impl ClientThrottle {
         Self {
             rate: 0,
             window: Duration::from_secs(1),
-            shards: (0..SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
             rejected: AtomicU64::new(0),
             allowed: AtomicU64::new(0),
         }
@@ -118,8 +127,8 @@ impl ClientThrottle {
             return true;
         }
         let ip = ip.to_canonical();
-        let map = self.shards[shard_of_canonical(ip)].lock();
-        map.get(&ip).is_none_or(|w| {
+        let shard = self.shards[shard_of_canonical(ip)].lock();
+        shard.map.get(&ip).is_none_or(|w| {
             Instant::now().duration_since(w.start) >= self.window || w.count < self.rate
         })
     }
@@ -133,10 +142,19 @@ impl ClientThrottle {
         // through equivalent address representations.
         let ip = ip.to_canonical();
         let now = Instant::now();
-        let shard = &self.shards[shard_of_canonical(ip)];
-        let mut map = shard.lock();
-        if map.len() >= MAX_IPS_PER_SHARD {
-            map.retain(|_, w| now.duration_since(w.start) < self.window);
+        let mut shard = self.shards[shard_of_canonical(ip)].lock();
+        let shard = &mut *shard;
+        let map = &mut shard.map;
+        if map.len() >= MAX_IPS_PER_SHARD && shard.sweep_after.is_none_or(|at| now >= at) {
+            let mut earliest: Option<Instant> = None;
+            map.retain(|_, w| {
+                let live = now.duration_since(w.start) < self.window;
+                if live && earliest.is_none_or(|e| w.start < e) {
+                    earliest = Some(w.start);
+                }
+                live
+            });
+            shard.sweep_after = earliest.map(|start| start + self.window);
         }
         let Some(w) = map.get_mut(&ip) else {
             if map.len() >= MAX_IPS_PER_SHARD {
@@ -289,6 +307,43 @@ mod tests {
         let tracked = IpAddr::V4(Ipv4Addr::new(172, 0, 0, 1));
         assert!(!t.allow(tracked));
         assert_eq!(t.rejected_total(), 1);
+    }
+
+    /// A full shard is swept once, then not again until its earliest window can have
+    /// expired; after that the sweep frees the expired windows as before.
+    #[test]
+    fn a_full_shard_sweeps_only_once_a_window_can_have_expired() {
+        let mut t = ClientThrottle::disabled();
+        t.rate = 1;
+        t.window = Duration::from_millis(200);
+        let target = shard_of_canonical(ip(1));
+        let mut filled = 0;
+        for i in 0u32.. {
+            let v = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 | i));
+            if shard_of_canonical(v) == target {
+                assert!(t.allow(v));
+                filled += 1;
+                if filled == MAX_IPS_PER_SHARD {
+                    break;
+                }
+            }
+        }
+        let newcomer = (0u32..)
+            .map(|i| IpAddr::V4(Ipv4Addr::from(0xac10_0000 | i)))
+            .find(|v| shard_of_canonical(*v) == target)
+            .unwrap();
+        assert!(t.allow(newcomer), "a full shard fails open");
+        let sweep_after = t.shards[target].lock().sweep_after;
+        assert!(sweep_after.is_some_and(|at| at > Instant::now()));
+        assert!(
+            t.allow(newcomer),
+            "still untracked: no sweep before the earliest expiry"
+        );
+        assert_eq!(t.shards[target].lock().sweep_after, sweep_after);
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(t.allow(newcomer), "the sweep freed the expired windows");
+        assert!(!t.allow(newcomer), "and the newcomer is now tracked");
+        assert_eq!(t.shards[target].lock().map.len(), 1);
     }
 
     #[test]

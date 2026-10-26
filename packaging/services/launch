@@ -1,0 +1,9 @@
+#!/bin/sh
+# The Python launcher execs setpriv (or verifies a supervisor-provided UID),
+# replaces the environment and then execs the foreground daemon.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+if [ -n "${NOTIFY_SOCKET:-}" ]; then
+    exec env -i PATH="$PATH" NOTIFY_SOCKET="$NOTIFY_SOCKET" python3 -I /opt/httpjet/libexec/manage.py launch
+fi
+exec env -i PATH="$PATH" python3 -I /opt/httpjet/libexec/manage.py launch

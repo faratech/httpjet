@@ -74,6 +74,10 @@ pub(super) struct Recv {
     /// The per-stream receive window we grant on a new stream = our advertised
     /// SETTINGS_INITIAL_WINDOW_SIZE (§6.9.2). Stamped into each `StreamState` at open.
     pub(super) our_initial_window: i64,
+    /// Header count of the last request dispatched on this connection, which sizes the
+    /// next stream's `HeaderMap`: a proxy repeats the same header set on every request, and
+    /// an unsized map regrew several times per request. Capped at `recv::HEADER_COUNT_HINT_MAX`.
+    pub(super) header_count_hint: usize,
     /// (CVE-2023-44487 rapid-reset) Debt of the reset budget: resets of streams whose
     /// handler was still in flight (backend work started, then discarded), whoever sent the
     /// RST_STREAM. The budget refills with time only, so completed requests cannot pay for

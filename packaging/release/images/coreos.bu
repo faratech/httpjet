@@ -1,0 +1,62 @@
+{
+  "variant": "fcos",
+  "version": "1.6.0",
+  "passwd": {
+    "users": [
+      {
+        "name": "qualifier",
+        "groups": [
+          "wheel"
+        ],
+        "ssh_authorized_keys": [
+          "@SSH_PUBLIC_KEY@"
+        ],
+        "home_dir": "/home/qualifier",
+        "shell": "/bin/bash"
+      }
+    ]
+  },
+  "storage": {
+    "directories": [
+      {
+        "path": "/var/lib/httpjet-qualification",
+        "mode": 448,
+        "user": {
+          "id": 0
+        },
+        "group": {
+          "id": 0
+        }
+      }
+    ],
+    "files": [
+      {
+        "path": "/etc/sudoers.d/90-httpjet-qualifier",
+        "mode": 288,
+        "contents": {
+          "inline": "qualifier ALL=(ALL) NOPASSWD: ALL\n"
+        }
+      },
+      {
+        "path": "/etc/httpjet-disposable-qualification",
+        "mode": 384,
+        "contents": {
+          "inline": "Disposable checksum-locked CoreOS QEMU qualification only\n"
+        }
+      }
+    ]
+  },
+  "systemd": {
+    "units": [
+      {
+        "name": "httpjet-qualification.service",
+        "enabled": true,
+        "contents": "[Unit]\nDescription=httpjet attested Podman qualification\nAfter=network-online.target\nWants=network-online.target\nConditionPathExists=/var/lib/httpjet-qualification/image-ready\n\n[Service]\nType=simple\nEnvironmentFile=/var/lib/httpjet-qualification/profile.env\nExecStartPre=-/usr/bin/podman rm --ignore --force @CONTAINER_NAME@\nExecStart=/usr/bin/podman run --name @CONTAINER_NAME@ --pull=never --network=host --read-only --user=10001:10001 --cap-drop=ALL --security-opt=no-new-privileges --security-opt=seccomp=/var/lib/httpjet-qualification/seccomp.json --ulimit=memlock=8388608:8388608 --tmpfs=/run/httpjet:rw,noexec,nosuid,nodev,size=16m,mode=0750,uid=10001,gid=10001 --tmpfs=/var/log/httpjet:rw,noexec,nosuid,nodev,size=16m,mode=0750,uid=10001,gid=10001 --volume=/var/lib/httpjet-qualification/configuration:/etc/httpjet:ro,z --volume=/var/lib/httpjet-qualification/site:/site:ro,z --volume=/var/lib/httpjet-qualification/certs:/certs:ro,z --env=RUST_LOG=warn ${HTTPJET_IMAGE} $HTTPJET_ARGS\nExecStop=/usr/bin/podman stop --ignore --time=25 @CONTAINER_NAME@\nExecStopPost=-/usr/bin/podman rm --ignore --force @CONTAINER_NAME@\nRestart=on-failure\nRestartSec=2\nTimeoutStartSec=45\nTimeoutStopSec=30\nKillMode=none\n\n[Install]\nWantedBy=multi-user.target\n"
+      },
+      {
+        "name": "zincati.service",
+        "mask": true
+      }
+    ]
+  }
+}

@@ -94,6 +94,17 @@ pub(super) fn convert_vhost_decls(
             tracing::warn!(vhost = %name, "duplicate virtualHost name; keeping the first declaration");
             continue;
         }
+        // OLS reads it per vhost (getLongValue 0..1, the server value as default).
+        if ols_long_value(&v.force_strict_ownership, 0, 1, 0) != 0 {
+            return Err(ConfigError::InvalidValue {
+                path: path.to_path_buf(),
+                directive: "virtualHost.forceStrictOwnership",
+                value: v.force_strict_ownership.clone().unwrap_or_default(),
+                reason: format!(
+                    "vhost {name:?}: file ownership checks are not enforced by httpjet; refusing to serve without them"
+                ),
+            });
+        }
         if let Some(listeners) = nonempty(v.listeners) {
             return Err(ConfigError::InvalidValue {
                 path: path.to_path_buf(),
@@ -318,6 +329,22 @@ fn reject_unenforced_vhost_security(path: &std::path::Path, raw: &RawVHostConfig
             .map(|r| r.name.as_deref().unwrap_or("").trim().to_string())
             .collect();
         return Err(unenforced(path, "realmList", names.join(","), "vhost"));
+    }
+    // OLS reads it with getLongValue(0..1, default 0): only `1` turns it on. A
+    // template's disabled block (`0`, or empty) still loads.
+    if let Some(enable) = raw
+        .security
+        .as_ref()
+        .and_then(|s| s.hotlink_ctrl.as_ref())
+        .map(|h| &h.enable)
+        .filter(|enable| ols_long_value(enable, 0, 1, 0) != 0)
+    {
+        return Err(unenforced(
+            path,
+            "enableHotlinkCtrl",
+            enable.clone().unwrap_or_default(),
+            "vhost",
+        ));
     }
     Ok(())
 }
@@ -694,6 +721,35 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
                             |v| parse_secs(v).filter(|&secs| secs > 0),
                             "expected a positive integer number of seconds",
                         )?;
+                        // `NONE` (any case) is LiteSpeed's "no headers, and none inherited".
+                        let extra_headers_none = c
+                            .extra_headers
+                            .as_deref()
+                            .is_some_and(|text| text.trim().eq_ignore_ascii_case("none"));
+                        let extra_headers = c
+                            .extra_headers
+                            .as_deref()
+                            .filter(|_| !extra_headers_none)
+                            .map(parse_extra_headers)
+                            .transpose()
+                            .map_err(|reason| ConfigError::InvalidValue {
+                                path: config_path.clone(),
+                                directive: "extraHeaders",
+                                value: c.extra_headers.clone().unwrap_or_default(),
+                                reason: format!("{reason} in context {uri:?}"),
+                            })?
+                            .unwrap_or_default();
+                        // Only static contexts apply them; a proxy context's would be ignored.
+                        if kind == ContextKind::Proxy && !extra_headers.is_empty() {
+                            return Err(ConfigError::InvalidValue {
+                                path: config_path.clone(),
+                                directive: "extraHeaders",
+                                value: c.extra_headers.clone().unwrap_or_default(),
+                                reason: format!(
+                                    "context {uri:?}: extra headers are not applied on proxy contexts"
+                                ),
+                            });
+                        }
                         Ok(Some(Context {
                             kind,
                             uri,
@@ -713,11 +769,8 @@ pub(crate) fn parse_vhost_config(text: &str, ctx: &SubstCtx) -> Result<VHostConf
                                 .map(|_| truthy(&c.enabled))
                                 .unwrap_or(true),
                             allow_browse,
-                            extra_headers: c
-                                .extra_headers
-                                .as_deref()
-                                .map(parse_extra_headers)
-                                .unwrap_or_default(),
+                            extra_headers,
+                            inherit_extra_headers: !extra_headers_none,
                             add_default_charset: c
                                 .add_default_charset
                                 .as_ref()

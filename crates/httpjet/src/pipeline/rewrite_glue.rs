@@ -44,8 +44,14 @@ pub(super) enum RwResult {
         code: u16,
         env: Vec<(String, String)>,
     },
-    Forbidden,
-    Gone,
+    /// `[F]` / `[G]`, with the `[E=]` env set up to it: the error response's
+    /// `Header ... env=` directives read it, as OLS expands env before the action.
+    Forbidden {
+        env: Vec<(String, String)>,
+    },
+    Gone {
+        env: Vec<(String, String)>,
+    },
     /// An internal rewrite produced a path with a malformed escape, an embedded NUL or
     /// invalid UTF-8 once decoded; refused like an undecodable request target.
     InvalidTarget,
@@ -71,12 +77,11 @@ impl RwResult {
             RwResult::Proxy { env, .. }
             | RwResult::Redirect { env, .. }
             | RwResult::Status { env, .. }
+            | RwResult::Forbidden { env }
+            | RwResult::Gone { env }
             | RwResult::Rewritten { env, .. }
             | RwResult::Unchanged { env } => std::mem::take(env),
-            RwResult::Failed { .. }
-            | RwResult::Forbidden
-            | RwResult::Gone
-            | RwResult::InvalidTarget => Vec::new(),
+            RwResult::Failed { .. } | RwResult::InvalidTarget => Vec::new(),
         }
     }
 }
@@ -1369,8 +1374,14 @@ fn terminal_outcome(outcome: RewriteOutcome, mut all: Vec<(String, String)>) -> 
             all.append(&mut env);
             RwResult::Status { code, env: all }
         }
-        RewriteOutcome::Forbidden { .. } => RwResult::Forbidden,
-        RewriteOutcome::Gone { .. } => RwResult::Gone,
+        RewriteOutcome::Forbidden { mut env, .. } => {
+            all.append(&mut env);
+            RwResult::Forbidden { env: all }
+        }
+        RewriteOutcome::Gone { mut env, .. } => {
+            all.append(&mut env);
+            RwResult::Gone { env: all }
+        }
         RewriteOutcome::Unchanged { env, .. } => {
             all.extend(env);
             RwResult::Unchanged { env: all }
@@ -1660,7 +1671,7 @@ mod tests {
     fn outcome_key_separates_listener_ports() {
         // #692: a path-only [R] Location carries the listener port.
         let c = Arc::new(RewriteOutcomeCache::new(DEFAULT_REWRITE_OUTCOME_TTL));
-        c.insert(okey("/p"), RwResult::Forbidden);
+        c.insert(okey("/p"), RwResult::Forbidden { env: Vec::new() });
         assert!(c.get(&okey("/p")).is_some());
         assert!(
             c.get(&OutcomeKey {
@@ -1745,15 +1756,21 @@ mod tests {
     #[test]
     fn empty_generation_preserves_old_outcomes_and_ttl() {
         let old = Arc::new(RewriteOutcomeCache::new(Duration::from_secs(45)));
-        old.insert(okey("/a"), RwResult::Forbidden);
+        old.insert(okey("/a"), RwResult::Forbidden { env: Vec::new() });
         let next = Arc::new(old.empty_generation());
         assert_eq!(next.ttl, Duration::from_secs(45));
         assert!(next.get(&okey("/a")).is_none());
-        assert!(matches!(old.get(&okey("/a")), Some(RwResult::Forbidden)));
-        old.insert(okey("/late"), RwResult::Forbidden);
+        assert!(matches!(
+            old.get(&okey("/a")),
+            Some(RwResult::Forbidden { .. })
+        ));
+        old.insert(okey("/late"), RwResult::Forbidden { env: Vec::new() });
         assert!(next.get(&okey("/late")).is_none());
-        next.insert(okey("/a"), RwResult::Gone);
-        assert!(matches!(old.get(&okey("/a")), Some(RwResult::Forbidden)));
+        next.insert(okey("/a"), RwResult::Gone { env: Vec::new() });
+        assert!(matches!(
+            old.get(&okey("/a")),
+            Some(RwResult::Forbidden { .. })
+        ));
     }
 
     #[test]
@@ -1775,7 +1792,7 @@ mod tests {
 
         // ttl=0 disables caching entirely (insert is a no-op, get always misses).
         let off = Arc::new(RewriteOutcomeCache::new(Duration::ZERO));
-        off.insert(okey("/a"), RwResult::Forbidden);
+        off.insert(okey("/a"), RwResult::Forbidden { env: Vec::new() });
         assert!(off.get(&okey("/a")).is_none());
     }
 
@@ -1789,7 +1806,10 @@ mod tests {
             ..okey(path)
         };
         let c = Arc::new(RewriteOutcomeCache::new(DEFAULT_REWRITE_OUTCOME_TTL));
-        c.insert(okey_ua("/p", "Googlebot"), RwResult::Forbidden);
+        c.insert(
+            okey_ua("/p", "Googlebot"),
+            RwResult::Forbidden { env: Vec::new() },
+        );
         // Same path, different UA fragment -> MISS (no cross-UA bleed).
         assert!(
             c.get(&okey_ua("/p", "Mozilla")).is_none(),
@@ -1798,14 +1818,14 @@ mod tests {
         // Same path + same UA fragment -> HIT.
         assert!(matches!(
             c.get(&okey_ua("/p", "Googlebot")),
-            Some(RwResult::Forbidden)
+            Some(RwResult::Forbidden { .. })
         ));
     }
 
     #[test]
     fn outcome_cache_respects_ttl_expiry() {
         let c = Arc::new(RewriteOutcomeCache::new(Duration::from_millis(20)));
-        c.insert(okey("/a"), RwResult::Gone);
+        c.insert(okey("/a"), RwResult::Gone { env: Vec::new() });
         assert!(c.get(&okey("/a")).is_some(), "fresh hit");
         std::thread::sleep(Duration::from_millis(35));
         assert!(c.get(&okey("/a")).is_none(), "expired after TTL");
@@ -1814,11 +1834,11 @@ mod tests {
     #[test]
     fn outcome_cache_prunes_expired_entries_at_cap() {
         let c = Arc::new(RewriteOutcomeCache::with_cap(Duration::from_millis(20), 2));
-        c.insert(okey("/a"), RwResult::Gone);
-        c.insert(okey("/b"), RwResult::Forbidden);
+        c.insert(okey("/a"), RwResult::Gone { env: Vec::new() });
+        c.insert(okey("/b"), RwResult::Forbidden { env: Vec::new() });
         std::thread::sleep(Duration::from_millis(35));
-        c.insert(okey("/c"), RwResult::Gone);
-        assert!(matches!(c.get(&okey("/c")), Some(RwResult::Gone)));
+        c.insert(okey("/c"), RwResult::Gone { env: Vec::new() });
+        assert!(matches!(c.get(&okey("/c")), Some(RwResult::Gone { .. })));
         // The prune now runs on a detached thread; wait briefly for it to land.
         for _ in 0..200 {
             if c.get(&okey("/a")).is_none() && c.get(&okey("/b")).is_none() {
@@ -1852,11 +1872,11 @@ mod tests {
     #[test]
     fn full_live_cache_runs_only_one_sync_prune_inside_the_window() {
         let c = Arc::new(RewriteOutcomeCache::with_cap(Duration::from_secs(60), 2));
-        c.insert(okey("/a"), RwResult::Gone);
-        c.insert(okey("/b"), RwResult::Forbidden);
+        c.insert(okey("/a"), RwResult::Gone { env: Vec::new() });
+        c.insert(okey("/b"), RwResult::Forbidden { env: Vec::new() });
         assert_eq!(c.count.load(Ordering::Relaxed), 2);
 
-        c.insert(okey("/cold-1"), RwResult::Gone);
+        c.insert(okey("/cold-1"), RwResult::Gone { env: Vec::new() });
         let first_claim = c.last_sync_prune.load(Ordering::Relaxed);
         assert_ne!(
             first_claim, 0,
@@ -1866,7 +1886,7 @@ mod tests {
         assert!(c.get(&okey("/cold-1")).is_none());
 
         for path in ["/cold-2", "/cold-3", "/cold-4"] {
-            c.insert(okey(path), RwResult::Gone);
+            c.insert(okey(path), RwResult::Gone { env: Vec::new() });
             assert!(c.get(&okey(path)).is_none());
         }
         assert_eq!(
@@ -1875,8 +1895,11 @@ mod tests {
             "later cold inserts over a live full cache must not sweep again inside the window"
         );
         assert_eq!(c.count.load(Ordering::Relaxed), 2);
-        assert!(matches!(c.get(&okey("/a")), Some(RwResult::Gone)));
-        assert!(matches!(c.get(&okey("/b")), Some(RwResult::Forbidden)));
+        assert!(matches!(c.get(&okey("/a")), Some(RwResult::Gone { .. })));
+        assert!(matches!(
+            c.get(&okey("/b")),
+            Some(RwResult::Forbidden { .. })
+        ));
     }
 
     #[test]
@@ -2150,7 +2173,10 @@ mod tests {
             (root.clone(), parsed("RewriteEngine On\n")),
             (root.join("sub"), Arc::clone(&child)),
         ];
-        assert!(matches!(run(&off_vhost, &on_parent), RwResult::Forbidden));
+        assert!(matches!(
+            run(&off_vhost, &on_parent),
+            RwResult::Forbidden { .. }
+        ));
         let off_parent = [
             (root.clone(), parsed("RewriteEngine Off\n")),
             (root.join("sub"), Arc::clone(&child)),
@@ -2162,7 +2188,7 @@ mod tests {
         let child_only = [(root.join("sub"), Arc::clone(&child))];
         assert!(matches!(
             run(&mk_ctx(vhost(true)), &child_only),
-            RwResult::Forbidden
+            RwResult::Forbidden { .. }
         ));
         assert!(matches!(
             run(&off_vhost, &child_only),

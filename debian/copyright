@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: httpjet
+Source: https://github.com/faratech/httpjet
+
+Files: *
+Copyright: 2026 httpjet contributors
+License: GPL-3
+ See /usr/share/common-licenses/GPL-3 for the full license text.
+ .
+ Third-party dependencies retain their respective licenses. The matching
+ source archive contains their license texts and THIRD_PARTY_NOTICES.md.

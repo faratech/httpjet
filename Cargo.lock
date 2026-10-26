@@ -317,9 +317,9 @@ dependencies = [
 
 [[package]]
 name = "brotli"
-version = "9.0.0"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8b851b75c23ca7873623d612fe49bd1989aeb03d08fb9432187eb253d3d4c6b"
+checksum = "6737ce8b81460bf9407909f73ff50bf13f7cb8577e1e76715f57ed0eba58ba44"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -328,9 +328,9 @@ dependencies = [
 
 [[package]]
 name = "brotli-decompressor"
-version = "6.0.1"
+version = "6.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "941cd9bd4ddab83cb46fa5a2d428f1c857b24ac78cb876cf7beb710840934bd7"
+checksum = "34c6783f42c21c952ad7112b354f0ba2f10760e9decea5b1b60523d6e270faaf"
 dependencies = [
  "alloc-no-stdlib",
  "alloc-stdlib",
@@ -988,7 +988,7 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "hj-acl"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "globset",
  "hj-core",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "hj-acme"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "hj-cache"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "hj-config",
  "parking_lot",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "hj-compress"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "brotli",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "hj-config"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "ipnet",
  "quick-xml",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "hj-core"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "hj-extension"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "hj-core",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "hj-fastcgi"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1101,14 +1101,14 @@ dependencies = [
 
 [[package]]
 name = "hj-geo"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "ipnet",
 ]
 
 [[package]]
 name = "hj-h2"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1126,14 +1126,14 @@ dependencies = [
 
 [[package]]
 name = "hj-http"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "hj-core",
 ]
 
 [[package]]
 name = "hj-log"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "flate2",
  "libc",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "hj-lsapi"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "hj-ocsp"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "base64 0.23.1",
  "foreign-types",
@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "hj-pagecache"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1188,6 +1188,7 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "proptest",
+ "rustc-hash",
  "rustix",
  "sha2 0.11.1",
  "tempfile",
@@ -1197,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "hj-proxy"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "bytes",
  "hj-core",
@@ -1219,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "hj-rewrite"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "base64 0.23.1",
  "bcrypt",
@@ -1239,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "hj-static"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1256,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "hj-tls"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1328,7 +1329,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "httpjet"
-version = "0.1.5"
+version = "0.1.10"
 dependencies = [
  "anyhow",
  "arc-swap",

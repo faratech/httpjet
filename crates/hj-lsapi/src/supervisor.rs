@@ -3396,13 +3396,14 @@ def stop(_signal, _frame):
     sys.exit(0)
 
 signal.signal(signal.SIGUSR1, stop)
+FLAG = bytes([{flag}])
 listener = socket.socket(fileno=0)
 
 while True:
     stream, _ = listener.accept()
     try:
         pid = os.getpid()
-        stream.sendall(b"LS\x06\x00" + struct.pack("=I", 16) + b"\x00PID" + struct.pack("=i", pid))
+        stream.sendall(b"LS\x06" + FLAG + struct.pack("=I", 16) + b"\x00PID" + struct.pack("=i", pid))
         header = b""
         while len(header) < 8:
             chunk = stream.recv(8 - len(header))
@@ -3419,12 +3420,13 @@ while True:
                 remaining -= len(chunk)
             body = str(pid).encode()
             response_header = struct.pack("=ii", 0, 200)
-            stream.sendall(b"LS\x03\x00" + struct.pack("=I", 8 + len(response_header)) + response_header)
-            stream.sendall(b"LS\x04\x00" + struct.pack("=I", 8 + len(body)) + body)
-            stream.sendall(b"LS\x05\x00" + struct.pack("=I", 8))
+            stream.sendall(b"LS\x03" + FLAG + struct.pack("=I", 8 + len(response_header)) + response_header)
+            stream.sendall(b"LS\x04" + FLAG + struct.pack("=I", 8 + len(body)) + body)
+            stream.sendall(b"LS\x05" + FLAG + struct.pack("=I", 8))
     finally:
         stream.close()
-"#
+"#,
+            flag = crate::proto::HOST_LSAPI_ENDIAN,
         );
         std::fs::write(&program, source).unwrap();
         let mut permissions = std::fs::metadata(&program).unwrap().permissions();

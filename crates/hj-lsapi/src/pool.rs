@@ -1,5 +1,9 @@
 //! Bounded pool of persistent Unix-domain-socket connections to an lsphp worker
-//! pool. Connections are pooled FIFO; idle ones can be reused for keep-alive.
+//! pool. Idle connections are reused newest-first (like OLS's connection pool), and
+//! expire oldest-first. lsphp's master counts a worker idle once it has waited 1 s
+//! for a request and marks the ones beyond `LSAPI_MAX_IDLE_CHILDREN` to exit on their
+//! next request; reusing the oldest socket kept every pooled worker cycling through
+//! those idle stretches after a surge, so requests kept landing on marked workers.
 //!
 //! LSAPI runs one request per connection round-trip but the *connection* can be
 //! reused (lsphp's PC keep-alive). We therefore hand out a [`PooledConn`] guard
@@ -72,6 +76,12 @@ pub struct PoolStats {
     /// Requests refused because their body held bytes lsphp could parse as a
     /// new BEGIN_REQUEST if the script left them unread.
     pub embedded_begin_rejects: u64,
+    /// Idempotent requests replayed on a fresh dial after their connection reset
+    /// before any response byte.
+    pub reset_replays: u64,
+    /// Idempotent requests that still reset before any response byte after every
+    /// replay.
+    pub reset_replay_exhaustions: u64,
 }
 
 /// How the handler delivered a response body, for [`PoolStats`].
@@ -101,6 +111,8 @@ struct PoolCounters {
     inline_tail_drains: AtomicU64,
     streamed_bodies: AtomicU64,
     embedded_begin_rejects: AtomicU64,
+    reset_replays: AtomicU64,
+    reset_replay_exhaustions: AtomicU64,
 }
 
 impl PoolCounters {
@@ -120,6 +132,8 @@ impl PoolCounters {
             inline_tail_drains: self.inline_tail_drains.load(Ordering::Relaxed),
             streamed_bodies: self.streamed_bodies.load(Ordering::Relaxed),
             embedded_begin_rejects: self.embedded_begin_rejects.load(Ordering::Relaxed),
+            reset_replays: self.reset_replays.load(Ordering::Relaxed),
+            reset_replay_exhaustions: self.reset_replay_exhaustions.load(Ordering::Relaxed),
         }
     }
 }
@@ -1164,6 +1178,17 @@ impl LsapiPool {
         note_embedded_begin(&self.counters);
     }
 
+    /// An idempotent request is replayed after a pre-response reset (`exhausted`:
+    /// it reset on every attempt and fails).
+    pub(crate) fn note_reset_replay(&self, exhausted: bool) {
+        let counter = if exhausted {
+            &self.counters.reset_replay_exhaustions
+        } else {
+            &self.counters.reset_replays
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Connections checked out right now (held semaphore permits).
     pub fn inflight(&self) -> u64 {
         self.max_conns.saturating_sub(self.sem.available_permits()) as u64
@@ -1271,7 +1296,7 @@ impl LsapiPool {
     /// complete. Idle entries older than the idle TTL or stamped against a stale
     /// generation are discarded (looping to a fresh dial).
     pub async fn acquire(&self) -> Result<PooledConn, PoolError> {
-        self.acquire_probed(true).await
+        self.acquire_probed(Reuse::Probed).await
     }
 
     /// (#315) `acquire` with the per-reuse health probe SKIPPED. For bodyless
@@ -1280,10 +1305,20 @@ impl LsapiPool {
     /// pure extra syscall on the hottest PHP path. The stale-TTL and
     /// wrong-generation filters below are NOT skipped — only the recv probe.
     pub async fn acquire_unprobed(&self) -> Result<PooledConn, PoolError> {
-        self.acquire_probed(false).await
+        self.acquire_probed(Reuse::Unprobed).await
     }
 
-    async fn acquire_probed(&self, probe_reuse: bool) -> Result<PooledConn, PoolError> {
+    /// `acquire` that always dials a new connection, leaving the idle sockets in place.
+    /// For replaying a request whose reused socket reset before any response byte:
+    /// lsphp's master retires excess idle workers by marking them, and a marked worker
+    /// passes the reuse probe but drops the next request it receives. It marks them in
+    /// one sweep, so the next idle sockets are likely marked too, while a new
+    /// connection is served by a worker the master has not marked.
+    pub async fn acquire_fresh(&self) -> Result<PooledConn, PoolError> {
+        self.acquire_probed(Reuse::Never).await
+    }
+
+    async fn acquire_probed(&self, reuse: Reuse) -> Result<PooledConn, PoolError> {
         let permit =
             match tokio::time::timeout(self.init_timeout, self.sem.clone().acquire_owned()).await {
                 Ok(Ok(p)) => p,
@@ -1315,30 +1350,45 @@ impl LsapiPool {
         // (UNIX_DIAG attribution + pidfd retirement) does blocking syscalls, so
         // it runs after the idle lock is released, like refresh/prune do.
         let mut wrong_generation = Vec::new();
-        let reused = loop {
-            let candidate = {
-                let mut idle = self.idle.lock();
-                loop {
-                    match idle.pop_front() {
-                        Some(entry) => {
-                            if entry.generation != acquire_gen {
-                                wrong_generation.push(entry);
-                            } else if now.duration_since(entry.since) < ttl {
-                                break Some(entry);
-                            }
-                            // Stale (wrong gen or too old): drop and keep looking.
+        let reused = if matches!(reuse, Reuse::Never) {
+            None
+        } else {
+            loop {
+                let candidate = {
+                    let mut idle = self.idle.lock();
+                    // The front holds the oldest entries: retire the expired ones, which
+                    // newest-first reuse would otherwise leave behind for good.
+                    while let Some(entry) =
+                        idle.pop_front_if(|entry| now.duration_since(entry.since) >= ttl)
+                    {
+                        if entry.generation != acquire_gen {
+                            wrong_generation.push(entry);
                         }
-                        None => break None,
                     }
+                    loop {
+                        match idle.pop_back() {
+                            Some(entry) => {
+                                if entry.generation != acquire_gen {
+                                    wrong_generation.push(entry);
+                                } else if now.duration_since(entry.since) < ttl {
+                                    break Some(entry);
+                                }
+                                // Stale (wrong gen or too old): drop and keep looking.
+                            }
+                            None => break None,
+                        }
+                    }
+                };
+                match candidate {
+                    Some(entry)
+                        if matches!(reuse, Reuse::Unprobed) || is_socket_healthy(&entry.stream) =>
+                    {
+                        break Some(entry);
+                    }
+                    // Half-closed or protocol-desynced: discard and try the next idle entry.
+                    Some(_dead) => continue,
+                    None => break None,
                 }
-            };
-            match candidate {
-                Some(entry) if !probe_reuse || is_socket_healthy(&entry.stream) => {
-                    break Some(entry);
-                }
-                // Half-closed or protocol-desynced: discard and try the next idle entry.
-                Some(_dead) => continue,
-                None => break None,
             }
         };
         self.counters
@@ -1504,6 +1554,14 @@ fn classify_dial_error(error: &io::Error) -> DialErrorClass {
     } else {
         DialErrorClass::Fatal
     }
+}
+
+/// Whether an acquire may hand out an idle pooled socket, and how it checks one first.
+#[derive(Clone, Copy)]
+enum Reuse {
+    Probed,
+    Unprobed,
+    Never,
 }
 
 /// Non-blocking liveness probe for an idle pooled socket, run before reuse.
@@ -2244,6 +2302,45 @@ mod tests {
         let stats = pool.stats();
         assert_eq!(stats.eagain_retries, 1);
         assert_eq!(stats.eagain_terminal_exhaustions, 1);
+    }
+
+    /// The most recently returned connection serves the next request, so after a
+    /// surge only the hot few workers keep being used and the rest go idle for lsphp's
+    /// trim; expired entries leave from the front.
+    #[tokio::test]
+    async fn idle_connections_are_reused_newest_first_and_expire_oldest_first() {
+        use std::os::fd::AsRawFd;
+        let socket_path = tmp_sock("newest-first");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                held.push(stream);
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let pool = LsapiPool::new(&socket_path, 3, Duration::from_secs(2))
+            .idle_ttl(Duration::from_secs(1));
+        let a = pool.acquire().await.unwrap();
+        let mut b = pool.acquire().await.unwrap();
+        let b_fd = b.stream_mut().as_raw_fd();
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        drop(b);
+        let mut newest = pool.acquire_unprobed().await.unwrap();
+        assert_eq!(newest.stream_mut().as_raw_fd(), b_fd, "newest first");
+        drop(newest);
+        assert_eq!(pool.idle_count(), 2);
+        // A has now been idle past the TTL while B was just returned: the next acquire
+        // reuses B and retires A from the front.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut again = pool.acquire_unprobed().await.unwrap();
+        assert_eq!(again.stream_mut().as_raw_fd(), b_fd);
+        assert_eq!(pool.idle_count(), 0, "the expired oldest entry was retired");
+        drop(again);
+        server.abort();
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[tokio::test]

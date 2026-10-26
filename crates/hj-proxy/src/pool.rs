@@ -293,8 +293,16 @@ impl Upstream {
     /// `connect_timeout` doubles as this wait for extProcessor targets, and prod
     /// configures `initTimeout=600s` there — parking every new request ~10 minutes
     /// while holding bridge admission slots (audit) is worse than shedding. Cap the
-    /// QUEUE wait at 10 s; the CONNECT itself still gets the full `connect_timeout`.
+    /// QUEUE wait at 10 s. A dial (connect, TLS, h2 SETTINGS) is capped the same way: it
+    /// holds one of the process-wide dial permits throughout, so a backend that stops
+    /// answering SYNs would otherwise take every permit for the whole `connect_timeout`
+    /// and fail new connections to every other upstream (OLS gives a connect ~2 s).
     const MAX_QUEUE_WAIT: Duration = Duration::from_secs(10);
+
+    /// The bound on each phase of a dial (see [`Self::MAX_QUEUE_WAIT`]).
+    fn dial_timeout(&self) -> Duration {
+        self.connect_timeout.min(Self::MAX_QUEUE_WAIT)
+    }
 
     /// Acquire a concurrency permit (LiteSpeed `maxConns`): at most `max_conns` requests may
     /// be in flight to this upstream concurrently. Waits up to [`Self::MAX_QUEUE_WAIT`] for a
@@ -430,7 +438,7 @@ impl Upstream {
         if self.breaker_open() {
             return Err(ProxyError::CircuitOpen);
         }
-        let budget = self.connect_timeout.min(Self::MAX_QUEUE_WAIT);
+        let budget = self.dial_timeout();
         match tokio::time::timeout(budget, self.dial_tracked()).await {
             Ok(r) => r,
             Err(_) => {
@@ -475,7 +483,7 @@ impl Upstream {
                     None => None,
                 };
                 let connect = TcpStream::connect(hostport.clone());
-                let stream = tokio::time::timeout(self.connect_timeout, connect)
+                let stream = tokio::time::timeout(self.dial_timeout(), connect)
                     .await
                     .map_err(|_| ProxyError::ConnectTimeout)?
                     .map_err(ProxyError::Connect)?;
@@ -492,7 +500,7 @@ impl Upstream {
                     })?;
                     let connector = TlsConnector::from(tls_cfg);
                     let tls = tokio::time::timeout(
-                        self.connect_timeout,
+                        self.dial_timeout(),
                         connector.connect(server_name, stream),
                     )
                     .await
@@ -512,7 +520,7 @@ impl Upstream {
             #[cfg(unix)]
             TargetTransport::Uds(path) => {
                 let connect = tokio::net::UnixStream::connect(path.clone());
-                let stream = tokio::time::timeout(self.connect_timeout, connect)
+                let stream = tokio::time::timeout(self.dial_timeout(), connect)
                     .await
                     .map_err(|_| ProxyError::ConnectTimeout)?
                     .map_err(ProxyError::Connect)?;
@@ -571,7 +579,7 @@ impl Upstream {
         // by dial_tracked across this call) or the upstream maxConns permit
         // forever. Capped at MAX_QUEUE_WAIT for the same reason as
         // checkout_fresh — prod connect_timeout can be 600 s.
-        let budget = self.connect_timeout.min(Self::MAX_QUEUE_WAIT);
+        let budget = self.dial_timeout();
         tokio::time::timeout(budget, self.h2_handshake_inner(io))
             .await
             .map_err(|_| ProxyError::ConnectTimeout)?

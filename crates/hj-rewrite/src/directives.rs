@@ -320,6 +320,7 @@ impl Htaccess {
     ) {
         let ext = ext_lower(basename);
         let success = (200..400).contains(&status);
+        let env_lens = EnvLengths::of(env);
 
         // `header_index` narrows the scan to directives whose scope could match
         // (superset filter); `scopes_match` below remains the arbiter, and
@@ -332,7 +333,7 @@ impl Htaccess {
             }
             // env=[!]NAME guard.
             if let Some(g) = &h.env {
-                if !env_guard_passes(g, env) {
+                if !env_guard_passes(g, env, env_lens) {
                     continue;
                 }
             }
@@ -380,6 +381,11 @@ fn stage_chain_headers<'a>(
     let mut staged = Vec::new();
     for ht in chain {
         if ht.has_resp_op {
+            // Sized once for a typical security/CORS header set instead of regrowing
+            // 4 -> 8 -> 16 on every response; a chain without header ops allocates nothing.
+            if staged.capacity() == 0 {
+                staged.reserve(16);
+            }
             ht.stage_response_headers(rel_path, basename, request_path, status, env, &mut staged);
         }
     }
@@ -434,17 +440,17 @@ pub fn chain_prepared_headers<'a>(
     status: u16,
     env: &[(String, String)],
 ) -> Vec<PreparedHeaderOp<'a>> {
-    stage_chain_headers(chain, rel_path, target_basename, request_path, status, env)
-        .into_iter()
-        .filter_map(|(_, kind, h, value)| {
-            Some(PreparedHeaderOp {
-                kind,
-                name: h.field_name.as_ref()?,
-                value,
-                field_value: h.static_value.as_ref(),
-            })
+    let staged = stage_chain_headers(chain, rel_path, target_basename, request_path, status, env);
+    let mut prepared = Vec::with_capacity(staged.len());
+    prepared.extend(staged.into_iter().filter_map(|(_, kind, h, value)| {
+        Some(PreparedHeaderOp {
+            kind,
+            name: h.field_name.as_ref()?,
+            value,
+            field_value: h.static_value.as_ref(),
         })
-        .collect()
+    }));
+    prepared
 }
 
 /// Request-plumbing names the pipeline keeps in the env (the negotiated
@@ -474,8 +480,30 @@ fn header_env_value<'e>(env: &'e [(String, String)], name: &str) -> Option<&'e s
     folded
 }
 
-fn env_guard_passes(g: &EnvGuard, env: &[(String, String)]) -> bool {
-    header_env_value(env, &g.var).is_some() != g.negate
+/// The lengths of the env's names, folded into a 64-bit set. Both of
+/// [`header_env_value`]'s comparisons need equal lengths, so a guard whose length is
+/// absent from the set is absent from the env: the common case, as a ruleset's many
+/// `env=` guards name variables most requests never set.
+#[derive(Clone, Copy)]
+struct EnvLengths(u64);
+
+impl EnvLengths {
+    fn of(env: &[(String, String)]) -> Self {
+        EnvLengths(env.iter().fold(0, |set, (k, _)| set | Self::bit(k.len())))
+    }
+
+    fn bit(len: usize) -> u64 {
+        1 << (len % 64)
+    }
+
+    fn may_hold(self, name: &str) -> bool {
+        self.0 & Self::bit(name.len()) != 0
+    }
+}
+
+fn env_guard_passes(g: &EnvGuard, env: &[(String, String)], lens: EnvLengths) -> bool {
+    let set = lens.may_hold(&g.var) && header_env_value(env, &g.var).is_some();
+    set != g.negate
 }
 
 fn uri_tests_match(tests: &[crate::htaccess::UriCond], path: &str, on_err: bool) -> bool {
@@ -1130,6 +1158,48 @@ mod directive_tests {
     use super::*;
     use crate::Htaccess;
     use crate::error::RewriteError;
+
+    /// The length-set shortcut never changes a guard's verdict.
+    #[test]
+    fn env_length_shortcut_agrees_with_the_full_lookup() {
+        let names = [
+            "no-cache",
+            "NO-CACHE",
+            "BLOCKED",
+            "blocked",
+            "WF_BETA_CONTROL",
+            "x",
+            "HTTP_ACCEPT_ENCODING",
+            "HJ_PLUMBING",
+            "a-sixty-four-character-name-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "proxy-img-cache",
+            "",
+        ];
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..2000 {
+            let mut env = Vec::new();
+            for _ in 0..(x % 6) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                env.push((
+                    names[(x % names.len() as u64) as usize].to_string(),
+                    "1".to_string(),
+                ));
+            }
+            let lens = EnvLengths::of(&env);
+            for var in names {
+                for negate in [false, true] {
+                    let g = EnvGuard {
+                        var: var.to_string(),
+                        negate,
+                    };
+                    let full = header_env_value(&env, var).is_some() != negate;
+                    assert_eq!(env_guard_passes(&g, &env, lens), full, "{var:?} {env:?}");
+                }
+            }
+        }
+    }
 
     /// A case-insensitive header lookup closure over a `(name, value)` slice — the test analogue
     /// of the production `req.headers()` callback. Bind it to a `let` so the `&` lives long enough
