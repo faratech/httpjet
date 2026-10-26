@@ -84,6 +84,7 @@ class EmptyBootstrap(unittest.TestCase):
         def opened(request,timeout):
             if isinstance(request,str):url=request;method='GET'
             else:url=request.full_url;method=request.get_method()
+            self.assertEqual(request.get_header('User-agent'),pages.release.USER_AGENT)
             if url==pages.ORIGIN+'/':return Response(pages.BOOTSTRAP.encode() if method=='GET' else b'')
             raise urllib.error.HTTPError(url,405 if method=='PUT' else 404,'fixture',{},None)
         with mock.patch.object(pages.urllib.request,'urlopen',side_effect=opened):

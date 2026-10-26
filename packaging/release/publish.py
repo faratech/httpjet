@@ -17,7 +17,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from release import load, run, sha, validate_key, verify_artifacts, verify_qualification
+from release import load, run, sha, validate_key, verify_artifacts, verify_qualification, USER_AGENT
 
 
 def signature(key, message):
@@ -49,7 +49,8 @@ class S3:
         message = '\n'.join(('AWS4-HMAC-SHA256', stamp, scope, hashlib.sha256(canonical.encode()).hexdigest()))
         signing = signature(signature(signature(signature(('AWS4' + self.secret).encode(), day), self.region), 's3'), 'aws4_request')
         fields['authorization'] = f'AWS4-HMAC-SHA256 Credential={self.access}/{scope}, SignedHeaders={signed}, Signature={hmac.new(signing,message.encode(),hashlib.sha256).hexdigest()}'
-        request = urllib.request.Request(self.endpoint + path, data=data if method == 'PUT' else None, headers=fields, method=method)
+        request = urllib.request.Request(self.endpoint + path, data=data if method == 'PUT' else None,
+                                         headers={**fields, 'User-Agent': USER_AGENT}, method=method)
         # No redirects: do not forward signing credentials to another endpoint.
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *args, **kwargs):

@@ -39,9 +39,13 @@ def bootstrap(output):
         (output / name).write_text(body)
 
 
+def public_request(url, method='GET', data=None):
+    return urllib.request.Request(url, method=method, data=data, headers={'User-Agent': release.USER_AGENT})
+
+
 def probe_bootstrap(base=ORIGIN, read_only=False):
     for method in ('GET', 'HEAD'):
-        request = urllib.request.Request(base + '/', method=method)
+        request = public_request(base + '/', method=method)
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read()
             if response.status != 200 or not response.url.startswith('https://') or 'no-store' not in response.headers.get('Cache-Control', ''):
@@ -52,7 +56,7 @@ def probe_bootstrap(base=ORIGIN, read_only=False):
     for path in ('/releases/stable.json', missing):
         for method in ('GET', 'HEAD'):
             try:
-                urllib.request.urlopen(urllib.request.Request(base + path, method=method), timeout=30).close()
+                urllib.request.urlopen(public_request(base + path, method=method), timeout=30).close()
             except urllib.error.HTTPError as error:
                 if error.code != 404 or error.url != base + path: raise
                 error.close()
@@ -60,13 +64,13 @@ def probe_bootstrap(base=ORIGIN, read_only=False):
     write_status = None
     if not read_only:
         try:
-            urllib.request.urlopen(urllib.request.Request(base + missing, data=b'bootstrap-readonly-test', method='PUT'), timeout=30).close()
+            urllib.request.urlopen(public_request(base + missing, data=b'bootstrap-readonly-test', method='PUT'), timeout=30).close()
         except urllib.error.HTTPError as error:
             if error.code not in (403, 404, 405): raise
             write_status = error.code; error.close()
         else: raise ValueError('static Pages origin accepted a public write')
         try:
-            urllib.request.urlopen(base + missing, timeout=30).close()
+            urllib.request.urlopen(public_request(base + missing), timeout=30).close()
         except urllib.error.HTTPError as error:
             if error.code != 404: raise
             error.close()

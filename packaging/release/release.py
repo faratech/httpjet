@@ -27,6 +27,7 @@ CHECKS = ('install', 'rerun', 'http', 'scripts-denied', 'bridged-transfer', 'res
           'config-preserved', 'upgrade', 'downgrade', 'remove', 'purge', 'occupied-port',
           'no-php-no-cache', 'io-uring-denied', 'reinstall', 'reboot')
 REPO_URL = 'https://httpjet-packages.pages.dev/apt'
+USER_AGENT = 'httpjet-release/0.1.10'
 
 def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, stdout=subprocess.PIPE,
@@ -307,7 +308,8 @@ def stage(directory, output, key, expected, template, repository=REPO_URL, candi
 def download(url, output):
     if not url.startswith('https://'):
         raise ValueError('downloads require HTTPS')
-    with urllib.request.urlopen(url, timeout=90) as response, output.open('wb') as stream:
+    request = urllib.request.Request(url, headers={'User-Agent': USER_AGENT})
+    with urllib.request.urlopen(request, timeout=90) as response, output.open('wb') as stream:
         if not response.url.startswith('https://'):
             raise ValueError('refusing HTTPS downgrade redirect')
         shutil.copyfileobj(response, stream)

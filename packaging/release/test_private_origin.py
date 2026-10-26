@@ -35,6 +35,7 @@ class PrivateOrigin(unittest.TestCase):
         def open(request,timeout):
             self.assertIsNotNone(store.data)
             self.assertEqual(request.get_method(),'GET')
+            self.assertEqual(request.get_header('User-agent'),probe.release.USER_AGENT)
             self.assertIsNone(request.get_header('Authorization'))
             if status==200:return Response(store.data,url=request.full_url)
             raise urllib.error.HTTPError(request.full_url,status,'UNIT ONLY',{},io.BytesIO())
@@ -71,10 +72,24 @@ class PrivateOrigin(unittest.TestCase):
         methods=[]
         def open(request,timeout):
             methods.append(request.get_method())
+            self.assertEqual(request.get_header('User-agent'),probe.release.USER_AGENT)
             if request.full_url==probe.pages.ORIGIN+'/':
                 return Response(probe.pages.BOOTSTRAP.encode() if request.get_method()=='GET' else b'',{'Cache-Control':'no-store'},request.full_url)
             raise urllib.error.HTTPError(request.full_url,404,'UNIT ONLY',{},io.BytesIO())
         result=probe.pages_readonly(mock.Mock(open=mock.Mock(side_effect=open)))
         self.assertEqual(result['status'],'passed');self.assertEqual(len(methods),6);self.assertEqual(set(methods),{'GET','HEAD'})
+    def test_honest_identity_does_not_relax_pages_bootstrap_or_404_checks(self):
+        for mode in ('403','changed-body','missing-returns-200'):
+            with self.subTest(mode=mode):
+                def open(request,timeout):
+                    self.assertEqual(request.get_header('User-agent'),probe.release.USER_AGENT)
+                    if mode=='403':raise urllib.error.HTTPError(request.full_url,403,'UNIT ONLY',{},io.BytesIO())
+                    if request.full_url==probe.pages.ORIGIN+'/':
+                        body=b'changed' if mode=='changed-body' else (probe.pages.BOOTSTRAP.encode() if request.get_method()=='GET' else b'')
+                        return Response(body,{'Cache-Control':'no-store'},request.full_url)
+                    return Response(b'SPA fallback',url=request.full_url)
+                with self.assertRaises((ValueError,urllib.error.HTTPError)) as raised:
+                    probe.pages_readonly(mock.Mock(open=mock.Mock(side_effect=open)))
+                if isinstance(raised.exception,urllib.error.HTTPError):raised.exception.close()
 
 if __name__=='__main__':unittest.main()

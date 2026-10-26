@@ -4,7 +4,7 @@ import argparse
 import hashlib
 from pathlib import Path
 import urllib.request
-from release import sha, load, REPO_URL
+from release import sha, load, REPO_URL, USER_AGENT
 
 ORIGIN = REPO_URL.removesuffix('/apt')
 
@@ -33,7 +33,7 @@ def objects(snapshot, website_redirect=True):
 
 def verify(snapshot, website_redirect=True):
     for remote, local in objects(snapshot, website_redirect):
-        request = urllib.request.Request(remote, headers={'Cache-Control': 'no-cache'})
+        request = urllib.request.Request(remote, headers={'Cache-Control': 'no-cache', 'User-Agent': USER_AGENT})
         with urllib.request.urlopen(request, timeout=30) as response:
             if not response.url.startswith('https://'):
                 raise ValueError('public download left HTTPS')

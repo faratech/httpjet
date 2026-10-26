@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 
 import pages
+import release
 from publish import S3
 from release import write_json
 
@@ -62,7 +63,8 @@ def public_denial(key, opener=None):
     opener = opener or urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
     result = {}
     for name, host in PUBLIC_HOSTS.items():
-        request = urllib.request.Request(host + '/' + key, headers={'Cache-Control': 'no-store'}, method='GET')
+        request = urllib.request.Request(host + '/' + key,
+            headers={'Cache-Control': 'no-store', 'User-Agent': release.USER_AGENT}, method='GET')
         try:
             with opener.open(request, timeout=30):
                 raise ValueError('private probe object is publicly accessible through ' + name)
@@ -143,7 +145,8 @@ def probe(store=None, public_opener=None):
 def pages_readonly(opener=None):
     opener = opener or urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler({}))
     for method in ('GET', 'HEAD'):
-        request = urllib.request.Request(pages.ORIGIN + '/', method=method)
+        request = urllib.request.Request(pages.ORIGIN + '/',
+            headers={'User-Agent': release.USER_AGENT}, method=method)
         with opener.open(request, timeout=30) as response:
             if (response.status != 200 or response.url != pages.ORIGIN + '/'
                 or 'no-store' not in response.headers.get('Cache-Control', '')
@@ -154,7 +157,8 @@ def pages_readonly(opener=None):
         for method in ('GET', 'HEAD'):
             url = pages.ORIGIN + path
             try:
-                with opener.open(urllib.request.Request(url, method=method), timeout=30):
+                request = urllib.request.Request(url, headers={'User-Agent': release.USER_AGENT}, method=method)
+                with opener.open(request, timeout=30):
                     raise ValueError('Pages bootstrap missing object did not return 404')
             except urllib.error.HTTPError as error:
                 try:

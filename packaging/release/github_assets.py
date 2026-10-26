@@ -142,7 +142,7 @@ class Github:
         if not path.startswith('/repos/'+self.repository+'/'):
             raise ValueError('unexpected GitHub API path')
         headers = {'Authorization':'Bearer '+self.token, 'Accept':'application/vnd.github+json',
-                   'X-GitHub-Api-Version':'2022-11-28'}
+                   'X-GitHub-Api-Version':'2022-11-28', 'User-Agent':release.USER_AGENT}
         if content_type: headers['Content-Type'] = content_type
         request = urllib.request.Request(host+path, data=body, headers=headers, method=method)
         with self.opener.open(request, timeout=180) as response:
@@ -336,7 +336,7 @@ class DownloadRedirect(urllib.request.HTTPRedirectHandler):
 
 def public_asset(opener, url, descriptor):
     safe_download_url(url)
-    request = urllib.request.Request(url, headers={'Cache-Control':'no-cache'})
+    request = urllib.request.Request(url, headers={'Cache-Control':'no-cache', 'User-Agent':release.USER_AGENT})
     with opener.open(request, timeout=60) as response:
         safe_download_url(response.url)
         digest = hashlib.sha256(); total = 0

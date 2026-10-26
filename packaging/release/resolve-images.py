@@ -3,11 +3,12 @@
 import argparse,base64,hashlib,json,os,re,shutil,subprocess,tempfile,urllib.request
 from pathlib import Path
 import support
-from release import download,sha,write_json
+from release import USER_AGENT,download,sha,write_json
 
 def text(url):
     if not url.startswith('https://'):raise ValueError('image metadata requires HTTPS')
-    with urllib.request.urlopen(url,timeout=45) as response:
+    request=urllib.request.Request(url,headers={'User-Agent':USER_AGENT})
+    with urllib.request.urlopen(request,timeout=45) as response:
         if not response.url.startswith('https://'):raise ValueError('image metadata downgraded HTTPS')
         return response.read().decode()
 
@@ -51,7 +52,7 @@ def tree_hash(directory):
 def oci_reference(repository,tag,arch):
     token=json.loads(text('https://auth.docker.io/token?service=registry.docker.io&scope=repository:'+repository+':pull'))['token']
     accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json'
-    request=urllib.request.Request('https://registry-1.docker.io/v2/'+repository+'/manifests/'+tag,headers={'Authorization':'Bearer '+token,'Accept':accept})
+    request=urllib.request.Request('https://registry-1.docker.io/v2/'+repository+'/manifests/'+tag,headers={'User-Agent':USER_AGENT,'Authorization':'Bearer '+token,'Accept':accept})
     with urllib.request.urlopen(request,timeout=45) as response:raw=response.read()
     document=json.loads(raw)
     if 'manifests' in document:

@@ -1,5 +1,5 @@
 %{!?httpjet_version:%global httpjet_version 0.1.10}
-%{!?httpjet_revision:%global httpjet_revision 5}
+%{!?httpjet_revision:%global httpjet_revision 6}
 Name: httpjet
 Version: %{httpjet_version}
 Release: %{httpjet_revision}
@@ -91,6 +91,9 @@ rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 
 %changelog
+* Mon Oct 26 2026 httpjet contributors - 0.1.10-6
+- Identify release HTTP requests for Cloudflare Pages compatibility.
+
 * Mon Oct 26 2026 httpjet contributors - 0.1.10-5
 - Publish qualified package repositories through Cloudflare Pages.
 - Qualify confined CoreOS io_uring and preserve GitHub release evidence.

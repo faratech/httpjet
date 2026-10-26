@@ -8,14 +8,14 @@ import os
 from pathlib import Path
 import re
 import urllib.request
-from release import load, verify_artifacts, verify_qualification
+from release import USER_AGENT, load, verify_artifacts, verify_qualification
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('run_id');parser.add_argument('directory',type=Path)
 args=parser.parse_args()
 if not re.fullmatch('[0-9]+',args.run_id):
     raise ValueError('numeric GitHub run id required')
 repository=os.environ['GITHUB_REPOSITORY']
-headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
+headers={'User-Agent':USER_AGENT,'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}
 def get(path):
     request=urllib.request.Request('https://api.github.com/repos/'+repository+'/'+path,headers=headers)
     with urllib.request.urlopen(request,timeout=30) as response:

@@ -284,6 +284,29 @@ class GithubAssets(unittest.TestCase):
             with self.subTest(url=url),self.assertRaisesRegex(ValueError,'approved HTTPS'):gh.safe_download_url(url)
 
 
+class HonestReleaseIdentity(unittest.TestCase):
+    def test_github_api_requests_use_the_shared_release_identity(self):
+        client=gh.Github('faratech/httpjet','unit-token');client.opener=mock.Mock()
+        client.opener.open.return_value=io.BytesIO(b'{"unit":true}')
+        self.assertEqual(client.json('GET','/repos/faratech/httpjet/releases'),{'unit':True})
+        request=client.opener.open.call_args.args[0]
+        self.assertEqual(request.get_header('User-agent'),release.USER_AGENT)
+        self.assertEqual(request.get_header('Authorization'),'Bearer unit-token')
+    def test_public_bytes_and_allowed_redirects_preserve_identity_without_credentials(self):
+        data=b'unit-only public bytes'
+        class Response(io.BytesIO):
+            url='https://release-assets.githubusercontent.com/unit-only'
+        opener=mock.Mock();opener.open.return_value=Response(data)
+        url='https://github.com/faratech/httpjet/releases/download/v1.2.3/install.sh'
+        gh.public_asset(opener,url,{'size':len(data),'sha256':hashlib.sha256(data).hexdigest()})
+        request=opener.open.call_args.args[0]
+        self.assertEqual(request.get_header('User-agent'),release.USER_AGENT)
+        self.assertIsNone(request.get_header('Authorization'))
+        redirected=gh.DownloadRedirect().redirect_request(request,None,302,'Found',{},Response.url)
+        self.assertEqual(redirected.get_header('User-agent'),release.USER_AGENT)
+        self.assertIsNone(redirected.get_header('Authorization'))
+
+
 class PublicationWorkflow(unittest.TestCase):
     """Execute the actual workflow shell gates against local non-network shims."""
     ROOT=Path(__file__).resolve().parents[2]
