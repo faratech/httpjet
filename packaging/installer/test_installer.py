@@ -100,8 +100,8 @@ class InstallerTests(unittest.TestCase):
         if not unrendered:
             text = text.replace("@HTTPJET_ARCHIVE_PUBLIC_KEY@", KEY)
             text = text.replace("@HTTPJET_ARCHIVE_KEY_FINGERPRINT@", "A" * 40)
-            text = text.replace("@HTTPJET_REPOSITORY_URL@", "https://packages.httpjet.net/apt")
-            text = text.replace("@HTTPJET_RELEASE_BASE_URL@", "https://packages.httpjet.net/releases")
+            text = text.replace("@HTTPJET_REPOSITORY_URL@", "https://httpjet-packages.pages.dev/apt")
+            text = text.replace("@HTTPJET_RELEASE_BASE_URL@", "https://httpjet-packages.pages.dev/releases")
             text = text.replace("@HTTPJET_INSTALLER_PYTHON@", "# mocked signed-download controller")
         if state.get("generic_mock") and not (self.bin / "python3").exists():
             (self.bin / "python3").symlink_to(self.bin / "mock-command")
@@ -137,7 +137,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("welcome page passed", result.stdout)
         source = (self.root / "etc/apt/sources.list.d/httpjet.sources").read_text()
-        self.assertEqual(source, "Types: deb\nURIs: https://packages.httpjet.net/apt\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /usr/share/keyrings/httpjet-archive-keyring.asc\n")
+        self.assertEqual(source, "Types: deb\nURIs: https://httpjet-packages.pages.dev/apt\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /usr/share/keyrings/httpjet-archive-keyring.asc\n")
         self.assertNotIn("Trusted:", source)
         self.assertEqual((self.root / "usr/share/keyrings/httpjet-archive-keyring.asc").read_text(), KEY + "\n")
         self.assertEqual((self.root / "usr/share/keyrings").stat().st_mode & 0o777, 0o755)
@@ -371,7 +371,7 @@ class InstallerTests(unittest.TestCase):
         self.assertIn("repo_gpgcheck=1\n", source)
         self.assertIn("gpgcheck=1\n", source)
         self.assertIn("pkg_gpgcheck=1\n", source)
-        self.assertIn("baseurl=https://packages.httpjet.net/rpm/x86_64", source)
+        self.assertIn("baseurl=https://httpjet-packages.pages.dev/rpm/x86_64", source)
         installs = [call for call in calls if call[0] == "dnf" and "install" in call]
         self.assertEqual(len(installs), 1)
         self.assertIn("httpjet-1.2.3-2", installs[0])

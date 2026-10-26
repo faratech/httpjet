@@ -23,7 +23,7 @@ class CoreOS(unittest.TestCase):
         self.temporary=tempfile.TemporaryDirectory(prefix='httpjet-coreos-test-');self.addCleanup(self.temporary.cleanup)
         self.work=Path(self.temporary.name)
         self.row={'architecture':'amd64','executor':'coreos','route':'immutable'}
-        self.lock={'definition':{'recipe':'packaging/release/images/coreos.bu','sha256':coreos.tree_hash(HERE/'images')},
+        self.lock={'selinux':coreos.selinux_descriptor(),'definition':{'recipe':'packaging/release/images/coreos.bu','sha256':coreos.tree_hash(HERE/'images')},
                    'cloud':{'url':'https://example.invalid/coreos.qcow2.xz','format':'qcow2.xz','sha256':'0'*64,'uncompressed_sha256':'1'*64}}
         self.ports={'ssh':22022,'http':22080,'tls':22443,'quic':22443}
         self.name='httpjet-coreos-'+'a'*32
@@ -95,6 +95,26 @@ class CoreOS(unittest.TestCase):
         with mock.patch.object(coreos.time,'monotonic',side_effect=lambda:clock[0]),mock.patch.object(coreos.time,'sleep',side_effect=lambda _:clock.__setitem__(0,clock[0]+1)):
             with self.assertRaises(TimeoutError):coreos.ready(guest,self.name,2,lambda:True)
         self.assertEqual(clock[0],2)
+
+    def test_ready_retries_rpc_timeouts_inside_remaining_budget(self):
+        guest=mock.Mock();guest.inspect.side_effect=[subprocess.TimeoutExpired('inspect',2),{'State':{'Running':True}}]
+        guest.podman.return_value=subprocess.CompletedProcess([],0,b'1\n')
+        clock=[0]
+        with mock.patch.object(coreos.time,'monotonic',side_effect=lambda:clock[0]),mock.patch.object(coreos.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+            coreos.ready(guest,self.name,2,lambda:True)
+        self.assertLessEqual(guest.inspect.call_args_list[0].kwargs['timeout'],2)
+        self.assertLessEqual(guest.inspect.call_args_list[1].kwargs['timeout'],1.5)
+        self.assertLessEqual(guest.podman.call_args.kwargs['timeout'],1.5)
+
+    def test_reboot_waits_for_boot_dependencies_without_starting_units(self):
+        guest=mock.Mock();guest.inspect.side_effect=[RuntimeError('queued policy dependency'),RuntimeError('still queued'),{'State':{'Running':True}}]
+        guest.podman.return_value=subprocess.CompletedProcess([],0,b'1\n')
+        clock=[0]
+        with mock.patch.object(coreos.time,'monotonic',side_effect=lambda:clock[0]),mock.patch.object(coreos.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+30)):
+            coreos.post_reboot_ready(guest,self.name,1000,lambda:True)
+        self.assertEqual(clock[0],60)
+        self.assertEqual([call.args for call in guest.root.call_args_list],[('systemctl','is-active','--quiet',coreos.SELINUX_UNIT),('systemctl','is-active','--quiet',coreos.UNIT)])
+        self.assertTrue(all(call.kwargs['timeout']<=10 for call in guest.root.call_args_list))
 
     def test_runtime_rejects_root_identity_before_marking_pass(self):
         guest=mock.Mock();guest.podman.return_value=subprocess.CompletedProcess([],0,b'Uid:\t0 0 0 0\nGid:\t0 0 0 0\n')

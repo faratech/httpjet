@@ -4,7 +4,7 @@
 Environment: HTTPJET_S3_ENDPOINT (HTTPS), HTTPJET_S3_BUCKET,
 HTTPJET_S3_REGION (default auto), AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
 optional AWS_SESSION_TOKEN. Endpoint uses path-style bucket addressing.
-The bucket is served as https://packages.httpjet.net, with objects below apt/.
+Production delivery uses Pages; pages.py uses this S3 client for its private CAS lease.
 """
 import argparse
 from datetime import datetime, timezone, timedelta

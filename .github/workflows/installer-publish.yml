@@ -16,7 +16,12 @@ jobs:
   promote:
     runs-on: ubuntu-24.04
     environment: httpjet-stable
-    timeout-minutes: 30
+    timeout-minutes: 75
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -30,6 +35,10 @@ jobs:
           github-token: ${{ github.token }}
       - name: Install archive tools
         run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg python3 binutils rpm createrepo-c
+      - name: Install the Pages CLI runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
       - name: Verify qualification run and exact release tag
         env:
           QUALIFICATION_RUN: ${{ inputs.qualification_run_id }}
@@ -66,64 +75,13 @@ jobs:
           try:
               release.fetch_current(release.REPO_URL,previous,pathlib.Path('archive.asc'),os.environ['ARCHIVE_FINGERPRINT'],True)
           except urllib.error.HTTPError as error:
-              if error.code != 404 or error.url != 'https://packages.httpjet.net/releases/stable.json' or os.environ.get('FIRST_RELEASE') != 'true':
+              if error.code != 404 or error.url != release.REPO_URL.removesuffix('/apt')+'/releases/stable.json' or os.environ.get('FIRST_RELEASE') != 'true':
                   raise
               shutil.rmtree(previous)
           release.stage(pathlib.Path('candidate'),pathlib.Path('snapshot'),pathlib.Path('archive.asc'),
                         os.environ['ARCHIVE_FINGERPRINT'],pathlib.Path('approved-installer.in'),
                         previous=previous if previous.exists() else None,installer_helper=pathlib.Path('approved-manage.py'))
           PY
-      - name: Publish immutable objects then signed metadata
-        env:
-          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
-          HTTPJET_S3_ENDPOINT: ${{ vars.HTTPJET_S3_ENDPOINT }}
-          HTTPJET_S3_BUCKET: ${{ vars.HTTPJET_S3_BUCKET }}
-          HTTPJET_S3_REGION: ${{ vars.HTTPJET_S3_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.HTTPJET_S3_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.HTTPJET_S3_SECRET_ACCESS_KEY }}
-        run: |
-          python3 packaging/release/publish.py snapshot --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT"
-          python3 packaging/release/check-public.py snapshot --without-website-redirect
-      - name: Retain the verified public snapshot for GitHub release
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: verified-publication-snapshot
-          path: snapshot/
-          if-no-files-found: error
-          retention-days: 30
-      - name: Website redirect deployment artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: always()
-        with:
-          name: httpjet-website-installer-redirect
-          path: packaging/release/website-redirects
-          if-no-files-found: error
-      - name: Remove ephemeral signing material
-        if: always()
-        run: |
-          gpgconf --kill all || true
-          rm -rf "$GNUPGHOME"
-
-  github-release:
-    needs: promote
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:
-      contents: write
-      actions: read
-      id-token: write
-      attestations: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: verified-publication-snapshot
-          path: snapshot
-      - name: Install archive verification tools
-        run: sudo apt-get update && sudo apt-get install -y rpm gnupg python3
       - name: Assemble only the verified release assets
         env:
           ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
@@ -156,7 +114,7 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: github-promotion-assets/*
-      - name: Verify promotion attestations and publish the exact release
+      - name: Verify promotion attestations and publish the non-latest release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -168,5 +126,58 @@ jobs:
               --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
           done
           python3 packaging/release/github_assets.py publish --directory github-release-assets
-      - name: Verify public GitHub release downloads
+      - name: Verify public tagged GitHub release downloads
         run: python3 packaging/release/github_assets.py verify-public --directory github-release-assets
+      - name: Project the complete signed Pages snapshot
+        env:
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+        run: |
+          set --
+          if [ -d previous ]; then set -- --previous previous; fi
+          python3 packaging/release/pages.py project --snapshot snapshot --output pages-site \
+            --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT" \
+            --repository "$GITHUB_REPOSITORY" "$@"
+      - name: Deploy, verify and promote while holding the publisher lease
+        env:
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: 'false'
+          GH_TOKEN: ${{ github.token }}
+          HTTPJET_S3_ENDPOINT: ${{ vars.HTTPJET_S3_ENDPOINT }}
+          HTTPJET_S3_BUCKET: ${{ vars.HTTPJET_S3_BUCKET }}
+          HTTPJET_S3_REGION: ${{ vars.HTTPJET_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.HTTPJET_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.HTTPJET_S3_SECRET_ACCESS_KEY }}
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          python3 packaging/release/pages.py deploy --snapshot snapshot --directory pages-site \
+            --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT" \
+            --receipt pages-deployment.json --github-assets github-release-assets
+      - name: Retain the verified public snapshot
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-publication-snapshot
+          path: snapshot/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain the verified Pages deployment receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verified-pages-deployment
+          path: pages-deployment.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Website redirect deployment artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: httpjet-website-installer-redirect
+          path: packaging/release/website-redirects
+          if-no-files-found: error
+      - name: Remove ephemeral signing material
+        if: always()
+        run: |
+          gpgconf --kill all || true
+          if [ -n "${GNUPGHOME:-}" ]; then rm -rf "$GNUPGHOME"; fi

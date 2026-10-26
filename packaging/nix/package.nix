@@ -1,7 +1,7 @@
 # releaseManifest must be a locally authenticated schema-2 manifest. Its payload
 # is fetched by an immutable URL and the exact SHA256, with no binary rewriting.
 { lib, stdenvNoCC, fetchurl, releaseManifest
-, releaseBase ? "https://packages.httpjet.net/releases", certificate ? null }:
+, releaseBase ? "https://httpjet-packages.pages.dev/releases", certificate ? null }:
 let
   manifest = builtins.fromJSON (builtins.readFile releaseManifest);
   architecture = { x86_64-linux = "amd64"; aarch64-linux = "arm64"; }.${stdenvNoCC.hostPlatform.system}

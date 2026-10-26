@@ -26,7 +26,7 @@ DISTROS = ('debian12', 'debian13', 'ubuntu24.04', 'ubuntu26.04')
 CHECKS = ('install', 'rerun', 'http', 'scripts-denied', 'bridged-transfer', 'restart',
           'config-preserved', 'upgrade', 'downgrade', 'remove', 'purge', 'occupied-port',
           'no-php-no-cache', 'io-uring-denied', 'reinstall', 'reboot')
-REPO_URL = 'https://packages.httpjet.net/apt'
+REPO_URL = 'https://httpjet-packages.pages.dev/apt'
 
 def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, stdout=subprocess.PIPE,

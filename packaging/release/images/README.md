@@ -6,8 +6,9 @@ Use the signed release OCI archive with rootful Podman. The app runs as
 On a controller with GnuPG, verify `manifest.json.asc` against the approved
 archive key and full fingerprint. Select `oci_images[ARCH].artifact`, verify
 its SHA256 against the authenticated manifest, and retain its exact `image_id`.
-Obtain `packaging/oci/seccomp-httpjet.json` from the matching hash-verified
-source archive. Transfer both files over authenticated SSH and confirm the
+Obtain `packaging/oci/seccomp-httpjet.json` and
+`packaging/release/images/httpjet-container.cil` from the matching hash-verified
+source archive. Transfer these files and the OCI archive over authenticated SSH and confirm the
 archive's SHA256 again on CoreOS using native `sha256sum`, then:
 
 ```sh
@@ -15,21 +16,66 @@ sudo podman load --input /var/tmp/httpjet-release-oci.tar
 sudo podman image inspect sha256:APPROVED_IMAGE_CONFIG_ID
 ```
 
+The CoreOS image must provide enforcing SELinux, `/usr/sbin/semodule`, and the
+packaged Udica base template `/usr/share/udica/templates/base_container.cil`.
+Use the approved CoreOS image and its authenticated container-selinux package;
+an image without that template needs a separately provisioned compatible image.
+The local enforcing-policy proof observed base-template SHA256
+`c95d8badacc674ace0d2fed4fbee4d28d2a92799b23fd5cc30cfb444ee8896b7`.
+Qualification records the actual template hash alongside the dedicated policy
+hash and domain; that component proof does not qualify every CoreOS image.
+
+Install the verified files as root-owned mode 0644:
+
+```sh
+test "$(getenforce)" = Enforcing
+test -r /usr/share/udica/templates/base_container.cil
+sha256sum /usr/share/udica/templates/base_container.cil
+sudo install -d -o root -g root -m 0755 /etc/httpjet
+sudo install -o root -g root -m 0644 /var/tmp/seccomp-httpjet.json /etc/httpjet/seccomp.json
+sudo install -o root -g root -m 0644 /var/tmp/httpjet-container.cil /etc/selinux/httpjet-container.cil
+```
+
+Create `/etc/systemd/system/httpjet-selinux-policy.service` with this persistent
+loader. It installs the dedicated `httpjet_container.process` domain from the
+packaged base and the authenticated CIL before the app starts:
+
+```ini
+[Unit]
+Description=httpjet dedicated container SELinux policy
+Before=httpjet.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/semodule -i /usr/share/udica/templates/base_container.cil /etc/selinux/httpjet-container.cil
+RemainAfterExit=yes
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The policy inherits the packaged container base and network domain, adding only
+`create`, `map`, `read` and `write` for `io_uring_t:anon_inode` to this dedicated
+domain. The app must use the explicit label below. SELinux stays enforcing;
+permissions for the default `container_t` domain remain unchanged. The loader
+does not change global io_uring policy, disable labels, or grant capabilities.
+
 Put your content, or the verified payload's welcome page, in persistent
-`/var/lib/httpjet/site`, readable by UID 10001. Install the verified seccomp
-file as `/etc/httpjet/seccomp.json`, root-owned and mode 0644. This owned
+`/var/lib/httpjet/site`, readable by UID 10001. This owned
 `/etc/systemd/system/httpjet.service` publishes HTTP 80 to unprivileged 8080:
 
 ```ini
 [Unit]
 Description=httpjet Podman service
-After=network-online.target
+After=network-online.target httpjet-selinux-policy.service
 Wants=network-online.target
+Requires=httpjet-selinux-policy.service
 
 [Service]
 Type=simple
 ExecStartPre=-/usr/bin/podman rm --ignore --force httpjet
-ExecStart=/usr/bin/podman run --name httpjet --pull=never --user=10001:10001 --publish=80:8080/tcp --read-only --cap-drop=ALL --security-opt=no-new-privileges --security-opt=seccomp=/etc/httpjet/seccomp.json --ulimit=memlock=8388608:8388608 --mount=type=tmpfs,dst=/run/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --mount=type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --volume=/var/lib/httpjet/site:/var/www/httpjet:ro,z sha256:APPROVED_IMAGE_CONFIG_ID
+ExecStart=/usr/bin/podman run --name httpjet --pull=never --user=10001:10001 --publish=80:8080/tcp --read-only --cap-drop=ALL --security-opt=no-new-privileges --security-opt=label=type:httpjet_container.process --security-opt=seccomp=/etc/httpjet/seccomp.json --ulimit=memlock=8388608:8388608 --mount=type=tmpfs,dst=/run/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --mount=type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --volume=/var/lib/httpjet/site:/var/www/httpjet:ro,z sha256:APPROVED_IMAGE_CONFIG_ID
 ExecStop=/usr/bin/podman stop --ignore --time=25 httpjet
 ExecStopPost=-/usr/bin/podman rm --ignore --force httpjet
 Restart=on-failure
@@ -45,8 +91,12 @@ The tmpfs `U` option assigns each mount to the container UID/GID while retaining
 mode 0750 and the size and execution restrictions.
 
 Replace the image ID with the verified manifest value. Run
-`sudo systemctl daemon-reload` and `sudo systemctl enable --now httpjet.service`.
-Ignition can install/enable this same unit when provisioning a new machine.
+`sudo systemctl daemon-reload` and
+`sudo systemctl enable --now httpjet-selinux-policy.service httpjet.service`.
+Confirm `getenforce` remains `Enforcing` and
+`sudo podman inspect --format '{{.ProcessLabel}}' httpjet` reports the dedicated
+`httpjet_container.process` type. Ignition can install the CIL and enable both
+units when provisioning a new machine.
 The adjacent `coreos.bu` is a disposable qualification recipe with test-specific
 update/policy controls; use your operator configuration for production.
 

@@ -1,5 +1,5 @@
 # Build a real NixOS VM with native declarative service generations.
-{ releaseManifest, sshPublicKey, releaseBase ? "https://packages.httpjet.net/releases"
+{ releaseManifest, sshPublicKey, releaseBase ? "https://httpjet-packages.pages.dev/releases"
 , previousManifest ? null, system ? builtins.currentSystem, sshPort ? 2222
 , httpPort ? 18080, tlsPort ? 18443, quicPort ? 18443, certificate ? null }:
 let

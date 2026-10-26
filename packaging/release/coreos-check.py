@@ -35,6 +35,15 @@ ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 REMOTE = '/var/lib/httpjet-qualification'
 UNIT = 'httpjet-qualification.service'
+SELINUX_DOMAIN = 'httpjet_container.process'
+SELINUX_UNIT = 'httpjet-selinux-policy.service'
+SELINUX_BASE = '/usr/share/udica/templates/base_container.cil'
+SELINUX_POLICY = HERE / 'images/httpjet-container.cil'
+# SSH can precede the 180s policy loader and the 45s app activation on TCG.
+POST_REBOOT_READINESS_SECONDS = 300
+
+def selinux_descriptor():
+    return {'domain':SELINUX_DOMAIN,'policy_sha256':release_api.sha(SELINUX_POLICY),'base_template':SELINUX_BASE}
 TOOLS = 'rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8'
 
 
@@ -62,6 +71,7 @@ def ignition(public_key, name):
     files = []
     for file in definition['storage']['files']:
         text = file['contents']['inline']
+        if text=='@HTTPJET_SELINUX_POLICY@':text=SELINUX_POLICY.read_text()
         files.append({'path': file['path'], 'mode': file['mode'],
                       'contents': {'source': 'data:text/plain;base64,' + base64.b64encode(text.encode()).decode()}})
     units = []
@@ -92,6 +102,7 @@ def qemu_args(arch, directory, ports):
 def _machine(row, lock, directory, public_key, ports, name):
     if lock['definition']['recipe'] != 'packaging/release/images/coreos.bu' or lock['definition']['sha256'] != tree_hash(HERE / 'images'):
         raise ValueError('CoreOS definition differs from the authenticated lock')
+    if lock.get('selinux')!=selinux_descriptor():raise ValueError('CoreOS SELinux policy differs from authenticated inputs')
     cloud = lock['cloud']
     if cloud.get('format') != 'qcow2.xz' or not re.fullmatch('[0-9a-f]{64}', cloud.get('uncompressed_sha256', '')):
         raise ValueError('CoreOS lock requires both compressed and decoded image hashes')
@@ -144,8 +155,8 @@ class Guest:
     def policy(self):
         result = self.call('cat', '/proc/sys/kernel/io_uring_disabled', check=False)
         return result.stdout.decode().strip() if result.returncode == 0 else None
-    def inspect(self, name, image=False):
-        value = json.loads(self.podman(*(['image', 'inspect'] if image else ['inspect']), name).stdout)[0]
+    def inspect(self, name, image=False, timeout=180):
+        value = json.loads(self.podman(*(['image', 'inspect'] if image else ['inspect']), name, timeout=timeout).stdout)[0]
         if image and not value['Id'].startswith('sha256:'): value['Id'] = 'sha256:' + value['Id']
         return value
 
@@ -153,17 +164,35 @@ class Guest:
 def ready(guest, name, deadline, alive):
     while time.monotonic() < deadline:
         if not alive(): raise RuntimeError('CoreOS VM exited while waiting for app readiness')
-        try: record = guest.inspect(name)
-        except (RuntimeError, subprocess.CalledProcessError, json.JSONDecodeError):
-            time.sleep(.5); continue
+        remaining=deadline-time.monotonic()
+        if remaining<=0:break
+        try: record = guest.inspect(name,timeout=min(10,remaining))
+        except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            time.sleep(min(.5,max(0,deadline-time.monotonic()))); continue
         if not record['State']['Running']:
             if record['State'].get('Status') in ('created', 'configured', 'starting'):
-                time.sleep(.5); continue
+                time.sleep(min(.5,max(0,deadline-time.monotonic()))); continue
             raise RuntimeError('CoreOS Podman app exited before activation')
-        result = guest.podman('exec', name, '/bin/busybox', 'cat', '/run/httpjet/ready', check=False)
-        if result.returncode == 0 and result.stdout == b'1\n': return
-        time.sleep(.5)
+        remaining=deadline-time.monotonic()
+        if remaining<=0:break
+        try:
+            result = guest.podman('exec', name, '/bin/busybox', 'cat', '/run/httpjet/ready', check=False, timeout=min(10,remaining))
+        except subprocess.TimeoutExpired:
+            result=None
+        if result is not None and result.returncode == 0 and result.stdout == b'1\n': return
+        time.sleep(min(.5,max(0,deadline-time.monotonic())))
     raise TimeoutError('CoreOS app did not publish PID1 activation readiness')
+
+
+def post_reboot_ready(guest,name,deadline,alive):
+    # Observe automatic boot activation; starting either unit here could hide
+    # a broken enable/persistence contract.
+    deadline=min(deadline,time.monotonic()+POST_REBOOT_READINESS_SECONDS)
+    ready(guest,name,deadline,alive)
+    for unit in (SELINUX_UNIT,UNIT):
+        remaining=deadline-time.monotonic()
+        if remaining<=0:raise TimeoutError('CoreOS boot activation deadline expired')
+        guest.root('systemctl','is-active','--quiet',unit,timeout=min(10,remaining))
 
 
 def sandbox(guest, name, metadata):
@@ -185,7 +214,10 @@ def sandbox(guest, name, metadata):
     record = guest.inspect(name)
     if record['HostConfig'].get('Privileged') or record['HostConfig'].get('NetworkMode') != 'host':
         raise ValueError('CoreOS Podman route differs from its explicit guest-host network scope')
-    return {'uid': metadata['uid'], 'gid': metadata['gid'], 'binary_sha256': hashed, 'init': 'systemd',
+    context=record.get('ProcessLabel','')
+    if context.split(':')[2:3]!=[SELINUX_DOMAIN] or guest.call('getenforce').stdout.strip()!=b'Enforcing':
+        raise ValueError('CoreOS app must retain enforcing dedicated SELinux confinement')
+    return {'selinux_domain':SELINUX_DOMAIN,'selinux_enforcing':True,'uid': metadata['uid'], 'gid': metadata['gid'], 'binary_sha256': hashed, 'init': 'systemd',
             'no_multishot_accept': True, 'readonly_rootfs': True, 'effective_capabilities': 0,
             'bounding_capabilities': 0, 'no_new_privileges': True, 'container_id': record['Id'],
             'network_scope': 'host network of isolated disposable QEMU guest', 'executable': executable}
@@ -259,7 +291,7 @@ def negative_probe(guest, image, work):
     before = guest.policy()
     guest.script('mkdir -p ' + REMOTE + '/negative-ready && chown 10001:10001 ' + REMOTE + '/negative-ready && chmod 0750 ' + REMOTE + '/negative-ready')
     command = ['run', '--rm', '--network', 'host', '--read-only', '--cap-drop', 'ALL',
-        '--security-opt', 'no-new-privileges', '--security-opt', 'seccomp=' + REMOTE + '/seccomp.json',
+        '--security-opt', 'no-new-privileges', '--security-opt', 'label=type:'+SELINUX_DOMAIN, '--security-opt', 'seccomp=' + REMOTE + '/seccomp.json',
         '--ulimit', 'memlock=8388608:8388608', '--mount', 'type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev',
         '--volume', REMOTE + '/negative-ready:/run/httpjet:rw,z',
         '--volume', REMOTE + '/configuration:/etc/httpjet:ro,z', '--volume', REMOTE + '/site:/site:ro,z',
@@ -316,6 +348,11 @@ def qualify(row, lock, manifest, artifacts, new_dir, timeout=7200):
         guest.podman('load', '--input', REMOTE + '/candidate-image.tar', timeout=300)
         if guest.inspect(image['image_id'], True)['Id'] != image['image_id']: raise ValueError('CoreOS loaded a different image')
         operator = operator_prepare(guest, lock, image, work)
+        guest.root('systemctl','start',SELINUX_UNIT)
+        if guest.call('getenforce').stdout.strip()!=b'Enforcing':raise ValueError('CoreOS requires enforcing SELinux')
+        policy_sha=guest.root('sha256sum','/etc/selinux/httpjet-container.cil').stdout.decode().split()[0]
+        if policy_sha!=lock['selinux']['policy_sha256']:raise ValueError('CoreOS provisioned SELinux policy changed')
+        selinux={**lock['selinux'],'mode':'Enforcing','base_template_sha256':guest.root('sha256sum',SELINUX_BASE).stdout.decode().split()[0]}
         guest.root('touch', REMOTE + '/image-ready')
         guest.root('systemctl', 'start', UNIT)
         ready(guest, name, min(deadline, time.monotonic()+45), alive)
@@ -350,8 +387,7 @@ def qualify(row, lock, manifest, artifacts, new_dir, timeout=7200):
             success=lambda result: result.returncode==0 and result.stdout.strip()!=old_boot and re.fullmatch(r'[0-9a-f-]{36}',result.stdout.strip()) is not None,
             label='CoreOS real reboot')
         new_boot = guest.call('cat','/proc/sys/kernel/random/boot_id').stdout.decode().strip()
-        ready(guest,name,min(deadline,time.monotonic()+45),alive)
-        guest.root('systemctl','is-active','--quiet',UNIT)
+        post_reboot_ready(guest,name,deadline,alive)
         sandbox(guest,name,image)
         if hashlib.sha256(protocols.http_body('127.0.0.1',ports['http'],'/operator-content.txt')[0]).hexdigest()!=operator_hash:
             raise ValueError('CoreOS persistent /var volume failed after real reboot')
@@ -368,7 +404,7 @@ def qualify(row, lock, manifest, artifacts, new_dir, timeout=7200):
              ('negative.json',negative,'uring-negative'),('runtime.json',runtime,'runtime'),('operator.json',operator,'operator'),('boot.json',boot,'reboot')]:
             path=work/filename;path.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n');files[role]=path
         files['uring-denial-log']=work/'negative.log';files['console']=work/'console.log'
-        result={'image':{**machine['image'],'operator_configuration':operator},'service':service,'runtime':runtime,
+        result={'image':{**machine['image'],'operator_configuration':operator,'selinux':selinux},'service':service,'runtime':runtime,
                 'positive':positive,'negative':negative,'checks':checks,'files':files,'log':log}
     (fixture_dir/'certs/key.pem').unlink(missing_ok=True)
     return result

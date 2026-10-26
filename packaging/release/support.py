@@ -106,6 +106,11 @@ def verify_row(row,receipt,manifest,manifest_sha,image_lock=None):
         raise ValueError('receipt does not identify authenticated image inputs')
     if not re.fullmatch(r'[0-9a-f]{64}',source.get('sha256','')) or not source.get('origin'):
         raise ValueError('receipt lacks resolved image/rootfs identity')
+    if image_lock.get('selinux'):
+        expected=image_lock['selinux'];observed=source.get('selinux',{})
+        if (observed.get('mode')!='Enforcing' or any(observed.get(k)!=v for k,v in expected.items())
+            or not re.fullmatch('[0-9a-f]{64}',observed.get('base_template_sha256',''))):
+            raise ValueError('receipt lacks its enforcing dedicated SELinux policy proof')
     if image_lock.get('operator_configuration'):
         setup=source.get('operator_configuration',{})
         if setup.get('scope')!='disposable-qualification-image' or setup.get('before') not in (None,'0','1','2') or setup.get('after') not in (None,'0') or type(setup.get('changed')) is not bool:

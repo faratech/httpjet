@@ -16,6 +16,7 @@ who approved a manifest obtained from an untrusted source.
 Keep that manifest at `/etc/nixos/httpjet-release/manifest.json` and this source
 checkout at `/etc/nixos/httpjet`. The package fetches the immutable universal tar
 URL and its exact manifest SHA256; it neither rebuilds nor patches/strips the ELF.
+The default release origin is `https://httpjet-packages.pages.dev/releases`.
 The qualification recipe's pinned nixpkgs revision is recorded in `pins.nix`.
 Your own NixOS configuration supplies its `pkgs`; qualify a different nixpkgs
 revision before treating it as supported.

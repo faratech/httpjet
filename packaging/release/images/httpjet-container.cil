@@ -1,0 +1,7 @@
+; Inherit the installed container-selinux Udica base for this dedicated domain.
+; Only explicitly labelled httpjet containers gain the audited ring permissions.
+(block httpjet_container
+    (blockinherit container)
+    (typeattributeset container_net_domain (process))
+    (allow process io_uring_t (anon_inode (create map read write)))
+)

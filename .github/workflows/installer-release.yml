@@ -200,7 +200,7 @@ jobs:
           try:
               release.fetch_current(release.REPO_URL,previous,pathlib.Path('archive.asc'),os.environ['ARCHIVE_FINGERPRINT'],True)
           except urllib.error.HTTPError as error:
-              if error.code != 404 or error.url != 'https://packages.httpjet.net/releases/stable.json' or os.environ.get('FIRST_RELEASE') != 'true':
+              if error.code != 404 or error.url != release.REPO_URL.removesuffix('/apt') + '/releases/stable.json' or os.environ.get('FIRST_RELEASE') != 'true':
                   raise
               shutil.rmtree(previous)
               pathlib.Path('first-release-fixture').write_text('No previous stable exists; upgrade baseline is a labelled package fixture.\n')

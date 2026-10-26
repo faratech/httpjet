@@ -28,7 +28,7 @@ artifact = m['artifacts'][binary['artifact']]
 assert m['schema'] == 2 and binary['libc'] == artifact['libc'] == 'musl'
 assert artifact['architecture'] == arch
 values = {'release-id': m['release_id'],
-          'uri': 'https://packages.httpjet.net/releases/' + m['release_id'] + '/' + binary['artifact'],
+          'uri': 'https://httpjet-packages.pages.dev/releases/' + m['release_id'] + '/' + binary['artifact'],
           'sha256': artifact['sha256'], 'binary-sha256': binary['binary_sha256'],
           'system': system}
 print('(use-modules (httpjet packages))')

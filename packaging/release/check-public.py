@@ -4,16 +4,18 @@ import argparse
 import hashlib
 from pathlib import Path
 import urllib.request
-from release import sha, load
+from release import sha, load, REPO_URL
+
+ORIGIN = REPO_URL.removesuffix('/apt')
 
 
 def objects(snapshot, website_redirect=True):
     site = (snapshot / 'apt').exists()
     installer = snapshot / ('apt/install.sh' if site else 'install.sh')
     result = [
-        ('https://packages.httpjet.net/apt/dists/stable/InRelease',
+        (ORIGIN + '/apt/dists/stable/InRelease',
          snapshot / ('apt/dists/stable/InRelease' if site else 'dists/stable/InRelease')),
-        ('https://packages.httpjet.net/apt/install.sh', installer),
+        (ORIGIN + '/apt/install.sh', installer),
     ]
     if website_redirect:
         result.append(('https://httpjet.net/install.sh', installer))
@@ -21,11 +23,11 @@ def objects(snapshot, website_redirect=True):
         for name in ('releases/stable.json', 'releases/stable.json.asc',
                      'rpm/x86_64/repodata/repomd.xml', 'rpm/x86_64/repodata/repomd.xml.asc',
                      'rpm/aarch64/repodata/repomd.xml', 'rpm/aarch64/repodata/repomd.xml.asc'):
-            result.append(('https://packages.httpjet.net/' + name, snapshot / name))
+            result.append((ORIGIN + '/' + name, snapshot / name))
         release_id = load(snapshot / 'publication.json')['release_id']
         for name in ('manifest.json', 'manifest.json.asc', 'qualification.json', 'qualification.json.asc'):
             relative = f'releases/{release_id}/{name}'
-            result.append(('https://packages.httpjet.net/' + relative, snapshot / relative))
+            result.append((ORIGIN + '/' + relative, snapshot / relative))
     return result
 
 

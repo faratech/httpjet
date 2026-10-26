@@ -299,9 +299,11 @@ def main():
             if args.dns01:
                 def cleaned():
                     with values_lock:
-                        return values == {"unrelated-owner-value"}
+                        provider_clean = values == {"unrelated-owner-value"}
+                    # The provider mutates TXT before its response is received and
+                    # the cleanup journal is committed. Wait for both boundaries.
+                    return provider_clean and not json.loads((store / "state.snapshot").read_text())["dns_cleanup"]
                 wait_for(cleaned, [server, ca, dns], 10)
-                assert not json.loads((store / "state.snapshot").read_text())["dns_cleanup"]
                 print("PASS: restart replays pending exact-value DNS cleanup before renewal")
             print("PASS: restart restores the same durable certificate pair")
             stop(server)

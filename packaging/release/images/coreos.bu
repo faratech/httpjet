@@ -43,15 +43,27 @@
         "contents": {
           "inline": "Disposable checksum-locked CoreOS QEMU qualification only\n"
         }
+      },
+      {
+        "path": "/etc/selinux/httpjet-container.cil",
+        "mode": 420,
+        "contents": {
+          "inline": "@HTTPJET_SELINUX_POLICY@"
+        }
       }
     ]
   },
   "systemd": {
     "units": [
       {
+        "name": "httpjet-selinux-policy.service",
+        "enabled": true,
+        "contents": "[Unit]\nDescription=httpjet dedicated container SELinux policy\nBefore=httpjet-qualification.service\n\n[Service]\nType=oneshot\nExecStart=/usr/sbin/semodule -i /usr/share/udica/templates/base_container.cil /etc/selinux/httpjet-container.cil\nRemainAfterExit=yes\nTimeoutStartSec=180\n\n[Install]\nWantedBy=multi-user.target\n"
+      },
+      {
         "name": "httpjet-qualification.service",
         "enabled": true,
-        "contents": "[Unit]\nDescription=httpjet attested Podman qualification\nAfter=network-online.target\nWants=network-online.target\nConditionPathExists=/var/lib/httpjet-qualification/image-ready\n\n[Service]\nType=simple\nEnvironmentFile=/var/lib/httpjet-qualification/profile.env\nExecStartPre=-/usr/bin/podman rm --ignore --force @CONTAINER_NAME@\nExecStart=/usr/bin/podman run --name @CONTAINER_NAME@ --pull=never --network=host --read-only --user=10001:10001 --cap-drop=ALL --security-opt=no-new-privileges --security-opt=seccomp=/var/lib/httpjet-qualification/seccomp.json --ulimit=memlock=8388608:8388608 --mount=type=tmpfs,dst=/run/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --mount=type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --volume=/var/lib/httpjet-qualification/configuration:/etc/httpjet:ro,z --volume=/var/lib/httpjet-qualification/site:/site:ro,z --volume=/var/lib/httpjet-qualification/certs:/certs:ro,z --env=RUST_LOG=warn ${HTTPJET_IMAGE} $HTTPJET_ARGS\nExecStop=/usr/bin/podman stop --ignore --time=25 @CONTAINER_NAME@\nExecStopPost=-/usr/bin/podman rm --ignore --force @CONTAINER_NAME@\nRestart=on-failure\nRestartSec=2\nTimeoutStartSec=45\nTimeoutStopSec=30\nKillMode=none\n\n[Install]\nWantedBy=multi-user.target\n"
+        "contents": "[Unit]\nDescription=httpjet attested Podman qualification\nAfter=network-online.target httpjet-selinux-policy.service\nWants=network-online.target\nRequires=httpjet-selinux-policy.service\nConditionPathExists=/var/lib/httpjet-qualification/image-ready\n\n[Service]\nType=simple\nEnvironmentFile=/var/lib/httpjet-qualification/profile.env\nExecStartPre=-/usr/bin/podman rm --ignore --force @CONTAINER_NAME@\nExecStart=/usr/bin/podman run --name @CONTAINER_NAME@ --pull=never --network=host --read-only --user=10001:10001 --cap-drop=ALL --security-opt=no-new-privileges --security-opt=label=type:httpjet_container.process --security-opt=seccomp=/var/lib/httpjet-qualification/seccomp.json --ulimit=memlock=8388608:8388608 --mount=type=tmpfs,dst=/run/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --mount=type=tmpfs,dst=/var/log/httpjet,tmpfs-size=16m,tmpfs-mode=0750,U,noexec,nosuid,nodev --volume=/var/lib/httpjet-qualification/configuration:/etc/httpjet:ro,z --volume=/var/lib/httpjet-qualification/site:/site:ro,z --volume=/var/lib/httpjet-qualification/certs:/certs:ro,z --env=RUST_LOG=warn ${HTTPJET_IMAGE} $HTTPJET_ARGS\nExecStop=/usr/bin/podman stop --ignore --time=25 @CONTAINER_NAME@\nExecStopPost=-/usr/bin/podman rm --ignore --force @CONTAINER_NAME@\nRestart=on-failure\nRestartSec=2\nTimeoutStartSec=45\nTimeoutStopSec=30\nKillMode=none\n\n[Install]\nWantedBy=multi-user.target\n"
       },
       {
         "name": "zincati.service",

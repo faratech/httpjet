@@ -42,12 +42,13 @@ bucket. Repository variables provide:
   path-style S3-compatible endpoint without an endpoint path. Region defaults to
   `auto` when unset.
 
-The stable environment supplies `HTTPJET_S3_ACCESS_KEY_ID` and
-`HTTPJET_S3_SECRET_ACCESS_KEY`, mapped to AWS credential variables by the workflow.
-The endpoint must provide strongly consistent atomic conditional PUT.
-Permissions cover reads and conditional writes to `apt/`, `rpm/`, `releases/`
-and the persistent publication record under `_httpjet/`. DELETE is not required.
-Preserve object bytes/cache headers and retain old immutable objects indefinitely.
+The stable environment supplies `CLOUDFLARE_API_TOKEN` with Pages Write access and
+`CLOUDFLARE_ACCOUNT_ID` for the separate `httpjet-packages` Pages project.
+`HTTPJET_S3_ACCESS_KEY_ID` and `HTTPJET_S3_SECRET_ACCESS_KEY`, mapped to AWS
+credential variables, retain only the private `_httpjet/publication.lock` lease.
+That endpoint must support strongly consistent conditional PUT. Public package
+objects are delivered entirely by Pages and GitHub Releases. Existing website
+projects, custom domains, DNS and Bot Fight Mode remain independent.
 
 The site layout is:
 
@@ -60,10 +61,30 @@ releases/stable.json                   # authenticated current selector
 releases/stable.json.asc
 ```
 
-Serve it as `https://packages.httpjet.net/`. The promotion workflow verifies the
-package-host bytes, then publishes the rendered installer and qualified artifacts
-as GitHub Release assets. It verifies every public asset against the staged bytes,
-including `releases/latest/download/install.sh`. An operator may additionally
+Serve native repository files and the signed selector at
+`https://httpjet-packages.pages.dev/`. Publish and verify the complete qualified
+GitHub Release asset set without marking it latest before deploying Pages.
+`pages.py project` emits native repository files, a real top-level `404.html`,
+no-store headers and a version-specific redirect to each immutable GitHub tag.
+Large source archives and OCI images stay on GitHub, avoiding Pages' 25 MiB file
+limit. The signed `pages-index.json(.asc)` binds every retained immutable native
+object and every redirected asset name/hash. Authenticated `fetch_current`
+recovers history without depending on expiring Actions artifacts. Prior native
+files and redirects remain available. Projection rejects more than 20,000 files,
+25 MiB per native file, or 100 dynamic redirects rather than pruning history.
+Pages may answer Range requests with a complete 200 response; partial responses
+are not assumed by the publisher.
+
+`pages.py deploy` holds the private CAS lease across the authenticated previous
+pointer recheck, pinned Wrangler deployment, public byte/real-404/redirect checks,
+and optional GitHub latest promotion plus latest-download verification. Failures
+retain the lease for explicit operator inspection and recovery. Refresh deploys
+one complete replacement Pages snapshot while reusing immutable GitHub assets.
+Before the first candidate, `pages.py bootstrap` prepares only an empty index,
+404 page and no-store headers. After reviewed deployment, `probe-bootstrap`
+and the manual `installer-origin-check.yml` verify external and GitHub-hosted
+GET/HEAD, genuine 404 and write refusal; this publishes no installer or packages.
+An operator may additionally
 deploy `website-redirects` to provide `https://httpjet.net/install.sh`; that
 website alias is optional and is not deployed by the release workflow.
 

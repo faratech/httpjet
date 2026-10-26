@@ -129,7 +129,8 @@ def special(row,root):
         stream=json.loads(text('https://builds.coreos.fedoraproject.org/streams/stable.json'));machine={'amd64':'x86_64','arm64':'aarch64'}[arch]
         entry=stream['architectures'][machine]['artifacts']['qemu']['formats']['qcow2.xz']['disk']
         return {'cloud':{'url':entry['location'],'sha256':entry['sha256'],'format':'qcow2.xz','uncompressed_sha256':entry['uncompressed-sha256']},
-                'definition':{'recipe':'packaging/release/images/coreos.bu','sha256':tree_hash(root/'packaging/release/images')},'init':'systemd'}
+                'definition':{'recipe':'packaging/release/images/coreos.bu','sha256':tree_hash(root/'packaging/release/images')},
+                'selinux':{'domain':'httpjet_container.process','policy_sha256':sha(root/'packaging/release/images/httpjet-container.cil'),'base_template':'/usr/share/udica/templates/base_container.cil'},'init':'systemd'}
     if kind=='oci':return {'oci':oci_reference('library/alpine','3',arch),'init':'foreground'}
     if kind=='nix-image':
         return {'definition':{'origin':'https://github.com/NixOS/nixpkgs/commit/1f607aa79b6356ed45d3cd3c8079c196e79efa2c',

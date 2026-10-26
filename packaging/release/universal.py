@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import support
 import payload
-BASE='https://packages.httpjet.net/releases'
+BASE='https://httpjet-packages.pages.dev/releases'
 def api():
     import release
     return release
@@ -251,6 +251,11 @@ def verify_qualification(directory,document=None):
             service=b.load(roles['service'])
             if service.get('scope')!='installed-init-service' or service.get('uid')!=document['service_uid'] or service.get('binary_sha256')!=document['binary_sha256'] or service.get('init')!=document['init'] or service.get('no_multishot_accept') is not True:
                 raise ValueError('service namespace/identity was not observed under its init')
+        if expected[target['row_id']]['route']=='immutable' and images[target['row_id']].get('selinux'):
+            if 'service' not in roles:raise ValueError('CoreOS omits actual dedicated-domain service evidence')
+            service=b.load(roles['service'])
+            if service.get('selinux_enforcing') is not True or service.get('selinux_domain')!=images[target['row_id']]['selinux']['domain']:
+                raise ValueError('CoreOS service did not retain its enforcing dedicated domain')
         if document['log_sha256']!=target['log_sha256']:raise ValueError('receipt log identity mismatch')
         seen.add(target['row_id'])
     if seen!=set(expected):raise ValueError('every required versioned matrix row must pass before publication')
@@ -400,7 +405,8 @@ def signed_rpm_history(base,directory,key,manifest):
             if not path.exists():b.download(base+'/'+arch+'/'+location,path)
             if b.sha(path)!=checksum.text:raise ValueError('historical RPM carrier mismatch')
 
-def fetch_current(repository,output,key,expected,release_base=BASE):
+def fetch_current(repository,output,key,expected,release_base=None):
+    release_base=release_base or repository.removesuffix('/apt')+'/releases'
     b=api();b.validate_key(key,expected);output.mkdir(parents=True,exist_ok=False)
     pointer=output/'current-stable.json';signature=Path(str(pointer)+'.asc')
     b.download(release_base+'/stable.json',pointer);b.download(release_base+'/stable.json.asc',signature);verify_signed(pointer,signature,key)
@@ -421,4 +427,7 @@ def fetch_current(repository,output,key,expected,release_base=BASE):
     verify_artifacts(output,manifest);verify_qualification(output)
     signed_apt_history(repository,output,key,manifest)
     signed_rpm_history(repository.removesuffix('/apt')+'/rpm',output,key,manifest)
+    if repository==b.REPO_URL:
+        import pages
+        pages.fetch_retention(repository.removesuffix('/apt'),output,key,expected,pointer)
     return output

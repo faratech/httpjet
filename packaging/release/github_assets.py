@@ -4,7 +4,9 @@
 The qualification job prepares subjects attested in the source-build workflow.
 Promotion prepares the same subjects plus its rendered installer/signatures.
 Publication is retryable without overwriting an existing release or asset; a
-partial release remains a draft until every uploaded digest matches.
+partial release remains a draft until every uploaded digest matches. Complete
+tagged assets become public with latest disabled so package hosting can verify
+its references before the workflow explicitly promotes this release.
 """
 from __future__ import annotations
 
@@ -60,12 +62,39 @@ def copy_regular(source, destination):
         raise ValueError('release asset changed during assembly: '+str(source))
 
 
+def qualified_names(directory, manifest):
+    """Include the proof files needed to authenticate a later current fetch."""
+    names = set(software_names(manifest))
+    reserved = names | set(GENERATED)
+    qualification = release.load(Path(directory)/'qualification.json')
+    proof = {}
+    for target in qualification.get('targets', []):
+        descriptors = [(target['receipt'], {'sha256':target['sha256']}),
+                       (target['log'], {'sha256':target['log_sha256']})]
+        descriptors.extend(target.get('evidence', {}).items())
+        for name, descriptor in descriptors:
+            release.filename(name)
+            if name in reserved or manifest['artifacts'].get(name, {}).get('kind') == 'qualification-image':
+                raise ValueError('qualification proof collides with a reserved/private release asset')
+            descriptor = {field:descriptor[field] for field in ('sha256','size') if field in descriptor}
+            old = proof.get(name, {})
+            if any(old[field] != value for field, value in descriptor.items() if field in old):
+                raise ValueError('qualification proof has conflicting descriptors')
+            proof[name] = {**old, **descriptor}
+    for name, descriptor in proof.items():
+        path = Path(directory)/name
+        if (path.is_symlink() or not path.is_file() or release.sha(path) != descriptor['sha256']
+            or 'size' in descriptor and path.stat().st_size != descriptor['size']):
+            raise ValueError('qualification proof differs from authenticated bytes: '+name)
+    return sorted(names | set(proof))
+
+
 def prepare_qualified(directory, output):
     directory, output = Path(directory), Path(output)
     manifest = release.load(directory/'manifest.json')
     universal.verify_artifacts(directory, manifest)
     universal.verify_qualification(directory)
-    names = software_names(manifest)
+    names = qualified_names(directory, manifest)
     output.mkdir(mode=0o755)
     for name in names: copy_regular(directory/name, output/name)
     return names
@@ -76,7 +105,7 @@ def prepare_snapshot(root, key, fingerprint, output, generated):
     publication = contracts.verify(root, key, fingerprint)
     directory = root/'releases'/publication['release_id']
     manifest = release.load(directory/'manifest.json')
-    names = software_names(manifest)
+    names = qualified_names(directory, manifest)
     output.mkdir(mode=0o755); generated.mkdir(mode=0o755)
     for name in names: copy_regular(directory/name, output/name)
     for name in GENERATED:
@@ -146,7 +175,7 @@ def check_asset(asset, descriptor):
 
 
 def verify_asset_set(directory, manifest, expected):
-    required = set(software_names(manifest)) | set(GENERATED)
+    required = set(qualified_names(directory, manifest)) | set(GENERATED)
     if set(expected) != required:
         raise ValueError('GitHub release asset set differs from qualified manifest')
     for name, descriptor in manifest['artifacts'].items():
@@ -225,7 +254,8 @@ def publish(directory, manifest, repository, ref, sha, client):
         current = matching[0]
     else:
         current = client.json('POST', prefix, {'tag_name':tag, 'target_commitish':sha,
-            'name':'httpjet '+tag, 'body':release_body(tag, sha, manifest_hash), 'draft':True, 'prerelease':False})
+            'name':'httpjet '+tag, 'body':release_body(tag, sha, manifest_hash),
+            'draft':True, 'prerelease':False, 'make_latest':'false'})
     marker = '<!-- httpjet-qualified '+manifest_hash+' '+sha+' -->'
     if current.get('tag_name') != tag or marker not in (current.get('body') or ''):
         raise ValueError('existing release is not the matching qualified publication')
@@ -249,9 +279,44 @@ def publish(directory, manifest, repository, ref, sha, client):
     if tag_commit(client, repository, tag) != sha:
         raise ValueError('public release tag changed during upload')
     if current.get('draft'):
-        current = client.json('PATCH', prefix+'/'+str(release_id), {'draft':False, 'make_latest':'true'})
+        current = client.json('PATCH', prefix+'/'+str(release_id), {'draft':False, 'make_latest':'false'})
     if current.get('draft') or current.get('tag_name') != tag:
         raise ValueError('GitHub release did not become public for the qualified tag')
+    return current['html_url']
+
+
+def promote_latest(directory, manifest, repository, ref, sha, client):
+    """Promote an existing complete publication after package-endpoint checks.
+
+    This action cannot create releases, finish drafts, or upload missing assets.
+    The workflow runs it only after the signed Pages deployment is verified.
+    """
+    tag = validate_tag_context(manifest, repository, ref, sha)
+    expected = expected_assets(directory)
+    verify_asset_set(directory, manifest, expected)
+    if release.load(Path(directory)/'manifest.json') != manifest:
+        raise ValueError('GitHub assets are not bound to the qualified manifest')
+    if tag_commit(client, repository, tag) != sha:
+        raise ValueError('public release tag changed after qualification')
+    prefix = '/repos/'+repository+'/releases'
+    matching = [item for item in pages(client, prefix) if item.get('tag_name') == tag]
+    if len(matching) != 1:
+        raise ValueError('latest promotion requires one existing qualified release')
+    release_id = matching[0]['id']
+    current = client.json('GET', prefix+'/'+str(release_id))
+    marker = '<!-- httpjet-qualified '+release.sha(Path(directory)/'manifest.json')+' '+sha+' -->'
+    if (current.get('draft') is not False or current.get('prerelease') is not False
+        or current.get('tag_name') != tag or marker not in (current.get('body') or '')):
+        raise ValueError('latest promotion requires the published qualified release')
+    actual = asset_map(client, prefix, release_id)
+    if set(actual) != set(expected):
+        raise ValueError('latest promotion requires the complete qualified asset set')
+    for name, asset in actual.items(): check_asset(asset, expected[name])
+    if tag_commit(client, repository, tag) != sha:
+        raise ValueError('public release tag changed before latest promotion')
+    current = client.json('PATCH', prefix+'/'+str(release_id), {'make_latest':'true'})
+    if current.get('draft') or current.get('tag_name') != tag or current.get('id') != release_id:
+        raise ValueError('GitHub latest promotion changed the release identity')
     return current['html_url']
 
 
@@ -283,7 +348,7 @@ def public_asset(opener, url, descriptor):
         raise ValueError('public GitHub asset differs from qualified bytes')
 
 
-def verify_public(directory, manifest, repository, ref, sha, opener=None):
+def verify_public(directory, manifest, repository, ref, sha, opener=None, *, require_latest=False):
     tag = validate_tag_context(manifest, repository, ref, sha)
     expected = expected_assets(directory)
     verify_asset_set(directory, manifest, expected)
@@ -291,7 +356,8 @@ def verify_public(directory, manifest, repository, ref, sha, opener=None):
     base = 'https://github.com/'+repository+'/releases/'
     urls = [(base+'download/'+urllib.parse.quote(tag,safe='')+'/'+urllib.parse.quote(name,safe=''), expected[name])
             for name in sorted(expected)]
-    urls.append((base+'latest/download/install.sh', expected['install.sh']))
+    if require_latest:
+        urls.append((base+'latest/download/install.sh', expected['install.sh']))
     for url, descriptor in urls:
         for attempt in range(12):
             try:
@@ -299,6 +365,12 @@ def verify_public(directory, manifest, repository, ref, sha, opener=None):
                 break
             except (urllib.error.URLError, TimeoutError):
                 if attempt == 11: raise
+                time.sleep(5)
+            except ValueError:
+                # The latest redirect can briefly retain the previous release.
+                # Immutable tag downloads must always match on the first read.
+                if not require_latest or url != base+'latest/download/install.sh' or attempt == 11:
+                    raise
                 time.sleep(5)
         print('verified public GitHub asset '+url)
 
@@ -310,7 +382,9 @@ def main():
     child = sub.add_parser('snapshot'); child.add_argument('--snapshot',type=Path,required=True); child.add_argument('--public-key',type=Path,required=True)
     child.add_argument('--fingerprint',required=True); child.add_argument('--output',type=Path,required=True); child.add_argument('--generated',type=Path,required=True)
     child = sub.add_parser('publish'); child.add_argument('--directory',type=Path,required=True)
+    child = sub.add_parser('latest'); child.add_argument('--directory',type=Path,required=True)
     child = sub.add_parser('verify-public'); child.add_argument('--directory',type=Path,required=True)
+    child.add_argument('--require-latest',action='store_true')
     args = parser.parse_args()
     if args.action == 'qualified': names = prepare_qualified(args.directory,args.output)
     elif args.action == 'snapshot': names = prepare_snapshot(args.snapshot,args.public_key,args.fingerprint,args.output,args.generated)
@@ -319,8 +393,10 @@ def main():
         repository, ref, sha = (os.environ[key] for key in ('GITHUB_REPOSITORY','GITHUB_REF','GITHUB_SHA'))
         if args.action == 'publish':
             print(publish(args.directory,manifest,repository,ref,sha,Github(repository,os.environ['GH_TOKEN'])))
+        elif args.action == 'latest':
+            print(promote_latest(args.directory,manifest,repository,ref,sha,Github(repository,os.environ['GH_TOKEN'])))
         else:
-            verify_public(args.directory,manifest,repository,ref,sha)
+            verify_public(args.directory,manifest,repository,ref,sha,require_latest=args.require_latest)
         return
     print('Prepared '+str(len(names))+' qualified software/metadata subjects')
 
