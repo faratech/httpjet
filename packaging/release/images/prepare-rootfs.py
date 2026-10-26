@@ -1,11 +1,47 @@
 #!/usr/bin/env python3
 """Derive locked rootfs tarballs from official media inside a private container."""
-import argparse,gzip,hashlib,os,re,shutil,subprocess,tempfile
+import argparse,gzip,hashlib,os,re,shutil,stat,subprocess,tempfile
 from pathlib import Path
 BASE='debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8'
 def call(command,**kwargs):return subprocess.run([str(x) for x in command],check=True,**kwargs)
 def digest(path):
     with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
+
+def slackware_bootstrap(root,scripts):
+    # The temporary host filesystem may be mounted nodev. A regular temporary
+    # sink lets package scripts redirect output until the guest mounts devtmpfs.
+    dev=root/'dev'
+    if dev.is_symlink() or not dev.is_dir():raise ValueError('Slackware bootstrap needs its own /dev directory')
+    null=dev/'null'
+    try:mode=null.lstat().st_mode
+    except FileNotFoundError:pass
+    else:
+        if not (stat.S_ISCHR(mode) or stat.S_ISREG(mode)):
+            raise ValueError('unexpected Slackware /dev/null type')
+        null.unlink()
+    null.touch(mode=0o666);null.chmod(0o666)
+
+    # The glibc package stores its shared libraries under lib64/incoming.
+    # Until its own post-install script has installed those libraries, the
+    # target ldconfig cannot run. Trigger that script's documented fallback.
+    ldconfig=root/'sbin/ldconfig'
+    if ldconfig.is_symlink() or not ldconfig.is_file():raise ValueError('Slackware ldconfig is missing')
+    original_mode=stat.S_IMODE(ldconfig.stat().st_mode)
+    applets=scripts/'bin';applets.mkdir()
+    names=subprocess.check_output([str(scripts/'busybox'),'--list'],text=True).splitlines()
+    for name in names:
+        if not name or '/' in name or name in ('.','..'):raise ValueError('invalid BusyBox applet')
+        (applets/name).symlink_to('../busybox')
+    environment={**os.environ,'PATH':'/bootstrap-scripts/bin:/sbin:/bin:/usr/sbin:/usr/bin'}
+    ldconfig.chmod(original_mode & ~0o111)
+    try:
+        for script in sorted(scripts.glob('[0-9]*.sh')):
+            subprocess.run(['chroot',str(root),'/bootstrap-scripts/busybox','sh',
+                            '/bootstrap-scripts/'+script.name],check=False,env=environment)
+    finally:
+        ldconfig.chmod(original_mode)
+    call(['chroot',root,'/sbin/ldconfig'])
+
 def inside(kind,source,output,work=Path('/work')):
     # The runner owns /work, but the builder container creates its extracted
     # tree as root. Remove only the directory allocated by this invocation so
@@ -46,13 +82,19 @@ def inside_tree(kind,source,output,work,root):
             shutil.rmtree(root/'install',ignore_errors=True)
         bootstrap=root/'bootstrap-packages';bootstrap.mkdir()
         shutil.copyfile('/bin/busybox',scripts/'busybox');(scripts/'busybox').chmod(0o755)
-        # Static bootstrap shell creates the original package symlinks before
-        # native glibc tools can run. Final package installation is mandatory.
-        for script in sorted(scripts.glob('[0-9]*.sh')):
-            subprocess.run(['chroot',str(root),'/bootstrap-scripts/busybox','sh','/bootstrap-scripts/'+script.name],check=False)
+        # Seed the extracted packages so native tools can run their original
+        # installation scripts. The full package transaction still follows.
+        slackware_bootstrap(root,scripts)
         for _,name in sorted(packages):shutil.copyfile(work/name,bootstrap/name)
         runner=scripts/'run'
-        runner.write_text('#!/bin/bash\nset -e\nfor package in /bootstrap-packages/*.t?z; do\n  /sbin/installpkg "$package"\ndone\n')
+        # The devs package reinstalls a device node for /dev/null. On a nodev
+        # host mount that node cannot be opened, so install it last and restore
+        # a temporary regular sink for first boot until devtmpfs is mounted.
+        runner.write_text('#!/bin/bash\nset -e\ndevs=\nfor package in /bootstrap-packages/*.t?z; do\n'
+                          '  case "$package" in /bootstrap-packages/devs-*.t?z) devs=$package; continue;; esac\n'
+                          '  /sbin/installpkg "$package"\ndone\n'
+                          '[ -n "$devs" ]\n/sbin/installpkg "$devs"\n'
+                          'rm -f /dev/null\n: > /dev/null\nchmod 666 /dev/null\n')
         call(['chroot',root,'/bin/bash','/bootstrap-scripts/run'])
         shutil.rmtree(scripts);shutil.rmtree(bootstrap)
         mirrors=root/'etc/slackpkg/mirrors'

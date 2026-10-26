@@ -107,6 +107,10 @@ class InstallerTests(unittest.TestCase):
             (self.bin / "python3").symlink_to(self.bin / "mock-command")
         text = text.replace("FILESYSTEM_ROOT=''", f"FILESYSTEM_ROOT='{self.root}'")
         text = text.replace("PATH='/usr/sbin:/usr/bin:/sbin:/bin'", f"PATH='{self.bin}:/usr/sbin:/usr/bin:/sbin:/bin'")
+        if state.get("busybox_shell"):
+            # Some BusyBox ash builds resolve `id` as an applet builtin before
+            # PATH. Keep the fixture's mock UID usable on non-root CI runners.
+            text = text.replace('$(id -u)', f'$("{self.bin}/id" -u)')
         if state.get("missing_ss"):
             text = text.replace("command -v ss >/dev/null 2>&1", "false")
         self.script_path.write_text(text)
@@ -324,6 +328,10 @@ class InstallerTests(unittest.TestCase):
     def test_real_busybox_shell_and_timeout_flags(self):
         result, _ = self.run_installer(busybox_shell=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        result, calls = self.run_installer(busybox_shell=True, uid="1000")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run installer as root", result.stderr)
+        self.assertFalse(any(call[0] == "apt-get" for call in calls))
         result = subprocess.run([shutil.which("busybox"), "timeout", "-k", "1", "1", "true"], capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 

@@ -70,4 +70,8 @@ fi
 "$destination/scripts/check-dependency-licenses.py" \
     >/dev/null
 
+# The fuzz crate has a separate workspace and lockfile. A source export can
+# otherwise pass the main workspace checks while every public fuzz job fails.
+cargo metadata --locked --manifest-path "$destination/fuzz/Cargo.toml" --format-version 1 >/dev/null
+
 echo "public source snapshot created at $destination"

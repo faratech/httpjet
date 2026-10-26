@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "hj-config"
-version = "0.1.6"
+version = "0.1.10"
 dependencies = [
  "ipnet",
  "quick-xml",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "hj-core"
-version = "0.1.6"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "hj-h2"
-version = "0.1.6"
+version = "0.1.10"
 dependencies = [
  "bytes",
  "futures-util",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "hj-lsapi"
-version = "0.1.6"
+version = "0.1.10"
 dependencies = [
  "async-trait",
  "bytes",

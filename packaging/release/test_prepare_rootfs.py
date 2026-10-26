@@ -4,6 +4,7 @@ import importlib.util
 import os
 from pathlib import Path
 import pwd
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -35,7 +36,6 @@ class PreparedRootfsCleanup(unittest.TestCase):
         self.assertFalse((self.work/'root').exists())
         self.assertEqual(output.read_text(), 'prepared unit artifact')
         self.assertEqual(self.sibling.read_text(), 'keep')
-
     def test_failed_builder_still_removes_only_created_tree(self):
         def fail(*args):
             self.tree(*args)
@@ -71,6 +71,49 @@ class PreparedRootfsCleanup(unittest.TestCase):
                                 text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.sibling.read_text(), 'keep')
+
+
+class SlackwareBootstrap(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='httpjet-slackware-bootstrap-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)/'root'
+        self.scripts = self.root/'bootstrap-scripts'
+        for path in (self.root/'dev', self.root/'sbin', self.scripts):path.mkdir(parents=True)
+        self.ldconfig = self.root/'sbin/ldconfig'
+        self.ldconfig.write_text('unit fixture');self.ldconfig.chmod(0o755)
+        (self.scripts/'busybox').write_text('unit fixture')
+        (self.scripts/'0000.sh').write_text('unit fixture')
+
+    def test_bootstrap_disables_ldconfig_until_libraries_are_seeded(self):
+        seen = []
+        def run(arguments,**kwargs):
+            seen.append((arguments,stat.S_IMODE(self.ldconfig.stat().st_mode),kwargs['env']['PATH']))
+            return subprocess.CompletedProcess(arguments,0)
+        with patch.object(prepare.subprocess,'check_output',return_value='cat\nmv\n'), \
+             patch.object(prepare.subprocess,'run',side_effect=run), patch.object(prepare,'call') as call:
+            prepare.slackware_bootstrap(self.root,self.scripts)
+        self.assertEqual(seen[0][1]&0o111,0)
+        self.assertTrue(seen[0][2].startswith('/bootstrap-scripts/bin:'))
+        self.assertTrue((self.scripts/'bin/cat').is_symlink())
+        self.assertTrue((self.root/'dev/null').is_file())
+        self.assertEqual(stat.S_IMODE(self.ldconfig.stat().st_mode),0o755)
+        call.assert_called_once_with(['chroot',self.root,'/sbin/ldconfig'])
+
+    def test_ldconfig_mode_restored_if_bootstrap_fails(self):
+        with patch.object(prepare.subprocess,'check_output',return_value='cat\n'), \
+             patch.object(prepare.subprocess,'run',side_effect=OSError('fixture failure')):
+            with self.assertRaisesRegex(OSError,'fixture failure'):
+                prepare.slackware_bootstrap(self.root,self.scripts)
+        self.assertEqual(stat.S_IMODE(self.ldconfig.stat().st_mode),0o755)
+
+    def test_unowned_null_symlink_is_not_followed(self):
+        target = Path(self.temporary.name)/'keep'
+        target.write_text('keep')
+        (self.root/'dev/null').symlink_to(target)
+        with self.assertRaisesRegex(ValueError,'unexpected Slackware'):
+            prepare.slackware_bootstrap(self.root,self.scripts)
+        self.assertEqual(target.read_text(),'keep')
 
 
 if __name__ == '__main__':
