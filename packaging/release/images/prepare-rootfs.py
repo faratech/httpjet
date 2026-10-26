@@ -15,8 +15,8 @@ def slackware_packages(listing):
         if not match:continue
         series,filename=match.groups();package=filename.rsplit('-',3)[0]
         if ((series in ('a','n') and not package.startswith(('kernel-','kernel_')))
-            or series=='l' and package in libraries or series=='d' and package=='python3'
-            or series=='ap' and package=='slackpkg'):
+            or series=='l' and package in libraries or series=='d' and package in ('python3','perl')
+            or series=='ap' and package in ('slackpkg','sudo')):
             packages.append((name,filename))
     if not packages:raise ValueError('official Slackware ISO has no packages')
     return packages
@@ -102,6 +102,9 @@ def inside_tree(kind,source,output,work,root):
                           '[ -n "$devs" ]\n/sbin/installpkg "$devs"\n'
                           'rm -f /dev/null\n: > /dev/null\nchmod 666 /dev/null\n')
         call(['chroot',root,'/bin/bash','/bootstrap-scripts/run'])
+        # The CA package can run before OpenSSL is fully installed. Rebuild its
+        # bundle and hashed links after the complete offline package transaction.
+        call(['chroot',root,'/usr/sbin/update-ca-certificates','--fresh'])
         shutil.rmtree(scripts);shutil.rmtree(bootstrap)
         mirrors=root/'etc/slackpkg/mirrors'
         if mirrors.exists():mirrors.write_text('https://mirrors.slackware.com/slackware/slackware64-15.0/\n')

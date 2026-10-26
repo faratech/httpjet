@@ -100,13 +100,15 @@ class SlackwareBootstrap(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.ldconfig.stat().st_mode),0o755)
         call.assert_called_once_with(['chroot',self.root,'/sbin/ldconfig'])
 
-    def test_package_selection_includes_slackpkg_from_the_ap_series(self):
+    def test_package_selection_includes_slackpkg_and_sudo_from_the_ap_series(self):
         listing = ['slackware64/ap/slackpkg-15.0.10-noarch-1.txz',
+                   'slackware64/ap/sudo-1.9.9-x86_64-1.txz',
                    'slackware64/ap/unrelated-1.0-x86_64-1.txz',
                    'slackware64/a/aaa_glibc-solibs-2.33-x86_64-5.txz',
-                   'slackware64/a/kernel-generic-5.15-x86_64-1.txz']
+                   'slackware64/a/kernel-generic-5.15-x86_64-1.txz',
+                   'slackware64/d/perl-5.34.0-x86_64-1.txz']
         names = [name for name, _ in prepare.slackware_packages(listing)]
-        self.assertEqual(names,[listing[0],listing[2]])
+        self.assertEqual(names,[listing[0],listing[1],listing[3],listing[5]])
 
     def test_ldconfig_mode_restored_if_bootstrap_fails(self):
         with patch.object(prepare.subprocess,'check_output',return_value='cat\n'), \
