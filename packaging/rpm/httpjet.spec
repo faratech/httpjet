@@ -1,5 +1,5 @@
 %{!?httpjet_version:%global httpjet_version 0.1.10}
-%{!?httpjet_revision:%global httpjet_revision 2}
+%{!?httpjet_revision:%global httpjet_revision 3}
 Name: httpjet
 Version: %{httpjet_version}
 Release: %{httpjet_revision}
@@ -91,6 +91,9 @@ rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 
 %changelog
+* Mon Oct 26 2026 httpjet contributors - 0.1.10-3
+- Resolve the source timestamp from the release tag's commit.
+
 * Mon Oct 26 2026 httpjet contributors - 0.1.10-2
 - Publish qualified Linux carriers with GitHub build provenance.
 

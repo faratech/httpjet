@@ -41,7 +41,7 @@ export PATH="$release_work/trainer/bin:$PATH"
 bash "$release_root/scripts/export-public-source.sh" "$release_source" "$release_tag"
 install -m0644 "$release_key" "$release_source/packaging/debian/archive-keyring.asc"
 export SOURCE_DATE_EPOCH
-SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$release_tag")
+SOURCE_DATE_EPOCH=$(bash "$release_root/packaging/release/source-date-epoch.sh" "$release_tag")
 cd "$release_source"
 cargo vendor --locked vendor/registry > "$release_work/vendor-config"
 mkdir -p .cargo
