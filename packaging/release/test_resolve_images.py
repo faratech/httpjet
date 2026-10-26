@@ -48,6 +48,7 @@ class PreparedSlackwareImage(unittest.TestCase):
         artifact = lock['rootfs']['artifact']
         self.assertEqual(lock['rootfs']['origin'], SLACKWARE_URL)
         self.assertEqual(lock['rootfs']['sha256'], hashlib.sha256(prepared).hexdigest())
+        self.assertIs(lock['prepared'], True)
         self.assertEqual(artifacts[artifact]['sha256'], lock['rootfs']['sha256'])
         self.assertEqual(artifacts[artifact]['size'], len(prepared))
 

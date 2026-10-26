@@ -87,6 +87,23 @@ class RootfsExtraction(unittest.TestCase):
             rootfs.inject(root, 'parent/outside', b'bad', 0o600)
         self.assertEqual(outside.read_text(), 'keep')
 
+    def test_slackware_fstab_is_seeded_only_when_absent(self):
+        root = self.work/'root'
+        root.mkdir()
+        rootfs.seed_slackware_fstab(root, 'slackware-sysv')
+        fstab = root/'etc/fstab'
+        self.assertIn('/dev/vda / ext4', fstab.read_text())
+        self.assertIn('tmpfs /dev/shm tmpfs', fstab.read_text())
+        fstab.write_text('operator fixture\n')
+        rootfs.seed_slackware_fstab(root, 'slackware-sysv')
+        self.assertEqual(fstab.read_text(), 'operator fixture\n')
+        fstab.unlink()
+        outside = self.work/'outside-fstab'
+        outside.write_text('keep')
+        fstab.symlink_to(outside)
+        rootfs.seed_slackware_fstab(root, 'slackware-sysv')
+        self.assertEqual(outside.read_text(), 'keep')
+
     def test_locked_input_mismatch_is_rejected_before_extraction(self):
         body = b'pinned rootfs bytes'
         source = {'url': 'https://example.invalid/rootfs.tar.gz',

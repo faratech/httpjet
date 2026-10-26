@@ -56,6 +56,16 @@ def slackware_bootstrap(root,scripts):
         ldconfig.chmod(original_mode)
     call(['chroot',root,'/sbin/ldconfig'])
 
+def verify_slackware_prerequisites(root):
+    # This offline image is marked prepared only when it already contains
+    # every tool required to boot, expose SSH and run the portable installer.
+    script = ('set -e; for tool in sshd ssh-keygen sudo curl gpg python3 setpriv tar gzip; do '
+              'command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }; done; '
+              'test -s /etc/ssl/certs/ca-certificates.crt; '
+              'python3 -c "import sys; assert sys.version_info >= (3, 8)"; '
+              'setpriv --help | grep -q -- --ambient-caps')
+    call(['chroot',root,'/bin/bash','-c',script])
+
 def inside(kind,source,output,work=Path('/work')):
     # The runner owns /work, but the builder container creates its extracted
     # tree as root. Remove only the directory allocated by this invocation so
@@ -105,6 +115,7 @@ def inside_tree(kind,source,output,work,root):
         # The CA package can run before OpenSSL is fully installed. Rebuild its
         # bundle and hashed links after the complete offline package transaction.
         call(['chroot',root,'/usr/sbin/update-ca-certificates','--fresh'])
+        verify_slackware_prerequisites(root)
         shutil.rmtree(scripts);shutil.rmtree(bootstrap)
         mirrors=root/'etc/slackpkg/mirrors'
         if mirrors.exists():mirrors.write_text('https://mirrors.slackware.com/slackware/slackware64-15.0/\n')

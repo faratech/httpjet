@@ -80,6 +80,9 @@ website alias is optional and is not deployed by the release workflow.
    published locks/evidence describe their hashes. Public-repository workflow
    artifacts may be accessible to others, so do not place credentials in them.
    The OS archives are qualification inputs, not software release downloads.
+   The Slackware image is assembled offline from the checksum-pinned official
+   installation media with its prerequisites preinstalled; its lock records
+   this prepared state instead of describing it as an untouched minimal image.
 3. Approve candidate signing. The job signs RPMs, builds the schema-2 manifest and
    signs a local unpublishable test site. It receives no hosting credentials.
    Previous stable inputs are authenticated through the signed selector/manifests.

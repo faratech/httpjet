@@ -179,6 +179,14 @@ def inject(root, relative, content, mode):
     path.chmod(mode)
 
 
+def seed_slackware_fstab(root, recipe):
+    if recipe != 'slackware-sysv':
+        return
+    path = safe_path(root, Path('etc/fstab'))
+    if not path.exists() and not path.is_symlink():
+        inject(root, 'etc/fstab', b'/dev/vda / ext4 defaults 0 1\ntmpfs /dev/shm tmpfs defaults 0 0\n', 0o644)
+
+
 def build(row, lock, work, public_key, artifact_dir=None, artifact_manifest=None):
     if os.geteuid() != 0:
         raise ValueError('rootfs image creation requires isolated root to preserve target numeric ownership')
@@ -201,6 +209,7 @@ def build(row, lock, work, public_key, artifact_dir=None, artifact_manifest=None
     root = work / 'root'
     extracted = extract_rootfs(archive, root, lock['rootfs'].get('strip_prefix', ''),
                               lock['rootfs'].get('format'))
+    seed_slackware_fstab(root, recipe)
     inject(root, 'httpjet-qualification-init', Path(__file__).with_name('rootfs-init.sh').read_bytes(), 0o700)
     inject(root, 'httpjet-qualification-recipe', (recipe + '\n').encode(), 0o600)
     inject(root, 'httpjet-qualification-target-init', (target_init + '\n').encode(), 0o600)

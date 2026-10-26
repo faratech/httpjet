@@ -9,6 +9,7 @@ mkdir -p /proc /sys /dev /run /tmp
 mount -t proc proc /proc 2>/dev/null || :
 mount -t sysfs sysfs /sys 2>/dev/null || :
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || :
+mkdir -p /dev/shm
 chmod 1777 /tmp
 ip link set lo up
 for candidate in /sys/class/net/*; do

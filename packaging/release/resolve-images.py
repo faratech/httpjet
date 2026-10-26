@@ -113,7 +113,8 @@ def prepare_media(row,cache,output):
     subprocess.run(['python3',str(Path(__file__).parent/'images/prepare-rootfs.py'),recipe,str(iso),source['sha256'],str(target)],check=True)
     k,i=kernel(row['architecture'])
     lock={'rootfs':{'artifact':name,'sha256':sha(target),'format':'tar.gz','strip_prefix':'','origin':source['url']},
-          'kernel':k,'initrd':i,'init':'/sbin/init','bootstrap':recipe,'prepared':False,'installation_media':source}
+          'kernel':k,'initrd':i,'init':'/sbin/init','bootstrap':recipe,
+          'prepared':recipe=='slackware-sysv','installation_media':source}
     return lock,{name:{'sha256':sha(target),'size':target.stat().st_size,'architecture':row['architecture'],'origin':source['url']}}
 
 def special(row,root):
