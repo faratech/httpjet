@@ -1,0 +1,45 @@
+name: Observe locked Fedora image redirects
+on:
+  workflow_dispatch:
+    inputs:
+      qualification_run_id:
+        description: Qualification run containing the exact image lock to inspect
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  fedora-arm-redirects:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: qualification-images
+          path: image-inputs
+          run-id: ${{ inputs.qualification_run_id }}
+          github-token: ${{ github.token }}
+      - name: Record HTTPS HEAD redirects without changing the image lock
+        run: |
+          python3 -B - <<'PY'
+          import json,pathlib,sys
+          sys.path.insert(0,'packaging/release')
+          import fedora_image,release
+          document=release.load('image-inputs/qualification-images.json')
+          asset=document['rows']['fedora-stable-arm64']['cloud']
+          observations=fedora_image.probe(asset)
+          release.write_json(pathlib.Path('fedora-origin-check.json'),{
+              'schema':1,'scope':'locked-image-redirect-observation-only',
+              'release_id':document['release_id'],'expected_sha256':asset['sha256'],
+              'checksum_verified':False,'observations':observations})
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: locked-fedora-origin-observation
+          path: fedora-origin-check.json
+          if-no-files-found: warn

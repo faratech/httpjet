@@ -13,6 +13,7 @@ import subprocess
 import time
 import urllib.parse
 import uuid
+import guix_bootstrap
 
 ROOT = Path(__file__).resolve().parents[2]
 DEBIAN_BUILDER = 'rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8'
@@ -50,6 +51,8 @@ def validate(row, lock, release_base, ports):
     if definition.get('recipe') != expected_recipe: raise ValueError('unexpected declarative image recipe')
     directory = ROOT / relative
     if tree_hash(directory) != definition['sha256']: raise ValueError('declarative definition differs from signed image lock')
+    if row['executor'] == 'guix-image' and lock.get('bootstrap') != guix_bootstrap.descriptor(native):
+        raise ValueError('Guix bootstrap differs from authenticated image inputs')
     uri = urllib.parse.urlsplit(release_base)
     if uri.scheme != 'https' or not uri.hostname or uri.username or uri.password or uri.query or uri.fragment:
         raise ValueError('declarative release base must be authenticated HTTPS')
@@ -81,6 +84,10 @@ def nix_script(system, release_base, ports, previous, certificate):
     command = 'nix-build ' + shlex.join(arguments)
     return '''#!/bin/bash
 set -euo pipefail
+if test -e /dev/kvm; then
+  echo 'httpjet: Nix qualification builder must not expose /dev/kvm; TCG is required' >&2
+  exit 1
+fi
 export NIX_REMOTE=local
 if [ -f /inputs/httpjet-qualification-ca.crt ]; then
   bundle=''
@@ -119,7 +126,7 @@ export DEBIAN_FRONTEND=noninteractive
 printf '#!/bin/sh\\nexit 101\\n' > /usr/sbin/policy-rc.d
 chmod 0755 /usr/sbin/policy-rc.d
 apt-get update
-apt-get install -y --no-install-recommends guix git ca-certificates curl openssh-client qemu-utils qemu-system-x86 qemu-system-arm qemu-efi-aarch64
+apt-get install -y --no-install-recommends python3 gnupg xz-utils tar git ca-certificates curl openssh-client qemu-utils qemu-system-x86 qemu-system-arm qemu-efi-aarch64
 if [ -f /inputs/httpjet-qualification-ca.crt ]; then
   cp /inputs/httpjet-qualification-ca.crt /usr/local/share/ca-certificates/httpjet-qualification.crt
   update-ca-certificates
@@ -132,10 +139,17 @@ export SSL_CERT_DIR=/etc/ssl/certs
 export HTTPJET_GUIX_RELEASE_LOCK=/inputs/release-lock.scm
 export HTTPJET_QUALIFICATION_SSH_KEY=/inputs/ssh-public.key
 ''' + f'''export HTTPJET_GUIX_SYSTEM={shlex.quote(SYSTEMS[arch])}
+python3 -B /inputs/guix_bootstrap.py --inside-builder --architecture {shlex.quote(arch)} --receipt /work/guix-bootstrap.json
+export GUIX_PROFILE=/var/guix/profiles/per-user/root/current-guix
+source "$GUIX_PROFILE/etc/profile"
+export GUIX_TLS_CERTIFICATE_DIRECTORY=/etc/ssl/certs SSL_CERT_DIR=/etc/ssl/certs
 guix-daemon --disable-chroot --build-users-group= > /work/guix-daemon.log 2>&1 &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
 for attempt in $(seq 1 30); do test -S /var/guix/daemon-socket/socket && break; sleep 1; done
+for httpjet_cache in ci.guix.gnu.org bordeaux.guix.gnu.org; do
+  guix archive --authorize < "$GUIX_PROFILE/share/guix/$httpjet_cache.pub"
+done
 image=$(guix time-machine -C /inputs/definitions/channels.scm -- -L /inputs/definitions system image --system={SYSTEMS[arch]} --image-type={image_type} --image-size=8G --max-jobs=2 --cores=2 /inputs/definitions/qualification.scm)
 cp "$image" /work/system.qcow2
 hash=$(sha256sum /work/system.qcow2 | cut -d' ' -f1)
@@ -168,6 +182,7 @@ def run(row, lock, manifest_path, release_base, ssh_public_key, new_dir, ports,
     else:
         if digest(inputs / 'definitions/channels.scm') != lock['channels_sha256']:
             raise ValueError('Guix authenticated channel pin changed')
+        guix_bootstrap.stage(inputs)
         builder = lock.get('builder', {}).get('image', DEBIAN_BUILDER)
         (inputs / 'release-lock.scm').write_text(guix_lock(manifest, arch, release_base))
         if previous_manifest:
@@ -181,7 +196,8 @@ def run(row, lock, manifest_path, release_base, ssh_public_key, new_dir, ports,
                  '--memory-swap', '6g', '--pids-limit', '2048', '--ulimit', 'memlock=8388608:8388608',
                  '--add-host', 'httpjet-qualification.local:127.0.0.1',
                  '--volume', str(inputs) + ':/inputs:ro', '--volume', str(output) + ':/work',
-                 '--workdir', '/work', '--entrypoint', '/bin/bash']
+                 '--workdir', '/work', '--entrypoint',
+                 '/nix/var/nix/profiles/default/bin/bash' if row['executor'] == 'nix-image' else '/bin/bash']
     if row['executor'] == 'guix-image':
         # Image construction uses a user namespace for mkfs; no host policy,
         # privileged mode, mount namespace, devices or host store are granted.

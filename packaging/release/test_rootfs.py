@@ -73,6 +73,23 @@ class RootfsExtraction(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unsafe'):
             rootfs.extract_rootfs(archive, self.work / 'root')
 
+    def test_arch_metadata_is_skipped_without_weakening_prefix_checks(self):
+        ignored = ('pkglist.x86_64.txt', 'version')
+        archive = self.archive([('root.x86_64/bin', 'directory', None),
+                                ('root.x86_64/bin/tool', 'file', b'fixture'),
+                                ('pkglist.x86_64.txt', 'file', b'packages'),
+                                ('version', 'file', b'2026')])
+        destination = self.work / 'root'
+        rootfs.extract_rootfs(archive, destination, 'root.x86_64', ignored_members=ignored)
+        self.assertEqual((destination / 'bin/tool').read_bytes(), b'fixture')
+        self.assertFalse((destination / 'version').exists())
+        archive = self.archive([('unexpected', 'file', b'bad')])
+        with self.assertRaisesRegex(ValueError, 'outside'):
+            rootfs.extract_rootfs(archive, self.work / 'rejected', 'root.x86_64', ignored_members=ignored)
+        archive = self.archive([('version', 'symlink', '/etc/passwd')])
+        with self.assertRaisesRegex(ValueError, 'metadata'):
+            rootfs.extract_rootfs(archive, self.work / 'rejected-link', 'root.x86_64', ignored_members=ignored)
+
     def test_injection_replaces_only_final_link_inside_guest_tree(self):
         root = self.work / 'root'
         root.mkdir()

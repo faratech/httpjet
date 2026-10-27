@@ -43,7 +43,9 @@ let
             { from = "host"; host.address = "127.0.0.1"; host.port = tlsPort; guest.port = 18443; }
             { from = "host"; proto = "udp"; host.address = "127.0.0.1"; host.port = quicPort; guest.port = 18443; }
           ];
-          qemu.options = [ "-accel" "tcg,thread=multi" ];
+          # The pinned wrapper already uses -machine accel=kvm:tcg.
+          # The isolated builder rejects /dev/kvm, selecting its TCG fallback.
+          qemu.forceAccel = false;
         };
       })
     ];

@@ -45,18 +45,21 @@ def source_asset(asset,work,name,artifacts=None,artifact_manifest=None):
         source=artifacts/filename
         if source.is_symlink() or expected['sha256']!=asset['sha256'] or b.sha(source)!=expected['sha256'] or source.stat().st_size!=expected['size']:raise ValueError('local qualification asset is not authenticated')
         shutil.copyfile(source,path)
+    elif asset.get('origin')=='https://fedoraproject.org/releases.json':
+        import fedora_image
+        fedora_image.fetch(asset,path)
     else:b.download(asset['url'],path)
     if b.sha(path)!=asset['sha256']:raise ValueError('qualification image checksum mismatch')
     return path
 
 def init_data(row,key,certificate):
     # Cloud-init is image construction input, never an installer host mutation.
+    # Omit unused command modules: cloud-init rejects an empty runcmd array.
     packages=['openssh-server','sudo','curl','ca-certificates','gnupg2' if row['route']=='rpm' else 'gnupg','util-linux','python3','tar','gzip']
     return '#cloud-config\n'+json.dumps({'users':[{'name':'qualifier','sudo':'ALL=(ALL) NOPASSWD:ALL','shell':'/bin/bash','ssh_authorized_keys':[key]}],
        'ssh_pwauth':False,'disable_root':True,'manage_etc_hosts':False,'package_update':True,'packages':packages,
        'write_files':[{'path':'/etc/hosts','permissions':'0644','content':'127.0.0.1 localhost\n::1 localhost\n10.0.2.2 httpjet-qualification.local\n'},
-                      {'path':'/run/httpjet-disposable-qualification','permissions':'0600','content':'controlled QEMU qualification image\n'}],
-       'runcmd':[]},indent=2)+'\n'
+                      {'path':'/run/httpjet-disposable-qualification','permissions':'0600','content':'controlled QEMU qualification image\n'}]},indent=2)+'\n'
 @contextlib.contextmanager
 def image_session(row,lock,work,key,ports,certificate,artifacts,manifest,previous_manifest=None):
     if row['executor'] in ('nix-image','guix-image'):
@@ -163,6 +166,15 @@ def run_guest_phase(key,ports,known,remote,phase,spec,out,transcript):
     ssh(key,ports['ssh'],known,['sudo','-n','python3','-B',remote+'/guest-v2.py',phase,'--spec',remote+'/spec.json','--output',remote+'/'+out.name],output=transcript,cwd=remote)
     receive(key,ports['ssh'],known,remote+'/'+out.name,out)
     return b.load(out)
+def reboot_guest(key,ports,known,transcript):
+    # BusyBox reboot signals are not the openrc-init shutdown protocol. Select
+    # the real PID 1 interface instead of inferring it from service management.
+    init=ssh(key,ports['ssh'],known,['cat','/proc/1/comm']).stdout.decode().strip()
+    command=['openrc-shutdown','--reboot','now'] if init=='openrc-init' else ['reboot']
+    try:
+        ssh(key,ports['ssh'],known,['sudo','-n',*command],output=transcript,timeout=15,check=False)
+    except subprocess.TimeoutExpired:pass
+
 def runtime_checks(row,completed,runtime):
     support.verify_runtime(runtime)
     for protocol in ('http','tls','h2','h3'):
@@ -327,9 +339,7 @@ def execute_session(args,row,manifest,image_lock,session,work,key,ports,known,pa
             else:exercise=run_guest_phase(key,ports,known,remote,'exercise',work.path/'spec.json',work.path/'exercise.json',transcript)
             checks.update(exercise['checks'])
             old_boot=ssh(key,ports['ssh'],known,['cat','/proc/sys/kernel/random/boot_id']).stdout.decode().strip()
-            try:
-                ssh(key,ports['ssh'],known,['sudo','-n','reboot'],output=transcript,timeout=15,check=False)
-            except subprocess.TimeoutExpired:pass
+            reboot_guest(key,ports,known,transcript)
             reboot_deadline=min(deadline,time.monotonic()+600)
             def changed(result):return result.returncode==0 and bool(re.fullmatch('[0-9a-f-]{36}',result.stdout.strip())) and result.stdout.strip()!=old_boot
             vm.wait_probe([*base_ssh,'cat /proc/sys/kernel/random/boot_id'],deadline=reboot_deadline,alive=lambda:process.poll() is None,success=changed,label='matrix reboot')

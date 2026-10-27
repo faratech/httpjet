@@ -64,6 +64,8 @@ class Builders(unittest.TestCase):
                     raise RuntimeError('guest failure')
         self.assertIn(('stop', '--time', '10', identifier), calls)
         self.assertIn(('rm', '--force', '--volumes', identifier), calls)
+        create = next(call for call in calls if call[0] == 'create')
+        self.assertEqual(create[create.index('--entrypoint') + 1], '/nix/var/nix/profiles/default/bin/bash')
         process.terminate.assert_called_once()
 
     def test_native_guix_image_format_and_tcg(self):

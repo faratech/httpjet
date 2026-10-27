@@ -23,6 +23,7 @@ import urllib.request
 RELEASE_ID = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-[0-9]+")
 ARCHES = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
 MAX_ARCHIVE = 128 * 1024 * 1024
+TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 INSPECT_PROCESS = r'''
 import json,sys
 from pathlib import Path
@@ -100,13 +101,17 @@ def download(url, destination, limit):
 
 def run(command, *, check=True, timeout=60, **kwargs):
     return subprocess.run([str(x) for x in command], check=check, timeout=timeout,
-                          stdin=subprocess.DEVNULL, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"}, **kwargs)
+                          stdin=subprocess.DEVNULL, env={"PATH": TRUSTED_PATH}, **kwargs)
 
 def verify_signature(document, signature_file, public_key, expected, home):
     if not re.fullmatch(r"[A-F0-9]{40}|[A-F0-9]{64}", expected):
         raise InstallError("invalid approved archive fingerprint")
+    gpg = shutil.which("gpg2", path=TRUSTED_PATH) or shutil.which("gpg", path=TRUSTED_PATH)
+    if not gpg:
+        raise InstallError("full GnuPG (gpg2 or gpg) is required")
     home.mkdir(mode=0o700, exist_ok=True)
-    command = ["gpg", "--batch", "--homedir", home, "--no-auto-key-retrieve"]
+    # Select once; never retry another implementation after verification fails.
+    command = [gpg, "--batch", "--homedir", home, "--no-auto-key-retrieve"]
     run(command + ["--import", public_key], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     result = run(command + ["--with-colons", "--list-keys"], capture_output=True, text=True)
     primary, pending = [], False
@@ -496,6 +501,25 @@ class Manager:
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
             raise InstallError("service profile must remain root-owned and non-writable by other users")
 
+    def wait_runit_supervisor(self, service, timeout=15):
+        # runsvdir discovers a newly enabled link asynchronously. A stale
+        # supervise/ok FIFO alone does not establish that runsv is listening.
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise InstallError("runit supervisor did not become ready; service start aborted")
+            try:
+                result = run(["sv", "status", service], check=False, capture_output=True,
+                             timeout=min(1, remaining))
+                if result.returncode == 0:
+                    return
+            except subprocess.TimeoutExpired:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
+
     def service(self, action, state):
         manager = state["init"]
         if action == "stop" and not self.running(state):
@@ -507,7 +531,10 @@ class Manager:
         elif manager == "openrc":
             run(["rc-service", "httpjet", action])
         elif manager == "runit":
-            run(["sv", "up" if action == "start" else "down", self.path("/etc/sv/httpjet")])
+            service = self.path("/etc/sv/httpjet")
+            if action == "start":
+                self.wait_runit_supervisor(service)
+            run(["sv", "up" if action == "start" else "down", service])
         elif manager == "sysv":
             run([self.path("/etc/rc.d/rc.httpjet" if state.get("sysv_style") == "slackware" else "/etc/init.d/httpjet"), action])
         elif manager == "none":

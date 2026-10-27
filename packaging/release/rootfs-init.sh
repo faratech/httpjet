@@ -3,6 +3,34 @@
 set -eu
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
+write_alpine_network_config() {
+    network_config=$1
+    network_interface=$2
+    case "$network_interface" in
+        ''|lo|*[!a-zA-Z0-9_.:-]*) printf 'Invalid qualification network interface\n' >&2; return 1 ;;
+    esac
+    mkdir -p "${network_config%/*}"
+    cat > "$network_config" <<EOF
+# Disposable QEMU user network, configured by real OpenRC networking.
+auto lo
+iface lo inet loopback
+
+auto $network_interface
+iface $network_interface inet static
+    address 10.0.2.15/24
+    gateway 10.0.2.2
+EOF
+}
+exec_target_init() {
+    [ -x "$target_init" ]
+    if [ "$recipe" = alpine ]; then
+        write_alpine_network_config /etc/network/interfaces "$interface"
+        # Let OpenRC configure its own address/route/state on every boot.
+        ip route del default via 10.0.2.2 dev "$interface" 2>/dev/null || :
+        ip address del 10.0.2.15/24 dev "$interface" 2>/dev/null || :
+    fi
+    exec "$target_init"
+}
 recipe=$(cat /httpjet-qualification-recipe)
 target_init=$(cat /httpjet-qualification-target-init)
 mkdir -p /proc /sys /dev /run /tmp
@@ -26,8 +54,7 @@ if ! grep -q 'httpjet-qualification.local' /etc/hosts; then
     printf '\n10.0.2.2 httpjet-qualification.local\n' >> /etc/hosts
 fi
 if [ -f /httpjet-qualification-initialized ]; then
-    [ -x "$target_init" ]
-    exec "$target_init"
+    exec_target_init
 fi
 if [ ! -f /httpjet-qualification-prepared ]; then
     case "$recipe" in
@@ -106,7 +133,8 @@ PidFile /run/sshd.pid
 Subsystem sftp internal-sftp
 EOF
 case "$recipe" in
-    alpine|gentoo-openrc) rc-update add sshd default ;;
+    alpine) rc-update add networking boot; rc-update add sshd default ;;
+    gentoo-openrc) rc-update add sshd default ;;
     void-musl)
         mkdir -p /etc/runit/runsvdir/default
         ln -s /etc/sv/sshd /etc/runit/runsvdir/default/sshd
@@ -119,4 +147,4 @@ esac
 printf '1\n' > /httpjet-qualification-initialized
 chmod 0600 /httpjet-qualification-initialized
 rm -f /httpjet-qualification-ssh.pub
-exec "$target_init"
+exec_target_init

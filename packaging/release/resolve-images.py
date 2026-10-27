@@ -138,8 +138,10 @@ def special(row,root):
                              'recipe':'packaging/nix/qualification.nix','sha256':tree_hash(root/'packaging/nix'),'system':system},
                 'builder':{'image':'docker.io/nixos/nix@sha256:f159a58f390677f41e8e900a74b6e2f9c7f27b364122ae6acf7a652ce6c551c0'},'init':'systemd'}
     if kind=='guix-image':
+        import guix_bootstrap
         return {'definition':{'origin':'https://codeberg.org/guix/guix/commit/ae27c30d2900d30af80abc99c6deb4ec5c2be87f',
                              'recipe':'packaging/guix/qualification.scm','sha256':tree_hash(root/'packaging/guix'),'system':system},
+                'bootstrap':guix_bootstrap.descriptor(arch),
                 'channels_sha256':sha(root/'packaging/guix/channels.scm'),'init':'shepherd'}
     raise ValueError('unknown source resolver')
 

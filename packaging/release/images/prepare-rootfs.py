@@ -8,7 +8,7 @@ def digest(path):
     with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
 
 def slackware_packages(listing):
-    libraries={'libffi','expat','libxml2','libxslt','libidn2','libunistring','libpsl','nghttp2','brotli','sqlite','readline','libgcrypt','libgpg-error','gmp','nettle','p11-kit','libtasn1','gnutls','libassuan','npth','libksba','pinentry','libssh2','libcap-ng','libseccomp','libtirpc','libnsl','python2'}
+    libraries={'libffi','expat','libxml2','libxslt','libidn2','libunistring','libpsl','nghttp2','brotli','sqlite','icu4c','readline','libgcrypt','libgpg-error','gmp','nettle','p11-kit','libtasn1','gnutls','libassuan','npth','libksba','pinentry','libssh2','libcap-ng','libseccomp','libtirpc','libnsl','python2'}
     packages=[]
     for name in listing:
         match=re.fullmatch(r'(?:\./)?slackware64/(a|ap|n|l|d)/([^/]+\.t[xg]z)',name)
@@ -16,7 +16,7 @@ def slackware_packages(listing):
         series,filename=match.groups();package=filename.rsplit('-',3)[0]
         if ((series in ('a','n') and not package.startswith(('kernel-','kernel_')))
             or series=='l' and package in libraries or series=='d' and package in ('python3','perl')
-            or series=='ap' and package in ('slackpkg','sudo')):
+            or series=='ap' and package in ('slackpkg','sudo','sqlite')):
             packages.append((name,filename))
     if not packages:raise ValueError('official Slackware ISO has no packages')
     return packages
@@ -59,8 +59,9 @@ def slackware_bootstrap(root,scripts):
 def verify_slackware_prerequisites(root):
     # This offline image is marked prepared only when it already contains
     # every tool required to boot, expose SSH and run the portable installer.
-    script = ('set -e; for tool in sshd ssh-keygen sudo curl gpg python3 setpriv tar gzip; do '
+    script = ('set -e; for tool in sshd ssh-keygen sudo curl gpg2 python3 setpriv tar gzip; do '
               'command -v "$tool" >/dev/null || { echo "missing $tool" >&2; exit 1; }; done; '
+              'gpg2 --version >/dev/null; '
               'test -s /etc/ssl/certs/ca-certificates.crt; '
               'python3 -c "import sys; assert sys.version_info >= (3, 8)"; '
               'setpriv --help | grep -q -- --ambient-caps')

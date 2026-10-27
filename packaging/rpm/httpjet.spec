@@ -1,5 +1,5 @@
 %{!?httpjet_version:%global httpjet_version 0.1.10}
-%{!?httpjet_revision:%global httpjet_revision 7}
+%{!?httpjet_revision:%global httpjet_revision 8}
 Name: httpjet
 Version: %{httpjet_version}
 Release: %{httpjet_revision}
@@ -91,6 +91,9 @@ rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 
 %changelog
+* Tue Oct 27 2026 httpjet contributors - 0.1.10-8
+- Correct service lifecycle and distribution qualification setup.
+
 * Tue Oct 27 2026 httpjet contributors - 0.1.10-7
 - Supply the authenticated source timestamp to first-release package fixtures.
 

@@ -220,6 +220,35 @@ class MaintainerLifecycle(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.path("/var/www/httpjet").exists())
 
+    def test_remove_stops_service_before_package_helper(self):
+        result = self.run_hook("prerm", "remove")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.state / "service.log").read_text(), "stop httpjet.service\n")
+        self.assertTrue((self.state / "helper-reached").exists())
+
+    def test_upgrade_never_stops_service_before_config_validation(self):
+        for action in ("upgrade", "failed-upgrade", "deconfigure"):
+            with self.subTest(action=action):
+                result = self.run_hook("prerm", action, "0.1.10-7")
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / "service.log").exists())
+
+    def test_offline_root_and_non_systemd_removal_never_touch_host_service(self):
+        self.env["DPKG_ROOT"] = str(self.root)
+        result = self.run_hook("prerm", "remove")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.env["DPKG_ROOT"] = ""
+        self.path("/run/systemd/system").rmdir()
+        result = self.run_hook("prerm", "remove")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.state / "service.log").exists())
+
+    def test_failed_stop_aborts_removal_before_helper(self):
+        self.command("deb-systemd-invoke", "exit 9\n")
+        result = self.run_hook("prerm", "remove")
+        self.assertEqual(result.returncode, 9)
+        self.assertFalse((self.state / "helper-reached").exists())
+
     def test_service_account_validation_drops_the_root_environment(self):
         self.account()
         self.env["HTTPJET_TEST_SECRET"] = "root-only-fixture-secret"

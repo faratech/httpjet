@@ -60,4 +60,17 @@ class PreparedSlackwareImage(unittest.TestCase):
         build.assert_not_called()
 
 
+class GuixImageBootstrap(unittest.TestCase):
+    def test_both_architecture_locks_bind_verified_bootstrap(self):
+        import guix_bootstrap
+        root=Path(__file__).resolve().parents[2]
+        for arch,system in [('amd64','x86_64-linux'),('arm64','aarch64-linux')]:
+            with self.subTest(architecture=arch):
+                lock=resolver.special({'executor':'guix-image','architecture':arch},root)
+                self.assertEqual(lock['bootstrap'],guix_bootstrap.descriptor(arch))
+                self.assertEqual(lock['bootstrap']['version'],'1.5.0')
+                self.assertEqual(lock['bootstrap']['system'],system)
+                self.assertEqual(lock['definition']['system'],system)
+
+
 if __name__ == '__main__': unittest.main()

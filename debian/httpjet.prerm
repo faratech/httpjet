@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if [ "$1" = remove ] && [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    # --no-start also suppresses debhelper's stop hook. Stop only on removal;
+    # upgrades retain the old process until postinst validates the new config.
+    deb-systemd-invoke stop httpjet.service
+fi
+
+#DEBHELPER#

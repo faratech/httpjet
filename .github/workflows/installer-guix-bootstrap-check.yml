@@ -1,0 +1,60 @@
+name: Check authenticated native Guix builder bootstrap
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Stage pinned bootstrap source and approved public key
+        run: |
+          mkdir -p .ci-guix/inputs .ci-guix/output
+          python3 -B - <<'PY'
+          import pathlib,sys
+          sys.path.insert(0,'packaging/release')
+          import guix_bootstrap
+          guix_bootstrap.stage(pathlib.Path('.ci-guix/inputs'))
+          PY
+      - name: Verify and activate Guix only inside the disposable native builder
+        env:
+          HTTPJET_TEST_ARCH: ${{ matrix.architecture }}
+        run: |
+          docker run --rm --platform "linux/$HTTPJET_TEST_ARCH" --cpus 2 --memory 2g --pids-limit 128 \
+            --security-opt no-new-privileges \
+            --volume "$GITHUB_WORKSPACE/.ci-guix/inputs:/inputs:ro" \
+            --volume "$GITHUB_WORKSPACE/.ci-guix/output:/work" \
+            --env "HTTPJET_TEST_ARCH=$HTTPJET_TEST_ARCH" --entrypoint /bin/bash \
+            rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 -c '
+          set -euo pipefail
+          python3 -B /inputs/guix_bootstrap.py --inside-builder --architecture "$HTTPJET_TEST_ARCH" --receipt /work/bootstrap.json
+          export GUIX_PROFILE=/var/guix/profiles/per-user/root/current-guix
+          source "$GUIX_PROFILE/etc/profile"
+          guix-daemon --version
+          guix-daemon --disable-chroot --build-users-group= >/work/daemon.log 2>&1 &
+          httpjet_daemon_pid=$!
+          trap '\''kill "$httpjet_daemon_pid" 2>/dev/null || true'\'' EXIT
+          for httpjet_attempt in $(seq 1 30); do test -S /var/guix/daemon-socket/socket && break; sleep 1; done
+          test -S /var/guix/daemon-socket/socket
+          for httpjet_cache in ci.guix.gnu.org bordeaux.guix.gnu.org; do
+            guix archive --authorize < "$GUIX_PROFILE/share/guix/$httpjet_cache.pub"
+          done
+          '
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: guix-bootstrap-${{ matrix.architecture }}
+          path: .ci-guix/output/
+          if-no-files-found: warn

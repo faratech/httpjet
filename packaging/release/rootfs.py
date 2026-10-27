@@ -61,7 +61,7 @@ def metadata(path, member):
         os.utime(path, (member.mtime, member.mtime), follow_symlinks=False)
 
 
-def extract_rootfs(archive, root, prefix='', compression=None):
+def extract_rootfs(archive, root, prefix='', compression=None, ignored_members=()):
     root = Path(root)
     root.mkdir(mode=0o700)
     links = []
@@ -74,6 +74,7 @@ def extract_rootfs(archive, root, prefix='', compression=None):
     else:
         opened = tarfile.open(archive, mode='r|*')
     count = 0
+    ignored = set()
     try:
         with opened:
             for member in opened:
@@ -81,6 +82,14 @@ def extract_rootfs(archive, root, prefix='', compression=None):
                 total += member.size
                 if count > 500000 or total > 8 * 1024**3:
                     raise ValueError('rootfs exceeds qualification extraction limits')
+                # Arch's official bootstrap includes two top-level informational
+                # files alongside the root directory. Never extract them, and
+                # continue to reject every other member outside the prefix.
+                if member.name in ignored_members:
+                    if not member.isfile() or member.name in ignored:
+                        raise ValueError('invalid rootfs archive metadata member')
+                    ignored.add(member.name)
+                    continue
                 relative = archive_name(member.name, prefix)
                 if relative == Path('.'):
                     if member.isdir():
@@ -207,8 +216,9 @@ def build(row, lock, work, public_key, artifact_dir=None, artifact_manifest=None
     kernel = locked_blob(lock['kernel'], work, 'kernel', artifact_dir, artifact_manifest)
     initrd = locked_blob(lock['initrd'], work, 'initrd', artifact_dir, artifact_manifest)
     root = work / 'root'
-    extracted = extract_rootfs(archive, root, lock['rootfs'].get('strip_prefix', ''),
-                              lock['rootfs'].get('format'))
+    prefix = lock['rootfs'].get('strip_prefix', '')
+    ignored = ('pkglist.x86_64.txt', 'version') if recipe == 'arch' and prefix == 'root.x86_64' else ()
+    extracted = extract_rootfs(archive, root, prefix, lock['rootfs'].get('format'), ignored)
     seed_slackware_fstab(root, recipe)
     inject(root, 'httpjet-qualification-init', Path(__file__).with_name('rootfs-init.sh').read_bytes(), 0o700)
     inject(root, 'httpjet-qualification-recipe', (recipe + '\n').encode(), 0o600)
