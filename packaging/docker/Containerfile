@@ -1,0 +1,20 @@
+# The base is the architecture-specific OCI carrier verified against the signed release manifest.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN apk add --no-cache openssl \
+ && mkdir -p /var/lib/httpjet /var/log/httpjet /run/httpjet \
+ && chown 10001:10001 /var/lib/httpjet /var/log/httpjet /run/httpjet
+COPY packaging/docker/entrypoint.sh /usr/local/bin/httpjet-entrypoint
+RUN sed -i 's|/etc/httpjet/tls/|/var/lib/httpjet/tls/|g' /etc/httpjet/conf/httpd_config.xml \
+ && chmod 0755 /usr/local/bin/httpjet-entrypoint
+LABEL org.opencontainers.image.source="https://github.com/faratech/httpjet" \
+      org.opencontainers.image.licenses="GPL-3.0-only" \
+      org.opencontainers.image.title="httpjet"
+USER 10001:10001
+WORKDIR /var/lib/httpjet
+VOLUME ["/var/lib/httpjet"]
+EXPOSE 8080/tcp 8443/tcp
+HEALTHCHECK --interval=15s --timeout=3s --start-period=10s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1
+ENTRYPOINT ["/usr/local/bin/httpjet-entrypoint"]
+CMD ["--root", "/etc/httpjet", "serve", "--http-addr", "0.0.0.0:8080", "--https-addr", "0.0.0.0:8443", "--metrics-addr=", "--no-php", "--no-multishot-accept", "--ready-file", "/run/httpjet/ready"]

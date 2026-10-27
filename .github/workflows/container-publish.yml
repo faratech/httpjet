@@ -1,0 +1,193 @@
+name: Publish Docker image
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Completed signed-candidate release run
+        required: true
+        type: string
+  workflow_run:
+    workflows: ['Publish signed installer and packages']
+    types: [completed]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: httpjet-container-publish
+  cancel-in-progress: false
+jobs:
+  candidate:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      run_id: ${{ steps.identify.outputs.run_id }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: github.event_name == 'workflow_run'
+        with:
+          name: published-candidate-run
+          path: published
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - id: identify
+        env:
+          REQUESTED_RUN: ${{ inputs.candidate_run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_run ]; then run_id=$(cat published/published-candidate-run.txt); else run_id=$REQUESTED_RUN; fi
+          case "$run_id" in ''|*[!0-9]*) echo 'Invalid candidate run ID' >&2; exit 1;; esac
+          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+  build:
+    needs: candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    environment: httpjet-stable
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-candidate
+          path: candidate-input
+          run-id: ${{ needs.candidate.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify the published release and its native image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          CANDIDATE_RUN: ${{ needs.candidate.outputs.run_id }}
+          ARCH: ${{ matrix.arch }}
+        run: python3 packaging/docker/verify-release.py candidate-input "$ARCH" "$CANDIDATE_RUN" verified.json
+      - name: Build and check the container
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          archive=$(python3 -c 'import json; print(json.load(open("verified.json"))["archive"])')
+          base=$(python3 -c 'import json; print(json.load(open("verified.json"))["image_id"])')
+          docker load --input "$archive"
+          test "$(docker image inspect "$base" --format '{{.Id}}')" = "$base"
+          context="$RUNNER_TEMP/httpjet-container-context"
+          mkdir -p "$context/packaging/docker"
+          cp packaging/docker/Containerfile packaging/docker/entrypoint.sh "$context/packaging/docker/"
+          docker build --build-arg "BASE_IMAGE=$base" --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "httpjet-container:$ARCH" --file "$context/packaging/docker/Containerfile" "$context"
+          container='httpjet-container-smoke'
+          trap 'docker rm -fv "$container" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$container" --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --security-opt "seccomp=$GITHUB_WORKSPACE/packaging/oci/seccomp-httpjet.json" \
+            --tmpfs '/run/httpjet:rw,noexec,nosuid,nodev,size=16m,uid=10001,gid=10001,mode=0750' \
+            -p 127.0.0.1::8080/tcp -p 127.0.0.1::8443/tcp "httpjet-container:$ARCH"
+          docker exec "$container" cat /var/www/httpjet/index.html > expected.html || { docker logs "$container"; exit 1; }
+          http_port=$(docker port "$container" 8080/tcp | sed 's/.*://')
+          https_port=$(docker port "$container" 8443/tcp | sed 's/.*://')
+          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 --retry-max-time 40 \
+            "http://127.0.0.1:$http_port/" -o http.html || { docker logs "$container"; exit 1; }
+          curl --fail --silent --show-error --insecure --retry 5 --retry-connrefused --retry-delay 1 \
+            "https://127.0.0.1:$https_port/" -o https.html || { docker logs "$container"; exit 1; }
+          cmp expected.html http.html
+          cmp expected.html https.html
+      - name: Publish architecture image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          tag="ghcr.io/faratech/httpjet:build-$GITHUB_RUN_ID-$ARCH"
+          docker tag "httpjet-container:$ARCH" "$tag"
+          docker push "$tag" | tee push.log
+          digest=$(sed -n 's/.*digest: \(sha256:[0-9a-f]*\).*/\1/p' push.log | tail -1)
+          printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          python3 - "$tag" "$digest" "$ARCH" <<'PY'
+          import json,sys
+          data=json.load(open('verified.json'))
+          data.update(tag=sys.argv[1],digest=sys.argv[2],architecture=sys.argv[3])
+          with open('image.json','w') as out:json.dump(data,out)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: container-${{ matrix.arch }}
+          path: image.json
+          if-no-files-found: error
+          retention-days: 30
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: httpjet-stable
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: container-amd64
+          path: amd64
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: container-arm64
+          path: arm64
+      - name: Publish the multi-architecture image
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib,re,sys,tempfile
+          sys.path.insert(0,'packaging/release')
+          import release,support,universal
+          images=[json.load(open('amd64/image.json')),json.load(open('arm64/image.json'))]
+          if {image['architecture'] for image in images}!={'amd64','arm64'} or any(image['release_id']!=images[0]['release_id'] or image['manifest_sha256']!=images[0]['manifest_sha256'] for image in images):
+              raise ValueError('architecture images differ in release identity')
+          with tempfile.TemporaryDirectory() as td:
+              root=pathlib.Path(td);key=root/'key.asc';key.write_text(os.environ['ARCHIVE_KEY'])
+              release.validate_key(key,os.environ['ARCHIVE_FINGERPRINT'])
+              pointer=root/'stable.json';release.download('https://httpjet-packages.pages.dev/releases/stable.json',pointer)
+              release.download('https://httpjet-packages.pages.dev/releases/stable.json.asc',root/'stable.json.asc')
+              universal.verify_signed(pointer,root/'stable.json.asc',key)
+              value=release.load(pointer);support.validate_window(value)
+              if value['manifest_sha256']!=images[0]['manifest_sha256'] or value['release_id']!=images[0]['release_id'] or value['archive_fingerprint']!=os.environ['ARCHIVE_FINGERPRINT']:
+                  raise ValueError('stable release changed before container promotion')
+          for image in images:
+              if not re.fullmatch(r'sha256:[0-9a-f]{64}',image['digest']):raise ValueError('invalid image digest')
+          with open(os.environ['GITHUB_ENV'],'a') as out:
+              out.write('HTTPJET_CONTAINER_VERSION='+images[0]['release_id']+'\n')
+              out.write('HTTPJET_IMAGE_AMD64=ghcr.io/faratech/httpjet@'+images[0]['digest']+'\n')
+              out.write('HTTPJET_IMAGE_ARM64=ghcr.io/faratech/httpjet@'+images[1]['digest']+'\n')
+          PY
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools create --tag "ghcr.io/faratech/httpjet:$HTTPJET_CONTAINER_VERSION" \
+            --tag ghcr.io/faratech/httpjet:latest "$HTTPJET_IMAGE_AMD64" "$HTTPJET_IMAGE_ARM64"
+          docker buildx imagetools inspect "ghcr.io/faratech/httpjet:$HTTPJET_CONTAINER_VERSION" | tee manifest.txt
+          digest=$(awk '$1 == "Digest:" {print $2; exit}' manifest.txt)
+          printf '%s\n' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$'
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - name: Attest the published image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/faratech/httpjet
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true

@@ -117,6 +117,26 @@ NixOS and Guix use the [NixOS module](packaging/nix/README.md) and
 [Guix service](packaging/guix/README.md); immutable systems such as CoreOS use
 the [container route](packaging/release/images/README.md).
 
+### Docker and WSL 2
+
+Run the published Linux container on Docker Engine or Docker Desktop with the
+WSL 2 backend. Docker's default seccomp profile blocks io_uring, so download
+both the Compose file and the supplied profile into a new directory:
+
+```bash
+curl -fsSLo compose.yaml https://raw.githubusercontent.com/faratech/httpjet/main/packaging/docker/compose.yaml
+curl -fsSLo seccomp-httpjet.json https://raw.githubusercontent.com/faratech/httpjet/main/packaging/oci/seccomp-httpjet.json
+docker compose up -d
+```
+
+Open `http://localhost:8080/` or `https://localhost:8443/`. The container
+creates a self-signed certificate, so browsers warn until you configure a
+trusted one. The certificate and logs are kept in named volumes. The host kernel
+and container security policy must allow io_uring; there is no epoll fallback.
+
+For PowerShell commands, Docker Desktop settings, a direct WSL 2 installation,
+custom content and troubleshooting, see the [Docker and WSL 2 guide](packaging/docker/README.md).
+
 ### What the installer does
 
 1. Checks the architecture, package manager and init system. It refuses an

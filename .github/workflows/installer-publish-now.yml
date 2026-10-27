@@ -214,6 +214,16 @@ jobs:
               subprocess.run(['gh', 'release', 'edit', os.environ['HTTPJET_RELEASE_TAG'], '--repo',
                               os.environ['GITHUB_REPOSITORY'], '--latest'], check=True)
           PY
+      - name: Record the published candidate for container builds
+        env:
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id || github.event.workflow_run.id }}
+        run: printf '%s\n' "$CANDIDATE_RUN" > published-candidate-run.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: published-candidate-run
+          path: published-candidate-run.txt
+          if-no-files-found: error
+          retention-days: 30
       - name: Remove ephemeral signing material
         if: always()
         run: |
