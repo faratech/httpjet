@@ -45,7 +45,8 @@ jobs:
           /bin/docker pull ghcr.io/faratech/httpjet:latest >/dev/null
           /bin/docker run --rm --network none --security-opt "seccomp=$profile" --entrypoint /usr/libexec/httpjet/io-uring-probe ghcr.io/faratech/httpjet:latest
           '@
-          ($script -replace "`r", "") | & $env:WSLC_EXE system session run /bin/sh
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($script -replace "`r", "") + "`n"))
+          & $env:WSLC_EXE system session run /bin/sh -c "echo $encoded | base64 -d | /bin/sh"
           if ($LASTEXITCODE -ne 0) { throw 'Per-container io_uring profile did not work in this WSL Containers session' }
       - name: Check io_uring as the image's unprivileged user
         shell: pwsh
