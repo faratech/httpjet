@@ -32,6 +32,21 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & $env:WSLC_EXE system session run /bin/sh -c 'id; echo session-tools:; command -v docker || true; command -v curl || true; echo daemon-socket:; ls -l /var/run/docker.sock; echo daemon-config:; cat /etc/docker/daemon.json'
           if ($LASTEXITCODE -ne 0) { throw 'WSL Containers session inspection failed' }
+      - name: Check per-container io_uring profile inside the disposable session
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = @'
+          set -eu
+          profile="/tmp/httpjet-seccomp-$$.json"
+          trap 'rm -f "$profile"' EXIT
+          /bin/curl -fsSL https://raw.githubusercontent.com/faratech/httpjet/6d5b2f8d4326e0174e49831b638d4b9f7713770e/packaging/oci/seccomp-httpjet.json -o "$profile"
+          printf '%s  %s\n' 68a3877444d9e17a42e1faaf1e93343231ea97ca3b7b145865c1ea219c50aca0 "$profile" | sha256sum -c -
+          /bin/docker pull ghcr.io/faratech/httpjet:latest >/dev/null
+          /bin/docker run --rm --network none --security-opt "seccomp=$profile" --entrypoint /usr/libexec/httpjet/io-uring-probe ghcr.io/faratech/httpjet:latest
+          '@
+          $script | & $env:WSLC_EXE system session run /bin/sh
+          if ($LASTEXITCODE -ne 0) { throw 'Per-container io_uring profile did not work in this WSL Containers session' }
       - name: Check io_uring as the image's unprivileged user
         shell: pwsh
         run: |
