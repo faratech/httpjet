@@ -1,0 +1,79 @@
+name: Diagnose WSL Containers networking
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - name: Locate WSL Containers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wslc = Join-Path $env:ProgramFiles 'WSL\wslc.exe'
+          if (-not (Test-Path $wslc)) {
+            & wsl.exe --update
+            if ($LASTEXITCODE -ne 0) { throw 'WSL update failed' }
+          }
+          if (-not (Test-Path $wslc)) { throw 'wslc.exe is not available' }
+          & $wslc version
+          if ($LASTEXITCODE -ne 0) { throw 'wslc version failed' }
+          "WSLC_EXE=$wslc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Diagnose server and forwarding in an isolated WSL session
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $direct = "httpjet-direct-$env:GITHUB_RUN_ID"
+          $relay = "httpjet-relay-$env:GITHUB_RUN_ID"
+          try {
+            # A wslc-managed, ordinary web server verifies the Windows port relay
+            # independently from httpjet and does not need io_uring.
+            & $env:WSLC_EXE run -d --name $relay -p '127.0.0.1:28081:8080' --entrypoint /bin/busybox ghcr.io/faratech/httpjet:0.1.10-11 httpd -f -p 8080 -h /var/www/httpjet
+            if ($LASTEXITCODE -ne 0) { throw 'Could not start WSL Containers relay control' }
+            $script = @'
+          set -eu
+          container=$1
+          profile="/tmp/httpjet-seccomp-$$.json"
+          trap 'rm -f "$profile"' EXIT
+          /bin/curl -fsSL https://raw.githubusercontent.com/faratech/httpjet/6d5b2f8d4326e0174e49831b638d4b9f7713770e/packaging/oci/seccomp-httpjet.json -o "$profile"
+          printf '%s  %s\n' 68a3877444d9e17a42e1faaf1e93343231ea97ca3b7b145865c1ea219c50aca0 "$profile" | sha256sum -c -
+          /bin/docker run -d --name "$container" --security-opt "seccomp=$profile" -p 127.0.0.1:38080:8080 -p 127.0.0.1:38443:8443 ghcr.io/faratech/httpjet:0.1.10-11 >/dev/null
+          echo '--- docker port mappings ---'
+          /bin/docker port "$container"
+          container_ip=$(/bin/docker inspect --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container")
+          echo "container IPv4: $container_ip"
+          for attempt in $(seq 1 30); do
+            if /bin/docker exec "$container" /bin/sh -c 'wget -q -O - http://127.0.0.1:8080/ | grep -q "Welcome to httpjet"'; then break; fi
+            if [ "$attempt" -eq 30 ]; then echo 'container HTTP: FAILED'; /bin/docker logs "$container"; exit 1; fi
+            sleep 1
+          done
+          echo 'container HTTP: welcome page received'
+          if /bin/docker exec "$container" /bin/sh -c 'wget -q --no-check-certificate -O - https://127.0.0.1:8443/ | grep -q "Welcome to httpjet"'; then
+            echo 'container HTTPS: welcome page received'
+          else
+            echo 'container HTTPS: FAILED'; /bin/docker logs "$container"; exit 1
+          fi
+          for url in http://127.0.0.1:38080/ https://127.0.0.1:38443/ "http://$container_ip:8080/"; do
+            echo "session VM request: $url"
+            /bin/curl --noproxy '*' --insecure --max-time 3 -sS -o /dev/null -w 'HTTP %{http_code}; curl %{exitcode}\n' "$url" || true
+          done
+          '@
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($script -replace "`r", "") + "`n"))
+            & $env:WSLC_EXE system session run /bin/sh -c "echo $encoded | base64 -d | /bin/sh -s -- $direct"
+            if ($LASTEXITCODE -ne 0) { throw 'Container-local HTTP/HTTPS check failed' }
+            foreach ($entry in @(@('wslc relay control','http://127.0.0.1:28081/'), @('direct Docker port','http://127.0.0.1:38080/'))) {
+              $ok = $false
+              for ($i = 0; $i -lt 15; $i++) {
+                $body = & curl.exe --noproxy '*' --silent --fail --max-time 3 $entry[1]
+                if ($LASTEXITCODE -eq 0 -and ($body -join "`n") -match 'Welcome to httpjet') { $ok = $true; break }
+                Start-Sleep -Seconds 1
+              }
+              Write-Host ("Windows " + $entry[0] + ': ' + $(if ($ok) {'welcome page received'} else {'not reachable'}))
+              if ($entry[0] -eq 'wslc relay control' -and -not $ok) { throw 'WSL Containers relay control failed' }
+            }
+          } finally {
+            & $env:WSLC_EXE container rm --force $relay
+            & $env:WSLC_EXE system session run /bin/docker rm --force $direct
+          }
