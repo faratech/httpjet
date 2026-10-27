@@ -1,0 +1,52 @@
+name: Check WSL Containers
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  wslc:
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - name: Install or update WSL Containers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & wsl.exe --version
+          $wslc = Join-Path $env:ProgramFiles 'WSL\wslc.exe'
+          if (-not (Test-Path $wslc)) {
+            & wsl.exe --update
+            if ($LASTEXITCODE -ne 0) { throw 'WSL update failed' }
+          }
+          if (-not (Test-Path $wslc)) {
+            $command = Get-Command wslc.exe -ErrorAction SilentlyContinue
+            if ($null -eq $command) { throw 'wslc.exe is unavailable after updating WSL' }
+            $wslc = $command.Source
+          }
+          & $wslc version
+          if ($LASTEXITCODE -ne 0) { throw 'wslc version failed' }
+          "WSLC_EXE=$wslc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Run the public image with native WSL Containers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "httpjet-ci-$env:GITHUB_RUN_ID"
+          try {
+            & $env:WSLC_EXE run -d --name $name -p '127.0.0.1:28080:8080' -p '127.0.0.1:28443:8443' ghcr.io/faratech/httpjet:latest
+            if ($LASTEXITCODE -ne 0) { throw 'wslc could not start the image' }
+            foreach ($url in @('http://127.0.0.1:28080/', 'https://127.0.0.1:28443/')) {
+              $ok = $false
+              for ($i = 0; $i -lt 30; $i++) {
+                $body = & curl.exe --silent --insecure --fail --max-time 3 $url
+                if ($LASTEXITCODE -eq 0 -and ($body -join "`n") -match 'Welcome to httpjet') { $ok = $true; break }
+                Start-Sleep -Seconds 1
+              }
+              if (-not $ok) { throw "Welcome page unavailable at $url" }
+              Write-Host "$url returned the welcome page"
+            }
+          } catch {
+            & $env:WSLC_EXE container logs $name
+            throw
+          } finally {
+            & $env:WSLC_EXE container rm --force $name
+          }
