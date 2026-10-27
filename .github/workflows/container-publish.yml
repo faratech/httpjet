@@ -97,12 +97,18 @@ jobs:
           docker exec "$container" cat /var/www/httpjet/index.html > expected.html || { docker logs "$container"; exit 1; }
           http_port=$(docker port "$container" 8080/tcp | sed 's/.*://')
           https_port=$(docker port "$container" 8443/tcp | sed 's/.*://')
-          curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 --retry-max-time 40 \
-            "http://127.0.0.1:$http_port/" -o http.html || { docker logs "$container"; exit 1; }
-          curl --fail --silent --show-error --insecure --retry 5 --retry-connrefused --retry-delay 1 \
-            "https://127.0.0.1:$https_port/" -o https.html || { docker logs "$container"; exit 1; }
-          cmp expected.html http.html
-          cmp expected.html https.html
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --max-time 2 "http://127.0.0.1:$http_port/" -o http.html \
+                && cmp -s expected.html http.html; then break; fi
+            if [ "$attempt" -eq 30 ]; then docker logs "$container"; exit 1; fi
+            sleep 1
+          done
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --insecure --max-time 2 "https://127.0.0.1:$https_port/" -o https.html \
+                && cmp -s expected.html https.html; then break; fi
+            if [ "$attempt" -eq 30 ]; then docker logs "$container"; exit 1; fi
+            sleep 1
+          done
       - name: Publish architecture image
         env:
           GH_TOKEN: ${{ github.token }}
