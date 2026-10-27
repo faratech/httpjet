@@ -1,5 +1,5 @@
 %{!?httpjet_version:%global httpjet_version 0.1.10}
-%{!?httpjet_revision:%global httpjet_revision 10}
+%{!?httpjet_revision:%global httpjet_revision 11}
 Name: httpjet
 Version: %{httpjet_version}
 Release: %{httpjet_revision}
@@ -91,6 +91,9 @@ rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 
 %changelog
+* Tue Oct 27 2026 httpjet contributors - 0.1.10-11
+- Allow bounded ARM guest setup time during release qualification.
+
 * Tue Oct 27 2026 httpjet contributors - 0.1.10-10
 - Initialize isolated ARM test guest clocks and confine Guix builder setup.
 

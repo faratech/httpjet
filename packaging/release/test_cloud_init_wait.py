@@ -25,7 +25,24 @@ class CloudInitWait(unittest.TestCase):
             return subprocess.CompletedProcess(['ssh-status'],255 if len(calls)==1 else 0,stdout=None)
         with patch.object(matrix_vm,'ssh',side_effect=remote),patch.object(matrix_vm.time,'monotonic',side_effect=lambda:clock[0]),patch.object(matrix_vm.time,'sleep',side_effect=lambda value:clock.__setitem__(0,clock[0]+value)):
             matrix_vm.wait_cloud_init(None,{'ssh':22},None,io.BytesIO(),5000,lambda:True,architecture='arm64')
-        self.assertEqual(calls,[1800,1698])
+        self.assertEqual(calls,[3600,3498])
+    def test_arm_status_after_old_limit_is_accepted_only_on_success(self):
+        for status in (0,2):
+            clock=[0.0]
+            def remote(*args,**options):
+                if options['timeout']<2000:raise subprocess.TimeoutExpired('status',options['timeout'])
+                clock[0]+=2000
+                return subprocess.CompletedProcess(['ssh-status'],status,stdout=None)
+            with self.subTest(status=status),patch.object(matrix_vm,'ssh',side_effect=remote) as query,patch.object(matrix_vm.time,'monotonic',side_effect=lambda:clock[0]),patch.object(matrix_vm.time,'sleep') as sleep:
+                if status==0:
+                    matrix_vm.wait_cloud_init(None,{'ssh':22},None,io.BytesIO(),5000,lambda:True,architecture='arm64')
+                else:
+                    with self.assertRaises(subprocess.CalledProcessError) as caught:
+                        matrix_vm.wait_cloud_init(None,{'ssh':22},None,io.BytesIO(),5000,lambda:True,architecture='arm64')
+                    self.assertEqual(caught.exception.returncode,2)
+                self.assertEqual(query.call_count,1);sleep.assert_not_called()
+                self.assertEqual(clock[0],2000)
+
     def test_arm_budget_is_clipped_by_existing_row_deadline(self):
         with patch.object(matrix_vm,'ssh',return_value=subprocess.CompletedProcess(['ssh-status'],0,stdout=None)) as remote,patch.object(matrix_vm.time,'monotonic',return_value=100):
             matrix_vm.wait_cloud_init(None,{'ssh':22},None,io.BytesIO(),400,lambda:True,architecture='arm64')
@@ -35,7 +52,7 @@ class CloudInitWait(unittest.TestCase):
             with self.assertRaises(subprocess.CalledProcessError) as caught:
                 matrix_vm.wait_cloud_init(None,{'ssh':22},None,io.BytesIO(),matrix_vm.time.monotonic()+2000,lambda:True,architecture='arm64')
         self.assertEqual(caught.exception.returncode,2);self.assertEqual(remote.call_count,1);sleep.assert_not_called()
-        with patch.object(matrix_vm,'ssh',side_effect=subprocess.TimeoutExpired('status',1800)) as remote,patch.object(matrix_vm.time,'sleep') as sleep:
+        with patch.object(matrix_vm,'ssh',side_effect=subprocess.TimeoutExpired('status',3600)) as remote,patch.object(matrix_vm.time,'sleep') as sleep:
             with self.assertRaises(subprocess.TimeoutExpired):
                 matrix_vm.wait_cloud_init(None,{'ssh':22},None,io.BytesIO(),matrix_vm.time.monotonic()+2000,lambda:True,architecture='arm64')
         self.assertEqual(remote.call_count,1);sleep.assert_not_called()

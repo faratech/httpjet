@@ -29,10 +29,10 @@ def ssh(key,number,known,args,*,output=None,timeout=1800,check=True,cwd=None):
 def wait_cloud_init(key,ports,known,transcript,deadline,alive,*,architecture='amd64'):
     # Only this idempotent status query may retry a transport close. A cloud-init
     # failure (including status 2) is preserved, under one fixed wait budget.
-    # Tag8 Ubuntu24 ARM was still progressing through apt indexes at the
-    # 600s cutoff under TCG. Allow bounded ARM boot/package headroom without
-    # resetting this budget or extending the existing overall row deadline.
-    budget=1800 if architecture=='arm64' else 600
+    # Tag9 Ubuntu24 ARM reached CA upgrade/rehash hooks at the 1800s
+    # cutoff under TCG. Preserve that maintenance and allow bounded headroom,
+    # without resetting this budget or extending the overall row deadline.
+    budget=3600 if architecture=='arm64' else 600
     deadline=min(deadline,time.monotonic()+budget)
     while time.monotonic()<deadline:
         if not alive():raise RuntimeError('cloud-init wait: VM exited')
