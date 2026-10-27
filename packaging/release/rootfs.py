@@ -15,6 +15,7 @@ import shutil
 import stat
 import subprocess
 import tarfile
+import time
 
 from release import download, sha, write_json
 
@@ -188,6 +189,15 @@ def inject(root, relative, content, mode):
     path.chmod(mode)
 
 
+def seed_controller_clock(root):
+    # This is current controller UTC, never the release's reproducibility epoch.
+    epoch=int(time.time())
+    if not 1577836800<=epoch<=4102444800:
+        raise ValueError('controller UTC is outside the qualification clock range')
+    inject(root,'httpjet-qualification-controller-epoch',(str(epoch)+'\n').encode(),0o600)
+    return epoch
+
+
 def seed_slackware_fstab(root, recipe):
     if recipe != 'slackware-sysv':
         return
@@ -220,6 +230,7 @@ def build(row, lock, work, public_key, artifact_dir=None, artifact_manifest=None
     ignored = ('pkglist.x86_64.txt', 'version') if recipe == 'arch' and prefix == 'root.x86_64' else ()
     extracted = extract_rootfs(archive, root, prefix, lock['rootfs'].get('format'), ignored)
     seed_slackware_fstab(root, recipe)
+    controller_epoch=seed_controller_clock(root)
     inject(root, 'httpjet-qualification-init', Path(__file__).with_name('rootfs-init.sh').read_bytes(), 0o700)
     inject(root, 'httpjet-qualification-recipe', (recipe + '\n').encode(), 0o600)
     inject(root, 'httpjet-qualification-target-init', (target_init + '\n').encode(), 0o600)
@@ -238,7 +249,7 @@ def build(row, lock, work, public_key, artifact_dir=None, artifact_manifest=None
               'bootstrap_sha256': sha(Path(__file__).with_name('rootfs-init.sh')),
               'builder_sha256': sha(Path(__file__)),
               'ssh_public_sha256': hashlib.sha256((public_key + '\n').encode()).hexdigest(),
-              'recipe': recipe, **extracted}
+              'recipe': recipe, 'controller_utc_epoch':controller_epoch, **extracted}
     write_json(work / 'rootfs-evidence.json', result)
     return result
 

@@ -1,3 +1,9 @@
+httpjet (0.1.10-10) stable; urgency=medium
+
+  * Initialize isolated ARM test guest clocks and confine Guix builder setup.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Tue, 27 Oct 2026 00:00:00 +0000
+
 httpjet (0.1.10-9) stable; urgency=medium
 
   * Correct runit reinstall readiness and qualification transport handling.

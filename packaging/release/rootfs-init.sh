@@ -31,6 +31,26 @@ exec_target_init() {
     fi
     exec "$target_init"
 }
+initialize_guest_clock() {
+    clock_seed=$(cat "$1")
+    case "$clock_seed" in
+        ''|*[!0-9]*) printf 'Invalid controller UTC epoch\n' >&2; return 1 ;;
+    esac
+    [ "${#clock_seed}" -eq 10 ] && [ "$clock_seed" -ge 1577836800 ] && [ "$clock_seed" -le 4102444800 ] \
+        || { printf 'Controller UTC epoch outside qualification range\n' >&2; return 1; }
+    clock_before=$(date -u +%s)
+    # Direct ARM kernel boot may reach PID 1 before an RTC/NTP source exists.
+    # Correct only a clearly uninitialized clock, using root-owned image data.
+    if [ "$clock_before" -lt 1577836800 ]; then
+        date -u -s "@$clock_seed" >/dev/null
+    fi
+    clock_after=$(date -u +%s)
+    if [ "$clock_after" -lt "$((clock_seed - 300))" ] || [ "$clock_after" -gt "$((clock_seed + 7200))" ]; then
+        printf 'Guest UTC outside controller qualification window: before=%s seed=%s after=%s\n' "$clock_before" "$clock_seed" "$clock_after" >&2
+        return 1
+    fi
+    printf 'Qualification UTC: before=%s controller=%s after=%s source=controller-owned-image\n' "$clock_before" "$clock_seed" "$clock_after"
+}
 recipe=$(cat /httpjet-qualification-recipe)
 target_init=$(cat /httpjet-qualification-target-init)
 mkdir -p /proc /sys /dev /run /tmp
@@ -39,6 +59,7 @@ mount -t sysfs sysfs /sys 2>/dev/null || :
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || :
 mkdir -p /dev/shm
 chmod 1777 /tmp
+initialize_guest_clock /httpjet-qualification-controller-epoch
 ip link set lo up
 for candidate in /sys/class/net/*; do
     interface=${candidate##*/}

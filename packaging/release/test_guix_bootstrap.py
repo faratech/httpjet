@@ -1,6 +1,7 @@
 """Pinned Guix bootstrap contracts; no host store is installed by these tests."""
 import hashlib
 import io
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -116,6 +117,19 @@ class GuixBootstrap(unittest.TestCase):
         self.assertLess(script.index('guix archive --authorize'), script.index('guix time-machine'))
         self.assertIn('guix time-machine -C /inputs/definitions/channels.scm', script)
         self.assertIn('$GUIX_PROFILE/share/guix/$httpjet_cache.pub', script)
+
+    def test_builder_personality_exception_is_exact_and_app_profile_is_unchanged(self):
+        path = declarative.ROOT / 'packaging/oci/seccomp-httpjet.json'
+        before = bootstrap.sha(path)
+        base = json.loads(path.read_text())
+        profile = declarative.guix_builder_profile()
+        self.assertEqual(profile['defaultAction'], base['defaultAction'])
+        self.assertEqual(profile['syscalls'][:-2], base['syscalls'])
+        self.assertEqual(profile['syscalls'][-2], {'names': ['unshare'], 'action': 'SCMP_ACT_ALLOW',
+            'args': [{'index': 0, 'value': 0x10000000, 'op': 'SCMP_CMP_EQ'}]})
+        self.assertEqual(profile['syscalls'][-1], {'names': ['personality'], 'action': 'SCMP_ACT_ALLOW',
+            'args': [{'index': 0, 'value': 0x40000, 'op': 'SCMP_CMP_EQ'}]})
+        self.assertEqual(bootstrap.sha(path), before)
 
 
 if __name__ == '__main__':

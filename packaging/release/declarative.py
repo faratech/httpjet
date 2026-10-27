@@ -72,6 +72,18 @@ def guix_lock(manifest, arch, release_base):
         '  #:' + key + ' ' + json.dumps(value) + '\n' for key, value in values.items()) + ')\n'
 
 
+def guix_builder_profile():
+    profile = json.loads((ROOT / 'packaging/oci/seccomp-httpjet.json').read_text())
+    profile['syscalls'].append({'names': ['unshare'], 'action': 'SCMP_ACT_ALLOW',
+        'args': [{'index': 0, 'value': 0x10000000, 'op': 'SCMP_CMP_EQ'}]})
+    # Guix 1.5 build.cc applies PER_LINUX | ADDR_NO_RANDOMIZE to native build
+    # children for reproducibility. Keep this exact exception in the builder
+    # copy; the web container profile and the host ASLR policy stay unchanged.
+    profile['syscalls'].append({'names': ['personality'], 'action': 'SCMP_ACT_ALLOW',
+        'args': [{'index': 0, 'value': 0x40000, 'op': 'SCMP_CMP_EQ'}]})
+    return profile
+
+
 def nix_script(system, release_base, ports, previous, certificate):
     arguments = ['--no-out-link', '--option', 'sandbox', 'false', '--option', 'build-users-group', '',
                  '--option', 'max-jobs', '2', '--option', 'cores', '2', '/inputs/definitions/qualification.nix',
@@ -201,9 +213,7 @@ def run(row, lock, manifest_path, release_base, ssh_public_key, new_dir, ports,
     if row['executor'] == 'guix-image':
         # Image construction uses a user namespace for mkfs; no host policy,
         # privileged mode, mount namespace, devices or host store are granted.
-        profile = json.loads((ROOT / 'packaging/oci/seccomp-httpjet.json').read_text())
-        profile['syscalls'].append({'names': ['unshare'], 'action': 'SCMP_ACT_ALLOW',
-            'args': [{'index': 0, 'value': 0x10000000, 'op': 'SCMP_CMP_EQ'}]})
+        profile = guix_builder_profile()
         profile_path = directory / 'builder-seccomp.json'
         profile_path.write_text(json.dumps(profile))
         arguments += ['--security-opt', 'seccomp=' + str(profile_path)]
