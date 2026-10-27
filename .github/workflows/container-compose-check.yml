@@ -1,0 +1,38 @@
+name: Check published Docker Compose setup
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Publish Docker image']
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  compose:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the published Compose configuration
+        run: |
+          set -eu
+          directory="$RUNNER_TEMP/httpjet-compose-check"
+          mkdir -p "$directory"
+          cp packaging/docker/compose.yaml "$directory/compose.yaml"
+          cp packaging/oci/seccomp-httpjet.json "$directory/seccomp-httpjet.json"
+          project="httpjet-compose-$GITHUB_RUN_ID"
+          trap 'docker compose --project-name "$project" --file "$directory/compose.yaml" down --volumes >/dev/null 2>&1 || true' EXIT
+          docker compose --project-name "$project" --file "$directory/compose.yaml" config --quiet
+          docker compose --project-name "$project" --file "$directory/compose.yaml" up -d
+          docker compose --project-name "$project" --file "$directory/compose.yaml" exec -T httpjet cat /var/www/httpjet/index.html > "$directory/expected"
+          for protocol in http https; do
+            if [ "$protocol" = http ]; then url=http://127.0.0.1:8080/; else url=https://127.0.0.1:8443/; fi
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --insecure --max-time 2 "$url" -o "$directory/response" \
+                  && cmp -s "$directory/expected" "$directory/response"; then break; fi
+              if [ "$attempt" -eq 30 ]; then docker compose --project-name "$project" --file "$directory/compose.yaml" logs; exit 1; fi
+              sleep 1
+            done
+          done
