@@ -45,6 +45,36 @@ container runtime policies. The image does not change host kernel settings or
 provide an epoll fallback. Do not replace the provided seccomp profile with an
 unconfined or privileged container to bypass the error.
 
+## Microsoft WSL Containers (`wslc`)
+
+Microsoft's [WSL Containers](https://learn.microsoft.com/windows/wsl/wsl-container)
+is a separate container runtime; it does not require Docker Desktop. It can pull
+the public `ghcr.io/faratech/httpjet:latest` OCI image, but **httpjet does not
+currently start in the WSL Containers environment we tested**. On a Windows
+Server 2025 GitHub runner using `wslc` 3.0.3, the image's unprivileged
+`io_uring_setup` probe returned `EPERM`. The kernel reported
+`io_uring_disabled=0` and one seccomp filter was active. This points to a
+runtime restriction, but does not prove which component denied the call.
+[Focused diagnostic run](https://github.com/faratech/httpjet/actions/runs/40459373096).
+
+WSL Containers 3.0.3 does not expose Docker's `--security-opt seccomp=...`
+CLI option; the Docker Compose profile above therefore cannot be passed to
+`wslc` that way. httpjet requires io_uring and has no epoll fallback. Do not
+claim `wslc` compatibility until it has been verified in the target environment.
+
+To check your own WSL Containers installation from PowerShell, first ensure WSL
+is up to date (`wsl --update`, then `wslc version`). Microsoft documents WSL
+2.9.3 or later for this feature. The following command runs the image's
+unprivileged io_uring diagnostic without starting the web server:
+
+```powershell
+wslc run --rm --entrypoint /bin/sh ghcr.io/faratech/httpjet:latest -c 'exec /usr/libexec/httpjet/io-uring-probe'
+```
+
+A JSON result with `status: passed` means this probe worked; a failed result
+with `operation: setup` and `errno: 1` means the runtime or host denied setup.
+A passing probe alone does not verify HTTP, HTTPS, networking or persistence.
+
 ## Docker Desktop on Windows with WSL 2
 
 Enable Docker Desktop's WSL 2 engine and use Linux containers. When using a WSL

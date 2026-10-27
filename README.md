@@ -117,7 +117,7 @@ NixOS and Guix use the [NixOS module](packaging/nix/README.md) and
 [Guix service](packaging/guix/README.md); immutable systems such as CoreOS use
 the [container route](packaging/release/images/README.md).
 
-### Docker and WSL 2
+### Docker and Docker Desktop with WSL 2
 
 Run the published Linux container on Docker Engine or Docker Desktop with the
 WSL 2 backend. Docker's default seccomp profile blocks io_uring, so download
@@ -136,6 +136,16 @@ and container security policy must allow io_uring; there is no epoll fallback.
 
 For PowerShell commands, Docker Desktop settings, a direct WSL 2 installation,
 custom content and troubleshooting, see the [Docker and WSL 2 guide](packaging/docker/README.md).
+
+### Microsoft WSL Containers (`wslc`)
+
+Microsoft's WSL Containers runtime is separate from Docker Desktop. It can
+pull the public image, but **httpjet did not start in the WSL Containers 3.0.3
+Windows runner we tested**: its `io_uring_setup` call was denied with `EPERM`.
+The kernel reported io_uring enabled and a seccomp filter active; the exact
+denial source has not been established. The current `wslc` CLI does not expose
+Docker's custom seccomp-profile option. See the [WSL Containers diagnostics](packaging/docker/README.md#microsoft-wsl-containers-wslc)
+and [test run](https://github.com/faratech/httpjet/actions/runs/40459373096).
 
 ### What the installer does
 
