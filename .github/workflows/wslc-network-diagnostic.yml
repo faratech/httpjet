@@ -30,7 +30,7 @@ jobs:
           try {
             # A wslc-managed, ordinary web server verifies the Windows port relay
             # independently from httpjet and does not need io_uring.
-            & $env:WSLC_EXE run -d --name $relay -p '127.0.0.1:28081:8080' --entrypoint /bin/busybox ghcr.io/faratech/httpjet:0.1.10-11 httpd -f -p 8080 -h /var/www/httpjet
+            & $env:WSLC_EXE run -d --name $relay -p '127.0.0.1:28081:80' docker.io/library/nginx:alpine
             if ($LASTEXITCODE -ne 0) { throw 'Could not start WSL Containers relay control' }
             $script = @'
           set -eu
@@ -64,16 +64,16 @@ jobs:
             & $env:WSLC_EXE system session run /bin/sh -c "echo $encoded | base64 -d | /bin/sh -s -- $direct"
             if ($LASTEXITCODE -ne 0) { throw 'Container-local HTTP/HTTPS check failed' }
             Write-Host 'Checking the WSLc relay control inside its own container:'
-            & $env:WSLC_EXE exec $relay /bin/busybox wget -q -O - http://127.0.0.1:8080/
+            & $env:WSLC_EXE exec $relay /bin/busybox wget -q -O - http://127.0.0.1:80/
             $relayLocalExit = $LASTEXITCODE
             Write-Host "Relay container-local wget exit: $relayLocalExit"
             if ($relayLocalExit -ne 0) { & $env:WSLC_EXE container logs $relay }
             $relayOk = $false
-            foreach ($entry in @(@('wslc relay control','http://127.0.0.1:28081/'), @('direct Docker port','http://127.0.0.1:38080/'))) {
+            foreach ($entry in @(@('wslc relay control','http://127.0.0.1:28081/','Welcome to nginx!'), @('direct Docker port','http://127.0.0.1:38080/','Welcome to httpjet'))) {
               $ok = $false
               for ($i = 0; $i -lt 5; $i++) {
                 $body = & curl.exe --noproxy '*' --silent --fail --max-time 3 $entry[1]
-                if ($LASTEXITCODE -eq 0 -and ($body -join "`n") -match 'Welcome to httpjet') { $ok = $true; break }
+                if ($LASTEXITCODE -eq 0 -and ($body -join "`n") -match [regex]::Escape($entry[2])) { $ok = $true; break }
                 Start-Sleep -Seconds 1
               }
               Write-Host ("Windows " + $entry[0] + ': ' + $(if ($ok) {'welcome page received'} else {'not reachable'}))
