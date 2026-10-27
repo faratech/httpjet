@@ -52,13 +52,13 @@ jobs:
               if /bin/curl -fks --max-time 2 "$url" | grep -q 'Welcome to httpjet'; then ready=1; break; fi
               sleep 1
             done
-            if [ "$ready" -ne 1 ]; then /bin/docker logs "$container"; exit 1; fi
+            if [ "$ready" -ne 1 ]; then echo "Session VM mapped-port check failed: $url"; /bin/docker logs "$container"; exit 1; fi
             echo "$url returned the welcome page inside the WSL Containers session VM"
           done
           '@
           $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($script -replace "`r", "") + "`n"))
           & $env:WSLC_EXE system session run /bin/sh -c "echo $encoded | base64 -d | /bin/sh"
-          if ($LASTEXITCODE -ne 0) { throw 'Per-container io_uring profile did not work in this WSL Containers session' }
+          if ($LASTEXITCODE -ne 0) { throw 'WSL session profile or mapped-port check failed; see preceding output' }
       - name: Check io_uring as the image's unprivileged user
         shell: pwsh
         run: |

@@ -61,11 +61,15 @@ the restriction. [Comparison run](https://github.com/faratech/httpjet/actions/ru
 
 WSL Containers 3.0.3 does not expose Docker's `--security-opt seccomp=...`
 CLI option; the Docker Compose profile above therefore cannot be passed to
-`wslc` that way. An isolated internal-Docker experiment initialized httpjet's
-HTTP and HTTPS listeners with that profile, but the session-local HTTP probe did
-not return the welcome page; Windows port forwarding was not verified. Direct
+`wslc` that way. A [focused Windows-runner check](https://github.com/faratech/httpjet/actions/runs/40461743109)
+confirmed the server returned the welcome page over HTTP and HTTPS inside its
+container and HTTP over its bridge IP from the session VM. Docker's mapped
+loopback ports in that VM refused connections, and the direct Docker port timed
+out from Windows. A separate `wslc`-managed nginx control was reachable from
+Windows, so the control demonstrates that the normal `wslc` relay worked in
+that runner. It does not demonstrate a Windows-facing httpjet route. Direct
 Docker API/CLI launches do not automatically register `wslc`'s Windows port
-relay. [Server experiment](https://github.com/faratech/httpjet/actions/runs/40460619946).
+relay.
 The internal session is a low-level route, not a supported one-command `wslc`
 configuration. httpjet requires io_uring and has no epoll fallback. Do not
 claim `wslc` compatibility until the full Windows-facing path works.
