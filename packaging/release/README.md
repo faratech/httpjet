@@ -57,7 +57,7 @@ releases/X.Y.Z-N/                      redirects to immutable GitHub release ass
 pages-index.json(.asc)                 signed native history and asset hash catalog
 ```
 
-Source archives, OCI images and other large assets remain on GitHub Releases.
+The uploaded downloads are the installer, two Linux static archives and four daemon DEB/RPM packages. GitHub supplies its automatic Source code links. Signed manifests, checksums and publication notices live on Pages; custom source/OCI/provenance archives are not required by public fetch or metadata refresh.
 The signed Pages index preserves old native packages and release redirects and
 binds the build-only publication notice to its release, manifest and original
 source run. Build-only pointers retain `qualification_sha256: "unqualified"`.

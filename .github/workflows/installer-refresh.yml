@@ -39,12 +39,16 @@ jobs:
           python3 - <<'PYCODE'
           import os,pathlib,sys
           sys.path.insert(0,'packaging/release')
-          import release
+          import release,universal
           approved=pathlib.Path('refresh-input/candidate')
           build_only=release.load(approved/'current-stable.json')['qualification_sha256']=='unqualified'
-          release.stage(approved,pathlib.Path('refresh-input/snapshot'),pathlib.Path('archive.asc'),
-                        os.environ['ARCHIVE_FINGERPRINT'],pathlib.Path('packaging/installer/install.sh.in'),
-                        candidate=build_only,previous=approved)
+          if build_only:
+              universal.refresh_build_only(approved,pathlib.Path('refresh-input/snapshot'),
+                                           pathlib.Path('archive.asc'),os.environ['ARCHIVE_FINGERPRINT'])
+          else:
+              release.stage(approved,pathlib.Path('refresh-input/snapshot'),pathlib.Path('archive.asc'),
+                            os.environ['ARCHIVE_FINGERPRINT'],pathlib.Path('packaging/installer/install.sh.in'),
+                            previous=approved)
           with open(os.environ['GITHUB_ENV'],'a') as output:
               output.write('HTTPJET_REFRESH_MODE='+('build-only' if build_only else 'qualified')+'\n')
           PYCODE

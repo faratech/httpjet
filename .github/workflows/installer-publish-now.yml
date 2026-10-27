@@ -97,17 +97,36 @@ jobs:
           CANDIDATE_RUN: ${{ inputs.candidate_run_id || github.event.workflow_run.id }}
         run: |
           printf 'Signed Linux builds from GitHub Actions run https://github.com/%s/actions/runs/%s.\n\nThe full distribution matrix was not completed for this release. io_uring is required.\n' "$GITHUB_REPOSITORY" "$CANDIDATE_RUN" > release-notes.txt
+          cat >> release-notes.txt <<'NOTES'
+
+          Downloads:
+          - .deb packages: Debian and Ubuntu.
+          - .rpm packages: Fedora, RHEL and compatible distributions.
+          - .tar.gz archives: other compatible Linux distributions.
+          - amd64/x86_64 is for Intel/AMD 64-bit systems; arm64/aarch64 is for 64-bit ARM.
+          - install.sh selects the installation route. Use the signed APT/RPM repositories for package-managed updates.
+
+          Installation instructions: https://github.com/faratech/httpjet/blob/main/packaging/installer/README.md
+          NOTES
           if gh release view "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release view "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > existing-release.json
             python3 - <<'PY'
           import hashlib, json, pathlib
           assets = {a['name']: a for a in json.loads(pathlib.Path('existing-release.json').read_text())['assets']}
+          missing = []
           for path in pathlib.Path('public-assets').iterdir():
               actual = assets.get(path.name)
+              if actual is None:
+                  missing.append(str(path)); continue
               digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              if not actual or actual.get('size') != path.stat().st_size or actual.get('digest') != 'sha256:' + digest:
+              if actual.get('size') != path.stat().st_size or actual.get('digest') != 'sha256:' + digest:
                   raise SystemExit('existing release asset differs: ' + path.name)
+          pathlib.Path('missing-assets.txt').write_text(''.join(path+'\n' for path in missing))
           PY
+            while IFS= read -r path; do
+              gh release upload "$HTTPJET_RELEASE_TAG" "$path" --repo "$GITHUB_REPOSITORY"
+            done < missing-assets.txt
+            gh release edit "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.txt
           else
             gh release create "$HTTPJET_RELEASE_TAG" public-assets/* --repo "$GITHUB_REPOSITORY" \
               --verify-tag --draft --title "HTTPJet $HTTPJET_RELEASE_TAG" --notes-file release-notes.txt

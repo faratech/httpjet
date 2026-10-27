@@ -425,6 +425,25 @@ def fetch_current(repository,output,key,expected,release_base=None,allow_unquali
         or qualified and b.sha(output/'qualification.json')!=qualification_hash):raise ValueError('current pointer hash mismatch')
     manifest=b.load(output/'manifest.json');support.identity_from_manifest(manifest)
     if manifest['release_id']!=current['release_id'] or manifest.get('archive_fingerprint')!=expected:raise ValueError('current pointer version/key mismatch')
+    if not qualified:
+        import pages
+        index=pages.fetch_retention(repository.removesuffix('/apt'),output,key,expected,pointer)
+        assets=index['releases'][manifest['release_id']]['assets']
+        for name in _build_only_names(manifest)|{'publication-status.json','RELEASE-NOTES.txt'}:
+            description=assets.get(name) or index['site_objects'].get(f"releases/{manifest['release_id']}/{name}")
+            if description is None:raise ValueError('build-only publication omits authenticated file: '+name)
+            path=output/('approved-install.sh' if name=='install.sh' else name);b.download(base+'/'+name,path)
+            if pages.descriptor(path)!=description:raise ValueError('public build-only bytes changed: '+name)
+        signed_apt_history(repository,output,key,manifest)
+        signed_rpm_history(repository.removesuffix('/apt')+'/rpm',output,key,manifest)
+        for name,item in manifest['artifacts'].items():
+            if not name.endswith(('.deb','.rpm')):continue
+            source=output/'history'/('deb' if name.endswith('.deb') else 'rpm')/b.filename(name)
+            if source.is_symlink() or not source.is_file() or pages.descriptor(source)!={field:item[field] for field in ('sha256','size')}:
+                raise ValueError('current native repository package differs from manifest: '+name)
+            copy(source,output/name)
+        _verify_build_only_current(output,key,expected)
+        return output
     for name in manifest['artifacts']:b.download(base+'/'+b.filename(name),output/name)
     if qualified:
         for target in b.load(output/'qualification.json')['targets']:
@@ -451,4 +470,52 @@ def fetch_current(repository,output,key,expected,release_base=None,allow_unquali
                 or status.get('manifest_sha256')!=b.sha(output/'manifest.json') or status.get('source_commit')!=manifest['commit']
                 or status.get('archive_fingerprint')!=expected or not re.fullmatch('[1-9][0-9]*',str(status.get('source_run_id','')))):
                 raise ValueError('build-only publication status does not bind the signed release/source run')
+    return output
+
+def _build_only_names(manifest):
+    return {'install.sh'}|{api().filename(manifest['binaries'][arch]['artifact']) for arch in support.ARCHES}
+
+def _verify_build_only_current(directory,key,expected):
+    import pages
+    b=api();b.validate_key(key,expected);pointer=directory/'current-stable.json'
+    verify_signed(pointer,Path(str(pointer)+'.asc'),key)
+    verify_signed(directory/'manifest.json',directory/'manifest.json.asc',key)
+    current=b.load(pointer);support.validate_window(current);manifest=b.load(directory/'manifest.json');support.identity_from_manifest(manifest)
+    if (current.get('schema')!=2 or current.get('qualification_sha256')!='unqualified' or current.get('archive_fingerprint')!=expected
+        or manifest.get('archive_fingerprint')!=expected or current.get('release_id')!=manifest['release_id']
+        or current.get('manifest_sha256')!=b.sha(directory/'manifest.json') or current.get('manifest_size')!=(directory/'manifest.json').stat().st_size):
+        raise ValueError('build-only selector/manifest mismatch')
+    index=pages.read_index(directory,key,expected,pointer);assets=index['releases'][manifest['release_id']]['assets']
+    if index['repository']!='faratech/httpjet':raise ValueError('unexpected build-only public repository')
+    for name in _build_only_names(manifest)|{'manifest.json','manifest.json.asc','publication-status.json','RELEASE-NOTES.txt'}:
+        path=directory/('approved-install.sh' if name=='install.sh' else name)
+        bound=assets.get(name) or index['site_objects'].get(f"releases/{manifest['release_id']}/{name}")
+        if not bound or path.is_symlink() or not path.is_file() or pages.descriptor(path)!=bound:raise ValueError('public file is not authenticated: '+name)
+        if name in manifest['artifacts'] and pages.descriptor(path)!={k:manifest['artifacts'][name][k] for k in ('sha256','size')}:raise ValueError('public archive manifest mismatch')
+    status=b.load(directory/'publication-status.json')
+    required={'schema':1,'publication_mode':'build-only','full_matrix_qualified':False,'release_id':manifest['release_id'],
+              'manifest_sha256':b.sha(directory/'manifest.json'),'source_commit':manifest['commit'],'archive_fingerprint':expected}
+    if status.get('full_matrix_qualified') is not False or any(status.get(k)!=v for k,v in required.items()) or not re.fullmatch('[1-9][0-9]*',str(status.get('source_run_id',''))):raise ValueError('build-only status mismatch')
+    for name,item in manifest['artifacts'].items():
+        if name.endswith(('.deb','.rpm')) and pages.descriptor(directory/b.filename(name))!={k:item[k] for k in ('sha256','size')}:raise ValueError('native package manifest mismatch')
+    return manifest,index,status
+
+def refresh_build_only(directory,output,key,expected,now=None):
+    b=api();manifest,index,status=_verify_build_only_current(directory,key,expected)
+    if output.exists():raise ValueError('refresh output already exists')
+    output.mkdir(parents=True);target=output/'releases'/manifest['release_id'];target.mkdir(parents=True)
+    for name in _build_only_names(manifest)|set(manifest['packages'].values())|set(manifest['rpm_packages'].values())|{'manifest.json','manifest.json.asc','publication-status.json','RELEASE-NOTES.txt'}:
+        copy(directory/('approved-install.sh' if name=='install.sh' else name),target/name)
+    (target/'SHA256SUMS').write_text(''.join(f"{item['sha256']}  {name}\n" for name,item in sorted(manifest['artifacts'].items()))+f"{b.sha(directory/'manifest.json')}  manifest.json\n")
+    (output/'apt').mkdir();copy(directory/'approved-install.sh',output/'apt/install.sh');copy(key,output/'apt/httpjet-archive-keyring.asc')
+    now=now or datetime.now(timezone.utc)
+    apt_repository(directory,output,manifest,directory,key,expected,False,now)
+    rpm_repository(directory,output,manifest,directory,key,expected)
+    pointer={'schema':2,'release_id':manifest['release_id'],'manifest_sha256':b.sha(directory/'manifest.json'),
+             'manifest_size':(directory/'manifest.json').stat().st_size,'issued_at':now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+             'expires_at':(now+timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ'),'archive_fingerprint':expected,'qualification_sha256':'unqualified'}
+    b.write_json(output/'releases/stable.json',pointer);sign(output/'releases/stable.json',expected)
+    b.write_json(output/'publication.json',{'schema':2,'qualified':False,'metadata_only':True,'release_id':manifest['release_id'],
+                 'archive_fingerprint':expected,'manifest_sha256':pointer['manifest_sha256'],'qualification_sha256':'unqualified',
+                 'stable_sha256':b.sha(output/'releases/stable.json'),'previous_stable_sha256':b.sha(directory/'current-stable.json')})
     return output

@@ -3,6 +3,7 @@
 import argparse
 from pathlib import Path
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 import pages
 import release
@@ -18,7 +19,9 @@ METADATA = ('manifest.json', 'manifest.json.asc', STATUS, NOTES, 'SHA256SUMS')
 
 def github_names(release_id):
     return {'install.sh', f'httpjet-{release_id}-linux-amd64-static.tar.gz',
-            f'httpjet-{release_id}-linux-arm64-static.tar.gz'}
+            f'httpjet-{release_id}-linux-arm64-static.tar.gz',
+            f'httpjet_{release_id}_amd64.deb', f'httpjet_{release_id}_arm64.deb',
+            f'httpjet-{release_id}.x86_64.rpm', f'httpjet-{release_id}.aarch64.rpm'}
 
 
 def regular_tree(root):
@@ -32,7 +35,7 @@ def regular_tree(root):
     return result
 
 
-def verify_candidate(root, key, fingerprint):
+def verify_candidate(root, key, fingerprint, previous=None):
     release.validate_key(key, fingerprint)
     native = root/'snapshot'
     publication = release.load(native/'publication.json')
@@ -63,16 +66,39 @@ def verify_candidate(root, key, fingerprint):
         raise ValueError('signed candidate selector does not bind this manifest/publication')
     if any(item['kind'] == 'qualification-image' for item in manifest['artifacts'].values()):
         raise ValueError('private qualification images cannot be published as software')
-    universal.verify_artifacts(directory, manifest)
+    metadata_only=publication.get('metadata_only') is True
+    if metadata_only:
+        if previous is None:raise ValueError('metadata-only refresh requires authenticated previous publication')
+        old,_,status=universal._verify_build_only_current(previous,key,fingerprint)
+        if (old['release_id']!=manifest['release_id'] or release.sha(previous/'manifest.json')!=release.sha(manifest_path)
+            or publication.get('previous_stable_sha256')!=release.sha(previous/'current-stable.json')):
+            raise ValueError('metadata-only refresh changed the authenticated release')
+        for name in ('manifest.json','manifest.json.asc','publication-status.json','RELEASE-NOTES.txt'):
+            if (directory/name).read_bytes()!=(previous/name).read_bytes():raise ValueError('immutable release metadata changed')
+        if (directory/'install.sh').read_bytes()!=(previous/'approved-install.sh').read_bytes():raise ValueError('immutable installer changed')
+    else:
+        universal.verify_artifacts(directory, manifest)
     if release.sha(root/'candidate/manifest.json') != release.sha(manifest_path):
         raise ValueError('candidate and signed snapshot identify different manifests')
     for name, item in manifest['artifacts'].items():
         source = root/'candidate'/release.filename(name)
+        if metadata_only and name not in universal._build_only_names(manifest) and not name.endswith(('.deb','.rpm')):continue
         if source.is_symlink() or not source.is_file() or pages.descriptor(source) != {'sha256': item['sha256'], 'size': item['size']}:
             raise ValueError('candidate artifact differs from signed snapshot: '+name)
+    if metadata_only:
+        with tempfile.TemporaryDirectory(prefix='httpjet-refresh-rpm-') as temporary:
+            database=Path(temporary)/'rpmdb';database.mkdir()
+            release.run(['rpm','--dbpath',database,'--initdb']);release.run(['rpmkeys','--dbpath',database,'--import',key])
+            for name in manifest['artifacts']:
+                if name.endswith('.rpm'):
+                    report=release.run(['rpmkeys','--dbpath',database,'--checksig','--verbose',root/'candidate'/name])
+                    if not universal.rpm_signature_verified(report):raise ValueError('native RPM archive signature did not verify')
     allowed = set(manifest['artifacts']) | {'manifest.json', 'manifest.json.asc', 'SHA256SUMS', 'install.sh'}
+    if metadata_only:allowed=universal._build_only_names(manifest)|set(manifest['packages'].values())|set(manifest['rpm_packages'].values())|{'manifest.json','manifest.json.asc','SHA256SUMS','publication-status.json','RELEASE-NOTES.txt'}
     if {path.name for path in directory.iterdir()} != allowed:
         raise ValueError('candidate release directory contains unbound/private files')
+    for name in (universal._build_only_names(manifest)|set(manifest['packages'].values())|set(manifest['rpm_packages'].values()))-{'install.sh'}:
+        if pages.descriptor(directory/name)!=pages.descriptor(root/'candidate'/name):raise ValueError('public Linux archive changed in refresh')
     sums = ''.join(f"{item['sha256']}  {name}\n" for name, item in sorted(manifest['artifacts'].items())) + release.sha(manifest_path)+'  manifest.json\n'
     if (directory/'SHA256SUMS').read_text() != sums: raise ValueError('checksum catalog mismatch')
     if (directory/'install.sh').read_bytes() != (native/'apt/install.sh').read_bytes(): raise ValueError('installer mismatch')
@@ -89,7 +115,7 @@ def verify_candidate(root, key, fingerprint):
 def assemble(root, assets, site, key, fingerprint, run_id, previous=None):
     if not re.fullmatch('[0-9]+', run_id): raise ValueError('numeric source run ID required')
     if assets.exists() or site.exists(): raise ValueError('publication outputs must not exist')
-    native, directory, manifest, publication = verify_candidate(root, key, fingerprint)
+    native, directory, manifest, publication = verify_candidate(root, key, fingerprint, previous)
     releases = {}; retained = {}
     if previous is not None:
         old = pages.read_index(previous, key, fingerprint, previous/'current-stable.json')
@@ -132,7 +158,7 @@ def assemble(root, assets, site, key, fingerprint, run_id, previous=None):
     for name in ('stable.json', 'stable.json.asc'):
         pages.checked_copy(native/'releases'/name, site/'releases'/name)
     redirects = ''.join(f'/releases/{version}/{name} https://github.com/{REPOSITORY}/releases/download/{value["tag"]}/{name} 302\n'
-                        for version, value in sorted(releases.items()) for name in sorted(github_names(version)))
+                        for version, value in sorted(releases.items()) for name in sorted(github_names(version) & set(value['assets'])))
     if len(redirects.splitlines()) > 2000: raise ValueError('Pages static redirect limit exceeded')
     if any(len(line) > 1000 for line in redirects.splitlines()): raise ValueError('Pages redirect line too long')
     (site/'_redirects').write_text(redirects)
