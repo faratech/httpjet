@@ -6,6 +6,10 @@ on:
         description: Run that built and signed the candidate
         required: true
         type: string
+      recover_failed_run_id:
+        description: Explicitly release the matching lease of this completed failed publication
+        required: false
+        type: string
   workflow_run:
     workflows: ['Installer release build and signing']
     types: [completed]
@@ -159,25 +163,51 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.HTTPJET_S3_SECRET_ACCESS_KEY }}
           GH_TOKEN: ${{ github.token }}
           WRANGLER_SEND_METRICS: 'false'
+          RECOVER_FAILED_RUN: ${{ inputs.recover_failed_run_id }}
         run: |
           python3 - <<'PY'
-          import hashlib, os, pathlib, subprocess, sys, urllib.request
+          import hashlib, json, os, pathlib, re, subprocess, sys, time, urllib.error, urllib.request
           sys.path.insert(0, 'packaging/release')
           import pages, release
           from publish import S3
-          from publish_v2 import publication_lock
+          from publish_v2 import LOCK_KEY, publication_lock
           publication = release.load('candidate-input/snapshot/publication.json')
-          with publication_lock(S3(), publication['stable_sha256']):
+          store = S3()
+          recovery = os.environ.get('RECOVER_FAILED_RUN', '')
+          if recovery:
+              if not re.fullmatch(r'[0-9]+', recovery):raise ValueError('invalid recovery run')
+              run = json.loads(subprocess.check_output(['gh', 'api', 'repos/'+os.environ['GITHUB_REPOSITORY']+'/actions/runs/'+recovery]))
+              if run['status'] != 'completed' or run['conclusion'] != 'failure' or run['path'] != '.github/workflows/installer-publish-now.yml':
+                  raise ValueError('recovery requires a completed failed publisher')
+              with store.request('GET', LOCK_KEY) as response:
+                  lock = json.loads(response.read()); etag = response.headers.get('ETag')
+              if (not etag or lock.get('schema') != 1 or lock.get('state') != 'held'
+                  or str(lock.get('run_id')) != recovery or str(lock.get('run_attempt')) != str(run['run_attempt'])
+                  or lock.get('stable_sha256') != publication['stable_sha256']):
+                  raise ValueError('failed publisher does not own this exact publication lease')
+              pages.precondition(publication, pathlib.Path('archive.asc'), os.environ['ARCHIVE_FINGERPRINT'])
+              lock.update(state='released', recovered_by_run=os.environ['GITHUB_RUN_ID'])
+              body = (json.dumps(lock, sort_keys=True, separators=(',', ':'))+'\n').encode()
+              with store.request('PUT', LOCK_KEY, body, {'if-match': etag, 'content-type': 'application/json',
+                                  'cache-control': 'no-store', 'x-amz-meta-sha256': hashlib.sha256(body).hexdigest()}):pass
+          with publication_lock(store, publication['stable_sha256']):
               pages.precondition(publication, pathlib.Path('archive.asc'), os.environ['ARCHIVE_FINGERPRINT'])
               subprocess.run(['npx', '--yes', 'wrangler@4.153.0', 'pages', 'deploy', 'pages-site',
                               '--project-name', 'httpjet-packages', '--branch', 'main', '--commit-dirty=true'], check=True)
               release_id = publication['release_id']
               for name in ('manifest.json', 'manifest.json.asc', 'publication-status.json', 'RELEASE-NOTES.txt'):
                   url = pages.ORIGIN + '/releases/' + release_id + '/' + name
-                  request = urllib.request.Request(url, headers={'User-Agent': release.USER_AGENT, 'Cache-Control': 'no-cache'})
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      if response.url != url or hashlib.sha256(response.read()).hexdigest() != release.sha(pathlib.Path('pages-site/releases') / release_id / name):
-                          raise ValueError('Pages metadata is not available at its permanent URL: ' + name)
+                  expected = release.sha(pathlib.Path('pages-site/releases') / release_id / name)
+                  for attempt in range(20):
+                      request = urllib.request.Request(url, headers={'User-Agent': release.USER_AGENT, 'Cache-Control': 'no-cache'})
+                      try:
+                          with urllib.request.urlopen(request, timeout=10) as response:
+                              if response.url == url and hashlib.sha256(response.read()).hexdigest() == expected:break
+                      except urllib.error.HTTPError as error:
+                          if error.code not in (404, 408, 429, 500, 502, 503, 504):raise
+                          error.close()
+                      time.sleep(2)
+                  else:raise ValueError('Pages metadata is not available at its permanent URL: ' + name)
               for name in ('manifest.json', 'manifest.json.asc', 'publication-status.json', 'RELEASE-NOTES.txt'):
                   subprocess.run(['gh', 'release', 'delete-asset', os.environ['HTTPJET_RELEASE_TAG'], name,
                                   '--repo', os.environ['GITHUB_REPOSITORY'], '--yes'], check=False)
