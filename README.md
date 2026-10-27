@@ -61,36 +61,36 @@ default: `acme`, `ocsp`, `otel`, `profiling`, `allocount`, and the staged
 
 ## Install on Linux
 
-The installer is designed for fresh Linux servers on **amd64 or arm64**. The
-kernel and service sandbox must allow **io_uring**; there is no epoll fallback.
+The installer is designed for fresh Linux servers on **amd64/x86-64 or arm64/aarch64**.
+The kernel and service sandbox must allow **io_uring**; there is no epoll fallback.
 The installer reports startup failures caused by io_uring restrictions and does
 not change the host's global kernel policy. A Rust toolchain, LiteSpeed, PHP and
 a domain name are not required on the target server.
 
 ### Install a published release
 
-Download the installer from the latest GitHub release:
+Download the installer from the latest GitHub release, then run it with root privileges:
 
 ```bash
 curl -fsSLo install.sh https://github.com/faratech/httpjet/releases/latest/download/install.sh
+sudo sh ./install.sh
 ```
 
 The published script contains the archive's public key and release URLs. The
 repository's [`install.sh.in`](packaging/installer/install.sh.in) is a template
 with placeholders; it cannot install a release until the publisher renders it.
 Published release assets carry GitHub Actions publication attestations. To check
-the downloaded installer with the optional GitHub CLI before running it:
+the downloaded installer with the optional GitHub CLI before running the second command:
 
 ```bash
 gh attestation verify ./install.sh --repo faratech/httpjet \
   --signer-workflow faratech/httpjet/.github/workflows/installer-publish-now.yml
 ```
 
-Then run it as root:
-
-```bash
-sudo sh ./install.sh
-```
+The [GitHub release downloads](https://github.com/faratech/httpjet/releases/latest) also provide
+DEB, RPM and static Linux archives for both architectures, plus source code.
+The installer configures the signed package repository when a native package
+manager is supported.
 
 The default `--method auto` chooses a native DEB/APT or RPM package on recognized
 Debian/Ubuntu or Fedora/RHEL/SUSE family systems running systemd with the matching
@@ -120,10 +120,10 @@ the [container route](packaging/release/images/README.md).
 ### What the installer does
 
 1. Checks the architecture, package manager and init system. It refuses an
-   unmanaged httpjet installation or an occupied HTTP port rather than taking
+   unmanaged httpjet installation or an occupied TCP port 80 or 443 rather than taking
    over an existing server.
 2. Installs missing prerequisites through supported package managers. Portable
-   installations need CA certificates, curl, GPG, Python 3.8+ and util-linux
+   installations need CA certificates, curl, GPG, OpenSSL, Python 3.8+ and util-linux
    `setpriv`; Python and `setpriv` remain required to manage the service.
 3. Verifies signed repository metadata and packages, or the portable release
    manifest and archive hash, before installing the selected payload.
@@ -133,15 +133,33 @@ the [container route](packaging/release/images/README.md).
 
 Fresh installs serve the welcome page at `http://SERVER-IP/` and `https://SERVER-IP/`
 on ports 80 and 443. HTTPS starts with a unique self-signed certificate, so browsers
-warn until you configure a trusted certificate. PHP execution, page caching, metrics
-and automatic `.htaccess` loading are disabled. PHP-shaped source paths are
-denied by the default rewrite rules. Configure application features explicitly
+warn until you configure a trusted certificate. HTTP is not automatically redirected
+to HTTPS. Open TCP ports 80 and 443 in your firewall if the server must be reachable
+from outside the host. Existing configurations, certificates and service state are
+preserved on upgrades.
+
+The default private key is `/etc/httpjet/tls/default.key` and its certificate is
+`/etc/httpjet/tls/default.crt`. To use a trusted certificate, set `keyFile` and
+`certFile` on the HTTPS listener in `/etc/httpjet/conf/httpd_config.xml`, validate
+with `httpjet --root /etc/httpjet check --strict`, then restart the service.
+`/etc/httpjet/listeners.env` controls the packaged HTTPS bind address.
+
+PHP execution, page caching, metrics and automatic `.htaccess` loading are
+disabled. PHP-shaped source paths are denied by the default rewrite rules. Configure application features explicitly
 before using them.
 
 ### Configure and manage the server
 
 Put static content in `/var/www/httpjet`. The default LiteSpeed-compatible XML
 configuration is under `/etc/httpjet/conf/`; logs are under `/var/log/httpjet`.
+Check a fresh installation locally (the second command accepts the self-signed
+certificate for this loopback check only):
+
+```bash
+curl -f http://127.0.0.1/
+curl -fk https://127.0.0.1/
+```
+
 After editing configuration, validate it before restarting:
 
 ```bash
