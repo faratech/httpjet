@@ -9,7 +9,7 @@ URL: https://httpjet.net
 Source0: httpjet-%{version}-%{release}-payload.tar.gz
 Source1: archive-keyring.asc
 Source2: preinstall.sh
-Requires: systemd
+Requires: systemd, openssl
 Requires(pre): /usr/sbin/useradd, /usr/sbin/groupadd, /usr/bin/getent
 Requires(post): /usr/bin/stat, /usr/bin/mktemp
 Requires(posttrans): /usr/sbin/runuser, /usr/bin/env, /usr/bin/systemctl
@@ -20,7 +20,8 @@ AutoReqProv: no
 
 %description
 httpjet is a native, fully static Linux web server. The default service serves
-HTTP on port 80 as a dedicated unprivileged account. PHP, TLS, page caching and
+HTTP on port 80 and HTTPS on port 443 with a unique self-signed certificate,
+as a dedicated unprivileged account. PHP, page caching and
 management listeners require explicit administrator configuration.
 
 %package archive-keyring
@@ -70,6 +71,7 @@ rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 /usr/bin/httpjet
 %dir /usr/libexec/httpjet
 /usr/libexec/httpjet/package-helper
+/usr/libexec/httpjet/setup-tls
 /usr/lib/systemd/system/httpjet.service
 %dir /etc/httpjet
 %dir /etc/httpjet/conf
@@ -92,7 +94,7 @@ rpmkeys --import /etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet
 
 %changelog
 * Tue Oct 27 2026 httpjet contributors - 0.1.10-11
-- Allow bounded ARM guest setup time during release qualification.
+- Amend the release with fresh-install HTTPS and unique per-host certificates.
 
 * Tue Oct 27 2026 httpjet contributors - 0.1.10-10
 - Initialize isolated ARM test guest clocks and confine Guix builder setup.

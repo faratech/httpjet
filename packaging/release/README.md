@@ -111,3 +111,11 @@ and the authenticated public metadata, prove the publisher has stopped, and
 reconcile its partial publication. Only then conditionally write the reviewed
 record as `released` using the exact reviewed ETag. Never overwrite a changed
 record or replace immutable release assets to force a retry.
+
+An explicit amendment of the current build-only release requires dispatching
+`installer-release.yml` on its release tag with `amend_current_release=true`.
+The candidate authenticates and retains the prior signed publication, replaces
+only that same release identity, rebuilds native repository metadata and reattests
+the seven GitHub downloads. Normal releases and metadata refreshes continue to
+reject changed immutable bytes. Reusing a package version requires existing users
+to request a package reinstall; it does not create an automatic version upgrade.

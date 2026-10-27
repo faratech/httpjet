@@ -5,6 +5,10 @@ set -eu
 # An upgrade/reinstall has an old-version argument and retains administrator
 # configuration, service overrides, enablement and content.
 if [ "$1" = install ] && [ -z "${2:-}" ]; then
+    for table in /proc/net/tcp /proc/net/tcp6; do
+        [ ! -r "$table" ] || ! awk '$2 ~ /:(0050|01BB)$/ && $4 == "0A" { found=1 } END { exit !found }' "$table" \
+            || { echo 'httpjet: TCP port 80 or 443 is occupied; stop the existing server explicitly' >&2; exit 1; }
+    done
     for path in /usr/bin/httpjet /usr/sbin/httpjet /usr/local/bin/httpjet \
         /usr/local/sbin/httpjet /etc/httpjet/conf/httpd_config.xml \
         /etc/systemd/system/httpjet.service /lib/systemd/system/httpjet.service \

@@ -19,8 +19,10 @@ LogsDirectory=httpjet
 LogsDirectoryMode=0750
 Environment=HTTPJET_LOG_DIR=/var/log/httpjet
 Environment=RUST_LOG=httpjet=info
+Environment=HTTPJET_HTTPS_ADDR=
+EnvironmentFile=-/etc/httpjet/listeners.env
 ExecStartPre=/usr/bin/httpjet --root /etc/httpjet check --strict
-ExecStart=/usr/bin/httpjet --root /etc/httpjet serve --http-addr 0.0.0.0:80 --https-addr= --metrics-addr= --no-php --no-multishot-accept
+ExecStart=/usr/bin/httpjet --root /etc/httpjet serve --http-addr 0.0.0.0:80 --https-addr=${HTTPJET_HTTPS_ADDR} --metrics-addr= --no-php --no-multishot-accept
 Restart=on-failure
 RestartSec=2
 TimeoutStartSec=30

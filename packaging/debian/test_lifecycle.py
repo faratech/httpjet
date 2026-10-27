@@ -57,6 +57,8 @@ class MaintainerLifecycle(unittest.TestCase):
             'printf "%s\\n" "$*" >> "$HTTPJET_HOOK_TEST_STATE/service.log"\n',
         )
         self.command("runuser", 'while [ "$1" != -- ]; do shift; done\nshift\nexec "$@"\n')
+        helper = self.path("/usr/libexec/httpjet/setup-tls"); helper.parent.mkdir(parents=True)
+        helper.write_text("#!/bin/sh\nexit 0\n"); helper.chmod(0o755)
         self.template = self.path("/usr/share/httpjet/welcome/index.html")
         self.template.parent.mkdir(parents=True)
         shutil.copyfile(REPO / "packaging/debian/welcome/index.html", self.template)
@@ -90,6 +92,8 @@ class MaintainerLifecycle(unittest.TestCase):
         # Rewrite only known managed paths; PATH substitutes identity/package
         # lookups, so there is no route from these hooks to host account tools.
         for prefix in (
+            "/usr/libexec/httpjet/setup-tls",
+            "/proc/net/tcp",
             "/usr/local/sbin/httpjet",
             "/usr/local/bin/httpjet",
             "/usr/lib/systemd/system/httpjet.service",

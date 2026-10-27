@@ -131,7 +131,9 @@ the [container route](packaging/release/images/README.md).
    page at `/var/www/httpjet`. It validates the configuration and starts and
    enables the service on a fresh installation when an init adapter is selected.
 
-The default listens on HTTP port 80. HTTPS, PHP execution, page caching, metrics
+Fresh installs serve the welcome page at `http://SERVER-IP/` and `https://SERVER-IP/`
+on ports 80 and 443. HTTPS starts with a unique self-signed certificate, so browsers
+warn until you configure a trusted certificate. PHP execution, page caching, metrics
 and automatic `.htaccess` loading are disabled. PHP-shaped source paths are
 denied by the default rewrite rules. Configure application features explicitly
 before using them.

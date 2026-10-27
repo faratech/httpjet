@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 if [ "$1" -eq 1 ]; then
+    for table in /proc/net/tcp /proc/net/tcp6; do
+        [ ! -r "$table" ] || ! awk '$2 ~ /:(0050|01BB)$/ && $4 == "0A" { found=1 } END { exit !found }' "$table" \
+            || { echo 'httpjet: TCP port 80 or 443 is occupied; stop the existing server explicitly' >&2; exit 1; }
+    done
     for candidate in /usr/bin/httpjet /usr/local/bin/httpjet /usr/local/sbin/httpjet \
         /usr/local/httpjet/bin/httpjet /etc/httpjet/conf/httpd_config.xml \
         /etc/systemd/system/httpjet.service /etc/systemd/system/httpjet.service.d \

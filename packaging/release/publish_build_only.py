@@ -117,13 +117,23 @@ def assemble(root, assets, site, key, fingerprint, run_id, previous=None):
     if assets.exists() or site.exists(): raise ValueError('publication outputs must not exist')
     native, directory, manifest, publication = verify_candidate(root, key, fingerprint, previous)
     releases = {}; retained = {}
+    amend=publication.get('amend') is True
+    if amend:
+        if previous is None:raise ValueError('release amendment needs authenticated prior publication')
+        old_manifest,_,_=universal._verify_build_only_current(previous,key,fingerprint)
+        if old_manifest['release_id']!=manifest['release_id'] or release.sha(previous/'manifest.json')!=publication.get('amends_manifest_sha256'):
+            raise ValueError('amendment does not replace the authenticated current release')
     if previous is not None:
         old = pages.read_index(previous, key, fingerprint, previous/'current-stable.json')
         if old['repository'] != REPOSITORY or publication.get('previous_stable_sha256') != old['stable_sha256']:
             raise ValueError('retention does not match staged previous publication')
         if universal.release_tuple(manifest['release_id']) < universal.release_tuple(old['release_id']):
             raise ValueError('publication cannot downgrade stable')
-        releases = dict(old['releases']); retained = old['objects']
+        releases = dict(old['releases']); retained = dict(old['objects'])
+        if amend:
+            for name in list(retained):
+                if name.startswith('releases/'+manifest['release_id']+'/') or Path(name).name in manifest['artifacts']:
+                    del retained[name]
     elif publication.get('previous_stable_sha256'):
         raise ValueError('existing publication requires authenticated retention')
     assets.mkdir(parents=True); site.mkdir(parents=True)
@@ -138,7 +148,7 @@ def assemble(root, assets, site, key, fingerprint, run_id, previous=None):
     (metadata_root/NOTES).write_text('HTTPJet '+manifest['release_id']+'\n\n'+status['notice']+'\nSigned source-built candidate artifacts are published at the operator\'s request.\nio_uring is required.\nSource commit: '+manifest['commit']+'\nSource run: https://github.com/'+REPOSITORY+'/actions/runs/'+run_id+'\n')
     entry = {'tag': manifest['tag'], 'assets': {path.name: pages.descriptor(path) for path in [*regular_tree(assets), *regular_tree(metadata_root)]}}
     rid = manifest['release_id']
-    if rid in releases and (releases[rid]['tag'] != entry['tag'] or any(name in releases[rid]['assets'] and releases[rid]['assets'][name] != item for name, item in entry['assets'].items())):
+    if not amend and rid in releases and (releases[rid]['tag'] != entry['tag'] or any(name in releases[rid]['assets'] and releases[rid]['assets'][name] != item for name, item in entry['assets'].items())):
         raise ValueError('immutable published asset bytes changed')
     releases[rid] = entry
     if len(releases) > pages.MAX_REDIRECTS: raise ValueError('Pages redirect history exceeds 100 rules')

@@ -157,15 +157,15 @@ if [ "$MANAGED" -eq 0 ]; then
     # Check before dependency/repository changes. /proc is a fallback when a
     # minimal image has not installed iproute2 yet; neither path changes sysctls.
     if command -v ss >/dev/null 2>&1; then
-        listeners=$(ss -H -ltn 'sport = :80') || fail 'cannot inspect TCP port 80'
-        [ -z "$listeners" ] || fail 'TCP port 80 is occupied; this installer will not stop the existing server'
+        listeners=$(ss -H -ltn '( sport = :80 or sport = :443 )') || fail 'cannot inspect TCP port 80 or 443'
+        [ -z "$listeners" ] || fail 'TCP port 80 or 443 is occupied; this installer will not stop the existing server'
     else
-        [ -r "$FILESYSTEM_ROOT/proc/net/tcp" ] || fail 'cannot inspect TCP port 80 (/proc/net/tcp is unavailable)'
+        [ -r "$FILESYSTEM_ROOT/proc/net/tcp" ] || fail 'cannot inspect TCP port 80 or 443 (/proc/net/tcp is unavailable)'
         set -- "$FILESYSTEM_ROOT/proc/net/tcp"
         if [ -r "$FILESYSTEM_ROOT/proc/net/tcp6" ]; then set -- "$@" "$FILESYSTEM_ROOT/proc/net/tcp6"; fi
-        listeners=$(awk '$2 ~ /:0050$/ && $4 == "0A" { print }' "$@") \
-            || fail 'cannot inspect TCP port 80 in /proc'
-        [ -z "$listeners" ] || fail 'TCP port 80 is occupied; this installer will not stop the existing server'
+        listeners=$(awk '$2 ~ /:(0050|01BB)$/ && $4 == "0A" { print }' "$@") \
+            || fail 'cannot inspect TCP port 80 or 443 in /proc'
+        [ -z "$listeners" ] || fail 'TCP port 80 or 443 is occupied; this installer will not stop the existing server'
     fi
 fi
 
@@ -204,7 +204,7 @@ if ! command -v curl >/dev/null 2>&1 || ! command -v ss >/dev/null 2>&1 \
     || [ ! -s "$FILESYSTEM_ROOT/etc/ssl/certs/ca-certificates.crt" ]; then
     message 'Installing HTTPS and network-inspection prerequisites.'
     apt-get update --error-on=any || fail 'APT could not refresh the existing distribution repositories'
-    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates curl iproute2 \
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends ca-certificates curl iproute2 openssl \
         || fail 'APT could not install the bootstrap prerequisites'
 fi
 
@@ -259,9 +259,12 @@ while [ "$attempt" -lt 15 ]; do
         status=$(curl --silent --show-error --fail --noproxy '*' \
             --connect-timeout 1 --max-time 2 --output "$WORK_DIR/welcome.html" \
             --write-out '%{http_code}' http://127.0.0.1/ 2>"$WORK_DIR/probe-error") || status=''
-        if [ "$status" = 200 ] && cmp -s "$WELCOME_FILE" "$WORK_DIR/welcome.html"; then
+        if [ "$status" = 200 ] && cmp -s "$WELCOME_FILE" "$WORK_DIR/welcome.html" \
+            && curl --fail --silent --insecure --noproxy '*' --connect-timeout 1 --max-time 2 \
+                https://127.0.0.1/ > "$WORK_DIR/welcome-tls.html" \
+            && cmp -s "$WELCOME_FILE" "$WORK_DIR/welcome-tls.html"; then
             SHOW_JOURNAL=0
-            message 'httpjet is running on TCP port 80. The packaged welcome page passed the HTTP check.'
+            message 'httpjet is running at http://SERVER-IP/ and https://SERVER-IP/. HTTPS uses a self-signed certificate; browsers will warn until you configure a trusted certificate.'
             message 'Configuration: /etc/httpjet/conf/httpd_config.xml; content: /var/www/httpjet'
             exit 0
         fi
@@ -276,14 +279,14 @@ require_command() { command -v "$1" >/dev/null 2>&1 || fail "required command is
 
 port_available() {
     if command -v ss >/dev/null 2>&1; then
-        listeners=$(ss -H -ltn 'sport = :80') || fail 'cannot inspect TCP port 80'
+        listeners=$(ss -H -ltn '( sport = :80 or sport = :443 )') || fail 'cannot inspect TCP port 80 or 443'
     else
-        [ -r "$FILESYSTEM_ROOT/proc/net/tcp" ] || fail 'cannot inspect /proc/net/tcp for port 80'
+        [ -r "$FILESYSTEM_ROOT/proc/net/tcp" ] || fail 'cannot inspect /proc/net/tcp for ports 80/443'
         set -- "$FILESYSTEM_ROOT/proc/net/tcp"
         if [ -r "$FILESYSTEM_ROOT/proc/net/tcp6" ]; then set -- "$@" "$FILESYSTEM_ROOT/proc/net/tcp6"; fi
-        listeners=$(awk '$2 ~ /:0050$/ && $4 == "0A" { print }' "$@") || fail 'cannot inspect TCP port 80'
+        listeners=$(awk '$2 ~ /:(0050|01BB)$/ && $4 == "0A" { print }' "$@") || fail 'cannot inspect TCP port 80 or 443'
     fi
-    [ -z "$listeners" ] || fail 'TCP port 80 is occupied; this installer will not stop another server'
+    [ -z "$listeners" ] || fail 'TCP port 80 or 443 is occupied; this installer will not stop another server'
 }
 
 fresh_guard() {
@@ -311,24 +314,24 @@ atomic_file() {
 
 generic_prerequisites() {
     missing=0
-    for requirement in curl python3 setpriv; do
+    for requirement in curl python3 setpriv openssl; do
         if ! command -v "$requirement" >/dev/null 2>&1; then missing=1; fi
     done
     if ! command -v gpg2 >/dev/null 2>&1 && ! command -v gpg >/dev/null 2>&1; then missing=1; fi
     if command -v setpriv >/dev/null 2>&1 && ! setpriv --help 2>&1 | grep -q -- --ambient-caps; then missing=1; fi
     if [ "$missing" -eq 1 ]; then
-        if command -v apk >/dev/null 2>&1; then apk add --no-cache ca-certificates curl gnupg python3 util-linux
+        if command -v apk >/dev/null 2>&1; then apk add --no-cache ca-certificates curl gnupg python3 util-linux openssl
         elif command -v apt-get >/dev/null 2>&1; then
             apt-get update --error-on=any
-            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg python3 util-linux
-        elif command -v dnf >/dev/null 2>&1; then dnf -y install ca-certificates curl gnupg2 python3 util-linux
-        elif command -v yum >/dev/null 2>&1; then yum -y install ca-certificates curl gnupg2 python3 util-linux
-        elif command -v zypper >/dev/null 2>&1; then zypper --non-interactive install ca-certificates curl gpg2 python3 util-linux
-        elif command -v pacman >/dev/null 2>&1; then pacman --sync --noconfirm --needed ca-certificates curl gnupg python util-linux
-        elif command -v xbps-install >/dev/null 2>&1; then xbps-install -Sy ca-certificates curl gnupg python3 util-linux
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg python3 util-linux openssl
+        elif command -v dnf >/dev/null 2>&1; then dnf -y install ca-certificates curl gnupg2 python3 util-linux openssl
+        elif command -v yum >/dev/null 2>&1; then yum -y install ca-certificates curl gnupg2 python3 util-linux openssl
+        elif command -v zypper >/dev/null 2>&1; then zypper --non-interactive install ca-certificates curl gpg2 python3 util-linux openssl
+        elif command -v pacman >/dev/null 2>&1; then pacman --sync --noconfirm --needed ca-certificates curl gnupg python util-linux openssl
+        elif command -v xbps-install >/dev/null 2>&1; then xbps-install -Sy ca-certificates curl gnupg python3 util-linux openssl
         else fail 'install CA certificates, curl, full GPG, Python3 and util-linux setpriv with ambient capabilities'; fi
     fi
-    for requirement in curl python3 setpriv; do require_command "$requirement"; done
+    for requirement in curl python3 setpriv openssl; do require_command "$requirement"; done
     command -v gpg2 >/dev/null 2>&1 || command -v gpg >/dev/null 2>&1 \
         || fail 'full GnuPG (gpg2 or gpg) is required'
     python3 -c 'import sys; assert sys.version_info >= (3, 8), "Python 3.8+ required"'
@@ -417,7 +420,14 @@ RPM_SOURCE
         while [ "$attempt" -lt 15 ]; do
             attempt=$((attempt + 1))
             if timeout -k 1 2 systemctl is-active --quiet httpjet.service && curl --fail --silent --noproxy '*' --connect-timeout 1 --max-time 2 --output "$WORK_DIR/welcome.html" --write-out '%{http_code}' http://127.0.0.1/ >"$WORK_DIR/status" \
-                && [ "$(cat "$WORK_DIR/status")" = 200 ] && cmp -s "$WORK_DIR/welcome.html" "$FILESYSTEM_ROOT/usr/share/httpjet/welcome/index.html"; then SHOW_JOURNAL=0; message 'RPM install passed exact welcome check'; return; fi
+                && [ "$(cat "$WORK_DIR/status")" = 200 ] && cmp -s "$WORK_DIR/welcome.html" "$FILESYSTEM_ROOT/usr/share/httpjet/welcome/index.html"; then
+                if curl --fail --silent --insecure --noproxy '*' --connect-timeout 1 --max-time 2 https://127.0.0.1/ > "$WORK_DIR/welcome-tls.html" \
+                    && cmp -s "$WORK_DIR/welcome-tls.html" "$FILESYSTEM_ROOT/usr/share/httpjet/welcome/index.html"; then
+                    SHOW_JOURNAL=0
+                    message 'httpjet is running at http://SERVER-IP/ and https://SERVER-IP/. HTTPS uses a self-signed certificate; browsers will warn until you configure a trusted certificate.'
+                    return
+                fi
+            fi
             sleep 1
         done
         fail 'fresh RPM installation failed bounded service/welcome check'

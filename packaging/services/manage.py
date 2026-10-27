@@ -718,6 +718,7 @@ class Manager:
         page = content / "index.html"
         if not page.exists() and not page.is_symlink():
             self.replace_file(page, (payload / "share/httpjet/welcome/index.html").read_bytes(), 0o644)
+        run([payload / "share/httpjet/services/setup-tls", str(self.root).rstrip("/"), str(state["gid"])])
         state["initialized"] = True
         self.save(state)
 
@@ -796,6 +797,18 @@ class Manager:
                             raise InstallError("fresh service did not return the exact welcome page")
                     finally:
                         connection.close()
+                    if self.path("/etc/httpjet/listeners.env").exists():
+                        import ssl
+                        connection = http.client.HTTPSConnection("127.0.0.1", 443, timeout=3,
+                                                                context=ssl._create_unverified_context())
+                        try:
+                            connection.request("GET", "/")
+                            response = connection.getresponse()
+                            if response.status != 200 or response.read() != (destination / "share/httpjet/welcome/index.html").read_bytes():
+                                raise InstallError("fresh HTTPS service did not return the exact welcome page")
+                        finally:
+                            connection.close()
+                        print("httpjet: http://SERVER-IP/ and https://SERVER-IP/ are ready. HTTPS uses a self-signed certificate; configure a trusted certificate to remove browser warnings.")
         except Exception:
             try:
                 self.service("stop", state)
@@ -873,8 +886,14 @@ def launch():
         if not re.fullmatch(rb"[1-9][0-9]*\n", body) or Path("/proc/" + body.decode().strip()).exists():
             raise InstallError("readiness marker is live or malformed")
         ready.unlink()
+    https = ""
+    settings = Path("/etc/httpjet/listeners.env")
+    if settings.exists():
+        for line in settings.read_text().splitlines():
+            if line.startswith("HTTPJET_HTTPS_ADDR="):
+                https = line.partition("=")[2].strip()
     arguments = ["/usr/local/bin/httpjet", "--root", "/etc/httpjet", "serve", "--http-addr", "0.0.0.0:80",
-                 "--https-addr=", "--metrics-addr=", "--no-php", "--no-multishot-accept", "--ready-file", str(ready)]
+                 "--https-addr=" + https, "--metrics-addr=", "--no-php", "--no-multishot-accept", "--ready-file", str(ready)]
     # This redirection is evaluated only after the identity/capability drop.
     arguments = ["/bin/sh", "-c", 'exec "$@" >> /var/log/httpjet/service.log 2>&1', "httpjet-log", *arguments]
     environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HTTPJET_LOG_DIR": "/var/log/httpjet", "RUST_LOG": "httpjet=info"}

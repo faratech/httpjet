@@ -30,5 +30,19 @@
         </vhostMap>
       </vhostMapList>
     </listener>
+    <listener>
+      <name>https</name>
+      <address>0.0.0.0:443</address>
+      <secure>1</secure>
+      <keyFile>/etc/httpjet/tls/default.key</keyFile>
+      <certFile>/etc/httpjet/tls/default.crt</certFile>
+      <clientVerify>0</clientVerify>
+      <vhostMapList>
+        <vhostMap>
+          <vhost>localhost</vhost>
+          <domain>localhost,www.localhost,*</domain>
+        </vhostMap>
+      </vhostMapList>
+    </listener>
   </listenerList>
 </httpServerConfig>

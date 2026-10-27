@@ -29,6 +29,8 @@ class RpmTransactions(unittest.TestCase):
         binary.write_text('#!/bin/sh\n' + f'env > {shlex.quote(str(self.state / "validation.env"))}\n'
                           + f'[ ! -f {shlex.quote(str(self.state / "invalid"))} ]\n')
         binary.chmod(0o755)
+        helper = self.path('/usr/libexec/httpjet/setup-tls'); helper.parent.mkdir(parents=True)
+        helper.write_text('#!/bin/sh\nexit 0\n'); helper.chmod(0o755)
         template = self.path('/usr/share/httpjet/welcome/index.html'); template.parent.mkdir(parents=True)
         template.write_bytes((REPO / 'packaging/debian/welcome/index.html').read_bytes())
 
@@ -39,7 +41,7 @@ class RpmTransactions(unittest.TestCase):
 
     def helper(self, *arguments):
         body = (REPO / 'packaging/rpm/package-helper.sh').read_text()
-        for prefix in ('/run/httpjet-package', '/run/systemd/system', '/usr/bin/httpjet',
+        for prefix in ('/usr/libexec/httpjet/setup-tls', '/run/httpjet-package', '/run/systemd/system', '/usr/bin/httpjet',
                        '/etc/httpjet', '/usr/share/httpjet', '/var/www'):
             body = body.replace(prefix, str(self.path(prefix)))
         body = body.replace('PATH=/usr/sbin:/usr/bin:/sbin:/bin', f'PATH={self.commands}:/usr/bin:/bin')

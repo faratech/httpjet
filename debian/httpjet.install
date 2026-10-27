@@ -3,3 +3,4 @@ packaging/debian/conf/httpd_config.xml etc/httpjet/conf
 packaging/debian/conf/mime.properties etc/httpjet/conf
 packaging/debian/conf/vhosts/default.xml etc/httpjet/conf/vhosts
 packaging/debian/welcome/index.html usr/share/httpjet/welcome
+packaging/services/setup-tls usr/libexec/httpjet

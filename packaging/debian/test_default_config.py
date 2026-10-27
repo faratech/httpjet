@@ -8,6 +8,7 @@ from pathlib import Path
 import pwd
 import shutil
 import socket
+import ssl
 import subprocess
 import tempfile
 import time
@@ -30,7 +31,8 @@ class DefaultConfig(unittest.TestCase):
         shutil.copyfile(cls.binary, executable)
         executable.chmod(0o755)
         cls.executable = executable
-        config = cls.root / "configuration"
+        config = cls.root / "etc/httpjet"
+        config.parent.mkdir(mode=0o755)
         shutil.copytree(REPO / "packaging/debian/conf", config / "conf")
         cls.config = config
         content = cls.root / "content"
@@ -41,10 +43,21 @@ class DefaultConfig(unittest.TestCase):
         (content / "healthy.txt").write_bytes(b"static content is available\n")
         for name in ("secret.php", "secret.PHTML", "secret.phar", "secret.phps", "secret.php7.gz.br"):
             (content / name).write_bytes(b"<?php /* package-source-marker */ ?>\n")
+        tls_group = pwd.getpwnam("nobody").pw_gid if os.geteuid() == 0 else os.getgid()
+        subprocess.run([str(REPO / "packaging/services/setup-tls"), str(cls.root), str(tls_group)], check=True)
+        cls.original_key = (config / "tls/default.key").read_bytes()
+        subprocess.run([str(REPO / "packaging/services/setup-tls"), str(cls.root), str(tls_group)], check=True)
+        assert cls.original_key == (config / "tls/default.key").read_bytes(), "certificate rotated on reinstall"
+        assert (config / "tls/default.key").stat().st_mode & 0o777 == 0o640
+        (config / "listeners.env").unlink()
+        subprocess.run([str(REPO / "packaging/services/setup-tls"), str(cls.root), str(tls_group), "upgrade"], check=True)
+        assert not (config / "listeners.env").exists(), "upgrade enabled HTTPS on an existing HTTP-only installation"
+        assert cls.original_key == (config / "tls/default.key").read_bytes()
+        subprocess.run([str(REPO / "packaging/services/setup-tls"), str(cls.root), str(tls_group)], check=True)
         for name in ("httpd_config.xml", "vhosts/default.xml"):
             path = config / "conf" / name
-            path.write_text(path.read_text().replace("/var/www/httpjet", str(content)))
-        for path in (config, *config.rglob("*"), *content.rglob("*")):
+            path.write_text(path.read_text().replace("/var/www/httpjet", str(content)).replace("/etc/httpjet/tls", str(config / "tls")))
+        for path in (config, config / "conf", *(config / "conf").rglob("*"), *content.rglob("*")):
             path.chmod(0o755 if path.is_dir() else 0o644)
         logs = cls.root / "logs"
         logs.mkdir(mode=0o750)
@@ -74,9 +87,12 @@ class DefaultConfig(unittest.TestCase):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             cls.port = reservation.getsockname()[1]
+        with socket.socket() as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            cls.tls_port = reservation.getsockname()[1]
         cls.server = subprocess.Popen(
             [str(executable), "--root", str(config), "serve", "--http-addr", f"127.0.0.1:{cls.port}",
-             "--https-addr=", "--metrics-addr=", "--no-php", "--workers", "1", "--no-multishot-accept"],
+             "--https-addr=" + f"127.0.0.1:{cls.tls_port}", "--metrics-addr=", "--no-php", "--workers", "1", "--no-multishot-accept"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -115,6 +131,16 @@ class DefaultConfig(unittest.TestCase):
             connection.request("GET", path, headers={"Host": host, "Connection": "close"})
             response = connection.getresponse()
             return response.status, response.read()
+        finally:
+            connection.close()
+
+    def test_https_serves_welcome_without_client_certificate(self):
+        connection = http.client.HTTPSConnection("127.0.0.1", self.tls_port, timeout=3,
+                                                context=ssl._create_unverified_context())
+        try:
+            connection.request("GET", "/", headers={"Host": "arbitrary.invalid"})
+            response = connection.getresponse()
+            self.assertEqual((response.status, response.read()), (200, self.welcome))
         finally:
             connection.close()
 

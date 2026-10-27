@@ -1,0 +1,53 @@
+#!/bin/sh
+# Bootstrap only the packaged HTTPS configuration. Administrator files win.
+set -eu
+root=${1:-}
+group=${2:-httpjet}
+mode=${3:-fresh}
+configuration=$root/etc/httpjet/conf/httpd_config.xml
+[ -f "$configuration" ] && [ ! -L "$configuration" ] || exit 0
+grep -Fq '<certFile>/etc/httpjet/tls/default.crt</certFile>' "$configuration" || exit 0
+for directory in "$root/etc" "$root/etc/httpjet"; do
+    [ -d "$directory" ] && [ ! -L "$directory" ] \
+        && [ "$(stat -c %u "$directory")" = 0 ] \
+        || { echo "httpjet: unsafe configuration directory: $directory" >&2; exit 1; }
+done
+# The directories above must not be writable by group/other; validate explicitly.
+for directory in "$root/etc" "$root/etc/httpjet"; do
+    permissions=$(stat -c %a "$directory")
+    case "$permissions" in *[2367][0-7]|*[0-7][2367]) echo "httpjet: writable configuration directory: $directory" >&2; exit 1;; esac
+done
+tls=$root/etc/httpjet/tls
+if [ ! -e "$tls" ] && [ ! -L "$tls" ]; then
+    mkdir -m0750 "$tls"
+    chown "0:$group" "$tls"
+fi
+[ -d "$tls" ] && [ ! -L "$tls" ] && [ "$(stat -c %u:%a "$tls")" = 0:750 ] \
+    || { echo 'httpjet: unsafe TLS directory' >&2; exit 1; }
+if [ -e "$tls/default.key" ] || [ -L "$tls/default.key" ] || [ -e "$tls/default.crt" ] || [ -L "$tls/default.crt" ]; then
+    [ -f "$tls/default.key" ] && [ ! -L "$tls/default.key" ] \
+        && [ -f "$tls/default.crt" ] && [ ! -L "$tls/default.crt" ] \
+        || { echo 'httpjet: incomplete or unsafe TLS pair; restore it explicitly' >&2; exit 1; }
+else
+    temporary=$(mktemp -d "$tls/.new.XXXXXX")
+    trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+    umask 077
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+        -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1' \
+        -addext 'basicConstraints=critical,CA:FALSE' \
+        -keyout "$temporary/default.key" -out "$temporary/default.crt" 2>/dev/null
+    chown "0:$group" "$temporary/default.key" "$temporary/default.crt"
+    chmod 0640 "$temporary/default.key"
+    chmod 0644 "$temporary/default.crt"
+    mv "$temporary/default.key" "$tls/default.key"
+    mv "$temporary/default.crt" "$tls/default.crt"
+fi
+settings=$root/etc/httpjet/listeners.env
+if [ "$mode" = fresh ] && [ ! -e "$settings" ] && [ ! -L "$settings" ]; then
+    (umask 022; set -C; printf 'HTTPJET_HTTPS_ADDR=0.0.0.0:443\n' > "$settings")
+fi
+if [ "$mode" = fresh ]; then
+    echo 'httpjet: HTTPS bootstrap ready. https://SERVER-IP/ uses a self-signed certificate; browsers will warn until you configure a trusted certificate.'
+else
+    echo 'httpjet: certificate material ready; existing listener settings retained.'
+fi

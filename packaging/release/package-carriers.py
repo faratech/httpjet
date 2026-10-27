@@ -107,6 +107,7 @@ def build(root, session, output, arch, release_id):
         shutil.copytree(root / 'packaging/debian/conf', rpm_payload / 'etc/httpjet/conf')
         shutil.copytree(root / 'packaging/debian/welcome', rpm_payload / 'usr/share/httpjet/welcome')
         copy(root / 'debian/httpjet.service', rpm_payload / 'usr/lib/systemd/system/httpjet.service')
+        copy(root / 'packaging/services/setup-tls', rpm_payload / 'usr/libexec/httpjet/setup-tls', 0o755)
         copy(root / 'packaging/rpm/package-helper.sh', rpm_payload / 'usr/libexec/httpjet/package-helper', 0o755)
         copy(root / 'packaging/rpm/README.md', rpm_payload / 'usr/share/doc/httpjet/README.md')
         copy(root / 'THIRD_PARTY_NOTICES.md', rpm_payload / 'usr/share/doc/httpjet/THIRD_PARTY_NOTICES.md')

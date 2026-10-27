@@ -3,6 +3,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      amend_current_release:
+        description: Replace the current release with rebuilt signed packages (explicit amendment only)
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -170,6 +175,7 @@ jobs:
           ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
           ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
           ARCHIVE_PRIVATE_KEY: ${{ secrets.HTTPJET_ARCHIVE_PRIVATE_KEY }}
+          AMEND_CURRENT_RELEASE: ${{ inputs.amend_current_release || false }}
         run: |
           export GNUPGHOME
           GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/httpjet-signing.XXXXXX")
@@ -193,7 +199,8 @@ jobs:
               shutil.rmtree(previous)
           release.stage(pathlib.Path('candidate'),pathlib.Path('snapshot'),pathlib.Path('archive.asc'),
                         os.environ['ARCHIVE_FINGERPRINT'],pathlib.Path('packaging/installer/install.sh.in'),
-                        candidate=True,previous=previous if previous.exists() else None)
+                        candidate=True,previous=previous if previous.exists() else None,
+                        amend=os.environ['AMEND_CURRENT_RELEASE']=='true')
           PY
       - name: Retain the successfully signed release candidate
         if: success()

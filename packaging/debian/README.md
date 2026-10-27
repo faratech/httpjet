@@ -3,7 +3,7 @@
 The native DEB carrier targets compatible Debian/Ubuntu-family amd64 and arm64
 hosts with systemd and usable unprivileged Linux io_uring. Release qualifications
 record the tested distribution versions. The default service serves a
-static welcome page over HTTP on port 80. TLS, PHP, page caching, metrics and
+static welcome page over HTTP on port 80 and HTTPS on port 443. PHP, page caching, metrics and
 management listeners are disabled.
 Fresh native profiles use `--no-multishot-accept`, retaining io_uring while
 avoiding an optional accept acceleration on older compatible kernels. Custom
@@ -91,3 +91,13 @@ readiness, welcome-body identity, disabled-service upgrades, administrator
 configuration/content preservation, port conflicts and remove/purge/reinstall
 against the actual built packages. Local maintainer tests do not substitute
 for these VM results.
+
+Fresh installations serve HTTP on port 80 and HTTPS on port 443. Each machine
+generates its own self-signed certificate; browsers warn until a trusted certificate
+is configured. The private key is `/etc/httpjet/tls/default.key` (root:httpjet, 0640);
+the certificate is `/etc/httpjet/tls/default.crt`. Both survive upgrades.
+`/etc/httpjet/listeners.env` controls the packaged HTTPS bind address. Existing
+HTTP-only installations retain their settings. No automatic HTTPS redirect is added.
+To install a trusted certificate, set the HTTPS listener's `keyFile` and `certFile`
+in `/etc/httpjet/conf/httpd_config.xml`, validate with `check --strict`, and restart
+the service. Firewall access to TCP 443 must also be permitted by the administrator.

@@ -236,10 +236,10 @@ def verify_qualification(directory):
     if actual != expected:
         raise ValueError('all eight VM targets must pass before stable publication')
 
-def stage(directory, output, key, expected, template, repository=REPO_URL, candidate=False, now=None, previous=None, installer_helper=None):
+def stage(directory, output, key, expected, template, repository=REPO_URL, candidate=False, now=None, previous=None, installer_helper=None, amend=False):
     if load(directory/'manifest.json').get('schema')==2:
         import universal
-        return universal.stage(directory,output,key,expected,template,repository,candidate,now,previous,installer_helper)
+        return universal.stage(directory,output,key,expected,template,repository,candidate,now,previous,installer_helper,amend)
     if output.exists():
         raise ValueError('snapshot output must not exist')
     validate_key(key, expected)

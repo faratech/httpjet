@@ -108,10 +108,19 @@ jobs:
 
           Installation instructions: https://github.com/faratech/httpjet/blob/main/packaging/installer/README.md
           NOTES
+          if python3 -c 'import json,sys; sys.exit(0 if json.load(open("candidate-input/snapshot/publication.json")).get("amend") is True else 1)'; then
+            cat >> release-notes.txt <<'AMENDMENT'
+
+          This release was amended to enable HTTPS on port 443 for fresh installations, using a unique self-signed certificate. Browsers show a certificate warning until a trusted certificate is configured. Existing listener settings and administrator certificates are preserved.
+
+          Already installed this package version? Use `sudo apt-get update && sudo apt-get install --reinstall httpjet` or `sudo dnf --refresh reinstall httpjet` to receive the amended package. HTTPS remains an explicit administrator choice for existing HTTP-only installations.
+          AMENDMENT
+          fi
           if gh release view "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release view "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > existing-release.json
             python3 - <<'PY'
           import hashlib, json, pathlib
+          amend=json.loads(pathlib.Path('candidate-input/snapshot/publication.json').read_text()).get('amend') is True
           assets = {a['name']: a for a in json.loads(pathlib.Path('existing-release.json').read_text())['assets']}
           missing = []
           for path in pathlib.Path('public-assets').iterdir():
@@ -120,11 +129,17 @@ jobs:
                   missing.append(str(path)); continue
               digest = hashlib.sha256(path.read_bytes()).hexdigest()
               if actual.get('size') != path.stat().st_size or actual.get('digest') != 'sha256:' + digest:
-                  raise SystemExit('existing release asset differs: ' + path.name)
+                  if not amend:raise SystemExit('existing release asset differs: ' + path.name)
+                  missing.append(str(path))
           pathlib.Path('missing-assets.txt').write_text(''.join(path+'\n' for path in missing))
           PY
+            amendment=$(python3 -c 'import json; print("true" if json.load(open("candidate-input/snapshot/publication.json")).get("amend") is True else "false")')
             while IFS= read -r path; do
-              gh release upload "$HTTPJET_RELEASE_TAG" "$path" --repo "$GITHUB_REPOSITORY"
+              if [ "$amendment" = true ]; then
+                gh release upload "$HTTPJET_RELEASE_TAG" "$path" --repo "$GITHUB_REPOSITORY" --clobber
+              else
+                gh release upload "$HTTPJET_RELEASE_TAG" "$path" --repo "$GITHUB_REPOSITORY"
+              fi
             done < missing-assets.txt
             gh release edit "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.txt
           else

@@ -24,6 +24,7 @@ case "$1" in
                 fi
             fi
         fi
+        /usr/libexec/httpjet/setup-tls '' httpjet "$mode"
         temporary=$(mktemp "$transaction_dir/pending.XXXXXX")
         printf '%s %s\n' "$release_id" "$mode" > "$temporary"
         chmod 0600 "$temporary"

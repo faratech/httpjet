@@ -37,6 +37,10 @@ EOF
         fi
     fi
 
+    tls_mode=upgrade
+    if [ -z "${2:-}" ]; then tls_mode=fresh; fi
+    /usr/libexec/httpjet/setup-tls '' httpjet "$tls_mode"
+
     # Validate before debhelper can restart an existing service. A failed
     # upgrade leaves the old running process and its active config in place.
     env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin runuser -u httpjet -- \

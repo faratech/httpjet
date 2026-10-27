@@ -10,11 +10,12 @@ Vcs-Git: https://github.com/faratech/httpjet.git
 
 Package: httpjet
 Architecture: amd64 arm64
-Depends: ${misc:Depends}, adduser, systemd, util-linux (>= 2.38)
+Depends: ${misc:Depends}, adduser, systemd, util-linux (>= 2.38), openssl
 Description: Rust HTTP server with LiteSpeed-compatible configuration
  httpjet serves HTTP with a dedicated unprivileged service account and reads
  LiteSpeed-compatible XML configuration. The default installation serves a
- static welcome page on port 80. PHP, TLS, page caching and management listeners
+ static welcome page on ports 80 and 443 with a unique self-signed certificate.
+ PHP, page caching and management listeners
  require explicit administrator configuration.
 
 Package: httpjet-archive-keyring

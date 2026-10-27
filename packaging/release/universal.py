@@ -267,10 +267,11 @@ def copy(source,destination):
     try:os.link(source,destination)
     except OSError:shutil.copyfile(source,destination)
 
-def apt_repository(directory,output,manifest,previous,key,expected,qualified,now):
+def apt_repository(directory,output,manifest,previous,key,expected,qualified,now,replace_current=False):
     b=api();root=output/'apt';pool=root/'pool/main/h/httpjet';pool.mkdir(parents=True)
     if previous:
-        for path in (previous/'history').rglob('*.deb'):copy(path,pool/path.name)
+        for path in (previous/'history').rglob('*.deb'):
+            if not replace_current or path.name not in manifest['artifacts']:copy(path,pool/path.name)
     for name in manifest['artifacts']:
         if name.endswith('.deb'):copy(directory/name,pool/name)
     packages=b.run(['apt-ftparchive','packages','pool'],cwd=root)
@@ -293,20 +294,20 @@ def apt_repository(directory,output,manifest,previous,key,expected,qualified,now
     b.run(['gpg','--batch','--yes','--pinentry-mode','loopback','--local-user',expected,'--digest-algo','SHA256','--clearsign','--output',release.with_name('InRelease'),release])
     sign(release,expected);shutil.copyfile(str(release)+'.asc',release.with_name('Release.gpg'))
 
-def rpm_repository(directory,output,manifest,previous,key,expected):
+def rpm_repository(directory,output,manifest,previous,key,expected,replace_current=False):
     b=api()
     for arch,rpm_arch in (('amd64','x86_64'),('arm64','aarch64')):
         root=output/'rpm'/rpm_arch;pool=root/'Packages';pool.mkdir(parents=True)
         if previous:
             for path in (previous/'history').rglob('*.rpm'):
-                if path.name.endswith(('.'+rpm_arch+'.rpm','.noarch.rpm')):copy(path,pool/path.name)
+                if path.name.endswith(('.'+rpm_arch+'.rpm','.noarch.rpm')) and (not replace_current or path.name not in manifest['artifacts']):copy(path,pool/path.name)
         for name in manifest['artifacts']:
             if name.endswith(('.'+rpm_arch+'.rpm','.noarch.rpm')):copy(directory/name,pool/name)
         b.run(['createrepo_c','--checksum','sha256','--compress-type','gz','--unique-md-filenames','--revision',str(manifest['source_date_epoch']),'--set-timestamp-to-revision',root])
         sign(root/'repodata/repomd.xml',expected)
         copy(key,root/'archive-key.asc')
 
-def stage(directory,output,key,expected,template,repository=None,candidate=False,now=None,previous=None,installer_helper=None):
+def stage(directory,output,key,expected,template,repository=None,candidate=False,now=None,previous=None,installer_helper=None,amend=False):
     b=api();b.validate_key(key,expected)
     if output.exists():raise ValueError('snapshot output must not exist')
     manifest=b.load(directory/'manifest.json');verify_artifacts(directory,manifest)
@@ -322,6 +323,10 @@ def stage(directory,output,key,expected,template,repository=None,candidate=False
             for name in target.get('evidence',{}):copy(directory/b.filename(name),release/name)
     (output/'apt').mkdir()
     same=previous and b.load(previous/'manifest.json').get('release_id')==manifest['release_id']
+    if amend:
+        if not candidate or not same:raise ValueError('amendment must replace exactly the current build-only release')
+        _verify_build_only_current(previous,key,expected)
+        same=False
     if same and (b.sha(previous/'manifest.json')!=b.sha(directory/'manifest.json') or (not candidate and b.sha(previous/'qualification.json')!=b.sha(directory/'qualification.json'))):
         raise ValueError('published release is immutable; increment package revision')
     if same:
@@ -334,8 +339,8 @@ def stage(directory,output,key,expected,template,repository=None,candidate=False
         if not (release/(name+'.asc')).exists():sign(release/name,expected)
     copy(output/'apt/install.sh',release/'install.sh');copy(key,output/'apt/httpjet-archive-keyring.asc')
     now=now or datetime.now(timezone.utc)
-    apt_repository(directory,output,manifest,previous,key,expected,not candidate,now)
-    rpm_repository(directory,output,manifest,previous,key,expected)
+    apt_repository(directory,output,manifest,previous,key,expected,not candidate,now,replace_current=amend)
+    rpm_repository(directory,output,manifest,previous,key,expected,replace_current=amend)
     pointer={'schema':2,'release_id':manifest['release_id'],'manifest_sha256':b.sha(release/'manifest.json'),
              'manifest_size':(release/'manifest.json').stat().st_size,'issued_at':now.strftime('%Y-%m-%dT%H:%M:%SZ'),
              'expires_at':(now+timedelta(days=30)).strftime('%Y-%m-%dT%H:%M:%SZ'),'archive_fingerprint':expected,
@@ -345,6 +350,10 @@ def stage(directory,output,key,expected,template,repository=None,candidate=False
                  'archive_fingerprint':expected,'manifest_sha256':b.sha(release/'manifest.json'),
                  'qualification_sha256':pointer['qualification_sha256'],'stable_sha256':b.sha(output/'releases/stable.json'),
                  'previous_stable_sha256':b.sha(previous/'current-stable.json') if previous and (previous/'current-stable.json').exists() else None})
+    if amend:
+        publication=b.load(output/'publication.json')
+        publication.update(amend=True,amends_manifest_sha256=b.sha(previous/'manifest.json'))
+        b.write_json(output/'publication.json',publication)
     return output
 def release_tuple(value):
     value=support.identity(value)
