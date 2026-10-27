@@ -142,10 +142,11 @@ custom content and troubleshooting, see the [Docker and WSL 2 guide](packaging/d
 Microsoft's WSL Containers runtime is separate from Docker Desktop. It can
 pull the public image, but **httpjet did not start in the WSL Containers 3.0.3
 Windows runner we tested**: its `io_uring_setup` call was denied with `EPERM`.
-The kernel reported io_uring enabled and a seccomp filter active; the exact
-denial source has not been established. The current `wslc` CLI does not expose
-Docker's custom seccomp-profile option. See the [WSL Containers diagnostics](packaging/docker/README.md#microsoft-wsl-containers-wslc)
-and [test run](https://github.com/faratech/httpjet/actions/runs/40459373096).
+A comparison in the WSL session shows io_uring works for the same image with a
+narrow per-container seccomp profile, but the current `wslc` CLI cannot select
+that profile, and Windows-facing networking remains unresolved. See the
+[WSL Containers diagnostics](packaging/docker/README.md#microsoft-wsl-containers-wslc)
+and [comparison run](https://github.com/faratech/httpjet/actions/runs/40460449802).
 
 ### What the installer does
 

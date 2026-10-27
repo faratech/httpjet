@@ -53,14 +53,22 @@ the public `ghcr.io/faratech/httpjet:latest` OCI image, but **httpjet does not
 currently start in the WSL Containers environment we tested**. On a Windows
 Server 2025 GitHub runner using `wslc` 3.0.3, the image's unprivileged
 `io_uring_setup` probe returned `EPERM`. The kernel reported
-`io_uring_disabled=0` and one seccomp filter was active. This points to a
-runtime restriction, but does not prove which component denied the call.
-[Focused diagnostic run](https://github.com/faratech/httpjet/actions/runs/40459373096).
+`io_uring_disabled=0` and one seccomp filter was active. In a controlled check
+inside the same kind of session, its internal Docker CLI ran the same image and
+user with the supplied per-container seccomp profile: the io_uring setup,
+register and NOP probe passed. This points to the default container filter as
+the restriction. [Comparison run](https://github.com/faratech/httpjet/actions/runs/40460449802).
 
 WSL Containers 3.0.3 does not expose Docker's `--security-opt seccomp=...`
 CLI option; the Docker Compose profile above therefore cannot be passed to
-`wslc` that way. httpjet requires io_uring and has no epoll fallback. Do not
-claim `wslc` compatibility until it has been verified in the target environment.
+`wslc` that way. An isolated internal-Docker experiment initialized httpjet's
+HTTP and HTTPS listeners with that profile, but the session-local HTTP probe did
+not return the welcome page; Windows port forwarding was not verified. Direct
+Docker API/CLI launches do not automatically register `wslc`'s Windows port
+relay. [Server experiment](https://github.com/faratech/httpjet/actions/runs/40460619946).
+The internal session is a low-level route, not a supported one-command `wslc`
+configuration. httpjet requires io_uring and has no epoll fallback. Do not
+claim `wslc` compatibility until the full Windows-facing path works.
 
 To check your own WSL Containers installation from PowerShell, first ensure WSL
 is up to date (`wsl --update`, then `wslc version`). Microsoft documents WSL
