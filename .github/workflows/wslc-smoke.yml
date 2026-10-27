@@ -26,6 +26,12 @@ jobs:
           & $wslc version
           if ($LASTEXITCODE -ne 0) { throw 'wslc version failed' }
           "WSLC_EXE=$wslc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Check io_uring as the image's unprivileged user
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:WSLC_EXE run --rm --entrypoint /bin/sh ghcr.io/faratech/httpjet:latest -c 'uname -r; echo io_uring_disabled:; cat /proc/sys/kernel/io_uring_disabled; echo seccomp:; grep "^Seccomp" /proc/self/status; exec /usr/libexec/httpjet/io-uring-probe'
+          if ($LASTEXITCODE -ne 0) { throw 'WSL Containers could not run the io_uring probe' }
       - name: Run the public image with native WSL Containers
         shell: pwsh
         run: |
