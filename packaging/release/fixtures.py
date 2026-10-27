@@ -5,6 +5,12 @@ from pathlib import Path
 import payload,support,universal
 from release import load,sha,write_json,run,validate_key
 
+def build_environment(manifest):
+    epoch=manifest.get('source_date_epoch')
+    if type(epoch) is not int or not 0<=epoch<=0xffffffff:
+        raise ValueError('fixture source_date_epoch must be an unsigned 32-bit integer')
+    return {**os.environ,'SOURCE_DATE_EPOCH':str(epoch)}
+
 def portable(source,target,old_id,new_id):
     with tarfile.open(source,'r:*') as original,target.open('wb') as raw,gzip.GzipFile(fileobj=raw,mode='wb',mtime=0) as compressed,tarfile.open(fileobj=compressed,mode='w|') as result:
         for member in original:
@@ -16,13 +22,15 @@ def portable(source,target,old_id,new_id):
             result.addfile(item,original.extractfile(member) if member.isfile() else None)
 
 def native_fixture(directory,manifest,arch,output,key,fingerprint):
+    environment=build_environment(manifest)
+    if arch not in support.ARCHES:raise ValueError('unsupported native fixture architecture')
     old=manifest['release_id'];upstream=manifest['upstream_version'];revision=manifest['revision']-1
     # On initial revision use -0 only as a native package-manager test fixture.
     fixture_id=upstream+'-'+str(revision);deb=directory/manifest['packages'][arch]
     with tempfile.TemporaryDirectory(prefix='httpjet-native-fixture-') as temporary:
         work=Path(temporary);tree=work/'deb';run(['dpkg-deb','-R',deb,tree])
         control=tree/'DEBIAN/control';control.write_text(re.sub(r'^Version: .+$','Version: '+fixture_id,control.read_text(),flags=re.M))
-        deb_out=output/f'baseline-{arch}.deb';run(['dpkg-deb','--build','--root-owner-group',tree,deb_out])
+        deb_out=output/f'baseline-{arch}.deb';run(['dpkg-deb','--build','--root-owner-group',tree,deb_out],env=environment)
         payload.verify_carrier_binary(deb_out,'deb',manifest['binaries'][arch]['binary_sha256'])
         top=work/'rpm'
         for child in ('SOURCES','BUILD','BUILDROOT','RPMS','SRPMS','SPECS'):(top/child).mkdir(parents=True)
@@ -36,7 +44,8 @@ def native_fixture(directory,manifest,arch,output,key,fingerprint):
         shutil.copyfile(root/'packaging/rpm/preinstall.sh',top/'SOURCES/preinstall.sh')
         rpm_arch={'amd64':'x86_64','arm64':'aarch64'}[arch]
         run(['rpmbuild','-bb','--target',rpm_arch,'--define','_topdir '+str(top),'--define','httpjet_version '+upstream,
-             '--define','httpjet_revision '+str(revision),root/'packaging/rpm/httpjet.spec'])
+             '--define','httpjet_revision '+str(revision),'--define','use_source_date_epoch_as_buildtime 1',
+             '--define','clamp_mtime_to_source_date_epoch 1',root/'packaging/rpm/httpjet.spec'],env=environment)
         rpm_out=output/f'baseline-{arch}.rpm';shutil.copyfile(top/'RPMS'/rpm_arch/f'httpjet-{fixture_id}.{rpm_arch}.rpm',rpm_out)
         run(['rpmsign','--define','__gpg /usr/bin/gpg','--define','_gpg_name '+fingerprint,'--define','_gpg_path '+os.environ['GNUPGHOME'],'--addsign',rpm_out])
         payload.verify_carrier_binary(rpm_out,'rpm',manifest['binaries'][arch]['binary_sha256'])
@@ -45,6 +54,7 @@ def native_fixture(directory,manifest,arch,output,key,fingerprint):
 def create(directory,output,key,fingerprint):
     validate_key(key,fingerprint);manifest=load(directory/'manifest.json')
     if manifest.get('schema')!=2 or manifest.get('test_fixture') or manifest.get('archive_fingerprint')!=fingerprint:raise ValueError('fixture source must be real schema-2 candidate')
+    build_environment(manifest)
     universal.verify_artifacts(directory,manifest)
     if output.exists():raise ValueError('fixture output must not exist')
     output.mkdir(parents=True);ident=support.identity(manifest['upstream_version'],manifest['revision']+1)
