@@ -6,6 +6,10 @@ on:
         description: Completed signed-candidate release run
         required: true
         type: string
+      image_build_run_id:
+        description: Reuse the successful architecture images from a completed container run
+        required: false
+        type: string
   workflow_run:
     workflows: ['Publish signed installer and packages']
     types: [completed]
@@ -39,6 +43,7 @@ jobs:
           printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
   build:
     needs: candidate
+    if: ${{ inputs.image_build_run_id == '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -135,6 +140,7 @@ jobs:
           retention-days: 30
   publish:
     needs: build
+    if: ${{ always() && (needs.build.result == 'success' || (inputs.image_build_run_id != '' && needs.build.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     environment: httpjet-stable
     permissions:
@@ -151,24 +157,45 @@ jobs:
         with:
           name: container-amd64
           path: amd64
+          run-id: ${{ inputs.image_build_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: container-arm64
           path: arm64
+          run-id: ${{ inputs.image_build_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Publish the multi-architecture image
         id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
           ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          PREVIOUS_BUILD_RUN: ${{ inputs.image_build_run_id }}
         run: |
           python3 - <<'PY'
-          import json,os,pathlib,re,sys,tempfile
+          import json,os,pathlib,re,subprocess,sys,tempfile
           sys.path.insert(0,'packaging/release')
           import release,support,universal
           images=[json.load(open('amd64/image.json')),json.load(open('arm64/image.json'))]
           if {image['architecture'] for image in images}!={'amd64','arm64'} or any(image['release_id']!=images[0]['release_id'] or image['manifest_sha256']!=images[0]['manifest_sha256'] for image in images):
               raise ValueError('architecture images differ in release identity')
+          support.identity(images[0]['release_id'])
+          previous=os.environ.get('PREVIOUS_BUILD_RUN','')
+          source_run=previous or os.environ['GITHUB_RUN_ID']
+          if not re.fullmatch(r'[1-9][0-9]*',source_run):raise ValueError('invalid container build run')
+          for image in images:
+              if image['tag']!='ghcr.io/faratech/httpjet:build-'+source_run+'-'+image['architecture']:
+                  raise ValueError('container tag does not match its build run and architecture')
+          if previous:
+              repository=os.environ['GITHUB_REPOSITORY']
+              run=json.loads(subprocess.check_output(['gh','api',f'repos/{repository}/actions/runs/{previous}']))
+              jobs=json.loads(subprocess.check_output(['gh','api',f'repos/{repository}/actions/runs/{previous}/jobs?per_page=100']))['jobs']
+              if run['status']!='completed' or run['path']!='.github/workflows/container-publish.yml' or run['head_repository']['full_name']!=repository:
+                  raise ValueError('container build run is not a completed public workflow')
+              for name in ('build (amd64, ubuntu-24.04)', 'build (arm64, ubuntu-24.04-arm)'):
+                  if not any(job['name']==name and job['conclusion']=='success' for job in jobs):
+                      raise ValueError('container architecture check did not succeed: '+name)
           with tempfile.TemporaryDirectory() as td:
               root=pathlib.Path(td);key=root/'key.asc';key.write_text(os.environ['ARCHIVE_KEY'])
               release.validate_key(key,os.environ['ARCHIVE_FINGERPRINT'])
@@ -180,11 +207,12 @@ jobs:
                   raise ValueError('stable release changed before container promotion')
           for image in images:
               if not re.fullmatch(r'sha256:[0-9a-f]{64}',image['digest']):raise ValueError('invalid image digest')
-          with open(os.environ['GITHUB_ENV'],'a') as out:
+          with open('image-env.sh','w') as out:
               out.write('HTTPJET_CONTAINER_VERSION='+images[0]['release_id']+'\n')
               out.write('HTTPJET_IMAGE_AMD64=ghcr.io/faratech/httpjet@'+images[0]['digest']+'\n')
               out.write('HTTPJET_IMAGE_ARM64=ghcr.io/faratech/httpjet@'+images[1]['digest']+'\n')
           PY
+          . ./image-env.sh
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker buildx imagetools create --tag "ghcr.io/faratech/httpjet:$HTTPJET_CONTAINER_VERSION" \
             --tag ghcr.io/faratech/httpjet:latest "$HTTPJET_IMAGE_AMD64" "$HTTPJET_IMAGE_ARM64"
