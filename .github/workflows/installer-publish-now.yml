@@ -97,9 +97,22 @@ jobs:
           CANDIDATE_RUN: ${{ inputs.candidate_run_id || github.event.workflow_run.id }}
         run: |
           printf 'Signed Linux builds from GitHub Actions run https://github.com/%s/actions/runs/%s.\n\nThe full distribution matrix was not completed for this release. io_uring is required.\n' "$GITHUB_REPOSITORY" "$CANDIDATE_RUN" > release-notes.txt
-          gh release create "$HTTPJET_RELEASE_TAG" public-assets/* --repo "$GITHUB_REPOSITORY" \
-            --verify-tag --draft --title "HTTPJet $HTTPJET_RELEASE_TAG" --notes-file release-notes.txt
-          gh release edit "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+          if gh release view "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release view "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > existing-release.json
+            python3 - <<'PY'
+          import hashlib, json, pathlib
+          assets = {a['name']: a for a in json.loads(pathlib.Path('existing-release.json').read_text())['assets']}
+          for path in pathlib.Path('public-assets').iterdir():
+              actual = assets.get(path.name)
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if not actual or actual.get('size') != path.stat().st_size or actual.get('digest') != 'sha256:' + digest:
+                  raise SystemExit('existing release asset differs: ' + path.name)
+          PY
+          else
+            gh release create "$HTTPJET_RELEASE_TAG" public-assets/* --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --draft --title "HTTPJet $HTTPJET_RELEASE_TAG" --notes-file release-notes.txt
+            gh release edit "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+          fi
       - name: Publish Pages and promote the release
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -114,7 +127,7 @@ jobs:
           WRANGLER_SEND_METRICS: 'false'
         run: |
           python3 - <<'PY'
-          import os, pathlib, subprocess, sys
+          import hashlib, os, pathlib, subprocess, sys, urllib.request
           sys.path.insert(0, 'packaging/release')
           import pages, release
           from publish import S3
@@ -124,6 +137,16 @@ jobs:
               pages.precondition(publication, pathlib.Path('archive.asc'), os.environ['ARCHIVE_FINGERPRINT'])
               subprocess.run(['npx', '--yes', 'wrangler@4.153.0', 'pages', 'deploy', 'pages-site',
                               '--project-name', 'httpjet-packages', '--branch', 'main', '--commit-dirty=true'], check=True)
+              release_id = publication['release_id']
+              for name in ('manifest.json', 'manifest.json.asc', 'publication-status.json', 'RELEASE-NOTES.txt'):
+                  url = pages.ORIGIN + '/releases/' + release_id + '/' + name
+                  request = urllib.request.Request(url, headers={'User-Agent': release.USER_AGENT, 'Cache-Control': 'no-cache'})
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      if response.url != url or hashlib.sha256(response.read()).hexdigest() != release.sha(pathlib.Path('pages-site/releases') / release_id / name):
+                          raise ValueError('Pages metadata is not available at its permanent URL: ' + name)
+              for name in ('manifest.json', 'manifest.json.asc', 'publication-status.json', 'RELEASE-NOTES.txt'):
+                  subprocess.run(['gh', 'release', 'delete-asset', os.environ['HTTPJET_RELEASE_TAG'], name,
+                                  '--repo', os.environ['GITHUB_REPOSITORY'], '--yes'], check=False)
               subprocess.run(['gh', 'release', 'edit', os.environ['HTTPJET_RELEASE_TAG'], '--repo',
                               os.environ['GITHUB_REPOSITORY'], '--latest'], check=True)
           PY

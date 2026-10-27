@@ -92,15 +92,19 @@ def descriptor(path):
     return {'sha256': release.sha(path), 'size': path.stat().st_size}
 
 
+def static_release_metadata(value):
+    return bool(re.fullmatch(r'releases/[0-9]+\.[0-9]+\.[0-9]+-[1-9][0-9]*/(?:manifest\.json(?:\.asc)?|publication-status\.json|RELEASE-NOTES\.txt|SHA256SUMS)', value))
+
+
 def relative(value, immutable=False):
     path = PurePosixPath(value)
     if (not isinstance(value, str) or path.is_absolute() or '\\' in value
             or any(part in ('', '.', '..') for part in value.split('/'))
             or not re.fullmatch(r'[A-Za-z0-9_./+~-]+', value)):
         raise ValueError('unsafe Pages object path')
-    if immutable and (not value.startswith(('apt/', 'rpm/')) or not snapshot.immutable(value)):
+    if immutable and not static_release_metadata(value) and (not value.startswith(('apt/', 'rpm/')) or not snapshot.immutable(value)):
         raise ValueError('retention accepts only immutable native repository objects')
-    if not immutable and value not in ('404.html', '_headers', '_redirects') and not value.startswith(('apt/', 'rpm/', 'releases/stable.json')):
+    if not immutable and value not in ('404.html', '_headers', '_redirects') and not value.startswith(('apt/', 'rpm/', 'releases/stable.json')) and not static_release_metadata(value):
         raise ValueError('unexpected Pages public object')
     return value
 

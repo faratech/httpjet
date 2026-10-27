@@ -79,8 +79,8 @@ APT/RPM metadata, with a maximum selector/APT lifetime of 30 days, and deploys a
 complete replacement Pages snapshot under the same publication lease. It does not
 build software, run a distro matrix, select a newer release or rewrite immutable
 GitHub assets. Qualified older publications remain supported. Expired or altered
-current metadata aborts refresh. Approve a protected scheduled job before its
-current metadata expires.
+current metadata aborts refresh. The branch-restricted environment allows the
+scheduled refresh to run without a manual approval.
 
 ## Credentials and publication lease
 

@@ -13,6 +13,12 @@ import universal
 REPOSITORY = 'faratech/httpjet'
 STATUS = 'publication-status.json'
 NOTES = 'RELEASE-NOTES.txt'
+METADATA = ('manifest.json', 'manifest.json.asc', STATUS, NOTES, 'SHA256SUMS')
+
+
+def github_names(release_id):
+    return {'install.sh', f'httpjet-{release_id}-linux-amd64-static.tar.gz',
+            f'httpjet-{release_id}-linux-arm64-static.tar.gz'}
 
 
 def regular_tree(root):
@@ -95,17 +101,19 @@ def assemble(root, assets, site, key, fingerprint, run_id, previous=None):
     elif publication.get('previous_stable_sha256'):
         raise ValueError('existing publication requires authenticated retention')
     assets.mkdir(parents=True); site.mkdir(parents=True)
-    for path in regular_tree(directory): pages.checked_copy(path, assets/path.name)
-    pages.checked_copy(key, assets/'httpjet-archive-keyring.asc')
+    for name in sorted(github_names(manifest['release_id'])): pages.checked_copy(directory/name, assets/name)
+    metadata_root = site/'releases'/manifest['release_id']; metadata_root.mkdir(parents=True)
+    for name in ('manifest.json', 'manifest.json.asc', 'SHA256SUMS'): pages.checked_copy(directory/name, metadata_root/name)
     status = {'schema': 1, 'publication_mode': 'build-only', 'full_matrix_qualified': False,
               'release_id': manifest['release_id'], 'manifest_sha256': release.sha(directory/'manifest.json'),
               'source_commit': manifest['commit'], 'source_run_id': run_id, 'archive_fingerprint': fingerprint,
               'notice': 'The full support-matrix lifecycle qualification was not completed. This release is not fully qualified.'}
-    release.write_json(assets/STATUS, status)
-    (assets/NOTES).write_text('HTTPJet '+manifest['release_id']+'\n\n'+status['notice']+'\nSigned source-built candidate artifacts are published at the operator\'s request.\nio_uring is required.\nSource commit: '+manifest['commit']+'\nSource run: https://github.com/'+REPOSITORY+'/actions/runs/'+run_id+'\n')
-    entry = {'tag': manifest['tag'], 'assets': {path.name: pages.descriptor(path) for path in regular_tree(assets)}}
+    release.write_json(metadata_root/STATUS, status)
+    (metadata_root/NOTES).write_text('HTTPJet '+manifest['release_id']+'\n\n'+status['notice']+'\nSigned source-built candidate artifacts are published at the operator\'s request.\nio_uring is required.\nSource commit: '+manifest['commit']+'\nSource run: https://github.com/'+REPOSITORY+'/actions/runs/'+run_id+'\n')
+    entry = {'tag': manifest['tag'], 'assets': {path.name: pages.descriptor(path) for path in [*regular_tree(assets), *regular_tree(metadata_root)]}}
     rid = manifest['release_id']
-    if rid in releases and releases[rid] != entry: raise ValueError('immutable GitHub asset set changed')
+    if rid in releases and (releases[rid]['tag'] != entry['tag'] or any(name in releases[rid]['assets'] and releases[rid]['assets'][name] != item for name, item in entry['assets'].items())):
+        raise ValueError('immutable published asset bytes changed')
     releases[rid] = entry
     if len(releases) > pages.MAX_REDIRECTS: raise ValueError('Pages redirect history exceeds 100 rules')
     for name, item in retained.items():
@@ -123,7 +131,9 @@ def assemble(root, assets, site, key, fingerprint, run_id, previous=None):
             pages.checked_copy(path, site/name)
     for name in ('stable.json', 'stable.json.asc'):
         pages.checked_copy(native/'releases'/name, site/'releases'/name)
-    redirects = ''.join(f'/releases/{version}/* https://github.com/{REPOSITORY}/releases/download/{value["tag"]}/:splat 302\n' for version, value in sorted(releases.items()))
+    redirects = ''.join(f'/releases/{version}/{name} https://github.com/{REPOSITORY}/releases/download/{value["tag"]}/{name} 302\n'
+                        for version, value in sorted(releases.items()) for name in sorted(github_names(version)))
+    if len(redirects.splitlines()) > 2000: raise ValueError('Pages static redirect limit exceeded')
     if any(len(line) > 1000 for line in redirects.splitlines()): raise ValueError('Pages redirect line too long')
     (site/'_redirects').write_text(redirects)
     (site/'_headers').write_text(pages.HEADERS)
@@ -135,7 +145,7 @@ def assemble(root, assets, site, key, fingerprint, run_id, previous=None):
     if len(objects)+2 > pages.MAX_FILES: raise ValueError('Pages file limit exceeded')
     index = {'schema': 1, 'release_id': rid, 'repository': REPOSITORY, 'archive_fingerprint': fingerprint,
              'stable_sha256': publication['stable_sha256'], 'releases': releases, 'site_objects': objects,
-             'objects': {name: item for name, item in objects.items() if name.startswith(('apt/', 'rpm/')) and snapshot.immutable(name)}}
+             'objects': {name: item for name, item in objects.items() if pages.static_release_metadata(name) or name.startswith(('apt/', 'rpm/')) and snapshot.immutable(name)}}
     release.write_json(site/pages.INDEX, index); universal.sign(site/pages.INDEX, fingerprint)
     universal.verify_signed(site/pages.INDEX, site/(pages.INDEX+'.asc'), key)
     return status
