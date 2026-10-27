@@ -26,6 +26,12 @@ jobs:
           & $wslc version
           if ($LASTEXITCODE -ne 0) { throw 'wslc version failed' }
           "WSLC_EXE=$wslc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Inspect the disposable WSL Containers session
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:WSLC_EXE system session run /bin/sh -c 'id; echo session-tools:; command -v docker || true; command -v curl || true; echo daemon-socket:; ls -l /var/run/docker.sock; echo daemon-config:; cat /etc/docker/daemon.json'
+          if ($LASTEXITCODE -ne 0) { throw 'WSL Containers session inspection failed' }
       - name: Check io_uring as the image's unprivileged user
         shell: pwsh
         run: |
