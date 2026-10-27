@@ -1,5 +1,5 @@
 # The base is the architecture-specific OCI carrier verified against the signed release manifest.
-ARG BASE_IMAGE
+ARG BASE_IMAGE=httpjet-verified-base:latest
 FROM ${BASE_IMAGE}
 USER root
 RUN apk add --no-cache openssl \

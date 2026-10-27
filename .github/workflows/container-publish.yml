@@ -82,10 +82,11 @@ jobs:
           base=$(python3 -c 'import json; print(json.load(open("verified.json"))["image_id"])')
           docker load --input "$archive"
           test "$(docker image inspect "$base" --format '{{.Id}}')" = "$base"
+          docker tag "$base" "httpjet-verified-base:$ARCH"
           context="$RUNNER_TEMP/httpjet-container-context"
           mkdir -p "$context/packaging/docker"
           cp packaging/docker/Containerfile packaging/docker/entrypoint.sh "$context/packaging/docker/"
-          docker build --build-arg "BASE_IMAGE=$base" --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+          DOCKER_BUILDKIT=0 docker build --build-arg "BASE_IMAGE=httpjet-verified-base:$ARCH" --label "org.opencontainers.image.revision=$GITHUB_SHA" \
             --tag "httpjet-container:$ARCH" --file "$context/packaging/docker/Containerfile" "$context"
           container='httpjet-container-smoke'
           trap 'docker rm -fv "$container" >/dev/null 2>&1 || true' EXIT
