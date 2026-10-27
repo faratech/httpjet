@@ -5,6 +5,7 @@ from pathlib import Path
 import payload,support,universal
 import release as b
 import vm
+from https_fixture import HTTPSFixtureServer
 
 ROOT=Path(__file__).resolve().parents[2]
 
@@ -24,6 +25,28 @@ def port(udp=False):
 def ssh(key,number,known,args,*,output=None,timeout=1800,check=True,cwd=None):
     invocation=[str(x) for x in vm.ssh_args(key,number,known)]+[(('cd '+shlex.quote(cwd)+' && ') if cwd else '')+shlex.join([str(x) for x in args])]
     return subprocess.run(invocation,check=check,stdout=output or subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout)
+
+def wait_cloud_init(key,ports,known,transcript,deadline,alive,*,architecture='amd64'):
+    # Only this idempotent status query may retry a transport close. A cloud-init
+    # failure (including status 2) is preserved, under one fixed wait budget.
+    # Tag8 Ubuntu24 ARM was still progressing through apt indexes at the
+    # 600s cutoff under TCG. Allow bounded ARM boot/package headroom without
+    # resetting this budget or extending the existing overall row deadline.
+    budget=1800 if architecture=='arm64' else 600
+    deadline=min(deadline,time.monotonic()+budget)
+    while time.monotonic()<deadline:
+        if not alive():raise RuntimeError('cloud-init wait: VM exited')
+        remaining=deadline-time.monotonic()
+        if remaining<=0:break
+        result=ssh(key,ports['ssh'],known,['sudo','-n','cloud-init','status','--wait'],
+                   output=transcript,timeout=remaining,check=False)
+        if result.returncode==0:return
+        if result.returncode!=255:
+            raise subprocess.CalledProcessError(result.returncode,result.args,output=result.stdout)
+        transcript.write(b'\ncloud-init SSH transport closed (255); retrying within the original deadline\n')
+        transcript.flush()
+        time.sleep(min(2,max(0,deadline-time.monotonic())))
+    raise TimeoutError('cloud-init wait: deadline expired after SSH transport failures')
 
 def send_tree(key,number,known,source,target):
     archive=subprocess.Popen(['tar','-C',str(source),'-cf','-','.'],stdout=subprocess.PIPE)
@@ -277,7 +300,7 @@ def main():
         cert=root/'test-ca.crt';private=root/'test-key.pem'
         command(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=httpjet-qualification',
                  '-addext','subjectAltName=DNS:portable.test,DNS:localhost,DNS:httpjet-qualification.local,IP:127.0.0.1,IP:10.0.2.2','-keyout',private,'-out',cert],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),functools.partial(http.server.SimpleHTTPRequestHandler,directory=serve))
+        server=HTTPSFixtureServer(('127.0.0.1',0),functools.partial(http.server.SimpleHTTPRequestHandler,directory=serve))
         context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.load_cert_chain(cert,private);server.socket=context.wrap_socket(server.socket,server_side=True)
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         try:
@@ -298,7 +321,7 @@ def execute_session(args,row,manifest,image_lock,session,work,key,ports,known,pa
         try:
             vm.wait_probe([*base_ssh,'true'],deadline=deadline,alive=lambda:process.poll() is None,label='matrix SSH boot')
             if row['executor'] in ('cloud','cloud-lock'):
-                ssh(key,ports['ssh'],known,['sudo','-n','cloud-init','status','--wait'],output=transcript,timeout=600)
+                wait_cloud_init(key,ports,known,transcript,deadline,lambda:process.poll() is None,architecture=row['architecture'])
             send_tree(key,ports['ssh'],known,payload_dir,remote)
             if image_lock.get('operator_configuration'):
                 ssh(key,ports['ssh'],known,['sudo','-n','python3','-B',remote+'/operator-prepare.py','--spec',remote+'/spec.json','--probe',remote+'/io-uring-probe','--output',remote+'/operator.json'],output=transcript)

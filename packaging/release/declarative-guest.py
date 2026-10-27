@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise native system generations using declarative inputs, never /etc edits."""
-import argparse,hashlib,http.client,json,os,subprocess,time
+import argparse,hashlib,json,os,subprocess,time
+from http import client as http_client
 from pathlib import Path
 
 def run(command,env=None):
@@ -8,7 +9,7 @@ def run(command,env=None):
     print(result.stdout,end='',flush=True);print(result.stderr,end='',flush=True)
     return result.stdout.strip()
 def http():
-    connection=http.client.HTTPConnection('127.0.0.1',80,timeout=3)
+    connection=http_client.HTTPConnection('127.0.0.1',80,timeout=3)
     try:
         connection.request('GET','/');response=connection.getresponse();body=response.read(2*1024*1024)
         return body if response.status==200 else None
@@ -18,7 +19,7 @@ def ready(timeout=60):
     while time.monotonic()<deadline:
         try:
             if http() is not None:return
-        except (OSError,http.client.HTTPException):pass
+        except (OSError,http_client.HTTPException):pass
         time.sleep(.5)
     raise RuntimeError('native declarative service did not become ready')
 def service(spec):

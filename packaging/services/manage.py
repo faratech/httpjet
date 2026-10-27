@@ -487,6 +487,14 @@ class Manager:
                          env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin"})
         self.wait_ready(state)
 
+    def start(self, state):
+        # runsv can launch as soon as its link is enabled. Its run profile
+        # records that PID's birth tick; a later controller prepare would
+        # incorrectly make the same process stale before it publishes ready.
+        if state["init"] != "runit":
+            self.prepare(state)
+        self.service("start", state)
+
     def profile(self, state):
         paths = {"systemd":"/usr/local/lib/systemd/system/httpjet.service", "openrc":"/etc/init.d/httpjet",
                  "runit":"/etc/sv/httpjet/run", "sysv":"/etc/rc.d/rc.httpjet" if state.get("sysv_style") == "slackware" else "/etc/init.d/httpjet"}
@@ -777,8 +785,7 @@ class Manager:
             if first_activation:
                 self.enable(state, True)
             if was_running or first_activation:
-                self.prepare(state)
-                self.service("start", state)
+                self.start(state)
                 if first_activation:
                     import http.client
                     connection = http.client.HTTPConnection("127.0.0.1", 80, timeout=3)
@@ -809,8 +816,7 @@ class Manager:
                 previous["versions"] = state["versions"]
                 self.save(previous)
                 if was_running:
-                    self.prepare(previous)
-                    self.service("start", previous)
+                    self.start(previous)
             else:
                 self.link.unlink(missing_ok=True)
                 state["current"] = None
@@ -964,8 +970,7 @@ def main():
         else:
             if args.command == "restart":
                 manager.service("stop", state)
-            manager.prepare(state)
-            manager.service("start", state)
+            manager.start(state)
         return 0
     finally:
         if lock is not None:

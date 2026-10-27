@@ -55,6 +55,21 @@ class RunitReadiness(unittest.TestCase):
             self.manager.service('start',{'init':'runit'})
         self.assertEqual([call.args[0][1] for call in calls.call_args_list],['status','up']);application.assert_not_called()
 
+    def test_runit_start_keeps_the_supervisor_owned_process_birth_epoch(self):
+        state={'init':'runit','launch_tick':200}
+        with patch.object(self.manager,'prepare',side_effect=AssertionError('controller must not replace supervisor epoch')), \
+             patch.object(self.manager,'service') as service:
+            self.manager.start(state)
+        self.assertEqual(state['launch_tick'],200);service.assert_called_once_with('start',state)
+
+    def test_other_init_profiles_keep_controller_preparation(self):
+        for init in ('systemd','openrc','sysv','none'):
+            sequence=[];state={'init':init}
+            with self.subTest(init=init),patch.object(self.manager,'prepare',side_effect=lambda state:sequence.append('prepare')), \
+                 patch.object(self.manager,'service',side_effect=lambda action,state:sequence.append(action)):
+                self.manager.start(state)
+            self.assertEqual(sequence,['prepare','start'])
+
     @unittest.skipUnless(shutil.which('sv') and shutil.which('runsvdir'),'real supervisor proof requires runit tools')
     def test_real_delayed_runsv_and_stale_fifo(self):
         self.service.mkdir(parents=True);script=self.service/'run';script.write_text('#!/bin/sh\nexec sleep 600\n');script.chmod(0o755)

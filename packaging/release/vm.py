@@ -10,6 +10,7 @@ import argparse
 import functools
 import hashlib
 import http.server
+from https_fixture import HTTPSFixtureServer
 import os
 from pathlib import Path
 import re
@@ -132,7 +133,7 @@ def main():
         run(['openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=httpjet-qualification',
              '-addext','subjectAltName=IP:10.0.2.2','-keyout',private,'-out',cert],stderr=subprocess.DEVNULL)
         serve=work/'serve';serve.mkdir();shutil.copytree(args.snapshot,serve/'apt')
-        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),functools.partial(http.server.SimpleHTTPRequestHandler,directory=serve))
+        server=HTTPSFixtureServer(('127.0.0.1',0),functools.partial(http.server.SimpleHTTPRequestHandler,directory=serve))
         tls=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);tls.load_cert_chain(cert,private)
         server.socket=tls.wrap_socket(server.socket,server_side=True)
         render_installer(Path(__file__).parents[1]/'installer/install.sh.in',payload/'install.sh',args.public_key,args.fingerprint,
