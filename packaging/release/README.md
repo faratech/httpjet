@@ -1,204 +1,113 @@
-# Linux installer release operations (schema 2)
+# Linux installer releases
 
-This pipeline builds and qualifies one shared static payload per architecture,
-then distributes it through DEB, RPM, a portable tarball and OCI. It does not
-provision signing credentials, public hosting, website routes, GitHub environment
-protection, or an already-qualified stable release.
+The release flow is **build → sign → publish**. A full distribution lifecycle
+matrix is not a release requirement and does not run automatically. Build-only
+releases state that full matrix qualification was not completed; they do not
+manufacture passed receipts or claim full qualification.
 
-## Identity and build contract
+## Build and publish
 
-The canonical release ID is `X.Y.Z-N`. Revision 1 uses tag `vX.Y.Z`; packaging
-revisions use `vX.Y.Z-N`. Cargo keeps upstream version `X.Y.Z`, while package
-metadata, manifests, URLs and versioned installations use the complete release
-ID. Increment the packaging revision instead of replacing published bytes.
+1. Export the reviewed public source and create its canonical release tag on
+   public `main`. Release IDs use `X.Y.Z-N`: revision 1 uses tag `vX.Y.Z`, later
+   packaging revisions use `vX.Y.Z-N`. Increment the revision to change published
+   software or installer bytes.
+2. `installer-release.yml` builds native amd64 and arm64 static musl payloads,
+   packages DEB/RPM/portable archives and OCI carriers, and signs the candidate
+   in `httpjet-candidate-signing`. The payload is source-bound and each carrier
+   contains the same architecture-specific ELF. No client Rust toolchain or PGO
+   profile is required. Linux io_uring is required.
+3. The successful candidate job uploads `signed-candidate`, containing software,
+   a signed native-repository snapshot, its public key, and authenticated prior
+   history when present. It creates no lifecycle fixtures. Prepared OS inputs
+   stay outside public software downloads.
+4. `installer-publish-now.yml` publishes after the build workflow completes, or
+   accepts a manual `candidate_run_id`. It checks the exact public tag/commit and
+   successful native/signing jobs, then authenticates the archive signatures and
+   artifact hashes. The protected `httpjet-stable` job publishes the immutable
+   GitHub assets with latest disabled, deploys the complete Pages snapshot under
+   the publisher lease, then marks the GitHub release latest.
 
-Native amd64 and arm64 builders use pinned Rust/C toolchains and baseline CPU
-flags. Source export, locked dependencies and the pinned source-built zstd trainer
-are bound to the build session. Client machines need no Rust toolchain. Static
-musl ELF validation rejects an interpreter, DT_NEEDED libraries, GLIBC references,
-wrong architecture and newer declared CPU requirements. No host PGO is reused.
+Use the signed candidate already produced by a completed signing job when an
+older workflow's optional matrix was cancelled. Its overall run does not need a
+successful matrix. Do not upload the Actions artifact directory indiscriminately:
+old artifacts may contain private OS inputs or intentionally labelled test
+fixtures. `publish_build_only.py` selects only authenticated software and emits
+an explicit `publication-status.json` and `RELEASE-NOTES.txt`.
 
-Carrier packaging consumes the source-bound payload without rewriting its ELF.
-DEB, RPM, portable tar and OCI inspections must recover the same binary SHA256.
-Nix/Guix definitions also copy the fixed-hash payload without ELF fixups. Complete
-corresponding source, dependency/license notices and per-architecture provenance
-accompany the software. RPM headers are signed and verified before the final
-manifest records their signed hashes; payload identity must remain unchanged.
+The existing `installer-publish.yml` qualified-release path is retained for its
+older artifact format; it is not the normal build-only release path.
 
-## Publication boundary
+## Signatures, files and hosting
 
-Configure protected GitHub environments `httpjet-candidate-signing` and
-`httpjet-stable`, with reviewers and restricted deployment tags/branches. Each
-signing environment supplies `HTTPJET_ARCHIVE_PRIVATE_KEY` for batch GPG in a
-private temporary home. Private keys must never enter checkout, artifacts or the
-bucket. Repository variables provide:
+The schema-2 manifest binds package/archive sizes, SHA256 hashes, source commit,
+archive fingerprint and native build provenance. RPM headers are signed before
+manifest creation. The manifest, stable selector, APT metadata and RPM repository
+metadata are authenticated with the archive key. Static ELF checks reject a
+dynamic interpreter, DT_NEEDED libraries, GLIBC references and wrong architecture.
 
-- `HTTPJET_ARCHIVE_PUBLIC_KEY`: the approved ASCII-armored public key.
-- `HTTPJET_ARCHIVE_FINGERPRINT`: its complete uppercase primary fingerprint.
-- `HTTPJET_FIRST_RELEASE=true`: initial bootstrap only, permitting an actual 404
-  for `releases/stable.json` to select labelled lifecycle fixtures. Other failures
-  still abort. Remove it after the first publication.
-- `HTTPJET_S3_ENDPOINT`, `HTTPJET_S3_BUCKET`, `HTTPJET_S3_REGION`: an HTTPS,
-  path-style S3-compatible endpoint without an endpoint path. Region defaults to
-  `auto` when unset.
-
-The stable environment supplies `CLOUDFLARE_API_TOKEN` with Pages Write access and
-`CLOUDFLARE_ACCOUNT_ID` for the separate `httpjet-packages` Pages project.
-`HTTPJET_S3_ACCESS_KEY_ID` and `HTTPJET_S3_SECRET_ACCESS_KEY`, mapped to AWS
-credential variables, retain only the private `_httpjet/publication.lock` lease.
-That endpoint must support strongly consistent conditional PUT. Public package
-objects are delivered entirely by Pages and GitHub Releases. Existing website
-projects, custom domains, DNS and Bot Fight Mode remain independent.
-
-The site layout is:
+Public package hosting is `https://httpjet-packages.pages.dev/`:
 
 ```
-apt/                                  # signed APT metadata, pool, bootstrap/key
-rpm/x86_64/                           # signed RPM-MD repository
-rpm/aarch64/
-releases/X.Y.Z-N/                      # manifest(.asc), software, proof objects
-releases/stable.json                   # authenticated current selector
-releases/stable.json.asc
+apt/install.sh                         rendered bootstrap and embedded public key
+apt/dists/stable/                      signed APT metadata and by-hash indexes
+apt/pool/                              native Debian packages
+rpm/x86_64/ and rpm/aarch64/           signed RPM packages and RPM-MD metadata
+releases/stable.json(.asc)             signed current selector
+releases/X.Y.Z-N/                      redirects to immutable GitHub release assets
+pages-index.json(.asc)                 signed native history and asset hash catalog
 ```
 
-Serve native repository files and the signed selector at
-`https://httpjet-packages.pages.dev/`. Publish and verify the complete qualified
-GitHub Release asset set without marking it latest before deploying Pages.
-`pages.py project` emits native repository files, a real top-level `404.html`,
-no-store headers and a version-specific redirect to each immutable GitHub tag.
-Large source archives and OCI images stay on GitHub, avoiding Pages' 25 MiB file
-limit. The signed `pages-index.json(.asc)` binds every retained immutable native
-object and every redirected asset name/hash. Authenticated `fetch_current`
-recovers history without depending on expiring Actions artifacts. Prior native
-files and redirects remain available. Projection rejects more than 20,000 files,
-25 MiB per native file, or 100 dynamic redirects rather than pruning history.
-Pages may answer Range requests with a complete 200 response; partial responses
-are not assumed by the publisher.
+Source archives, OCI images and other large assets remain on GitHub Releases.
+The signed Pages index preserves old native packages and release redirects and
+binds the build-only publication notice to its release, manifest and original
+source run. Build-only pointers retain `qualification_sha256: "unqualified"`.
+Pages projections enforce its 25 MiB per-file, 20,000-file and 100 dynamic-redirect
+limits. The optional `https://httpjet.net/install.sh` website redirect is separate
+from package publication.
 
-`pages.py deploy` holds the private CAS lease across the authenticated previous
-pointer recheck, pinned Wrangler deployment, public byte/real-404/redirect checks,
-and optional GitHub latest promotion plus latest-download verification. Failures
-retain the lease for explicit operator inspection and recovery. Refresh deploys
-one complete replacement Pages snapshot while reusing immutable GitHub assets.
-Before the first candidate, `pages.py bootstrap` prepares only an empty index,
-404 page and no-store headers. After reviewed deployment, `probe-bootstrap`
-and the manual `installer-origin-check.yml` verify external and GitHub-hosted
-GET/HEAD, genuine 404 and write refusal; this publishes no installer or packages.
-An operator may additionally
-deploy `website-redirects` to provide `https://httpjet.net/install.sh`; that
-website alias is optional and is not deployed by the release workflow.
+## Metadata refresh
 
-## Candidate and qualification
+`installer-refresh.yml` runs weekly on Monday at 04:13 UTC and supports manual
+execution. It authenticates the current selector, manifest, packages and retained
+history. Explicit `--universal --allow-unqualified` fetching additionally binds
+the build-only status and release notes through the signed Pages index; default
+fetching continues to require qualification.
 
-1. Export the reviewed public source, retain the existing public-only CI files,
-   and create the canonical tag on the resulting public commit. Record the mapping
-   to the reviewed internal source separately. The native jobs source-build both
-   static payloads and carriers from that public tag. OCI derivation uses an
-   authenticated architecture-specific base and the same ELF. Test/prebuilt
-   shortcuts cannot authorize a release.
-2. Resolve and hash-lock image inputs against the versioned
-   `support-matrix.json`. Prepared OS archives remain workflow artifacts;
-   published locks/evidence describe their hashes. Public-repository workflow
-   artifacts may be accessible to others, so do not place credentials in them.
-   The OS archives are qualification inputs, not software release downloads.
-   The Slackware image is assembled offline from the checksum-pinned official
-   installation media with its prerequisites preinstalled; its lock records
-   this prepared state instead of describing it as an untouched minimal image.
-3. Approve candidate signing. The job signs RPMs, builds the schema-2 manifest and
-   signs a local unpublishable test site. It receives no hosting credentials.
-   Previous stable inputs are authenticated through the signed selector/manifests.
-   First-release native lower-version and portable forward-version fixtures are
-   explicit same-ELF packaging tests, not evidence about an older runtime.
-4. Run every required support row on its native architecture. The current policy
-   has 25 rows across mutable package/portable systems, declarative NixOS/Guix,
-   immutable CoreOS and OCI. Missing executors, failed boots, unavailable probes
-   and omitted checks fail closed; they never become passed or skipped receipts.
-   Mutable guests exercise real version transitions, state opt-outs, config/data,
-   source denial and lifecycle. Host probes/protocol clients and reboot checks
-   retain their actual scope, UID, flags, hashes and logs. Declarative systems use
-   native generations; CoreOS uses its OCI/systemd route, without an OS rebase.
-5. Assemble qualification only after all required rows and attachments verify.
-   The qualification run attests the final signed software and source assets.
-   Dispatch promotion **from the exact public release tag** with that successful
-   qualification run ID, review its evidence, then approve the stable environment.
-   Promotion verifies the run/tag/commit, renders the bootstrap/helper from the
-   qualified commit, and attests those newly generated files separately. The GitHub
-   release job verifies both workflows' attestations before publishing assets.
-   No stable pointer advances from a candidate or incomplete matrix.
+Refresh keeps the exact release ID, software, manifest signatures, approved
+installer and original source-run identity. It renews the signed selector and
+APT/RPM metadata, with a maximum selector/APT lifetime of 30 days, and deploys a
+complete replacement Pages snapshot under the same publication lease. It does not
+build software, run a distro matrix, select a newer release or rewrite immutable
+GitHub assets. Qualified older publications remain supported. Expired or altered
+current metadata aborts refresh. Approve a protected scheduled job before its
+current metadata expires.
 
-For a direct row invocation, see `matrix_vm.py --help`. It consumes authenticated
-artifacts, the candidate site, approved image locks and previous/fixture inputs.
-Run qualification only in disposable environments and retain console/guest logs
-on failures. These commands install tools and services inside those guests.
+## Credentials and publication lease
 
-## Commit, locking and refresh
+Configure protected `httpjet-candidate-signing` and `httpjet-stable` environments.
+Both signing jobs use `HTTPJET_ARCHIVE_PRIVATE_KEY` only in an ephemeral private
+GPG home. The approved public key and full primary fingerprint are repository
+variables `HTTPJET_ARCHIVE_PUBLIC_KEY` and `HTTPJET_ARCHIVE_FINGERPRINT`. Never put
+private keys in the checkout or artifacts.
 
-The universal manifest and qualification have detached archive signatures. The
-signed stable selector binds the release ID, manifest SHA256/size, qualification,
-issued time and expiry. Its maximum lifetime is 30 days. APT has matching signed
-Date/Valid-Until metadata and by-hash indexes; RPM requires signed packages and
-signed repomd metadata. Default selection refuses a silent version downgrade.
+The stable environment also needs `CLOUDFLARE_API_TOKEN` with Pages Write access,
+`CLOUDFLARE_ACCOUNT_ID`, and private lease credentials
+`HTTPJET_S3_ACCESS_KEY_ID` / `HTTPJET_S3_SECRET_ACCESS_KEY`. Repository variables
+`HTTPJET_S3_ENDPOINT`, `HTTPJET_S3_BUCKET` and `HTTPJET_S3_REGION` identify the
+HTTPS S3-compatible lease store. Wrangler is pinned by the release tooling.
+Public package bytes are served by Pages and GitHub, not by this private bucket.
+These workflows do not provision credentials, environment reviewers, DNS, website
+routes or hosting projects.
 
-Immutable software/proof/index objects upload first. Native commit metadata and
-the signed stable selector follow with conditional replacement. All writers must
-use the bucket-scoped conditional `_httpjet/publication.lock`; GitHub's shared
-publication concurrency group also serializes the normal promotion/refresh jobs.
-The weekly refresh authenticates the current selector, reuses that exact release,
-qualification and approved bootstrap, and refreshes expiry without choosing a
-new tag or package. A scheduled refresh also waits for the `httpjet-stable`
-environment's required reviewer; approve it before metadata expires. Expired
-current metadata stops the job for investigation.
+All publishers share `_httpjet/publication.lock` and the Actions concurrency group
+`httpjet-apt-stable`. The private endpoint must support strongly consistent
+conditional PUT. A missing lock is acquired with `If-None-Match: *`; a released
+record is acquired using its exact ETag and `If-Match`. Completion conditionally
+writes the owned record as `released`. No DELETE or automatic timeout takeover is
+used; see the [R2 conditional-write contract](https://developers.cloudflare.com/r2/api/s3/api/).
 
-The persistent lock has `held` and `released` states. A missing record is acquired
-with `If-None-Match: *`; a released record is acquired with `If-Match` against its
-exact ETag. Successful completion writes `released` through conditional PUT using
-the owned held-record ETag. No DELETE is required. See the
-[R2 S3 API conditional-write contract](https://developers.cloudflare.com/r2/api/s3/api/)
-when provisioning an endpoint.
-
-Failures retain `held`; no timeout-based takeover is allowed. Inspect the record's
-owner/token/run identity and current authenticated metadata, prove that publisher
-has stopped, and reconcile partial metadata from its known signed snapshot. Only
-then write the reviewed record with state `released`, using exact-ETag conditional
-PUT. With authorized credentials already configured:
-
-```sh
-# HTTPJET_REVIEWED_LOCK_ETAG is the exact ETag reviewed by the operator.
-PYTHONPATH=packaging/release python3 - <<'UNLOCK'
-import json, os, tempfile
-from pathlib import Path
-from publish import S3
-store = S3()
-key = '_httpjet/publication.lock'
-expected = os.environ['HTTPJET_REVIEWED_LOCK_ETAG']
-with store.request('GET', key) as response:
-    if response.headers['ETag'] != expected:
-        raise SystemExit('Lock changed since review; investigate again')
-    record = json.load(response)
-if record.get('state') != 'held':
-    raise SystemExit('Expected the reviewed held record')
-record['state'] = 'released'
-with tempfile.TemporaryDirectory(prefix='httpjet-lock-recovery-') as temporary:
-    document = Path(temporary) / 'released.json'
-    document.write_text(json.dumps(record, sort_keys=True) + '\n')
-    store.put(key, document, condition={'if-match': expected})
-UNLOCK
-```
-
-Do not use unconditional writes, deletion, automatic timeout recovery or a
-publisher that bypasses the record. Verify conditional-write support before
-allowing publication.
-
-## Current evidence and limits
-
-Local checks have exercised the amd64 static payload and common-carrier byte
-identity, real signed portable lifecycle on Alpine/BusyBox, real generic Debian
-systemd lifecycle including notification/reboot/state opt-outs, protocol clients,
-and a non-root read-only OCI case. A raw Alpine/OpenRC image has booted with its
-actual PID 1 and non-root SSH; that boot proof alone is not installer lifecycle
-qualification. Nix expressions/package bytes have been checked separately.
-
-Those results do not establish all 25 rows, ARM64 runtime, a complete NixOS/Guix
-generation lifecycle or CoreOS qualification. Definitions, source inspection,
-component probes and fixture runs are not substitutes. Inspect the public
-qualification and promotion workflow runs for the actual release status.
+A failed publisher retains a held record. Before recovery, inspect its owner/run
+and the authenticated public metadata, prove the publisher has stopped, and
+reconcile its partial publication. Only then conditionally write the reviewed
+record as `released` using the exact reviewed ETag. Never overwrite a changed
+record or replace immutable release assets to force a retry.

@@ -314,11 +314,12 @@ def download(url, output):
             raise ValueError('refusing HTTPS downgrade redirect')
         shutil.copyfileobj(response, stream)
 
-def fetch_current(repository, output, key, expected, universal_release=False):
+def fetch_current(repository, output, key, expected, universal_release=False, allow_unqualified=False):
     """Fetch ONLY the hashes/version already approved by the current InRelease."""
     if universal_release:
         import universal
-        return universal.fetch_current(repository,output,key,expected)
+        return universal.fetch_current(repository,output,key,expected,allow_unqualified=allow_unqualified)
+    if allow_unqualified:raise ValueError('--allow-unqualified requires --universal')
     validate_key(key, expected); output.mkdir(parents=True, exist_ok=False)
     signed = output / 'current.InRelease'; download(repository + '/dists/stable/InRelease', signed)
     with tempfile.TemporaryDirectory(prefix='httpjet-gpgv-') as temporary:
@@ -392,11 +393,13 @@ def main():
         command.add_argument('--repository', default=REPO_URL); command.add_argument('--output', required=True, type=Path)
         if action in ('stage', 'render'):
             command.add_argument('--template', type=Path, default=Path('packaging/installer/install.sh.in'))
-        if action=='fetch-current':command.add_argument('--universal',action='store_true')
+        if action=='fetch-current':
+            command.add_argument('--universal',action='store_true')
+            command.add_argument('--allow-unqualified',action='store_true',help='accept an authenticated explicitly build-only universal publication')
         if action in ('stage','render'):command.add_argument('--installer-helper',type=Path)
         if action == 'stage':
             command.add_argument('--directory', required=True, type=Path)
-            command.add_argument('--candidate', action='store_true', help='local test snapshot; publish.py rejects this')
+            command.add_argument('--candidate', action='store_true', help='stage an explicitly unqualified build-only snapshot')
             command.add_argument('--previous', type=Path, help='authenticated fetch-current output to retain older APT versions')
     args = parser.parse_args()
     if args.command=='sign-carriers':
@@ -413,7 +416,7 @@ def main():
     elif args.command == 'render':
         render_installer(args.template, args.output, args.public_key, args.fingerprint, args.repository, installer_helper=args.installer_helper)
     elif args.command == 'fetch-current':
-        fetch_current(args.repository, args.output, args.public_key, args.fingerprint, args.universal)
+        fetch_current(args.repository, args.output, args.public_key, args.fingerprint, args.universal, args.allow_unqualified)
 
 if __name__ == '__main__':
     main()

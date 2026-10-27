@@ -1,4 +1,4 @@
-name: Refresh approved package metadata
+name: Refresh signed package metadata
 on:
   schedule:
     - cron: '13 4 * * 1'
@@ -23,7 +23,7 @@ jobs:
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '22'
-      - name: Refresh exactly the current signed and qualified version
+      - name: Refresh exactly the current signed version
         env:
           ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
           ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
@@ -34,15 +34,38 @@ jobs:
           printf 'GNUPGHOME=%s\n' "$GNUPGHOME" >> "$GITHUB_ENV"
           printf '%s\n' "$ARCHIVE_KEY" > archive.asc
           printf '%s\n' "$ARCHIVE_PRIVATE_KEY" | gpg --batch --import
-          python3 packaging/release/release.py fetch-current --universal --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT" --output approved
-          python3 packaging/release/release.py stage --directory approved --previous approved --output snapshot --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT"
+          python3 packaging/release/release.py fetch-current --universal --allow-unqualified \
+            --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT" --output refresh-input/candidate
+          python3 - <<'PYCODE'
+          import os,pathlib,sys
+          sys.path.insert(0,'packaging/release')
+          import release
+          approved=pathlib.Path('refresh-input/candidate')
+          build_only=release.load(approved/'current-stable.json')['qualification_sha256']=='unqualified'
+          release.stage(approved,pathlib.Path('refresh-input/snapshot'),pathlib.Path('archive.asc'),
+                        os.environ['ARCHIVE_FINGERPRINT'],pathlib.Path('packaging/installer/install.sh.in'),
+                        candidate=build_only,previous=approved)
+          with open(os.environ['GITHUB_ENV'],'a') as output:
+              output.write('HTTPJET_REFRESH_MODE='+('build-only' if build_only else 'qualified')+'\n')
+          PYCODE
       - name: Project refreshed metadata with retained native packages and release routes
         env:
           ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
         run: |
-          python3 packaging/release/pages.py project --snapshot snapshot --output pages-site \
-            --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT" \
-            --previous approved --repository "$GITHUB_REPOSITORY"
+          python3 - <<'PYCODE'
+          import os,pathlib,sys
+          sys.path.insert(0,'packaging/release')
+          import pages,release,publish_build_only
+          root=pathlib.Path('refresh-input');approved=root/'candidate';key=pathlib.Path('archive.asc')
+          fingerprint=os.environ['ARCHIVE_FINGERPRINT']
+          if os.environ['HTTPJET_REFRESH_MODE']=='build-only':
+              status=release.load(approved/'publication-status.json')
+              publish_build_only.assemble(root,pathlib.Path('refresh-assets'),pathlib.Path('pages-site'),
+                                          key,fingerprint,status['source_run_id'],previous=approved)
+          else:
+              pages.project(root/'snapshot',pathlib.Path('pages-site'),key,fingerprint,
+                            previous=approved,repository=os.environ['GITHUB_REPOSITORY'])
+          PYCODE
       - name: Deploy and verify refreshed Pages metadata under the publisher lease
         env:
           ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
@@ -57,8 +80,25 @@ jobs:
         run: |
           test -n "$CLOUDFLARE_API_TOKEN"
           test -n "$CLOUDFLARE_ACCOUNT_ID"
-          python3 packaging/release/pages.py deploy --snapshot snapshot --directory pages-site \
-            --public-key archive.asc --fingerprint "$ARCHIVE_FINGERPRINT" --receipt pages-deployment.json
+          python3 - <<'PYCODE'
+          import os,pathlib,subprocess,sys
+          sys.path.insert(0,'packaging/release')
+          import pages,release
+          from publish import S3
+          from publish_v2 import publication_lock
+          root=pathlib.Path('refresh-input');key=pathlib.Path('archive.asc')
+          fingerprint=os.environ['ARCHIVE_FINGERPRINT'];receipt=pathlib.Path('pages-deployment.json')
+          if os.environ['HTTPJET_REFRESH_MODE']=='build-only':
+              publication=release.load(root/'snapshot/publication.json')
+              with publication_lock(S3(),publication['stable_sha256']):
+                  pages.precondition(publication,key,fingerprint)
+                  subprocess.run(['npx','--yes','wrangler@'+pages.WRANGLER,'pages','deploy','pages-site',
+                                  '--project-name',pages.PROJECT,'--branch','main','--commit-dirty=true'],check=True)
+                  report=pages.verify(pathlib.Path('pages-site'),key,fingerprint)
+                  release.write_json(receipt,{**report,'publication_mode':'build-only','full_matrix_qualified':False})
+          else:
+              pages.deploy(root/'snapshot',pathlib.Path('pages-site'),key,fingerprint,receipt)
+          PYCODE
       - name: Retain the verified Pages refresh receipt
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

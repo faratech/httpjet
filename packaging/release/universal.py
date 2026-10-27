@@ -405,29 +405,50 @@ def signed_rpm_history(base,directory,key,manifest):
             if not path.exists():b.download(base+'/'+arch+'/'+location,path)
             if b.sha(path)!=checksum.text:raise ValueError('historical RPM carrier mismatch')
 
-def fetch_current(repository,output,key,expected,release_base=None):
+def fetch_current(repository,output,key,expected,release_base=None,allow_unqualified=False):
     release_base=release_base or repository.removesuffix('/apt')+'/releases'
     b=api();b.validate_key(key,expected);output.mkdir(parents=True,exist_ok=False)
     pointer=output/'current-stable.json';signature=Path(str(pointer)+'.asc')
     b.download(release_base+'/stable.json',pointer);b.download(release_base+'/stable.json.asc',signature);verify_signed(pointer,signature,key)
     current=b.load(pointer);support.validate_window(current)
-    if current.get('schema')!=2 or current.get('archive_fingerprint')!=expected or not re.fullmatch('[0-9a-f]{64}',current.get('qualification_sha256','')):raise ValueError('current pointer has no approved qualification/key')
+    qualification_hash=current.get('qualification_sha256','')
+    qualified=bool(re.fullmatch('[0-9a-f]{64}',qualification_hash))
+    if (current.get('schema')!=2 or current.get('archive_fingerprint')!=expected
+        or not qualified and not (allow_unqualified and qualification_hash=='unqualified')):
+        raise ValueError('current pointer has no approved qualification/key or explicit build-only permission')
     ident=support.identity(current['release_id']);base=release_base+'/'+ident['release_id']
-    for name in ('manifest.json','manifest.json.asc','qualification.json','qualification.json.asc'):
-        b.download(base+'/'+name,output/name)
-    verify_signed(output/'manifest.json',output/'manifest.json.asc',key);verify_signed(output/'qualification.json',output/'qualification.json.asc',key)
-    if b.sha(output/'manifest.json')!=current['manifest_sha256'] or (output/'manifest.json').stat().st_size!=current['manifest_size'] or b.sha(output/'qualification.json')!=current['qualification_sha256']:raise ValueError('current pointer hash mismatch')
+    names=('manifest.json','manifest.json.asc')+(('qualification.json','qualification.json.asc') if qualified else ())
+    for name in names:b.download(base+'/'+name,output/name)
+    verify_signed(output/'manifest.json',output/'manifest.json.asc',key)
+    if qualified:verify_signed(output/'qualification.json',output/'qualification.json.asc',key)
+    if (b.sha(output/'manifest.json')!=current['manifest_sha256'] or (output/'manifest.json').stat().st_size!=current['manifest_size']
+        or qualified and b.sha(output/'qualification.json')!=qualification_hash):raise ValueError('current pointer hash mismatch')
     manifest=b.load(output/'manifest.json');support.identity_from_manifest(manifest)
-    if manifest['release_id']!=current['release_id']:raise ValueError('current pointer version mismatch')
+    if manifest['release_id']!=current['release_id'] or manifest.get('archive_fingerprint')!=expected:raise ValueError('current pointer version/key mismatch')
     for name in manifest['artifacts']:b.download(base+'/'+b.filename(name),output/name)
-    for target in b.load(output/'qualification.json')['targets']:
-        for field in ('receipt','log'):b.download(base+'/'+b.filename(target[field]),output/target[field])
-        for name in target.get('evidence',{}):b.download(base+'/'+b.filename(name),output/name)
+    if qualified:
+        for target in b.load(output/'qualification.json')['targets']:
+            for field in ('receipt','log'):b.download(base+'/'+b.filename(target[field]),output/target[field])
+            for name in target.get('evidence',{}):b.download(base+'/'+b.filename(name),output/name)
     for name in ('SHA256SUMS','install.sh'):b.download(base+'/'+name,output/('approved-install.sh' if name=='install.sh' else name))
-    verify_artifacts(output,manifest);verify_qualification(output)
+    verify_artifacts(output,manifest)
+    if qualified:verify_qualification(output)
     signed_apt_history(repository,output,key,manifest)
     signed_rpm_history(repository.removesuffix('/apt')+'/rpm',output,key,manifest)
-    if repository==b.REPO_URL:
+    if repository==b.REPO_URL or not qualified:
         import pages
-        pages.fetch_retention(repository.removesuffix('/apt'),output,key,expected,pointer)
+        index=pages.fetch_retention(repository.removesuffix('/apt'),output,key,expected,pointer)
+        if not qualified:
+            assets=index['releases'][manifest['release_id']]['assets']
+            for name in ('publication-status.json','RELEASE-NOTES.txt'):
+                description=assets.get(name)
+                if description is None:raise ValueError('build-only publication omits its authenticated status/notice')
+                path=output/name;b.download(base+'/'+name,path)
+                if pages.descriptor(path)!=description:raise ValueError('build-only publication status/notice changed')
+            status=b.load(output/'publication-status.json')
+            if (status.get('schema')!=1 or status.get('publication_mode')!='build-only'
+                or status.get('full_matrix_qualified') is not False or status.get('release_id')!=manifest['release_id']
+                or status.get('manifest_sha256')!=b.sha(output/'manifest.json') or status.get('source_commit')!=manifest['commit']
+                or status.get('archive_fingerprint')!=expected or not re.fullmatch('[1-9][0-9]*',str(status.get('source_run_id','')))):
+                raise ValueError('build-only publication status does not bind the signed release/source run')
     return output
