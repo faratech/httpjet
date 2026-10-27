@@ -61,10 +61,6 @@ default: `acme`, `ocsp`, `otel`, `profiling`, `allocount`, and the staged
 
 ## Install on Linux
 
-> **Installer availability:** The download becomes available when the first
-> qualified stable release is published. Before then, use
-> [Build and try it](#build-and-try-it).
-
 The installer is designed for fresh Linux servers on **amd64 or arm64**. The
 kernel and service sandbox must allow **io_uring**; there is no epoll fallback.
 The installer reports startup failures caused by io_uring restrictions and does
@@ -73,7 +69,7 @@ a domain name are not required on the target server.
 
 ### Install a published release
 
-Once a qualified release is published, download the installer:
+Download the installer from the latest GitHub release:
 
 ```bash
 curl -fsSLo install.sh https://github.com/faratech/httpjet/releases/latest/download/install.sh
@@ -82,12 +78,12 @@ curl -fsSLo install.sh https://github.com/faratech/httpjet/releases/latest/downl
 The published script contains the archive's public key and release URLs. The
 repository's [`install.sh.in`](packaging/installer/install.sh.in) is a template
 with placeholders; it cannot install a release until the publisher renders it.
-Published release assets also carry GitHub Actions build attestations. To check
+Published release assets carry GitHub Actions publication attestations. To check
 the downloaded installer with the optional GitHub CLI before running it:
 
 ```bash
 gh attestation verify ./install.sh --repo faratech/httpjet \
-  --signer-workflow faratech/httpjet/.github/workflows/installer-publish.yml
+  --signer-workflow faratech/httpjet/.github/workflows/installer-publish-now.yml
 ```
 
 Then run it as root:

@@ -1,0 +1,134 @@
+name: Publish signed installer and packages
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Run that built and signed the candidate
+        required: true
+        type: string
+  workflow_run:
+    workflows: ['Installer release build and signing']
+    types: [completed]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: httpjet-apt-stable
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    environment: httpjet-stable
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: signed-candidate
+          path: candidate-input
+          run-id: ${{ inputs.candidate_run_id || github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Confirm the candidate source and signing job
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id || github.event.workflow_run.id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          run_id = os.environ['CANDIDATE_RUN']
+          repository = os.environ['GITHUB_REPOSITORY']
+          if repository != 'faratech/httpjet' or not re.fullmatch(r'[0-9]+', run_id):
+              raise SystemExit('unexpected repository or candidate run')
+          manifest = json.loads(pathlib.Path('candidate-input/candidate/manifest.json').read_text())
+          run = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repository}/actions/runs/{run_id}']))
+          jobs = json.loads(subprocess.check_output(['gh', 'api', f'repos/{repository}/actions/runs/{run_id}/jobs?per_page=100']))['jobs']
+          if (run['status'] != 'completed' or run['path'] != '.github/workflows/installer-release.yml'
+              or run['head_sha'] != manifest['commit'] or run['head_branch'] != manifest['tag']
+              or run['head_repository']['full_name'] != repository):
+              raise SystemExit('candidate does not match the public release tag')
+          required = ('candidate', 'native (amd64, ubuntu-24.04)', 'native (arm64, ubuntu-24.04-arm)')
+          if any(not any(j['name'] == name and j['conclusion'] == 'success' for j in jobs) for name in required):
+              raise SystemExit('candidate signing or native build job did not succeed')
+          tag = manifest['tag']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9]+)?', tag):
+              raise SystemExit('invalid release tag')
+          target = subprocess.check_output(['git', 'rev-parse', tag + '^{commit}'], text=True).strip()
+          if target != manifest['commit']:
+              raise SystemExit('release tag changed')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write('HTTPJET_RELEASE_TAG=' + tag + '\n')
+          PY
+      - name: Install archive tools
+        run: sudo apt-get update && sudo apt-get install -y apt-utils gnupg python3 binutils rpm createrepo-c
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      - name: Assemble the signed build-only release
+        env:
+          ARCHIVE_KEY: ${{ vars.HTTPJET_ARCHIVE_PUBLIC_KEY }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          ARCHIVE_PRIVATE_KEY: ${{ secrets.HTTPJET_ARCHIVE_PRIVATE_KEY }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id || github.event.workflow_run.id }}
+        run: |
+          export GNUPGHOME
+          GNUPGHOME=$(mktemp -d "$RUNNER_TEMP/httpjet-signing.XXXXXX")
+          printf 'GNUPGHOME=%s\n' "$GNUPGHOME" >> "$GITHUB_ENV"
+          printf '%s\n' "$ARCHIVE_KEY" > archive.asc
+          printf '%s\n' "$ARCHIVE_PRIVATE_KEY" | gpg --batch --import
+          python3 packaging/release/publish_build_only.py --candidate candidate-input \
+            --assets public-assets --pages pages-site --public-key archive.asc \
+            --fingerprint "$ARCHIVE_FINGERPRINT" --run-id "$CANDIDATE_RUN"
+      - name: Attest the published artifact bytes
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: public-assets/*
+      - name: Publish GitHub assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id || github.event.workflow_run.id }}
+        run: |
+          printf 'Signed Linux builds from GitHub Actions run https://github.com/%s/actions/runs/%s.\n\nThe full distribution matrix was not completed for this release. io_uring is required.\n' "$GITHUB_REPOSITORY" "$CANDIDATE_RUN" > release-notes.txt
+          gh release create "$HTTPJET_RELEASE_TAG" public-assets/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --draft --title "HTTPJet $HTTPJET_RELEASE_TAG" --notes-file release-notes.txt
+          gh release edit "$HTTPJET_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false
+      - name: Publish Pages and promote the release
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          ARCHIVE_FINGERPRINT: ${{ vars.HTTPJET_ARCHIVE_FINGERPRINT }}
+          HTTPJET_S3_ENDPOINT: ${{ vars.HTTPJET_S3_ENDPOINT }}
+          HTTPJET_S3_BUCKET: ${{ vars.HTTPJET_S3_BUCKET }}
+          HTTPJET_S3_REGION: ${{ vars.HTTPJET_S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.HTTPJET_S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.HTTPJET_S3_SECRET_ACCESS_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, subprocess, sys
+          sys.path.insert(0, 'packaging/release')
+          import pages, release
+          from publish import S3
+          from publish_v2 import publication_lock
+          publication = release.load('candidate-input/snapshot/publication.json')
+          with publication_lock(S3(), publication['stable_sha256']):
+              pages.precondition(publication, pathlib.Path('archive.asc'), os.environ['ARCHIVE_FINGERPRINT'])
+              subprocess.run(['npx', '--yes', 'wrangler@4.153.0', 'pages', 'deploy', 'pages-site',
+                              '--project-name', 'httpjet-packages', '--branch', 'main', '--commit-dirty=true'], check=True)
+              subprocess.run(['gh', 'release', 'edit', os.environ['HTTPJET_RELEASE_TAG'], '--repo',
+                              os.environ['GITHUB_REPOSITORY'], '--latest'], check=True)
+          PY
+      - name: Remove ephemeral signing material
+        if: always()
+        run: |
+          gpgconf --kill all || true
+          if [ -n "${GNUPGHOME:-}" ]; then rm -rf "$GNUPGHOME"; fi
