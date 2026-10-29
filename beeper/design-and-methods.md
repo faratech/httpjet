@@ -48,9 +48,11 @@ The limited native HTTPJet corpus passed eight cases in each of off/observe
 mode, with byte/header parity. Aggregate observer counters recorded seven
 matches, two coverage declines and no mismatches/errors; those counters include
 setup traffic and are not a one-to-one count of test cases. This is not all-flow
-parser coverage. Observation covers a bounded
-first H1 head or first H2 header block; unsupported CONTINUATION and unsafe
-queued/racing enrollment decline observation while native serving continues.
+parser coverage. Observation is plaintext-only and covers a bounded first H1
+head or first complete H2 HEADERS block. CONTINUATION, dynamic-index coverage
+and unsafe queued/racing enrollment are outside this observation scope; native
+serving continues. The observation lease is five seconds. Captures never
+authorize a cached response or kernel output.
 
 The tested freplace/DynPtr integration needed an observer-specific fixed-span
 adapter for verifier bounds. Generic caller length bounds were insufficient at
