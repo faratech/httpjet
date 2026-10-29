@@ -4,12 +4,13 @@ These are research results from the SINGULARITY lab, recorded on 2026-10-29. The
 use generated content and isolated loopback fixtures. They do not establish a
 general performance improvement over a shipped HTTPJet release. Earlier **v3**
 measurements are historical checkpoints; **v5** includes later correctness and
-scheduling changes. A final v5 cache-performance conclusion is deliberately
-absent from this document.
+scheduling changes. The final v5 saturation and matched offered-load matrices
+are included below; their gains remain conditional and their losses are retained.
 
 ## Comparators and artifact identity
 
-**B** means the original runtime-source baseline rebuilt with native profile-guided
+**B**, except in tables explicitly labeled exact shipped, means the original
+runtime-source baseline rebuilt with native profile-guided
 optimization (PGO). Its runtime source matches released
 [v0.1.10-11](https://github.com/faratech/httpjet/releases/tag/v0.1.10-11), public
 source commit `5ea8675352231d3e5d4788e60b0b7a05b3777ff9`. **B is not the exact
@@ -27,9 +28,10 @@ synonym for the original baseline.
 | v3 L and A | Experimental checkpoint `edc73bba36998f8ddd5a6f35e3daafb98787197f`; native PGO | `5eb5007538a2b4d7e9945e7cf26c0f8196c8aece3a5fcb8b68d37dfb9b8c5e6e` |
 | v3 H3 client | Independently implemented validating client; frozen measurement build | `8019560a4f4d9106d14a67365bb79e26c6633b1b22a8013128faa73ec43fde76` |
 | v3 CID-steering launcher | Experimental helper; separately built from the server | `ed5505ffb403e04eb68dcff260674424bffb345aab74a8a2da1014f4dfcac360` |
+| v5 matched-native B | Runtime-source equivalent to the release commit above; matched native PGO | `b2712264638f67c2e8e52d158b3d074bd72e107247efd4b8eb49ba6f7645db04` |
 | v5 L and A | Experimental serving checkpoint `8bfc217150b69684d42f38182117c887b46c8651`; matched native PGO | `4a4dcd18caf297549ab839a529d80f2b23bc86e20d0095a1fa21d01b6156e210` |
 | v5 H3 client | Failure-reporting revision of the validating client | `7ec8199c486dc10044b4c25760f14ad83506bab8ba067b7d20579e0f54c98fe2` |
-| Exact shipped amd64 release binary | Extracted from the v0.1.10-11 static archive; not B in the timing tables | `3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec` |
+| Exact shipped amd64 release binary | Extracted from the v0.1.10-11 static archive; B only in tables labeled exact shipped | `3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec` |
 
 The v3 and v5 server builds used the same compiler identity, release profile,
 native code generation, frame pointers and optional steering feature. Each used
@@ -196,6 +198,174 @@ establish a repeatable BPF throughput gain. Across all 44 retained v3 timing
 arms above, 8,800,000 measured responses were validated; warmup and separate
 correctness probes are additional work.
 
+## Final v5 cache matrices
+
+These 48 arms validate 14,400,000 measured status-200 responses, with zero
+response errors and zero observed client UDP receive drops. Both server workers
+were active in every arm; all server exit records were zero and post-run body
+buffer gauges returned to zero. Steering is off. Caches are enabled equally.
+
+Within each fixture the order is B, L, A, A, L, B. Each 1 KiB arm has 500,000
+measured requests and 10,000 warmup requests; each 32 KiB arm has 100,000 and
+5,000 respectively. The tables preserve individual arms rather than averaging
+away drift. The first two matrices use the matched native-PGO baseline. The
+other two use the exact shipped executable: that comparison also includes
+compiler, code-generation and profile differences.
+
+### Matched native PGO: 1 KiB
+
+| Fixture | Arm | Dispatch | Responses/s | p50 ms | p99 ms |
+|---|---:|---|---:|---:|---:|
+| static | 1 | B | 23,239.54 | 5.067 | 15.449 |
+| static | 2 | L | 24,644.98 | 4.890 | 13.049 |
+| static | 3 | A | 38,658.21 | 3.064 | 8.583 |
+| static | 4 | A | 30,610.55 | 3.539 | 16.703 |
+| static | 5 | L | 21,896.71 | 5.525 | 14.238 |
+| static | 6 | B | 21,541.45 | 5.533 | 15.369 |
+| pagecache | 1 | B | 14,173.46 | 5.309 | 63.987 |
+| pagecache | 2 | L | 24,233.05 | 4.725 | 15.766 |
+| pagecache | 3 | A | 37,840.50 | 3.297 | 6.638 |
+| pagecache | 4 | A | 33,224.99 | 3.478 | 10.752 |
+| pagecache | 5 | L | 22,332.46 | 4.696 | 24.172 |
+| pagecache | 6 | B | 21,332.08 | 4.990 | 23.574 |
+
+### Matched native PGO: 32 KiB
+
+| Fixture | Arm | Dispatch | Responses/s | p50 ms | p99 ms |
+|---|---:|---|---:|---:|---:|
+| static | 1 | B | 5,118.55 | 22.697 | 68.805 |
+| static | 2 | L | 5,129.54 | 22.660 | 73.329 |
+| static | 3 | A | 5,793.30 | 18.485 | 82.866 |
+| static | 4 | A | 6,154.56 | 18.897 | 62.532 |
+| static | 5 | L | 5,562.22 | 21.065 | 61.985 |
+| static | 6 | B | 5,462.50 | 21.659 | 58.507 |
+| pagecache | 1 | B | 6,209.89 | 19.598 | 46.647 |
+| pagecache | 2 | L | 5,751.84 | 20.079 | 60.526 |
+| pagecache | 3 | A | 6,296.32 | 18.513 | 57.233 |
+| pagecache | 4 | A | 6,781.17 | 18.438 | 41.733 |
+| pagecache | 5 | L | 6,464.59 | 18.926 | 45.873 |
+| pagecache | 6 | B | 5,599.97 | 20.982 | 62.275 |
+
+### Exact shipped baseline: 1 KiB
+
+| Fixture | Arm | Dispatch | Responses/s | p50 ms | p99 ms |
+|---|---:|---|---:|---:|---:|
+| static | 1 | B | 13,774.51 | 7.843 | 37.587 |
+| static | 2 | L | 21,703.03 | 5.534 | 14.381 |
+| static | 3 | A | 38,949.74 | 3.141 | 7.447 |
+| static | 4 | A | 33,639.97 | 3.274 | 13.848 |
+| static | 5 | L | 23,320.76 | 5.243 | 12.703 |
+| static | 6 | B | 14,616.82 | 7.745 | 28.050 |
+| pagecache | 1 | B | 14,277.86 | 7.237 | 36.399 |
+| pagecache | 2 | L | 20,254.23 | 5.470 | 21.968 |
+| pagecache | 3 | A | 19,976.85 | 4.965 | 31.983 |
+| pagecache | 4 | A | 19,308.80 | 5.043 | 32.376 |
+| pagecache | 5 | L | 22,385.55 | 4.975 | 19.640 |
+| pagecache | 6 | B | 19,873.59 | 5.962 | 16.148 |
+
+### Exact shipped baseline: 32 KiB
+
+| Fixture | Arm | Dispatch | Responses/s | p50 ms | p99 ms |
+|---|---:|---|---:|---:|---:|
+| static | 1 | B | 4,418.76 | 26.610 | 71.363 |
+| static | 2 | L | 5,257.88 | 22.446 | 60.137 |
+| static | 3 | A | 5,701.59 | 19.449 | 79.744 |
+| static | 4 | A | 5,660.77 | 19.277 | 75.318 |
+| static | 5 | L | 5,586.18 | 21.678 | 49.732 |
+| static | 6 | B | 4,278.37 | 27.813 | 71.330 |
+| pagecache | 1 | B | 4,298.96 | 27.154 | 79.922 |
+| pagecache | 2 | L | 5,704.99 | 20.603 | 55.905 |
+| pagecache | 3 | A | 5,952.89 | 19.531 | 63.282 |
+| pagecache | 4 | A | 6,888.59 | 17.771 | 53.674 |
+| pagecache | 5 | L | 6,100.28 | 19.695 | 50.445 |
+| pagecache | 6 | B | 5,272.82 | 22.788 | 56.454 |
+
+Across these four fixtures, descriptive A/B median throughput differences are
+approximately +55%, +100%, +13% and +11% against matched native builds, and
++156%, +15%, +31% and +34% against the shipped executable (1 KiB static,
+1 KiB page cache, 32 KiB static, 32 KiB page cache, respectively). These are
+conditional observations from two repetitions per mode, not confidence
+intervals or universal speedup estimates.
+
+The shipped 1 KiB page-cache A range overlaps the later B arm and trails both
+L arms. Native baseline page-cache throughput also drifts substantially.
+The shipped 32 KiB static A arms have worse p99 (75.318 and 79.744 ms) than
+either B arm (71.330 and 71.363 ms), despite higher throughput. Broad
+performance superiority therefore remains unproven. The H3 engine changes
+and native build/profile effects must not be attributed to Beeper parsing or
+CID steering alone.
+
+Preflight and periodic checks observed no compilers during these matrices.
+Unobserved Windows-host activity, CPU frequency, individual client-thread
+limits and kernel scheduling can still affect results. Process CPU does not
+include all kernel/IRQ work; no production-wide or whole-machine CPU saving
+is claimed.
+
+## Final v5 matched offered-load controls
+
+A separate validating client schedules arrivals from a monotonic clock.
+Its primary latency is scheduled-arrival to completion, including admission
+backlog. It also records service latency and dispatch lateness. Concurrency is
+bounded at 128 slots: these are bounded-admission measurements, not an
+unrestricted open-loop test. All logical outcomes are retained; invalid arms
+report null primary metrics and are not retried.
+
+B is the exact shipped binary; L and A are the same v5 candidate binary.
+The new client SHA-256 is
+`bb753fc5e0e9dc83abcf454c3b97b0c70bab1d7d1e2850edd9efeefeeed3bf37`.
+The 24 arms validate 1,560,000 measured responses with zero response errors,
+zero observed client UDP drops and no expired arrivals. Both workers were
+active in every arm; all exit records were zero and post-run body-buffer
+gauges returned to zero. No compilers were observed during the matrices.
+
+The 32 KiB workload offers 2,500 requests/s for 30,000 measured requests per
+arm, after 5,000 unpaced warmup requests. The 1 KiB workload offers 8,000/s for
+100,000 measured requests, after 10,000 warmup. Each fixture retains the
+B, L, A, A, L, B order. Achieved throughput remains close to offered throughput
+by construction and is not evidence of increased saturation capacity.
+
+### 32 KiB at 2,500 requests/s
+
+| Fixture | Arm | Dispatch | Scheduled p99 ms | Service p99 ms | Dispatch-late p99 ms | Bound waits |
+|---|---:|---|---:|---:|---:|---:|
+| static | 1 | B | 4.032 | 3.342 | 1.118 | 0 |
+| static | 2 | L | 4.038 | 3.333 | 1.197 | 0 |
+| static | 3 | A | 3.382 | 2.291 | 1.860 | 0 |
+| static | 4 | A | 3.758 | 2.882 | 1.618 | 0 |
+| static | 5 | L | 4.014 | 3.316 | 1.197 | 0 |
+| static | 6 | B | 35.321 | 30.043 | 5.812 | 35 |
+| pagecache | 1 | B | 7.170 | 6.075 | 1.471 | 0 |
+| pagecache | 2 | L | 10.464 | 8.209 | 2.459 | 0 |
+| pagecache | 3 | A | 6.400 | 4.971 | 1.854 | 0 |
+| pagecache | 4 | A | 3.734 | 2.959 | 1.438 | 0 |
+| pagecache | 5 | L | 27.050 | 22.105 | 6.637 | 0 |
+| pagecache | 6 | B | 62.170 | 47.454 | 18.731 | 138 |
+
+### 1 KiB at 8,000 requests/s
+
+| Fixture | Arm | Dispatch | Scheduled p99 ms | Service p99 ms | Dispatch-late p99 ms | Bound waits |
+|---|---:|---|---:|---:|---:|---:|
+| static | 1 | B | 3.915 | 2.965 | 1.966 | 0 |
+| static | 2 | L | 29.690 | 12.133 | 14.921 | 322 |
+| static | 3 | A | 11.119 | 6.241 | 3.451 | 66 |
+| static | 4 | A | 3.849 | 2.512 | 2.029 | 0 |
+| static | 5 | L | 28.775 | 16.996 | 14.061 | 585 |
+| static | 6 | B | 11.919 | 9.647 | 2.165 | 99 |
+| pagecache | 1 | B | 20.154 | 14.480 | 6.861 | 300 |
+| pagecache | 2 | L | 3.362 | 2.041 | 1.983 | 0 |
+| pagecache | 3 | A | 4.259 | 2.948 | 2.019 | 0 |
+| pagecache | 4 | A | 3.133 | 1.458 | 2.037 | 0 |
+| pagecache | 5 | L | 3.232 | 1.713 | 1.972 | 0 |
+| pagecache | 6 | B | 5.323 | 4.262 | 1.978 | 0 |
+
+At the tested 32 KiB offered rate, A has lower scheduled p99 than L in both
+repetitions of both fixtures. The 1 KiB results are mixed: page-cache L and A
+overlap, while static L has larger tails in this window. Seven arms reach
+the admission bound; late shipped-baseline 32 KiB arms show substantial drift.
+Client timer granularity, admission limits and unobserved host activity limit
+generalization. These controls support a conditional responsiveness benefit,
+not a universal latency, throughput or CPU win.
+
 ## Final v5 bridge-only Range control
 
 The final v5 candidate and v5 client identified above are fixed across all four
@@ -230,7 +400,7 @@ softirq share. Process CPU and VM counters cover different scopes, and VM
 counters include unrelated work. They identify changed conditions, not an
 attributed cause. Source, PGO corpus/profile and client binary also differ
 between v3 and v5. Historical rates therefore cannot isolate a server revision's
-cost. No final v5 cache-performance claim is made here.
+cost. The separate v5 matrices above compare fixed artifacts within each window.
 
 ## Rejected body-expansion egress microprobes
 
@@ -364,6 +534,12 @@ tables are a curated research summary, not a binary or reproduction bundle.
 | Egress size-parity checks | `6ce9a0b55a0a16dbf629a300c31bfed3daf2e4dcf6b67e0f7c22d2d9e427e7f3` |
 | Final v5 Range 4-arm evidence | `8b6500c9cc2299fa5db0d503ff200c020bb89b637c920142e59e4caa1be3570d` |
 | Final optimized v5 shutdown 6-case evidence | `ca7457c4ca56759380a8d1b785654d6345e084937b0e9c3e866aa827a2549ee6` |
+| Final v5 native 1 KiB 12-arm matrix | `a91587cc77b5932e04873e832973f3f0dc448410e2b01a5862fe577014ec73f8` |
+| Final v5 native 32 KiB 12-arm matrix | `4197b954e7109fe0b07b07bf9f45f32fa125f5c0b3555bcec614abef63d99000` |
+| Final v5 shipped 1 KiB 12-arm matrix | `592eb1d0ffd80ac6aeb8404986ceba6059ee1adfd0485556690d3986d84ca49d` |
+| Final v5 shipped 32 KiB 12-arm matrix | `0bad931d3b8418de5cccf158082d118437c24092f7033fdda751c4534ab11031` |
+| Offered-load shipped 1 KiB 12-arm matrix | `67561833ca8b653193a7c1caf224fb6b05fc1c6e5e8bf0d00fa593266198192d` |
+| Offered-load shipped 32 KiB 12-arm matrix | `b58b7d90d4909d22d3cc828156ec82f3ecd40ebb71c40c244e991def3aaf7a52` |
 
 The evidence covers one lab environment and synthetic public-cache fixtures,
 with a small number of repeated timing arms. It does not establish production,

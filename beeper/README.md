@@ -15,12 +15,16 @@ memo and an origin page cache?
 
 ## Findings so far
 
-- **Cache-aware comparisons matter.** An earlier H3 checkpoint improved the
-  median throughput of the 1 KiB cached-static fixture from 27,877 to 43,814
-  requests/second, approximately 57%. All timed responses were validated. This
-  compares native-PGO builds of an original runtime source baseline and a
-  prototype. It is a historical, workload-specific result; the final cache
-  matrix and comparison with the exact shipped binary remain pending.
+- **Cache-aware comparisons matter.** Final H3 matched native-PGO matrices
+  show descriptive median throughput gains of approximately 55%, 100%, 13% and
+  11% for 1 KiB static, 1 KiB page cache, 32 KiB static and 32 KiB page cache.
+  All 14.4 million measured responses validate. Exact shipped-binary matrices
+  also show conditional gains, but include build/profile effects. Repeated
+  arms reveal drift and worse 32 KiB static p99; broad superiority is unproven.
+- **Matched offered-load latency is mixed.** At 2,500 requests/s and 32 KiB,
+  accelerated dispatch has lower scheduled p99 than bridged dispatch in both
+  repetitions of both cache fixtures. The 1 KiB results overlap or drift.
+  Admission is bounded; these are not unrestricted open-loop measurements.
 - **Moving only response bodies into BPF did not pay.** A native-owned SK_MSG
   experiment kept HTTP processing in userspace and expanded selected bodies in
   the kernel. Even after eliminating per-hit map syscalls, server-thread CPU
@@ -45,7 +49,7 @@ integration contracts and remaining work.
 | H2 | Limited native off/observe parity cases passed while native HPACK, stream and flow-control ownership are retained. Complete kernel serving and a performance win remain unproven. |
 | H3 | Shared on-core cache dispatch, owned payload transfer, bounded scheduling and response-drain fixes are implemented experimentally. Quinn owns QUIC/TLS and io_uring supplies packet I/O. |
 | Optional routing | CID-aware reuseport steering has functional evidence. Migration and state-preserving restart remain outside its qualification. |
-| Release comparison | The exact v0.1.10-11 archive is pinned and passed protocol/cache smoke checks. Final performance superiority over that shipped binary remains unproven. |
+| Release comparison | The exact v0.1.10-11 archive is pinned and has separate completed timing matrices. Gains are conditional; general performance superiority remains unproven. |
 
 All runtime experiments use **SINGULARITY** and literal loopback destinations.
 No public origin or CDN is a load-test target. Results include unsuccessful and

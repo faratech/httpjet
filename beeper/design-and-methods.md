@@ -123,10 +123,11 @@ activity and cannot observe Windows-host scheduling. Memory high-water sums are
 not simultaneous peaks. WSL loopback cannot establish NIC zero-copy gains or
 production-wide CPU savings.
 
-These fixed-concurrency saturation tests exclude waiting before admission.
-Matched offered-load latency, repeated final-source cache matrices, mixed
-misses, privacy/invalidation races and complete lifecycle qualification remain
-necessary. Cross-checkpoint rates with different source, profiles or binaries
+Fixed-concurrency saturation tests exclude waiting before admission. Separate
+matched offered-load controls include admission backlog and explicitly report
+their bounded concurrency. Final-source cache matrices are complete for the
+listed fixtures; mixed misses, privacy/invalidation races and complete lifecycle
+qualification remain necessary. Cross-checkpoint rates with different source, profiles or binaries
 are not isolated code-change estimates.
 
 ## References
