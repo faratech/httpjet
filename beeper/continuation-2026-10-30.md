@@ -15,7 +15,7 @@ checked at `6135c588add5f7760c11d0e0cda1997bdaa5adca`; hyper-fast-path's at
 ## Work continued from the earlier implementation
 
 The continuation starts from experimental source `a7d22f4c`, not from an empty
-implementation. The current runtime checkpoint is `f7555d80`. The main changes
+implementation. The first continuation checkpoint tested here is `f7555d80`. The main changes
 and validation since that starting point are:
 
 - Preserve the actual socket-registration error through helper RPC. A map
@@ -48,9 +48,9 @@ and Quinn transport work; no Beeper HTTP/3 parser or in-kernel QUIC termination
 is claimed. The io_uring path remains necessary for TLS, misses, unsupported
 requests, protocol control and safe fallback.
 
-## Candidate identity and measurement controls
+## Initial candidate identity and measurement controls
 
-The integrated server's SHA-256 is
+The initial integrated server's SHA-256 is
 `3c20b62faff9b210e3dd2b017df0d1e55af52792beeceeacf815629c409e14b0`.
 It uses serving ABI 5 and helper RPC 2, native CPU code generation, frame
 pointers, thin LTO and no PGO. PGO preparation and instrumented training are
@@ -163,6 +163,39 @@ offered-load tails. The buffer changes are also being compared directly with
 the previous integrated binary. PGO remains a separate experiment, with
 independently trained source baselines and no training rates counted as
 benchmark evidence.
+
+## Buffer optimization comparison
+
+A separate comparison used the previous integrated binary (`3c20b62f…`) as
+the baseline, with the same memo and H3 GSO/batch settings. It tested H1 TLS
+buffer reuse and the additional H3 local-completion change. Three ABBA cycles
+were planned for each cell. Seven cells completed; the final H3 page-cache
+32 KiB cell stopped when one request timed out in its last baseline arm.
+That arm completed 199,036 of 200,000 requests: 199,035 succeeded, one timed
+out, and 964 remained unattempted. The cause is still under investigation;
+it is not evidence that the new change fixes a reliability defect.
+
+The complete cells below show candidate changes against that integrated
+baseline, not against the public release. Values are ratios of six-arm
+medians; repeated arms show substantial host/run variation.
+
+| Cell | Throughput | p99 | Process CPU/response | User instructions/response |
+|---|---:|---:|---:|---:|
+| h1s static 1 KiB | +3.36% | +4.27% | -2.81% | -1.21% |
+| h1s pagecache 1 KiB | +5.97% | -7.62% | -4.47% | -0.70% |
+| h3 static 1 KiB | -6.61% | +9.27% | +7.82% | -3.68% |
+| h3 pagecache 1 KiB | -2.67% | +10.39% | +1.72% | -1.07% |
+| h1s static 32 KiB | +2.15% | -23.56% | -1.58% | -0.38% |
+| h1s pagecache 32 KiB | +3.46% | -26.11% | -0.43% | -0.24% |
+| h3 static 32 KiB | -10.83% | +8.28% | +11.39% | -0.23% |
+
+H1 buffer reuse is retained for further qualification. Its gains are small;
+these figures do not establish a whole-server CPU reduction in every case.
+The additional H3 local-completion change is reverted in `9c87355d`: despite
+fewer instructions, the completed H3 cells consumed more process CPU and had
+lower throughput and worse p99. This reversion retains the main accelerated
+H3 engine, its cache path and its existing transport improvements. The failed
+baseline arm and all other observations remain retained.
 
 ## Individual tuning arms
 
