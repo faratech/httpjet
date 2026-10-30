@@ -309,8 +309,10 @@ A single ABBA pilot against the prior candidate validated 800,000 measured
 32 KiB H2c static responses. The two corrected arms queued zero publication
 candidates and zero publication tasks. Descriptive medians improved by 76.4%
 in throughput, 54.0% in p99 and 43.6% in process CPU per response. These are
-preliminary paired results, not a replacement for the full matrix. A new
-release/native-source capacity matrix is running on the corrected build.
+preliminary paired results, not a replacement for the full matrix. The [complete corrected-build matrix](final-matrix-2026-10-30.md) validated
+96 million measured responses across 40 cells and both comparators. It records
+large page-cache gains but remaining static-file losses; broad superiority is
+still unproven. A profile-guided build of the same source is the next experiment.
 
 ## Individual tuning arms
 

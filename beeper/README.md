@@ -17,9 +17,18 @@ The [30 October continuation](continuation-2026-10-30.md) records the subsequent
 Rust parser, H1/H2 serving and H3 transport work. The earlier measurement tables
 below remain evidence for their original binaries, not the latest build.
 
+The [complete 30 October matrix](final-matrix-2026-10-30.md) and its per-arm CSV
+cover the corrected Candidate C against both the exact release and a native
+source rebuild.
+
 ## Findings so far
 
-- **Cache-aware comparisons matter.** Final H3 matched native-PGO matrices
+- **The corrected C matrix is complete, with mixed results.** All 96 million
+  measured responses validated. Against the exact shipped release, page-cache
+  throughput medians improved by approximately 17–230%, while several static
+  cells remained about 4–7% slower. Build/profile effects and CPU/latency
+  tradeoffs remain explicit; a profile-guided build is the next experiment.
+- **Cache-aware comparisons matter.** The 29 October H3 matched native-PGO matrices
   show descriptive median throughput gains of approximately 55%, 100%, 13% and
   11% for 1 KiB static, 1 KiB page cache, 32 KiB static and 32 KiB page cache.
   All 14.4 million measured responses validate. Exact shipped-binary matrices
@@ -49,11 +58,11 @@ integration contracts and remaining work.
 
 | Area | Evidence and remaining work |
 |---|---|
-| H1 | Experimental plaintext kernel cache serving, raw User-Agent identity, ordered fallback and safe late enrollment have live correctness evidence. HTTPS retains native TLS. The latest release comparison is incomplete. |
-| H2 | Experimental plaintext kernel serving has live HPACK, flow-control and native-handoff evidence. Unsupported input and HTTPS retain native protocol ownership. The latest release comparison is incomplete. |
+| H1 | Experimental plaintext kernel cache serving, raw User-Agent identity, ordered fallback and safe late enrollment have live correctness evidence. HTTPS retains native TLS. Candidate C's full comparison is published; static-file weaknesses remain. |
+| H2 | Experimental plaintext kernel serving has live HPACK, flow-control, expiry recovery and native-handoff evidence. Known oversized bodies avoid publication work. Full comparisons and the low-load CPU/latency cost are published; unsupported input and HTTPS retain native ownership. |
 | H3 | Shared on-core cache dispatch, owned payload transfer, bounded scheduling and response-drain fixes are implemented experimentally. A pinned Quinn UDP fork adds optional sendmmsg batching. Quinn owns QUIC/TLS and io_uring supplies packet I/O. |
 | Optional routing | CID-aware reuseport steering has functional evidence. Migration and state-preserving restart remain outside its qualification. |
-| Release comparison | The exact v0.1.10-11 archive is pinned. Earlier matrices are complete; the latest integrated matrix stopped on an H2 expiry-recovery qualification failure; it compares that archive separately from a matching native-source rebuild. General performance superiority remains unproven. |
+| Release comparison | The exact v0.1.10-11 archive is pinned. Candidate C completed 40 cells against that archive and a separate matching native-source rebuild. Earlier failed attempts remain retained. General performance superiority remains unproven. |
 
 All runtime experiments use **SINGULARITY** and literal loopback destinations.
 No public origin or CDN is a load-test target. Results include unsuccessful and
@@ -67,7 +76,6 @@ source. Their recorded identities distinguish experiments, but do not make a
 public release checkout sufficient to reproduce every variant. The methods and
 data should be read with that limitation.
 
-The remaining target is complete H1/H2/H3 integration, equivalent cache and
-policy behavior, safe io_uring fallback, and repeated performance comparisons
-against the latest release. Observation hooks and one fast fixture do not
-complete that target.
+The remaining target is broadly superior performance while preserving the
+H1/H2/H3 cache and policy contracts and safe io_uring fallback. Observation
+hooks or one fast fixture do not complete that target.
