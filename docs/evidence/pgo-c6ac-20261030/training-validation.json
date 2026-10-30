@@ -1,0 +1,2305 @@
+{
+  "status": "passed",
+  "scope": "PGO training coverage/identity checks only; not performance evidence",
+  "arms": [
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-1-h1-polling",
+      "protocol": "h1",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "h1-polling",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618398,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618398": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        },
+        "618397": {
+          "role": "helper",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d",
+          "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+          "uid": 0
+        }
+      },
+      "kernel": {
+        "successes": 31931.0,
+        "readiness": {
+          "httpjet_h1_kernel_readiness_bindings_total": 0.0,
+          "httpjet_h1_kernel_readiness_submissions_total": 0.0,
+          "httpjet_h1_kernel_readiness_wakes_total": 0.0,
+          "httpjet_h1_kernel_readiness_spurious_total": 0.0,
+          "httpjet_h1_kernel_readiness_data_total": 0.0,
+          "httpjet_h1_kernel_readiness_eof_total": 0.0,
+          "httpjet_h1_kernel_readiness_maintenance_total": 0.0
+        }
+      },
+      "metadata_sha256": "7da7327af93a5a26835180559720e4402b6ee07988719b2ab85219367d293457",
+      "result_sha256": "44d409b3f23795a2455f193f2c681ce0bc4509ace8a52c0130306975d0bc048c",
+      "exit_sha256": "fcbc712ec966c7b649d5fb2cdda62b50d57357a8de6d86af940dd44cdbcf4d1b"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-2-h1-readiness",
+      "protocol": "h1",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "h1-readiness",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618455,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618455": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        },
+        "618454": {
+          "role": "helper",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d",
+          "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+          "uid": 0
+        }
+      },
+      "kernel": {
+        "successes": 30761.0,
+        "readiness": {
+          "httpjet_h1_kernel_readiness_bindings_total": 194.0,
+          "httpjet_h1_kernel_readiness_submissions_total": 2467.0,
+          "httpjet_h1_kernel_readiness_wakes_total": 2342.0,
+          "httpjet_h1_kernel_readiness_spurious_total": 2273.0,
+          "httpjet_h1_kernel_readiness_data_total": 5.0,
+          "httpjet_h1_kernel_readiness_eof_total": 64.0,
+          "httpjet_h1_kernel_readiness_maintenance_total": 2289.0
+        }
+      },
+      "metadata_sha256": "7da7327af93a5a26835180559720e4402b6ee07988719b2ab85219367d293457",
+      "result_sha256": "9e80c3330a15f299b7aed45eb0cd5f61cd92e94ac6b88898286fd0b18f2b1cc5",
+      "exit_sha256": "bc359c474e2848eb81367bda152bb41b0fbd138397c57283e3bce5ef92908b34"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-1-h1-polling",
+      "protocol": "h1",
+      "case": "static",
+      "size": 1024,
+      "name": "h1-polling",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618284,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618284": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        },
+        "618283": {
+          "role": "helper",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d",
+          "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+          "uid": 0
+        }
+      },
+      "kernel": {
+        "successes": 31936.0,
+        "readiness": {
+          "httpjet_h1_kernel_readiness_bindings_total": 0.0,
+          "httpjet_h1_kernel_readiness_submissions_total": 0.0,
+          "httpjet_h1_kernel_readiness_wakes_total": 0.0,
+          "httpjet_h1_kernel_readiness_spurious_total": 0.0,
+          "httpjet_h1_kernel_readiness_data_total": 0.0,
+          "httpjet_h1_kernel_readiness_eof_total": 0.0,
+          "httpjet_h1_kernel_readiness_maintenance_total": 0.0
+        }
+      },
+      "metadata_sha256": "7da7327af93a5a26835180559720e4402b6ee07988719b2ab85219367d293457",
+      "result_sha256": "a9ce38f04e42913afed284bea163f6a7616dcf065b53df48b77f98942f849efd",
+      "exit_sha256": "fe20764560ec3d5213c7a7e055ba323a0d057259667154c0783addc76fd404a0"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-2-h1-readiness",
+      "protocol": "h1",
+      "case": "static",
+      "size": 1024,
+      "name": "h1-readiness",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618340,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618340": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        },
+        "618339": {
+          "role": "helper",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d",
+          "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+          "uid": 0
+        }
+      },
+      "kernel": {
+        "successes": 31936.0,
+        "readiness": {
+          "httpjet_h1_kernel_readiness_bindings_total": 64.0,
+          "httpjet_h1_kernel_readiness_submissions_total": 2195.0,
+          "httpjet_h1_kernel_readiness_wakes_total": 2195.0,
+          "httpjet_h1_kernel_readiness_spurious_total": 2131.0,
+          "httpjet_h1_kernel_readiness_data_total": 0.0,
+          "httpjet_h1_kernel_readiness_eof_total": 64.0,
+          "httpjet_h1_kernel_readiness_maintenance_total": 2136.0
+        }
+      },
+      "metadata_sha256": "7da7327af93a5a26835180559720e4402b6ee07988719b2ab85219367d293457",
+      "result_sha256": "e00a1e650d7363752f671e5321ee5ae28acf2e7b39bad4136abff45401300ce3",
+      "exit_sha256": "bf7c73b14240c6dccb38400c34938cd28f6622d96df37337be10938fe6954301"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel",
+      "protocol": "h2c",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "h2-kernel",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618664,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618664": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        },
+        "618662": {
+          "role": "helper",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d",
+          "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+          "uid": 0
+        }
+      },
+      "kernel": {
+        "successes": 26524.0,
+        "candidates": 5412.0
+      },
+      "metadata_sha256": "9404ee451005b91d71f28068f003e7af7245fb71b2038336f8412dfa8ca2964f",
+      "result_sha256": "fcf64a0e5122d0bcb8aa2a902783fd92a0218d5bfb461a4fbcbf2e3113e2d4f9",
+      "exit_sha256": "a9a5f523471558fd1b868ca17e9934646ee8cefede9cd5ad4fba009553befb68"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-static-1-1-h2-kernel",
+      "protocol": "h2c",
+      "case": "static",
+      "size": 1024,
+      "name": "h2-kernel",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618544,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618544": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        },
+        "618542": {
+          "role": "helper",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d",
+          "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+          "uid": 0
+        }
+      },
+      "kernel": {
+        "successes": 28008.0,
+        "candidates": 3928.0
+      },
+      "metadata_sha256": "9404ee451005b91d71f28068f003e7af7245fb71b2038336f8412dfa8ca2964f",
+      "result_sha256": "41d2bf7d405e38348c48005024c6b8801c6767ae8949e6db09cd2c86c5715b95",
+      "exit_sha256": "43278d4b4cfd22f3673d167809714f3650346d33d4ee45da0375da4ac4cfec2f"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel",
+      "protocol": "h2c",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "h2-kernel",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 618760,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618760": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        },
+        "618742": {
+          "role": "helper",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d",
+          "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+          "uid": 0
+        }
+      },
+      "kernel": {
+        "successes": 0.0,
+        "candidates": 0.0
+      },
+      "metadata_sha256": "a08c7cf5c1d4dda1b4430507e325bb3444db780c1786b80753624dd109363e1a",
+      "result_sha256": "0ab7f03ca61162cd0eb70788880b467f03b15044d839ea792a68c2327022b81d",
+      "exit_sha256": "ba02a97107c745dd8361b78adec3b64e94ae6fb59af7a7d48fd2f41fd3c59fdf"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-1-legacy",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "legacy",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619452,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619452": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "a86481d3981801c434b7db867b65bee30c2008e608361a61cdc17f60ed9387c5",
+      "result_sha256": "dae2fb1ce5653765af5543ba3f735421284512e2a211237b7e514b032846b724",
+      "exit_sha256": "ad77b1025154bf8bec750e2fca4d7c2c2427cd1be1b94ea4d59c9eaa12bbdd32"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-2-accelerated",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "accelerated",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619514,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619514": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "a86481d3981801c434b7db867b65bee30c2008e608361a61cdc17f60ed9387c5",
+      "result_sha256": "ae67d6392d9074a9a1cfe1fbbaf2ac9747b1a39cc960be3acb5b3b5cd9f1b597",
+      "exit_sha256": "624d9373ccc0460680105a946921acd814c133d3a7be1c86b51fa9355225254c"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-1-legacy",
+      "protocol": "h3",
+      "case": "static",
+      "size": 1024,
+      "name": "legacy",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619332,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619332": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "a86481d3981801c434b7db867b65bee30c2008e608361a61cdc17f60ed9387c5",
+      "result_sha256": "19fc95b5b79c57459f309c4f20347196122873231210cb274bd45019a5102b40",
+      "exit_sha256": "e3d17fac76689c101e94c3d750c151cc285fa8a93aedde038b563c9beb317b67"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-2-accelerated",
+      "protocol": "h3",
+      "case": "static",
+      "size": 1024,
+      "name": "accelerated",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619391,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619391": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "a86481d3981801c434b7db867b65bee30c2008e608361a61cdc17f60ed9387c5",
+      "result_sha256": "2a48a638aa3dfa9463fee96d3511c0b078622ca26cc3ec941827b8372c3145ad",
+      "exit_sha256": "85f329ed966ffb84b2bd94f1b9aebf1acca822521eccd19be6a6f84e571bb5cc"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-1-legacy",
+      "protocol": "h3",
+      "case": "range",
+      "size": 1024,
+      "name": "legacy",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619607,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619607": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "07d75d4227c0202e010c348e46d8bccea6a2577f001e6e798615be09bbe40c7f",
+      "result_sha256": "cafb764502bb2c2758f5b57566f904e08183beda2a7a4b1035dc70238905d62d",
+      "exit_sha256": "5b72067a0f137489017c586b061fc32af098c6f94d1a6e00f2da874218fba401"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-2-accelerated",
+      "protocol": "h3",
+      "case": "range",
+      "size": 1024,
+      "name": "accelerated",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619687,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619687": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "07d75d4227c0202e010c348e46d8bccea6a2577f001e6e798615be09bbe40c7f",
+      "result_sha256": "2038da98f23afc7c72442b028b6542c824bfff050ecedf067a12a8cb5c0e5b90",
+      "exit_sha256": "8bfde51dee17f0aa9e76d372bacc6e4bb918ca7cc1d4c12987de7167a313008f"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-1-legacy",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "legacy",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618930,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618930": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "3c0c2d6fc063f1d995dff35da4964370aa0568b125e0af62c75a3d3d6e5d95b5",
+      "result_sha256": "9bbb6354576cb27b340a9fbe637ea92dc4c698f86daaf59b65a004ae01115c05",
+      "exit_sha256": "177637ea0f4390bd077f155d371d0868070db634ea49da7748702957eabf5c76"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-2-accelerated",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "accelerated",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619051,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619051": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "3c0c2d6fc063f1d995dff35da4964370aa0568b125e0af62c75a3d3d6e5d95b5",
+      "result_sha256": "8adccfde05feef1ecc91c32741bc7231d3d1eab7fc7113e8e82364302bed91a0",
+      "exit_sha256": "8e88c7ea88e5d55034a4d443a3a3c17886e7352be651110bd8abeee95385bdc0"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-1-legacy",
+      "protocol": "h3",
+      "case": "static",
+      "size": 1024,
+      "name": "legacy",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618817,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618817": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "3c0c2d6fc063f1d995dff35da4964370aa0568b125e0af62c75a3d3d6e5d95b5",
+      "result_sha256": "f41370cce4fe2d33a63d37395d64d9477ae8c99f69fbc8504d11ff08c38764c0",
+      "exit_sha256": "6029d1d73b0e0c4258cc725f44332ee080c60da36f58232ab11a2e5fee645b9a"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-2-accelerated",
+      "protocol": "h3",
+      "case": "static",
+      "size": 1024,
+      "name": "accelerated",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 618879,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618879": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "3c0c2d6fc063f1d995dff35da4964370aa0568b125e0af62c75a3d3d6e5d95b5",
+      "result_sha256": "172e24715336b52512269d892dd70e2f9d74aeea25cc3e85606b8c8805566aa9",
+      "exit_sha256": "68965d9f97026286927839ca4058552e1663ffe16caa44e7840eb9ab3567b239"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-1-legacy",
+      "protocol": "h3",
+      "case": "range",
+      "size": 1024,
+      "name": "legacy",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619076,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619076": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "a3d832e216a922e13809a322664a31498ad1c6889054ef56fcc631c358254150",
+      "result_sha256": "b71c6f282cc09c86df0f529519398237e74d00402c8f8d795ddbe02dc9d4a5eb",
+      "exit_sha256": "cba8063b1fc2bca8dae9ee22b21f0672e931a45b6c7a479449c0046784c00d37"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-2-accelerated",
+      "protocol": "h3",
+      "case": "range",
+      "size": 1024,
+      "name": "accelerated",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 619178,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619178": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "a3d832e216a922e13809a322664a31498ad1c6889054ef56fcc631c358254150",
+      "result_sha256": "4e7665107c7dd0d1d33c4aa23911de0fd92095d460681b11078029f5037d0bf9",
+      "exit_sha256": "8838b56771854be1ab852113f036cbbdb0a413320a9fa473170085e3082637cd"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-1-legacy",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "legacy",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620301,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620301": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c97bd7033bc0fba90422ea937450a5f73c5cfbed966c2b6a726e120a6460e6f7",
+      "result_sha256": "7e059e5ad4d660ed16ada5b0347f651af3a86fd1d2c9348d0114dc86865f06fc",
+      "exit_sha256": "2d3525b1933826e941a051b632e065411980a8d390e69296ff76bbb5dbc8efcd"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-2-accelerated",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "accelerated",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620365,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620365": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c97bd7033bc0fba90422ea937450a5f73c5cfbed966c2b6a726e120a6460e6f7",
+      "result_sha256": "6bc890d80f65fb492bcc0ee9a1c317e5b4c9b0bdc0ba171496c522d58baab608",
+      "exit_sha256": "2202b1a04660b1f0bdfdfe4b0375d61cc09a8d4b11a47ed81b77505aa695c2b0"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-1-legacy",
+      "protocol": "h3",
+      "case": "static",
+      "size": 32768,
+      "name": "legacy",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620171,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620171": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c97bd7033bc0fba90422ea937450a5f73c5cfbed966c2b6a726e120a6460e6f7",
+      "result_sha256": "3caa78cd7acf5ed75b3f92dd469cadfc2f80aa58e64a22fbbe122370267bef0f",
+      "exit_sha256": "3f3d13bb92641b72e30ef48dbcacab0ebe300b7886e866805e5a6acf5d08318b"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-2-accelerated",
+      "protocol": "h3",
+      "case": "static",
+      "size": 32768,
+      "name": "accelerated",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620231,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620231": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c97bd7033bc0fba90422ea937450a5f73c5cfbed966c2b6a726e120a6460e6f7",
+      "result_sha256": "61e1b9894222cab9723e80787225daefeb328a23ac691de9d10375eccea03511",
+      "exit_sha256": "f76095a3b1e939e79cc604eafc008cac4647964ff76c540d7114a19fcf130ccc"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-1-legacy",
+      "protocol": "h3",
+      "case": "range",
+      "size": 32768,
+      "name": "legacy",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620430,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620430": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "bcec7a83b0b840dcfcb13e31a44fac8a71368adbe0a57d09e40f9f7e6be75de6",
+      "result_sha256": "4c25f2a93c7cc7fff320951728245c4672759e47cabce9074a9ca980c3fae897",
+      "exit_sha256": "5c74983d85207c2e4c6e7a476799c55064f835f9d560391dae5ce9719f579721"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-2-accelerated",
+      "protocol": "h3",
+      "case": "range",
+      "size": 32768,
+      "name": "accelerated",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620490,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620490": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "bcec7a83b0b840dcfcb13e31a44fac8a71368adbe0a57d09e40f9f7e6be75de6",
+      "result_sha256": "bb43d42d3385fc161bafdb74ed90b2760e94a257433d0fa8725dd69d50a3ad2f",
+      "exit_sha256": "50d220ba7bbfd9547354345653472be36be50b1a5efee77aa089d3555b8814cc"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-1-legacy",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "legacy",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 619872,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619872": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "ad8269834cee374c8add641f39c3a9475a5284dce4daaa9e44964a6cfad49bbb",
+      "result_sha256": "5dab9f38b122a5cd86a67154052b9c0281a4740fc4cb8b13045cd4adc166c8a8",
+      "exit_sha256": "4d2912aeb4994e9391385330e8785f4e1d916e9ddc63c8dad1c0bcd891c8fa38"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-2-accelerated",
+      "protocol": "h3",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "accelerated",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 619962,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619962": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "ad8269834cee374c8add641f39c3a9475a5284dce4daaa9e44964a6cfad49bbb",
+      "result_sha256": "cb0dd96269127ec0897aee0f6dc0d5864e7b2dcd6cb9e5b41d96e7ecd3559cc5",
+      "exit_sha256": "728e1656a23dfc157f6cb118ee6f20f2ef6b2f82be4d26af905eba42d80e03cf"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-1-legacy",
+      "protocol": "h3",
+      "case": "static",
+      "size": 32768,
+      "name": "legacy",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 619750,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619750": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "ad8269834cee374c8add641f39c3a9475a5284dce4daaa9e44964a6cfad49bbb",
+      "result_sha256": "acd1d7c701fc6e6cef6178d357612303f6e992ae72a16724fad1bf5605d2ae2d",
+      "exit_sha256": "aa7b07a38bd0a438ffd09edfd21aa3a8fbb876e882f9dc408793794a4d742fbe"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-2-accelerated",
+      "protocol": "h3",
+      "case": "static",
+      "size": 32768,
+      "name": "accelerated",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 619811,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "619811": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "ad8269834cee374c8add641f39c3a9475a5284dce4daaa9e44964a6cfad49bbb",
+      "result_sha256": "5158c32cd76c9068e3e4a9d93ea9bee458814e822cbbb03d8f1370faa14baa66",
+      "exit_sha256": "3964e5170b4cf3263c35624049b736351d393d6f0cda7225176cf6789ecaa7da"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-1-legacy",
+      "protocol": "h3",
+      "case": "range",
+      "size": 32768,
+      "name": "legacy",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620048,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620048": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "34c9a02af2073218d337468dfccebfe51c061f75fa62e082ed23a008326fdcaf",
+      "result_sha256": "f359c32baffa6b62b42699dd7a571cef7e3ab9a56414823c1bca2b6e7a22cdda",
+      "exit_sha256": "93df17b4c40ccf2c719910e2e2ee9d7127a622a5334ab73610d563773ce50559"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-2-accelerated",
+      "protocol": "h3",
+      "case": "range",
+      "size": 32768,
+      "name": "accelerated",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 620108,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "620108": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "34c9a02af2073218d337468dfccebfe51c061f75fa62e082ed23a008326fdcaf",
+      "result_sha256": "ddb66905bd07fde0142eb0d8371913eb6fd4c7b98a11e861a28079121e359e80",
+      "exit_sha256": "5193340fc0176dc698018745070da3a2ad236214e7ffcce70385d434f9f566eb"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-pagecache-1-1-native",
+      "protocol": "h1",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617048,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617048": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "a70efb7055f6c46af34138056fdecd86811f6d12708064a582dc0706d52c1cdd",
+      "exit_sha256": "1d7c4591ef0cdfa9068de88c702e5e07b153505ea80c108b7fd3600d6b183518"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-range-1-1-native",
+      "protocol": "h1",
+      "case": "range",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617186,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617186": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "27a1e27eafe4eb0bcd6e88a34a4bcb3b8635009d3197299c880ea358e2edaa07",
+      "exit_sha256": "58ec1f1d83a5d159cb5b67aa7b93f3e6353b701e9b71392ded2540c85fd49906"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-static-1-1-native",
+      "protocol": "h1",
+      "case": "static",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 616860,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "616860": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "21a088862b851195a146c152eb03343c794ed8336f9d4fb3b0c934e47d35d700",
+      "exit_sha256": "f76a1f196675e4901052eb5def70754ed3375141c42c3a09766162894927dd1c"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-pagecache-1-1-native",
+      "protocol": "h1s",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617102,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617102": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "cb69381b37a933fe588dfbbc609b0eb7b1a720d0bb74797096f35231ed3cf8ca",
+      "exit_sha256": "2ada0924fcba1d7ecb7b6725e0ebb6ab81e8fbbd0bab6d47be965212be666c17"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-range-1-1-native",
+      "protocol": "h1s",
+      "case": "range",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617270,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617270": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "b2ef1a16b219ecb16fa231234b8d279945843f08984ec0d8ba6c9595e39d194a",
+      "exit_sha256": "9a01f5fa9b9b596d17cbfdeba35ad3283bae9d93ba879ae2e35c06576f0a48ef"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-static-1-1-native",
+      "protocol": "h1s",
+      "case": "static",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 616874,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "616874": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "b72e02fd166a4f4d44211c08ae2c7a23cf122ae606d0558f69f7e98e30862461",
+      "exit_sha256": "6750e7676e2a9f3f84b2af4bdb9a3a3b2b1733ce41370385d4cd89e80feea3de"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-pagecache-1-1-native",
+      "protocol": "h2",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617170,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617170": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "f612f3c2f6124e9dedfefb045b9e7c6d8ad0b4c5b7d27e1506f17613de71c7c1",
+      "exit_sha256": "886cd0c120a17eecdc1ce8fcabb8fb6d7f0229f86b4e2305eddcb481e80a9946"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-range-1-1-native",
+      "protocol": "h2",
+      "case": "range",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617480,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617480": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "c96e6ec77c551ed476a2a8aa9379bc377221498f55ec2277bf3c5eb8a4b58264",
+      "exit_sha256": "ce431d1b804783fa51faa8c844b86f1cfad739f747b898dd3a3a0098350212f8"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-static-1-1-native",
+      "protocol": "h2",
+      "case": "static",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 616993,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "616993": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "ac4c06f2de063a6f7d19996b27079ebf6310d3c2812592c6cd81d970b1e61eda",
+      "exit_sha256": "fac6053616072831765f761e9d20706b406574d1cf8c3d03f197215265e8ce4a"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-pagecache-1-1-native",
+      "protocol": "h2c",
+      "case": "pagecache",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617116,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617116": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "7592fb6efcc61d4b18bcf92e855d3f5c67391e45614c2b09174bcc40326592e0",
+      "exit_sha256": "76490d6dfd86ee176fc9aa9e96857acee84b2ea67baf0f3019559c3506036ce9"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-range-1-1-native",
+      "protocol": "h2c",
+      "case": "range",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 617348,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617348": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "bd387a67e8e92897a7f7bef3efbcf5d5c60fcc0dbf5dc85dd984d75c52d0772b",
+      "exit_sha256": "d5dfa40d7076b4a9623f2908eede9179e1e0ed1c7dde58471783ff3c97823b8d"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-static-1-1-native",
+      "protocol": "h2c",
+      "case": "static",
+      "size": 1024,
+      "name": "native",
+      "requested": 30000,
+      "warmup": 2000,
+      "exit": 0,
+      "server_pid": 616958,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "616958": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "b19fe11355ffdf3c8499b8367808bcfe7ce4e772a6464e7cba74a274d649690c",
+      "result_sha256": "65121692165d598cb4ef343c34031527340065f8061cdeb4d80292f5051eef8e",
+      "exit_sha256": "4f463e79310a254047fe981aa437410ce094d1d958ff089f591061470aeb675b"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-pagecache-1-1-native",
+      "protocol": "h1",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617729,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617729": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "9d38f2b89c7b02f84a152676625d176a96493d5c7e3a4291bdac578878215ef8",
+      "exit_sha256": "0d5c0b7826b99e98056eddeb3df008d25ad9f7d4b42bec8d28bb15c649ffcd99"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-range-1-1-native",
+      "protocol": "h1",
+      "case": "range",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617898,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617898": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "0a3332dc32d32dd036d364682f513da7f0561935c3282996e664c26573331650",
+      "exit_sha256": "a71ef3dda17715c4520ea52166a4a3dee37a61c28d99b5e839d81ee2dadb7ca7"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-static-1-1-native",
+      "protocol": "h1",
+      "case": "static",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617537,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617537": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "4bba933a598b997f188b2cc03786eab2c19f2ebce1c2649dfdc63193c80f45a7",
+      "exit_sha256": "4dd70d78f204efd6b1deaa77429d9520c46b4fa963fa0fb14a45f4a3859f4043"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-pagecache-1-1-native",
+      "protocol": "h1s",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617743,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617743": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "97f0abdb3e3eec5eef0b737e1e753e00934a074872d28912cd1c595685f0df8c",
+      "exit_sha256": "a6a06e925bfb6bd294f71f89e6a0ae6eafa2c5647165368ddf05cfb9f334ee4c"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-range-1-1-native",
+      "protocol": "h1s",
+      "case": "range",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617953,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617953": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "acebf3d468292b5b42cc22d3c648844b5934afc13c2b94e96138e52d3f626036",
+      "exit_sha256": "e5a02854338d3aacb96934f45e9939e8d158cea04d3c68d0864844d489078f97"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-static-1-1-native",
+      "protocol": "h1s",
+      "case": "static",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617551,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617551": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "f8ee8e730fea0eb1468968deea7639bffe531acdcacd4b5ba9d3d105cae89efd",
+      "exit_sha256": "94d5b07c8930a04ed199fde6b229596077fcbaea9cdcec810f8170e220219297"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-pagecache-1-1-native",
+      "protocol": "h2",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617883,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617883": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "7cec8e233742482a0b15b6f8adfcb0b6612b9ddcf278767bc535d069e59f0f81",
+      "exit_sha256": "1abd9c813c71f299eb1fe8d7daadd2e43b3c181f0d279bca100ace3533247d1a"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-range-1-1-native",
+      "protocol": "h2",
+      "case": "range",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 618050,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "618050": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "731bb66a27448cda3ef624464addfa9fcf951332331381c635cd26beff4abbf3",
+      "exit_sha256": "c94bafe2466151bd3fea3263fab1941b1f8931a917b48c9b80fa401ffd95af52"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-static-1-1-native",
+      "protocol": "h2",
+      "case": "static",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617651,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617651": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "316f8b470a0a8e6b60a79894e8e1512b3aaa6d7ce96d84858ee13bb6c8daaa72",
+      "exit_sha256": "f8815cc65789f756e941ffb2ac29611184c2aa0a705801fc662bc93899df62eb"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-pagecache-1-1-native",
+      "protocol": "h2c",
+      "case": "pagecache",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617828,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617828": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "81b7edfbfd5e450458b70eb1d6020980853cc5efcaf958f892c9a4c0769988e6",
+      "exit_sha256": "56c7ea2bb28e265461e4985a02e3fc3cf25e844a4111b07578d41ba8a14b1bee"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-range-1-1-native",
+      "protocol": "h2c",
+      "case": "range",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617966,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617966": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "98f13460185a3cf65810143e5336898c94421cecccd381d7029663cc0ced1870",
+      "exit_sha256": "5fa15e59ba7587bd29c0141916aff1065cf8f23fae985c4546e8571862828ad2"
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-static-1-1-native",
+      "protocol": "h2c",
+      "case": "static",
+      "size": 32768,
+      "name": "native",
+      "requested": 8000,
+      "warmup": 1000,
+      "exit": 0,
+      "server_pid": 617605,
+      "server_profile_nonempty": true,
+      "allowed_profile_processes": {
+        "617605": {
+          "role": "server",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+          "uid": 65534
+        }
+      },
+      "kernel": {},
+      "metadata_sha256": "c3ecea9c1fe6b3ea6ceeda512a8e34e0e8e40b50826d6c79c1eb85eb383b85fc",
+      "result_sha256": "317db330e508dc967f5cacbfb42d4aef1b23c7977dad66530e730856dd1f7c67",
+      "exit_sha256": "d604d7ffdb718ab4cbeee0587bf466be2a97d61a1faf60daadc34377d7b83cba"
+    }
+  ],
+  "arm_count": 55,
+  "measured_training_responses": 1100000,
+  "warmup_responses": 85000,
+  "all_exits_zero": true,
+  "all_server_pid_profiles_nonempty": true,
+  "raw_file_count": 62,
+  "raw_profiles": [
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-1-h1-polling/10244722706071600097_0-618397.profraw",
+      "bytes": 655688,
+      "sha256": "b71ab062b5dca92d0b3cc0ad3f69b44fbe41fb1424ed7b2dd19927240f8703bf",
+      "pid": 618397,
+      "uid": 0,
+      "role": "helper",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-1-h1-polling",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-1-h1-polling/10408977862382863250_0-618398.profraw",
+      "bytes": 5428736,
+      "sha256": "68eb7e3fd23b74bf7ceaf55d0210579b84cb8345be8bc7c1010a55df173d381e",
+      "pid": 618398,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-1-h1-polling",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-2-h1-readiness/10244722706071600097_0-618454.profraw",
+      "bytes": 655704,
+      "sha256": "5178c321dbefbf398f79a9feab621c44a85b495fad68d8e35443722d99061023",
+      "pid": 618454,
+      "uid": 0,
+      "role": "helper",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-2-h1-readiness",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-2-h1-readiness/10408977862382863250_0-618455.profraw",
+      "bytes": 5428976,
+      "sha256": "661583d7529916a261a0f40c6fb115a39477dbeeaf63d8f06552fb71822342f9",
+      "pid": 618455,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-2-h1-readiness",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-1-h1-polling/10244722706071600097_0-618283.profraw",
+      "bytes": 655704,
+      "sha256": "53312d58008c0e8d0353b821b2e5899360a338f5bdb5f2e689cab431e8054445",
+      "pid": 618283,
+      "uid": 0,
+      "role": "helper",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-1-h1-polling",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-1-h1-polling/10408977862382863250_0-618284.profraw",
+      "bytes": 5426992,
+      "sha256": "890b6f03065bda703564eb720e1f14cb0f742a4b7ae82541aae84af52d6c4dfe",
+      "pid": 618284,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-1-h1-polling",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-2-h1-readiness/10244722706071600097_0-618339.profraw",
+      "bytes": 655720,
+      "sha256": "718771e153af2e4adffbd44414b327929263cfc5607ec8929573a7a4755a40c4",
+      "pid": 618339,
+      "uid": 0,
+      "role": "helper",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-2-h1-readiness",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-2-h1-readiness/10408977862382863250_0-618340.profraw",
+      "bytes": 5427024,
+      "sha256": "db31e67e03225d23e09c4ad04ebdbaf54ee427840397ffc3d4a9bef7a3ee595b",
+      "pid": 618340,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-2-h1-readiness",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel/10244722706071600097_0-618662.profraw",
+      "bytes": 655736,
+      "sha256": "a465d010fe575b0a6564c5e3abd37a329f6a75ecd98e34426fffec61eb6a0d8f",
+      "pid": 618662,
+      "uid": 0,
+      "role": "helper",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618664.profraw",
+      "bytes": 5431168,
+      "sha256": "2b3381f1c56165b7ab4926c32f3af0c58d6aa49164c84a69a4f200aea3a4ed7e",
+      "pid": 618664,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-static-1-1-h2-kernel/10244722706071600097_0-618542.profraw",
+      "bytes": 655736,
+      "sha256": "73d196bb4bf20306cdf457a7ba671e234007a14da8100548535acafaff12bb76",
+      "pid": 618542,
+      "uid": 0,
+      "role": "helper",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-static-1-1-h2-kernel",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-static-1-1-h2-kernel/10408977862382863250_0-618544.profraw",
+      "bytes": 5428928,
+      "sha256": "a3f0ef0e9e4b6dad3f75ec64b4f413bc78b46fd782cfabd4c61107c0ef1b2e0d",
+      "pid": 618544,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-static-1-1-h2-kernel",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel/10244722706071600097_0-618742.profraw",
+      "bytes": 655640,
+      "sha256": "8a33b9a007a12c549dc45192c739d1c67f21cb13cea43078661a90350441d0b7",
+      "pid": 618742,
+      "uid": 0,
+      "role": "helper",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "identity_basis": "recorded launcher argv/hash and supervisor exit PID",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618760.profraw",
+      "bytes": 5429744,
+      "sha256": "529b13592876532a16606d7301496273a496838b650ee8e09cac1fc93f02abf9",
+      "pid": 618760,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-619452.profraw",
+      "bytes": 5436496,
+      "sha256": "d6af0b1f23f3305b013510f3057c3d8765ef9dbb478344929cccab6172f97342",
+      "pid": 619452,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-619514.profraw",
+      "bytes": 5437376,
+      "sha256": "c65b37830b8946a93f2004e53895845a154bc7bec0e31dc24fffbda6dd58feed",
+      "pid": 619514,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-1-legacy/10408977862382863250_0-619332.profraw",
+      "bytes": 5435408,
+      "sha256": "261979f432cfe4ad9390a0f24ef0fb21cccb991a0560893f1b3fefa7e553ec7a",
+      "pid": 619332,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-619391.profraw",
+      "bytes": 5435552,
+      "sha256": "3f7c5a3770d66a691b264eb9defc7a9c03ef23eb1551fba6b7a6012b8afa3210",
+      "pid": 619391,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-1-legacy/10408977862382863250_0-619607.profraw",
+      "bytes": 5435296,
+      "sha256": "3bad6e7fe9585c7365c766c9e8bd66eb2dcab46d4731ffd837f17b34c3bde643",
+      "pid": 619607,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-619687.profraw",
+      "bytes": 5435504,
+      "sha256": "5c5948ee69f2252f9cd1d47dd628527758663de4100b562a00422419f218a9cf",
+      "pid": 619687,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-618930.profraw",
+      "bytes": 5436896,
+      "sha256": "b4eb527a12d7265973c271c83811934925d1d93d34b0dfe0780f4bd79542655d",
+      "pid": 618930,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619051.profraw",
+      "bytes": 5437456,
+      "sha256": "98bb24a6ecb6a7bcfbe21668ca890a76211c93b08f74a555cb43682c6141f087",
+      "pid": 619051,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-1-legacy/10408977862382863250_0-618817.profraw",
+      "bytes": 5435280,
+      "sha256": "3e7df86ae0923d33494fa6f13f29fc0461f111a40cf48822dcff798afb076fba",
+      "pid": 618817,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-618879.profraw",
+      "bytes": 5435376,
+      "sha256": "a12e5286cf280a1ba19de4cad3ed0d4cba02d2825c33039e398f4bfadb976780",
+      "pid": 618879,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-1-legacy/10408977862382863250_0-619076.profraw",
+      "bytes": 5435488,
+      "sha256": "1cde24c40c5aea141e6b8bd2a9f346a71595bbe6fe71b9b4b4b7890ab2fd0bb0",
+      "pid": 619076,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-619178.profraw",
+      "bytes": 5435840,
+      "sha256": "b1c458faf34b71f05071dbab8816324332c4ceeace1747e08c11b741237db012",
+      "pid": 619178,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-620301.profraw",
+      "bytes": 5437584,
+      "sha256": "63f5904d8aa388cc58160e1a5c84f7611d89e00f102da62de4bfc32d813856d0",
+      "pid": 620301,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-620365.profraw",
+      "bytes": 5438480,
+      "sha256": "c6724b522ebc17741f20443f13a78c28faf130872eb18643ee2ab870a3ee8305",
+      "pid": 620365,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-1-legacy/10408977862382863250_0-620171.profraw",
+      "bytes": 5435808,
+      "sha256": "62d03676dc585cefe08fb8a90182464c547bfb1aa19d269bce350432ccf8b87b",
+      "pid": 620171,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-620231.profraw",
+      "bytes": 5436192,
+      "sha256": "54fcde4c600e5b6002cd70f4173d9fa069b844fba7a2b9aeddd12e66d85ca23a",
+      "pid": 620231,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-1-legacy/10408977862382863250_0-620430.profraw",
+      "bytes": 5436000,
+      "sha256": "ace81c3479f6623ce313883242c01e8145e5ba66f4d314630162be54991f98bf",
+      "pid": 620430,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-620490.profraw",
+      "bytes": 5436192,
+      "sha256": "eb5e06e6300912728084a04203b6e5b5394ed4af9c9fac6fedfe335aacfcd5b5",
+      "pid": 620490,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-619872.profraw",
+      "bytes": 5437632,
+      "sha256": "a598c381dbdc13ca07111c3ae1fc4cea633b7930b9aef054ffd7839efbf2455a",
+      "pid": 619872,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619962.profraw",
+      "bytes": 5438128,
+      "sha256": "8979348b13fdbf3f37385cd1898eca2fafdd9ddd09aa41bd8ec42770ba26142f",
+      "pid": 619962,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-1-legacy/10408977862382863250_0-619750.profraw",
+      "bytes": 5435808,
+      "sha256": "afec474d3919a9de15e37f1782f34c5963b433e24c9cf0e28ed1aea330f54e20",
+      "pid": 619750,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-619811.profraw",
+      "bytes": 5436208,
+      "sha256": "d945479349b52a8c9be5c2d92934c5bc485f623b884e07da77ac66e6ad23baf3",
+      "pid": 619811,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-1-legacy/10408977862382863250_0-620048.profraw",
+      "bytes": 5435952,
+      "sha256": "3c05112c69a1f69e15a4e04d496eea1ced55a9ff44753f4e6281fde8c60ec389",
+      "pid": 620048,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-1-legacy",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-620108.profraw",
+      "bytes": 5435904,
+      "sha256": "022578f79b858adc29d870308cc73ac2ab851084dc011664dd96e05407d8b38b",
+      "pid": 620108,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "direct taskset-exec server PID and recorded binary SHA",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-2-accelerated",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-pagecache-1-1-native/10408977862382863250_0-617048.profraw",
+      "bytes": 5427536,
+      "sha256": "1d5d54c9e788b4f2f0bab1845b93d31bce2b34d49a1f7422d89ba83c7b59176d",
+      "pid": 617048,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-range-1-1-native/10408977862382863250_0-617186.profraw",
+      "bytes": 5425792,
+      "sha256": "fbf574fa73024cb2009150350e6ce95fce165cf9711e81fd1109eab0269907bd",
+      "pid": 617186,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-static-1-1-native/10408977862382863250_0-616860.profraw",
+      "bytes": 5425584,
+      "sha256": "75aa65f310cdbe7a3e90c8ccb6947ecdf9653a50b4926caacf816849ef557aa5",
+      "pid": 616860,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-pagecache-1-1-native/10408977862382863250_0-617102.profraw",
+      "bytes": 5431232,
+      "sha256": "c34c0c6cd54b88d931ce85e7fd9963e87a3542df98607dc40755b099065eab18",
+      "pid": 617102,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-range-1-1-native/10408977862382863250_0-617270.profraw",
+      "bytes": 5429264,
+      "sha256": "3119ca81add1037fa0abd9731f9bfdcafdc86f19f56c4fd5caf2c491ca09526f",
+      "pid": 617270,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-static-1-1-native/10408977862382863250_0-616874.profraw",
+      "bytes": 5429232,
+      "sha256": "6b9faea7bb9201d5aea149fba402d1b411d486a080a77a932d0c15819f12d838",
+      "pid": 616874,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-pagecache-1-1-native/10408977862382863250_0-617170.profraw",
+      "bytes": 5433488,
+      "sha256": "e9b2a706e0c1c0a7f53e2dc2ffe9df508eb1d5e78cabf4ab54f37eba2d1561bf",
+      "pid": 617170,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-range-1-1-native/10408977862382863250_0-617480.profraw",
+      "bytes": 5431440,
+      "sha256": "5cc72a8f2391e34df999471220a7ee54ee6f0b750fe350ed572c3e805ac2dc2d",
+      "pid": 617480,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-static-1-1-native/10408977862382863250_0-616993.profraw",
+      "bytes": 5431120,
+      "sha256": "09255b444ed1222c3d8d4766432a4e8540a7af253f666b6626ddc860bb4715ec",
+      "pid": 616993,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-pagecache-1-1-native/10408977862382863250_0-617116.profraw",
+      "bytes": 5429280,
+      "sha256": "8dccb0ed8a30e2edb28441786871132fa425167206809c477ea9cf08f33c625d",
+      "pid": 617116,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-range-1-1-native/10408977862382863250_0-617348.profraw",
+      "bytes": 5427520,
+      "sha256": "b9fe5b6a78f2c9b9fb2d600c7580a58e5db0289e6f2d94dc28e6d0bc42a3fd96",
+      "pid": 617348,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-static-1-1-native/10408977862382863250_0-616958.profraw",
+      "bytes": 5427184,
+      "sha256": "9f5122d00b346f47a298f2b0a4970ebf1b8a75bc2cb0d75ff8c4f8feafe28f20",
+      "pid": 616958,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-pagecache-1-1-native/10408977862382863250_0-617729.profraw",
+      "bytes": 5427536,
+      "sha256": "f180e9d0096d11171410541459c505a853b1254031a5b5a50c7cc4bccbdb9c88",
+      "pid": 617729,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-range-1-1-native/10408977862382863250_0-617898.profraw",
+      "bytes": 5425776,
+      "sha256": "e278f63af3d436f00eef1ea7bc2fa101b807b96de1ea89a640d0b0bf5c4c43cd",
+      "pid": 617898,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-static-1-1-native/10408977862382863250_0-617537.profraw",
+      "bytes": 5425728,
+      "sha256": "7c7d56fd1589b72604234cf98778628fbc35e7142cdeeee2637431c1a369eb03",
+      "pid": 617537,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-pagecache-1-1-native/10408977862382863250_0-617743.profraw",
+      "bytes": 5431264,
+      "sha256": "e58179b7f4fbfd4ff991fef131a61c49c9c4e43028a945de98e35dadceb3500f",
+      "pid": 617743,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-range-1-1-native/10408977862382863250_0-617953.profraw",
+      "bytes": 5429264,
+      "sha256": "8c45bda29d68c6bb560e6d9b9b961579ed8d9872cd14e52a6d2dc8011e4fa508",
+      "pid": 617953,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-static-1-1-native/10408977862382863250_0-617551.profraw",
+      "bytes": 5429344,
+      "sha256": "4d3c28e52428d6765aeddd501019ec7e90256c0b3a7970feb6160f065b6e417d",
+      "pid": 617551,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-pagecache-1-1-native/10408977862382863250_0-617883.profraw",
+      "bytes": 5433712,
+      "sha256": "ca94693b542c6575c0a20bbeb03a635beaed78a06a3d8ca0d85496d8543fbaf0",
+      "pid": 617883,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-range-1-1-native/10408977862382863250_0-618050.profraw",
+      "bytes": 5431392,
+      "sha256": "a15c48b3819f985f6ddb189b41aaf1b1bd04f3ef10112268ab35eb1567f6119a",
+      "pid": 618050,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-static-1-1-native/10408977862382863250_0-617651.profraw",
+      "bytes": 5431456,
+      "sha256": "9c2bfe5b5ca424fc0973f006dd96eb6ea4ee37ca24ba220530167771eab60ef8",
+      "pid": 617651,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-pagecache-1-1-native/10408977862382863250_0-617828.profraw",
+      "bytes": 5429360,
+      "sha256": "22869e18448203083afb560c4c3e0b5d67964de249230dd9baf9402c36f34e0d",
+      "pid": 617828,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-pagecache-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-range-1-1-native/10408977862382863250_0-617966.profraw",
+      "bytes": 5427552,
+      "sha256": "b229e2ee54b238001a4fdbd14b1e105f7760673030a9fead6b2c74bc04bc0917",
+      "pid": 617966,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-range-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-static-1-1-native/10408977862382863250_0-617605.profraw",
+      "bytes": 5427280,
+      "sha256": "00106952e42c58fe2fbe2704415218bb7cebe05bf30124167fb037f26e734ad4",
+      "pid": 617605,
+      "uid": 65534,
+      "role": "server",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "identity_basis": "HTTP readiness /proc executable+PID/starttime check",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-static-1-1-native",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    }
+  ],
+  "all_raw_files_attributed": true,
+  "gen_artifacts_sha256": "2538fca3a5a3900fd8a2979df578f3522f595eb64d8e439ec076d8f0f9fe2b78",
+  "known_owned_pids": [
+    616860,
+    616874,
+    616958,
+    616993,
+    617048,
+    617102,
+    617116,
+    617170,
+    617186,
+    617270,
+    617348,
+    617480,
+    617537,
+    617551,
+    617605,
+    617651,
+    617729,
+    617743,
+    617828,
+    617883,
+    617898,
+    617953,
+    617966,
+    618050,
+    618283,
+    618284,
+    618339,
+    618340,
+    618397,
+    618398,
+    618454,
+    618455,
+    618542,
+    618544,
+    618662,
+    618664,
+    618742,
+    618760,
+    618817,
+    618879,
+    618930,
+    619051,
+    619076,
+    619178,
+    619332,
+    619391,
+    619452,
+    619514,
+    619607,
+    619687,
+    619750,
+    619811,
+    619872,
+    619962,
+    620048,
+    620108,
+    620171,
+    620231,
+    620301,
+    620365,
+    620430,
+    620490
+  ],
+  "known_owned_pids_absent": true,
+  "merge_invoked_by_this_audit": false,
+  "excluded_build_profiles": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw",
+  "hash_fields": "raw_profiles.sha256 hashes the profraw file; executable_sha256 hashes its frozen executable"
+}

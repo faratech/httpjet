@@ -21,6 +21,10 @@ The [complete 30 October matrix](final-matrix-2026-10-30.md) and its per-arm CSV
 cover the corrected Candidate C against both the exact release and a native
 source rebuild.
 
+The [candidate C PGO experiment](../docs/performance/beeper-pgo-c6ac-2026-10-30.md)
+records the next build comparison. Its instrumented build and training are
+separate from performance qualification.
+
 ## Findings so far
 
 - **The corrected C matrix is complete, with mixed results.** All 96 million

@@ -1,0 +1,1915 @@
+{
+  "checked_arms": [
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-1-h1-polling",
+      "server_pid": 618398,
+      "processes": {
+        "618398": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2567169
+        },
+        "618397": {
+          "role": "helper",
+          "scope": "privileged owned H1/H2 launcher runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-1-h1-polling/10408977862382863250_0-618398.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-1-h1-polling/10244722706071600097_0-618397.profraw",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-1-h1-polling/10408977862382863250_0-618398.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-2-h1-readiness",
+      "server_pid": 618455,
+      "processes": {
+        "618455": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2567430
+        },
+        "618454": {
+          "role": "helper",
+          "scope": "privileged owned H1/H2 launcher runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-2-h1-readiness/10408977862382863250_0-618455.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-2-h1-readiness/10244722706071600097_0-618454.profraw",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-2-h1-readiness/10408977862382863250_0-618455.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-1-h1-polling",
+      "server_pid": 618284,
+      "processes": {
+        "618284": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2566635
+        },
+        "618283": {
+          "role": "helper",
+          "scope": "privileged owned H1/H2 launcher runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-1-h1-polling/10408977862382863250_0-618284.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-1-h1-polling/10244722706071600097_0-618283.profraw",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-1-h1-polling/10408977862382863250_0-618284.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-2-h1-readiness",
+      "server_pid": 618340,
+      "processes": {
+        "618340": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2566907
+        },
+        "618339": {
+          "role": "helper",
+          "scope": "privileged owned H1/H2 launcher runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-2-h1-readiness/10408977862382863250_0-618340.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-2-h1-readiness/10244722706071600097_0-618339.profraw",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-2-h1-readiness/10408977862382863250_0-618340.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel",
+      "server_pid": 618664,
+      "processes": {
+        "618664": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2568311
+        },
+        "618662": {
+          "role": "helper",
+          "scope": "privileged owned H1/H2 launcher runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618664.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel/10244722706071600097_0-618662.profraw",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618664.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-static-1-1-h2-kernel",
+      "server_pid": 618544,
+      "processes": {
+        "618544": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2567809
+        },
+        "618542": {
+          "role": "helper",
+          "scope": "privileged owned H1/H2 launcher runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-static-1-1-h2-kernel/10408977862382863250_0-618544.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-static-1-1-h2-kernel/10244722706071600097_0-618542.profraw",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-static-1-1-h2-kernel/10408977862382863250_0-618544.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel",
+      "server_pid": 618760,
+      "processes": {
+        "618760": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2568713
+        },
+        "618742": {
+          "role": "helper",
+          "scope": "privileged owned H1/H2 launcher runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+          "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618760.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel/10244722706071600097_0-618742.profraw",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618760.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-1-legacy",
+      "server_pid": 619452,
+      "processes": {
+        "619452": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-619452.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-619452.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-2-accelerated",
+      "server_pid": 619514,
+      "processes": {
+        "619514": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-619514.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-619514.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-1-legacy",
+      "server_pid": 619332,
+      "processes": {
+        "619332": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-1-legacy/10408977862382863250_0-619332.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-1-legacy/10408977862382863250_0-619332.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-2-accelerated",
+      "server_pid": 619391,
+      "processes": {
+        "619391": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-619391.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-619391.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-1-legacy",
+      "server_pid": 619607,
+      "processes": {
+        "619607": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-1-legacy/10408977862382863250_0-619607.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-1-legacy/10408977862382863250_0-619607.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-2-accelerated",
+      "server_pid": 619687,
+      "processes": {
+        "619687": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-619687.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-619687.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-1-legacy",
+      "server_pid": 618930,
+      "processes": {
+        "618930": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-618930.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-618930.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-2-accelerated",
+      "server_pid": 619051,
+      "processes": {
+        "619051": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619051.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619051.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-1-legacy",
+      "server_pid": 618817,
+      "processes": {
+        "618817": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-1-legacy/10408977862382863250_0-618817.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-1-legacy/10408977862382863250_0-618817.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-2-accelerated",
+      "server_pid": 618879,
+      "processes": {
+        "618879": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-618879.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-618879.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-1-legacy",
+      "server_pid": 619076,
+      "processes": {
+        "619076": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-1-legacy/10408977862382863250_0-619076.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-1-legacy/10408977862382863250_0-619076.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-2-accelerated",
+      "server_pid": 619178,
+      "processes": {
+        "619178": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-619178.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-619178.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-1-legacy",
+      "server_pid": 620301,
+      "processes": {
+        "620301": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-620301.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-620301.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-2-accelerated",
+      "server_pid": 620365,
+      "processes": {
+        "620365": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-620365.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-620365.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-1-legacy",
+      "server_pid": 620171,
+      "processes": {
+        "620171": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-1-legacy/10408977862382863250_0-620171.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-1-legacy/10408977862382863250_0-620171.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-2-accelerated",
+      "server_pid": 620231,
+      "processes": {
+        "620231": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-620231.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-620231.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-1-legacy",
+      "server_pid": 620430,
+      "processes": {
+        "620430": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-1-legacy/10408977862382863250_0-620430.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-1-legacy/10408977862382863250_0-620430.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-2-accelerated",
+      "server_pid": 620490,
+      "processes": {
+        "620490": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-620490.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-620490.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-1-legacy",
+      "server_pid": 619872,
+      "processes": {
+        "619872": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-619872.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-619872.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-2-accelerated",
+      "server_pid": 619962,
+      "processes": {
+        "619962": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619962.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619962.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-1-legacy",
+      "server_pid": 619750,
+      "processes": {
+        "619750": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-1-legacy/10408977862382863250_0-619750.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-1-legacy/10408977862382863250_0-619750.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-2-accelerated",
+      "server_pid": 619811,
+      "processes": {
+        "619811": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-619811.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-619811.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-1-legacy",
+      "server_pid": 620048,
+      "processes": {
+        "620048": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-1-legacy/10408977862382863250_0-620048.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-1-legacy/10408977862382863250_0-620048.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-2-accelerated",
+      "server_pid": 620108,
+      "processes": {
+        "620108": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-620108.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-620108.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-pagecache-1-1-native",
+      "server_pid": 617048,
+      "processes": {
+        "617048": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2562247
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-pagecache-1-1-native/10408977862382863250_0-617048.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-pagecache-1-1-native/10408977862382863250_0-617048.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-range-1-1-native",
+      "server_pid": 617186,
+      "processes": {
+        "617186": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2562924
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-range-1-1-native/10408977862382863250_0-617186.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-range-1-1-native/10408977862382863250_0-617186.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-static-1-1-native",
+      "server_pid": 616860,
+      "processes": {
+        "616860": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2561470
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-static-1-1-native/10408977862382863250_0-616860.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-static-1-1-native/10408977862382863250_0-616860.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-pagecache-1-1-native",
+      "server_pid": 617102,
+      "processes": {
+        "617102": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2562404
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-pagecache-1-1-native/10408977862382863250_0-617102.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-pagecache-1-1-native/10408977862382863250_0-617102.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-range-1-1-native",
+      "server_pid": 617270,
+      "processes": {
+        "617270": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2563285
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-range-1-1-native/10408977862382863250_0-617270.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-range-1-1-native/10408977862382863250_0-617270.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-static-1-1-native",
+      "server_pid": 616874,
+      "processes": {
+        "616874": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2561656
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-static-1-1-native/10408977862382863250_0-616874.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-static-1-1-native/10408977862382863250_0-616874.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-pagecache-1-1-native",
+      "server_pid": 617170,
+      "processes": {
+        "617170": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2562709
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-pagecache-1-1-native/10408977862382863250_0-617170.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-pagecache-1-1-native/10408977862382863250_0-617170.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-range-1-1-native",
+      "server_pid": 617480,
+      "processes": {
+        "617480": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2563937
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-range-1-1-native/10408977862382863250_0-617480.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-range-1-1-native/10408977862382863250_0-617480.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-static-1-1-native",
+      "server_pid": 616993,
+      "processes": {
+        "616993": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2562032
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-static-1-1-native/10408977862382863250_0-616993.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-static-1-1-native/10408977862382863250_0-616993.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-pagecache-1-1-native",
+      "server_pid": 617116,
+      "processes": {
+        "617116": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2562570
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-pagecache-1-1-native/10408977862382863250_0-617116.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-pagecache-1-1-native/10408977862382863250_0-617116.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-range-1-1-native",
+      "server_pid": 617348,
+      "processes": {
+        "617348": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2563599
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-range-1-1-native/10408977862382863250_0-617348.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-range-1-1-native/10408977862382863250_0-617348.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-static-1-1-native",
+      "server_pid": 616958,
+      "processes": {
+        "616958": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2561873
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-static-1-1-native/10408977862382863250_0-616958.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-static-1-1-native/10408977862382863250_0-616958.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-pagecache-1-1-native",
+      "server_pid": 617729,
+      "processes": {
+        "617729": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2565014
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-pagecache-1-1-native/10408977862382863250_0-617729.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-pagecache-1-1-native/10408977862382863250_0-617729.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-range-1-1-native",
+      "server_pid": 617898,
+      "processes": {
+        "617898": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2565679
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-range-1-1-native/10408977862382863250_0-617898.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-range-1-1-native/10408977862382863250_0-617898.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-static-1-1-native",
+      "server_pid": 617537,
+      "processes": {
+        "617537": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2564337
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-static-1-1-native/10408977862382863250_0-617537.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-static-1-1-native/10408977862382863250_0-617537.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-pagecache-1-1-native",
+      "server_pid": 617743,
+      "processes": {
+        "617743": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2565143
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-pagecache-1-1-native/10408977862382863250_0-617743.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-pagecache-1-1-native/10408977862382863250_0-617743.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-range-1-1-native",
+      "server_pid": 617953,
+      "processes": {
+        "617953": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2565863
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-range-1-1-native/10408977862382863250_0-617953.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-range-1-1-native/10408977862382863250_0-617953.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-static-1-1-native",
+      "server_pid": 617551,
+      "processes": {
+        "617551": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2564461
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-static-1-1-native/10408977862382863250_0-617551.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-static-1-1-native/10408977862382863250_0-617551.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-pagecache-1-1-native",
+      "server_pid": 617883,
+      "processes": {
+        "617883": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2565507
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-pagecache-1-1-native/10408977862382863250_0-617883.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-pagecache-1-1-native/10408977862382863250_0-617883.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-range-1-1-native",
+      "server_pid": 618050,
+      "processes": {
+        "618050": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2566252
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-range-1-1-native/10408977862382863250_0-618050.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-range-1-1-native/10408977862382863250_0-618050.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-static-1-1-native",
+      "server_pid": 617651,
+      "processes": {
+        "617651": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2564738
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-static-1-1-native/10408977862382863250_0-617651.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-static-1-1-native/10408977862382863250_0-617651.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-pagecache-1-1-native",
+      "server_pid": 617828,
+      "processes": {
+        "617828": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2565339
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-pagecache-1-1-native/10408977862382863250_0-617828.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-pagecache-1-1-native/10408977862382863250_0-617828.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-range-1-1-native",
+      "server_pid": 617966,
+      "processes": {
+        "617966": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2566066
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-range-1-1-native/10408977862382863250_0-617966.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-range-1-1-native/10408977862382863250_0-617966.profraw"
+      ]
+    },
+    {
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-static-1-1-native",
+      "server_pid": 617605,
+      "processes": {
+        "617605": {
+          "role": "server",
+          "scope": "unprivileged HTTPJet runtime",
+          "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+          "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+          "starttime_ticks": 2564622
+        }
+      },
+      "server_profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-static-1-1-native/10408977862382863250_0-617605.profraw"
+      ],
+      "profiles": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-static-1-1-native/10408977862382863250_0-617605.profraw"
+      ]
+    }
+  ],
+  "raw_profiles": [
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-1-h1-polling/10244722706071600097_0-618397.profraw",
+      "bytes": 655688,
+      "sha256": "b71ab062b5dca92d0b3cc0ad3f69b44fbe41fb1424ed7b2dd19927240f8703bf",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-1-h1-polling",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618397,
+      "module_id": "10244722706071600097_0",
+      "role": "helper",
+      "scope": "privileged owned H1/H2 launcher runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-1-h1-polling/10408977862382863250_0-618398.profraw",
+      "bytes": 5428736,
+      "sha256": "68eb7e3fd23b74bf7ceaf55d0210579b84cb8345be8bc7c1010a55df173d381e",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-1-h1-polling",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618398,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2567169
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-2-h1-readiness/10244722706071600097_0-618454.profraw",
+      "bytes": 655704,
+      "sha256": "5178c321dbefbf398f79a9feab621c44a85b495fad68d8e35443722d99061023",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-2-h1-readiness",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618454,
+      "module_id": "10244722706071600097_0",
+      "role": "helper",
+      "scope": "privileged owned H1/H2 launcher runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-pagecache-1-2-h1-readiness/10408977862382863250_0-618455.profraw",
+      "bytes": 5428976,
+      "sha256": "661583d7529916a261a0f40c6fb115a39477dbeeaf63d8f06552fb71822342f9",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-pagecache-1-2-h1-readiness",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618455,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2567430
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-1-h1-polling/10244722706071600097_0-618283.profraw",
+      "bytes": 655704,
+      "sha256": "53312d58008c0e8d0353b821b2e5899360a338f5bdb5f2e689cab431e8054445",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-1-h1-polling",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618283,
+      "module_id": "10244722706071600097_0",
+      "role": "helper",
+      "scope": "privileged owned H1/H2 launcher runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-1-h1-polling/10408977862382863250_0-618284.profraw",
+      "bytes": 5426992,
+      "sha256": "890b6f03065bda703564eb720e1f14cb0f742a4b7ae82541aae84af52d6c4dfe",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-1-h1-polling",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618284,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2566635
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-2-h1-readiness/10244722706071600097_0-618339.profraw",
+      "bytes": 655720,
+      "sha256": "718771e153af2e4adffbd44414b327929263cfc5607ec8929573a7a4755a40c4",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-2-h1-readiness",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618339,
+      "module_id": "10244722706071600097_0",
+      "role": "helper",
+      "scope": "privileged owned H1/H2 launcher runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h1-kernel/h1-static-1-2-h1-readiness/10408977862382863250_0-618340.profraw",
+      "bytes": 5427024,
+      "sha256": "db31e67e03225d23e09c4ad04ebdbaf54ee427840397ffc3d4a9bef7a3ee595b",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/h1-static-1-2-h1-readiness",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h1-kernel/metadata.json",
+      "process_pid": 618340,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2566907
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel/10244722706071600097_0-618662.profraw",
+      "bytes": 655736,
+      "sha256": "a465d010fe575b0a6564c5e3abd37a329f6a75ecd98e34426fffec61eb6a0d8f",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/metadata.json",
+      "process_pid": 618662,
+      "module_id": "10244722706071600097_0",
+      "role": "helper",
+      "scope": "privileged owned H1/H2 launcher runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618664.profraw",
+      "bytes": 5431168,
+      "sha256": "2b3381f1c56165b7ab4926c32f3af0c58d6aa49164c84a69a4f200aea3a4ed7e",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-pagecache-1-1-h2-kernel",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/metadata.json",
+      "process_pid": 618664,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2568311
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-static-1-1-h2-kernel/10244722706071600097_0-618542.profraw",
+      "bytes": 655736,
+      "sha256": "73d196bb4bf20306cdf457a7ba671e234007a14da8100548535acafaff12bb76",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-static-1-1-h2-kernel",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/metadata.json",
+      "process_pid": 618542,
+      "module_id": "10244722706071600097_0",
+      "role": "helper",
+      "scope": "privileged owned H1/H2 launcher runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-1024/h2c-static-1-1-h2-kernel/10408977862382863250_0-618544.profraw",
+      "bytes": 5428928,
+      "sha256": "a3f0ef0e9e4b6dad3f75ec64b4f413bc78b46fd782cfabd4c61107c0ef1b2e0d",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/h2c-static-1-1-h2-kernel",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-1024/metadata.json",
+      "process_pid": 618544,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2567809
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel/10244722706071600097_0-618742.profraw",
+      "bytes": 655640,
+      "sha256": "8a33b9a007a12c549dc45192c739d1c67f21cb13cea43078661a90350441d0b7",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/metadata.json",
+      "process_pid": 618742,
+      "module_id": "10244722706071600097_0",
+      "role": "helper",
+      "scope": "privileged owned H1/H2 launcher runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1",
+      "executable_sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel/10408977862382863250_0-618760.profraw",
+      "bytes": 5429744,
+      "sha256": "529b13592876532a16606d7301496273a496838b650ee8e09cac1fc93f02abf9",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/h2c-pagecache-1-1-h2-kernel",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h2-kernel-32768/metadata.json",
+      "process_pid": 618760,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2568713
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-619452.profraw",
+      "bytes": 5436496,
+      "sha256": "d6af0b1f23f3305b013510f3057c3d8765ef9dbb478344929cccab6172f97342",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/metadata.json",
+      "process_pid": 619452,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-619514.profraw",
+      "bytes": 5437376,
+      "sha256": "c65b37830b8946a93f2004e53895845a154bc7bec0e31dc24fffbda6dd58feed",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/pagecache-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/metadata.json",
+      "process_pid": 619514,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-1-legacy/10408977862382863250_0-619332.profraw",
+      "bytes": 5435408,
+      "sha256": "261979f432cfe4ad9390a0f24ef0fb21cccb991a0560893f1b3fefa7e553ec7a",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/metadata.json",
+      "process_pid": 619332,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-619391.profraw",
+      "bytes": 5435552,
+      "sha256": "3f7c5a3770d66a691b264eb9defc7a9c03ef23eb1551fba6b7a6012b8afa3210",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/static-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-all/metadata.json",
+      "process_pid": 619391,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-1-legacy/10408977862382863250_0-619607.profraw",
+      "bytes": 5435296,
+      "sha256": "3bad6e7fe9585c7365c766c9e8bd66eb2dcab46d4731ffd837f17b34c3bde643",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/metadata.json",
+      "process_pid": 619607,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-619687.profraw",
+      "bytes": 5435504,
+      "sha256": "5c5948ee69f2252f9cd1d47dd628527758663de4100b562a00422419f218a9cf",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/range-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g10-b4-range/metadata.json",
+      "process_pid": 619687,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-618930.profraw",
+      "bytes": 5436896,
+      "sha256": "b4eb527a12d7265973c271c83811934925d1d93d34b0dfe0780f4bd79542655d",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/metadata.json",
+      "process_pid": 618930,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619051.profraw",
+      "bytes": 5437456,
+      "sha256": "98bb24a6ecb6a7bcfbe21668ca890a76211c93b08f74a555cb43682c6141f087",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/pagecache-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/metadata.json",
+      "process_pid": 619051,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-1-legacy/10408977862382863250_0-618817.profraw",
+      "bytes": 5435280,
+      "sha256": "3e7df86ae0923d33494fa6f13f29fc0461f111a40cf48822dcff798afb076fba",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/metadata.json",
+      "process_pid": 618817,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-618879.profraw",
+      "bytes": 5435376,
+      "sha256": "a12e5286cf280a1ba19de4cad3ed0d4cba02d2825c33039e398f4bfadb976780",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/static-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-all/metadata.json",
+      "process_pid": 618879,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-1-legacy/10408977862382863250_0-619076.profraw",
+      "bytes": 5435488,
+      "sha256": "1cde24c40c5aea141e6b8bd2a9f346a71595bbe6fe71b9b4b4b7890ab2fd0bb0",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/metadata.json",
+      "process_pid": 619076,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-1024-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-619178.profraw",
+      "bytes": 5435840,
+      "sha256": "b1c458faf34b71f05071dbab8816324332c4ceeace1747e08c11b741237db012",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/range-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-1024-g20-b1-range/metadata.json",
+      "process_pid": 619178,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-1-legacy/10408977862382863250_0-620301.profraw",
+      "bytes": 5437584,
+      "sha256": "63f5904d8aa388cc58160e1a5c84f7611d89e00f102da62de4bfc32d813856d0",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/metadata.json",
+      "process_pid": 620301,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/pagecache-1-2-accelerated/10408977862382863250_0-620365.profraw",
+      "bytes": 5438480,
+      "sha256": "c6724b522ebc17741f20443f13a78c28faf130872eb18643ee2ab870a3ee8305",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/pagecache-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/metadata.json",
+      "process_pid": 620365,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-1-legacy/10408977862382863250_0-620171.profraw",
+      "bytes": 5435808,
+      "sha256": "62d03676dc585cefe08fb8a90182464c547bfb1aa19d269bce350432ccf8b87b",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/metadata.json",
+      "process_pid": 620171,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-all/static-1-2-accelerated/10408977862382863250_0-620231.profraw",
+      "bytes": 5436192,
+      "sha256": "54fcde4c600e5b6002cd70f4173d9fa069b844fba7a2b9aeddd12e66d85ca23a",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/static-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-all/metadata.json",
+      "process_pid": 620231,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-1-legacy/10408977862382863250_0-620430.profraw",
+      "bytes": 5436000,
+      "sha256": "ace81c3479f6623ce313883242c01e8145e5ba66f4d314630162be54991f98bf",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/metadata.json",
+      "process_pid": 620430,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g10-b4-range/range-1-2-accelerated/10408977862382863250_0-620490.profraw",
+      "bytes": 5436192,
+      "sha256": "eb5e06e6300912728084a04203b6e5b5394ed4af9c9fac6fedfe335aacfcd5b5",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/range-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g10-b4-range/metadata.json",
+      "process_pid": 620490,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-1-legacy/10408977862382863250_0-619872.profraw",
+      "bytes": 5437632,
+      "sha256": "a598c381dbdc13ca07111c3ae1fc4cea633b7930b9aef054ffd7839efbf2455a",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/metadata.json",
+      "process_pid": 619872,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/pagecache-1-2-accelerated/10408977862382863250_0-619962.profraw",
+      "bytes": 5438128,
+      "sha256": "8979348b13fdbf3f37385cd1898eca2fafdd9ddd09aa41bd8ec42770ba26142f",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/pagecache-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/metadata.json",
+      "process_pid": 619962,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-1-legacy/10408977862382863250_0-619750.profraw",
+      "bytes": 5435808,
+      "sha256": "afec474d3919a9de15e37f1782f34c5963b433e24c9cf0e28ed1aea330f54e20",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/metadata.json",
+      "process_pid": 619750,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-all/static-1-2-accelerated/10408977862382863250_0-619811.profraw",
+      "bytes": 5436208,
+      "sha256": "d945479349b52a8c9be5c2d92934c5bc485f623b884e07da77ac66e6ad23baf3",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/static-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-all/metadata.json",
+      "process_pid": 619811,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-1-legacy/10408977862382863250_0-620048.profraw",
+      "bytes": 5435952,
+      "sha256": "3c05112c69a1f69e15a4e04d496eea1ced55a9ff44753f4e6281fde8c60ec389",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-1-legacy",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/metadata.json",
+      "process_pid": 620048,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/h3-32768-g20-b1-range/range-1-2-accelerated/10408977862382863250_0-620108.profraw",
+      "bytes": 5435904,
+      "sha256": "022578f79b858adc29d870308cc73ac2ab851084dc011664dd96e05407d8b38b",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/range-1-2-accelerated",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/h3-32768-g20-b1-range/metadata.json",
+      "process_pid": 620108,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-pagecache-1-1-native/10408977862382863250_0-617048.profraw",
+      "bytes": 5427536,
+      "sha256": "1d5d54c9e788b4f2f0bab1845b93d31bce2b34d49a1f7422d89ba83c7b59176d",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617048,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2562247
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-range-1-1-native/10408977862382863250_0-617186.profraw",
+      "bytes": 5425792,
+      "sha256": "fbf574fa73024cb2009150350e6ce95fce165cf9711e81fd1109eab0269907bd",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617186,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2562924
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1-static-1-1-native/10408977862382863250_0-616860.profraw",
+      "bytes": 5425584,
+      "sha256": "75aa65f310cdbe7a3e90c8ccb6947ecdf9653a50b4926caacf816849ef557aa5",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 616860,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2561470
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-pagecache-1-1-native/10408977862382863250_0-617102.profraw",
+      "bytes": 5431232,
+      "sha256": "c34c0c6cd54b88d931ce85e7fd9963e87a3542df98607dc40755b099065eab18",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617102,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2562404
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-range-1-1-native/10408977862382863250_0-617270.profraw",
+      "bytes": 5429264,
+      "sha256": "3119ca81add1037fa0abd9731f9bfdcafdc86f19f56c4fd5caf2c491ca09526f",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617270,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2563285
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h1s-static-1-1-native/10408977862382863250_0-616874.profraw",
+      "bytes": 5429232,
+      "sha256": "6b9faea7bb9201d5aea149fba402d1b411d486a080a77a932d0c15819f12d838",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h1s-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 616874,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2561656
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-pagecache-1-1-native/10408977862382863250_0-617170.profraw",
+      "bytes": 5433488,
+      "sha256": "e9b2a706e0c1c0a7f53e2dc2ffe9df508eb1d5e78cabf4ab54f37eba2d1561bf",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617170,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2562709
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-range-1-1-native/10408977862382863250_0-617480.profraw",
+      "bytes": 5431440,
+      "sha256": "5cc72a8f2391e34df999471220a7ee54ee6f0b750fe350ed572c3e805ac2dc2d",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617480,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2563937
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2-static-1-1-native/10408977862382863250_0-616993.profraw",
+      "bytes": 5431120,
+      "sha256": "09255b444ed1222c3d8d4766432a4e8540a7af253f666b6626ddc860bb4715ec",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 616993,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2562032
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-pagecache-1-1-native/10408977862382863250_0-617116.profraw",
+      "bytes": 5429280,
+      "sha256": "8dccb0ed8a30e2edb28441786871132fa425167206809c477ea9cf08f33c625d",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617116,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2562570
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-range-1-1-native/10408977862382863250_0-617348.profraw",
+      "bytes": 5427520,
+      "sha256": "b9fe5b6a78f2c9b9fb2d600c7580a58e5db0289e6f2d94dc28e6d0bc42a3fd96",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 617348,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2563599
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-1024/h2c-static-1-1-native/10408977862382863250_0-616958.profraw",
+      "bytes": 5427184,
+      "sha256": "9f5122d00b346f47a298f2b0a4970ebf1b8a75bc2cb0d75ff8c4f8feafe28f20",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/h2c-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-1024/metadata.json",
+      "process_pid": 616958,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2561873
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-pagecache-1-1-native/10408977862382863250_0-617729.profraw",
+      "bytes": 5427536,
+      "sha256": "f180e9d0096d11171410541459c505a853b1254031a5b5a50c7cc4bccbdb9c88",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617729,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2565014
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-range-1-1-native/10408977862382863250_0-617898.profraw",
+      "bytes": 5425776,
+      "sha256": "e278f63af3d436f00eef1ea7bc2fa101b807b96de1ea89a640d0b0bf5c4c43cd",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617898,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2565679
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1-static-1-1-native/10408977862382863250_0-617537.profraw",
+      "bytes": 5425728,
+      "sha256": "7c7d56fd1589b72604234cf98778628fbc35e7142cdeeee2637431c1a369eb03",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617537,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2564337
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-pagecache-1-1-native/10408977862382863250_0-617743.profraw",
+      "bytes": 5431264,
+      "sha256": "e58179b7f4fbfd4ff991fef131a61c49c9c4e43028a945de98e35dadceb3500f",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617743,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2565143
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-range-1-1-native/10408977862382863250_0-617953.profraw",
+      "bytes": 5429264,
+      "sha256": "8c45bda29d68c6bb560e6d9b9b961579ed8d9872cd14e52a6d2dc8011e4fa508",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617953,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2565863
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h1s-static-1-1-native/10408977862382863250_0-617551.profraw",
+      "bytes": 5429344,
+      "sha256": "4d3c28e52428d6765aeddd501019ec7e90256c0b3a7970feb6160f065b6e417d",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h1s-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617551,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2564461
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-pagecache-1-1-native/10408977862382863250_0-617883.profraw",
+      "bytes": 5433712,
+      "sha256": "ca94693b542c6575c0a20bbeb03a635beaed78a06a3d8ca0d85496d8543fbaf0",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617883,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2565507
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-range-1-1-native/10408977862382863250_0-618050.profraw",
+      "bytes": 5431392,
+      "sha256": "a15c48b3819f985f6ddb189b41aaf1b1bd04f3ef10112268ab35eb1567f6119a",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 618050,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2566252
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2-static-1-1-native/10408977862382863250_0-617651.profraw",
+      "bytes": 5431456,
+      "sha256": "9c2bfe5b5ca424fc0973f006dd96eb6ea4ee37ca24ba220530167771eab60ef8",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617651,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2564738
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-pagecache-1-1-native/10408977862382863250_0-617828.profraw",
+      "bytes": 5429360,
+      "sha256": "22869e18448203083afb560c4c3e0b5d67964de249230dd9baf9402c36f34e0d",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-pagecache-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617828,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2565339
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-range-1-1-native/10408977862382863250_0-617966.profraw",
+      "bytes": 5427552,
+      "sha256": "b229e2ee54b238001a4fdbd14b1e105f7760673030a9fead6b2c74bc04bc0917",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-range-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617966,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2566066
+    },
+    {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/raw/http-native-32768/h2c-static-1-1-native/10408977862382863250_0-617605.profraw",
+      "bytes": 5427280,
+      "sha256": "00106952e42c58fe2fbe2704415218bb7cebe05bf30124167fb037f26e734ad4",
+      "arm": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/h2c-static-1-1-native",
+      "metadata": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/results/http-native-32768/metadata.json",
+      "process_pid": 617605,
+      "module_id": "10408977862382863250_0",
+      "role": "server",
+      "scope": "unprivileged HTTPJet runtime",
+      "executable": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet",
+      "executable_sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e",
+      "starttime_ticks": 2564622
+    }
+  ],
+  "scope": "only attributed server/helper runtime profiles from accepted training arms",
+  "excluded_build_profiles": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw"
+}
