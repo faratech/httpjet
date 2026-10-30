@@ -296,8 +296,21 @@ was near throughput parity rather than benefiting from the new memo.
 Qualification paused to add a conservative early H2 check of actual body
 length before canonicalizing the request or queueing publication. The final
 authoritative size check remains necessary, and unknown-length bodies must
-retain their existing handling. This is a pending optimization at this
-checkpoint; the interrupted run is not a completed capacity qualification.
+retain their existing handling. The interrupted run is not a completed capacity qualification.
+
+The early check is implemented and passed 1,076 server tests, 227 H2 tests,
+the live large-response/small-response handoff, expiry recovery and both
+required cache-isolation gates. It reads actual body metadata, not an HTTP
+Content-Length header, and leaves unknown-length bodies on their previous
+path. The corrected binary is
+`6ac144f2449750d6063963c0994f30c933c11df8e8dbfa548b1a7b4a71e51e8f`.
+
+A single ABBA pilot against the prior candidate validated 800,000 measured
+32 KiB H2c static responses. The two corrected arms queued zero publication
+candidates and zero publication tasks. Descriptive medians improved by 76.4%
+in throughput, 54.0% in p99 and 43.6% in process CPU per response. These are
+preliminary paired results, not a replacement for the full matrix. A new
+release/native-source capacity matrix is running on the corrected build.
 
 ## Individual tuning arms
 
