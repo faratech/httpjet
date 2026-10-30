@@ -197,6 +197,12 @@ lower throughput and worse p99. This reversion retains the main accelerated
 H3 engine, its cache path and its existing transport improvements. The failed
 baseline arm and all other observations remain retained.
 
+A separate [scheduler fairness regression](h3-scheduler-fairness-20261030.md)
+then showed that repeated overdue work could prevent a queued request from
+receiving its first poll. The repaired scheduling boundary passed 128 H3
+tests and the full 1,075-test server suite. This establishes that conditional
+defect and its repair; it does not prove the earlier timeout had that cause.
+
 ## Individual tuning arms
 
 All 28 arms below passed response validation, client-headroom checks and 100%
