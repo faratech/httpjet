@@ -240,8 +240,7 @@ The stable instruction reduction was only about 0.22% for H1 TLS and near zero
 for H2. Throughput variation between repeated cycles exceeded the apparent
 gain. The fork is retained as an experiment and is not merged into the
 continuation build: the measurements do not justify its additional vendored
-dependency and update burden. The stock-rustls control is the selected build
-for final qualification.
+dependency and update burden. Stock rustls remains the selected dependency for continued qualification.
 
 ## H2 at the same offered rate
 
@@ -278,6 +277,27 @@ The kernel option therefore remains an opt-in capacity path. The native
 io_uring path remains necessary and preferable for CPU/latency in this tested
 load regime. Higher saturated throughput does not make a path universally
 faster or cheaper. The larger capacity matrix is still in progress.
+
+## Oversized H2 responses exposed a remaining cost
+
+The next capacity run completed 16 of its 40 planned cells (192 valid arms,
+38.4 million measured responses) before being stopped for an implementation
+fix. All 1 KiB release comparisons improved median throughput, but the 32 KiB
+plaintext H2 static fixture regressed from 67,941 to 42,219 responses/s.
+Process CPU rose from 14.60 to 23.67 us/response. Responses remained correct.
+
+The 16 KiB kernel body limit correctly kept these responses native. However,
+each candidate arm still queued 209,968 publication candidates and started
+roughly 52,500 asynchronous publication attempts, all unable to serve that
+body. Native authority was run again before the late size check declined it.
+H1 already had an early check; H2 lacked it. The 32 KiB H2 page-cache fixture
+was near throughput parity rather than benefiting from the new memo.
+
+Qualification paused to add a conservative early H2 check of actual body
+length before canonicalizing the request or queueing publication. The final
+authoritative size check remains necessary, and unknown-length bodies must
+retain their existing handling. This is a pending optimization at this
+checkpoint; the interrupted run is not a completed capacity qualification.
 
 ## Individual tuning arms
 
