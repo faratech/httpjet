@@ -49,11 +49,11 @@ integration contracts and remaining work.
 
 | Area | Evidence and remaining work |
 |---|---|
-| H1 | Experimental plaintext kernel cache serving, raw User-Agent identity, ordered fallback and safe late enrollment have live correctness evidence. HTTPS retains native TLS. The latest release comparison is in progress. |
-| H2 | Experimental plaintext kernel serving has live HPACK, flow-control and native-handoff evidence. Unsupported input and HTTPS retain native protocol ownership. The latest release comparison is in progress. |
+| H1 | Experimental plaintext kernel cache serving, raw User-Agent identity, ordered fallback and safe late enrollment have live correctness evidence. HTTPS retains native TLS. The latest release comparison is incomplete. |
+| H2 | Experimental plaintext kernel serving has live HPACK, flow-control and native-handoff evidence. Unsupported input and HTTPS retain native protocol ownership. The latest release comparison is incomplete. |
 | H3 | Shared on-core cache dispatch, owned payload transfer, bounded scheduling and response-drain fixes are implemented experimentally. A pinned Quinn UDP fork adds optional sendmmsg batching. Quinn owns QUIC/TLS and io_uring supplies packet I/O. |
 | Optional routing | CID-aware reuseport steering has functional evidence. Migration and state-preserving restart remain outside its qualification. |
-| Release comparison | The exact v0.1.10-11 archive is pinned. Earlier matrices are complete; the latest integrated build is being compared separately with that archive and a matching native-source rebuild. General performance superiority remains unproven. |
+| Release comparison | The exact v0.1.10-11 archive is pinned. Earlier matrices are complete; the latest integrated matrix stopped on an H2 expiry-recovery qualification failure; it compares that archive separately from a matching native-source rebuild. General performance superiority remains unproven. |
 
 All runtime experiments use **SINGULARITY** and literal loopback destinations.
 No public origin or CDN is a load-test target. Results include unsuccessful and

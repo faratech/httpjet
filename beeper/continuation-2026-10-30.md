@@ -102,11 +102,44 @@ so it is not included in the integrated candidate.
 
 ## Remaining qualification
 
-The latest integrated release/source matrix is in progress: H1, H1 over TLS,
-H2c, H2 over TLS and H3; 1 KiB and 32 KiB; cached static and origin page-cache
-fixtures. Its final results must replace any prediction of broad superiority.
-Range controls, equal offered-load tails and PGO comparisons remain separate
-checks. Production settings and binaries have not changed.
+The latest matrix stopped after 72 measured arms (14.4 million validated
+responses), at an H2 page-cache activation failure. Five cells completed all
+three ABBA cycles. The sixth served correct responses but one candidate arm
+recorded zero kernel hits, so it failed the acceleration-coverage gate. The
+remaining planned cells have not run. Production settings and binaries have
+not changed.
+
+The completed cells below compare the exact shipped release with the integrated
+candidate, all at 1 KiB. Values are descriptive medians over six arms per
+implementation. User/process CPU omits offloaded kernel work; VM busy includes
+clients and unrelated Linux activity. These are different measurement scopes.
+
+| Protocol / cache | Responses/s: release / candidate | p99 ms: release / candidate | Process CPU change | VM busy per response change |
+|---|---:|---:|---:|---:|
+| h1 / static | 74,764 / 144,727 | 0.908 / 0.768 | -86.7% | -2.8% |
+| h1 / pagecache | 45,198 / 142,007 | 1.474 / 0.790 | -91.1% | -29.2% |
+| h1s / static | 60,193 / 59,661 | 1.139 / 1.117 | +0.6% | +1.5% |
+| h1s / pagecache | 40,759 / 67,396 | 1.533 / 0.946 | -39.2% | -25.1% |
+| h2c / static | 84,765 / 149,954 | 3.051 / 5.621 | -47.1% | +1.8% |
+
+The H2c static cell illustrates why throughput alone is insufficient: its
+throughput rises while p99 and whole-VM CPU per response worsen. Small static
+HTTPS/H1 remains approximately level. Broad superiority is therefore still
+unproven even among the completed cells.
+
+Source inspection identifies an H2 expiry-recovery hole: the native owner can
+consider an open but expired kernel entry ready, suppressing new publication,
+while the refresh path is unreachable after failed registration or native
+handoff. The failing arm repeatedly attempted activation and rejected expired
+entries without recovering. Freshness checks must remain intact; the repair
+must let native cache authority publish a fresh representation. The exact
+expired-entry history is inferred from the retained refusal counters and
+immutable-field validation; raw entry timestamps were not captured in that arm.
+
+The next gates are a deterministic expiry/recovery regression, refreshed H2
+qualification, the remaining protocol/size matrix, Range controls and equal
+offered-load tails. PGO remains a separate experiment, with independently
+trained source baselines and no training rates counted as benchmark evidence.
 
 ## Individual tuning arms
 
