@@ -68,6 +68,12 @@ enables the new page-response memo. Plaintext kernel serving must show actual
 success-counter increases for eligible fixtures. A command-line flag alone
 does not establish that the kernel served any response.
 
+The fixtures use `maxKeepAliveReq=32767`. HTTPJet applies that compatibility
+cap during configuration parsing even though the field is a 32-bit integer;
+it is not a Rust or eBPF limit. A larger value currently selects the 1,000-request
+default, which changes connection churn and makes it unsuitable for these
+comparisons.
+
 SINGULARITY has two different loopback routes. Binding both client and server
 to `127.0.0.2` selects Linux `lo`; `127.0.0.1` traverses the WSL/Hyper-V loopback
 interface. Results from these routes are not combined into a code-change gain.
@@ -236,6 +242,42 @@ gain. The fork is retained as an experiment and is not merged into the
 continuation build: the measurements do not justify its additional vendored
 dependency and update burden. The stock-rustls control is the selected build
 for final qualification.
+
+## H2 at the same offered rate
+
+The selected stock-rustls build was also compared at a scheduled 15,000
+requests/s using a separately qualified paced HTTP client. Three symmetric
+release/native/kernel/kernel/native/release cycles ran for each 1 KiB cache
+fixture. All 2,160,000 measured responses validated; each arm also had 5,000
+unpaced warmup requests. Both native and kernel candidate modes enabled the
+page-response memo, and the release retained its existing caches.
+
+These are bounded offered-load measurements, not unrestricted open-loop
+results. Fourteen of the 36 arms reached the 128-request limit and recorded
+admission waits (2,743 total). Scheduled latency includes those waits; service
+latency excludes admission backlog. The table reports medians of per-arm
+percentiles, not pooled percentiles. CPU values cover the whole client span
+and divide by measured plus warmup responses.
+
+| Cache | Mode | Scheduled p99 ms | Service p99 ms | Process CPU us/response | VM busy us/response |
+|---|---|---:|---:|---:|---:|
+| static | release | 2.005 | 0.624 | 18.08 | 85.15 |
+| static | native | 2.138 | 0.731 | 18.77 | 78.69 |
+| static | kernel | 3.786 | 2.987 | 27.77 | 113.08 |
+| pagecache | release | 2.573 | 1.199 | 27.92 | 81.77 |
+| pagecache | native | 2.492 | 1.011 | 22.77 | 97.08 |
+| pagecache | kernel | 5.292 | 3.180 | 28.15 | 113.54 |
+
+All modes achieved approximately the requested rate. The kernel path served
+about 97% of requests in its arms, but used more process CPU and had worse p99
+in this workload. Lower user-mode instruction counts did not establish lower
+total CPU cost. VM busy values include clients and unrelated Linux activity;
+they are not total-server CPU attribution, and Windows-host work is unobserved.
+
+The kernel option therefore remains an opt-in capacity path. The native
+io_uring path remains necessary and preferable for CPU/latency in this tested
+load regime. Higher saturated throughput does not make a path universally
+faster or cheaper. The larger capacity matrix is still in progress.
 
 ## Individual tuning arms
 
