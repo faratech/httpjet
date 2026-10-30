@@ -203,6 +203,40 @@ receiving its first poll. The repaired scheduling boundary passed 128 H3
 tests and the full 1,075-test server suite. This establishes that conditional
 defect and its repair; it does not prove the earlier timeout had that cause.
 
+## Rustls metadata experiment
+
+A separate fork of rustls 0.23.46 replaced the temporary vector of slice
+references in small vectored writes with a bounded stack array. Encryption,
+record boundaries, payload copying and the large-vector fallback were
+unchanged. The [upstream function](https://github.com/rustls/rustls/blob/f04804fa13341a9b1dc02b5d1dd8a746f2c4b7fb/rustls/src/conn.rs#L392)
+was checked before making the experiment.
+
+The fork passed four focused TLS tests, 33 existing TLS-library tests, the
+1,075-test server suite, cache isolation gates and live protocol/shutdown
+checks. Production-dependent ignored tests remained skipped. Both builds used
+the same native compiler profile, TLS features and caches. The control was
+`0a7cec3500f73188b7c705c1bc60871ab448fa02884d0e3b46f12a3db633b922`;
+the fork was
+`4ffb6d8b296226a2a4ec9aaf0c5ee2690d67e5113d9ab213d49dfb99bfe954dd`.
+
+All 48 timing arms completed: three ABBA cycles per 1 KiB cell, with 200,000
+measured responses plus 10,000 warmup responses each. Changes below are fork
+versus control medians, not comparisons with the public release.
+
+| Cell | Throughput | p99 | Process CPU/response | User instructions/response |
+|---|---:|---:|---:|---:|
+| h1s static | -0.09% | -0.44% | +0.00% | -0.22% |
+| h1s pagecache | +1.47% | -10.22% | -2.14% | -0.22% |
+| h2 static | -0.93% | +0.47% | +0.89% | -0.00% |
+| h2 pagecache | +1.40% | -0.46% | -1.41% | -0.01% |
+
+The stable instruction reduction was only about 0.22% for H1 TLS and near zero
+for H2. Throughput variation between repeated cycles exceeded the apparent
+gain. The fork is retained as an experiment and is not merged into the
+continuation build: the measurements do not justify its additional vendored
+dependency and update burden. The stock-rustls control is the selected build
+for final qualification.
+
 ## Individual tuning arms
 
 All 28 arms below passed response validation, client-headroom checks and 100%
