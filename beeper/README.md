@@ -1,6 +1,6 @@
 # Beeper research for HTTPJet
 
-Research snapshot: **29 October 2026**. Integration and benchmarking are ongoing.
+Research snapshot: **30 October 2026**. Integration and benchmarking are ongoing.
 
 This work builds on [Beeper](https://github.com/lerboe/beeper) and
 [hyper-fast-path](https://github.com/lerboe/hyper-fast-path) by
@@ -12,6 +12,10 @@ attribute QUIC termination or an HTTP/3 parser to Beeper.
 The question is practical: how much useful work can kernel assistance remove
 when the comparison server already has a static-body cache, a finished-response
 memo and an origin page cache?
+
+The [30 October continuation](continuation-2026-10-30.md) records the subsequent
+Rust parser, H1/H2 serving and H3 transport work. The earlier measurement tables
+below remain evidence for their original binaries, not the latest build.
 
 ## Findings so far
 
@@ -45,11 +49,11 @@ integration contracts and remaining work.
 
 | Area | Evidence and remaining work |
 |---|---|
-| H1 | Limited native off/observe byte/header-parity cases passed with Beeper on owned accepted sockets. Kernel cache serving and its performance remain unproven. |
-| H2 | Limited native off/observe parity cases passed while native HPACK, stream and flow-control ownership are retained. Complete kernel serving and a performance win remain unproven. |
-| H3 | Shared on-core cache dispatch, owned payload transfer, bounded scheduling and response-drain fixes are implemented experimentally. Quinn owns QUIC/TLS and io_uring supplies packet I/O. |
+| H1 | Experimental plaintext kernel cache serving, raw User-Agent identity, ordered fallback and safe late enrollment have live correctness evidence. HTTPS retains native TLS. The latest release comparison is in progress. |
+| H2 | Experimental plaintext kernel serving has live HPACK, flow-control and native-handoff evidence. Unsupported input and HTTPS retain native protocol ownership. The latest release comparison is in progress. |
+| H3 | Shared on-core cache dispatch, owned payload transfer, bounded scheduling and response-drain fixes are implemented experimentally. A pinned Quinn UDP fork adds optional sendmmsg batching. Quinn owns QUIC/TLS and io_uring supplies packet I/O. |
 | Optional routing | CID-aware reuseport steering has functional evidence. Migration and state-preserving restart remain outside its qualification. |
-| Release comparison | The exact v0.1.10-11 archive is pinned and has separate completed timing matrices. Gains are conditional; general performance superiority remains unproven. |
+| Release comparison | The exact v0.1.10-11 archive is pinned. Earlier matrices are complete; the latest integrated build is being compared separately with that archive and a matching native-source rebuild. General performance superiority remains unproven. |
 
 All runtime experiments use **SINGULARITY** and literal loopback destinations.
 No public origin or CDN is a load-test target. Results include unsuccessful and
