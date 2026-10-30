@@ -136,10 +136,33 @@ must let native cache authority publish a fresh representation. The exact
 expired-entry history is inferred from the retained refusal counters and
 immutable-field validation; raw entry timestamps were not captured in that arm.
 
-The next gates are a deterministic expiry/recovery regression, refreshed H2
-qualification, the remaining protocol/size matrix, Range controls and equal
-offered-load tails. PGO remains a separate experiment, with independently
-trained source baselines and no training rates counted as benchmark evidence.
+The subsequent repair checks the current image key, epoch and deadline through
+the native registry. An expired open index no longer suppresses publication.
+Evicted log metadata cannot hide a current image: the fast metadata hint has an
+authoritative bounded fallback. The deterministic regression first reproduced
+zero recovered kernel hits across 512 correct responses on the old binary;
+the repaired build recovered 510/512 after the same 2.1-second native hold.
+The existing 16-case H2 handoff corpus also passed.
+
+The repaired build has SHA-256
+`8bfbf568094bc2545b43219db469f334af4a9d2c73ab8c922741b454b05a0b90`.
+Its runtime inputs match source `d0f1d027`; it also includes bounded H1 response
+buffer reuse and local H3 completion pumping. All 1,076 server tests passed,
+as did the H1 late-enrollment and H1/H2 User-Agent corpora and six H3 delivery,
+cancellation and shutdown controls. These are correctness results.
+
+A repeated three-cycle H2 page-cache comparison then passed kernel-coverage
+checks in every candidate arm. Median throughput was 45,707 versus 119,083
+responses/s, process CPU 21.83 versus 7.93 us/response, and saturated p99 5.289
+versus 6.671 ms, release versus candidate. The throughput gain therefore still
+comes with a saturated tail-latency loss. This compares the combined cache and
+kernel changes, not the parser in isolation.
+
+The next gates are the remaining protocol/size matrix, Range controls and equal
+offered-load tails. The buffer changes are also being compared directly with
+the previous integrated binary. PGO remains a separate experiment, with
+independently trained source baselines and no training rates counted as
+benchmark evidence.
 
 ## Individual tuning arms
 
