@@ -1,0 +1,9 @@
+{
+  "observed_at_utc": "2026-10-31T21:45:31.283525+00:00",
+  "hostname": "SINGULARITY",
+  "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda",
+  "kernel": "7.3.1-microsoft-standard-WSL2-dirty",
+  "docker_endpoint": "unix:///var/run/docker.sock",
+  "docker_running": [],
+  "matching_application_compiler_VM_processes": []
+}

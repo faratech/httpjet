@@ -52,6 +52,8 @@ H1/H2 over verified TLS. Page-cache CPU improves, while static H2 CPU and p99
 regress. That regression remains open; the plaintext kernel gains do not establish
 universal HTTPS improvement.
 
+The [exact shipped-release p99 comparison](release-p99-2026-10-31.md) measures the retained repaired build against the distributed v0.1.10-11 binary at the same offered load. All ten cell medians improve; one H1 plaintext static cycle regresses sharply, and H1 TLS page-cache whole-VM CPU rises. These results preserve both qualifications and remain separate from the native PGO source-control study.
+
 ## Findings so far
 
 - **Quiescent H2 ownership fixes the tested process-CPU and tail regressions.**
