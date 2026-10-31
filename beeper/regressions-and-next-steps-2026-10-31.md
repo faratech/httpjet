@@ -37,6 +37,8 @@ The H1 HTTPS page-cache client CPU rises 38.620→39.456 µs/response (+2.16%, h
 
 A further **diagnostic signal**, not an established server regression: VM-wide TCP retransmissions total 13 in release H2c arms and 140 in candidate H2c arms, across twelve arms per role. Captured TCP timeouts, backlog drops and spurious RTOs are zero. These counters include unrelated traffic and need per-socket attribution. The H3 JSON has no corresponding kernel-counter delta; it is unmeasured, not zero. [Network counters](../docs/evidence/regression-review-20261031/network-counters.csv).
 
+An additional latency statistic is mixed: for H1 plaintext page-cache traffic, the median of six per-arm maximum latencies rises **4.173→5.749 ms (+37.75%)**. Paired cycle changes are +42.01%, −78.62%, −97.53%. The absolute worst request across all arms instead falls 564.725→8.404 ms. These distinct aggregations must not be described as a uniform worst-case regression or guarantee. A separate audit recomputed p50 and maxima for all 720,000 measured rows in those twelve arms. The client summaries show lower overall p50 medians in every release-comparison cell. [Maximum-latency audit](../docs/evidence/regression-review-20261031/h1-pagecache-max-audit.json).
+
 ## Stricter native-PGO comparisons remain relevant
 
 These earlier campaigns used fresh source-specific PGO builds. They finished before the forum containers were stopped, so their measurements must not be pooled with the newer release campaign.
