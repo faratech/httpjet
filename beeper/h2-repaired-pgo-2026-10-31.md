@@ -4,6 +4,8 @@ The repaired build completed all 96 matched-load benchmark arms on SINGULARITY. 
 
 These are warm, synthetic **1 KiB** responses at **15,000 requests/s**. H1 and H2c use plaintext connections; H3 uses QUIC/TLS. This study does not establish HTTPS/H2 performance gains, full-site speedups or throughput-capacity multipliers. The proposed Unix send hook is absent from these binaries.
 
+The subsequent [native HTTPS study](native-tls-followup-2026-10-31.md) records page-cache gains and a static H2 CPU/p99 regression separately.
+
 ## Production-source comparison
 
 Each row summarizes six baseline and six candidate arms across three ABBA cycles. Percentages compare medians; negative values mean less CPU or lower latency. H1 uses readiness-driven kernel serving, H2c uses kernel serving, and H3 uses the accelerated native engine without a BPF serving helper.

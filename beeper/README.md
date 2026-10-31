@@ -47,6 +47,11 @@ application across all 11 correctness gates and 96 matched-load benchmark arms.
 Process CPU and tail latency improve across H1, H2c and H3; whole-VM CPU remains
 higher for static H1/H2c traffic. The proposed Unix send hook is not part of those results.
 
+The [native HTTPS follow-up](native-tls-followup-2026-10-31.md) separately measures
+H1/H2 over verified TLS. Page-cache CPU improves, while static H2 CPU and p99
+regress. That regression remains open; the plaintext kernel gains do not establish
+universal HTTPS improvement.
+
 ## Findings so far
 
 - **Quiescent H2 ownership fixes the tested process-CPU and tail regressions.**
