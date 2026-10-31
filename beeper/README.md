@@ -40,7 +40,12 @@ CPU remains higher. Optimization continues.
 
 The [packet-preparation regression](h2-packet-preparation-2026-10-31.md) explains
 a stress failure in the next certified-header candidate and its correctness
-repair. Fresh application and performance qualification remain pending.
+repair at its earlier evidence checkpoint.
+
+The [repaired PGO follow-up](h2-repaired-pgo-2026-10-31.md) now validates that
+application across all 11 correctness gates and 96 matched-load benchmark arms.
+Process CPU and tail latency improve across H1, H2c and H3; whole-VM CPU remains
+higher for static H1/H2c traffic. The proposed Unix send hook is not part of those results.
 
 ## Findings so far
 

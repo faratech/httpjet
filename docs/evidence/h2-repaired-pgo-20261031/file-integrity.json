@@ -1,0 +1,121 @@
+{
+  "files": {
+    "candidate-json-manifest.json": {
+      "sha256": "796d6268fb881f5085abd4d1bfcc8cb980b85f7d3fcc9512f6c5fe61a29b465a",
+      "bytes": 33512
+    },
+    "candidate-qualification-seal.json": {
+      "sha256": "18e64bc5c774ec9e2138ec12e0ce1194bad5f4ffe745440d6d57a072c2a788b5",
+      "bytes": 9553
+    },
+    "candidate-qualification.json": {
+      "sha256": "bb8850619fd76372f63da27fd665ea28c31152eb65e88d6c44bce53843a6f7d3",
+      "bytes": 1021
+    },
+    "candidate-warning-review.json": {
+      "sha256": "a971b0e12bfe4211f25ae97fce524ace949bb4d5609d70ab0131bdb9b864fdc9",
+      "bytes": 19020
+    },
+    "e9/TABLE.md": {
+      "sha256": "0fa16280c7e281da46aa99f716bf27bb771f2f34dc31287b8a82977e7dc22653",
+      "bytes": 752
+    },
+    "e9/arms.csv": {
+      "sha256": "c50c24986db595b747a6a897d8c29e58e084f7e276d89a1e294fa9b09311dcac",
+      "bytes": 6218
+    },
+    "e9/changes-percent.csv": {
+      "sha256": "0714703352ad6870b76674e1c758423429c5ca2c57c9158b6be36342ed365da6",
+      "bytes": 662
+    },
+    "e9/cycles-percent.csv": {
+      "sha256": "3858f767d9dccf7aebd35b085bd49f69eabe4d0458de714099bb3edbfcf37e5a",
+      "bytes": 1645
+    },
+    "e9/groups.csv": {
+      "sha256": "9c2e850c94d24a4e1aa6b7b48407afe23cc56d4994ad237030016090fd8fe22a",
+      "bytes": 1062
+    },
+    "e9/raw-manifest.json": {
+      "sha256": "1a2a08be19c0ac1ec6281c6e1e74b0ef4107cc1efa1726df4ff29f3d2d55e6ba",
+      "bytes": 64452
+    },
+    "e9/receipt.json": {
+      "sha256": "f0020822a19a471d65332bb44a81b0e707e941f5a8c5e7b2caa844acc0c04c49",
+      "bytes": 13375
+    },
+    "e9/recompute.py": {
+      "sha256": "3d3e129b4cbb2664a79dcb40780fe3c3b8c7cfd8ada0fda8da656b558051d311",
+      "bytes": 20073
+    },
+    "final/TABLE.md": {
+      "sha256": "34b8f5c9acedde31202fbe239a6b372df221bf8149cadc2f7284f189638261bf",
+      "bytes": 2473
+    },
+    "final/arms.csv": {
+      "sha256": "e75e750eb7faf216588f0a6801be03f914196d2f51e25c32f3c9cfd4cea1e9dd",
+      "bytes": 19238
+    },
+    "final/changes-percent.csv": {
+      "sha256": "7c1f714dc3545e8b239441c6321e5010323a2c2190d45ad0c041879a9a06bc5d",
+      "bytes": 1657
+    },
+    "final/cycles-percent.csv": {
+      "sha256": "b1c716ce26f5cda5ad5ef4e3bbda9581275ffbc54cf619acc4084d14e354d0fa",
+      "bytes": 4823
+    },
+    "final/groups.csv": {
+      "sha256": "925f0afa543f9d5221fde776858d34894328953fefe444316793f67fccaea922",
+      "bytes": 2918
+    },
+    "final/raw-manifest.json": {
+      "sha256": "6c3e35ed7e33507cdf8d43c9f3d0208bafd57e634b27a9b8e47f95cb39d36897",
+      "bytes": 361524
+    },
+    "final/receipt.json": {
+      "sha256": "119dd604c269fe2729f80a0950047c49e55d556c25c170e8f1f273403f9d6488",
+      "bytes": 69087
+    },
+    "final/recompute.py": {
+      "sha256": "65a29aba7324547bf0ee4d882be168c5bdba104bc8db99141d3ae705d57e7362",
+      "bytes": 19552
+    },
+    "gen-ua-binding-audit.json": {
+      "sha256": "0ab33c9ce663830132eea1e7bfebb964da7d3023865170db67eb262c32f63e80",
+      "bytes": 4888
+    },
+    "gen-ua-qualification.json": {
+      "sha256": "f5e2445624376015f1bf4c7766b3aa65a89c4e39a1606393405a394047f49de1",
+      "bytes": 728
+    },
+    "kernel-cost-analyze-samples.py": {
+      "sha256": "d8a4b6f8dc32103f067254080799b12e59fb6d541738b41b292cc9ce2fcffa53",
+      "bytes": 6374
+    },
+    "kernel-cost-evidence-sha256.json": {
+      "sha256": "d801f82caf3f8675464e7d5cff6f87db0b4bf52cca53f62203a9f384681d4598",
+      "bytes": 4081
+    },
+    "kernel-cost-ranking.json": {
+      "sha256": "0875dcd0980472a0bbbfad6b52778efb09ba207efe2cfcf5d2015182108e798f",
+      "bytes": 8948
+    },
+    "production-source-json-manifest.json": {
+      "sha256": "0dd9dc1f783b6590f19abdc678bfe4480c3ac5d7039f5d8ecb43b7a2e9b544fd",
+      "bytes": 18576
+    },
+    "production-source-qualification-seal.json": {
+      "sha256": "ec1e41bc2255a7c8e6076841997461e5b72f8877c51441eeb0e274488f2d1734",
+      "bytes": 5257
+    },
+    "production-source-qualification.json": {
+      "sha256": "6ad5ab8331f41201555b0e569e45b13090ce208a18f14292dd30b35e6a4c3f78",
+      "bytes": 15989
+    },
+    "production-source-warning-review.json": {
+      "sha256": "cf935dad7ae9fe26b341c15e0d3f29be047c1354afa5eb08e96b3b96bb56755b",
+      "bytes": 13174
+    }
+  },
+  "scope": "Byte-preserved compact evidence; full latency/perf blobs retained outside Git."
+}
