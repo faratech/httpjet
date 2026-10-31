@@ -6,9 +6,11 @@ static-file regressions against the shipped release. PGO is a separate build
 experiment intended to address those remaining costs. It does not change the
 runtime implementation or turn a training run into a benchmark.
 
-All build, training, correctness and timing work runs on **SINGULARITY**. Network
-fixtures bind both endpoints to `127.0.0.2`, use generated configuration and
-content, and leave production listeners, PHP pools and cache directories alone.
+All build, training, correctness and timing work runs on **SINGULARITY**. Training
+and timing bind both endpoints to `127.0.0.2`. The existing H1/H2 handoff
+correctness corpora use `127.0.0.1`; their results are not timing comparisons.
+Fixtures use generated configuration and content, leaving production listeners,
+PHP pools and cache directories alone.
 
 ## Frozen inputs
 
@@ -109,3 +111,37 @@ These are IR execution counters, not source coverage percentages or CPU samples.
 
 These are build/training milestones only. No PGO performance result is claimed
 by these receipts.
+
+The non-PGO control and profile-use build both completed. Their server hashes
+are `f9b441d1810afc842e096222fd279323b174076410c923d713e533b11a79c7e2`
+and `0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5`,
+respectively. Actual Cargo fingerprints confirm matching release settings and
+the intended PGO flag difference. There were zero profile-hash/control-flow
+mismatches. The 847 missing-function warnings comprise 400 build-script
+instances, 227 BPF build utilities, 124 unused CID-helper instances, 90 unused
+observer-helper instances and six instances in the separate parser library
+exported for fuzzing. No missing profile in the serving hot paths was identified.
+
+The first qualification attempt failed during fixture setup: the H1 backend
+bound to `127.0.0.1` while its imported readiness probe inherited `127.0.0.2`.
+HTTPJet had not launched, and the backend was reaped. The failed receipt is
+retained. The corrected wrapper selects each existing handoff fixture's `.1`
+address explicitly; it does not change the server or mix `.1` timing into the
+`.2` benchmark.
+
+Qualification v2 passed all nine steps and all 33 recorded cleanup checks:
+H1 late handoff; native/polling/readiness H1/H2 User-Agent cases; H2 oversized
+fallback and expiry recovery; H1/H2 TLS static/page-cache/Range probes; six H3
+delivery/cancellation/drain cases; cross-URL/cross-scheme cache isolation; and
+H3 static/page-cache probes at GSO20/batch1. Both unacknowledged H3 shutdown cases
+retained the intended approximately 15-second drain deadline.
+
+The [completed ten-cell static pilot](../../beeper/pgo-pilot-2026-10-30.md) uses five protocols, two sizes,
+three ABBA cycles, 100,000 measured and 5,000 warmup requests per arm. Both builds
+use native H1/H2 ownership and accelerated H3 with GSO20/batch1; this isolates
+the PGO effect before testing the integrated selection against the release.
+All 12 million measured responses and 600,000 warmup responses validated. Every
+pooled throughput median rose, but the 32 KiB H2c cycles disagree and its pooled
+p99 worsened. The report retains those tradeoffs. The full release comparison
+is a separate 20-cell, 240-arm run with both static and page-cache fixtures;
+it is currently in progress.

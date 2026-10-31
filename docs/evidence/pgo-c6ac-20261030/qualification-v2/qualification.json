@@ -1,0 +1,825 @@
+{
+  "passed": true,
+  "recorded_at_utc": "2026-10-30T15:55:25.424576+00:00",
+  "original_exit": 0,
+  "final_integrity_exit": 0,
+  "scope": "post-PGO live correctness only; preflight rates are not performance evidence",
+  "source_runtime_commit_label": "1371045361b3caef938bd530e9f24246c0ecb368",
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": {
+      "bytes": 23518040,
+      "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1": {
+      "bytes": 2459592,
+      "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-observe": {
+      "bytes": 1961032,
+      "sha256": "8ab3543e785fb7077e3b4379539349cd2ec5fcf34f470ae0b6877668ecb37261"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-quic-steer": {
+      "bytes": 1322048,
+      "sha256": "cb37fb72cf116f6f786a64ac71295016ec4628b232ff97e873ad8a42ca57322c"
+    }
+  },
+  "expected_steps": [
+    "inputs-before",
+    "h1-late-readiness",
+    "h1-h2-ua",
+    "h2-oversize",
+    "h2-expiry",
+    "tls-smoke",
+    "h3-shutdown",
+    "cache-required",
+    "h3-gso20-batch1"
+  ],
+  "steps": [
+    {
+      "name": "inputs-before",
+      "started_at_utc": "2026-10-30T15:53:17Z",
+      "finished_at_utc": "2026-10-30T15:53:18.267944+00:00",
+      "returncode": 0,
+      "command": [
+        "pgo_qual_integrity",
+        "before"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/inputs-before.log",
+      "log_sha256": "9a456a2f913c17964eceb21e4da8b46e28f5ae5f15b56f30c9a1c20fbe8e135c"
+    },
+    {
+      "name": "h1-late-readiness",
+      "started_at_utc": "2026-10-30T15:53:18Z",
+      "finished_at_utc": "2026-10-30T15:53:29.274493+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/beeper_h1_late_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+        "--wakeup",
+        "readiness",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-late-readiness"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/h1-late-readiness.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "h1-h2-ua",
+      "started_at_utc": "2026-10-30T15:53:29Z",
+      "finished_at_utc": "2026-10-30T15:54:20.146602+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/beeper_h1_serve_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+        "--arms",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/ua-arms.json",
+        "--hit-metric",
+        "httpjet_h1_kernel_successes_total",
+        "--h2-ua-corpus",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-h2-ua"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/h1-h2-ua.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "h2-oversize",
+      "started_at_utc": "2026-10-30T15:54:20Z",
+      "finished_at_utc": "2026-10-30T15:54:23.032804+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/beeper_h2_serve_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-oversize"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/h2-oversize.log",
+      "log_sha256": "dc13c73d7d90e7587d136eab4e64be12e238c74aeb474c68606fdf37febda503"
+    },
+    {
+      "name": "h2-expiry",
+      "started_at_utc": "2026-10-30T15:54:23Z",
+      "finished_at_utc": "2026-10-30T15:54:30.508790+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/beeper_h2_expiry_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-expiry"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/h2-expiry.log",
+      "log_sha256": "21e1ec99619d565ab0f219606eb3449a50832313a54bb26a06eece7eddddf964"
+    },
+    {
+      "name": "tls-smoke",
+      "started_at_utc": "2026-10-30T15:54:30Z",
+      "finished_at_utc": "2026-10-30T15:54:34.806923+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/http_engine_check.py",
+        "--arms",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/http-native-arms.json",
+        "--client",
+        "/var/tmp/hjc/httpjet-http-load-bind",
+        "--sequence",
+        "native",
+        "--protocols",
+        "h1s,h2",
+        "--cases",
+        "static,pagecache,range",
+        "--rounds",
+        "1",
+        "--size",
+        "1024",
+        "--requests",
+        "1000",
+        "--warmup",
+        "100",
+        "--workers",
+        "1",
+        "--server-cpus",
+        "8",
+        "--client-cpus",
+        "0,2,4,6,12,14",
+        "--client-threads",
+        "6",
+        "--connections",
+        "32",
+        "--streams",
+        "4",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/tls-smoke"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/tls-smoke.log",
+      "log_sha256": "95dbaafb46328152674e818fe5b71c43b3425baa352e3d7062a30690c4721e57"
+    },
+    {
+      "name": "h3-shutdown",
+      "started_at_utc": "2026-10-30T15:54:34Z",
+      "finished_at_utc": "2026-10-30T15:55:13.679471+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/h3_shutdown_check.py",
+        "--candidate",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--modes",
+        "legacy,accelerated",
+        "--cases",
+        "delivery,stop,unacked",
+        "--server-cpus",
+        "8",
+        "--source-commit",
+        "1371045361b3caef938bd530e9f24246c0ecb368",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-shutdown"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/h3-shutdown.log",
+      "log_sha256": "def26e60988a8c0ae6dde7c2d3910e36f365a0cb5c9093821c22256b1384e492"
+    },
+    {
+      "name": "cache-required",
+      "started_at_utc": "2026-10-30T15:55:13Z",
+      "finished_at_utc": "2026-10-30T15:55:15.131626+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/cache_required_lab.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--address",
+        "127.0.0.2",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/cache-required"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/cache-required.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "h3-gso20-batch1",
+      "started_at_utc": "2026-10-30T15:55:15Z",
+      "finished_at_utc": "2026-10-30T15:55:24.055259+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/h3_engine_check.py",
+        "--candidate",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--candidate-page-response-memo",
+        "--client",
+        "/var/tmp/httpjet-continuation/h3-bind-client-20261030/bin/httpjet-h3-load-bind",
+        "--sequence",
+        "accelerated",
+        "--case",
+        "all",
+        "--steering",
+        "off",
+        "--rounds",
+        "1",
+        "--candidate-arg=--h3-gso-segments=20",
+        "--candidate-arg=--h3-send-batch=1",
+        "--workers",
+        "1",
+        "--server-cpus",
+        "8",
+        "--client-cpus",
+        "0,2,4,6,12,14",
+        "--client-threads",
+        "6",
+        "--size",
+        "1024",
+        "--requests",
+        "1000",
+        "--warmup",
+        "100",
+        "--connections",
+        "32",
+        "--streams",
+        "4",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-gso20-batch1"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/h3-gso20-batch1.log",
+      "log_sha256": "1d8769540c82a5f4161a798a37336cf644cbf769386289f6c368e006b8563698"
+    }
+  ],
+  "cleanup": [
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-late-readiness/native/cleanup.json",
+      "sha256": "f29d099d9a3e69860373629750093fd890f1aad02a7e346c070b5363b5d96074",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-late-readiness/native/exits.json",
+      "sha256": "ebd9473a8dce499b9772212abb7c51c08023e47fd27640127afca0833303b1ad",
+      "valid": true,
+      "summary": {
+        "server": 0,
+        "backend": -15
+      }
+    },
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-late-readiness/kernel/cleanup.json",
+      "sha256": "475646bbc3306709a70ba28f80f4af96e99fad9fd40bfebfa16a9237038b7134",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-late-readiness/kernel/exits.json",
+      "sha256": "ebd9473a8dce499b9772212abb7c51c08023e47fd27640127afca0833303b1ad",
+      "valid": true,
+      "summary": {
+        "server": 0,
+        "backend": -15
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-h2-ua/native/cleanup.json",
+      "sha256": "1f1976f0696df655623b4e602636fa430c56ab138b0003ae2b32a3054e72c4df",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-h2-ua/native/exit.json",
+      "sha256": "a51b80f3407aaa0f6a592c76b6dd91657a953963c641853c14337bd767a37562",
+      "valid": true,
+      "summary": {
+        "pid": 653353,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-h2-ua/polling/cleanup.json",
+      "sha256": "2c3a1e8bc83902f4f92b39be5d34047cc8dccac7e27c7bdeb6168d833c5d252b",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-h2-ua/polling/exit.json",
+      "sha256": "8f765a14d270876d062dd2a4dd5c54a09ab29145d6fc210afedd65d43a9d9131",
+      "valid": true,
+      "summary": {
+        "pid": 653662,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-h2-ua/readiness/cleanup.json",
+      "sha256": "fb99a8df4ceefdcb37f41485aa9893ea441d26bad05378ea8bbc0525a3f94093",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h1-h2-ua/readiness/exit.json",
+      "sha256": "134c545d6751bc6e3135682d8e477f996adb4f7ab8d56108026a544431632ddc",
+      "valid": true,
+      "summary": {
+        "pid": 653970,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-oversize/native/cleanup.json",
+      "sha256": "dd31424dc6b2fe8645539ad80ba45f850cfe18d601a53083a14f85dcf6bb2e16",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-oversize/native/exit.json",
+      "sha256": "309afe229afd1443a07665c358be74d176816b1083f9fa3bb2893443125b4afe",
+      "valid": true,
+      "summary": {
+        "pid": 654237,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-oversize/kernel/cleanup.json",
+      "sha256": "2587171c59618d4f982ab7c06a8e76e1c13914709d2b09d7ccdc4b0cdd5d7e85",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-oversize/kernel/exit.json",
+      "sha256": "ae5642ea405e3155291c1ebd02db73f0e81f81ee13371051d8dd238d8418cfa5",
+      "valid": true,
+      "summary": {
+        "pid": 654282,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-expiry/native/cleanup.json",
+      "sha256": "04590e08eb9668db0bfea6a377650a1a64190248cf375d8b7381c04b62140550",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-expiry/native/exit.json",
+      "sha256": "7ae0db698aa0b1e0cefb6ca10bb79f8afad4739016f66cdac7eae5d1977e46e0",
+      "valid": true,
+      "summary": {
+        "pid": 654292,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-expiry/kernel/cleanup.json",
+      "sha256": "48c557295465862f69246e91588d61bb8bca1a7d5bde5eabed35fba510d894c7",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h2-expiry/kernel/exit.json",
+      "sha256": "f24aa4c231793fce0398a4d5b73d90aa72d47ce89e6be5f4f3600ec622e48026",
+      "valid": true,
+      "summary": {
+        "pid": 654361,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-shutdown/legacy-delivery/result.json",
+      "sha256": "bbb105ea9e3269e2ff31192494278f76260ced64fe238c6145738103ec067bdd",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 654654,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 44364
+          },
+          {
+            "kind": "tcp",
+            "port": 46846
+          },
+          {
+            "kind": "udp",
+            "port": 46846
+          },
+          {
+            "kind": "tcp",
+            "port": 44708
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-shutdown/legacy-stop/result.json",
+      "sha256": "12debd5b2b4e9cf050e9193d3b12f880545ce9bd2469d35be0d331f660151f03",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 654704,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 43680
+          },
+          {
+            "kind": "tcp",
+            "port": 44930
+          },
+          {
+            "kind": "udp",
+            "port": 44930
+          },
+          {
+            "kind": "tcp",
+            "port": 44018
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-shutdown/legacy-unacked/result.json",
+      "sha256": "ff7c23b0a22eb5b17ad510a216a7bfe7c5737bb0d1a2f8e9390fc58fbde1a64f",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 654713,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 44724
+          },
+          {
+            "kind": "tcp",
+            "port": 45178
+          },
+          {
+            "kind": "udp",
+            "port": 45178
+          },
+          {
+            "kind": "tcp",
+            "port": 43744
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-shutdown/accelerated-delivery/result.json",
+      "sha256": "45940d1fe05e9e93275907fd26e4ef4e47e324bf967682fa285afd6b124891d9",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 655039,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 46764
+          },
+          {
+            "kind": "tcp",
+            "port": 44082
+          },
+          {
+            "kind": "udp",
+            "port": 44082
+          },
+          {
+            "kind": "tcp",
+            "port": 43752
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-shutdown/accelerated-stop/result.json",
+      "sha256": "8fb3106b3a555e98ed83310c10cdc91239cc20ea2f1e47a604c424d7f51de81d",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 655111,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 43286
+          },
+          {
+            "kind": "tcp",
+            "port": 44322
+          },
+          {
+            "kind": "udp",
+            "port": 44322
+          },
+          {
+            "kind": "tcp",
+            "port": 46348
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-shutdown/accelerated-unacked/result.json",
+      "sha256": "16e0cae45674a8d9d86b7b97c3925014f3194a04d984b9f841024e26c03f0c07",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 655120,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 44632
+          },
+          {
+            "kind": "tcp",
+            "port": 43938
+          },
+          {
+            "kind": "udp",
+            "port": 43938
+          },
+          {
+            "kind": "tcp",
+            "port": 44270
+          }
+        ]
+      }
+    },
+    {
+      "gate": "cache-required",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/cache-required/cleanup.json",
+      "sha256": "3dda9603105e812a9979bf4a446639bc37e014aac256f161a9af971be2b8a0fd",
+      "valid": true,
+      "summary": {
+        "clean": true,
+        "processes": [
+          {
+            "name": "server",
+            "pid": 655430,
+            "returncode": 0
+          },
+          {
+            "name": "backend",
+            "pid": 655427,
+            "returncode": 0
+          }
+        ],
+        "listeners": [
+          {
+            "address": "127.0.0.2",
+            "port": 19272,
+            "connect_errno": 111
+          },
+          {
+            "address": "127.0.0.2",
+            "port": 23177,
+            "connect_errno": 111
+          },
+          {
+            "address": "127.0.0.2",
+            "port": 40607,
+            "connect_errno": 111
+          },
+          {
+            "address": "127.0.0.1",
+            "port": 32239,
+            "connect_errno": 111
+          }
+        ]
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/tls-smoke/h1s-pagecache-1-1-native/server-exit.json",
+      "sha256": "56b25717ff26bba9d3bbb25d56485f704a1da14ddf883da3a459b1943a4f98f5",
+      "valid": true,
+      "summary": {
+        "pid": 654552,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/tls-smoke/h1s-range-1-1-native/server-exit.json",
+      "sha256": "a8a2646395a503cb49f3fe03be3952a2beb359d3bfa9ebcaedf617e04c13e62c",
+      "valid": true,
+      "summary": {
+        "pid": 654601,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/tls-smoke/h1s-static-1-1-native/server-exit.json",
+      "sha256": "7a7385c3080af59b3ab11efe195a6ab73f54f2a8e4ccfe57ff4dd86035fb330e",
+      "valid": true,
+      "summary": {
+        "pid": 654493,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/tls-smoke/h2-pagecache-1-1-native/server-exit.json",
+      "sha256": "ffe7f01c398bcd7a1db2f9370e1c143f310b16330a7db04d5c64c9257dbbb7c0",
+      "valid": true,
+      "summary": {
+        "pid": 654566,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/tls-smoke/h2-range-1-1-native/server-exit.json",
+      "sha256": "83f55e8fd0ac29d65d50b12e37b5a7128f132b7def3ab41d7e8907e7a5423023",
+      "valid": true,
+      "summary": {
+        "pid": 654635,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/tls-smoke/h2-static-1-1-native/server-exit.json",
+      "sha256": "f4ac845c191336ef36ad8991c522c601b30d9170f75bacf452dc237f8a291121",
+      "valid": true,
+      "summary": {
+        "pid": 654528,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "h3-gso20-batch1",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-gso20-batch1/pagecache-1-1-accelerated/server-exit.json",
+      "sha256": "523c03a737cfda50e1596160954ae037416fa5dfa3d8629c56320464e8d93b4e",
+      "valid": true,
+      "summary": {
+        "pid": 655599,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "h3-gso20-batch1",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/h3-gso20-batch1/static-1-1-accelerated/server-exit.json",
+      "sha256": "f06f69f409201516f1e0cd64607db25a425cb840c6f3dc188b463766b8a1697e",
+      "valid": true,
+      "summary": {
+        "pid": 655472,
+        "exit": 0
+      }
+    }
+  ],
+  "cleanup_errors": [],
+  "before_after_inputs": {
+    "before": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/inputs-before.json",
+      "sha256": "08dc504daf58f901df0c1f897dccd24a77208493b888aa0faca871624be46b9d"
+    },
+    "after": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/inputs-after.json",
+      "sha256": "08dc504daf58f901df0c1f897dccd24a77208493b888aa0faca871624be46b9d"
+    }
+  },
+  "final_integrity_log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/logs/inputs-after.log",
+  "live_artifacts_exercised": [
+    "httpjet",
+    "httpjet-beeper-h1"
+  ],
+  "hash_verified_artifacts": [
+    "httpjet",
+    "httpjet-beeper-h1",
+    "httpjet-beeper-observe",
+    "httpjet-quic-steer"
+  ]
+}

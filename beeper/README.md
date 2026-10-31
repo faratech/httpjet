@@ -25,13 +25,25 @@ The [candidate C PGO experiment](../docs/performance/beeper-pgo-c6ac-2026-10-30.
 records the next build comparison. Its instrumented build and training are
 separate from performance qualification.
 
+The [completed same-source PGO pilot](pgo-pilot-2026-10-30.md) measures the compiler
+profile separately. The subsequent cache-aware comparison against the shipped
+release is in progress.
+
 ## Findings so far
 
 - **The corrected C matrix is complete, with mixed results.** All 96 million
   measured responses validated. Against the exact shipped release, page-cache
   throughput medians improved by approximately 17–230%, while several static
   cells remained about 4–7% slower. Build/profile effects and CPU/latency
-  tradeoffs remain explicit; a profile-guided build is the next experiment.
+  tradeoffs remain explicit; the subsequent profile-guided pilot is reported
+  separately.
+- **PGO improved every static throughput median in its same-source pilot.**
+  All 12 million measured responses validated. Median throughput increased
+  4.6–49.9% and process CPU per response fell 4.4–32.8%. Eight cells improved
+  throughput in every cycle. The 32 KiB H2c result varied sharply and its pooled
+  p99 rose 9.6%; 32 KiB H2-TLS had one slightly negative throughput cycle.
+  This pilot does not compare against the release or establish whole-system
+  CPU savings.
 - **Cache-aware comparisons matter.** The 29 October H3 matched native-PGO matrices
   show descriptive median throughput gains of approximately 55%, 100%, 13% and
   11% for 1 KiB static, 1 KiB page cache, 32 KiB static and 32 KiB page cache.

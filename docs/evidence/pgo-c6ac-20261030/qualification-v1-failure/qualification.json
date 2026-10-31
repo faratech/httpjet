@@ -1,0 +1,121 @@
+{
+  "passed": false,
+  "recorded_at_utc": "2026-10-30T15:52:45.962955+00:00",
+  "original_exit": 1,
+  "final_integrity_exit": 0,
+  "scope": "post-PGO live correctness only; preflight rates are not performance evidence",
+  "source_runtime_commit_label": "1371045361b3caef938bd530e9f24246c0ecb368",
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": {
+      "bytes": 23518040,
+      "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1": {
+      "bytes": 2459592,
+      "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-observe": {
+      "bytes": 1961032,
+      "sha256": "8ab3543e785fb7077e3b4379539349cd2ec5fcf34f470ae0b6877668ecb37261"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-quic-steer": {
+      "bytes": 1322048,
+      "sha256": "cb37fb72cf116f6f786a64ac71295016ec4628b232ff97e873ad8a42ca57322c"
+    }
+  },
+  "expected_steps": [
+    "inputs-before",
+    "h1-late-readiness",
+    "h1-h2-ua",
+    "h2-oversize",
+    "h2-expiry",
+    "tls-smoke",
+    "h3-shutdown",
+    "cache-required",
+    "h3-gso20-batch1"
+  ],
+  "steps": [
+    {
+      "name": "inputs-before",
+      "started_at_utc": "2026-10-30T15:52:32Z",
+      "finished_at_utc": "2026-10-30T15:52:34.101560+00:00",
+      "returncode": 0,
+      "command": [
+        "pgo_qual_integrity",
+        "before"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/logs/inputs-before.log",
+      "log_sha256": "9a456a2f913c17964eceb21e4da8b46e28f5ae5f15b56f30c9a1c20fbe8e135c"
+    },
+    {
+      "name": "h1-late-readiness",
+      "started_at_utc": "2026-10-30T15:52:34Z",
+      "finished_at_utc": "2026-10-30T15:52:44.732854+00:00",
+      "returncode": 1,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-harness/scripts/beeper_h1_late_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+        "--wakeup",
+        "readiness",
+        "--results",
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/h1-late-readiness"
+      ],
+      "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/logs/h1-late-readiness.log",
+      "log_sha256": "b8cf2b5383de14c271122556ceb0c25f7d29ca37e64ade10612f320c297410e8"
+    }
+  ],
+  "cleanup": [
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/h1-late-readiness/native/cleanup.json",
+      "sha256": "44e25291ae1fd0273a7a65cc1307d896758b01b9126c2bb127c79a65af247e7a",
+      "valid": false,
+      "summary": {
+        "proved": false
+      }
+    },
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/h1-late-readiness/native/exits.json",
+      "sha256": "adefc37f1520c69d99db96ffa183dca90e03cd9ae1c2b11acfd7ce232253d5d8",
+      "valid": false,
+      "summary": {
+        "backend": -15
+      }
+    }
+  ],
+  "cleanup_errors": [],
+  "before_after_inputs": {
+    "before": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/inputs-before.json",
+      "sha256": "6115c386a635d43093b2e5cecd69eda37c24593f4ac0a903eb8bc4744abb8cd1"
+    },
+    "after": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/inputs-after.json",
+      "sha256": "6115c386a635d43093b2e5cecd69eda37c24593f4ac0a903eb8bc4744abb8cd1"
+    }
+  },
+  "final_integrity_log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v1/logs/inputs-after.log",
+  "live_artifacts_exercised": [
+    "httpjet",
+    "httpjet-beeper-h1"
+  ],
+  "hash_verified_artifacts": [
+    "httpjet",
+    "httpjet-beeper-h1",
+    "httpjet-beeper-observe",
+    "httpjet-quic-steer"
+  ]
+}

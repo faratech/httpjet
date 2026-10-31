@@ -4,7 +4,7 @@ set -euo pipefail
 source /var/tmp/pgo-c-common.sh
 
 test "$PGO_RUN" = /var/tmp/httpjet-continuation/pgo-c6ac-v1
-export PGO_QUAL_OUT="$PGO_RUN/qualification-v1"
+export PGO_QUAL_OUT="$PGO_RUN/qualification-v2"
 export PGO_QUAL_HARNESS="$PGO_RUN/qualification-harness"
 export PGO_QUAL_RUNNER="$(readlink -f -- "${BASH_SOURCE[0]}")"
 export PGO_QUAL_SOURCE_COMMIT=1371045361b3caef938bd530e9f24246c0ecb368
@@ -287,24 +287,30 @@ pgo_qual_step inputs-before pgo_qual_integrity before
 pgo_qual_python=(env -i PATH=/usr/local/bin:/usr/bin:/bin
     PYTHONPATH=/var/tmp/httpjet-h3-tools/python PYTHONDONTWRITEBYTECODE=1
     HJ_BENCH_ADDR=127.0.0.2 HJ_BENCH_BIND=127.0.0.2 python3 -B)
+# The H1/H2 handoff corpora explicitly bind their helper/backend to .1.
+# Keep their imported readiness helper on the same address. These are
+# correctness gates; timed comparisons below continue to use true-lo .2.
+pgo_qual_handoff_python=(env -i PATH=/usr/local/bin:/usr/bin:/bin
+    PYTHONPATH=/var/tmp/httpjet-h3-tools/python PYTHONDONTWRITEBYTECODE=1
+    HJ_BENCH_ADDR=127.0.0.1 HJ_BENCH_BIND=127.0.0.1 python3 -B)
 pgo_qual_scripts="$PGO_QUAL_HARNESS/scripts"
 pgo_qual_binary="$PGO_RUN/bin-use/httpjet"
 pgo_qual_helper="$PGO_RUN/bin-use/httpjet-beeper-h1"
 
-pgo_qual_step h1-late-readiness "${pgo_qual_python[@]}" "$pgo_qual_scripts/beeper_h1_late_check.py" \
+pgo_qual_step h1-late-readiness "${pgo_qual_handoff_python[@]}" "$pgo_qual_scripts/beeper_h1_late_check.py" \
     --binary "$pgo_qual_binary" --helper "$pgo_qual_helper" --wakeup readiness \
     --results "$PGO_QUAL_OUT/h1-late-readiness"
 
 # Only this corpus uses a 32 KiB H1 cap: it asserts the 32 KiB boundary hits.
-pgo_qual_step h1-h2-ua "${pgo_qual_python[@]}" "$pgo_qual_scripts/beeper_h1_serve_check.py" \
+pgo_qual_step h1-h2-ua "${pgo_qual_handoff_python[@]}" "$pgo_qual_scripts/beeper_h1_serve_check.py" \
     --binary "$pgo_qual_binary" --helper "$pgo_qual_helper" --arms "$PGO_QUAL_OUT/ua-arms.json" \
     --hit-metric httpjet_h1_kernel_successes_total --h2-ua-corpus \
     --results "$PGO_QUAL_OUT/h1-h2-ua"
 
-pgo_qual_step h2-oversize "${pgo_qual_python[@]}" "$pgo_qual_scripts/beeper_h2_serve_check.py" \
+pgo_qual_step h2-oversize "${pgo_qual_handoff_python[@]}" "$pgo_qual_scripts/beeper_h2_serve_check.py" \
     --binary "$pgo_qual_binary" --helper "$pgo_qual_helper" --results "$PGO_QUAL_OUT/h2-oversize"
 
-pgo_qual_step h2-expiry "${pgo_qual_python[@]}" "$pgo_qual_scripts/beeper_h2_expiry_check.py" \
+pgo_qual_step h2-expiry "${pgo_qual_handoff_python[@]}" "$pgo_qual_scripts/beeper_h2_expiry_check.py" \
     --binary "$pgo_qual_binary" --helper "$pgo_qual_helper" --results "$PGO_QUAL_OUT/h2-expiry"
 
 pgo_qual_step tls-smoke "${pgo_qual_python[@]}" "$pgo_qual_scripts/http_engine_check.py" \

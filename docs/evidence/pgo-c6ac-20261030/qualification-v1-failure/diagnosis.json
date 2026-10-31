@@ -1,0 +1,9 @@
+{
+  "phase": "H1 late fixture backend readiness, before HTTPJet launch",
+  "backend_bind": "127.0.0.1",
+  "imported_readiness_probe_address": "127.0.0.2",
+  "server_command_created": false,
+  "backend_exit": -15,
+  "diagnosis": "wrapper address mismatch; no evidence of a PGO server failure",
+  "change": "qualifier v2 sets both HJ_BENCH_ADDR and HJ_BENCH_BIND to 127.0.0.1 for the existing H1/H2 handoff corpora; other gates and performance retain 127.0.0.2"
+}

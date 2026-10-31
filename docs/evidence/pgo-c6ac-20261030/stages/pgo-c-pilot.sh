@@ -23,7 +23,7 @@ for label in ('use','control'):
     assert len(files)==4
     for name,row in files.items():
         assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==row['sha256'],name
-q=json.loads((r/'qualification-v1/qualification.json').read_text())
+q=json.loads((r/'qualification-v2/qualification.json').read_text())
 assert q['passed'] is True
 assert q['artifacts']==json.loads((r/'use-artifacts.json').read_text())
 control=json.loads((r/'build-control.json').read_text())

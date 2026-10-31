@@ -1,0 +1,18 @@
+{
+  "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": {
+    "bytes": 23518040,
+    "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+  },
+  "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1": {
+    "bytes": 2459592,
+    "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+  },
+  "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-observe": {
+    "bytes": 1961032,
+    "sha256": "8ab3543e785fb7077e3b4379539349cd2ec5fcf34f470ae0b6877668ecb37261"
+  },
+  "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-quic-steer": {
+    "bytes": 1322048,
+    "sha256": "cb37fb72cf116f6f786a64ac71295016ec4628b232ff97e873ad8a42ca57322c"
+  }
+}
