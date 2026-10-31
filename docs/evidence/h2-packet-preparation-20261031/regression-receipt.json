@@ -1,0 +1,195 @@
+{
+  "passed_correctness": true,
+  "performance_qualified": false,
+  "diagnostic_only": true,
+  "arms": [
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 366106.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509557.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509463.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509522.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509525.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509427.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509426.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509573.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509510.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509513.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509521.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509530.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509255.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509571.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509449.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509427.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509541.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509487.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509287.0,
+      "kernel_failures": 0
+    },
+    {
+      "arm": "repaired",
+      "measured_succeeded": 500000,
+      "warmup_succeeded": 10000,
+      "verified_body_bytes": 512000000,
+      "kernel_successes": 509465.0,
+      "kernel_failures": 0
+    }
+  ],
+  "measured_responses": 10000000,
+  "warmup_responses": 200000,
+  "raw_results_sha256": "9dc5665e542320ab3625c5887c6dee4f3ff304d4f98fbca2103926c6e60997f3",
+  "observer_sha256": "7f31d240596e51719165b00f158e4b041ca03cd134cc29981b2266392ea10ccc",
+  "observer_final": {
+    "event": "finished",
+    "monotonic_ns": 16117229459018,
+    "unix_ns": 1793461954034128918,
+    "command_exit": 0,
+    "compiler_overlap_observed": true,
+    "unique_compilers": [
+      {
+        "pid": 325071,
+        "comm": "cargo",
+        "starttime_ticks": 1600674,
+        "user_ticks": 52,
+        "system_ticks": 32
+      },
+      {
+        "pid": 325133,
+        "comm": "rustc",
+        "starttime_ticks": 1600886,
+        "user_ticks": 5892,
+        "system_ticks": 278
+      }
+    ]
+  },
+  "scope": "Positive kernel coverage, full body/status validation, zero H2 failure counters. Compiler overlap invalidates timing interpretation; no CPU/RPS/p99 claim."
+}

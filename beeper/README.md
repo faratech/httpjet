@@ -38,6 +38,10 @@ records the source fixes and their controlled non-PGO experiment. The
 implementation: server/helper CPU and p99 improve, while lower-load whole-VM
 CPU remains higher. Optimization continues.
 
+The [packet-preparation regression](h2-packet-preparation-2026-10-31.md) explains
+a stress failure in the next certified-header candidate and its correctness
+repair. Fresh application and performance qualification remain pending.
+
 ## Findings so far
 
 - **Quiescent H2 ownership fixes the tested process-CPU and tail regressions.**
