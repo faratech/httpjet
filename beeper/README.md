@@ -54,6 +54,8 @@ universal HTTPS improvement.
 
 The [exact shipped-release p99 comparison](release-p99-2026-10-31.md) measures the retained repaired build against the distributed v0.1.10-11 binary at the same offered load. All ten cell medians improve; one H1 plaintext static cycle regresses sharply, and H1 TLS page-cache whole-VM CPU rises. These results preserve both qualifications and remain separate from the native PGO source-control study.
 
+The [regression ledger and next steps](regressions-and-next-steps-2026-10-31.md) adds the memory, client-CPU and network-counter audit, and keeps the exact-release and stricter native-PGO controls separate. It records repeatable RSS costs and the remaining CPU regressions before further optimization.
+
 ## Findings so far
 
 - **Quiescent H2 ownership fixes the tested process-CPU and tail regressions.**
