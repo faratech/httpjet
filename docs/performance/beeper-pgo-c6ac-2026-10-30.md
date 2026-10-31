@@ -143,5 +143,16 @@ the PGO effect before testing the integrated selection against the release.
 All 12 million measured responses and 600,000 warmup responses validated. Every
 pooled throughput median rose, but the 32 KiB H2c cycles disagree and its pooled
 p99 worsened. The report retains those tradeoffs. The full release comparison
-is a separate 20-cell, 240-arm run with both static and page-cache fixtures;
-it is currently in progress.
+is a separate 20-cell, 240-arm run with both static and page-cache fixtures.
+It [completed successfully](../../beeper/pgo-release-2026-10-31.md): 48 million
+measured and 2.4 million warmup responses validated. Throughput medians rose
+5.6–231.1% and process CPU per response fell in all twenty cells. H2c's 1 KiB
+tail-latency regressions and opposite-sign cycles remain visible in the report;
+this does not establish universal latency or whole-system CPU superiority.
+
+The [matched-load H2 follow-up](../../beeper/h2-pgo-rate-2026-10-31.md) also
+completed 36 arms at 15,000 requests/s: 2.16 million measured and 180,000 warmup
+responses validated. Native PGO H2 reduces process CPU relative to the release
+in both fixtures; kernel H2 raises process CPU and service p99 relative to native
+PGO H2. Kernel offload therefore remains an explicit capacity option. No runtime
+defaults or production deployment changed.

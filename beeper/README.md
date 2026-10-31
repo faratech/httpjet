@@ -26,11 +26,29 @@ records the next build comparison. Its instrumented build and training are
 separate from performance qualification.
 
 The [completed same-source PGO pilot](pgo-pilot-2026-10-30.md) measures the compiler
-profile separately. The subsequent cache-aware comparison against the shipped
-release is in progress.
+profile separately. The [completed PGO release matrix](pgo-release-2026-10-31.md)
+then compares the integrated build with the shipped release.
+
+The [matched-load H2 follow-up](h2-pgo-rate-2026-10-31.md) measures CPU and latency
+at 15,000 requests/s on the same PGO build, with kernel serving off and on.
 
 ## Findings so far
 
+- **The PGO release matrix improves every tested throughput median.** All 48
+  million measured responses validated across 20 cells. Relative to the exact
+  shipped v0.1.10-11, throughput medians rose 5.6–231.1% and process CPU per
+  response fell in all cells. Arm p99 fell in 18 cells; 1 KiB H2c kernel serving
+  instead raised static p99 101.7% and page-cache p99 3.2%. These are combined
+  runtime/build effects, with all caches enabled; kernel work outside the process
+  is not included in the process CPU result. The matched-load H2 follow-up is
+  separate from this capacity matrix.
+- **Native PGO H2 is the lower-CPU choice at the tested lower load.** At 15,000
+  requests/s with 1 KiB bodies, native process CPU is 19.9% below the release for
+  static content and 43.6% below it for page-cache hits. Kernel H2 instead costs
+  52.6–56.3% more process CPU than native PGO H2 and has higher service p99.
+  Both kernel groups record about 97.9% offload hits. Scheduled p99 is mixed,
+  and bounded admission reached its cap in 7 of 36 arms. Kernel H2 remains an
+  opt-in capacity option; the runtime default is unchanged.
 - **The corrected C matrix is complete, with mixed results.** All 96 million
   measured responses validated. Against the exact shipped release, page-cache
   throughput medians improved by approximately 17–230%, while several static
@@ -78,7 +96,7 @@ integration contracts and remaining work.
 | H2 | Experimental plaintext kernel serving has live HPACK, flow-control, expiry recovery and native-handoff evidence. Known oversized bodies avoid publication work. Full comparisons and the low-load CPU/latency cost are published; unsupported input and HTTPS retain native ownership. |
 | H3 | Shared on-core cache dispatch, owned payload transfer, bounded scheduling and response-drain fixes are implemented experimentally. A pinned Quinn UDP fork adds optional sendmmsg batching. Quinn owns QUIC/TLS and io_uring supplies packet I/O. |
 | Optional routing | CID-aware reuseport steering has functional evidence. Migration and state-preserving restart remain outside its qualification. |
-| Release comparison | The exact v0.1.10-11 archive is pinned. Candidate C completed 40 cells against that archive and a separate matching native-source rebuild. Earlier failed attempts remain retained. General performance superiority remains unproven. |
+| Release comparison | The exact v0.1.10-11 archive is pinned. Candidate C completed 40 cells against that archive and a native-source rebuild. The PGO integration then completed 20 release cells with higher throughput and lower process CPU medians throughout; H2c tail-latency and CPU-scope limits remain explicit. Earlier failed attempts remain retained. |
 
 All runtime experiments use **SINGULARITY** and literal loopback destinations.
 No public origin or CDN is a load-test target. Results include unsuccessful and
@@ -92,6 +110,9 @@ source. Their recorded identities distinguish experiments, but do not make a
 public release checkout sufficient to reproduce every variant. The methods and
 data should be read with that limitation.
 
-The remaining target is broadly superior performance while preserving the
-H1/H2/H3 cache and policy contracts and safe io_uring fallback. Observation
-hooks or one fast fixture do not complete that target.
+The integrated prototype meets this study's throughput and process-CPU target
+across the full release matrix while retaining native io_uring fallback.
+Qualification remains limited to the tested SINGULARITY fixtures; universal
+latency, whole-system CPU and production-site superiority are not established.
+Kernel H2's measured lower-load tradeoffs remain explicit. No production
+deployment is part of this work.

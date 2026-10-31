@@ -1,0 +1,3047 @@
+{
+  "schema": 1,
+  "status": "incomplete",
+  "input": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1",
+  "issues": [
+    "input/identity/seal validation: ValueError: not a regular, nonsymlink file: /var/tmp/httpjet-continuation/pgo-c6ac-v1/src/AGENTS.md"
+  ],
+  "rows": [
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 1,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-1-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.37337079134,
+        "scheduled_p99_us": 2136.116,
+        "service_p99_us": 720.5999999999999,
+        "dispatch_lateness_p99_us": 1717.0919999999999,
+        "process_cpu_us_per_response": 19.846153846153847,
+        "user_instructions_per_response": 35258.05069230769,
+        "user_cycles_per_response": 42743.72406153846,
+        "whole_vm_busy_us_per_response": 83.23076923076923,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-1-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596090,
+        "exit": 0
+      },
+      "source_sha256": "c5bc9d9eb019b4f2ddc94f40e2e70ad9af35d4158cc20d86b0d5de57d2f5086a",
+      "peak_in_flight": 38,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 2,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-2-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14994.375294944984,
+        "scheduled_p99_us": 2049.5570000000002,
+        "service_p99_us": 640.5999999999999,
+        "dispatch_lateness_p99_us": 1648.6280000000002,
+        "process_cpu_us_per_response": 16.615384615384617,
+        "user_instructions_per_response": 24695.176384615384,
+        "user_cycles_per_response": 28088.0998,
+        "whole_vm_busy_us_per_response": 64.3076923076923,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-2-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596195,
+        "exit": 0
+      },
+      "source_sha256": "4f9592eb3b55469a6918aa5935b805b21e0e19c6532496e3dba72e78e0bb81e0",
+      "peak_in_flight": 45,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 3,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-3-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14997.99832589893,
+        "scheduled_p99_us": 2158.321,
+        "service_p99_us": 1280.2,
+        "dispatch_lateness_p99_us": 1480.1390000000001,
+        "process_cpu_us_per_response": 27.076923076923077,
+        "user_instructions_per_response": 5843.410353846154,
+        "user_cycles_per_response": 7721.1930923076925,
+        "whole_vm_busy_us_per_response": 115.23076923076923,
+        "kernel_success_fraction": 0.9790461538461539
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-3-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596312,
+        "exit": 0
+      },
+      "source_sha256": "7352028f5221be4836fcf1729fc2ca55d2f8e99ccf2a1dbbbd8ca3f6beaa8c33",
+      "peak_in_flight": 91,
+      "concurrency_waits": 0,
+      "kernel_successes": 63638.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 4,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-4-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.9177209931,
+        "scheduled_p99_us": 1938.911,
+        "service_p99_us": 763.9,
+        "dispatch_lateness_p99_us": 1455.695,
+        "process_cpu_us_per_response": 26.307692307692307,
+        "user_instructions_per_response": 5818.8284,
+        "user_cycles_per_response": 7434.214523076923,
+        "whole_vm_busy_us_per_response": 111.84615384615384,
+        "kernel_success_fraction": 0.9794153846153846
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-4-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596408,
+        "exit": 0
+      },
+      "source_sha256": "b9443efd84e0bc5b3d1fa0015aa9baff23e0fda2f4f3ecb70ff316fb8848e34a",
+      "peak_in_flight": 70,
+      "concurrency_waits": 0,
+      "kernel_successes": 63662.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 5,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-5-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14995.090944614281,
+        "scheduled_p99_us": 2311.499,
+        "service_p99_us": 817.6,
+        "dispatch_lateness_p99_us": 1782.788,
+        "process_cpu_us_per_response": 18.615384615384617,
+        "user_instructions_per_response": 24619.441046153846,
+        "user_cycles_per_response": 32311.994953846155,
+        "whole_vm_busy_us_per_response": 76.61538461538461,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-5-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596568,
+        "exit": 0
+      },
+      "source_sha256": "b9334457f713c4064496b89c212e2df6191ff695626fbfc1715eab80f6a827f0",
+      "peak_in_flight": 119,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 6,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-6-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14993.08739957171,
+        "scheduled_p99_us": 2144.655,
+        "service_p99_us": 755.3,
+        "dispatch_lateness_p99_us": 1715.5,
+        "process_cpu_us_per_response": 19.999999999999996,
+        "user_instructions_per_response": 35326.72344615385,
+        "user_cycles_per_response": 43405.316892307696,
+        "whole_vm_busy_us_per_response": 63.53846153846154,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-6-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596657,
+        "exit": 0
+      },
+      "source_sha256": "06566a698381d78b90761f578048dffaa412a7fb457bed5f6a8eeb1aa747aa9e",
+      "peak_in_flight": 47,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 1,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-1-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14997.758262575853,
+        "scheduled_p99_us": 2581.312,
+        "service_p99_us": 1112.3000000000002,
+        "dispatch_lateness_p99_us": 1894.5310000000002,
+        "process_cpu_us_per_response": 23.53846153846154,
+        "user_instructions_per_response": 35165.998984615384,
+        "user_cycles_per_response": 52873.74804615384,
+        "whole_vm_busy_us_per_response": 89.07692307692308,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-1-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596739,
+        "exit": 0
+      },
+      "source_sha256": "cd70f6e65a818afbf8614c421685fcbbcc7932639d7976db523d0c191cd049f3",
+      "peak_in_flight": 60,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 2,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-2-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14995.83559647152,
+        "scheduled_p99_us": 2067.204,
+        "service_p99_us": 637.1,
+        "dispatch_lateness_p99_us": 1672.178,
+        "process_cpu_us_per_response": 16.461538461538456,
+        "user_instructions_per_response": 24668.605584615383,
+        "user_cycles_per_response": 27667.037030769232,
+        "whole_vm_busy_us_per_response": 64.92307692307692,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-2-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596856,
+        "exit": 0
+      },
+      "source_sha256": "3f4468f2abdd11fee446bd2925e56e11816f69ba2ef26bc2a685d5805bfaa07d",
+      "peak_in_flight": 42,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 3,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-3-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14998.580031933347,
+        "scheduled_p99_us": 2140.435,
+        "service_p99_us": 1452.3,
+        "dispatch_lateness_p99_us": 1495.165,
+        "process_cpu_us_per_response": 26.923076923076923,
+        "user_instructions_per_response": 5784.143369230769,
+        "user_cycles_per_response": 8296.376538461538,
+        "whole_vm_busy_us_per_response": 111.38461538461539,
+        "kernel_success_fraction": 0.979476923076923
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-3-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 596942,
+        "exit": 0
+      },
+      "source_sha256": "bc07194b69c93272f9bc659387f9f3b92470e38f1d2d4305945cc53e40acd6f4",
+      "peak_in_flight": 128,
+      "concurrency_waits": 0,
+      "kernel_successes": 63666.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 4,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-4-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14999.326057781236,
+        "scheduled_p99_us": 2049.991,
+        "service_p99_us": 994.0999999999999,
+        "dispatch_lateness_p99_us": 1478.506,
+        "process_cpu_us_per_response": 26.76923076923077,
+        "user_instructions_per_response": 5784.418230769231,
+        "user_cycles_per_response": 7489.298123076923,
+        "whole_vm_busy_us_per_response": 110.61538461538461,
+        "kernel_success_fraction": 0.9806
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-4-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597071,
+        "exit": 0
+      },
+      "source_sha256": "e980896ef3b5b5ede6a068bb92ca8065216f851a8eef658cd776766e1aff025d",
+      "peak_in_flight": 71,
+      "concurrency_waits": 0,
+      "kernel_successes": 63739.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 5,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-5-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14998.04967611719,
+        "scheduled_p99_us": 10092.679,
+        "service_p99_us": 2645.1,
+        "dispatch_lateness_p99_us": 6394.5779999999995,
+        "process_cpu_us_per_response": 21.53846153846154,
+        "user_instructions_per_response": 24413.57009230769,
+        "user_cycles_per_response": 38226.321323076925,
+        "whole_vm_busy_us_per_response": 94.46153846153847,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-5-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597230,
+        "exit": 0
+      },
+      "source_sha256": "2dac5e0a1c4c15708b7365277d8c685743ae0929d8c25cfcfcf4d7d27face8c9",
+      "peak_in_flight": 128,
+      "concurrency_waits": 130,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 6,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-6-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.172822984803,
+        "scheduled_p99_us": 14025.436,
+        "service_p99_us": 6288.9,
+        "dispatch_lateness_p99_us": 8674.075,
+        "process_cpu_us_per_response": 26.0,
+        "user_instructions_per_response": 35062.46184615385,
+        "user_cycles_per_response": 54651.01441538461,
+        "whole_vm_busy_us_per_response": 87.53846153846153,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-6-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597309,
+        "exit": 0
+      },
+      "source_sha256": "477783a632f450edd18fb1c1c3f80d5672d53badc86c167056a2facd00586381",
+      "peak_in_flight": 128,
+      "concurrency_waits": 329,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 1,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-1-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.196375998337,
+        "scheduled_p99_us": 2567.272,
+        "service_p99_us": 1176.1,
+        "dispatch_lateness_p99_us": 1869.431,
+        "process_cpu_us_per_response": 22.76923076923077,
+        "user_instructions_per_response": 35220.110384615386,
+        "user_cycles_per_response": 50287.893138461535,
+        "whole_vm_busy_us_per_response": 92.92307692307692,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-1-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597364,
+        "exit": 0
+      },
+      "source_sha256": "0af0a827cb7fab29fd21187de4b66888d46f80b0b40913ee42ec2e08cb50a22f",
+      "peak_in_flight": 74,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 2,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-2-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14997.593707328231,
+        "scheduled_p99_us": 2823.671,
+        "service_p99_us": 1433.5,
+        "dispatch_lateness_p99_us": 1951.745,
+        "process_cpu_us_per_response": 20.0,
+        "user_instructions_per_response": 24500.549246153845,
+        "user_cycles_per_response": 35195.577907692306,
+        "whole_vm_busy_us_per_response": 97.38461538461539,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-2-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597497,
+        "exit": 0
+      },
+      "source_sha256": "a3a6d451b4d0fac2c969a00868e6eb504b09999866b0cb9698698b701bd65a56",
+      "peak_in_flight": 128,
+      "concurrency_waits": 6,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 3,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-3-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14997.515117960787,
+        "scheduled_p99_us": 2341.31,
+        "service_p99_us": 1623.1,
+        "dispatch_lateness_p99_us": 1495.6100000000001,
+        "process_cpu_us_per_response": 27.23076923076923,
+        "user_instructions_per_response": 5801.030830769231,
+        "user_cycles_per_response": 7975.922215384616,
+        "whole_vm_busy_us_per_response": 110.46153846153847,
+        "kernel_success_fraction": 0.9795076923076923
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-3-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597583,
+        "exit": 0
+      },
+      "source_sha256": "8fac0b6612a35b663f2a60d244c4156854f30340ad0a3c889824cd6e4a7429bf",
+      "peak_in_flight": 106,
+      "concurrency_waits": 0,
+      "kernel_successes": 63668.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 4,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-4-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14997.769824128267,
+        "scheduled_p99_us": 2637.934,
+        "service_p99_us": 1635.3999999999999,
+        "dispatch_lateness_p99_us": 1510.301,
+        "process_cpu_us_per_response": 27.23076923076923,
+        "user_instructions_per_response": 5869.880246153846,
+        "user_cycles_per_response": 8084.310692307692,
+        "whole_vm_busy_us_per_response": 108.92307692307692,
+        "kernel_success_fraction": 0.9768769230769231
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-4-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597715,
+        "exit": 0
+      },
+      "source_sha256": "42b0b15e7d93aca4dbfc99c1897ab2311e613c072d5a0719fde591eadc1a4921",
+      "peak_in_flight": 88,
+      "concurrency_waits": 0,
+      "kernel_successes": 63497.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 5,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-5-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14995.677027481921,
+        "scheduled_p99_us": 2066.31,
+        "service_p99_us": 638.6,
+        "dispatch_lateness_p99_us": 1667.4389999999999,
+        "process_cpu_us_per_response": 16.769230769230766,
+        "user_instructions_per_response": 24702.388969230768,
+        "user_cycles_per_response": 28621.818338461537,
+        "whole_vm_busy_us_per_response": 77.6923076923077,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-5-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597879,
+        "exit": 0
+      },
+      "source_sha256": "b4bf637032cd1ba90e330e42ddc53db9245d3d79fcf3ef64a9625d5b8023f838",
+      "peak_in_flight": 42,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 6,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-6-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14998.123629747055,
+        "scheduled_p99_us": 2351.156,
+        "service_p99_us": 916.8,
+        "dispatch_lateness_p99_us": 1813.4360000000001,
+        "process_cpu_us_per_response": 21.384615384615387,
+        "user_instructions_per_response": 35276.022923076926,
+        "user_cycles_per_response": 46861.2888,
+        "whole_vm_busy_us_per_response": 98.92307692307692,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-6-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 597954,
+        "exit": 0
+      },
+      "source_sha256": "16105b6cdccd357e1674a1af4777e9c341d030ce1985085f9171464a22597710",
+      "peak_in_flight": 78,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 1,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-1-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14992.867375735439,
+        "scheduled_p99_us": 3158.183,
+        "service_p99_us": 2127.4,
+        "dispatch_lateness_p99_us": 1961.3539999999998,
+        "process_cpu_us_per_response": 32.3076923076923,
+        "user_instructions_per_response": 68465.62632307693,
+        "user_cycles_per_response": 92914.81212307692,
+        "whole_vm_busy_us_per_response": 92.61538461538461,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-1-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598052,
+        "exit": 0
+      },
+      "source_sha256": "b590c228416926c13db5ebf4ec5dafdb0cee8a253ce1d405016b18bb402b8593",
+      "peak_in_flight": 128,
+      "concurrency_waits": 3,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 2,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-2-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14998.62063685451,
+        "scheduled_p99_us": 2308.936,
+        "service_p99_us": 808.0999999999999,
+        "dispatch_lateness_p99_us": 1738.638,
+        "process_cpu_us_per_response": 17.384615384615383,
+        "user_instructions_per_response": 25773.296815384616,
+        "user_cycles_per_response": 30240.199753846155,
+        "whole_vm_busy_us_per_response": 88.76923076923077,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-2-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598173,
+        "exit": 0
+      },
+      "source_sha256": "1677d407f95399431f46637d7d090521ef58be212bb842f9c88822ce8693a097",
+      "peak_in_flight": 73,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 3,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-3-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14995.76858399558,
+        "scheduled_p99_us": 3915.4869999999996,
+        "service_p99_us": 1787.9,
+        "dispatch_lateness_p99_us": 2311.6870000000004,
+        "process_cpu_us_per_response": 27.23076923076923,
+        "user_instructions_per_response": 5747.210784615385,
+        "user_cycles_per_response": 8456.230984615384,
+        "whole_vm_busy_us_per_response": 116.0,
+        "kernel_success_fraction": 0.9788769230769231
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-3-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598231,
+        "exit": 0
+      },
+      "source_sha256": "57839f1ee12af4692716de7be8e2aa6280cca322612eb434529fab3cb392556d",
+      "peak_in_flight": 128,
+      "concurrency_waits": 65,
+      "kernel_successes": 63627.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 4,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-4-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.377943580761,
+        "scheduled_p99_us": 4520.505999999999,
+        "service_p99_us": 2510.301,
+        "dispatch_lateness_p99_us": 1819.636,
+        "process_cpu_us_per_response": 27.23076923076923,
+        "user_instructions_per_response": 5945.395,
+        "user_cycles_per_response": 9226.751046153846,
+        "whole_vm_busy_us_per_response": 116.3076923076923,
+        "kernel_success_fraction": 0.9734
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-4-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598384,
+        "exit": 0
+      },
+      "source_sha256": "1f2bf30f1757207a417430001e035b1c16f63d69eacb0cba3e7c525005011ea5",
+      "peak_in_flight": 128,
+      "concurrency_waits": 61,
+      "kernel_successes": 63271.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 5,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-5-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.65970025584,
+        "scheduled_p99_us": 2113.654,
+        "service_p99_us": 679.3,
+        "dispatch_lateness_p99_us": 1696.9089999999999,
+        "process_cpu_us_per_response": 17.23076923076923,
+        "user_instructions_per_response": 25768.168646153845,
+        "user_cycles_per_response": 30627.07650769231,
+        "whole_vm_busy_us_per_response": 70.61538461538461,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-5-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598539,
+        "exit": 0
+      },
+      "source_sha256": "86067b4e5cbfd2c57d95e5052448d1c1aa142db9a9c2f578b6dbaf4df68c36f9",
+      "peak_in_flight": 36,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 6,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-6-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14994.081974539906,
+        "scheduled_p99_us": 2927.795,
+        "service_p99_us": 1635.8,
+        "dispatch_lateness_p99_us": 1971.2229999999997,
+        "process_cpu_us_per_response": 32.0,
+        "user_instructions_per_response": 68458.64461538462,
+        "user_cycles_per_response": 94149.8569076923,
+        "whole_vm_busy_us_per_response": 114.61538461538461,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-6-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598600,
+        "exit": 0
+      },
+      "source_sha256": "03beb183a40cd0d49ab1ebeb8ee4a7bca7daa7bbad9b05cafd3875e75954b342",
+      "peak_in_flight": 85,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 1,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-1-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14987.318210924099,
+        "scheduled_p99_us": 2891.4689999999996,
+        "service_p99_us": 1597.0,
+        "dispatch_lateness_p99_us": 1976.514,
+        "process_cpu_us_per_response": 32.46153846153847,
+        "user_instructions_per_response": 68474.08532307693,
+        "user_cycles_per_response": 94810.39275384616,
+        "whole_vm_busy_us_per_response": 88.92307692307692,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-1-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598717,
+        "exit": 0
+      },
+      "source_sha256": "c4a90c9a8d11b7e04f9f40cdf0517546debcd616fff626636f81944c1de71069",
+      "peak_in_flight": 79,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 2,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-2-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14994.596775773483,
+        "scheduled_p99_us": 2403.2900000000004,
+        "service_p99_us": 841.0,
+        "dispatch_lateness_p99_us": 1850.119,
+        "process_cpu_us_per_response": 18.615384615384617,
+        "user_instructions_per_response": 25679.03049230769,
+        "user_cycles_per_response": 33710.37763076923,
+        "whole_vm_busy_us_per_response": 112.76923076923077,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-2-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598802,
+        "exit": 0
+      },
+      "source_sha256": "51247df2f94c2b4c8281cbdadc816163e4aab914812b5f6e7542b120ee8252ec",
+      "peak_in_flight": 46,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 3,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-3-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14998.982034088329,
+        "scheduled_p99_us": 2300.239,
+        "service_p99_us": 1252.3,
+        "dispatch_lateness_p99_us": 1625.0259999999998,
+        "process_cpu_us_per_response": 27.23076923076923,
+        "user_instructions_per_response": 5700.7328,
+        "user_cycles_per_response": 9161.677169230768,
+        "whole_vm_busy_us_per_response": 124.61538461538461,
+        "kernel_success_fraction": 0.9804
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-3-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 598898,
+        "exit": 0
+      },
+      "source_sha256": "045388a4cc40334d6ffe56f494ad4ffeda9b62f66ec16bcb9181327e0a1c8d2b",
+      "peak_in_flight": 71,
+      "concurrency_waits": 0,
+      "kernel_successes": 63726.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 4,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-4-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14994.856550526463,
+        "scheduled_p99_us": 2393.0179999999996,
+        "service_p99_us": 1466.5,
+        "dispatch_lateness_p99_us": 1520.6480000000001,
+        "process_cpu_us_per_response": 26.307692307692307,
+        "user_instructions_per_response": 5968.732384615385,
+        "user_cycles_per_response": 8517.296,
+        "whole_vm_busy_us_per_response": 122.76923076923077,
+        "kernel_success_fraction": 0.9732461538461539
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-4-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599012,
+        "exit": 0
+      },
+      "source_sha256": "1567253c9a2238515dcdf2f1fdf15fb114ca25691df5149488ec665eb836f6d8",
+      "peak_in_flight": 71,
+      "concurrency_waits": 0,
+      "kernel_successes": 63261.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 5,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-5-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14993.842684789975,
+        "scheduled_p99_us": 2185.549,
+        "service_p99_us": 699.7,
+        "dispatch_lateness_p99_us": 1726.739,
+        "process_cpu_us_per_response": 17.076923076923073,
+        "user_instructions_per_response": 25748.602323076924,
+        "user_cycles_per_response": 30558.576553846153,
+        "whole_vm_busy_us_per_response": 89.07692307692308,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-5-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599193,
+        "exit": 0
+      },
+      "source_sha256": "ba1aebd165cc1b1b701d6666c5afb0f0d38377b32f1ca635c3036131bffe1006",
+      "peak_in_flight": 77,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 6,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-6-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14993.780958251486,
+        "scheduled_p99_us": 2658.801,
+        "service_p99_us": 1316.8999999999999,
+        "dispatch_lateness_p99_us": 1953.734,
+        "process_cpu_us_per_response": 29.07692307692308,
+        "user_instructions_per_response": 68517.90306153845,
+        "user_cycles_per_response": 84547.31006153846,
+        "whole_vm_busy_us_per_response": 82.61538461538461,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-6-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599303,
+        "exit": 0
+      },
+      "source_sha256": "2685c39aab53fc07f46daa3b7af46838dc65ad7c2c707200eacaaed707a73b2d",
+      "peak_in_flight": 65,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 1,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-1-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14994.44760103668,
+        "scheduled_p99_us": 2661.655,
+        "service_p99_us": 1378.1,
+        "dispatch_lateness_p99_us": 1937.126,
+        "process_cpu_us_per_response": 28.923076923076923,
+        "user_instructions_per_response": 68555.59072307692,
+        "user_cycles_per_response": 83364.54918461539,
+        "whole_vm_busy_us_per_response": 74.0,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-1-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599382,
+        "exit": 0
+      },
+      "source_sha256": "a60a484ba6284732a5359795740b2040f3a7e3ac7a9d4318d7ecade4e28cf2f3",
+      "peak_in_flight": 71,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 2,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-2-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.744360515962,
+        "scheduled_p99_us": 2317.0,
+        "service_p99_us": 850.0,
+        "dispatch_lateness_p99_us": 1769.79,
+        "process_cpu_us_per_response": 17.23076923076923,
+        "user_instructions_per_response": 25742.234784615386,
+        "user_cycles_per_response": 29906.390784615385,
+        "whole_vm_busy_us_per_response": 92.61538461538461,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-2-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599478,
+        "exit": 0
+      },
+      "source_sha256": "dab438b9e1aee5533984935c0ae551b40a553ba0c1f349abbb1e19fada1af722",
+      "peak_in_flight": 45,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 3,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-3-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.527872647304,
+        "scheduled_p99_us": 1971.8829999999998,
+        "service_p99_us": 876.5999999999999,
+        "dispatch_lateness_p99_us": 1495.4470000000001,
+        "process_cpu_us_per_response": 26.615384615384617,
+        "user_instructions_per_response": 5760.6506,
+        "user_cycles_per_response": 7874.9122,
+        "whole_vm_busy_us_per_response": 115.84615384615384,
+        "kernel_success_fraction": 0.9797076923076923
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-3-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599565,
+        "exit": 0
+      },
+      "source_sha256": "efb93219b15241b22ff9b09196f031671991648532b952d54eeaa951ae271633",
+      "peak_in_flight": 67,
+      "concurrency_waits": 0,
+      "kernel_successes": 63681.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 4,
+      "mode": "kernel",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-4-kernel",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14996.901583894387,
+        "scheduled_p99_us": 1881.3619999999999,
+        "service_p99_us": 783.1,
+        "dispatch_lateness_p99_us": 1447.811,
+        "process_cpu_us_per_response": 24.923076923076923,
+        "user_instructions_per_response": 5818.786538461539,
+        "user_cycles_per_response": 6415.297846153846,
+        "whole_vm_busy_us_per_response": 82.0,
+        "kernel_success_fraction": 0.9798769230769231
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-4-kernel/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599718,
+        "exit": 0
+      },
+      "source_sha256": "54ced8a05cbacb145b1fae307a61b1a2412e54e5ad13a5f92d7f7acd97c50adc",
+      "peak_in_flight": 69,
+      "concurrency_waits": 0,
+      "kernel_successes": 63692.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "kernel",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "required",
+          "--h2-kernel",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+        "launcher": {
+          "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+          "args": [],
+          "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d"
+        }
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 5,
+      "mode": "native",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-5-native",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14998.32325495255,
+        "scheduled_p99_us": 1947.529,
+        "service_p99_us": 612.0,
+        "dispatch_lateness_p99_us": 1600.347,
+        "process_cpu_us_per_response": 15.384615384615385,
+        "user_instructions_per_response": 25809.698784615386,
+        "user_cycles_per_response": 25940.0638,
+        "whole_vm_busy_us_per_response": 65.6923076923077,
+        "kernel_success_fraction": 0.0
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-5-native/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599810,
+        "exit": 0
+      },
+      "source_sha256": "f0ab9771be911d3fa60b878f4f5a1207cebea7775463ac6e9d5462e298151647",
+      "peak_in_flight": 54,
+      "concurrency_waits": 0,
+      "kernel_successes": 0.0,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "native",
+        "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+        "serve_args": [
+          "--h1-kernel",
+          "off",
+          "--page-cache-response-memo"
+        ],
+        "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 6,
+      "mode": "release",
+      "directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-6-release",
+      "status": "complete",
+      "issues": [],
+      "metrics": {
+        "rps": 14994.305822398108,
+        "scheduled_p99_us": 2582.953,
+        "service_p99_us": 1248.9,
+        "dispatch_lateness_p99_us": 1951.15,
+        "process_cpu_us_per_response": 27.846153846153847,
+        "user_instructions_per_response": 68557.0188,
+        "user_cycles_per_response": 80833.28864615384,
+        "whole_vm_busy_us_per_response": 76.0,
+        "kernel_success_fraction": null
+      },
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-6-release/result.json",
+      "failure": null,
+      "server_exit": {
+        "pid": 599932,
+        "exit": 0
+      },
+      "source_sha256": "165199a9d3fa837552978c6e594b47b330a458e3aa9b6c46527796a969c899a3",
+      "peak_in_flight": 62,
+      "concurrency_waits": 0,
+      "kernel_successes": null,
+      "pmu_running_fraction": 1.0,
+      "recorded_arm": {
+        "name": "release",
+        "binary": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+        "serve_args": [],
+        "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec"
+      },
+      "latency_counts": {
+        "scheduled_all_outcomes": 60000,
+        "service": 60000,
+        "dispatch_lateness": 60000
+      },
+      "denominator": {
+        "measured_responses": 60000,
+        "warmup_responses": 5000,
+        "whole_client_span_responses": 65000
+      }
+    }
+  ],
+  "unplanned_rows": [],
+  "groups": [
+    {
+      "case": "static",
+      "mode": "release",
+      "planned_arms": 6,
+      "validated_arms": 6,
+      "status": "unqualified",
+      "max_peak_in_flight": 128,
+      "total_concurrency_waits": 329,
+      "arms_at_cap": 1,
+      "admission_statistics_scope": "validated arms only; partial counts are not complete-run estimates",
+      "medians": null
+    },
+    {
+      "case": "static",
+      "mode": "native",
+      "planned_arms": 6,
+      "validated_arms": 6,
+      "status": "unqualified",
+      "max_peak_in_flight": 128,
+      "total_concurrency_waits": 136,
+      "arms_at_cap": 2,
+      "admission_statistics_scope": "validated arms only; partial counts are not complete-run estimates",
+      "medians": null
+    },
+    {
+      "case": "static",
+      "mode": "kernel",
+      "planned_arms": 6,
+      "validated_arms": 6,
+      "status": "unqualified",
+      "max_peak_in_flight": 128,
+      "total_concurrency_waits": 0,
+      "arms_at_cap": 1,
+      "admission_statistics_scope": "validated arms only; partial counts are not complete-run estimates",
+      "medians": null
+    },
+    {
+      "case": "pagecache",
+      "mode": "release",
+      "planned_arms": 6,
+      "validated_arms": 6,
+      "status": "unqualified",
+      "max_peak_in_flight": 128,
+      "total_concurrency_waits": 3,
+      "arms_at_cap": 1,
+      "admission_statistics_scope": "validated arms only; partial counts are not complete-run estimates",
+      "medians": null
+    },
+    {
+      "case": "pagecache",
+      "mode": "native",
+      "planned_arms": 6,
+      "validated_arms": 6,
+      "status": "unqualified",
+      "max_peak_in_flight": 77,
+      "total_concurrency_waits": 0,
+      "arms_at_cap": 0,
+      "admission_statistics_scope": "validated arms only; partial counts are not complete-run estimates",
+      "medians": null
+    },
+    {
+      "case": "pagecache",
+      "mode": "kernel",
+      "planned_arms": 6,
+      "validated_arms": 6,
+      "status": "unqualified",
+      "max_peak_in_flight": 128,
+      "total_concurrency_waits": 126,
+      "arms_at_cap": 2,
+      "admission_statistics_scope": "validated arms only; partial counts are not complete-run estimates",
+      "medians": null
+    }
+  ],
+  "offered_rate": 15000,
+  "concurrency_limit": 128,
+  "fully_open_loop": false,
+  "sequence": [
+    "release",
+    "native",
+    "kernel",
+    "kernel",
+    "native",
+    "release"
+  ],
+  "cycles": 3,
+  "requests_per_arm": 60000,
+  "warmup_per_arm": 5000,
+  "planned_arms": 36,
+  "validated_arms": 36,
+  "measured_responses": null,
+  "warmup_responses": null,
+  "monitor": {
+    "event": "finished",
+    "monotonic_ns": 34741875037521,
+    "unix_ns": 1793440018164078221,
+    "command_exit": 0,
+    "compiler_overlap_observed": false,
+    "unique_compilers": []
+  },
+  "run_status": {
+    "passed": true,
+    "command_exit": 0,
+    "final_integrity_exit": 0,
+    "completed_arms": 36,
+    "expected_arms": 36,
+    "measured_responses": 2160000,
+    "warmup_responses": 180000,
+    "rows": [
+      {
+        "case": "static",
+        "cycle": 1,
+        "position": 1,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-1-release/result.json",
+        "source_sha256": "c5bc9d9eb019b4f2ddc94f40e2e70ad9af35d4158cc20d86b0d5de57d2f5086a",
+        "kernel_successes": null,
+        "peak_in_flight": 38,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 1,
+        "position": 2,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-2-native/result.json",
+        "source_sha256": "4f9592eb3b55469a6918aa5935b805b21e0e19c6532496e3dba72e78e0bb81e0",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 45,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 1,
+        "position": 3,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-3-kernel/result.json",
+        "source_sha256": "7352028f5221be4836fcf1729fc2ca55d2f8e99ccf2a1dbbbd8ca3f6beaa8c33",
+        "kernel_successes": 63638.0,
+        "peak_in_flight": 91,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 1,
+        "position": 4,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-4-kernel/result.json",
+        "source_sha256": "b9443efd84e0bc5b3d1fa0015aa9baff23e0fda2f4f3ecb70ff316fb8848e34a",
+        "kernel_successes": 63662.0,
+        "peak_in_flight": 70,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 1,
+        "position": 5,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-5-native/result.json",
+        "source_sha256": "b9334457f713c4064496b89c212e2df6191ff695626fbfc1715eab80f6a827f0",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 119,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 1,
+        "position": 6,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-6-release/result.json",
+        "source_sha256": "06566a698381d78b90761f578048dffaa412a7fb457bed5f6a8eeb1aa747aa9e",
+        "kernel_successes": null,
+        "peak_in_flight": 47,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 2,
+        "position": 1,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-1-release/result.json",
+        "source_sha256": "cd70f6e65a818afbf8614c421685fcbbcc7932639d7976db523d0c191cd049f3",
+        "kernel_successes": null,
+        "peak_in_flight": 60,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 2,
+        "position": 2,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-2-native/result.json",
+        "source_sha256": "3f4468f2abdd11fee446bd2925e56e11816f69ba2ef26bc2a685d5805bfaa07d",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 42,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 2,
+        "position": 3,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-3-kernel/result.json",
+        "source_sha256": "bc07194b69c93272f9bc659387f9f3b92470e38f1d2d4305945cc53e40acd6f4",
+        "kernel_successes": 63666.0,
+        "peak_in_flight": 128,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 2,
+        "position": 4,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-4-kernel/result.json",
+        "source_sha256": "e980896ef3b5b5ede6a068bb92ca8065216f851a8eef658cd776766e1aff025d",
+        "kernel_successes": 63739.0,
+        "peak_in_flight": 71,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 2,
+        "position": 5,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-5-native/result.json",
+        "source_sha256": "2dac5e0a1c4c15708b7365277d8c685743ae0929d8c25cfcfcf4d7d27face8c9",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 128,
+        "concurrency_waits": 130
+      },
+      {
+        "case": "static",
+        "cycle": 2,
+        "position": 6,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-6-release/result.json",
+        "source_sha256": "477783a632f450edd18fb1c1c3f80d5672d53badc86c167056a2facd00586381",
+        "kernel_successes": null,
+        "peak_in_flight": 128,
+        "concurrency_waits": 329
+      },
+      {
+        "case": "static",
+        "cycle": 3,
+        "position": 1,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-1-release/result.json",
+        "source_sha256": "0af0a827cb7fab29fd21187de4b66888d46f80b0b40913ee42ec2e08cb50a22f",
+        "kernel_successes": null,
+        "peak_in_flight": 74,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 3,
+        "position": 2,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-2-native/result.json",
+        "source_sha256": "a3a6d451b4d0fac2c969a00868e6eb504b09999866b0cb9698698b701bd65a56",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 128,
+        "concurrency_waits": 6
+      },
+      {
+        "case": "static",
+        "cycle": 3,
+        "position": 3,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-3-kernel/result.json",
+        "source_sha256": "8fac0b6612a35b663f2a60d244c4156854f30340ad0a3c889824cd6e4a7429bf",
+        "kernel_successes": 63668.0,
+        "peak_in_flight": 106,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 3,
+        "position": 4,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-4-kernel/result.json",
+        "source_sha256": "42b0b15e7d93aca4dbfc99c1897ab2311e613c072d5a0719fde591eadc1a4921",
+        "kernel_successes": 63497.0,
+        "peak_in_flight": 88,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 3,
+        "position": 5,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-5-native/result.json",
+        "source_sha256": "b4bf637032cd1ba90e330e42ddc53db9245d3d79fcf3ef64a9625d5b8023f838",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 42,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "static",
+        "cycle": 3,
+        "position": 6,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-6-release/result.json",
+        "source_sha256": "16105b6cdccd357e1674a1af4777e9c341d030ce1985085f9171464a22597710",
+        "kernel_successes": null,
+        "peak_in_flight": 78,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 1,
+        "position": 1,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-1-release/result.json",
+        "source_sha256": "b590c228416926c13db5ebf4ec5dafdb0cee8a253ce1d405016b18bb402b8593",
+        "kernel_successes": null,
+        "peak_in_flight": 128,
+        "concurrency_waits": 3
+      },
+      {
+        "case": "pagecache",
+        "cycle": 1,
+        "position": 2,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-2-native/result.json",
+        "source_sha256": "1677d407f95399431f46637d7d090521ef58be212bb842f9c88822ce8693a097",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 73,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 1,
+        "position": 3,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-3-kernel/result.json",
+        "source_sha256": "57839f1ee12af4692716de7be8e2aa6280cca322612eb434529fab3cb392556d",
+        "kernel_successes": 63627.0,
+        "peak_in_flight": 128,
+        "concurrency_waits": 65
+      },
+      {
+        "case": "pagecache",
+        "cycle": 1,
+        "position": 4,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-4-kernel/result.json",
+        "source_sha256": "1f2bf30f1757207a417430001e035b1c16f63d69eacb0cba3e7c525005011ea5",
+        "kernel_successes": 63271.0,
+        "peak_in_flight": 128,
+        "concurrency_waits": 61
+      },
+      {
+        "case": "pagecache",
+        "cycle": 1,
+        "position": 5,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-5-native/result.json",
+        "source_sha256": "86067b4e5cbfd2c57d95e5052448d1c1aa142db9a9c2f578b6dbaf4df68c36f9",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 36,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 1,
+        "position": 6,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-6-release/result.json",
+        "source_sha256": "03beb183a40cd0d49ab1ebeb8ee4a7bca7daa7bbad9b05cafd3875e75954b342",
+        "kernel_successes": null,
+        "peak_in_flight": 85,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 2,
+        "position": 1,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-1-release/result.json",
+        "source_sha256": "c4a90c9a8d11b7e04f9f40cdf0517546debcd616fff626636f81944c1de71069",
+        "kernel_successes": null,
+        "peak_in_flight": 79,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 2,
+        "position": 2,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-2-native/result.json",
+        "source_sha256": "51247df2f94c2b4c8281cbdadc816163e4aab914812b5f6e7542b120ee8252ec",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 46,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 2,
+        "position": 3,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-3-kernel/result.json",
+        "source_sha256": "045388a4cc40334d6ffe56f494ad4ffeda9b62f66ec16bcb9181327e0a1c8d2b",
+        "kernel_successes": 63726.0,
+        "peak_in_flight": 71,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 2,
+        "position": 4,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-4-kernel/result.json",
+        "source_sha256": "1567253c9a2238515dcdf2f1fdf15fb114ca25691df5149488ec665eb836f6d8",
+        "kernel_successes": 63261.0,
+        "peak_in_flight": 71,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 2,
+        "position": 5,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-5-native/result.json",
+        "source_sha256": "ba1aebd165cc1b1b701d6666c5afb0f0d38377b32f1ca635c3036131bffe1006",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 77,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 2,
+        "position": 6,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-6-release/result.json",
+        "source_sha256": "2685c39aab53fc07f46daa3b7af46838dc65ad7c2c707200eacaaed707a73b2d",
+        "kernel_successes": null,
+        "peak_in_flight": 65,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 3,
+        "position": 1,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-1-release/result.json",
+        "source_sha256": "a60a484ba6284732a5359795740b2040f3a7e3ac7a9d4318d7ecade4e28cf2f3",
+        "kernel_successes": null,
+        "peak_in_flight": 71,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 3,
+        "position": 2,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-2-native/result.json",
+        "source_sha256": "dab438b9e1aee5533984935c0ae551b40a553ba0c1f349abbb1e19fada1af722",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 45,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 3,
+        "position": 3,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-3-kernel/result.json",
+        "source_sha256": "efb93219b15241b22ff9b09196f031671991648532b952d54eeaa951ae271633",
+        "kernel_successes": 63681.0,
+        "peak_in_flight": 67,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 3,
+        "position": 4,
+        "arm": "kernel",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-4-kernel/result.json",
+        "source_sha256": "54ced8a05cbacb145b1fae307a61b1a2412e54e5ad13a5f92d7f7acd97c50adc",
+        "kernel_successes": 63692.0,
+        "peak_in_flight": 69,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 3,
+        "position": 5,
+        "arm": "native",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-5-native/result.json",
+        "source_sha256": "f0ab9771be911d3fa60b878f4f5a1207cebea7775463ac6e9d5462e298151647",
+        "kernel_successes": 0.0,
+        "peak_in_flight": 54,
+        "concurrency_waits": 0
+      },
+      {
+        "case": "pagecache",
+        "cycle": 3,
+        "position": 6,
+        "arm": "release",
+        "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-6-release/result.json",
+        "source_sha256": "165199a9d3fa837552978c6e594b47b330a458e3aa9b6c46527796a969c899a3",
+        "kernel_successes": null,
+        "peak_in_flight": 62,
+        "concurrency_waits": 0
+      }
+    ],
+    "errors": [],
+    "monitor": {
+      "event": "finished",
+      "monotonic_ns": 34741875037521,
+      "unix_ns": 1793440018164078221,
+      "command_exit": 0,
+      "compiler_overlap_observed": false,
+      "unique_compilers": []
+    },
+    "results": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1",
+    "monitor_directory": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-monitor-v1",
+    "scope": "bounded offered load, not unrestricted open loop; no automatic retries or reconnects; failed arms remain in place"
+  },
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d",
+    "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec",
+    "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced": "0cb400bd7a56df95a03219ff227195e2ca6168ca1cf98c02b8ce48ac5ffacca6"
+  },
+  "source_inputs": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-inputs-before-v1.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-inputs-before-v1.json",
+      "sha256": "81af1b3f57e92dd76518ab3bf58f11e92107f724f980e483813174e07d781bcb",
+      "bytes": 3842
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-inputs-after-v1.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-inputs-after-v1.json",
+      "sha256": "81af1b3f57e92dd76518ab3bf58f11e92107f724f980e483813174e07d781bcb",
+      "bytes": 3842
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness-sha256.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness-sha256.json",
+      "sha256": "59af819f8911d7b78ea5435e0a5929fc1f5f5ded40abf31d705cae5cf5afef39",
+      "bytes": 949
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/metadata.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/metadata.json",
+      "sha256": "b091f4ff57f82d37b960be7c6aed03994651a19968bc2d6fb4adc4f7148d8a21",
+      "bytes": 3138
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-status-v1.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-status-v1.json",
+      "sha256": "05625a7fc0cded8784b9d59504329e935c609c60e3e68eb1ee85e9168a97990b",
+      "bytes": 14917
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/packaging/debian/conf/httpd_config.xml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/packaging/debian/conf/httpd_config.xml",
+      "sha256": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+      "bytes": 1402
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/packaging/debian/conf/mime.properties": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/packaging/debian/conf/mime.properties",
+      "sha256": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+      "bytes": 126
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/packaging/debian/conf/vhosts/default.xml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/packaging/debian/conf/vhosts/default.xml",
+      "sha256": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe",
+      "bytes": 405
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_cpu.py": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_cpu.py",
+      "sha256": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+      "bytes": 4596
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_environment_run.py": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_environment_run.py",
+      "sha256": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+      "bytes": 5159
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_hw_counters.py": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_hw_counters.py",
+      "sha256": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+      "bytes": 25935
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_syscall_counts.py": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/bench_syscall_counts.py",
+      "sha256": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+      "bytes": 6346
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/h3_engine_check.py": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/h3_engine_check.py",
+      "sha256": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+      "bytes": 46880
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/http_engine_check.py": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness/scripts/http_engine_check.py",
+      "sha256": "7bd48ce75e71ff670a905c505722f87d3b26ea6603360c901394cac61c3eacd1",
+      "bytes": 35785
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-arms-v1.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-arms-v1.json",
+      "sha256": "dc035e0d74f27c459fa9acf3fbc316370bd18675e5b612e5fb42be5e0106b148",
+      "bytes": 671
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/use-artifacts.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/use-artifacts.json",
+      "sha256": "1474d50031c62b42093d1ca235c4b1987fb27810daad8dc927e0faa6b4c25617",
+      "bytes": 732
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-use.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-use.json",
+      "sha256": "fe0a1b6af4f582526e46ea0c5919bc2acbcb7792806479514252ee41e2c96ff6",
+      "bytes": 764
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/profile-use-warnings.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/profile-use-warnings.json",
+      "sha256": "1780f06b082c167c97d97b754ce8419f80b043b5dfb3e0d3090a1b5f2ea0b403",
+      "bytes": 248381
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/pgo-inputs.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/pgo-inputs.json",
+      "sha256": "0f6e8e3b62a2528d2a1cdbb4adee4e3a621b83ad987dae991c87a90c8524d946",
+      "bytes": 1351
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-source-manifest.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-source-manifest.json",
+      "sha256": "966389d667bba3c9dab0b55d7178b30cd7c6d371b0edc3f25dbddfaf848c624c",
+      "bytes": 146844
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/merge-receipt.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/merge-receipt.json",
+      "sha256": "6a6ba1addce99231f024716f100a5cd820271990814da985eb65a1d6e87e9917",
+      "bytes": 441
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/coverage-review.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/coverage-review.json",
+      "sha256": "fe3c6f76a0c07235e165dec0a7bc0c7413897e7d7888393b45fa1f356360b887",
+      "bytes": 1629
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/profile-inputs.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/profile-inputs.json",
+      "sha256": "fd92eb36357fb087cdd455586e770d39b4423feb186489f2f44ac8f6d10bf999",
+      "bytes": 98892
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/qualification.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/qualification.json",
+      "sha256": "23b90b993a4d92f68a3645e7ec3307b57da5c5a34e3f06f771e746a68d7ce315",
+      "bytes": 26401
+    },
+    "/var/tmp/pgo-c-common.sh": {
+      "path": "/var/tmp/pgo-c-common.sh",
+      "sha256": "520702a5887a9eb396feea0a097269423cf91b39ddc2a3947723547b5c6562fa",
+      "bytes": 6721
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/final-pgo-release-true-lo-v1/summary.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/final-pgo-release-true-lo-v1/summary.json",
+      "sha256": "eb948cbf34f675472149d80543ea10a73c17b7f4f54408508764d6b88d13a034",
+      "bytes": 2204701
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/final-pgo-release-true-lo-v1/final-integrity.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/final-pgo-release-true-lo-v1/final-integrity.json",
+      "sha256": "d8eedde98c889a6f8dd5f41d000a221220c08b44c02172a980587cf392ed8ff0",
+      "bytes": 757
+    },
+    "/var/tmp/pgo-c-h2-rate.sh": {
+      "path": "/var/tmp/pgo-c-h2-rate.sh",
+      "sha256": "775750688a1d83aedcc2515142e5aa41a510af5aa2df06c5de21005185fee374",
+      "bytes": 10609
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+      "sha256": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+      "bytes": 23518040
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1",
+      "sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d",
+      "bytes": 2459592
+    },
+    "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet": {
+      "path": "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+      "sha256": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec",
+      "bytes": 22038936
+    },
+    "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced": {
+      "path": "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced",
+      "sha256": "0cb400bd7a56df95a03219ff227195e2ca6168ca1cf98c02b8ce48ac5ffacca6",
+      "bytes": 6991320
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.cargo/config.toml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.cargo/config.toml",
+      "sha256": "f66e1e1ea1aa14f4a613e6994686c637af25b778f6a48c1c9af771ee20ea5b6a",
+      "bytes": 910
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.dockerignore": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.dockerignore",
+      "sha256": "e201586647efd35348b5ba3b4d6fbfbb980d37c85b921d24b89a60b084ec4532",
+      "bytes": 525
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/ISSUE_TEMPLATE/bug_report.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/ISSUE_TEMPLATE/bug_report.yml",
+      "sha256": "de41ecc176835a87fd6dcdd0a6b31ee0a2bffa626076cc0efc9cb6d5047ea522",
+      "bytes": 1073
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/ci-policy.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/ci-policy.yml",
+      "sha256": "84aff6c0b312ca0653e83c88ed7c7477fb19114078401429bbac47e732ab53e0",
+      "bytes": 380
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/pull_request_template.md": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/pull_request_template.md",
+      "sha256": "5553fa3f9c9768e5ad0528eea3e292afa21f5002caae00bb88af1656053505db",
+      "bytes": 560
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/actions-policy.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/actions-policy.yml",
+      "sha256": "99a285142f380dada99c8a348d51d2383124262dce479868560909651ea44fcc",
+      "bytes": 260
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/container-compose-check.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/container-compose-check.yml",
+      "sha256": "22628d8f1b9a8b8e6f565cfebbd43ebc62ef3c02485d1698a6c5d10086c941b1",
+      "bytes": 1914
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/container-publish.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/container-publish.yml",
+      "sha256": "0c811fbc6c8086990cf4f5cf6398a3cbfb8a9db3b7a9daa18d70a2ab97c274e6",
+      "bytes": 11976
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/deps-advisory.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/deps-advisory.yml",
+      "sha256": "5b9820ede99cb491ace59c0597726436244b091a08ef213381bc5033346316ba",
+      "bytes": 1591
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-guix-bootstrap-check.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-guix-bootstrap-check.yml",
+      "sha256": "3e935258d794951abf925f80b23c240365b6e0a57315a2923411d18bc5f384ca",
+      "bytes": 2625
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-image-origin-check.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-image-origin-check.yml",
+      "sha256": "1253021ef268cac6e447bc32158edaa5e36a3b488836a399a1c37ebc64ba9db7",
+      "bytes": 1764
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-origin-check.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-origin-check.yml",
+      "sha256": "df01db106ef269a395c5b827eaae67f6178d63e39ab082bb9a74929eadb4c7eb",
+      "bytes": 688
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-private-origin-check.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-private-origin-check.yml",
+      "sha256": "33aa16e9d0415d3ec5e94de179c791719cbc428121b19d41ddf7be9242b1ff5a",
+      "bytes": 5254
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-publish-now.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-publish-now.yml",
+      "sha256": "3a1014e4a864179bddf00348684dbbc157c14f4950dc85e54342e973307d4ed1",
+      "bytes": 14231
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-publish.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-publish.yml",
+      "sha256": "de4027b9c52e6a7fd556e290f27bc18781d300e51018ac288f0bff1344903840",
+      "bytes": 8874
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-refresh.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-refresh.yml",
+      "sha256": "538bc723193af9c4d3cc61124c577ab98411428362c7882f5a90fe3245b721df",
+      "bytes": 6089
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-release.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-release.yml",
+      "sha256": "d45904075793c233910bd560edd0682583d5da3f0d6b791cba50dba460067bb0",
+      "bytes": 9741
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-tests.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/installer-tests.yml",
+      "sha256": "ed8ba2fbefb3dbd149d74a9a1767e5a681625f7dd42d18474ae4ac5216cacbe5",
+      "bytes": 1709
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/wslc-network-diagnostic.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/wslc-network-diagnostic.yml",
+      "sha256": "685a0e91fe4c073dab4c4dd8d866cea2b4972189637d1fb445dc774f4633d2f9",
+      "bytes": 5071
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/wslc-smoke.yml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.github/workflows/wslc-smoke.yml",
+      "sha256": "95da3717c0c019dac6f02fb4c5cbecfcf2662fe008145a10832ad9f5e8ee334d",
+      "bytes": 5000
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.gitignore": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.gitignore",
+      "sha256": "829554086b69c3b706f58bf5f013faeb1d7eaec3dbed141bf943965d71aa330b",
+      "bytes": 1516
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.gitleaks.toml": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/src/.gitleaks.toml",
+      "sha256": "60f4e96ddb6294ee0de5264ddb547836eba6a87c282b8b05ec8cfdd3ab7391ec",
+      "bytes": 229
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-1-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-1-release/result.json",
+      "sha256": "c5bc9d9eb019b4f2ddc94f40e2e70ad9af35d4158cc20d86b0d5de57d2f5086a",
+      "bytes": 37518
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-1-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-1-release/server-exit.json",
+      "sha256": "4bb7b2a4fbd838d4826ce1e22843d6f026382239d2ba9ae38cd9e4a00b818802",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-2-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-2-native/result.json",
+      "sha256": "4f9592eb3b55469a6918aa5935b805b21e0e19c6532496e3dba72e78e0bb81e0",
+      "bytes": 41449
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-2-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-2-native/server-exit.json",
+      "sha256": "234f87909bcfc0e69b6e7a2810bef2a210874747736bfdb28d5c4cf3679f4d17",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-3-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-3-kernel/result.json",
+      "sha256": "7352028f5221be4836fcf1729fc2ca55d2f8e99ccf2a1dbbbd8ca3f6beaa8c33",
+      "bytes": 56014
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-3-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-3-kernel/server-exit.json",
+      "sha256": "79fce600f1416cda0c6c6388f7925b7ae5c5794346f71a37d0b02fe8605ec10b",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-4-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-4-kernel/result.json",
+      "sha256": "b9443efd84e0bc5b3d1fa0015aa9baff23e0fda2f4f3ecb70ff316fb8848e34a",
+      "bytes": 55587
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-4-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-4-kernel/server-exit.json",
+      "sha256": "28f025c58f94ca4de0b939e113b432d219fcbd3bc3245bb5725a68b91f537177",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-5-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-5-native/result.json",
+      "sha256": "b9334457f713c4064496b89c212e2df6191ff695626fbfc1715eab80f6a827f0",
+      "bytes": 41409
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-5-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-5-native/server-exit.json",
+      "sha256": "846f22307e94d9b44330352ba68ff8a70d7b0a3fb4aef503dff32840178223f2",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-6-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-6-release/result.json",
+      "sha256": "06566a698381d78b90761f578048dffaa412a7fb457bed5f6a8eeb1aa747aa9e",
+      "bytes": 37479
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-6-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-1-6-release/server-exit.json",
+      "sha256": "5ebf27046424730c7963c451e5a23ff960eb06d79620b4f34c5553792dfc8997",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-1-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-1-release/result.json",
+      "sha256": "cd70f6e65a818afbf8614c421685fcbbcc7932639d7976db523d0c191cd049f3",
+      "bytes": 38210
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-1-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-1-release/server-exit.json",
+      "sha256": "b0103e3b0cdf96d723b803595ceeafc73993fe291e1ceb87fabe088c59ef6657",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-2-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-2-native/result.json",
+      "sha256": "3f4468f2abdd11fee446bd2925e56e11816f69ba2ef26bc2a685d5805bfaa07d",
+      "bytes": 41421
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-2-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-2-native/server-exit.json",
+      "sha256": "4db6d97ede313fc72b7d02148340862fe8de5e7b1c7d9f81219dcdf4e1877bb5",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-3-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-3-kernel/result.json",
+      "sha256": "bc07194b69c93272f9bc659387f9f3b92470e38f1d2d4305945cc53e40acd6f4",
+      "bytes": 55617
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-3-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-3-kernel/server-exit.json",
+      "sha256": "01a193a2a17ef0ba7d1b14c012c446219246fee62704389ff01776bb13a36dea",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-4-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-4-kernel/result.json",
+      "sha256": "e980896ef3b5b5ede6a068bb92ca8065216f851a8eef658cd776766e1aff025d",
+      "bytes": 56005
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-4-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-4-kernel/server-exit.json",
+      "sha256": "ba1879616b587ec858c451aea82684080429e132d36c6e5e5fd32162a13c0693",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-5-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-5-native/result.json",
+      "sha256": "2dac5e0a1c4c15708b7365277d8c685743ae0929d8c25cfcfcf4d7d27face8c9",
+      "bytes": 41377
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-5-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-5-native/server-exit.json",
+      "sha256": "a33bea7e6e3e55f30f1ac7dd389b707b24704ff83bcc196560b89beefef62e86",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-6-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-6-release/result.json",
+      "sha256": "477783a632f450edd18fb1c1c3f80d5672d53badc86c167056a2facd00586381",
+      "bytes": 38216
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-6-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-2-6-release/server-exit.json",
+      "sha256": "388d77679866ff432864be0eacae94f7fbf22e13fef8d975b3b706f5d3fe1dcc",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-1-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-1-release/result.json",
+      "sha256": "0af0a827cb7fab29fd21187de4b66888d46f80b0b40913ee42ec2e08cb50a22f",
+      "bytes": 38188
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-1-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-1-release/server-exit.json",
+      "sha256": "a018fd49f51b5fb7d16c5b174d6d27b2ff11aa489c4af7abe42a2f1990a2c687",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-2-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-2-native/result.json",
+      "sha256": "a3a6d451b4d0fac2c969a00868e6eb504b09999866b0cb9698698b701bd65a56",
+      "bytes": 41417
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-2-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-2-native/server-exit.json",
+      "sha256": "ead5f691baaa15d97290e36a3ef68b83ec4cc811e5c13ee5c5002d3ad9f769e6",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-3-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-3-kernel/result.json",
+      "sha256": "8fac0b6612a35b663f2a60d244c4156854f30340ad0a3c889824cd6e4a7429bf",
+      "bytes": 55722
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-3-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-3-kernel/server-exit.json",
+      "sha256": "4eb51f68362add8bc74959053d390e15aaf5e33d9c8d5fca3e7cea56fa0225c9",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-4-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-4-kernel/result.json",
+      "sha256": "42b0b15e7d93aca4dbfc99c1897ab2311e613c072d5a0719fde591eadc1a4921",
+      "bytes": 55100
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-4-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-4-kernel/server-exit.json",
+      "sha256": "a8cb359559e6f78149eada4f8e9904f9dd1c582e48a4df7145dbd1967b8a0e01",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-5-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-5-native/result.json",
+      "sha256": "b4bf637032cd1ba90e330e42ddc53db9245d3d79fcf3ef64a9625d5b8023f838",
+      "bytes": 41418
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-5-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-5-native/server-exit.json",
+      "sha256": "f350da5663ae35b95d53ab66d72da3066f37c13563d78efb3490b7e30421a6a0",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-6-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-6-release/result.json",
+      "sha256": "16105b6cdccd357e1674a1af4777e9c341d030ce1985085f9171464a22597710",
+      "bytes": 38197
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-6-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-static-3-6-release/server-exit.json",
+      "sha256": "d90b6fcaee439e716bcd87864173c9d57ddfa978982272c9367923c15ff11b3b",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-1-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-1-release/result.json",
+      "sha256": "b590c228416926c13db5ebf4ec5dafdb0cee8a253ce1d405016b18bb402b8593",
+      "bytes": 38436
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-1-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-1-release/server-exit.json",
+      "sha256": "8bed6f3cd8a6d987513d37c374262598ab029163404d12478abf27aac5c716ed",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-2-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-2-native/result.json",
+      "sha256": "1677d407f95399431f46637d7d090521ef58be212bb842f9c88822ce8693a097",
+      "bytes": 40905
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-2-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-2-native/server-exit.json",
+      "sha256": "ebb19b6b6a206c90a01b64d2e6fd9d3562601b3fc3b0468de06458b121636989",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-3-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-3-kernel/result.json",
+      "sha256": "57839f1ee12af4692716de7be8e2aa6280cca322612eb434529fab3cb392556d",
+      "bytes": 56078
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-3-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-3-kernel/server-exit.json",
+      "sha256": "010037efd3a5ba91ecfbecd6a4b71cff00e49a9ab3083cc0b9bdf0feb3b0eff3",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-4-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-4-kernel/result.json",
+      "sha256": "1f2bf30f1757207a417430001e035b1c16f63d69eacb0cba3e7c525005011ea5",
+      "bytes": 55028
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-4-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-4-kernel/server-exit.json",
+      "sha256": "e289c701ca1eb9899d0f0449457b54d479145c5d9e0634235cc8ee6958c25f20",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-5-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-5-native/result.json",
+      "sha256": "86067b4e5cbfd2c57d95e5052448d1c1aa142db9a9c2f578b6dbaf4df68c36f9",
+      "bytes": 42363
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-5-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-5-native/server-exit.json",
+      "sha256": "edc4cf25f14babe39ace3c098122db6b261848b28f1564cf237a94239a57fdef",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-6-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-6-release/result.json",
+      "sha256": "03beb183a40cd0d49ab1ebeb8ee4a7bca7daa7bbad9b05cafd3875e75954b342",
+      "bytes": 38400
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-6-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-1-6-release/server-exit.json",
+      "sha256": "94f5669383add043252c39145853319a81694e382faf92a5aa0091b691ede426",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-1-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-1-release/result.json",
+      "sha256": "c4a90c9a8d11b7e04f9f40cdf0517546debcd616fff626636f81944c1de71069",
+      "bytes": 38457
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-1-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-1-release/server-exit.json",
+      "sha256": "37f10797d4a3de27deafa7d2ce5d7cb73a736cbcd42763fdd8da3810fb77f6e2",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-2-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-2-native/result.json",
+      "sha256": "51247df2f94c2b4c8281cbdadc816163e4aab914812b5f6e7542b120ee8252ec",
+      "bytes": 41654
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-2-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-2-native/server-exit.json",
+      "sha256": "3ede779a8f31d24ef400b09c6568ecd4eac78bca453f861f2d0581c6be0c0e83",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-3-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-3-kernel/result.json",
+      "sha256": "045388a4cc40334d6ffe56f494ad4ffeda9b62f66ec16bcb9181327e0a1c8d2b",
+      "bytes": 55000
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-3-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-3-kernel/server-exit.json",
+      "sha256": "ffa11009e9e7a6d4a478162d7731dd3c828f3b60012733be63ccf1edceae0ce6",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-4-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-4-kernel/result.json",
+      "sha256": "1567253c9a2238515dcdf2f1fdf15fb114ca25691df5149488ec665eb836f6d8",
+      "bytes": 55035
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-4-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-4-kernel/server-exit.json",
+      "sha256": "1500b07818dd08cf046153a139f107a752f6d82ea6100e2d9a6d8fcacb4ad6e2",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-5-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-5-native/result.json",
+      "sha256": "ba1aebd165cc1b1b701d6666c5afb0f0d38377b32f1ca635c3036131bffe1006",
+      "bytes": 41613
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-5-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-5-native/server-exit.json",
+      "sha256": "3623eef402f30d11aa94186df3048a1bc6cff37d4b54dff04759c08588eb6129",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-6-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-6-release/result.json",
+      "sha256": "2685c39aab53fc07f46daa3b7af46838dc65ad7c2c707200eacaaed707a73b2d",
+      "bytes": 37712
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-6-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-2-6-release/server-exit.json",
+      "sha256": "8f357b22163a83da8c259aefc5654d9f008e180dd4974ba362abb68302456fd0",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-1-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-1-release/result.json",
+      "sha256": "a60a484ba6284732a5359795740b2040f3a7e3ac7a9d4318d7ecade4e28cf2f3",
+      "bytes": 38346
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-1-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-1-release/server-exit.json",
+      "sha256": "b26fe882b7770204a38b9f3060e3a696c4afa66e66c00dbd07d9d3277786c0c0",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-2-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-2-native/result.json",
+      "sha256": "dab438b9e1aee5533984935c0ae551b40a553ba0c1f349abbb1e19fada1af722",
+      "bytes": 41633
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-2-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-2-native/server-exit.json",
+      "sha256": "87272ef97f959ca69220272e121bee7eb984d6cf09ea9c8f345c820665b12a2c",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-3-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-3-kernel/result.json",
+      "sha256": "efb93219b15241b22ff9b09196f031671991648532b952d54eeaa951ae271633",
+      "bytes": 55898
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-3-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-3-kernel/server-exit.json",
+      "sha256": "07374be946ab023d04abea68e80157b57f844c37cd3662ddc5521279656f1a13",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-4-kernel/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-4-kernel/result.json",
+      "sha256": "54ced8a05cbacb145b1fae307a61b1a2412e54e5ad13a5f92d7f7acd97c50adc",
+      "bytes": 55931
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-4-kernel/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-4-kernel/server-exit.json",
+      "sha256": "c7894c89b0f961ea6c671f530c6602940d82e13f310f16cc42d2bf1150f4fec0",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-5-native/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-5-native/result.json",
+      "sha256": "f0ab9771be911d3fa60b878f4f5a1207cebea7775463ac6e9d5462e298151647",
+      "bytes": 41621
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-5-native/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-5-native/server-exit.json",
+      "sha256": "5f260291288d66f27c5e7e9d108b24ad8f3ca385767d75a2e158fc3a50f83aec",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-6-release/result.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-6-release/result.json",
+      "sha256": "165199a9d3fa837552978c6e594b47b330a458e3aa9b6c46527796a969c899a3",
+      "bytes": 38398
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-6-release/server-exit.json": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-v1/h2c-pagecache-3-6-release/server-exit.json",
+      "sha256": "ce2ef328d5882329bce82651a84bd54aed7b665a9e7b8f2af8ce6d4ac2eeee07",
+      "bytes": 33
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-monitor-v1/environment.jsonl": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-monitor-v1/environment.jsonl",
+      "sha256": "0c7a8b7181d38c1f5873b9031e744fdb787b9cfdeefa0f860556bcd3a518d111",
+      "bytes": 20484
+    }
+  },
+  "summarizer": {
+    "path": "/var/tmp/summarize-pgo-h2-rate.py",
+    "sha256": "8d4b0d29fecfe6537d77ac10057f3586e0ecc656f57a058f0b957f7b299c0f59"
+  },
+  "scopes": {
+    "latency": "scheduled-to-completion, service and dispatch lateness p99 are distinct; never add quantiles",
+    "aggregation": "medians of the six complete per-arm values per fixture/mode; not pooled request percentiles; all36 arms and global seals must validate",
+    "offered_load": "bounded admission at128; peak/cap/wait counts remain visible; not unrestricted open loop or proof of continuous unsaturation",
+    "throughput": "rate-matched15k/s; achieved RPS validates delivery at this offered rate, not maximum capacity",
+    "process_cpu": "server and helper user+system CPU over the whole client span, including handshake/warmup/measurement/output/drain; denominator65000; excludes kernel/IRQ work charged elsewhere",
+    "pmu": "server/helper user-mode instructions/cycles only; kernel/IRQ/hypervisor work excluded; denominator65000",
+    "whole_vm": "all Linux CPUs user+nice+system+IRQ+softIRQ, converted using recorded tick timebase; includes clients/unrelated Linux work; Windows host unobserved",
+    "interpretation": "process CPU and VM busy are separate scopes; neither establishes whole-server CPU savings or performance superiority"
+  }
+}
