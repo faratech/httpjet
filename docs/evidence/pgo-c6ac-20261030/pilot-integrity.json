@@ -1,0 +1,17 @@
+{
+  "status": "passed",
+  "completed_cells": 10,
+  "completed_arms": 120,
+  "measured_responses": 12000000,
+  "warmup_responses": 600000,
+  "all_artifact_hashes_unchanged": true,
+  "no_owned_benchmark_executables_running": true,
+  "owned_executable_scope": [
+    "/var/tmp/hjc/httpjet-http-load-bind",
+    "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet",
+    "/var/tmp/httpjet-continuation/h3-bind-client-20261030/bin/httpjet-h3-load-bind",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-control/httpjet",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet"
+  ],
+  "summary_sha256": "34331fc817d9a0f433ef5e796f88389498fae98ace7366692780a74daa209442"
+}

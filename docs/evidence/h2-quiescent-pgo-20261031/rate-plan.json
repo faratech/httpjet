@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "mode": "rate15000",
+  "control": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/h2-final-rate15000-v1",
+  "harness": "/var/tmp/httpjet-continuation/h2-quiescent-v2/harness-current",
+  "results": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/h2-final-rate15000-v1/results",
+  "monitor": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/h2-final-rate15000-v1/monitor",
+  "arms": [
+    {
+      "name": "fresh-native",
+      "binary": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+      "serve_args": [
+        "--h1-kernel",
+        "off",
+        "--page-cache-response-memo"
+      ]
+    },
+    {
+      "name": "old-native",
+      "binary": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet",
+      "serve_args": [
+        "--h1-kernel",
+        "off",
+        "--page-cache-response-memo"
+      ]
+    },
+    {
+      "name": "fresh-kernel",
+      "binary": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+      "serve_args": [
+        "--h1-kernel",
+        "required",
+        "--h2-kernel",
+        "--page-cache-response-memo"
+      ],
+      "launcher": {
+        "binary": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1"
+      }
+    },
+    {
+      "name": "old-kernel",
+      "binary": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+      "serve_args": [
+        "--h1-kernel",
+        "required",
+        "--h2-kernel",
+        "--page-cache-response-memo"
+      ],
+      "launcher": {
+        "binary": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1"
+      }
+    }
+  ],
+  "pairs": [
+    [
+      "fresh-native",
+      "fresh-kernel"
+    ],
+    [
+      "old-native",
+      "old-kernel"
+    ]
+  ],
+  "sequence": [
+    "fresh-native",
+    "fresh-kernel",
+    "fresh-kernel",
+    "fresh-native",
+    "old-native",
+    "old-kernel",
+    "old-kernel",
+    "old-native"
+  ],
+  "rounds": 3,
+  "cases": [
+    "static",
+    "pagecache"
+  ],
+  "size": 1024,
+  "client": "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced",
+  "client_sha256": "0cb400bd7a56df95a03219ff227195e2ca6168ca1cf98c02b8ce48ac5ffacca6",
+  "requests": 60000,
+  "warmup": 5000,
+  "rate": "15000",
+  "scope": "per-worker true-loopback experiment; no timing improvement is an acceptance precondition"
+}

@@ -1,0 +1,68 @@
+{
+  "schema": 1,
+  "verified": true,
+  "integrated_commit": "96ddc5d67b9261e341932b579cc578655a465fab",
+  "native_source_manifest_sha256": "7c66ac12e6e7f0861596ae5aba040a1e3c57e8866493a4873c78847363c31a71",
+  "native_snapshot_files": 683,
+  "native_snapshot_files_matching_integrated_source": 681,
+  "selected_bpf_source_manifest_sha256": "16fccd5aefc0808b60c61cec006fc9560ee2c2fc88107ad9606208f359602d20",
+  "selected_bpf_source_files_checked": [
+    "bpf/Cargo.lock",
+    "bpf/Cargo.toml",
+    "bpf/beeper-kern/Cargo.toml",
+    "bpf/beeper-kern/src/engine/h1.rs",
+    "bpf/beeper-kern/src/engine/h2.rs",
+    "bpf/beeper-kern/src/engine/iter.rs",
+    "bpf/beeper-kern/src/engine/mod.rs",
+    "bpf/beeper-kern/src/h1.rs",
+    "bpf/beeper-kern/src/h2.rs",
+    "bpf/beeper-kern/src/lib.rs",
+    "bpf/beeper-kern/src/scratch.rs",
+    "bpf/beeper-kern/src/skb.rs",
+    "bpf/hj-bpf-kern/Cargo.toml",
+    "bpf/hj-bpf-kern/src/atomic.rs",
+    "bpf/hj-bpf-kern/src/bin/beeper_test.rs",
+    "bpf/hj-bpf-kern/src/bin/cid_steering.rs",
+    "bpf/hj-bpf-kern/src/bin/h1_ack_probe.rs",
+    "bpf/hj-bpf-kern/src/bin/h1_serve/h1.rs",
+    "bpf/hj-bpf-kern/src/bin/h1_serve/h2.rs",
+    "bpf/hj-bpf-kern/src/bin/h1_serve/main.rs",
+    "bpf/hj-bpf-kern/src/bin/observer.rs",
+    "bpf/hj-bpf-kern/src/iter.rs",
+    "bpf/hj-bpf-kern/src/kfunc.rs",
+    "bpf/hj-bpf-kern/src/lib.rs",
+    "bpf/hj-bpf-kern/src/maps.rs",
+    "crates/hj-bpf-abi/Cargo.toml",
+    "crates/hj-bpf-abi/src/beeper.rs",
+    "crates/hj-bpf-abi/src/beeper_test.rs",
+    "crates/hj-bpf-abi/src/lib.rs",
+    "crates/hj-bpf-abi/src/observer.rs",
+    "crates/hj-bpf-abi/src/quic.rs",
+    "crates/hj-bpf-abi/src/serve.rs"
+  ],
+  "native_snapshot_bpf_source_replacements": [
+    {
+      "path": "bpf/hj-bpf-kern/src/bin/h1_serve/h2.rs",
+      "ignored_native_snapshot_sha256": "cdaaa34bf0d2d1e1d6a2ca309f124f392d16c0eb7db8dc5242456405d4743ad6",
+      "selected_bpf_source_sha256": "da0426882903c3e9675f0263884f8793f5d7cff36373a0e93510297bd0190c47"
+    },
+    {
+      "path": "bpf/hj-bpf-kern/src/bin/h1_serve/main.rs",
+      "ignored_native_snapshot_sha256": "dc9d35dc6d292200198d38e0709864b4ee3d43aef6581c0228b90e7d5fb2b07c",
+      "selected_bpf_source_sha256": "88cfb0b2330c044444771979f73b6781c7416971c2a10bcf881887dd23573427"
+    }
+  ],
+  "selected_bpf_hashes": {
+    "cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f",
+    "h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+    "h1_serve": "353abef987650e609aad33aebf09eb92570be477377b272886f861cebf029b16",
+    "observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a"
+  },
+  "frozen_helper_binding": {
+    "helper_sha256": "b9b924c3eb6c59b688ccb857fd804d88b72b4a2e569485e2240f17af7d3a73b9",
+    "h1_serve_sha256": "353abef987650e609aad33aebf09eb92570be477377b272886f861cebf029b16",
+    "object_offset": 108898,
+    "method": "raw include_bytes object containment"
+  },
+  "scope": "Committed native source matches the frozen V2 Rust inputs. Two BPF source files differ from ignored native-snapshot BPF text and match the separately compiled wide component used by both fresh PGO stages. The helper embeds that selected complete serving ELF. No mixed Rust CFG or old Rust profiles are asserted."
+}

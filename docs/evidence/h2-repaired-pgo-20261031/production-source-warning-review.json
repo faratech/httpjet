@@ -1,0 +1,284 @@
+{
+  "schema": 1,
+  "status": "reviewed_for_wire_qualification",
+  "binary_sha256": "24ccc3a889018e9c9a739ac1619da4f1c860f732dd3421c55daea2321e1fe12c",
+  "source_commit": "c07d345714d04d0fc9e0b7d41bafee3cbacc5e73",
+  "warnings_sha256": "f1ddebf2161b6c488c11cb2f98fab321a2276bb93f99e234080ffb83c80d120f",
+  "counts_log_sha256": "ccb47d46a4794298c0215c3928b30369bdd6dd6321b441f423ab210a966ea987",
+  "CFG_or_profile_hash_mismatches": 0,
+  "missing_function_warnings": 866,
+  "unit_counts": {
+    "build_script_build.2c690d170d79ada1-cgu.0": 186,
+    "build_script_build.2c690d170d79ada1-cgu.4": 227,
+    "build_script_build.2c690d170d79ada1-cgu.1": 193,
+    "build_script_build.2c690d170d79ada1-cgu.3": 115,
+    "build_script_build.2c690d170d79ada1-cgu.2": 139,
+    "httpjet.c11e404994a1cd6-cgu.0": 6
+  },
+  "classification": {
+    "pprof_build_script_prost_codegen": 860,
+    "auxiliary_fuzz_library_codec": 5,
+    "auxiliary_fuzz_library_RawVec_specialization": 1,
+    "served_bin_uring_namespace": 0
+  },
+  "auxiliary_warning_details": [
+    {
+      "unit": "httpjet.c11e404994a1cd6-cgu.0",
+      "mangled": "_RINvNvMs2_NtCsgFX3jaOk65H_5alloc7raw_vecINtB8_11RawVecInnerpE7reserve21do_reserve_and_handleNtNtBa_5alloc6GlobalECs12fme0d2BJq_7httpjet",
+      "demangled": "<alloc[c23e483dde3f7cfb]::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc[c23e483dde3f7cfb]::alloc::Global>",
+      "function_hash": 753202733449284396
+    },
+    {
+      "unit": "httpjet.c11e404994a1cd6-cgu.0",
+      "mangled": "_RNvMNtCs12fme0d2BJq_7httpjet5codecNtB2_14ChunkedDecoder13next_line_end",
+      "demangled": "<httpjet[c11e404994a1cd6]::codec::ChunkedDecoder>::next_line_end",
+      "function_hash": 948827213290633728
+    },
+    {
+      "unit": "httpjet.c11e404994a1cd6-cgu.0",
+      "mangled": "_RNvMNtCs12fme0d2BJq_7httpjet5codecNtB2_14ChunkedDecoder7advance",
+      "demangled": "<httpjet[c11e404994a1cd6]::codec::ChunkedDecoder>::advance",
+      "function_hash": 1021170726032974281
+    },
+    {
+      "unit": "httpjet.c11e404994a1cd6-cgu.0",
+      "mangled": "_RNvNtCs12fme0d2BJq_7httpjet5codec13te_is_chunked",
+      "demangled": "httpjet[c11e404994a1cd6]::codec::te_is_chunked",
+      "function_hash": 321806759602108471
+    },
+    {
+      "unit": "httpjet.c11e404994a1cd6-cgu.0",
+      "mangled": "_RNvNtCs12fme0d2BJq_7httpjet5codec16head_has_bare_lf",
+      "demangled": "httpjet[c11e404994a1cd6]::codec::head_has_bare_lf",
+      "function_hash": 287486626971661737
+    },
+    {
+      "unit": "httpjet.c11e404994a1cd6-cgu.0",
+      "mangled": "_RNvNtCs12fme0d2BJq_7httpjet5codec16parse_chunk_size",
+      "demangled": "httpjet[c11e404994a1cd6]::codec::parse_chunk_size",
+      "function_hash": 408462323105766661
+    }
+  ],
+  "profile": {
+    "functions": 27202,
+    "positive_functions": 4570,
+    "auxiliary_lib_namespace_entries": 0,
+    "source_note": "src/lib.rs exposes uring/codec.rs only as the pure fuzz/tooling library. The served binary compiles the same file under uring::codec, a distinct crate/unit namespace.",
+    "examples": [
+      {
+        "family": "H1 parser",
+        "mangled": "_RNvNtNtCsdMfmKnnjkfT_7httpjet5uring5codec16head_has_bare_lf",
+        "demangled": "httpjet[a07bad660249bea3]::uring::codec::head_has_bare_lf",
+        "max_IR_block_count": 18196180
+      },
+      {
+        "family": "H1 plaintext/TLS serving",
+        "mangled": "_RNCINvNtCsdMfmKnnjkfT_7httpjet5uring17handle_h1_bridgedNtNtNtNtCsioSdtzwCyS_6monoio3net3tcp6stream9TcpStreamE0B6_",
+        "demangled": "httpjet[a07bad660249bea3]::uring::handle_h1_bridged::<monoio[374f9e7b927d8dc]::net::tcp::stream::TcpStream>::{closure#0}",
+        "max_IR_block_count": 12314400
+      },
+      {
+        "family": "H1 plaintext/TLS serving",
+        "mangled": "_RNCINvNtCsdMfmKnnjkfT_7httpjet5uring17handle_h1_bridgedINtNtCscvujLaXUkCw_13monoio_rustls6stream6StreamNtNtB4_8directio17DirectWriteSocketNtNtNtNtCsajFikgJL2xZ_6rustls6server11server_conn10connection16ServerConnectionEE0B6_",
+        "demangled": "httpjet[a07bad660249bea3]::uring::handle_h1_bridged::<monoio_rustls[91afe5bf7320a096]::stream::Stream<httpjet[a07bad660249bea3]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>>::{closure#0}",
+        "max_IR_block_count": 12310400
+      },
+      {
+        "family": "H2 serving",
+        "mangled": "_RNCINvNtCs9J2You0AkGU_5hj_h26server23serve_local_with_prefixINtNtCscvujLaXUkCw_13monoio_rustls6stream6StreamNtNtNtCsdMfmKnnjkfT_7httpjet5uring8directio17DirectWriteSocketNtNtNtNtCsajFikgJL2xZ_6rustls6server11server_conn10connection16ServerConnectionENCNCINvB1M_16serve_h2_bridgedBW_E0s_0NCNCB42_s_00E0B1O_",
+        "demangled": "hj_h2[714a9f6ab31c29d6]::server::serve_local_with_prefix::<monoio_rustls[91afe5bf7320a096]::stream::Stream<httpjet[a07bad660249bea3]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>, httpjet[a07bad660249bea3]::uring::serve_h2_bridged<monoio_rustls[91afe5bf7320a096]::stream::Stream<httpjet[a07bad660249bea3]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>>::{closure#0}::{closure#1}, httpjet[a07bad660249bea3]::uring::serve_h2_bridged<monoio_rustls[91afe5bf7320a096]::stream::Stream<httpjet[a07bad660249bea3]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>>::{closure#0}::{closure#1}::{closure#0}>::{closure#0}",
+        "max_IR_block_count": 192551
+      },
+      {
+        "family": "H2 serving",
+        "mangled": "_RNCINvNtCs9J2You0AkGU_5hj_h26server23serve_local_with_prefixNtNtNtNtCsioSdtzwCyS_6monoio3net3tcp6stream9TcpStreamNCNCINvNtCsdMfmKnnjkfT_7httpjet5uring16serve_h2_bridgedBW_E0s_0NCNCB1P_s_00E0B1W_",
+        "demangled": "hj_h2[714a9f6ab31c29d6]::server::serve_local_with_prefix::<monoio[374f9e7b927d8dc]::net::tcp::stream::TcpStream, httpjet[a07bad660249bea3]::uring::serve_h2_bridged<monoio[374f9e7b927d8dc]::net::tcp::stream::TcpStream>::{closure#0}::{closure#1}, httpjet[a07bad660249bea3]::uring::serve_h2_bridged<monoio[374f9e7b927d8dc]::net::tcp::stream::TcpStream>::{closure#0}::{closure#1}::{closure#0}>::{closure#0}",
+        "max_IR_block_count": 190593
+      },
+      {
+        "family": "H2 HPACK",
+        "mangled": "_RNvNtNtCs9J2You0AkGU_5hj_h25hpack7huffman12encode_sized",
+        "demangled": "hj_h2[714a9f6ab31c29d6]::hpack::huffman::encode_sized",
+        "max_IR_block_count": 8637422
+      },
+      {
+        "family": "H3 serving",
+        "mangled": "_RNvNtNtCsdMfmKnnjkfT_7httpjet5uring2h312service_conn",
+        "demangled": "httpjet[a07bad660249bea3]::uring::h3::service_conn",
+        "max_IR_block_count": 2647680
+      },
+      {
+        "family": "H3 QPACK",
+        "mangled": "_RNvNtNtCsdMfmKnnjkfT_7httpjet5uring2h311qpack_field",
+        "demangled": "httpjet[a07bad660249bea3]::uring::h3::qpack_field",
+        "max_IR_block_count": 2254254
+      },
+      {
+        "family": "cache",
+        "mangled": "_RNvNtCsdMfmKnnjkfT_7httpjet7lscache16stored_file_body",
+        "demangled": "httpjet[a07bad660249bea3]::lscache::stored_file_body",
+        "max_IR_block_count": 205114
+      }
+    ],
+    "counter_interpretation": "Maximum IR block count, not function call/request count. Examples demonstrate positive serving coverage, not complete branch coverage."
+  },
+  "actual_gen_use_identities": {
+    "-bin": {
+      "gen": {
+        "rustc": 11835527281324007204,
+        "features": "[\"profiling\"]",
+        "target": 6248963632557106312,
+        "profile": 6536927300735754373,
+        "path": 12872388799603138581,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-c21433951f19d614/dep-bin-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-generate=/var/tmp/httpjet-continuation/prod-c7-control-v1/pgo-v2/build-raw"
+        ]
+      },
+      "use": {
+        "rustc": 11835527281324007204,
+        "features": "[\"profiling\"]",
+        "target": 6248963632557106312,
+        "profile": 6536927300735754373,
+        "path": 12872388799603138581,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-f335a0c7496e6486/dep-bin-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-use=/var/tmp/httpjet-continuation/prod-c7-control-v1/pgo-v2/runtime.profdata",
+          "-Cllvm-args=-pgo-warn-missing-function"
+        ]
+      }
+    },
+    "-lib": {
+      "gen": {
+        "rustc": 11835527281324007204,
+        "features": "[\"profiling\"]",
+        "target": 11350266134701595711,
+        "profile": 4651311442752216146,
+        "path": 15082379935308900531,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-973bbf33aa05ad9f/dep-lib-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-generate=/var/tmp/httpjet-continuation/prod-c7-control-v1/pgo-v2/build-raw"
+        ]
+      },
+      "use": {
+        "rustc": 11835527281324007204,
+        "features": "[\"profiling\"]",
+        "target": 11350266134701595711,
+        "profile": 4651311442752216146,
+        "path": 15082379935308900531,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-925741c608f3a8af/dep-lib-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-use=/var/tmp/httpjet-continuation/prod-c7-control-v1/pgo-v2/runtime.profdata",
+          "-Cllvm-args=-pgo-warn-missing-function"
+        ]
+      }
+    },
+    "-pprof-build": {
+      "gen": {
+        "rustc": 11835527281324007204,
+        "features": "[\"_protobuf\", \"frame-pointer\", \"prost\", \"prost-build\", \"prost-codec\", \"sha2\"]",
+        "target": 5408242616063297496,
+        "profile": 17485757231948151148,
+        "path": 7684306656751116002,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/pprof-e338693e598b719f/dep-build-script-build-script-build",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-generate=/var/tmp/httpjet-continuation/prod-c7-control-v1/pgo-v2/build-raw"
+        ]
+      },
+      "use": {
+        "rustc": 11835527281324007204,
+        "features": "[\"_protobuf\", \"frame-pointer\", \"prost\", \"prost-build\", \"prost-codec\", \"sha2\"]",
+        "target": 5408242616063297496,
+        "profile": 17485757231948151148,
+        "path": 7684306656751116002,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/pprof-bd032efc85533da2/dep-build-script-build-script-build",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-use=/var/tmp/httpjet-continuation/prod-c7-control-v1/pgo-v2/runtime.profdata",
+          "-Cllvm-args=-pgo-warn-missing-function"
+        ]
+      }
+    }
+  },
+  "evidence_sources": {
+    "library_surface": {
+      "path": "/var/tmp/httpjet-prod-c7-control/crates/httpjet/src/lib.rs",
+      "sha256": "dc43abcaa9d271e7294ec4f9566cb56446193c2eef753936c5a5004e62c39402"
+    },
+    "pprof_build_script": {
+      "path": "/var/tmp/httpjet-prod-c7-control/vendor/pprof/build.rs",
+      "sha256": "d4a973f88a8edaff955a6af805bfe50ca8c822a7d349d495856451756cb78eda"
+    }
+  },
+  "conclusion": "All missing warnings map to excluded build tooling or the auxiliary fuzz-library copy, with no identified missing serving namespace. Gen/use source identity fields match; only intended PGO flags and dependency fingerprints differ. Proceed only to compatible wire qualification.",
+  "limitations": [
+    "No binary execution or runtime qualification performed during this review.",
+    "Some chunked-specific binary codec functions remain zero-count; synthetic GET/cache training does not imply full branch coverage.",
+    "This is a new historical production-source control, not exact deployed994127 provenance."
+  ]
+}
