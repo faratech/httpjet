@@ -1,6 +1,6 @@
 # Beeper research for HTTPJet
 
-Research snapshot: **30 October 2026**. Integration and benchmarking are ongoing.
+Research snapshot: **31 October 2026**. Integration and benchmarking are ongoing.
 
 This work builds on [Beeper](https://github.com/lerboe/beeper) and
 [hyper-fast-path](https://github.com/lerboe/hyper-fast-path) by
@@ -32,6 +32,10 @@ then compares the integrated build with the shipped release.
 The [matched-load H2 follow-up](h2-pgo-rate-2026-10-31.md) measures CPU and latency
 at 15,000 requests/s on the same PGO build, with kernel serving off and on.
 
+The [H2 ownership and pin-limit checkpoint](h2-quiescent-owner-2026-10-31.md)
+records the next source fixes and their controlled non-PGO experiment. Fresh
+PGO qualification and comparison remain pending.
+
 ## Findings so far
 
 - **The PGO release matrix improves every tested throughput median.** All 48
@@ -42,7 +46,7 @@ at 15,000 requests/s on the same PGO build, with kernel serving off and on.
   runtime/build effects, with all caches enabled; kernel work outside the process
   is not included in the process CPU result. The matched-load H2 follow-up is
   separate from this capacity matrix.
-- **Native PGO H2 is the lower-CPU choice at the tested lower load.** At 15,000
+- **The earlier PGO build favored native H2 at the tested lower load.** At 15,000
   requests/s with 1 KiB bodies, native process CPU is 19.9% below the release for
   static content and 43.6% below it for page-cache hits. Kernel H2 instead costs
   52.6–56.3% more process CPU than native PGO H2 and has higher service p99.

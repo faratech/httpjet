@@ -1,0 +1,1060 @@
+{
+  "status": "passed",
+  "completed_arms": 24,
+  "measured_responses": 4800000,
+  "warmup_responses": 240000,
+  "scope": {
+    "purpose": "matched non-PGO helper recipe comparison, ONLYH2pinlimit differs; not final native-PGO goal qualification",
+    "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+    "helpers": {
+      "pin64": [
+        "/var/tmp/httpjet-continuation/h2-gate-pins-v1/bin/httpjet-beeper-h1",
+        "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223"
+      ],
+      "pin8192": [
+        "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/bin/httpjet-beeper-h1",
+        "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89"
+      ]
+    },
+    "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda"
+  },
+  "medians": {
+    "static": {
+      "pin64": {
+        "cpu_us_per_response": 4.023809523809524,
+        "rps": 175975.1577196331,
+        "p99_us": 4959.0,
+        "user_instructions_per_response": 8196.538421428571,
+        "user_cycles_per_response": 8633.898238095237,
+        "kernel_fraction": 0.9597714285714285
+      },
+      "pin8192": {
+        "cpu_us_per_response": 3.5,
+        "rps": 174389.35473537986,
+        "p99_us": 4079.3,
+        "user_instructions_per_response": 6818.365464285715,
+        "user_cycles_per_response": 6360.1997190476195,
+        "kernel_fraction": 0.9975714285714286
+      }
+    },
+    "pagecache": {
+      "pin64": {
+        "cpu_us_per_response": 4.571428571428571,
+        "rps": 154325.24010525524,
+        "p99_us": 5563.4,
+        "user_instructions_per_response": 8291.779223809524,
+        "user_cycles_per_response": 9119.77069047619,
+        "kernel_fraction": 0.9596833333333333
+      },
+      "pin8192": {
+        "cpu_us_per_response": 3.666666666666667,
+        "rps": 164774.1477418425,
+        "p99_us": 4321.85,
+        "user_instructions_per_response": 7075.884516666667,
+        "user_cycles_per_response": 6703.575992857142,
+        "kernel_fraction": 0.9914571428571428
+      }
+    }
+  },
+  "cycles": {
+    "static": [
+      {
+        "cycle": 1,
+        "percent_change": {
+          "cpu_us_per_response": -29.842931937172768,
+          "rps": 9.80231108637797,
+          "p99_us": -23.237270502973207
+        }
+      },
+      {
+        "cycle": 2,
+        "percent_change": {
+          "cpu_us_per_response": -16.47727272727273,
+          "rps": 3.0973317830291336,
+          "p99_us": -19.37743162976744
+        }
+      },
+      {
+        "cycle": 3,
+        "percent_change": {
+          "cpu_us_per_response": -6.0975609756097615,
+          "rps": -12.101281532575726,
+          "p99_us": -13.748128704140427
+        }
+      }
+    ],
+    "pagecache": [
+      {
+        "cycle": 1,
+        "percent_change": {
+          "cpu_us_per_response": -26.923076923076927,
+          "rps": 7.970402768093576,
+          "p99_us": -22.244257284179227
+        }
+      },
+      {
+        "cycle": 2,
+        "percent_change": {
+          "cpu_us_per_response": -37.34939759036144,
+          "rps": 23.722154816081353,
+          "p99_us": -45.61041978781301
+        }
+      },
+      {
+        "cycle": 3,
+        "percent_change": {
+          "cpu_us_per_response": -18.085106382978722,
+          "rps": 6.7707055757442625,
+          "p99_us": -19.385766113613666
+        }
+      }
+    ]
+  },
+  "rows": [
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 1,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-1-pin64/result.json",
+      "source_sha256": "36a99f6abbae22b6cc9ad7a934e65454e9f71c3ee7273a17fee33f635019228f",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.0,
+      "rps": 183660.88318239426,
+      "p99_us": 5001.0,
+      "user_instructions_per_response": 8280.054976190477,
+      "user_cycles_per_response": 8698.323066666666,
+      "kernel_fraction": 0.9570571428571428,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 1.0,
+        "38": 1723.0,
+        "39": 0
+      },
+      "pid": 83296,
+      "server_tree": [
+        83296,
+        83318
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 2,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-2-pin8192/result.json",
+      "source_sha256": "75d26b945b39eb3657d6d5ec48c942ef67e41d667b797c25eafa5647b946c9b6",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 2.857142857142857,
+      "rps": 197804.83904021888,
+      "p99_us": 3726.8,
+      "user_instructions_per_response": 6778.628823809524,
+      "user_cycles_per_response": 5714.656680952381,
+      "kernel_fraction": 0.9979904761904762,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 6.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 83355,
+      "server_tree": [
+        83355,
+        83357
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 3,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-3-pin8192/result.json",
+      "source_sha256": "56d6e26d6debf7d35feaf9d2cc835378e5352c30f4d81c4741c647d517fcd9c7",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.5238095238095237,
+      "rps": 165220.6552168411,
+      "p99_us": 4411.2,
+      "user_instructions_per_response": 6852.82000952381,
+      "user_cycles_per_response": 6480.083233333334,
+      "kernel_fraction": 0.9966714285714285,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 4.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 83399,
+      "server_tree": [
+        83399,
+        83400
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 1,
+      "position": 4,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-4-pin64/result.json",
+      "source_sha256": "93088ab8443b7d511f8cdc76cf9d6145ba8ffcfb8ce4693ba95f5e9049d297f9",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 5.095238095238094,
+      "rps": 146956.46964497876,
+      "p99_us": 5600.499,
+      "user_instructions_per_response": 8080.2994761904765,
+      "user_cycles_per_response": 9455.003347619047,
+      "kernel_fraction": 0.9631047619047619,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 3.0,
+        "38": 1529.0,
+        "39": 0
+      },
+      "pid": 83462,
+      "server_tree": [
+        83462,
+        83463
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 1,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-1-pin64/result.json",
+      "source_sha256": "5d30c113c660b9fa479e389415f57175b59ec124f4368bdbfc03a80a1c962a13",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.952380952380953,
+      "rps": 178799.13549652472,
+      "p99_us": 4844.8,
+      "user_instructions_per_response": 8248.544461904761,
+      "user_cycles_per_response": 8569.47340952381,
+      "kernel_fraction": 0.9579190476190477,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 3.0,
+        "38": 1743.0,
+        "39": 0
+      },
+      "pid": 83522,
+      "server_tree": [
+        83522,
+        83620
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 2,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-2-pin8192/result.json",
+      "source_sha256": "cf477805124093097d24e3928e2772a861021b00915ac5f98248a38c4d6d6e03",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.4761904761904763,
+      "rps": 173143.08940886994,
+      "p99_us": 4062.8,
+      "user_instructions_per_response": 6818.410728571429,
+      "user_cycles_per_response": 6269.098352380953,
+      "kernel_fraction": 0.9974095238095239,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 5.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 83677,
+      "server_tree": [
+        83677,
+        83678
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 3,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-3-pin8192/result.json",
+      "source_sha256": "628ee5816b8fa72a641a627eb9a9975a84d28e71820b621772c9aa215401ec0b",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.5238095238095237,
+      "rps": 175635.62006188981,
+      "p99_us": 4095.8,
+      "user_instructions_per_response": 6821.683138095238,
+      "user_cycles_per_response": 6450.00160952381,
+      "kernel_fraction": 0.9972904761904762,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 7.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 83789,
+      "server_tree": [
+        83789,
+        83790
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 2,
+      "position": 4,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-4-pin64/result.json",
+      "source_sha256": "afd3660da74cf934822f5ee10b6a1ebc9485e606434242883562699e895294ff",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.428571428571428,
+      "rps": 159501.2874521245,
+      "p99_us": 5274.699,
+      "user_instructions_per_response": 8223.177885714285,
+      "user_cycles_per_response": 9065.48421904762,
+      "kernel_fraction": 0.9590904761904762,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 3.0,
+        "38": 1717.0,
+        "39": 0
+      },
+      "pid": 83852,
+      "server_tree": [
+        83852,
+        83853
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 1,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-1-pin64/result.json",
+      "source_sha256": "ab8a9c5feff32565340cdec58832df351e046a8b915f6ae2d6682aa04784b335",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.047619047619048,
+      "rps": 173151.1799427415,
+      "p99_us": 4917.0,
+      "user_instructions_per_response": 8169.898957142857,
+      "user_cycles_per_response": 8470.070152380953,
+      "kernel_fraction": 0.960452380952381,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 2.0,
+        "38": 1757.0,
+        "39": 0
+      },
+      "pid": 83916,
+      "server_tree": [
+        83916,
+        83917
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 2,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-2-pin8192/result.json",
+      "source_sha256": "e4405e2e46a0b9c0495f03e1ac8fb72f20b7922a5c96fbee62050a38dfcb2d5a",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.3333333333333335,
+      "rps": 176281.19136036467,
+      "p99_us": 3922.7999999999997,
+      "user_instructions_per_response": 6801.378276190476,
+      "user_cycles_per_response": 6270.397828571428,
+      "kernel_fraction": 0.9977333333333334,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 4.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 83977,
+      "server_tree": [
+        83977,
+        83978
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 3,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-3-pin8192/result.json",
+      "source_sha256": "0cadf3c2443536e8e6f5a1bf703b37f4c4e6e3071704d7dcbfbf9b51fe474b9e",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.0,
+      "rps": 151313.60786494604,
+      "p99_us": 4489.0,
+      "user_instructions_per_response": 6818.3202,
+      "user_cycles_per_response": 6715.0867761904765,
+      "kernel_fraction": 0.9978523809523809,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 5.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 84036,
+      "server_tree": [
+        84036,
+        84037
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "static",
+      "cycle": 3,
+      "position": 4,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-4-pin64/result.json",
+      "source_sha256": "7a8369458443630e29b7e2536c2f4128614f4c1f195870ecd6795e93ff587d58",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.761904761904762,
+      "rps": 199544.58279095413,
+      "p99_us": 4835.599999999999,
+      "user_instructions_per_response": 8023.863795238095,
+      "user_cycles_per_response": 7877.230561904762,
+      "kernel_fraction": 0.9634,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 0,
+        "12": 5.0,
+        "38": 1583.0,
+        "39": 0
+      },
+      "pid": 84146,
+      "server_tree": [
+        84146,
+        84148
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 1,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-1-pin64/result.json",
+      "source_sha256": "cffca08e9e54ded7468d9e2f287187505bc6f8c1c8b74acfc564ac0a28a2c9e9",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.428571428571429,
+      "rps": 161195.50595408282,
+      "p99_us": 5253.0,
+      "user_instructions_per_response": 8420.742142857143,
+      "user_cycles_per_response": 9205.120861904761,
+      "kernel_fraction": 0.9557619047619048,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 113.0,
+        "12": 4.0,
+        "38": 1636.0,
+        "39": 0
+      },
+      "pid": 84188,
+      "server_tree": [
+        84188,
+        84208
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 2,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-2-pin8192/result.json",
+      "source_sha256": "62b2900dcf06954483dc03e536ed40edee646ff400fcc0d48c010d6dc23016ee",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.380952380952381,
+      "rps": 172608.20335969422,
+      "p99_us": 4134.2,
+      "user_instructions_per_response": 7068.885547619047,
+      "user_cycles_per_response": 6595.460890476191,
+      "kernel_fraction": 0.9913857142857143,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 127.0,
+        "12": 2.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 84247,
+      "server_tree": [
+        84247,
+        84248
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 3,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-3-pin8192/result.json",
+      "source_sha256": "c76c39d1677e52d029d178572f993a924634bd71f24e937216318b9567879846",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.857142857142857,
+      "rps": 144958.82097151532,
+      "p99_us": 4802.5,
+      "user_instructions_per_response": 7075.709090476191,
+      "user_cycles_per_response": 7129.2637428571425,
+      "kernel_fraction": 0.9922238095238095,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 112.0,
+        "12": 4.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 84291,
+      "server_tree": [
+        84291,
+        84311
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 1,
+      "position": 4,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-4-pin64/result.json",
+      "source_sha256": "67fd51d14ac3703cd7181f43a1fa29897e6847d341c0200341ac5651e976230c",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 5.476190476190476,
+      "rps": 132928.6393575748,
+      "p99_us": 6240.299,
+      "user_instructions_per_response": 8293.717661904762,
+      "user_cycles_per_response": 10272.722152380953,
+      "kernel_fraction": 0.9599047619047619,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 90.0,
+        "12": 4.0,
+        "38": 1524.0,
+        "39": 0
+      },
+      "pid": 84350,
+      "server_tree": [
+        84350,
+        84371
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 1,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-1-pin64/result.json",
+      "source_sha256": "34f946c451a78c534708a7cbd8df062ec77efb875819e1f6f90d3efe26f02e42",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 7.333333333333333,
+      "rps": 102068.91386755527,
+      "p99_us": 10636.7,
+      "user_instructions_per_response": 8333.511876190476,
+      "user_cycles_per_response": 10387.825433333333,
+      "kernel_fraction": 0.9586857142857143,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 116.0,
+        "12": 7.0,
+        "38": 1448.0,
+        "39": 0
+      },
+      "pid": 84458,
+      "server_tree": [
+        84458,
+        84479
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 2,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-2-pin8192/result.json",
+      "source_sha256": "8ecd0af061faa1ca65efc72be615bbec5cbdd9cc150ea171d13f7e9afa8461df",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.142857142857143,
+      "rps": 145585.69285837043,
+      "p99_us": 4852.0,
+      "user_instructions_per_response": 7228.947485714286,
+      "user_cycles_per_response": 7344.775352380952,
+      "kernel_fraction": 0.9877904761904762,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 104.0,
+        "12": 4.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 84557,
+      "server_tree": [
+        84557,
+        84558
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 3,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-3-pin8192/result.json",
+      "source_sha256": "353777294f86370a317dfa971d4748ba18f00a1031f7ace8ef01906bb8492c9e",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.2857142857142856,
+      "rps": 173185.9231329694,
+      "p99_us": 4042.6000000000004,
+      "user_instructions_per_response": 7101.050080952381,
+      "user_cycles_per_response": 6437.994876190476,
+      "kernel_fraction": 0.9904190476190476,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 127.0,
+        "12": 4.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 84619,
+      "server_tree": [
+        84619,
+        84620
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 2,
+      "position": 4,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-4-pin64/result.json",
+      "source_sha256": "e2f06b9ddb37606d5de4cdbe8612058c3fc1d7e275326411c9a75700fd4ce7f0",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.523809523809524,
+      "rps": 155582.28568131162,
+      "p99_us": 5716.8,
+      "user_instructions_per_response": 8289.840785714287,
+      "user_cycles_per_response": 8994.09770952381,
+      "kernel_fraction": 0.9594619047619047,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 127.0,
+        "12": 6.0,
+        "38": 1546.0,
+        "39": 0
+      },
+      "pid": 84685,
+      "server_tree": [
+        84685,
+        84686
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 1,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-1-pin64/result.json",
+      "source_sha256": "0f054a5f48a2bf396229470fa854384e43bbe84a800ea9ee0fba7aa0818f0b82",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.333333333333333,
+      "rps": 155259.57840762846,
+      "p99_us": 5312.3,
+      "user_instructions_per_response": 8181.347333333333,
+      "user_cycles_per_response": 9034.420519047619,
+      "kernel_fraction": 0.9626095238095238,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 82.0,
+        "12": 3.0,
+        "38": 1515.0,
+        "39": 0
+      },
+      "pid": 84727,
+      "server_tree": [
+        84727,
+        84748
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 2,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-2-pin8192/result.json",
+      "source_sha256": "57e4381ecf4f1ef54f9df38d835d459a669279843b96def2bf8851f429e54da1",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.7142857142857144,
+      "rps": 167737.30663762227,
+      "p99_us": 4364.0,
+      "user_instructions_per_response": 7076.059942857143,
+      "user_cycles_per_response": 6701.162866666667,
+      "kernel_fraction": 0.9915285714285714,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 107.0,
+        "12": 2.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 84836,
+      "server_tree": [
+        84836,
+        84857
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 3,
+      "role": "pin8192",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-3-pin8192/result.json",
+      "source_sha256": "18fc44c8b51660cd153cfd9b5679fe864452e96540233c851284ad98ed3edc0a",
+      "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 3.619047619047619,
+      "rps": 161810.9888460627,
+      "p99_us": 4279.7,
+      "user_instructions_per_response": 7024.319547619048,
+      "user_cycles_per_response": 6705.989119047619,
+      "kernel_fraction": 0.9925238095238095,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 108.0,
+        "12": 3.0,
+        "38": 0,
+        "39": 0
+      },
+      "pid": 84917,
+      "server_tree": [
+        84917,
+        84918
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    },
+    {
+      "case": "pagecache",
+      "cycle": 3,
+      "position": 4,
+      "role": "pin64",
+      "source": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-4-pin64/result.json",
+      "source_sha256": "6f48bda0875dacab71f7a00e05cf365a65cf1ffb10e6268050e7f47f5cf08069",
+      "helper_sha256": "711e9b2573d7aac4151b51367ad260fb70035753f49e424e4ce2d9b001fde223",
+      "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+      "cpu_us_per_response": 4.619047619047619,
+      "rps": 153390.90180288203,
+      "p99_us": 5410.0,
+      "user_instructions_per_response": 8215.826961904762,
+      "user_cycles_per_response": 8968.488966666666,
+      "kernel_fraction": 0.9616142857142858,
+      "denials": {
+        "1": 32.0,
+        "5": 0,
+        "7": 0,
+        "8": 94.0,
+        "12": 0,
+        "38": 1472.0,
+        "39": 0
+      },
+      "pid": 84979,
+      "server_tree": [
+        84979,
+        84980
+      ],
+      "pmu_running_fraction": 1.0,
+      "body_verified_bytes": 204800000
+    }
+  ],
+  "source_hashes": {
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-1-pin64": {
+      "result.json": "36a99f6abbae22b6cc9ad7a934e65454e9f71c3ee7273a17fee33f635019228f",
+      "client.json": "8c54544769bbc4fb60f9be5f23d5f3d91d728d6b185c27f0fac82b211316824e",
+      "server-exit.json": "8b697b02e64b9e28d4b62457a7e271f47afaa565a17c267bf3bbfebda793e3f1",
+      "server-command.json": "403bc4414e6ec8cdf253954a19a8f3cd29e935191fb4abbe6da2975eceac4eba",
+      "client-command.json": "25e738defe2d362581e23853d44630c12e774ea5600e21eb64dc78246695f78b"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-2-pin8192": {
+      "result.json": "75d26b945b39eb3657d6d5ec48c942ef67e41d667b797c25eafa5647b946c9b6",
+      "client.json": "6086ebca9c5a341e4aa3bdf9f09cb61323aed53322282bd350861df651296ace",
+      "server-exit.json": "035b81f92cb91d736125d0275e33a6d004a7ea1f9aa70bdf28c030296e071884",
+      "server-command.json": "dd75425ac3320d67c1a3d2a7322c8a1f7b740448bd440a09552d15cb07749927",
+      "client-command.json": "edb1d07b504a642ca20572c90488a791ef3686e9af27fc20738dc34ffb27067b"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-3-pin8192": {
+      "result.json": "56d6e26d6debf7d35feaf9d2cc835378e5352c30f4d81c4741c647d517fcd9c7",
+      "client.json": "ab6bbae9447422b4d85f07c95de352081bb043fd17e60ed46ac3f050626a9226",
+      "server-exit.json": "2b41b28cdcd6c6dbd13e4be8ed57d01cfff7162ebd4122e824d3b09b7529da24",
+      "server-command.json": "ca476dc68b09134e0c2cf78248b2da0a78c5eccb9141331e48042a3dd26e55fd",
+      "client-command.json": "485de4e3aa2ab392fd00a6d2a89f71fd525d219bd3e2f67e9188d7b455f81af8"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-1-4-pin64": {
+      "result.json": "93088ab8443b7d511f8cdc76cf9d6145ba8ffcfb8ce4693ba95f5e9049d297f9",
+      "client.json": "36eeadb8968a3403c93b1d3487a84ec0aa10f22ea1ed025f5917d999c23e4b0e",
+      "server-exit.json": "661a9e7e53ab2005f62bd3cb5927aa1c35944a0aba2acf9c5a1e17d5c31be4e4",
+      "server-command.json": "24ddaaf04812b83c24d9c1f2acaa47e2d9a7a090ef418fc7de03559467acd414",
+      "client-command.json": "53055fd842023c50b7730f2010b879f8a4ff19e237c81af916a3b2dabcfe51d8"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-1-pin64": {
+      "result.json": "5d30c113c660b9fa479e389415f57175b59ec124f4368bdbfc03a80a1c962a13",
+      "client.json": "5db29d85e22481e5ffb9efe60b1110f4085920e8a8ed96b68c1294cd47616acd",
+      "server-exit.json": "48eba8766b50552c8434dd69857f317b178608aaade4cbd4c3f92b4c9dd2b7e8",
+      "server-command.json": "0766e475ffedaa282663ef9a726a7225964a0689f5d38fffc772ba8e6d07a03e",
+      "client-command.json": "2dd3dc0833ddbbfe16f813834cd85f1b719d36054d4cca63810485d69affd862"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-2-pin8192": {
+      "result.json": "cf477805124093097d24e3928e2772a861021b00915ac5f98248a38c4d6d6e03",
+      "client.json": "47f4da1c4b8ae46b343e94708173657897d592b450dd4925617c9dd659fbe968",
+      "server-exit.json": "3ccb1efaf3e3bb5462fd93811eeaf180c701369038848ffd3b16bddd498b6cb6",
+      "server-command.json": "3806654a6b8bbe0fb91f143a82692a4081b88fd42826826ecd58b1299b322820",
+      "client-command.json": "1a95353ea88d919ed1b2aa8ae940b769b552ffbde190ba6424f8a21cba42fac1"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-3-pin8192": {
+      "result.json": "628ee5816b8fa72a641a627eb9a9975a84d28e71820b621772c9aa215401ec0b",
+      "client.json": "f7f805b8ebd90a69ab137adb2c914aa7d49afc29c4886eb1e1c95b88dc93397c",
+      "server-exit.json": "e1dd63115734d7ddf63089fdf7bb6d2fb8a57285d331d37994c22f806690ee24",
+      "server-command.json": "d780f14b84851261fda0c922b61991f943249f47b84afeba9c2c7ed6a68fe2dd",
+      "client-command.json": "fe1c1b7aeff8639db92a6e038ca1517b2f473c4f4221e27def49e25ef13d013d"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-2-4-pin64": {
+      "result.json": "afd3660da74cf934822f5ee10b6a1ebc9485e606434242883562699e895294ff",
+      "client.json": "036bba59d1a1cd2b96197d818444792fe4d7beb194888b1b0becdb3ba6febbcf",
+      "server-exit.json": "ca11e30d85ae7a28614f5c349f8887fef1edeefc8e3c21375e828fe021667e4a",
+      "server-command.json": "a5911bedb82c43064ceab3689cf13b102f2737c4be1f3a63c816d719a8f4c7af",
+      "client-command.json": "372616598222e1b0631ccc687c74636b57831fd440e105bd8a3e90572a9aca0f"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-1-pin64": {
+      "result.json": "ab8a9c5feff32565340cdec58832df351e046a8b915f6ae2d6682aa04784b335",
+      "client.json": "a02c61f255ca7a4674bf9c0c5830afc30160344c3973d19b55a1b906d95edb7c",
+      "server-exit.json": "f97904d032aa2a0f8c22169e2152a019d907df87718d3bbc23836b0cc54f90a1",
+      "server-command.json": "c102825fa7942a933504367b0803971dacd35b1ffcffb6bac24fa4068db75958",
+      "client-command.json": "2cc91d353118504e83d0bd684460f9ee64967f9714811893ca9d480525abd09d"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-2-pin8192": {
+      "result.json": "e4405e2e46a0b9c0495f03e1ac8fb72f20b7922a5c96fbee62050a38dfcb2d5a",
+      "client.json": "61ee5173211d2c3999b6313cab9b611b864bfae79d7dc384eceba2348558d577",
+      "server-exit.json": "c54652a0d6e33371d3bf9d54eff5a7ce34bb47041b0266b3ae2037281d89e53c",
+      "server-command.json": "ce1626b825359794efd9f395d905fd9e497f2b54c07b971314f978851c60b833",
+      "client-command.json": "1b958d07b5a49ab8425812134bf2070a11371093effbaf2a6081ab5803cae4af"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-3-pin8192": {
+      "result.json": "0cadf3c2443536e8e6f5a1bf703b37f4c4e6e3071704d7dcbfbf9b51fe474b9e",
+      "client.json": "00b3a4c391f8cdaca2de6d561bf86f5371177284fc01ca5a75a33240c7371b63",
+      "server-exit.json": "15cac16a9efc6daeb42a3536f12a2fb95e562e66189b0cba1fb31e1863009fa0",
+      "server-command.json": "b385a3d8a32bd207bccd0d19bb4c12a5bfd24fc31172ea450589e265793123c6",
+      "client-command.json": "e5b4456ec29b6823e8f69bcf8b705f6db9cec5270bf1296493b32f321eedb063"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-static-3-4-pin64": {
+      "result.json": "7a8369458443630e29b7e2536c2f4128614f4c1f195870ecd6795e93ff587d58",
+      "client.json": "466196911c1b26e970981f85a6237836d85d227abaa80db12f91a12959265b8d",
+      "server-exit.json": "7023406ce05c62b628a3ed2156e8ce18ac8a313d61d03d23983d46da5aabed2d",
+      "server-command.json": "636dfe574eb27b0983ea73d0b60a3524a7c0cc2db826539b52a908c485c89c55",
+      "client-command.json": "3d62769bc98686d2f14df6b47dc451fa3f242e0e02f641b3ebfb95d2a76e53c4"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-1-pin64": {
+      "result.json": "cffca08e9e54ded7468d9e2f287187505bc6f8c1c8b74acfc564ac0a28a2c9e9",
+      "client.json": "abb49a7df6a44590e90157adf1d9f3f5d95c6de27f0203c7ec429a748bf5348f",
+      "server-exit.json": "9a1ae602e35f985b0628d5d9209eb38a807ae099f4f3b2bd0299eed2bc9669ff",
+      "server-command.json": "100f061e4bdd9af07f0ec50e17ad76f6b60dc0afa3738552c391b40215610580",
+      "client-command.json": "690038bee1ec3fa4ce0ef59eb130ea8f67f963e490e41ca9e1a8c97b039ffb58"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-2-pin8192": {
+      "result.json": "62b2900dcf06954483dc03e536ed40edee646ff400fcc0d48c010d6dc23016ee",
+      "client.json": "34c5a4cac0e6d0608796c853ffc9c7e913328c09e22db8aa56a04dfe7cff1269",
+      "server-exit.json": "6d73ca48471c1ad2b0ad6ce335964f36e9a5de86b1625488a243999a5380c7c1",
+      "server-command.json": "abb273d0c72927b06ceab07447621f7e5d39028f307a9a41b0b55d1ec8af6220",
+      "client-command.json": "438b24682d8ceb176c241b7a1ae8559b2f0d22a5d0a5cdb333a43a1556a9bc9f"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-3-pin8192": {
+      "result.json": "c76c39d1677e52d029d178572f993a924634bd71f24e937216318b9567879846",
+      "client.json": "b2e209672de90b9029928a577f5515a4c7644e4771bfcf0d1965e29ecd882138",
+      "server-exit.json": "82d4691cc79b447d1ce92a619351550a2f680831493bea72e4b2fbb769b4849e",
+      "server-command.json": "54e738243383d8ba8ce61bee41c1fede63aa56fb1415344b0802ed283206b652",
+      "client-command.json": "886009e6d76e7023d5add358468d5b83a16cce00fa7ecb91f19b413c699a18df"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-1-4-pin64": {
+      "result.json": "67fd51d14ac3703cd7181f43a1fa29897e6847d341c0200341ac5651e976230c",
+      "client.json": "9b7fd599fd06c3a18f4dc11a46b5d0ea95142ae4d5cbcddef11ad2099abd30c0",
+      "server-exit.json": "0e10073ac3e6c8baf9f1a28f4cb7486cc3e4f79c8c1eaf8d18cfa628fcfb499d",
+      "server-command.json": "23055eb9685e66bba7faaa87760a91e21807908de5d23f4c82abe89b730f7299",
+      "client-command.json": "d85c7d3ba3c739b6c09aeb8d7d46a26643ae58b2026edb0d107258d6f15be545"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-1-pin64": {
+      "result.json": "34f946c451a78c534708a7cbd8df062ec77efb875819e1f6f90d3efe26f02e42",
+      "client.json": "5b1fd140091aa617b27dade1622b84b081314141d8e5175b7b9888f6c3043704",
+      "server-exit.json": "68741098491690e3b1a518c76f4b39a2c186661a50692137e44715ea42ca65bd",
+      "server-command.json": "3f072f680a16b72a4d1a53d16943d1cee98979a55b00ef9bf6ec2397228fd74c",
+      "client-command.json": "40b5e59e91267f5ae7575e62a26a0caad82dce276c3078212a9e6c3ccc93a722"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-2-pin8192": {
+      "result.json": "8ecd0af061faa1ca65efc72be615bbec5cbdd9cc150ea171d13f7e9afa8461df",
+      "client.json": "bc43df4a37dffa6eebfe1d331b101931520b6d0bf72f22ebc2b86883cc833010",
+      "server-exit.json": "2b64ad7ad3cef6792fbcb68b66dab2c403498b5f6b37162383ab54b69a040ad0",
+      "server-command.json": "65e21a43a9656db8591ee56af4b18852282a4b73cec8ed939ddab1746cc96a3a",
+      "client-command.json": "7594e1dd98b7ec988147ba22e45e73c948763fa8f56509b05a347d2b1c99fabd"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-3-pin8192": {
+      "result.json": "353777294f86370a317dfa971d4748ba18f00a1031f7ace8ef01906bb8492c9e",
+      "client.json": "dc45918135f716527bb4378bacc562c7a2fb3a8471ebc3e5482c8447a8498faa",
+      "server-exit.json": "91159ba4f42af2343171898c720a08333325ca623cd9d9776dd36b0c39ece30f",
+      "server-command.json": "ec1307371d67a83564b96f236c25a52e7d60c1cadd00ea2febfee63499b01f42",
+      "client-command.json": "f415f7e6085a1633fcdee0139ede5aca1b0aff4d0bb55dde2c42794a3bf79995"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-2-4-pin64": {
+      "result.json": "e2f06b9ddb37606d5de4cdbe8612058c3fc1d7e275326411c9a75700fd4ce7f0",
+      "client.json": "db6a4cc5448fed0d8de6c97393d53cb03b15e4b49735a1e1869596a399d7356a",
+      "server-exit.json": "28f21744b40f19eaacd87bf231104445151939b23532bcb313bbbd1ac4a5d0b8",
+      "server-command.json": "6c79c1811b1fbf14a4d55f7a29e9f5501301e8a9218f0c9b921812f1fd5fe3fd",
+      "client-command.json": "dea9605fa4bc95a8c17e1fca6d19f1a8c6efaf4dc700b5e7dc2ce0ad8ca3605d"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-1-pin64": {
+      "result.json": "0f054a5f48a2bf396229470fa854384e43bbe84a800ea9ee0fba7aa0818f0b82",
+      "client.json": "8ee886012db7986b69e761e0f469cdd0f8b774059394a8a6f0b7a4caa5c520f3",
+      "server-exit.json": "47b103dc60d1c714d5122e11182734ae37ea3501b62f599aaafeb14a4a04520a",
+      "server-command.json": "5529a9c5eae86a00b1b257b304a81cb7176f81dd75e1aa5dd28135c578f71392",
+      "client-command.json": "ef5c627b7ca4d85c56343aa5c7dcc65ac131f53c16ddeeb7427273eb5fc756fb"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-2-pin8192": {
+      "result.json": "57e4381ecf4f1ef54f9df38d835d459a669279843b96def2bf8851f429e54da1",
+      "client.json": "fbfe798601a85d4216d6a39b14c85ca6e55b30703867ad500711e84f3bdc5a3d",
+      "server-exit.json": "29ac9c5ca26a8e526f1efa1fe658b348d264ecef13b6e0b7ecea30c5424d5b63",
+      "server-command.json": "735dc4b9a47b729d7429f0651d40cc3a474e62f9649ad7b370700309786b3f48",
+      "client-command.json": "308b34d98e1b0b2cdf9d5638ad6c89b61238428106a76da5d06e7d86daecb497"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-3-pin8192": {
+      "result.json": "18fc44c8b51660cd153cfd9b5679fe864452e96540233c851284ad98ed3edc0a",
+      "client.json": "7e31f6e25cfc9cae117d1076630d687abacac0de462a8406276ff91c18da9882",
+      "server-exit.json": "4998b1f41f534b84d1670f6bcc56ca3c0a43a6b80db4e10bc10c3912822923a0",
+      "server-command.json": "54811b23ffb2a93fa4c8ffb52b8559d01eab5c869600a37124a90b0bfb17d29f",
+      "client-command.json": "4cde3e43ec1e60fe0f34121e570abfbded06c46a21fe4e013ee10f3a7d0aba04"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/h2c-pagecache-3-4-pin64": {
+      "result.json": "6f48bda0875dacab71f7a00e05cf365a65cf1ffb10e6268050e7f47f5cf08069",
+      "client.json": "233d8065b0be3d16c3fe7de6d5f4376a09b717b9907d95077d55b36be1c46c3c",
+      "server-exit.json": "d0fcca50bfd5947472cceccdee41b22ced2534b87e94f005a8c3d87f077a37dc",
+      "server-command.json": "3d488e1063aa7bc9460a16492ca2631c161dca0e29f456b399e58c767d06d8c7",
+      "client-command.json": "b041cabf0c4592c24ec266ae6a8974f93a2367196f78b895a1d12ab4416fe8d8"
+    },
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/metadata.json": "78cbce6778dd976aaacdd5e95915c62bb5f1599907d5421b2dc22c4f96387893",
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1/results.json": "7d6ec0aa5ba8e4fd7b62e159c60b645723122749b3cfd4e6d17a22d5917b9767",
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-scope.json": "0899e4e9bf3fa3853cc2935d193b251f3f2b613497fe1e1e1aa77e83b9851247",
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-arms.json": "f23ebd3ad4c4ad41fd63ed8dff76dece93a8b85709492d0011b94e8aa46c9419",
+    "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/pin-limit-capacity-v1-monitor/environment.jsonl": "114f6a939fe38aa3d1d619dafa764485af51bfcc67742280e2dbdd2ca91f4177"
+  },
+  "body_and_status_verified_for_every_arm": true,
+  "process_and_pmu_provenance": "stable initial launcher+web PID/TID trees; command/binary hashes checked; user-only PMU; processCPUuser+system wholeclientspan denominator210000; external kernel/IRQ work excluded"
+}
