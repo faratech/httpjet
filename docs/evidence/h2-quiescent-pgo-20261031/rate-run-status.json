@@ -1,0 +1,7 @@
+{
+  "command_exit": 0,
+  "interrupted": null,
+  "final_integrity_error": null,
+  "same_inputs_and_boot": true,
+  "scope": "execution/integrity only; summarizer independently validates every planned arm"
+}

@@ -33,11 +33,20 @@ The [matched-load H2 follow-up](h2-pgo-rate-2026-10-31.md) measures CPU and late
 at 15,000 requests/s on the same PGO build, with kernel serving off and on.
 
 The [H2 ownership and pin-limit checkpoint](h2-quiescent-owner-2026-10-31.md)
-records the next source fixes and their controlled non-PGO experiment. Fresh
-PGO qualification and comparison remain pending.
+records the source fixes and their controlled non-PGO experiment. The
+[fresh PGO follow-up](h2-quiescent-pgo-2026-10-31.md) now qualifies the combined
+implementation: server/helper CPU and p99 improve, while lower-load whole-VM
+CPU remains higher. Optimization continues.
 
 ## Findings so far
 
+- **Quiescent H2 ownership fixes the tested process-CPU and tail regressions.**
+  The fresh PGO study validates 120 arms and 17.28 million measured responses.
+  Against the same binary in native mode, capacity rises 77–89% and p99 falls
+  22–25%; at 15,000 requests/s process CPU falls about 59%. Whole-VM CPU at
+  that lower load instead rises 2.2% for static and 17.3% for page-cache
+  traffic, so an overall CPU win remains unproven. The source fixes are
+  committed; further kernel parsing work remains experimental.
 - **The PGO release matrix improves every tested throughput median.** All 48
   million measured responses validated across 20 cells. Relative to the exact
   shipped v0.1.10-11, throughput medians rose 5.6–231.1% and process CPU per
@@ -97,7 +106,7 @@ integration contracts and remaining work.
 | Area | Evidence and remaining work |
 |---|---|
 | H1 | Experimental plaintext kernel cache serving, raw User-Agent identity, ordered fallback and safe late enrollment have live correctness evidence. HTTPS retains native TLS. Candidate C's full comparison is published; static-file weaknesses remain. |
-| H2 | Experimental plaintext kernel serving has live HPACK, flow-control, expiry recovery and native-handoff evidence. Known oversized bodies avoid publication work. Full comparisons and the low-load CPU/latency cost are published; unsupported input and HTTPS retain native ownership. |
+| H2 | Plaintext kernel serving has HPACK, flow-control, expiry, ownership and lifecycle evidence. Quiescent receive ownership and multiplexed pin bounds lower process CPU and p99 in the fresh PGO study; lower-load whole-VM CPU remains higher. Known oversized bodies avoid publication work; unsupported input and HTTPS retain native ownership. |
 | H3 | Shared on-core cache dispatch, owned payload transfer, bounded scheduling and response-drain fixes are implemented experimentally. A pinned Quinn UDP fork adds optional sendmmsg batching. Quinn owns QUIC/TLS and io_uring supplies packet I/O. |
 | Optional routing | CID-aware reuseport steering has functional evidence. Migration and state-preserving restart remain outside its qualification. |
 | Release comparison | The exact v0.1.10-11 archive is pinned. Candidate C completed 40 cells against that archive and a native-source rebuild. The PGO integration then completed 20 release cells with higher throughput and lower process CPU medians throughout; H2c tail-latency and CPU-scope limits remain explicit. Earlier failed attempts remain retained. |

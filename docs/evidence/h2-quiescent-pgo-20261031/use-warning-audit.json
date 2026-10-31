@@ -1,0 +1,46 @@
+{
+  "build_exit": 0,
+  "mismatch_count": 0,
+  "missing_function_warning_count": 847,
+  "total_warning_lines_including_cargo_summaries": 855,
+  "groups": {
+    "hj_bpf": 227,
+    "build_script_build": 400,
+    "httpjet": 6,
+    "httpjet_quic_steer": 124,
+    "httpjet_beeper_observe": 90
+  },
+  "examples": {
+    "hj_bpf": "warning: hj_bpf.865e7329ced40ab8-cgu.0: no profile data available for function _RINvMNtCsgFX3jaOk65H_5alloc5sliceSNtNtB5_6string6String4joinReECsbxf35J47ayG_6hj_bpf Hash = 742261418966908927 up to 0 count discarded",
+    "build_script_build": "warning: build_script_build.e31b35a81b1e24ca-cgu.0: no profile data available for function _RINvNtCs8ZKwes1zzDd_3std2fs4copyNtNtB4_4path7PathBufBu_ECsjuSEfEjjZXO_18build_script_build Hash = 974670604839785541 up to 0 count discarded",
+    "httpjet": "warning: httpjet.ebc26bf31cc18146-cgu.0: no profile data available for function _RINvNvMs2_NtCsgFX3jaOk65H_5alloc7raw_vecINtB8_11RawVecInnerpE7reserve21do_reserve_and_handleNtNtBa_5alloc6GlobalECskeWpk5ebFWI_7httpjet Hash = 753202733449284396 up to 0 count discarded",
+    "httpjet_quic_steer": "warning: httpjet_quic_steer.c1d84de929d7fcf9-cgu.0: no profile data available for function _RINvMsh_NtNtNtCsgFX3jaOk65H_5alloc11collections5btree4nodeINtB6_7NodeRefNtNtB6_6marker5DyingNtNtNtCs8ZKwes1zzDd_3std3ffi6os_str8OsStringINtNtCskADBYZwJmSU_4core6option6OptionB1s_ENtB1a_14LeafOrInternalE21deallocate_and_ascendNtNtBc_5alloc6GlobalECsgDPArnNiSYT_18httpjet_quic_steer Hash = 1096621590013681508 up to 0 count discarded",
+    "httpjet_beeper_observe": "warning: httpjet_beeper_observe.59996d33f43b0e3-cgu.0: no profile data available for function _RINvMsh_NtNtNtCsgFX3jaOk65H_5alloc11collections5btree4nodeINtB6_7NodeRefNtNtB6_6marker5DyingNtNtNtCs8ZKwes1zzDd_3std3ffi6os_str8OsStringINtNtCskADBYZwJmSU_4core6option6OptionB1s_ENtB1a_14LeafOrInternalE21deallocate_and_ascendNtNtBc_5alloc6GlobalECstO7EEE4G9H_22httpjet_beeper_observe Hash = 1096621590013681508 up to 0 count discarded"
+  },
+  "server_hot_path_misses_identified": false,
+  "interpretation": "build scripts/build utilities are excluded from runtime training; observer/CID helpers were not trained; six root-codec/library instances are outside serving uring::codec",
+  "limitations": "cold/absent profiles are not coverage percentages; this accepts only correctness qualification, not performance",
+  "source_evidence": {
+    "library": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/src/crates/httpjet/src/lib.rs",
+    "library_sha256": "dc43abcaa9d271e7294ec4f9566cb56446193c2eef753936c5a5004e62c39402",
+    "warning_lines": [
+      "warning: httpjet.ebc26bf31cc18146-cgu.0: no profile data available for function _RINvNvMs2_NtCsgFX3jaOk65H_5alloc7raw_vecINtB8_11RawVecInnerpE7reserve21do_reserve_and_handleNtNtBa_5alloc6GlobalECskeWpk5ebFWI_7httpjet Hash = 753202733449284396 up to 0 count discarded",
+      "warning: httpjet.ebc26bf31cc18146-cgu.0: no profile data available for function _RNvMNtCskeWpk5ebFWI_7httpjet5codecNtB2_14ChunkedDecoder13next_line_end Hash = 948827213290633728 up to 0 count discarded",
+      "warning: httpjet.ebc26bf31cc18146-cgu.0: no profile data available for function _RNvMNtCskeWpk5ebFWI_7httpjet5codecNtB2_14ChunkedDecoder7advance Hash = 1021170726032974281 up to 0 count discarded",
+      "warning: httpjet.ebc26bf31cc18146-cgu.0: no profile data available for function _RNvNtCskeWpk5ebFWI_7httpjet5codec13te_is_chunked Hash = 321806759602108471 up to 0 count discarded",
+      "warning: httpjet.ebc26bf31cc18146-cgu.0: no profile data available for function _RNvNtCskeWpk5ebFWI_7httpjet5codec16head_has_bare_lf Hash = 287486626971661737 up to 0 count discarded",
+      "warning: httpjet.ebc26bf31cc18146-cgu.0: no profile data available for function _RNvNtCskeWpk5ebFWI_7httpjet5codec16parse_chunk_size Hash = 408462323105766661 up to 0 count discarded"
+    ]
+  },
+  "auxiliary_library_fingerprint": {
+    "source": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/target-use/release/.fingerprint/httpjet-c825caea1b6c7638/lib-httpjet.json",
+    "copy": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-auxiliary-lib-fingerprint.json",
+    "sha256": "47fb76a2cc2da94e25e48fe91d5bb1dac714a6ac96393a12aee78c83fc77cc31",
+    "scope": "tooling library, not one of the four server/helper executables"
+  },
+  "full_warning_receipt": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/profile-use-warnings.json",
+  "full_warning_receipt_sha256": "10d8507e2c47dd19a150f1b8ea393ff917a05b6a22e1fbebfcdfac57dfeeee14",
+  "build_log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/logs/build-use.log",
+  "build_log_sha256": "3c7b52902f5d8b23ac9ea5082e248892e3cbbd55a73100aaf5ec76f4d214dcb3",
+  "performance_qualified": false
+}
