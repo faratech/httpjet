@@ -56,6 +56,8 @@ The [exact shipped-release p99 comparison](release-p99-2026-10-31.md) measures t
 
 The [regression ledger and next steps](regressions-and-next-steps-2026-10-31.md) adds the memory, client-CPU and network-counter audit, and keeps the exact-release and stricter native-PGO controls separate. It records repeatable RSS costs and the remaining CPU regressions before further optimization.
 
+The [first BTF lifetime experiment](btf-retention-2026-10-31.md) reduces helper private memory by about 64% but fails the p99 requirement in its longer confirmation. That candidate is rejected; the report retains the negative results and the subsequent parser-table reproducibility work.
+
 ## Findings so far
 
 - **Quiescent H2 ownership fixes the tested process-CPU and tail regressions.**
