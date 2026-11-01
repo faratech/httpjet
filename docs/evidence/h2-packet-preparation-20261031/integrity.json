@@ -1,0 +1,12 @@
+{
+  "sha256": {
+    "h1-unit-validation.json": "70130286f17b46dbe4070d25a8965123b83a9b37d86db8798505e1465ccd323d",
+    "partial-qualification.json": "b8592456f5a7282d0d5c1263ec064e6a98ccd4ebef5a563269248b16f750108f",
+    "red-client.json": "cf71307e16add4314199b4c51ace2be8b288b2d8218fd58aeb5897335e2dddb8",
+    "red-failure.json": "4ad9640a4dda6871ec258c9f7aafb8c468a07fee8903d661ba50b8e766232f42",
+    "red-snapshot.json": "b79e0a964f1acce641d1ad835c0fd5f0b6d95a082fb911261af42ca973bf08a8",
+    "regression-receipt.json": "d496632bce06fae00b8fa1b263c2b1c73844e5e73580a6b7265fdb574fbf5b54",
+    "summary.json": "424c04be22292e4d2899de6436ad70032490092cf1e9a23ed0721b5b5f7f2aa3"
+  },
+  "scope": "Retained diagnosis and correctness evidence; timing and whole-application qualification excluded"
+}

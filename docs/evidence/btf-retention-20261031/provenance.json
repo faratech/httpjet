@@ -1,0 +1,78 @@
+{
+  "scope": "First scoped-BTF helper experiment only; rejected/unpromoted source, fixed ABF application and four serving objects",
+  "app_sha256": "abf7a79c1eb9593c3af7e77e60c4aaf4a5b30873d0e2b989283c88b662db9c48",
+  "helpers_sha256": {
+    "frozen": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+    "control": "3b673b25efeb9c90ad6f615c6aa217899f113765175d27764188edf0cc6825d7",
+    "candidate": "8f230a145ab691f99ef00b862ff01bffbd002780363043f654a5d19626065501"
+  },
+  "helper_build_recipe": "Both matched helpers: native Rust CPU/frame-pointers, release/offline/locked/jobs2, features beeper-h1-serve,beeper-observer, no PGO; separate fresh target for measured8f candidate. Frozen0e is an operational PGO-use control, not a matched non-PGO build.",
+  "source_manifests": {
+    "baseline": {
+      "entries": 1531,
+      "sha256": "6332a5a9c055edfce26e1d533b0116e2c453db89d46f02d97acb4d391e64f7dc"
+    },
+    "candidate": {
+      "entries": 1531,
+      "sha256": "82e31974d2586712d43d3999708568829e211eef64a48f5efed381b8be6894b9"
+    }
+  },
+  "changed_source_files": {
+    "crates/hj-bpf/src/load.rs": {
+      "baseline_sha256": "de673118ab20fc89a9b16666008d45d9742e84dd8d452816d804c6117c3f42a3",
+      "candidate_sha256": "382b7b9c421dcfd0d7de4b6584f078ff303f25c4fefb7d1a0a8a6e0b2b5c296b"
+    },
+    "crates/hj-kernel-fastpath/probes/h1_ack_probe.rs": {
+      "baseline_sha256": "31602e0cab580d5941d4813490d82bf4aa78ce460094f7da55cb169f9bae8b6f",
+      "candidate_sha256": "4ff5545fb2851a6e3311251766cfd59a87dc7d2f477804c23a5496669c83ea2f"
+    },
+    "crates/hj-kernel-fastpath/src/h1_loader.rs": {
+      "baseline_sha256": "5cf900daf7472a5f8e30fcdb9b2c8eac4603157e90f37c8e3c159dc51d28b9f5",
+      "candidate_sha256": "90c5913c723a1eb66e1a6de99bd4489c2c328cb88906257c2c859b81a8bd3412"
+    }
+  },
+  "serving_objects_sha256": {
+    "h1_serve": "4bdf891e8a249de182c68714a48ae29ed1c6dbb1e43d90a063dfd8421932677b",
+    "observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a",
+    "h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+    "cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f"
+  },
+  "measured_artifacts": {
+    "baseline-build-v2": {
+      "path": "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/baseline-build-v2/helper",
+      "sha256": "3b673b25efeb9c90ad6f615c6aa217899f113765175d27764188edf0cc6825d7",
+      "bytes": 2454216,
+      "profile": "matched native release without PGO",
+      "serving_elf": "4bdf891e8a249de182c68714a48ae29ed1c6dbb1e43d90a063dfd8421932677b"
+    },
+    "candidate-build-v4": {
+      "path": "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/candidate-build-v4/helper",
+      "sha256": "8f230a145ab691f99ef00b862ff01bffbd002780363043f654a5d19626065501",
+      "bytes": 2453576,
+      "profile": "matched native release without PGO",
+      "serving_elf": "4bdf891e8a249de182c68714a48ae29ed1c6dbb1e43d90a063dfd8421932677b"
+    }
+  },
+  "build_source_inputs_equal": {
+    "baseline-build-v2": true,
+    "candidate-build-v4": true
+  },
+  "runtime_source_inputs_equal": {
+    "initial72": true,
+    "confirmation24": true
+  },
+  "unpromoted": true,
+  "canonical_followup": {
+    "separate_from_these_timing_data": true,
+    "deterministic_table_patch_sha256": "6b080c3df5c665a7e113598cd80f8fbd1df377a301a0e308d2abb48df5b14225",
+    "coordinator_reported_status_at_preparation": {
+      "tests_only_RED_failures": 2,
+      "canonical_GREEN_tests_passed": 17,
+      "wire_gates_passed": 7,
+      "control_helper_prefix": "d381",
+      "scoped_helper_prefix": "64126",
+      "timing": "active; no timing result included"
+    },
+    "status_scope": "Progress supplied by root coordinator; not certified by the two older timing receipts. Certified fast-path DFA bypass means nondeterminism is not established as their regression cause."
+  }
+}

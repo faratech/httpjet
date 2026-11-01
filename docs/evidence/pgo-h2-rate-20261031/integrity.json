@@ -1,0 +1,9 @@
+{
+  "status": "passed",
+  "completed_arms": 36,
+  "measured_responses": 2160000,
+  "warmup_responses": 180000,
+  "all_pinned_binaries_unchanged": true,
+  "no_owned_benchmark_executables_running": true,
+  "summary_sha256": "8e5dbed8e0f832afca18aed80c5880393388e64ecd25cc54791a55bc0e38c656"
+}

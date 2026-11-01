@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "run_completion": {
+    "passed": true,
+    "planned_arms": 120,
+    "error": null,
+    "integrity_error": null
+  },
+  "files": 1930,
+  "uncompressed_bytes": 1566914869,
+  "archive_bytes": 324246824,
+  "archive_sha256": "b41a173ad39365cb631702b5c85cb7f289eaa4aeeb0c34669af5882e745ca6aa",
+  "manifest_sha256": "3d1daef1c6898f2fecda01cac7bb4d4badb034225bd01b4c630799ac33c9116c"
+}

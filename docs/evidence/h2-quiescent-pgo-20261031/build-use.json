@@ -1,0 +1,19 @@
+{
+  "stage": "use",
+  "target": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/target-use",
+  "rustflags": "-Ctarget-cpu=native -Cforce-frame-pointers=yes -Cprofile-use=/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/runtime.profdata -Cllvm-args=-pgo-warn-missing-function",
+  "exit": 0,
+  "jobs": 2,
+  "profile": "release/opt3/thinLTO/codegen1/panic-abort/strip-debuginfo",
+  "features": [
+    "httpjet/beeper-h2-serve",
+    "httpjet/beeper-observer",
+    "httpjet/quic-bpf"
+  ],
+  "prebuilt_bpf": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/objects",
+  "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/logs/build-use.log",
+  "log_sha256": "3c7b52902f5d8b23ac9ea5082e248892e3cbbd55a73100aaf5ec76f4d214dcb3",
+  "source_manifest_sha256": "7c66ac12e6e7f0861596ae5aba040a1e3c57e8866493a4873c78847363c31a71",
+  "cflags_cxxflags": "unset, unchanged from non-PGO recipe",
+  "scope": "build only; no performance result"
+}

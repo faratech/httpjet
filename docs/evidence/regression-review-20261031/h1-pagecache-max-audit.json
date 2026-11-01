@@ -1,0 +1,103 @@
+{
+  "passed": true,
+  "raw_measured_rows_recomputed": 720000,
+  "definition": "Per-arm maximum scheduled latency among60000 measured requests. Group is medianofsixarmmaxima; distinctfromoverallworstrequest.",
+  "arms": [
+    {
+      "cycle": 1,
+      "role": "release",
+      "max_us": 3262.609,
+      "p50_us": 1123.023,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-1-1-baseline/result.json",
+      "sha256": "f70b536d392133c04fc0555aea753679ff3cc09169cf90464b08855490d21dd5"
+    },
+    {
+      "cycle": 1,
+      "role": "candidate",
+      "max_us": 5766.984,
+      "p50_us": 885.289,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-1-2-candidate/result.json",
+      "sha256": "a06046e2623f59ccd1592618ee4af16a6e7a5f0c5eea28600013e9b882c87082"
+    },
+    {
+      "cycle": 1,
+      "role": "candidate",
+      "max_us": 5730.505,
+      "p50_us": 870.425,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-1-3-candidate/result.json",
+      "sha256": "20f6f5c1c1ee20d6dc841343442eacb82e43328cee872ad1478055d5a90865d1"
+    },
+    {
+      "cycle": 1,
+      "role": "release",
+      "max_us": 4833.747,
+      "p50_us": 1414.168,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-1-4-baseline/result.json",
+      "sha256": "4843bb5a4e92ed3392ff6ffeb04150c69b883cd9e6a1210e4d5c293e6c2985bf"
+    },
+    {
+      "cycle": 2,
+      "role": "release",
+      "max_us": 3198.901,
+      "p50_us": 1201.543,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-2-1-baseline/result.json",
+      "sha256": "633512cd6f92be6be7b3d8aa6def4008573be29e3f743edc758b3e8186ea0ec7"
+    },
+    {
+      "cycle": 2,
+      "role": "candidate",
+      "max_us": 6049.842,
+      "p50_us": 865.258,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-2-2-candidate/result.json",
+      "sha256": "4cb6656684fabef73157bc09bae0b621851f8194f1f52cfddbc6dfedc21502da"
+    },
+    {
+      "cycle": 2,
+      "role": "candidate",
+      "max_us": 5409.237,
+      "p50_us": 897.77,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-2-3-candidate/result.json",
+      "sha256": "6f305fce2358e757b495e681b64b630d7cfbe5b36d9a7a898081a2e96a1bdb1f"
+    },
+    {
+      "cycle": 2,
+      "role": "release",
+      "max_us": 50391.642,
+      "p50_us": 1474.613,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-2-4-baseline/result.json",
+      "sha256": "7d1ead83d5bdaa3f158101c3009f73c0e2e077f9d7e24757d8d4d96f903e9722"
+    },
+    {
+      "cycle": 3,
+      "role": "release",
+      "max_us": 3512.695,
+      "p50_us": 1326.464,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-3-1-baseline/result.json",
+      "sha256": "74e265cf9b16bdf5e99ea11c3d9603f80b7d3410b43b16171cee8a61de8eeb5b"
+    },
+    {
+      "cycle": 3,
+      "role": "candidate",
+      "max_us": 8403.939,
+      "p50_us": 1066.656,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-3-2-candidate/result.json",
+      "sha256": "848e97f14730c2674c11d4af84aba24cce0dca4fe7001a81689765fc9d2a4090"
+    },
+    {
+      "cycle": 3,
+      "role": "candidate",
+      "max_us": 5617.338,
+      "p50_us": 976.572,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-3-3-candidate/result.json",
+      "sha256": "77adf5060a38af22384a4b387596b43333cdced673de5f7e0ee5afb3b853443a"
+    },
+    {
+      "cycle": 3,
+      "role": "release",
+      "max_us": 564724.668,
+      "p50_us": 369481.627,
+      "path": "/var/tmp/httpjet-exact-release-p99-independent-v1/raw/run-v1/release-comparison/release/h1-pagecache-1024/measurements/h1-pagecache-3-4-baseline/result.json",
+      "sha256": "d9da8d32b0ac5878c8da8ad5a4084c5d8ecd2817c9ff391e53be3530a7bcbc71"
+    }
+  ]
+}

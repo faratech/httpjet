@@ -1,0 +1,1142 @@
+{
+  "audit_kind": "Independent local sealed-metadata arithmetic audit",
+  "blockers": [],
+  "common_artifact_pins": {
+    "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet": "e9be9eca3c2fa6ad0f01e493696e1d3f74899345b81e705423e6c3a799112676",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1": "b9b924c3eb6c59b688ccb857fd804d88b72b4a2e569485e2240f17af7d3a73b9",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-observe": "68f1f01362b3d1dd584b61376412f457c330f67b3d869a35f17375870fd75254",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-quic-steer": "7a96a79c5e5b807e9d21460e208bcdfad7cc9fb0c534ab4e32b663fc8b5a8587",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5"
+  },
+  "common_snapshot_input_sha256": {
+    "/var/tmp/h2q-final-run.py": "1076e6aba54488b1b3ede822462437da8b37c6cd15bbfa6b4972febb36c6a518",
+    "/var/tmp/h2q-final-run.sh": "b49c9292b6cc3c7f387fc4fd58cdec84a70b7154b2dc002ecb6f689469a035d1",
+    "/var/tmp/h2q-final-summarize.py": "d9830cfa1c487ff1a05fe4e286f929d9ab3c8a83c5f2c2bf22878d9f4129b138",
+    "/var/tmp/h2q-pgo-common.sh": "05939c965ecbc4f7ca965885fc579b0472e1edfae9c8210badd00986b1d1425b",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bpf-objects.json": "99e7ecf1de175d307f73f42920ba0cdef9954c2f6537a40fa6d9a8228db71cc5",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bpf-source-identity": "16fccd5aefc0808b60c61cec006fc9560ee2c2fc88107ad9606208f359602d20",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-source-manifest.json": "7c66ac12e6e7f0861596ae5aba040a1e3c57e8866493a4873c78847363c31a71",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-use.json": "0428f4f98cb49e67832deed91c8192daa1266efbf850d333ff861e74ef0db58c",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/coverage-review.json": "920f9c197a49d9b20ef3687bf0f593b46a0181624d0d779df1ceb6b6624d7f06",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/qualification.json": "8d5e527b99e4136e82748b047b687b88a22b70b01301f38e015a3bab3de66b1b",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/cache-required.json": "b4bb499addf2b4de785ac42fb62c21d03e4a8ec8b2589de0ffb687e2338526d8",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h1-h2-ua.json": "861de96d4f7da7c08c60bc4a87299ae4e814e28764f8d1385d535f28842000c0",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h1-late-readiness.json": "659ceda705f7cf6734f1a9f203a6fcd01117b4c3784dddf25b549e82e49e46b1",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-expiry.json": "c3ccb7eb79e317696a26a6cc1d16d9a2379e50a1f02b4c5f63600fd28df95a31",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-lifecycle.json": "64cc6cc9d65e4c8b5ea5fea9b653a7f7dd94e763b8628d8b1f44df882ca4e743",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-oversize.json": "8e5affa4d6a2d8153828eb4a0b465f0c3693d5c78ab71488ff47a57055d03427",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h3-gso20-batch1.json": "2dfa3316c520b69a5508107036e77f5a32ae50ed141c74659b6efc4d729f8866",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h3-shutdown.json": "83814bfe0489d5c66a90426dffcc3693a94eaab212fe8ddfa96edf092da12db1",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/inputs-before.json": "1e73e352a01bdcb41d0acd781a8c601d6489e6d8ef07b1fa0f6c0cd7cf358d55",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/tls-smoke.json": "ae896e0602f3813a9604d290024cbcb0535dddaaaa31e24b5d297c9c3f5c6180",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/merge-receipt.json": "8b04ce52411d9a348c92bbbc93e7356e7a49b913f01bf3d89fb04ba47ce14d2d",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/pgo-inputs.json": "1c81b39262cb21f750c4c9f0b3786e807cf80399853956f095b57963bc7a3e39",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/profile-inputs.json": "2299f4acf214de52f1b5214eed861bf74d8e78f3db7e02f373605b805d105d49",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/profile-use-warnings.json": "10d8507e2c47dd19a150f1b8ea393ff917a05b6a22e1fbebfcdfac57dfeeee14",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualified-inputs.json": "b10a7db343830a1c1b5667502ea5b3e7afd36dcc72cdea9608d044d41a2d10b8",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/runtime.profdata": "0ade3a4f73f5c085826de497088987d8d06b6617edda2fae28baf59a1269ede3",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-artifacts.json": "d2b3f65e597e237005e10a0e9fb4ec7448c25eda57ee14878735cbe9f9206eef",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprint-audit.json": "836d0c8754b07469f231d9083e72a260ddfe1c79ff867478e4fc3365d21e09e5",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet-beeper-h1.json": "5f843328236272f33ad470206889fe14b47fa3235165fde22c063b3da01c5dbe",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet-beeper-observe.json": "93812326f0506a7328a2f15ba6ea650bf26cbd46b98fbc4fbba537a3db9ba1d7",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet-quic-steer.json": "9357c8e5c6160c556c760a21881c63d37129be1a06db45feba3259856d256469",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet.json": "9836d08bf595f6681d80585ed307ba0f0f91f1faf714ff54625e9fc4a6b3c9ca",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use.rustc_info.json": "b3e6d8c43eb15ed16fad2958055cacc1b38da9bcfa8b8d61e5d788f63b561910"
+  },
+  "created_utc": "2026-10-31T13:42:51.842035+00:00",
+  "cross_mode": {
+    "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda",
+    "counts": {
+      "arms": 120,
+      "comparison_cycles": 30,
+      "comparisons": 10,
+      "groups": 20,
+      "recomputed_cycle_metric_values": 762,
+      "recomputed_group_metric_values": 254
+    },
+    "measured_responses": 17280000,
+    "same_uname_harness_network": true,
+    "shared_artifact_pins_equal": 6,
+    "shared_snapshot_inputs_equal": 33,
+    "warmup_responses": 960000
+  },
+  "harness_sha256": {
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe",
+    "scripts/bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "scripts/bench_environment_run.py": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+    "scripts/bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "scripts/bench_kernel_samples.py": "61bc86d0dfbaa4cdb64a776f07840ea37438c03de0343cf4e13f2261e69f5edb",
+    "scripts/bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "scripts/h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "scripts/http_engine_check.py": "6b7b239d1dfc07c2ae81efcf5ea597e2f402cff35a27b145fe70d36fd5004655"
+  },
+  "modes": {
+    "capacity": {
+      "admission": null,
+      "all_process_cpu_and_p99_cycles_lower": true,
+      "all_requested_checks_passed": true,
+      "all_service_p99_cycles_lower": null,
+      "comparisons": [
+        {
+          "all_metric_percent_changes": {
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -25.382082144548267,
+            "process_cpu_us_per_response": -72.8337236533958,
+            "process_system_us_per_response": -63.13131313131313,
+            "process_user_us_per_response": -81.22270742358079,
+            "rps": 89.4697982929936,
+            "user_cycles_per_response": -82.72479529839048,
+            "user_instructions_per_response": -83.40625191702335,
+            "web_cpu_us_per_response": -73.30210772833723,
+            "whole_vm_busy_ticks_per_response": -2.080783353733162,
+            "whole_vm_busy_us_per_response": -2.0807833537331732
+          },
+          "baseline": "fresh-native",
+          "case": "static",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -27.895915852283927,
+                "process_cpu_us_per_response": -73.78048780487805,
+                "rps": 101.6331811434656,
+                "whole_vm_busy_us_per_response": -7.725788900979325
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -37.23517706504891,
+                "process_cpu_us_per_response": -74.18546365914787,
+                "rps": 107.47926018166787,
+                "whole_vm_busy_us_per_response": -14.081765087605447
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -30.451692595312817,
+                "process_cpu_us_per_response": -75.75150300601202,
+                "rps": 103.03436441316363,
+                "whole_vm_busy_us_per_response": -13.541666666666663
+              }
+            }
+          ],
+          "kernel_alias": "fresh-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -27.127764777898257,
+            "process_cpu_us_per_response": -72.64367816091955,
+            "process_system_us_per_response": -62.4390243902439,
+            "process_user_us_per_response": -81.30434782608695,
+            "rps": 99.13993928094203,
+            "user_cycles_per_response": -82.16178212386089,
+            "user_instructions_per_response": -83.49103724232283,
+            "web_cpu_us_per_response": -73.5632183908046,
+            "whole_vm_busy_ticks_per_response": -11.1368909512761,
+            "whole_vm_busy_us_per_response": -11.1368909512761
+          },
+          "baseline": "old-native",
+          "case": "static",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -35.79149255097306,
+                "process_cpu_us_per_response": -72.97297297297298,
+                "rps": 101.01052523249491,
+                "whole_vm_busy_us_per_response": -7.820927723840343
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -28.19681132305689,
+                "process_cpu_us_per_response": -71.7741935483871,
+                "rps": 86.95900547499514,
+                "whole_vm_busy_us_per_response": -8.213820078226842
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [
+                "whole_vm_busy_ticks_per_response",
+                "whole_vm_busy_us_per_response"
+              ],
+              "percent_change": {
+                "p99_us": -24.156395940868702,
+                "process_cpu_us_per_response": -68.0089485458613,
+                "rps": 75.71999161470475,
+                "whole_vm_busy_us_per_response": 4.152249134948094
+              }
+            }
+          ],
+          "kernel_alias": "old-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "helper_cpu_us_per_response": null,
+            "p99_us": -33.36005936591066,
+            "process_cpu_us_per_response": -79.42238267148014,
+            "process_system_us_per_response": -62.23404255319149,
+            "process_user_us_per_response": -88.25136612021858,
+            "rps": 150.34275274610116,
+            "user_cycles_per_response": -88.7742975055257,
+            "user_instructions_per_response": -88.67304270923981,
+            "web_cpu_us_per_response": -79.78339350180505,
+            "whole_vm_busy_ticks_per_response": -16.456361724500535,
+            "whole_vm_busy_us_per_response": -16.456361724500535
+          },
+          "baseline": "release",
+          "case": "static",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -32.97968162685558,
+                "process_cpu_us_per_response": -80.03663003663004,
+                "rps": 151.94088799590025,
+                "whole_vm_busy_us_per_response": -13.56783919597988
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -36.30205101615823,
+                "process_cpu_us_per_response": -80.50089445438283,
+                "rps": 162.7492957533735,
+                "whole_vm_busy_us_per_response": -23.09670781893005
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -28.380220164249515,
+                "process_cpu_us_per_response": -75.92592592592592,
+                "rps": 116.52620397704881,
+                "whole_vm_busy_us_per_response": -9.26620246384573
+              }
+            }
+          ],
+          "kernel_alias": "release-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -21.70407825717121,
+            "process_cpu_us_per_response": -70.97505668934241,
+            "process_system_us_per_response": -54.59459459459459,
+            "process_user_us_per_response": -82.86852589641434,
+            "rps": 77.42222133705195,
+            "user_cycles_per_response": -82.8347672721258,
+            "user_instructions_per_response": -83.72721189248985,
+            "web_cpu_us_per_response": -71.65532879818595,
+            "whole_vm_busy_ticks_per_response": 0.17751479289942473,
+            "whole_vm_busy_us_per_response": 0.17751479289940253
+          },
+          "baseline": "fresh-native",
+          "case": "pagecache",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [
+                "whole_vm_busy_ticks_per_response",
+                "whole_vm_busy_us_per_response"
+              ],
+              "percent_change": {
+                "p99_us": -21.718255280941367,
+                "process_cpu_us_per_response": -70.79646017699115,
+                "rps": 82.42162664610963,
+                "whole_vm_busy_us_per_response": -2.9059829059829068
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -15.95307923832302,
+                "process_cpu_us_per_response": -69.13265306122449,
+                "rps": 65.09069852039234,
+                "whole_vm_busy_us_per_response": 6.241956241956248
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [
+                "whole_vm_busy_ticks_per_response",
+                "whole_vm_busy_us_per_response"
+              ],
+              "percent_change": {
+                "p99_us": -24.57823866274571,
+                "process_cpu_us_per_response": -72.19730941704037,
+                "rps": 82.65953945039988,
+                "whole_vm_busy_us_per_response": -4.082840236686403
+              }
+            }
+          ],
+          "kernel_alias": "fresh-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -24.977534855713568,
+            "process_cpu_us_per_response": -70.27649769585254,
+            "process_system_us_per_response": -56.25,
+            "process_user_us_per_response": -79.14893617021276,
+            "rps": 75.75631338769236,
+            "user_cycles_per_response": -81.42009517039068,
+            "user_instructions_per_response": -83.576142086321,
+            "web_cpu_us_per_response": -71.19815668202764,
+            "whole_vm_busy_ticks_per_response": -2.971428571428558,
+            "whole_vm_busy_us_per_response": -2.9714285714285804
+          },
+          "baseline": "old-native",
+          "case": "pagecache",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -20.0981927377904,
+                "process_cpu_us_per_response": -70.3448275862069,
+                "rps": 79.21164137373036,
+                "whole_vm_busy_us_per_response": -0.528789659224449
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -23.207275210044187,
+                "process_cpu_us_per_response": -69.68973747016707,
+                "rps": 75.02089718168799,
+                "whole_vm_busy_us_per_response": -2.6300059772863205
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [
+                "whole_vm_busy_ticks_per_response",
+                "whole_vm_busy_us_per_response"
+              ],
+              "percent_change": {
+                "p99_us": -14.501849051791659,
+                "process_cpu_us_per_response": -66.51480637813212,
+                "rps": 60.60298126752788,
+                "whole_vm_busy_us_per_response": 4.12429378531074
+              }
+            }
+          ],
+          "kernel_alias": "old-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "helper_cpu_us_per_response": null,
+            "p99_us": -42.10161479857929,
+            "process_cpu_us_per_response": -86.68032786885246,
+            "process_system_us_per_response": -57.28155339805825,
+            "process_user_us_per_response": -93.96325459317585,
+            "rps": 280.4501992591013,
+            "user_cycles_per_response": -94.22819080793006,
+            "user_instructions_per_response": -94.33155695325925,
+            "web_cpu_us_per_response": -86.88524590163934,
+            "whole_vm_busy_ticks_per_response": -34.3384847342631,
+            "whole_vm_busy_us_per_response": -34.3384847342631
+          },
+          "baseline": "release",
+          "case": "pagecache",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -45.07803201519185,
+                "process_cpu_us_per_response": -86.95652173913044,
+                "rps": 297.0562434483052,
+                "whole_vm_busy_us_per_response": -34.94795836669336
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -44.81826573779528,
+                "process_cpu_us_per_response": -87.19262295081967,
+                "rps": 293.4919219729119,
+                "whole_vm_busy_us_per_response": -36.260836788541276
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "p99_us": -41.427194673208334,
+                "process_cpu_us_per_response": -84.86328125,
+                "rps": 252.49662838009465,
+                "whole_vm_busy_us_per_response": -24.881775190978527
+              }
+            }
+          ],
+          "kernel_alias": "release-kernel"
+        }
+      ],
+      "compiler_overlap_observed": false,
+      "counts": {
+        "arms": 72,
+        "comparison_cycles": 18,
+        "comparisons": 6,
+        "groups": 12,
+        "independently_hashed_local_source_entries": 11,
+        "measured_responses": 14400000,
+        "opposite_metric_entries": 8,
+        "source_manifest_entries": 273,
+        "warmup_responses": 720000
+      },
+      "denominator_per_arm": {
+        "measured": 200000,
+        "warmup": 10000,
+        "whole_client_span": 210000
+      },
+      "directory": "/var/tmp/httpjet-h2-quiescent-v2-freeze/singularity/pgo-v1/final-capacity",
+      "groups": [
+        {
+          "arm": "fresh-native",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "p99_us": 5421.151,
+            "process_cpu_us_per_response": 10.166666666666668,
+            "rps": 96680.35774856334,
+            "whole_vm_busy_us_per_response": 38.904761904761905
+          }
+        },
+        {
+          "arm": "old-native",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "p99_us": 5402.4005,
+            "process_cpu_us_per_response": 10.357142857142858,
+            "rps": 95173.01615935756,
+            "whole_vm_busy_us_per_response": 41.04761904761905
+          }
+        },
+        {
+          "arm": "release",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "p99_us": 5861.95,
+            "process_cpu_us_per_response": 13.190476190476192,
+            "rps": 75502.97750692285,
+            "whole_vm_busy_us_per_response": 45.28571428571429
+          }
+        },
+        {
+          "arm": "fresh-kernel",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "p99_us": 4045.15,
+            "process_cpu_us_per_response": 2.761904761904762,
+            "rps": 183180.07881514757,
+            "whole_vm_busy_us_per_response": 38.095238095238095
+          }
+        },
+        {
+          "arm": "old-kernel",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "p99_us": 3936.8500000000004,
+            "process_cpu_us_per_response": 2.833333333333333,
+            "rps": 189527.4865915858,
+            "whole_vm_busy_us_per_response": 36.47619047619048
+          }
+        },
+        {
+          "arm": "release-kernel",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "p99_us": 3906.4,
+            "process_cpu_us_per_response": 2.7142857142857144,
+            "rps": 189016.23229610024,
+            "whole_vm_busy_us_per_response": 37.833333333333336
+          }
+        },
+        {
+          "arm": "fresh-native",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "p99_us": 5290.25,
+            "process_cpu_us_per_response": 10.5,
+            "rps": 94791.77452712157,
+            "whole_vm_busy_us_per_response": 40.23809523809524
+          }
+        },
+        {
+          "arm": "old-native",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "p99_us": 5397.25,
+            "process_cpu_us_per_response": 10.333333333333332,
+            "rps": 96806.7256968789,
+            "whole_vm_busy_us_per_response": 41.66666666666667
+          }
+        },
+        {
+          "arm": "release",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "p99_us": 7573.7,
+            "process_cpu_us_per_response": 23.238095238095237,
+            "rps": 42894.30492481319,
+            "whole_vm_busy_us_per_response": 63.166666666666664
+          }
+        },
+        {
+          "arm": "fresh-kernel",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "p99_us": 4142.05,
+            "process_cpu_us_per_response": 3.0476190476190474,
+            "rps": 168181.67201082886,
+            "whole_vm_busy_us_per_response": 40.30952380952381
+          }
+        },
+        {
+          "arm": "old-kernel",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "p99_us": 4049.1499999999996,
+            "process_cpu_us_per_response": 3.071428571428571,
+            "rps": 170143.93219617018,
+            "whole_vm_busy_us_per_response": 40.42857142857143
+          }
+        },
+        {
+          "arm": "release-kernel",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "p99_us": 4385.05,
+            "process_cpu_us_per_response": 3.095238095238095,
+            "rps": 163191.46855725825,
+            "whole_vm_busy_us_per_response": 41.476190476190474
+          }
+        }
+      ],
+      "kernel_success_fraction_range": [
+        0.9914809523809524,
+        0.9979142857142858
+      ],
+      "plan": {
+        "cases": [
+          "static",
+          "pagecache"
+        ],
+        "client": "/var/tmp/hjc/httpjet-http-load-bind",
+        "client_sha256": "e5c21fa94ea72c965cd4cfea950977c2bb771a4a5842a58499a5b1355c758b8f",
+        "pairs": [
+          [
+            "fresh-native",
+            "fresh-kernel"
+          ],
+          [
+            "old-native",
+            "old-kernel"
+          ],
+          [
+            "release",
+            "release-kernel"
+          ]
+        ],
+        "rate": null,
+        "requests": 200000,
+        "rounds": 3,
+        "sequence": [
+          "fresh-native",
+          "fresh-kernel",
+          "fresh-kernel",
+          "fresh-native",
+          "old-native",
+          "old-kernel",
+          "old-kernel",
+          "old-native",
+          "release",
+          "release-kernel",
+          "release-kernel",
+          "release"
+        ],
+        "size": 1024,
+        "warmup": 10000
+      },
+      "sealed_files": {
+        "inputs-after": {
+          "bytes": 7811,
+          "sha256": "eb4a9c73c1f6388e9de97a22497eca57565009c1e3f11a5197ec671d5236d640"
+        },
+        "inputs-before": {
+          "bytes": 7811,
+          "sha256": "eb4a9c73c1f6388e9de97a22497eca57565009c1e3f11a5197ec671d5236d640"
+        },
+        "plan": {
+          "bytes": 2995,
+          "sha256": "8a867ea747e8872da4f5e0713621166d6d7b8181f139397d76bd4f50585dac11"
+        },
+        "run-status": {
+          "bytes": 205,
+          "sha256": "23cc32ae7cc1243646b4e1e958abac656fa8cbc481bcdf7276d56cacb68e1476"
+        },
+        "summary": {
+          "bytes": 367796,
+          "sha256": "c2ccb875d2abb74ab8fa542485f630f73aeda2dbc3f61a1ba2617d3d1474ede8"
+        }
+      }
+    },
+    "rate15000": {
+      "admission": {
+        "arms_with_waits": 7,
+        "kernel_arms_with_waits": 0,
+        "limit": 128,
+        "total_waits": 2496,
+        "waiting_arms": [
+          {
+            "arm": "fresh-native",
+            "case": "static",
+            "cycle": 1,
+            "position": 1,
+            "waits": 1433
+          },
+          {
+            "arm": "fresh-native",
+            "case": "static",
+            "cycle": 1,
+            "position": 4,
+            "waits": 921
+          },
+          {
+            "arm": "fresh-native",
+            "case": "static",
+            "cycle": 2,
+            "position": 4,
+            "waits": 79
+          },
+          {
+            "arm": "old-native",
+            "case": "static",
+            "cycle": 3,
+            "position": 8,
+            "waits": 24
+          },
+          {
+            "arm": "old-native",
+            "case": "pagecache",
+            "cycle": 2,
+            "position": 8,
+            "waits": 1
+          },
+          {
+            "arm": "fresh-native",
+            "case": "pagecache",
+            "cycle": 3,
+            "position": 4,
+            "waits": 3
+          },
+          {
+            "arm": "old-native",
+            "case": "pagecache",
+            "cycle": 3,
+            "position": 8,
+            "waits": 35
+          }
+        ]
+      },
+      "all_process_cpu_and_p99_cycles_lower": true,
+      "all_requested_checks_passed": true,
+      "all_service_p99_cycles_lower": true,
+      "comparisons": [
+        {
+          "all_metric_percent_changes": {
+            "dispatch_lateness_p99_us": -21.28443659348931,
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -55.1032282636327,
+            "process_cpu_us_per_response": -59.25925925925927,
+            "process_system_us_per_response": -50.898203592814376,
+            "process_user_us_per_response": -64.92537313432835,
+            "rps": -0.0030124014689048018,
+            "service_p99_us": -80.82755482347478,
+            "user_cycles_per_response": -68.6996785305118,
+            "user_instructions_per_response": -77.801356876681,
+            "web_cpu_us_per_response": -60.60606060606061,
+            "whole_vm_busy_ticks_per_response": 2.1706586826347296,
+            "whole_vm_busy_us_per_response": 2.1706586826347296
+          },
+          "baseline": "fresh-native",
+          "case": "static",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [
+                "rps"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -93.5640058433396,
+                "p99_us": -93.81863238673928,
+                "process_cpu_us_per_response": -56.40449438202246,
+                "rps": 0.005158953278905365,
+                "service_p99_us": -96.99400208847065,
+                "whole_vm_busy_us_per_response": 13.622843545508623
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -23.29274572069734,
+                "p99_us": -56.23464193574071,
+                "process_cpu_us_per_response": -61.35593220338983,
+                "rps": -0.0030493139857035167,
+                "service_p99_us": -81.61392253586236,
+                "whole_vm_busy_us_per_response": 3.477588871715609
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [
+                "rps",
+                "whole_vm_busy_ticks_per_response",
+                "whole_vm_busy_us_per_response"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -15.930579418502234,
+                "p99_us": -25.053859011783196,
+                "process_cpu_us_per_response": -57.6923076923077,
+                "rps": 0.00016593641956053062,
+                "service_p99_us": -58.91290031574199,
+                "whole_vm_busy_us_per_response": -8.485273492286115
+              }
+            }
+          ],
+          "kernel_alias": "fresh-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "dispatch_lateness_p99_us": -17.258729067029364,
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -26.6188346810701,
+            "process_cpu_us_per_response": -58.156028368794324,
+            "process_system_us_per_response": -59.883720930232556,
+            "process_user_us_per_response": -55.45454545454545,
+            "rps": 0.012155092319265925,
+            "service_p99_us": -63.05882352941177,
+            "user_cycles_per_response": -67.26047142163762,
+            "user_instructions_per_response": -77.81842000442218,
+            "web_cpu_us_per_response": -59.57446808510638,
+            "whole_vm_busy_ticks_per_response": 8.016528925619815,
+            "whole_vm_busy_us_per_response": 8.016528925619838
+          },
+          "baseline": "old-native",
+          "case": "static",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -16.35598393049379,
+                "p99_us": -32.64898507491536,
+                "process_cpu_us_per_response": -57.93103448275861,
+                "rps": 0.006523704295924304,
+                "service_p99_us": -72.36632022895014,
+                "whole_vm_busy_us_per_response": 24.28687856560716
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [
+                "rps"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -17.22938423774898,
+                "p99_us": -25.228202528045674,
+                "process_cpu_us_per_response": -58.78136200716846,
+                "rps": -0.003534173802322016,
+                "service_p99_us": -56.859666339548575,
+                "whole_vm_busy_us_per_response": 3.878583473861741
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [
+                "whole_vm_busy_ticks_per_response",
+                "whole_vm_busy_us_per_response"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -23.139821761723656,
+                "p99_us": -47.356293178976635,
+                "process_cpu_us_per_response": -59.31034482758621,
+                "rps": 0.015046723588962863,
+                "service_p99_us": -76.7731899680703,
+                "whole_vm_busy_us_per_response": -4.968454258675081
+              }
+            }
+          ],
+          "kernel_alias": "old-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "dispatch_lateness_p99_us": -15.332426088680762,
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -22.869404558329975,
+            "process_cpu_us_per_response": -58.98305084745763,
+            "process_system_us_per_response": -56.57142857142856,
+            "process_user_us_per_response": -63.55932203389831,
+            "rps": 0.0019476825340092319,
+            "service_p99_us": -52.66823633592597,
+            "user_cycles_per_response": -69.16069203479871,
+            "user_instructions_per_response": -78.50931924802723,
+            "web_cpu_us_per_response": -60.00000000000001,
+            "whole_vm_busy_ticks_per_response": 17.280917280917272,
+            "whole_vm_busy_us_per_response": 17.280917280917272
+          },
+          "baseline": "fresh-native",
+          "case": "pagecache",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -16.012220116004006,
+                "p99_us": -25.51604513808423,
+                "process_cpu_us_per_response": -59.66101694915255,
+                "rps": 0.028918407274280966,
+                "service_p99_us": -61.1856217485403,
+                "whole_vm_busy_us_per_response": 14.628297362110331
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [
+                "rps"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -16.251533008247566,
+                "p99_us": -25.90222829646588,
+                "process_cpu_us_per_response": -58.58585858585859,
+                "rps": -0.009050473993021946,
+                "service_p99_us": -58.28315843798383,
+                "whole_vm_busy_us_per_response": 18.78980891719746
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [
+                "rps"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -14.436620354792884,
+                "p99_us": -20.319485268700145,
+                "process_cpu_us_per_response": -57.3943661971831,
+                "rps": -0.0034466732676596834,
+                "service_p99_us": -48.01648090433679,
+                "whole_vm_busy_us_per_response": 23.539982030548078
+              }
+            }
+          ],
+          "kernel_alias": "fresh-kernel"
+        },
+        {
+          "all_metric_percent_changes": {
+            "dispatch_lateness_p99_us": -14.601627701239439,
+            "helper_cpu_us_per_response": null,
+            "kernel_success_fraction": null,
+            "p99_us": -21.447006337155216,
+            "process_cpu_us_per_response": -58.53658536585367,
+            "process_system_us_per_response": -60.86956521739131,
+            "process_user_us_per_response": -57.52212389380531,
+            "rps": -0.009543704107184414,
+            "service_p99_us": -52.82788997703951,
+            "user_cycles_per_response": -67.05962209428411,
+            "user_instructions_per_response": -78.25755470042283,
+            "web_cpu_us_per_response": -59.58188153310105,
+            "whole_vm_busy_ticks_per_response": 11.167945439045202,
+            "whole_vm_busy_us_per_response": 11.16794543904518
+          },
+          "baseline": "old-native",
+          "case": "pagecache",
+          "cycles": [
+            {
+              "cycle": 1,
+              "opposite_aggregate_direction": [],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -14.740254093000772,
+                "p99_us": -22.45659865532318,
+                "process_cpu_us_per_response": -57.87671232876712,
+                "rps": -0.00706987045167029,
+                "service_p99_us": -51.63816295157571,
+                "whole_vm_busy_us_per_response": 13.29572925060436
+              }
+            },
+            {
+              "cycle": 2,
+              "opposite_aggregate_direction": [
+                "rps"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -14.838133047227132,
+                "p99_us": -21.332942847461634,
+                "process_cpu_us_per_response": -58.241758241758234,
+                "rps": 0.003040044285507193,
+                "service_p99_us": -51.11679247233998,
+                "whole_vm_busy_us_per_response": 15.585585585585559
+              }
+            },
+            {
+              "cycle": 3,
+              "opposite_aggregate_direction": [
+                "rps"
+              ],
+              "percent_change": {
+                "dispatch_lateness_p99_us": -17.2194444451392,
+                "p99_us": -42.8933682465582,
+                "process_cpu_us_per_response": -59.27152317880795,
+                "rps": 0.011508213433875092,
+                "service_p99_us": -74.121422698459,
+                "whole_vm_busy_us_per_response": 22.0213640098603
+              }
+            }
+          ],
+          "kernel_alias": "old-kernel"
+        }
+      ],
+      "compiler_overlap_observed": false,
+      "counts": {
+        "arms": 48,
+        "comparison_cycles": 12,
+        "comparisons": 4,
+        "groups": 8,
+        "independently_hashed_local_source_entries": 11,
+        "measured_responses": 2880000,
+        "opposite_metric_entries": 11,
+        "source_manifest_entries": 201,
+        "warmup_responses": 240000
+      },
+      "denominator_per_arm": {
+        "measured": 60000,
+        "warmup": 5000,
+        "whole_client_span": 65000
+      },
+      "directory": "/var/tmp/httpjet-h2-quiescent-v2-freeze/singularity/pgo-v1/final-rate",
+      "groups": [
+        {
+          "arm": "fresh-native",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "dispatch_lateness_p99_us": 2098.2585,
+            "p99_us": 4453.044,
+            "process_cpu_us_per_response": 22.846153846153847,
+            "rps": 14994.310074039775,
+            "service_p99_us": 2386.5005,
+            "whole_vm_busy_us_per_response": 102.76923076923077
+          }
+        },
+        {
+          "arm": "old-native",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "dispatch_lateness_p99_us": 1949.0484999999999,
+            "p99_us": 2644.186,
+            "process_cpu_us_per_response": 21.692307692307693,
+            "rps": 14995.005225819234,
+            "service_p99_us": 1190.0,
+            "whole_vm_busy_us_per_response": 93.07692307692308
+          }
+        },
+        {
+          "arm": "fresh-kernel",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "dispatch_lateness_p99_us": 1651.656,
+            "p99_us": 1999.2730000000001,
+            "process_cpu_us_per_response": 9.307692307692307,
+            "rps": 14993.858385222853,
+            "service_p99_us": 457.55050000000006,
+            "whole_vm_busy_us_per_response": 105.0
+          }
+        },
+        {
+          "arm": "old-kernel",
+          "arms": 6,
+          "case": "static",
+          "medians": {
+            "dispatch_lateness_p99_us": 1612.6675,
+            "p99_us": 1940.3345,
+            "process_cpu_us_per_response": 9.076923076923078,
+            "rps": 14996.82788254771,
+            "service_p99_us": 439.6,
+            "whole_vm_busy_us_per_response": 100.53846153846155
+          }
+        },
+        {
+          "arm": "fresh-native",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "dispatch_lateness_p99_us": 1951.697,
+            "p99_us": 2617.2084999999997,
+            "process_cpu_us_per_response": 22.692307692307693,
+            "rps": 14995.150348289852,
+            "service_p99_us": 1034.4005,
+            "whole_vm_busy_us_per_response": 93.92307692307693
+          }
+        },
+        {
+          "arm": "old-native",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "dispatch_lateness_p99_us": 1949.3135,
+            "p99_us": 2585.545,
+            "process_cpu_us_per_response": 22.07692307692308,
+            "rps": 14997.042265969892,
+            "service_p99_us": 1067.05,
+            "whole_vm_busy_us_per_response": 90.23076923076923
+          }
+        },
+        {
+          "arm": "fresh-kernel",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "dispatch_lateness_p99_us": 1652.4545,
+            "p99_us": 2018.6685000000002,
+            "process_cpu_us_per_response": 9.307692307692307,
+            "rps": 14995.442406214133,
+            "service_p99_us": 489.6,
+            "whole_vm_busy_us_per_response": 110.15384615384616
+          }
+        },
+        {
+          "arm": "old-kernel",
+          "arms": 6,
+          "case": "pagecache",
+          "medians": {
+            "dispatch_lateness_p99_us": 1664.682,
+            "p99_us": 2031.0230000000001,
+            "process_cpu_us_per_response": 9.153846153846153,
+            "rps": 14995.610992631198,
+            "service_p99_us": 503.34999999999997,
+            "whole_vm_busy_us_per_response": 100.3076923076923
+          }
+        }
+      ],
+      "kernel_success_fraction_range": [
+        0.7869076923076923,
+        0.9936
+      ],
+      "plan": {
+        "cases": [
+          "static",
+          "pagecache"
+        ],
+        "client": "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced",
+        "client_sha256": "0cb400bd7a56df95a03219ff227195e2ca6168ca1cf98c02b8ce48ac5ffacca6",
+        "pairs": [
+          [
+            "fresh-native",
+            "fresh-kernel"
+          ],
+          [
+            "old-native",
+            "old-kernel"
+          ]
+        ],
+        "rate": "15000",
+        "requests": 60000,
+        "rounds": 3,
+        "sequence": [
+          "fresh-native",
+          "fresh-kernel",
+          "fresh-kernel",
+          "fresh-native",
+          "old-native",
+          "old-kernel",
+          "old-kernel",
+          "old-native"
+        ],
+        "size": 1024,
+        "warmup": 5000
+      },
+      "sealed_files": {
+        "inputs-after": {
+          "bytes": 7843,
+          "sha256": "f05f6ec09b6c441505dd29e99b482cdda324b264a1106dfb3ccc8451ae666d3c"
+        },
+        "inputs-before": {
+          "bytes": 7843,
+          "sha256": "f05f6ec09b6c441505dd29e99b482cdda324b264a1106dfb3ccc8451ae666d3c"
+        },
+        "plan": {
+          "bytes": 2370,
+          "sha256": "6267232f4ec1616398ab4d61f6f7eaa49090ee09c824ea032ec9b6ccbeb4ad6a"
+        },
+        "run-status": {
+          "bytes": 205,
+          "sha256": "23cc32ae7cc1243646b4e1e958abac656fa8cbc481bcdf7276d56cacb68e1476"
+        },
+        "summary": {
+          "bytes": 279229,
+          "sha256": "f0f9aecba82ff3cdabf264aae1f5f57fa685bc47313d145ad80540e661b05e37"
+        }
+      }
+    }
+  },
+  "normalization": {
+    "aggregation": "Six-arm group medians; two-arm per-role cycle medians. P99 is median of arm p99 values, not a pooled request p99.",
+    "capacity_latency": "Actual request to completion at fixed concurrency.",
+    "kernel_success_fraction": "H2 kernel successes/(measured+warmup responses).",
+    "percent_change": "100*(candidate median/baseline median-1). Undefined when baseline absent or zero; null and omitted undefined fields are equivalent.",
+    "process_cpu": "Server plus helper user+system CPU over full client span, divided by measured+warmup responses. Each row total reconciles user+system and web+helper. Kernel/IRQ work charged elsewhere excluded.",
+    "rate_latency": "Scheduled to completion at15000requests/s, bounded admission128. Service latency and dispatch lateness are separate; never add their quantiles.",
+    "user_pmu": "Server/helper user-mode instructions and cycles over full span, divided by measured+warmup responses. All recorded running fractions1.0.",
+    "whole_vm": "All Linux VM busy ticks/R converted at recorded10000us/tick. Includes clients and unrelated Linux work. Windows-host work unobserved. Raw timebase not independently re-read."
+  },
+  "schema": 1,
+  "scope_notes": [
+    "No remote activity or engine test/build/profile performed.",
+    "Remote raw result bodies and runtime binaries were not independently read. Every row result hash reconciles to the sealed source manifest; locally mirrored source files were independently hashed.",
+    "old-kernel and release-kernel are separately timed comparison aliases for the same fresh candidate server/helper.",
+    "Lower server/helper process CPU does not establish lower overall CPU. Favorable VM CPU is not a validity requirement.",
+    "At matched rate, page-cache VM busy CPU increases in all three cycles against both native PGO controls. Overall CPU goal remains unresolved."
+  ],
+  "status": "pass"
+}

@@ -1,0 +1,7 @@
+{
+  "profile_sha256": "c5b2da5ab846dc8af3927158b51129d2d5c936f71afa2a692f036c9075f16f0a",
+  "profile_inputs_sha256": "fd92eb36357fb087cdd455586e770d39b4423feb186489f2f44ac8f6d10bf999",
+  "counts_log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/logs/profile-counts.txt",
+  "counts_log_sha256": "817576bd66079e0e4ba49ed942033886649af2d4f91c666a4ae651d3e894cc96",
+  "scope": "merged verified runtime training profiles; no performance result"
+}

@@ -1,0 +1,21 @@
+{
+  "candidate_reference": {
+    "path": "/var/tmp/httpjet-continuation/h2-oversize-c-ed7a4fda/bin/httpjet",
+    "sha256": "6ac144f2449750d6063963c0994f30c933c11df8e8dbfa548b1a7b4a71e51e8f"
+  },
+  "source_manifest_sha256": "966389d667bba3c9dab0b55d7178b30cd7c6d371b0edc3f25dbddfaf848c624c",
+  "completed_summary_sha256": "7ff1d17a46ddb8ed404bd456c29bcb07a24e24a9d21961cf22a1ec475ec1a21f",
+  "harness_sha256": {
+    "bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "http_engine_check.py": "7bd48ce75e71ff670a905c505722f87d3b26ea6603360c901394cac61c3eacd1"
+  },
+  "bpf_manifest_sha256": "2ff167fe629687d7af97f2f0d755f1ee19f76e9902cddbe479628e6beeda0511",
+  "fixture_sha256": {
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe"
+  }
+}

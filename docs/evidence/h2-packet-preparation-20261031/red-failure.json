@@ -1,0 +1,5 @@
+{
+  "type": "AssertionError",
+  "message": "validated load client failed; raw result retained",
+  "diagnostic_only": true
+}

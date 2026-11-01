@@ -1,0 +1,17 @@
+{
+  "profile_sha256": "c5b2da5ab846dc8af3927158b51129d2d5c936f71afa2a692f036c9075f16f0a",
+  "profile_inputs_sha256": "fd92eb36357fb087cdd455586e770d39b4423feb186489f2f44ac8f6d10bf999",
+  "coverage_notes": "Inspected merged IR block counters and the 55-arm training ledger. All 29484 profile records and 337612 counter slots account for total count 7370316073. Nonzero counters are present in native H1 plaintext/TLS and H2 plaintext/TLS serving, HPACK encode/decode, H3 pump/pump_stream/flush_pending, Quinn poll_transmit, cache lookup and response/fast memo, helper enrollment/serve_one/validate_entry, and H2 Owner current/publish_pending/arm. Training contains 55 server and 7 helper profiles attributed to accepted arms and pinned executables; all training processes exited. H1 kernel successes/readiness and H2 eligible success/oversize-zero-publication gates passed. All 712 hj_lsapi-matching records have zero counters, consistent with no-PHP fixtures. Counts are IR block execution counts, not call counts, source coverage percentages, CPU samples or performance results. Approves profile-use build for the exercised synthetic workload only; PHP, authenticated workload, production content and optional CID steering remain untrained.",
+  "counts_log_sha256": "817576bd66079e0e4ba49ed942033886649af2d4f91c666a4ae651d3e894cc96",
+  "profile_records": 29484,
+  "counter_slots": 337612,
+  "total_counter_count": 7370316073,
+  "trained_server_profiles": 55,
+  "trained_helper_profiles": 7,
+  "untrained_scope": [
+    "PHP/LSAPI",
+    "authenticated workload",
+    "production content distribution",
+    "H3 CID steering"
+  ]
+}
