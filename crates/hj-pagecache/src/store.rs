@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -615,12 +615,30 @@ impl ShardKey for CacheKeyId {
     }
 }
 
-/// One resident page-cache entry — the value `V` stored in the [`ShardedCache`].
-/// The payload (`meta`/`decoded`/`tags`/`body`/variants/timings) is the old
-/// `ResidentEntry`, kept verbatim so decode-once, freshness, retention and the
-/// denormalized tag GC all behave identically. The intrusive LRU links + cached
-/// weights/deadline now live in the primitive's internal node wrapper, so the byte
-/// weights / deadline / freshness are exposed via the [`CacheValue`] impl below.
+/// Revocation handle for one exact native serve snapshot. It does not pin the
+/// entry or its payload and is invalidated before removal or snapshot mutation.
+/// Freshness, identity and request policy still require native validation.
+#[derive(Clone, Debug)]
+pub struct SnapshotLease(Arc<AtomicBool>);
+
+impl SnapshotLease {
+    pub fn is_current(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    fn revoke(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+struct SnapshotLeaseOwner(SnapshotLease);
+impl Drop for SnapshotLeaseOwner {
+    fn drop(&mut self) {
+        self.0.revoke();
+    }
+}
+
+/// One resident page-cache entry, owned by its shard. Payload snapshots are
+/// invalidated together with their optional external memo lease on mutation.
 struct Node {
     // ---- payload (UNCHANGED from the old ResidentEntry) ----
     meta: MetaBlob,
@@ -638,6 +656,8 @@ struct Node {
     /// `body`/`variants`/`variants_filled`/`dict_gen` MUST call `invalidate_snapshot`
     /// (the next hit rebuilds from the mutated fields); missing it serves stale bytes.
     resp_snapshot: OnceLock<Arc<CachedResponse>>,
+    // Allocated only when an external finalized-response memo requests a lease.
+    snapshot_lease: Option<SnapshotLeaseOwner>,
     /// Plaintext copy of the purge tags, denormalized off the encoded `meta` so [`StoreEvict`]
     /// can drop this key from the tag index WITHOUT decoding `meta` (a decode failure on a corrupt
     /// blob would otherwise strand the key in its tag sets forever).
@@ -676,6 +696,7 @@ impl CacheValue for Node {
             + variants_ram_bytes(&self.variants)
             + decoded
             + snap
+            + if self.snapshot_lease.is_some() { 24 } else { 0 }
     }
 
     /// Disk (tmpfs) bytes: the charged file-tier footprint of a File body, else 0.
@@ -714,6 +735,7 @@ impl Node {
             meta,
             decoded: OnceLock::new(),
             resp_snapshot: OnceLock::new(),
+            snapshot_lease: None,
             tags: entry.tags.clone(),
             body: entry.body,
             variants: entry.variants,
@@ -761,6 +783,7 @@ impl Node {
     /// the next hit rebuilds it from the mutated fields (one rebuild per mutation —
     /// mutations are rare relative to hits).
     fn invalidate_snapshot(&mut self) {
+        self.snapshot_lease = None;
         self.resp_snapshot = OnceLock::new();
     }
 
@@ -1064,6 +1087,9 @@ impl HotShard {
 /// Tunable store limits.
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
+    /// Experimental per-worker finalized-response memo for fresh public hits.
+    /// The server still applies its memo eligibility, freshness and purge fences.
+    pub response_memo: bool,
     /// RAM budget (bytes) for the in-process index: zstd-compressed entry
     /// metadata, precompressed variants, and any body still resident in RAM (a
     /// not-yet-offloaded or degraded `InMem` body). With a tmpfs file tier,
@@ -1173,6 +1199,7 @@ pub struct StoreConfig {
 impl Default for StoreConfig {
     fn default() -> Self {
         StoreConfig {
+            response_memo: false,
             max_mem_bytes: 128 * 1024 * 1024,
             max_disk_bytes: 0,
             store_path: None,
@@ -1542,6 +1569,9 @@ impl OnEvict<CacheKeyId, CacheEntry> for StoreEvict {
     fn on_evict(&self, id: &CacheKeyId, entry: &CacheEntry, cause: EvictCause) {
         match entry {
             CacheEntry::Page(node) => {
+                if let Some(lease) = node.snapshot_lease.as_ref() {
+                    lease.0.revoke();
+                }
                 if cause == EvictCause::Disk {
                     let b = evict_age_bucket(node.stored_at.elapsed());
                     self.disk_evict_ages[b].fetch_add(1, Ordering::Relaxed);
@@ -2215,6 +2245,44 @@ impl PageStore {
         self.inner.remove(&CacheKeyId::new(key));
     }
 
+    /// Lease only the exact snapshot just selected by native lookup. The initial
+    /// allocation is reweighed under the shard lock; later memo hits only read
+    /// the returned atomic and do not reacquire a cache shard.
+    pub fn lease_snapshot(
+        &self,
+        key: &PageCacheKey,
+        expected: &Arc<CachedResponse>,
+    ) -> Option<SnapshotLease> {
+        let id = CacheKeyId::new(key);
+        let mut result = None;
+        self.inner.with_shard(&id, |access| {
+            let Some(node) = access.get(&id).and_then(CacheEntry::as_page) else {
+                return;
+            };
+            if !node
+                .resp_snapshot
+                .get()
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                return;
+            }
+            if let Some(lease) = node.snapshot_lease.as_ref() {
+                result = Some(lease.0.clone());
+                return;
+            }
+            access.mutate(&id, |entry| {
+                let CacheEntry::Page(node) = entry else {
+                    return false;
+                };
+                let lease = SnapshotLease(Arc::new(AtomicBool::new(true)));
+                result = Some(lease.clone());
+                node.snapshot_lease = Some(SnapshotLeaseOwner(lease));
+                true
+            });
+        });
+        result.filter(SnapshotLease::is_current)
+    }
+
     fn page_resident(&self, raw_hash: u64) -> bool {
         let id = CacheKeyId::from_raw_page_hash(raw_hash);
         self.inner.with_shard(&id, |acc| acc.contains(&id))
@@ -2469,9 +2537,7 @@ impl PageStore {
                     return None;
                 }
                 acc.touch_ram(&id);
-                if body_is_file && matches!(fresh, Freshness::Fresh | Freshness::Stale) {
-                    acc.touch_disk(&id);
-                }
+                if body_is_file && matches!(fresh, Freshness::Fresh | Freshness::Stale) { acc.touch_disk(&id); }
                 Some((fresh, snap))
             });
         match outcome {

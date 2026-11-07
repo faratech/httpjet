@@ -42,3 +42,4 @@ conf/
 /debian/*.debhelper
 /debian/*.substvars
 /packaging/**/__pycache__/
+/scripts/**/__pycache__/

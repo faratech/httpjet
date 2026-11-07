@@ -98,6 +98,26 @@ pub fn clf_time(ts: SystemTime) -> String {
     })
 }
 
+/// Append [`clf_time`] without allocating: the thread's cached text for the
+/// current second is copied straight into `out`.
+pub fn clf_time_into(ts: SystemTime, out: &mut Vec<u8>) {
+    let secs = ts
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    thread_local! {
+        static CACHE: RefCell<(u64, String)> = const { RefCell::new((u64::MAX, String::new())) };
+    }
+    CACHE.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        if cell.0 != secs {
+            cell.1 = clf_fmt(&to_civil(ts));
+            cell.0 = secs;
+        }
+        out.extend_from_slice(cell.1.as_bytes());
+    })
+}
+
 /// LiteSpeed-style error-log prefix timestamp with microseconds, e.g.
 /// `2026-05-31 13:55:36.000000`.
 pub fn error_time(ts: SystemTime) -> String {

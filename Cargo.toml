@@ -6,6 +6,7 @@ exclude = [
     "vendor/monoio",
     "vendor/monoio-rustls",
     "vendor/pprof",
+    "vendor/quinn-udp",
 ]
 
 [workspace.lints.clippy]
@@ -19,7 +20,7 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 publish = false
 rust-version = "1.99.1"
@@ -151,6 +152,7 @@ dashmap = { path = "vendor/dashmap" }
 monoio = { path = "vendor/monoio" }
 monoio-rustls = { path = "vendor/monoio-rustls" }
 pprof = { path = "vendor/pprof" }
+quinn-udp = { path = "vendor/quinn-udp" }
 
 [profile.release]
 opt-level = 3

@@ -805,6 +805,28 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
         h3.handshake_timeouts,
         h3.send_stall_resets,
     ));
+    let engine = crate::uring::h3::engine_counts();
+    out.push_str(&format!(
+        "# HELP httpjet_h3_request_engine_total HTTP/3 dispatch selections by application path, before egress completion.\n\
+         # TYPE httpjet_h3_request_engine_total counter\n\
+         httpjet_h3_request_engine_total{{path=\"on_core\"}} {}\n\
+         httpjet_h3_request_engine_total{{path=\"bridge\"}} {}\n\
+         # HELP httpjet_h3_telemetry_fallback_total HTTP/3 requests retaining bridge dispatch for active tracing.\n\
+         # TYPE httpjet_h3_telemetry_fallback_total counter\n\
+         httpjet_h3_telemetry_fallback_total {}\n",
+        engine.on_core_responses,
+        engine.bridged_requests,
+        engine.telemetry_fallbacks,
+    ));
+    let scheduling = crate::uring::h3::scheduling_counts();
+    out.push_str(&format!(
+        "# HELP httpjet_h3_inline_dispatch_total Initial polls of accelerated HTTP/3 request futures, before egress completion.\n\
+         # TYPE httpjet_h3_inline_dispatch_total counter\n\
+         httpjet_h3_inline_dispatch_total{{result=\"ready\"}} {}\n\
+         httpjet_h3_inline_dispatch_total{{result=\"deferred\"}} {}\n\
+         httpjet_h3_inline_dispatch_total{{result=\"spilled\"}} {}\n",
+        scheduling.ready, scheduling.deferred, scheduling.spilled,
+    ));
 }
 
 /// Precompressed page-cache variants: built by first-hit fills vs served, per codec.
@@ -1940,7 +1962,12 @@ mod tests {
         assert!(
             body.contains("httpjet_pagecache_lookup_total{path=\"dispatch\",result=\"hit\"} 0\n")
         );
-        assert_eq!(body.matches("httpjet_pagecache_lookup_total{").count(), 6);
+        assert!(
+            body.contains(
+                "httpjet_pagecache_lookup_total{path=\"response_memo\",result=\"hit\"} 0\n"
+            )
+        );
+        assert_eq!(body.matches("httpjet_pagecache_lookup_total{").count(), 9);
     }
 
     #[test]

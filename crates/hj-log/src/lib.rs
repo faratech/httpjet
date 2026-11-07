@@ -484,10 +484,12 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
         out.extend_from_slice(line.as_bytes());
         return;
     }
+    // Fields are appended as bytes rather than through core::fmt, which runs
+    // for every logged response.
     if f.peer_unix {
         out.extend_from_slice(b"unix:");
     } else {
-        let _ = write!(out, "{}", f.client_ip);
+        push_ip(out, f.client_ip);
     }
     // OLS `AccessLog::log`: the verified auth user is quoted, ` - "alice" `.
     match f.remote_user {
@@ -496,33 +498,76 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
         }
         _ => out.extend_from_slice(b" - - "),
     }
-    let _ = write!(out, "[{}] \"", fmt::clf_time(f.ts));
-    let _ = write!(out, "{} ", escape(f.method));
-    let _ = write!(out, "{}", escape(f.path));
+    out.push(b'[');
+    fmt::clf_time_into(f.ts, out);
+    out.extend_from_slice(b"] \"");
+    out.extend_from_slice(escape(f.method).as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(escape(f.path).as_bytes());
     if let Some(q) = f.query {
-        let _ = write!(out, "?{}", escape(q));
+        out.push(b'?');
+        out.extend_from_slice(escape(q).as_bytes());
     }
-    let _ = write!(out, " {}\" {} ", escape(f.protocol), f.status);
+    out.push(b' ');
+    out.extend_from_slice(escape(f.protocol).as_bytes());
+    out.extend_from_slice(b"\" ");
+    push_decimal(out, u64::from(f.status));
+    out.push(b' ');
     // `%b`: OLS writes `-` when no body byte was sent (`contentWritten == 0`).
     if f.bytes == 0 {
         out.push(b'-');
     } else {
-        let _ = write!(out, "{}", f.bytes);
+        push_decimal(out, f.bytes);
     }
     let mask = format.header_mask();
-    if mask & LOG_REFERER != 0 {
-        let _ = write!(out, " \"{}\"", quoted_bytes(f.referer));
-    }
-    if mask & LOG_USERAGENT != 0 {
-        let _ = write!(out, " \"{}\"", quoted_bytes(f.user_agent));
-    }
-    if mask & LOG_VHOST != 0 {
-        let _ = write!(out, " \"{}\"", quoted_bytes(f.host));
+    for (bit, value) in [
+        (LOG_REFERER, f.referer),
+        (LOG_USERAGENT, f.user_agent),
+        (LOG_VHOST, f.host),
+    ] {
+        if mask & bit != 0 {
+            out.extend_from_slice(b" \"");
+            out.extend_from_slice(quoted_bytes(value).as_bytes());
+            out.push(b'"');
+        }
     }
     if let Some(id) = f.request_id {
         // Trailing token in every text format so the line is joinable with the
         // error/php-slow logs; absent ⇒ nothing appended (legacy layout).
         let _ = write!(out, " reqid={}", id);
+    }
+}
+
+fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        if let Some(slot) = digits.get_mut(start) {
+            *slot = b'0' + (value % 10) as u8;
+        }
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(digits.get(start..).unwrap_or_default());
+}
+
+fn push_ip(out: &mut Vec<u8>, ip: IpAddr) {
+    match ip {
+        IpAddr::V4(v4) => {
+            for (index, octet) in v4.octets().into_iter().enumerate() {
+                if index > 0 {
+                    out.push(b'.');
+                }
+                push_decimal(out, u64::from(octet));
+            }
+        }
+        IpAddr::V6(_) => {
+            use std::io::Write;
+            let _ = write!(out, "{ip}");
+        }
     }
 }
 
@@ -1375,6 +1420,24 @@ mod tests {
         );
         assert!(r.render(LogFormat::Combined).contains(r#"" 200 - "https"#));
         assert!(r.render(LogFormat::Json).contains(r#""bytes":0,"#));
+    }
+
+    #[test]
+    fn numbers_and_addresses_render_like_display() {
+        let mut r = sample();
+        r.client_ip = "2001:db8::7".parse().unwrap();
+        r.status = 599;
+        r.bytes = u64::MAX;
+        assert!(r.render(LogFormat::Common).starts_with("2001:db8::7 - - ["));
+        assert!(
+            r.render(LogFormat::Common)
+                .ends_with(r#"" 599 18446744073709551615"#)
+        );
+        r.client_ip = "10.0.0.9".parse().unwrap();
+        r.status = 200;
+        r.bytes = 7;
+        assert!(r.render(LogFormat::Common).starts_with("10.0.0.9 - - ["));
+        assert!(r.render(LogFormat::Common).ends_with(r#"" 200 7"#));
     }
 
     #[test]

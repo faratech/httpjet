@@ -59,10 +59,12 @@ pub(crate) enum FastBridge {
     /// (`--fast-early-bridge`) As `EarlyNoCache`, but because no page entry can be resident for
     /// the path.
     EarlyCacheAbsent,
+    /// A public response memo lost freshness/revocation before rate admission.
+    MemoChanged,
 }
 
 impl FastBridge {
-    pub(crate) const ALL: [FastBridge; 32] = [
+    pub(crate) const ALL: [FastBridge; 33] = [
         FastBridge::PreHandler,
         FastBridge::Acme,
         FastBridge::Method,
@@ -95,6 +97,7 @@ impl FastBridge {
         FastBridge::VhostDisabled,
         FastBridge::EarlyNoCache,
         FastBridge::EarlyCacheAbsent,
+        FastBridge::MemoChanged,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -131,12 +134,18 @@ impl FastBridge {
             FastBridge::VhostDisabled => "vhost_disabled",
             FastBridge::EarlyNoCache => "early_no_cache",
             FastBridge::EarlyCacheAbsent => "early_cache_absent",
+            FastBridge::MemoChanged => "memo_changed",
         }
     }
 }
 
-#[derive(Default)]
 pub struct FastBridgeCounters([AtomicU64; FastBridge::ALL.len()]);
+
+impl Default for FastBridgeCounters {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+}
 
 impl FastBridgeCounters {
     pub(crate) fn bump(&self, why: FastBridge) {
@@ -165,10 +174,7 @@ mod tests {
         for (i, r) in FastBridge::ALL.iter().enumerate() {
             assert_eq!(*r as usize, i, "{r:?} out of order");
         }
-        assert_eq!(
-            FastBridge::EarlyCacheAbsent as usize + 1,
-            FastBridge::ALL.len()
-        );
+        assert_eq!(FastBridge::MemoChanged as usize + 1, FastBridge::ALL.len());
     }
 
     #[test]

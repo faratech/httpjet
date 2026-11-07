@@ -124,6 +124,63 @@ fn encode_string_literal(out: &mut Vec<u8>, raw: &[u8]) {
     }
 }
 
+// HTTP-date is 29 octets and is deliberately never inserted into HPACK's
+// dynamic table. Its literal bytes repeat across responses and connections
+// during a clock second. Remember only the string literal, which has no table
+// indices or protocol state. Fixed arrays avoid retaining a large allocation
+// through a small HeaderValue/Bytes slice.
+const HTTP_DATE_BYTES: usize = 29;
+const DATE_LITERAL_BYTES: usize = HTTP_DATE_BYTES + 1;
+struct DateLiteral {
+    raw: [u8; HTTP_DATE_BYTES],
+    encoded: [u8; DATE_LITERAL_BYTES],
+    len: usize,
+}
+
+std::thread_local! {
+    static DATE_LITERAL: std::cell::RefCell<Option<DateLiteral>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn encode_date_literal(out: &mut Vec<u8>, raw: &[u8]) {
+    if raw.len() != HTTP_DATE_BYTES {
+        return encode_string_bytes(out, raw);
+    }
+    DATE_LITERAL.with(|memo| {
+        let Ok(mut memo) = memo.try_borrow_mut() else {
+            return encode_string_literal(out, raw);
+        };
+        if let Some(entry) = memo.as_ref()
+            && entry.raw == raw
+            && let Some(encoded) = entry.encoded.get(..entry.len)
+        {
+            out.extend_from_slice(encoded);
+            return;
+        }
+        let start = out.len();
+        encode_string_literal(out, raw);
+        let Some(encoded) = out.get(start..) else {
+            return;
+        };
+        // The ordinary writer chooses Huffman only when shorter. A 29-byte
+        // raw value has a one-byte length prefix, so 30 bytes is the maximum.
+        if encoded.len() > DATE_LITERAL_BYTES {
+            return;
+        }
+        let mut entry = DateLiteral {
+            raw: [0; HTTP_DATE_BYTES],
+            encoded: [0; DATE_LITERAL_BYTES],
+            len: encoded.len(),
+        };
+        entry.raw.copy_from_slice(raw);
+        let Some(destination) = entry.encoded.get_mut(..encoded.len()) else {
+            return;
+        };
+        destination.copy_from_slice(encoded);
+        *memo = Some(entry);
+    });
+}
+
 fn decode_string<'a>(buf: &'a [u8], pos: &mut usize) -> Result<Cow<'a, [u8]>, Error> {
     let huff = buf.get(*pos).ok_or(Error::Truncated)? & 0x80 != 0;
     let len = integer::decode(buf, pos, 7).ok_or(Error::Truncated)? as usize;
@@ -449,7 +506,9 @@ impl Encoder {
                 encode_string(out, name);
             }
         }
-        if value_is_secret(name) {
+        if name == "date" {
+            encode_date_literal(out, value);
+        } else if value_is_secret(name) {
             encode_string_literal(out, value);
         } else {
             encode_string_bytes(out, value);
@@ -660,6 +719,110 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_date_block(enc: &mut Encoder, dec: &mut Decoder, date: &[u8], marker: &str) {
+        let mut wire = Vec::new();
+        enc.encode_header(&mut wire, ":status", "200");
+        enc.encode_header(&mut wire, "x-state", marker);
+        enc.encode_header(&mut wire, "date", date);
+        let mut got = Vec::new();
+        dec.decode_octets(&wire, |name, value| {
+            got.push((name.to_vec(), value.to_vec()))
+        })
+        .unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (b":status".to_vec(), b"200".to_vec()),
+                (b"x-state".to_vec(), marker.as_bytes().to_vec()),
+                (b"date".to_vec(), date.to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn date_literal_reuse_preserves_connections_resizes_and_fresh_values() {
+        let (mut a, mut da) = (Encoder::new(), Decoder::new(4096, 64 * 1024));
+        let (mut b, mut db) = (Encoder::new(), Decoder::new(4096, 64 * 1024));
+        let date = b"Wed, 21 Oct 2015 07:28:00 GMT";
+        check_date_block(&mut a, &mut da, date, "connection-a");
+        check_date_block(&mut b, &mut db, date, "connection-b");
+        check_date_block(&mut a, &mut da, date, "connection-a");
+        a.set_peer_max_size(0);
+        check_date_block(&mut a, &mut da, b"Wed, 21 Oct 2015 07:28:01 GMT", "resized");
+        a.set_peer_max_size(4096);
+        check_date_block(&mut a, &mut da, date, "restored");
+        check_date_block(&mut b, &mut db, &[0xff; HTTP_DATE_BYTES], "octets");
+        check_date_block(&mut b, &mut db, b"unusual-date", "short");
+    }
+
+    #[test]
+    fn date_literal_cache_does_not_retain_a_large_input_allocation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Tracked {
+            bytes: Vec<u8>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl AsRef<[u8]> for Tracked {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut input = vec![0; 4 * 1024 * 1024];
+        input[..HTTP_DATE_BYTES].copy_from_slice(b"Wed, 21 Oct 2015 07:28:00 GMT");
+        let owner = bytes::Bytes::from_owner(Tracked {
+            bytes: input,
+            dropped: dropped.clone(),
+        });
+        let view = owner.slice(..HTTP_DATE_BYTES);
+        drop(owner);
+        let mut wire = Vec::new();
+        Encoder::new().encode_header(&mut wire, "date", view.as_ref());
+        drop(view);
+        assert!(dropped.load(Ordering::Relaxed));
+        let mut got = Vec::new();
+        Decoder::new(4096, 64 * 1024)
+            .decode_octets(&wire, |_, value| got.extend_from_slice(value))
+            .unwrap();
+        assert_eq!(got, b"Wed, 21 Oct 2015 07:28:00 GMT");
+    }
+
+    #[test]
+    fn date_literal_cache_reentrant_use_falls_back_without_changing_bytes() {
+        DATE_LITERAL.with(|memo| {
+            let _held = memo.borrow_mut();
+            let mut enc = Encoder::new();
+            let mut dec = Decoder::new(4096, 64 * 1024);
+            check_date_block(
+                &mut enc,
+                &mut dec,
+                b"Wed, 21 Oct 2015 07:28:00 GMT",
+                "nested",
+            );
+        });
+    }
+
+    #[test]
+    fn date_literal_cache_never_remembers_cookie_values() {
+        DATE_LITERAL.with(|memo| *memo.borrow_mut() = None);
+        let mut wire = Vec::new();
+        Encoder::new().encode_header(&mut wire, "cookie", b"Wed, 21 Oct 2015 07:28:00 GMT");
+        DATE_LITERAL.with(|memo| assert!(memo.borrow().is_none()));
+        let mut got = Vec::new();
+        Decoder::new(4096, 64 * 1024)
+            .decode_octets(&wire, |_, value| got.extend_from_slice(value))
+            .unwrap();
+        assert_eq!(got, b"Wed, 21 Oct 2015 07:28:00 GMT");
+    }
 
     // ── Stage-2 safety net: the pre-optimization linear scans, kept as oracles so the
     //    O(1) `name_index` lookups are provably byte-identical (a wrong dynamic index =

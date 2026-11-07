@@ -361,6 +361,41 @@ pub(crate) struct Bridge {
 }
 
 impl Bridge {
+    /// Adapt an already selected on-core response without executing its pipeline
+    /// again. Shared cached bodies stay on the serving core. Fresh large bodies,
+    /// files and streams use the existing budgeted forwarder on its Tokio runtime
+    /// so H3 retains streaming, body leases and cancellation semantics.
+    pub(crate) async fn forward_fast_response(
+        &self,
+        response: Response,
+        connection_budget: Arc<hj_core::budget::BodyBufferBudget>,
+    ) -> Option<BridgeResp> {
+        let buffered = match response.body() {
+            Body::Empty => true,
+            Body::Full(bytes) => {
+                let fresh = response
+                    .extensions()
+                    .get::<hj_core::FreshBody>()
+                    .is_some_and(|mark| mark.names(bytes));
+                bytes.len() < FULL_LEASE_MIN || !(fresh || bytes.is_unique())
+            }
+            Body::File(file) => file.cached.is_some(),
+            Body::Stream(_) => false,
+        };
+        if buffered {
+            return Some(fast_response(response, false).await);
+        }
+        let budget = ResponseBudget {
+            global: self.body_budget.clone(),
+            connection: connection_budget,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.timer.spawn(async move {
+            forward_response_with_budget(response, tx, false, &budget).await;
+        });
+        rx.await.ok()
+    }
+
     /// Send `req` (+ its connection context) to the tokio side-runtime and await
     /// the buffered response. `None` if the side-runtime is gone.
     pub(crate) async fn dispatch(&self, req: Request, ctx: BridgeCtx) -> Option<BridgeResp> {

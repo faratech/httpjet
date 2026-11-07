@@ -13,6 +13,7 @@ pub(crate) mod codec;
 pub(crate) mod directio;
 #[cfg(test)]
 mod generation_test;
+mod h1_write_buffers;
 pub(crate) mod h3;
 #[cfg(feature = "ktls")]
 pub(crate) mod ktls;
@@ -178,8 +179,20 @@ impl CoreHandler {
     }
 
     /// Try the on-core cache-hit fast path; `Some(resp)` if served without the bridge.
-    async fn fast(
-        &self,
+    fn fast<'a>(
+        &'a self,
+        st: &'a Arc<ServerState>,
+        ctx: &'a BridgeCtx,
+        req: &'a hj_core::Request,
+    ) -> impl std::future::Future<Output = Option<hj_core::Response>> + 'a {
+        Self::fast_for_listener(&self.listener_name, st, ctx, req)
+    }
+
+    /// Shared on-core entry point for protocol engines that already selected a
+    /// request generation. The transport owns that snapshot and never reloads it
+    /// between a fast-path decline and bridged dispatch.
+    async fn fast_for_listener(
+        listener_name: &str,
         st: &Arc<ServerState>,
         ctx: &BridgeCtx,
         req: &hj_core::Request,
@@ -189,7 +202,7 @@ impl CoreHandler {
         // tokio path stamps at server::stamp_date, this is its on-core fast-path twin.
         crate::pipeline::fast_serve(
             st,
-            &self.listener_name,
+            listener_name,
             ctx.peer.ip(),
             ctx.local,
             ctx.peer.port(),
@@ -696,7 +709,9 @@ pub(crate) fn spawn_uring_http(
                 .name(format!("hj-uring-{core_i}"))
                 .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
             move |shutdown| {
-                maybe_pin_core_thread(core_i, worker_count);
+                if let Some(cpu) = maybe_pin_core_thread(core_i, worker_count) {
+                    steer_listener(&std_listener, cpu);
+                }
                 per_core_bridged(
                     core_i,
                     std_listener,
@@ -721,6 +736,10 @@ pub(crate) fn spawn_uring_http(
 pub(crate) static CORE_PINNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+/// Kill switch for listener CPU steering (`--no-cpu-steering`).
+pub(crate) static CPU_STEERING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// (#334) Kill switch for multishot accept (`--no-multishot-accept`): the
 /// accept loops then submit one single-shot accept SQE per connection.
 pub(crate) static MULTISHOT_ACCEPT: std::sync::atomic::AtomicBool =
@@ -732,7 +751,7 @@ pub(crate) const RING_LEGACY: u8 = 0;
 pub(crate) const RING_COOP: u8 = 1;
 pub(crate) const RING_DEFER: u8 = 2;
 pub(crate) static RING_MODE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(RING_LEGACY);
+    std::sync::atomic::AtomicU8::new(RING_COOP);
 
 /// (#330) Build a per-core monoio io_uring runtime with the configured ring
 /// setup. `coop` (default) = COOP_TASKRUN (completion task work runs on the
@@ -779,39 +798,93 @@ pub(crate) fn build_core_runtime()
         .build()
 }
 
-/// (#296) Pin the CALLING per-core transport thread to `core` — only when the
-/// worker count equals the machine's CPU count, so each runtime owns exactly
-/// one core (any other shape and the kernel's own placement beats a partial
-/// pin). Gives the per-core io_uring state + SO_REUSEPORT socket L1/L2
-/// locality and stops migration stalls. HISTORY: the per-core single-thread
-/// RUNTIME change was reverted for uneven keepalive distribution — pinning
-/// keeps today's runtime model but makes any placement unevenness permanent,
-/// hence the self-gating condition, the `--no-core-pinning` kill switch, and
-/// the pre-registered p99 watch in the campaign notes.
-pub(crate) fn maybe_pin_core_thread(core: usize, workers: usize) {
+/// The CPUs this process may run on. `main` captures it before any transport
+/// thread pins itself, because threads inherit their creator's mask.
+pub(crate) fn allowed_cpus() -> &'static [usize] {
+    static CPUS: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    CPUS.get_or_init(|| {
+        // SAFETY: a zeroed cpu_set_t is a valid empty mask, sized as passed;
+        // pid 0 reads the calling thread's mask. CPU_ISSET indexes stay below
+        // CPU_SETSIZE.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+                return Vec::new();
+            }
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+                .collect()
+        }
+    })
+}
+
+/// (#296) Pin the CALLING per-core transport thread to the `core`-th CPU this
+/// process may run on, returning that CPU — only when the worker count equals
+/// the allowed CPU count, so each runtime owns exactly one core (any other
+/// shape and the kernel's own placement beats a partial pin). Gives the
+/// per-core io_uring state + SO_REUSEPORT socket L1/L2 locality and stops
+/// migration stalls. HISTORY: the per-core single-thread RUNTIME change was
+/// reverted for uneven keepalive distribution — pinning keeps today's runtime
+/// model but makes any placement unevenness permanent, hence the self-gating
+/// condition, the `--no-core-pinning` kill switch, and the pre-registered p99
+/// watch in the campaign notes.
+pub(crate) fn maybe_pin_core_thread(core: usize, workers: usize) -> Option<usize> {
     if !CORE_PINNING.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
+        return None;
     }
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(0);
-    if workers != cpus || core >= cpus {
-        return;
+    let cpus = allowed_cpus();
+    if workers != cpus.len() {
+        return None;
     }
-    if core >= libc::CPU_SETSIZE as usize {
-        // available_parallelism() can exceed CPU_SETSIZE (1024) on pathological
-        // hosts; CPU_SET would write past the fixed-size mask.
-        return;
-    }
+    let cpu = *cpus.get(core)?;
     // SAFETY: a zeroed cpu_set_t is a valid empty mask; CPU_SET stays in
-    // bounds (core < cpus and core < CPU_SETSIZE are both checked above); pid
-    // 0 targets the calling thread.
+    // bounds (allowed_cpus() only yields CPUs below CPU_SETSIZE); pid 0
+    // targets the calling thread.
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(core, &mut set);
+        libc::CPU_SET(cpu, &mut set);
         if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
-            tracing::warn!(core, "uring: sched_setaffinity failed; running unpinned");
+            tracing::warn!(
+                core,
+                cpu,
+                "uring: sched_setaffinity failed; running unpinned"
+            );
+            return None;
         }
+    }
+    Some(cpu)
+}
+
+/// Ask the kernel to hand this listener the connections whose SYN was
+/// processed on `cpu` (Linux 6.1+ reuseport selection; older kernels ignore
+/// it). With RSS or RPS spreading flows over the pinned workers' CPUs, every
+/// connection then lives on the core that receives its packets: no
+/// cross-core wakeup per request. Only connection placement changes, so it is
+/// safe for TCP. UDP stays on reuseport hashing: a datagram flow must never move.
+pub(crate) fn steer_listener(listener: &impl std::os::fd::AsRawFd, cpu: usize) {
+    if !CPU_STEERING.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let Ok(cpu) = libc::c_int::try_from(cpu) else {
+        return;
+    };
+    // SAFETY: the descriptor is an open socket borrowed from the caller; the
+    // option value is a c_int of the length passed.
+    let rc = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_INCOMING_CPU,
+            std::ptr::from_ref(&cpu).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        let error = io::Error::last_os_error();
+        WARNED.call_once(
+            || tracing::warn!(%error, "uring: SO_INCOMING_CPU rejected; hash placement"),
+        );
     }
 }
 
@@ -1004,6 +1077,7 @@ pub(crate) fn spawn_uring_h3(
             },
         )
         .with_serving_view(serving_view)
+        .with_request_engine(listener_name.clone())
     };
     let bridge = build_pipeline_bridge(holder, listener_name, admission);
     let group = h3::serve_h3_pipeline(
@@ -1072,7 +1146,9 @@ pub(crate) fn spawn_uring_https(
                 .name(format!("hj-uring-tls-{core_i}"))
                 .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
             move |shutdown| {
-                maybe_pin_core_thread(core_i, worker_count);
+                if let Some(cpu) = maybe_pin_core_thread(core_i, worker_count) {
+                    steer_listener(&std_listener, cpu);
+                }
                 per_core_https(
                     core_i,
                     std_listener,
@@ -1841,6 +1917,7 @@ async fn handle_h1_bridged<S>(
     // Requests served on this keep-alive connection (LiteSpeed maxKeepAliveReq enforcement).
     let mut served: u32 = 0;
     let mut read_scratch: Vec<u8> = Vec::new();
+    let mut response_buffers = h1_write_buffers::ResponseBuffers::default();
     // (Tier 2) One bucket per CONNECTION — pacing must not reset per response. Rebuilt
     // inside the loop only when a response carries a different rate (context override or
     // a post-reload tuning change).
@@ -2049,7 +2126,7 @@ async fn handle_h1_bridged<S>(
             headers = parts.headers;
             if let Some(response) = refused {
                 let response = bridge::fast_response(hj_core::stamp_date(response), false).await;
-                let outcome = write_h1_response(
+                let outcome = write_h1_response_reusing(
                     &mut stream,
                     response,
                     method == http::Method::HEAD,
@@ -2059,6 +2136,7 @@ async fn handle_h1_bridged<S>(
                     None,
                     header_read_timeout,
                     &shutdown,
+                    &mut response_buffers,
                 )
                 .await;
                 if !outcome.failed {
@@ -2118,7 +2196,9 @@ async fn handle_h1_bridged<S>(
                 // Send the interim 100 only if we still need to wait for body bytes (a
                 // client that already streamed the body doesn't need it).
                 if expect_continue && content_length > 0 && acc.len() < total {
-                    write_continue(&mut stream).await;
+                    if write_continue(&mut stream).await.is_err() {
+                        return;
+                    }
                 }
                 while acc.len() < total {
                     match read_before_deadline(
@@ -2166,7 +2246,9 @@ async fn handle_h1_bridged<S>(
                 dec.max_raw = max_body.saturating_add(1 << 20);
                 // A chunked request always carries a body; honor Expect before draining it.
                 if expect_continue {
-                    write_continue(&mut stream).await;
+                    if write_continue(&mut stream).await.is_err() {
+                        return;
+                    }
                 }
                 // Reserve incrementally AS BYTES DECODE (never trust the client's framing
                 // to pre-declare anything). The DECODED payload lives in `dec.body` while
@@ -2360,7 +2442,7 @@ async fn handle_h1_bridged<S>(
         if keep_alive && shutdown.is_cancelled() {
             keep_alive = false;
         }
-        let outcome = write_h1_response(
+        let outcome = write_h1_response_reusing(
             &mut stream,
             resp,
             is_head,
@@ -2370,6 +2452,7 @@ async fn handle_h1_bridged<S>(
             sendfile_fd,
             header_read_timeout,
             &shutdown,
+            &mut response_buffers,
         )
         .await;
         #[cfg(feature = "otel")]
@@ -2629,13 +2712,12 @@ fn expect_is_100_continue(value: &[u8]) -> bool {
 
 /// Write an interim `100 Continue` (RFC 7231 §5.1.1) without closing — the body read
 /// and final response follow on the same connection.
-async fn write_continue<S>(stream: &mut S)
+const H1_CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+async fn write_continue<S>(stream: &mut S) -> io::Result<()>
 where
     S: AsyncWriteRent,
 {
-    let _ = stream
-        .write_all(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec())
-        .await;
+    stream.write_all(H1_CONTINUE.to_vec()).await.0.map(|_| ())
 }
 
 /// Hop-by-hop response headers the io_uring H1 writer manages itself and must NOT
@@ -2765,16 +2847,30 @@ fn h1_head_capacity(headers: &http::HeaderMap) -> usize {
             .sum::<usize>()
 }
 
-fn serialize_h1_response_head(
+pub(crate) fn serialize_h1_response_head(
     status: http::StatusCode,
     headers: &http::HeaderMap,
     body_len: usize,
     is_head: bool,
     keep_alive: bool,
 ) -> Vec<u8> {
+    let mut out = Vec::new();
+    serialize_h1_response_head_into(&mut out, status, headers, body_len, is_head, keep_alive);
+    out
+}
+
+fn serialize_h1_response_head_into(
+    out: &mut Vec<u8>,
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body_len: usize,
+    is_head: bool,
+    keep_alive: bool,
+) {
+    out.clear();
+    out.reserve(h1_head_capacity(headers));
     let reason = status.canonical_reason().unwrap_or("");
-    let mut out: Vec<u8> = Vec::with_capacity(h1_head_capacity(headers));
-    push_h1_status_line(&mut out, status, reason);
+    push_h1_status_line(out, status, reason);
     for (n, v) in headers.iter() {
         if n == http::header::CONTENT_LENGTH || is_hop_by_hop_response(n) {
             continue;
@@ -2790,7 +2886,7 @@ fn serialize_h1_response_head(
     match h1_response_framing(status, headers, known_len, is_head) {
         H1ResponseFraming::ContentLength(n) => {
             out.extend_from_slice(b"content-length: ");
-            push_u64_decimal(&mut out, n);
+            push_u64_decimal(out, n);
             out.extend_from_slice(b"\r\n");
         }
         H1ResponseFraming::Chunked => out.extend_from_slice(b"transfer-encoding: chunked\r\n"),
@@ -2801,7 +2897,6 @@ fn serialize_h1_response_head(
     } else {
         b"connection: close\r\n\r\n"
     });
-    out
 }
 
 fn serialize_h1_upgrade_response(status: http::StatusCode, headers: &http::HeaderMap) -> Vec<u8> {
@@ -3320,6 +3415,32 @@ impl SendProgress {
         }
         Ok(())
     }
+
+    /// Return the entire owned head/body buffer only after every write completed.
+    async fn write_full<S>(
+        &mut self,
+        stream: &mut S,
+        mut buffer: h1_write_buffers::FullResponse,
+    ) -> io::Result<h1_write_buffers::FullResponse>
+    where
+        S: AsyncWriteRent,
+    {
+        while buffer.remaining() != 0 {
+            let ((result, returned), blocked) = self
+                .timed(buffer.remaining(), stream.writev(buffer))
+                .await?;
+            buffer = returned;
+            let n = match result {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(n) => n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => 0,
+                Err(error) => return Err(error),
+            };
+            buffer.consume(n)?;
+            self.record(n, blocked)?;
+        }
+        Ok(buffer)
+    }
 }
 
 fn send_progress_timeout() -> io::Error {
@@ -3343,7 +3464,38 @@ impl WriteOutcome {
     }
 }
 
+#[cfg(test)]
 async fn write_h1_response<S>(
+    stream: &mut S,
+    resp: bridge::BridgeResp,
+    is_head: bool,
+    keep_alive: bool,
+    http10: bool,
+    throttle: &mut Option<hj_http::BandwidthThrottle>,
+    sendfile_fd: Option<std::os::fd::RawFd>,
+    send_window: Option<std::time::Duration>,
+    shutdown: &CancellationToken,
+) -> WriteOutcome
+where
+    S: AsyncWriteRent,
+{
+    let mut buffers = h1_write_buffers::ResponseBuffers::default();
+    write_h1_response_reusing(
+        stream,
+        resp,
+        is_head,
+        keep_alive,
+        http10,
+        throttle,
+        sendfile_fd,
+        send_window,
+        shutdown,
+        &mut buffers,
+    )
+    .await
+}
+
+async fn write_h1_response_reusing<S>(
     stream: &mut S,
     mut resp: bridge::BridgeResp,
     is_head: bool,
@@ -3353,6 +3505,7 @@ async fn write_h1_response<S>(
     sendfile_fd: Option<std::os::fd::RawFd>,
     send_window: Option<std::time::Duration>,
     shutdown: &CancellationToken,
+    buffers: &mut h1_write_buffers::ResponseBuffers,
 ) -> WriteOutcome
 where
     S: AsyncWriteRent,
@@ -3370,25 +3523,57 @@ where
     };
     let outcome = match resp.body {
         bridge::BridgeBody::Full(body) => {
-            let head = with_interim(
-                interim,
-                serialize_h1_response_head(
+            let body_forbidden = hj_core::response_body_forbidden(is_head, resp.status);
+            let result = if interim.is_none() && throttle.is_none() {
+                let mut head = buffers.take_head();
+                serialize_h1_response_head_into(
+                    &mut head,
                     resp.status,
                     &resp.headers,
                     body.len(),
                     is_head,
                     keep_alive,
-                ),
-            );
-            let body_forbidden = hj_core::response_body_forbidden(is_head, resp.status);
-            let result = if body_forbidden || body.is_empty() {
-                progress.write_all(stream, head).await.map(drop)
-            } else if let Some(t) = throttle.as_mut() {
-                paced_h1_body(stream, head, body, t, &mut progress).await
+                );
+                if body_forbidden || body.is_empty() {
+                    match progress.write_all(stream, head).await {
+                        Ok(head) => {
+                            buffers.recycle_head(head);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    match buffers.full(head, body) {
+                        Ok(buffer) => match progress.write_full(stream, buffer).await {
+                            Ok(buffer) => {
+                                buffers.recycle_full(buffer);
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
             } else {
-                progress
-                    .write_vectored(stream, vec![bytes::Bytes::from(head), body])
-                    .await
+                let head = with_interim(
+                    interim,
+                    serialize_h1_response_head(
+                        resp.status,
+                        &resp.headers,
+                        body.len(),
+                        is_head,
+                        keep_alive,
+                    ),
+                );
+                if body_forbidden || body.is_empty() {
+                    progress.write_all(stream, head).await.map(drop)
+                } else if let Some(t) = throttle.as_mut() {
+                    paced_h1_body(stream, head, body, t, &mut progress).await
+                } else {
+                    progress
+                        .write_vectored(stream, vec![bytes::Bytes::from(head), body])
+                        .await
+                }
             };
             WriteOutcome::new(result.is_err(), keep_alive)
         }

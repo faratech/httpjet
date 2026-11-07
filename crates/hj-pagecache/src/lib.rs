@@ -47,5 +47,6 @@ pub use proto::{
 pub use shared_paths::{SharedPathMatcher, parse_shared_paths, path_has_segment_prefix};
 pub use store::{
     BodyReadFailures, CacheFootprint, CacheListing, CacheStats, CachedResponse, EntryInfo,
-    EntryState, FileId, Freshness, PageBody, PageScope, PageStore, StaticNode, StoreConfig,
+    EntryState, FileId, Freshness, PageBody, PageScope, PageStore, SnapshotLease, StaticNode,
+    StoreConfig,
 };

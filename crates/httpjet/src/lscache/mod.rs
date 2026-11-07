@@ -24,7 +24,7 @@ use http::header::{
     CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, DATE, ETAG, LOCATION, SET_COOKIE,
     TRANSFER_ENCODING,
 };
-use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use http_body_util::BodyExt;
 
 use std::borrow::Cow;
@@ -597,7 +597,7 @@ pub struct LookupCounters(Box<[LookupShard; crate::telemetry::SHARDS]>);
 
 #[repr(align(128))]
 #[derive(Default)]
-struct LookupShard([std::sync::atomic::AtomicU64; 6]);
+struct LookupShard([std::sync::atomic::AtomicU64; 9]);
 
 impl Default for LookupCounters {
     fn default() -> Self {
@@ -606,7 +606,7 @@ impl Default for LookupCounters {
 }
 
 impl LookupCounters {
-    const PATHS: [&'static str; 2] = ["dispatch", "on_core"];
+    const PATHS: [&'static str; 3] = ["dispatch", "on_core", "response_memo"];
     const RESULTS: [&'static str; 3] = ["hit", "miss", "bypass"];
 
     pub(crate) fn record(&self, mode: LookupMode, outcome: &CacheOutcome) {
@@ -621,6 +621,10 @@ impl LookupCounters {
             CacheOutcome::Miss(_) => 1,
             CacheOutcome::Bypass => 2,
         };
+        self.record_result(path, result);
+    }
+
+    fn record_result(&self, path: usize, result: usize) {
         let shard = &self.0[crate::telemetry::shard_index()];
         if let Some(c) = shard.0.get(path * Self::RESULTS.len() + result) {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -642,6 +646,39 @@ impl LookupCounters {
     }
 }
 
+pub(crate) fn record_response_memo_hit(state: &ServerState, key_hash: u64, response: &Response) {
+    if let Some(store) = state.page_cache.as_ref() {
+        store.record_hit();
+        state.page_cache_admission.record(key_hash);
+        state.metrics.pagecache_lookup.record_result(2, 0);
+        note_variant_serve(state, response);
+    }
+}
+
+/// Fresh public selection that may be retained by the finalized-response memo.
+/// Expiry at the next entry-Age tick preserves Age even if header transforms
+/// override it; a memo never invents a new freshness window.
+#[derive(Clone)]
+pub(crate) struct PublicResponseMemo {
+    pub key_hash: u64,
+    pub purge_epoch: u64,
+    pub deadline: Instant,
+    pub lease: hj_pagecache::SnapshotLease,
+}
+
+fn response_memo_deadline(stored_at: Instant, ttl: Duration, now: Instant) -> Option<Instant> {
+    let fresh_until = stored_at.checked_add(ttl)?;
+    if now >= fresh_until {
+        return None;
+    }
+    let age = now
+        .checked_duration_since(stored_at)?
+        .as_secs()
+        .checked_add(1)?;
+    let age_tick = stored_at.checked_add(Duration::from_secs(age))?;
+    Some(fresh_until.min(age_tick))
+}
+
 pub fn cache_lookup(
     state: &Arc<ServerState>,
     ctx: &ReqCtx,
@@ -658,6 +695,7 @@ pub fn cache_lookup(
         force_miss,
         gates,
         LookupMode::Full,
+        false,
     );
     state
         .metrics
@@ -675,6 +713,16 @@ pub fn cache_lookup_fast_path(
     cc: &CacheCtx<'_>,
     if_none_match: Option<&str>,
 ) -> CacheOutcome {
+    cache_lookup_fast_path_with_memo(state, ctx, cc, if_none_match, false)
+}
+
+pub(crate) fn cache_lookup_fast_path_with_memo(
+    state: &Arc<ServerState>,
+    ctx: &ReqCtx,
+    cc: &CacheCtx<'_>,
+    if_none_match: Option<&str>,
+    memo_requested: bool,
+) -> CacheOutcome {
     let outcome = lookup(
         state,
         ctx,
@@ -683,6 +731,7 @@ pub fn cache_lookup_fast_path(
         false,
         None,
         LookupMode::FastPath,
+        memo_requested,
     );
     state
         .metrics
@@ -691,6 +740,7 @@ pub fn cache_lookup_fast_path(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lookup(
     state: &Arc<ServerState>,
     ctx: &ReqCtx,
@@ -699,6 +749,7 @@ fn lookup(
     force_miss: bool,
     gates: Option<&SharedCacheGates>,
     mode: LookupMode,
+    memo_requested: bool,
 ) -> CacheOutcome {
     if !cc.enabled {
         return CacheOutcome::Bypass;
@@ -808,6 +859,9 @@ fn lookup(
     if force_miss {
         return CacheOutcome::Miss(key_hash);
     }
+    let memo_epoch =
+        (memo_requested && mode == LookupMode::FastPath && store.config().response_memo)
+            .then(|| store.purge_epoch());
     let now = Instant::now();
     let probed = match mode {
         LookupMode::Full => store.get_entry_hashed(key_hash, &key, identity, now),
@@ -996,6 +1050,24 @@ fn lookup(
             // replace and unlink its pathname. The response keeps that inode alive.
             maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
             record_fast_path_hit(state, store, mode, key_hash);
+            if let Some(purge_epoch) = memo_epoch
+                && method == Method::GET
+                && cc.cookie.is_none()
+                && matches!(route, PrivateRoute::Public)
+                && matches!(entry.scope, hj_pagecache::PageScope::Public)
+                && resp.status() == StatusCode::OK
+                && matches!(resp.body(), Body::Full(body)
+                    if body.len() <= crate::pipeline::fast_memo::MAX_BODY)
+                && let Some(deadline) = response_memo_deadline(entry.stored_at, entry.ttl, now)
+                && let Some(lease) = store.lease_snapshot(&key, &entry)
+            {
+                resp.extensions_mut().insert(PublicResponseMemo {
+                    key_hash,
+                    purge_epoch,
+                    deadline,
+                    lease,
+                });
+            }
             CacheOutcome::Hit(resp)
         }
         // (fail-closed) A fresh entry that can't be rendered (dict-decode failure / empty body /
@@ -4830,6 +4902,29 @@ fn error_502() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_memo_deadline_never_crosses_age_or_freshness_boundary() {
+        let now = Instant::now();
+        let born = now - Duration::from_millis(750);
+        assert_eq!(
+            response_memo_deadline(born, Duration::from_secs(5), now),
+            Some(now + Duration::from_millis(250))
+        );
+        assert_eq!(
+            response_memo_deadline(born, Duration::from_millis(900), now),
+            Some(now + Duration::from_millis(150))
+        );
+        assert_eq!(
+            response_memo_deadline(born, Duration::from_millis(750), now),
+            None
+        );
+        assert_eq!(
+            response_memo_deadline(now + Duration::from_secs(1), Duration::from_secs(5), now),
+            None
+        );
+        assert_eq!(response_memo_deadline(now, Duration::MAX, now), None);
+    }
 
     fn unlimited_fill_budget() -> Arc<BodyBufferBudget> {
         Arc::new(BodyBufferBudget::new(0))

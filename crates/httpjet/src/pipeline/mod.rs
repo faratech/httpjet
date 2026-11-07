@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hj_compress::ExpiresHeaders;
@@ -245,6 +245,11 @@ pub(crate) async fn fast_serve(
 ) -> Option<Response> {
     let proto = effective_proto(proto, req);
     let req_start = std::time::Instant::now();
+    let memo_purge_epoch = state
+        .page_cache
+        .as_ref()
+        .map_or(0, |store| store.purge_epoch());
+
     // The on-core memo/static/page-cache path cannot perform asynchronous WAF
     // inspection. When a sidecar is configured, force every request through the
     // bridged full pipeline where inspection precedes every cache/backend path.
@@ -377,9 +382,18 @@ pub(crate) async fn fast_serve(
     // the probe entirely. Its keyable vars become vary items at the store site.
     let memo_inline = state.inline_rules.get(&ctx.vhost_name);
     let memo_inline_ok = memo_inline.is_none_or(|rs| rs.path_cacheable);
+    let allow_page_responses = state
+        .page_cache
+        .as_ref()
+        .is_some_and(|store| store.config().response_memo)
+        && !req.headers().contains_key(http::header::CACHE_CONTROL)
+        && !req.headers().contains_key(http::header::PRAGMA);
     if memo_eligible_req && memo_inline_ok {
         let mk = fast_memo::MemoKey {
             generation: state.generation,
+            allow_page_responses,
+            response_epoch: state.response_cache_epoch.as_deref(),
+            purge_epoch: memo_purge_epoch,
             listener,
             https: effective_https,
             trusted_proxy,
@@ -394,7 +408,12 @@ pub(crate) async fn fast_serve(
                 .map(|v| v.as_bytes())
                 .unwrap_or(b""),
         };
-        if let Some(mut resp) = fast_memo::probe(&mk, req, &state.ua_classify, req_start) {
+        if let Some((mut resp, page)) = fast_memo::probe(&mk, req, &state.ua_classify, req_start)
+            && state
+                .page_cache
+                .as_ref()
+                .is_none_or(|store| store.purge_epoch() == mk.purge_epoch)
+        {
             let mtls_ok = mtls_ok(client_auth_requested, is_tls, ctx.tls.as_ref());
             ctx.client_ip = state.acl.resolve_client_ip(
                 peer_ip,
@@ -408,6 +427,18 @@ pub(crate) async fn fast_serve(
             if !state.geo.allows(ctx.client_ip) {
                 return bridge(state, FastBridge::Acl); // the full pipeline renders the identical geo 403
             }
+            // ACL resolution can outlive the cached selection. Check again before
+            // consuming a rate token, so fallback never charges admission twice.
+            if page.as_ref().is_some_and(|page| {
+                Instant::now() >= page.deadline
+                    || !page.lease.is_current()
+                    || state
+                        .page_cache
+                        .as_ref()
+                        .is_none_or(|store| store.purge_epoch() != page.purge_epoch)
+            }) {
+                return bridge(state, FastBridge::MemoChanged);
+            }
             if !state
                 .client_throttle
                 .allow_deferring_rejection(ctx.client_ip)
@@ -419,7 +450,13 @@ pub(crate) async fn fast_serve(
                 .metrics
                 .fast_memo_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // The memo keeps no response extensions; re-derive the context egress rate.
+            if let Some(page) = &page {
+                lscache::record_response_memo_hit(state, page.key_hash, &resp);
+                state
+                    .telemetry
+                    .record_cache_hit(peer_ip.is_loopback(), &ctx.vhost_name);
+            }
+            // Only memo metadata is restored; re-derive the context egress rate.
             if has_bandwidth_context(&ctx.vhost) {
                 let Some(path) = decode_request_path(req.uri().path()) else {
                     return bridge(state, FastBridge::MalformedPath);
@@ -604,7 +641,7 @@ pub(crate) async fn fast_serve(
     // its env and keeps the original path exactly as dispatch() defers it; a
     // rewritten target carries dispatch()'s post-rewrite gates below.
     let mut rewrite_trace = RewriteTrace::default();
-    let rw = run_rewrite_traced(
+    let rw = rewrite_glue::run_rewrite_traced(
         state,
         &ctx,
         req,
@@ -759,9 +796,13 @@ pub(crate) async fn fast_serve(
         if !state.client_throttle.would_allow(ctx.client_ip) {
             return bridge(state, FastBridge::Throttle);
         }
-        if let lscache::CacheOutcome::Hit(mut resp) =
-            lscache::cache_lookup_fast_path(state, &ctx, &cc, inm)
-        {
+        if let lscache::CacheOutcome::Hit(mut resp) = lscache::cache_lookup_fast_path_with_memo(
+            state,
+            &ctx,
+            &cc,
+            inm,
+            allow_page_responses && memo_store_ok,
+        ) {
             stamp_bandwidth(
                 &ctx,
                 &orig_path,
@@ -786,6 +827,49 @@ pub(crate) async fn fast_serve(
                 .record_cache_hit(peer_ip.is_loopback(), &ctx.vhost_name);
             if early_predicted {
                 state.early_bridge.forfeit(early_bridge::Branch::PageCache);
+            }
+            // A public page-cache hit may be memoized while its memo lease holds;
+            // its Age header is exact only until the next Age tick.
+            if allow_page_responses
+                && memo_store_ok
+                && resp.status() == StatusCode::OK
+                && !resp.headers().contains_key(http::header::SET_COOKIE)
+                && !lscache::has_purge_header(resp.headers())
+                && resp
+                    .extensions()
+                    .get::<lscache::PublicResponseMemo>()
+                    .is_some()
+                && let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs)
+                && let Some(vary) = page_memo_vary(req, resp.headers(), vary)
+                && fast_memo::store_until(
+                    &fast_memo::MemoKey {
+                        generation: state.generation,
+                        allow_page_responses,
+                        response_epoch: state.response_cache_epoch.as_deref(),
+                        purge_epoch: memo_purge_epoch,
+                        listener,
+                        https: effective_https,
+                        trusted_proxy,
+                        vhost: &ctx.vhost_name,
+                        host_src,
+                        host: route_key.as_deref().unwrap_or("").as_bytes(),
+                        path: req.uri().path(),
+                        query: req.uri().query().unwrap_or(""),
+                        ae: req
+                            .headers()
+                            .get(http::header::ACCEPT_ENCODING)
+                            .map_or(b"", http::HeaderValue::as_bytes),
+                    },
+                    vary,
+                    &resp,
+                    req_start,
+                    policy_deadline,
+                )
+            {
+                state
+                    .metrics
+                    .fast_memo_stores
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
         }
@@ -948,6 +1032,9 @@ pub(crate) async fn fast_serve(
                 fast_memo::store_until(
                     &fast_memo::MemoKey {
                         generation: state.generation,
+                        allow_page_responses,
+                        response_epoch: state.response_cache_epoch.as_deref(),
+                        purge_epoch: memo_purge_epoch,
                         listener,
                         https: effective_https,
                         trusted_proxy,
@@ -1031,6 +1118,35 @@ fn early_bridge_reason(
 /// choice `run_rewrite` makes for its outcome key). `None` refuses the store:
 /// an `%{ENV:}` name the rewrite classifier assumed constant-empty is actually
 /// seeded on this request (mirrors `run_rewrite`'s `assumed_env_absent`).
+fn page_memo_vary(
+    request: &Request,
+    headers: &http::HeaderMap,
+    mut vary: Vec<fast_memo::VaryItem>,
+) -> Option<Vec<fast_memo::VaryItem>> {
+    if vary.len() > 16 {
+        return None;
+    }
+    for value in headers.get_all(http::header::VARY) {
+        for raw in value.as_bytes().split(|byte| *byte == b',') {
+            let raw = raw.trim_ascii();
+            if raw == b"*" {
+                return None;
+            }
+            let name = http::HeaderName::from_bytes(raw).ok()?;
+            if !vary.iter().any(|item| {
+                matches!(item,
+                fast_memo::VaryItem::Header { name: stored, .. } if stored == name)
+            }) {
+                vary.push(fast_memo::vary_header(request, name));
+            }
+            if vary.len() > 16 {
+                return None;
+            }
+        }
+    }
+    Some(vary)
+}
+
 fn memo_vary_set(
     state: &ServerState,
     ctx: &ReqCtx,
@@ -1274,6 +1390,17 @@ fn record_fast_serve(
     mut resp: Response,
 ) -> Response {
     apply_request_id_header(state, ctx, &mut resp);
+    record_served_response(state, ctx, proto, req, req_start, resp)
+}
+
+fn record_served_response(
+    state: &Arc<ServerState>,
+    ctx: &ReqCtx,
+    proto: Proto,
+    req: &Request,
+    req_start: std::time::Instant,
+    resp: Response,
+) -> Response {
     state
         .metrics
         .requests_total

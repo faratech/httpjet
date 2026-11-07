@@ -22,3 +22,9 @@ upgrade each pair together so the deduplicated graph cannot silently split again
 When an upstream release adopts these dependency versions, replace the corresponding path patch
 with that release, run `cargo update`, confirm the old package version disappears from
 `cargo tree -d --all-features`, and rerun the full workspace, vendor, profiling, and kTLS gates.
+
+## quinn-udp 0.6.3 (experimental H3 send batching)
+
+Pinned with `try_send_batch` for Linux/Android. Preserves scalar ancillary and
+GSO fallback behavior, and reports only accepted prefixes. See
+[`quinn-udp/HTTPJET-VENDOR.md`](quinn-udp/HTTPJET-VENDOR.md).

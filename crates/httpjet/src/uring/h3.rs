@@ -1,14 +1,18 @@
 //! HTTP/3 over **pure io_uring**: a monoio io_uring UDP loop driving quinn's
-//! sans-IO state machine (`quinn-proto`). This is the path quinn's high-level
-//! `AsyncUdpSocket` can't take (its `try_send` is synchronous, so it can't use
-//! io_uring) — instead we own the datagram loop: `recv_from` (io_uring) →
-//! `Endpoint::handle` → `accept`/`poll_transmit` → `send_to` (io_uring), reusing
-//! ALL of quinn-proto's QUIC + TLS-1.3 + loss-recovery logic (no fork, no QUIC
-//! rewrite).
+//! sans-IO state machine (`quinn-proto`). Each serving core owns its UDP socket;
+//! monoio supplies io_uring readiness while quinn-udp supplies batched receives,
+//! GSO transmits and ECN metadata. The packet engine owns datagram dispatch and
+//! reuses quinn-proto's QUIC, TLS 1.3 and loss recovery.
 //!
 //! The real-pipeline listener is the sole production H3 transport used by `serve`;
-//! it shares the same request pipeline as H1/H2. A separate fixed-response entrypoint
-//! remains below for isolated transport smoke tests.
+//! it shares the same request pipeline as H1/H2.
+
+mod request_engine;
+mod scheduling;
+use request_engine::H3RequestEngine;
+pub(crate) use request_engine::{H3EngineMode, configure_engine_mode, engine_counts};
+pub(crate) use scheduling::counts as scheduling_counts;
+use scheduling::{InlineBudget, dispatch_work, sleep_until_opt};
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -18,16 +22,24 @@ use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(test)]
+use std::os::fd::AsRawFd;
 
 use bytes::{Bytes, BytesMut};
 use hj_core::body_deadline::BodyProgress;
 use monoio::net::udp::UdpSocket;
+use quinn_proto::EndpointConfig;
 use quinn_proto::{
-    ConnectionHandle, DatagramEvent, Dir, Endpoint, EndpointConfig, Event, ServerConfig,
-    StreamEvent, StreamId, WriteError,
+    ConnectionHandle, DatagramEvent, Dir, Endpoint, Event, ServerConfig, StreamEvent, StreamId,
+    WriteError,
 };
-use quinn_udp::{Transmit as UdpTransmit, UdpSockRef, UdpSocketState};
+use quinn_udp::Transmit as UdpTransmit;
+#[cfg(test)]
+use quinn_udp::{UdpSockRef, UdpSocketState};
+
+mod datagram;
+pub(crate) use datagram::{GsoSegments, SendBatch, configure_gso_segments, configure_send_batch};
+use datagram::{IoUringDatagram, SendOutcome};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -43,6 +55,7 @@ const MAX_RECV_DRAIN_BATCHES: usize = 8;
 /// deadlines and the shutdown drain deadline. The first awaited completion is
 /// included in this total.
 const MAX_COMPLETION_DRAIN_BATCH: usize = 64;
+const MAX_PUMP_ROUNDS: usize = 64;
 const MAX_PEER_UNI_STREAMS: usize = 16;
 /// Advertised MAX_STREAMS for client request streams, and the admission bound the
 /// accept loop enforces itself so a transport bug that over-reports peer streams
@@ -393,6 +406,7 @@ impl Ord for H3RequestDeadlineKey {
 pub(crate) struct H3RuntimeConfig {
     config: Arc<dyn Fn() -> (H3RequestConfig, u32) + Send + Sync>,
     serving_view: Option<crate::serving_generation::ServingView>,
+    request_engine: Option<H3RequestEngine>,
     active_conns: Arc<AtomicU64>,
     /// (#236 residual) Server-wide buffered-body cap shared with H1/H2/LSAPI. H3 commits
     /// the whole request-stream buffer before parse, so the reservation is taken when a
@@ -416,6 +430,7 @@ impl H3RuntimeConfig {
         Self {
             config: Arc::new(config),
             serving_view: None,
+            request_engine: None,
             active_conns,
             body_budget,
             shutdown: None,
@@ -432,6 +447,11 @@ impl H3RuntimeConfig {
         view: crate::serving_generation::ServingView,
     ) -> Self {
         self.serving_view = Some(view);
+        self
+    }
+
+    pub(crate) fn with_request_engine(mut self, listener_name: Arc<str>) -> Self {
+        self.request_engine = Some(H3RequestEngine::configured(listener_name));
         self
     }
 
@@ -453,6 +473,7 @@ impl H3RuntimeConfig {
         H3State {
             _connection_permit: Some(permit),
             serving_view: self.serving_view.as_ref().map(|view| view.pin_connection()),
+            request_engine: self.request_engine.clone(),
             epoch,
             body_budget: Some(self.body_budget.clone()),
             egress_budget: Some(H3EgressBudget::new(self.body_budget.clone())),
@@ -479,6 +500,7 @@ impl H3RuntimeConfig {
                 .as_ref()
                 .map(|view| view.pin_connection()),
             client_auth: policy.client_auth,
+            request_engine: self.request_engine.clone(),
             epoch,
             body_budget: Some(self.body_budget.clone()),
             egress_budget: Some(H3EgressBudget::new(self.body_budget.clone())),
@@ -535,6 +557,31 @@ struct H3EgressLease {
     _connection: hj_core::budget::BodyBufferLease,
 }
 
+fn leased_h3_bytes(data: Bytes, lease: Option<H3EgressLease>) -> Bytes {
+    match lease {
+        Some(lease) => h3_bytes_with_lease(data, lease),
+        None => data,
+    }
+}
+
+fn h3_bytes_with_lease<L: Send + Sync + 'static>(data: Bytes, lease: L) -> Bytes {
+    struct Owned<L> {
+        data: Bytes,
+        _lease: L,
+    }
+    impl<L> AsRef<[u8]> for Owned<L> {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+    // A partial QUIC write retains a slice of the original allocation until
+    // acknowledgement. Its full reservation must outlive the driver's part.
+    Bytes::from_owner(Owned {
+        data,
+        _lease: lease,
+    })
+}
+
 fn reserve_h3_egress(
     budget: Option<&H3EgressBudget>,
     bytes: usize,
@@ -561,8 +608,8 @@ fn reuseport_udp(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
     Ok(sock.into())
 }
 
-/// Self-signed rustls server config with the `h3` ALPN, for the smoke entrypoint
-/// (the real driver takes hj-tls's cert resolver). Mirrors the h3_roundtrip test.
+/// Ephemeral self-signed H3 TLS configuration for isolated tests.
+#[cfg(test)]
 pub(crate) fn self_signed_config() -> io::Result<Arc<rustls::ServerConfig>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -577,6 +624,15 @@ pub(crate) fn self_signed_config() -> io::Result<Arc<rustls::ServerConfig>> {
     cfg.alpn_protocols = vec![b"h3".to_vec()];
     cfg.max_early_data_size = 0;
     Ok(Arc::new(cfg))
+}
+
+static ACK_ELICITING_THRESHOLD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static MAX_ACK_DELAY_US: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1000);
+
+/// Startup only: ask QUIC peers for the ACK_FREQUENCY extension (0 = do not).
+pub(crate) fn configure_ack_frequency(threshold: u32, max_ack_delay_us: u32) {
+    ACK_ELICITING_THRESHOLD.store(threshold, std::sync::atomic::Ordering::Relaxed);
+    MAX_ACK_DELAY_US.store(max_ack_delay_us, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Build the quinn-proto server [`ServerConfig`] from a rustls config that already
@@ -605,6 +661,18 @@ fn server_config(rustls_cfg: Arc<rustls::ServerConfig>) -> io::Result<ServerConf
     // up to 1.25 MB of DATAGRAM frames nothing reads for the connection's life (#1047).
     // Unadvertised, a peer DATAGRAM is a PROTOCOL_VIOLATION (RFC 9221 §3).
     transport.datagram_receive_buffer_size(None);
+    let threshold = ACK_ELICITING_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
+    if threshold > 0 {
+        // Peers that advertise min_ack_delay (draft-ietf-quic-ack-frequency) then
+        // ACK every `threshold` ack-eliciting packets instead of every second one,
+        // and the PTO no longer adds their default 25 ms max_ack_delay.
+        let mut ack = quinn_proto::AckFrequencyConfig::default();
+        ack.ack_eliciting_threshold(threshold.into())
+            .max_ack_delay(Some(std::time::Duration::from_micros(u64::from(
+                MAX_ACK_DELAY_US.load(std::sync::atomic::Ordering::Relaxed),
+            ))));
+        transport.ack_frequency_config(Some(ack));
+    }
     cfg.transport_config(Arc::new(transport));
     // Linux SO_REUSEPORT hashes a rebinding tuple independently for every datagram. Each
     // worker owns a separate sans-I/O endpoint, so a migrated tuple can land on a worker
@@ -612,74 +680,6 @@ fn server_config(rustls_cfg: Arc<rustls::ServerConfig>) -> io::Result<ServerConf
     // destination connection ID rather than by the kernel's 4-tuple hash.
     cfg.migration(false);
     Ok(cfg)
-}
-
-/// (N3) Max bytes accumulated for one H3 request (header block + body) before the stream is
-/// reset. Bounds the app-side `req_buf` growth that the QUIC receive window alone doesn't
-/// cap (the app drains the window as it reads, so a single body could otherwise grow to the
-/// whole upload). This const is the SMOKE-path default; the production pipeline path threads
-/// `max_req_bytes` from the LiteSpeed config (`maxReqBodySize` + `maxReqHeaderSize`) so a
-/// valid large upload is not wrongly rejected (and the cap tracks the operator's setting).
-const MAX_H3_REQ_BYTES: usize = 64 * 1024 * 1024;
-
-/// H3 smoke entrypoint: per-core monoio io_uring runtimes, each adopting its own
-/// `SO_REUSEPORT` UDP socket and driving a quinn-proto endpoint. Blocks.
-/// Reachable via the gated `HJ_URING_H3_SMOKE=<addr>` dev hook.
-pub(crate) fn serve_h3_smoke(
-    addr: SocketAddr,
-    workers: usize,
-    rustls_cfg: Arc<rustls::ServerConfig>,
-) -> io::Result<()> {
-    let workers = workers.max(1);
-    let mut handles = Vec::with_capacity(workers);
-    for core in 0..workers {
-        let std_sock = reuseport_udp(addr)?;
-        let cfg = rustls_cfg.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("hj-uring-h3-{core}"))
-            .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
-            .spawn(move || per_core_h3(core, std_sock, cfg))?;
-        handles.push(handle);
-    }
-    for h in handles {
-        let _ = h.join();
-    }
-    Ok(())
-}
-
-fn per_core_h3(core: usize, std_sock: std::net::UdpSocket, rustls_cfg: Arc<rustls::ServerConfig>) {
-    let server_cfg = match server_config(rustls_cfg) {
-        Ok(c) => Arc::new(c),
-        Err(e) => {
-            tracing::error!(core, error = %e, "uring h3: server config build failed");
-            return;
-        }
-    };
-    let mut rt = super::build_core_runtime().expect("build monoio io_uring runtime");
-    rt.block_on(async move {
-        let udp = match UdpSocket::from_std(std_sock) {
-            Ok(u) => u,
-            Err(e) => {
-                tracing::error!(core, error = %e, "uring h3: adopt reuseport udp failed");
-                return;
-            }
-        };
-        let endpoint = Endpoint::new(
-            Arc::new(EndpointConfig::default()),
-            Some(server_cfg),
-            true,
-            None,
-        );
-        tracing::info!(
-            core,
-            "uring h3: per-core quinn-proto endpoint serving (fixed-response smoke)"
-        );
-        // Fixed-response handler (the original smoke behavior).
-        let smoke = |_bytes: Bytes, _cc: bool, _peer: SocketAddr| async { h3_response_bytes() };
-        if let Err(e) = endpoint_loop(udp, endpoint, smoke).await {
-            tracing::error!(core, error = %e, "uring h3: endpoint loop ended");
-        }
-    });
 }
 
 /// Per-connection HTTP/3 state.
@@ -692,6 +692,7 @@ struct H3State {
     handshake_slot: Option<super::ConnectionPermit>,
     accepted_at: Option<Instant>,
     serving_view: Option<crate::serving_generation::ServingView>,
+    request_engine: Option<H3RequestEngine>,
     connected: bool,
     control_setup: bool,
     control_stream: Option<StreamId>,
@@ -764,6 +765,12 @@ struct H3State {
     /// as the peer grants more window (`StreamEvent::Writable`). Without this, a large
     /// response is silently truncated to the first window.
     pending: std::collections::HashMap<StreamId, PendingSend>,
+    /// Response FINs accepted by QUIC but not yet fully acknowledged. An empty
+    /// application queue does not mean QUIC sent every byte: congestion/pacing
+    /// can leave a whole buffered response queued inside the transport. Only
+    /// client-initiated bidi streams belong here, never permanent H3 control or
+    /// QPACK streams. The peer's MAX_STREAMS bound also bounds these live sends.
+    response_fins: std::collections::HashSet<StreamId>,
     /// Live `header_read_timeout`, refreshed per drive: how long a response may wait
     /// on the peer's flow-control credit without [`SEND_STALL_MIN_PROGRESS`] progress.
     send_stall_timeout: Option<Duration>,
@@ -1097,6 +1104,14 @@ enum CompletionKind {
         Option<hj_core::ResponseCompletion>,
         Option<H3EgressLease>,
     ),
+    /// Buffered body retains its original shared allocation. The driver queues
+    /// HEADERS and an inline DATA prefix without copying the payload into wire storage.
+    Buffered {
+        head: Vec<u8>,
+        body: Bytes,
+        completion: Option<hj_core::ResponseCompletion>,
+        lease: Option<H3EgressLease>,
+    },
     /// HEADERS frame only; DATA `Chunk`s follow. The stream stays open until `Chunk{fin}`.
     Head(
         Vec<u8>,
@@ -1116,8 +1131,8 @@ enum CompletionKind {
     Abort(u32),
 }
 
-/// A response buffered in the driver awaiting the QUIC flow-control window. Parts retain an
-/// offset rather than deleting their written prefix, so partial writes never memmove a body.
+/// A response buffered in the driver awaiting the QUIC flow-control window. Parts advance
+/// shared Bytes handles, so partial writes never copy or memmove a body.
 /// Streamed DATA keeps the bridge's original `Bytes` and an inline frame header, avoiding both
 /// copies formerly made while framing and appending each chunk.
 struct PendingSend {
@@ -1161,6 +1176,42 @@ fn advance_send_stall(
     }
 }
 impl PendingSend {
+    fn buffered(
+        head: Vec<u8>,
+        body: Bytes,
+        completion: Option<hj_core::ResponseCompletion>,
+        lease: Option<H3EgressLease>,
+    ) -> Self {
+        let mut parts = std::collections::VecDeque::with_capacity(2);
+        if body.is_empty() {
+            parts.push_back(PendingPart::contiguous(head, lease));
+        } else {
+            let (head, body) = match lease {
+                Some(lease) => {
+                    let lease = Arc::new(lease);
+                    (
+                        h3_bytes_with_lease(Bytes::from(head), lease.clone()),
+                        h3_bytes_with_lease(body, lease),
+                    )
+                }
+                None => (Bytes::from(head), body),
+            };
+            // ACKs can retire DATA before a lost HEADERS packet. Either original
+            // allocation must retain the combined reservation independently.
+            parts.push_back(PendingPart::Contiguous {
+                data: head,
+                ack: None,
+            });
+            parts.push_back(PendingPart::data_frame(body, None, None));
+        }
+        Self {
+            completion,
+            parts,
+            fin: true,
+            stall: None,
+        }
+    }
+
     /// Report completion only after every queued byte has entered QUIC and its
     /// FIN is accepted. This is not acknowledgement by the remote application.
     fn finish_if_drained(&mut self, finish: impl FnOnce() -> bool) -> bool {
@@ -1182,28 +1233,22 @@ impl PendingSend {
 enum PendingPart {
     Contiguous {
         data: Bytes,
-        off: usize,
         ack: Option<flume::Sender<()>>,
-        _lease: Option<H3EgressLease>,
     },
     DataFrame {
         header: [u8; 16],
         header_len: usize,
         header_off: usize,
         data: Bytes,
-        data_off: usize,
         ack: Option<flume::Sender<()>>,
-        _lease: Option<H3EgressLease>,
     },
 }
 
 impl PendingPart {
     fn contiguous(data: Vec<u8>, lease: Option<H3EgressLease>) -> Self {
         Self::Contiguous {
-            data: Bytes::from(data),
-            off: 0,
+            data: leased_h3_bytes(Bytes::from(data), lease),
             ack: None,
-            _lease: lease,
         }
     }
 
@@ -1220,10 +1265,8 @@ impl PendingPart {
             header,
             header_len,
             header_off: 0,
-            data,
-            data_off: 0,
+            data: leased_h3_bytes(data, lease),
             ack,
-            _lease: lease,
         }
     }
 
@@ -1256,10 +1299,9 @@ impl PendingPart {
         sent: &mut u64,
     ) -> Result<bool, WriteError> {
         match self {
-            Self::Contiguous { data, off, .. } => {
-                while *off < data.len() {
-                    let n = stream.write(&data[*off..])?;
-                    *off += n;
+            Self::Contiguous { data, .. } => {
+                while !data.is_empty() {
+                    let n = stream.write_chunks(std::slice::from_mut(data))?.bytes;
                     *sent += n as u64;
                     if n == 0 {
                         return Ok(false);
@@ -1272,7 +1314,6 @@ impl PendingPart {
                 header_len,
                 header_off,
                 data,
-                data_off,
                 ..
             } => {
                 while *header_off < *header_len {
@@ -1283,9 +1324,8 @@ impl PendingPart {
                         return Ok(false);
                     }
                 }
-                while *data_off < data.len() {
-                    let n = stream.write(&data[*data_off..])?;
-                    *data_off += n;
+                while !data.is_empty() {
+                    let n = stream.write_chunks(std::slice::from_mut(data))?.bytes;
                     *sent += n as u64;
                     if n == 0 {
                         return Ok(false);
@@ -1340,6 +1380,7 @@ fn cancel_dispatched_request(st: &mut H3State, id: StreamId) {
         token.cancel();
     }
     st.pending.remove(&id);
+    st.response_fins.remove(&id);
 }
 
 fn cancel_all_dispatched_requests(st: &mut H3State) {
@@ -1347,6 +1388,7 @@ fn cancel_all_dispatched_requests(st: &mut H3State) {
         token.cancel();
     }
     st.pending.clear();
+    st.response_fins.clear();
 }
 
 fn reject_stopped_local_critical_stream(
@@ -1514,29 +1556,6 @@ fn qpack_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
         return;
     }
     qpack_literal(out, name.as_bytes(), value);
-}
-
-/// The fixed HTTP/3 response (HEADERS frame with a QPACK field section + DATA
-/// frame) — the H3 echo-level analog of the H1/H2 smoke responses.
-fn h3_response_bytes() -> Vec<u8> {
-    let body: &[u8] = b"httpjet-uring-h3\n";
-    let mut field = Vec::new();
-    field.extend_from_slice(&[0x00, 0x00]); // QPACK field section prefix: RIC=0, Base=0
-    qpack_literal(&mut field, b":status", b"200");
-    qpack_literal(&mut field, b"content-type", b"text/plain");
-    qpack_literal(
-        &mut field,
-        b"content-length",
-        body.len().to_string().as_bytes(),
-    );
-    let mut out = Vec::new();
-    write_varint(&mut out, 0x01); // HEADERS frame
-    write_varint(&mut out, field.len() as u64);
-    out.extend_from_slice(&field);
-    write_varint(&mut out, 0x00); // DATA frame
-    write_varint(&mut out, body.len() as u64);
-    out.extend_from_slice(body);
-    out
 }
 
 /// How a `read_stream` pass ended.
@@ -2388,8 +2407,7 @@ fn service_peer_uni(
 }
 
 async fn send_endpoint_datagram(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
+    udp: &IoUringDatagram,
     payload: &[u8],
     destination: SocketAddr,
     src_ip: Option<std::net::IpAddr>,
@@ -2404,115 +2422,7 @@ async fn send_endpoint_datagram(
         segment_size: None,
         src_ip,
     };
-    loop {
-        // SAFETY: `udp` owns the fd and outlives this borrow.
-        let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
-        match udp_state.try_send(UdpSockRef::from(&bfd), &transmit) {
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if udp.writable(false).await.is_err() {
-                    return;
-                }
-            }
-            _ => return,
-        }
-    }
-}
-
-/// The per-core datagram loop. On loopback, QUIC is driven by the packet exchange
-/// (client Initial → our response → ...), so servicing connection timers after each
-/// received datagram suffices for handshake + request/response; precise timer
-/// scheduling (idle/retransmit on a quiet link) is a later refinement.
-async fn endpoint_loop<H, Fut>(
-    udp: UdpSocket,
-    mut endpoint: Endpoint,
-    handle_request: H,
-) -> io::Result<()>
-where
-    H: Fn(Bytes, bool, SocketAddr) -> Fut,
-    Fut: std::future::Future<Output = Vec<u8>>,
-{
-    let mut conns: HashMap<ConnectionHandle, quinn_proto::Connection> = HashMap::new();
-    let mut h3: HashMap<ConnectionHandle, H3State> = HashMap::new();
-    let mut scratch: Vec<u8> = Vec::with_capacity(MAX_DATAGRAM);
-    let mut tx_scratch: Vec<u8> = Vec::with_capacity(MAX_DATAGRAM);
-    let udp_state = {
-        let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
-        UdpSocketState::new(UdpSockRef::from(&bfd))?
-    };
-    // Reused across recvs — monoio's recv_from takes the buffer by value and hands it
-    // back, so threading one buffer avoids a per-datagram heap allocation.
-    let mut recv_buf: Vec<u8> = vec![0u8; MAX_DATAGRAM];
-    loop {
-        crate::memtrim::collect_if_requested_on_thread();
-        let (res, buf) = udp.recv_from(recv_buf).await;
-        recv_buf = buf;
-        let (n, remote) = match res {
-            Ok(v) => v,
-            Err(e) => return Err(e),
-        };
-        let now = Instant::now();
-        let data = BytesMut::from(&recv_buf[..n]);
-        scratch.clear();
-        if let Some(ev) = endpoint.handle(now, remote, None, None, data, &mut scratch) {
-            match ev {
-                DatagramEvent::Response(t) => {
-                    send_endpoint_datagram(
-                        &udp,
-                        &udp_state,
-                        &scratch[..t.size],
-                        t.destination,
-                        t.src_ip,
-                    )
-                    .await;
-                }
-                DatagramEvent::NewConnection(incoming) => {
-                    scratch.clear();
-                    match endpoint.accept(incoming, now, &mut scratch, None) {
-                        Ok((handle, conn)) => {
-                            conns.insert(handle, conn);
-                            h3.insert(handle, H3State::default());
-                        }
-                        Err(e) => {
-                            if let Some(t) = e.response {
-                                send_endpoint_datagram(
-                                    &udp,
-                                    &udp_state,
-                                    &scratch[..t.size],
-                                    t.destination,
-                                    t.src_ip,
-                                )
-                                .await;
-                            }
-                            tracing::debug!(error = ?e.cause, "uring h3: accept rejected");
-                        }
-                    }
-                }
-                DatagramEvent::ConnectionEvent(handle, cev) => {
-                    if let Some(conn) = conns.get_mut(&handle) {
-                        conn.handle_event(cev);
-                    }
-                }
-            }
-        }
-        drive_connections(
-            &udp,
-            &udp_state,
-            &mut endpoint,
-            &mut conns,
-            &mut h3,
-            now,
-            &handle_request,
-            &mut tx_scratch,
-        )
-        .await;
-        conns.retain(|hd, c| {
-            let drained = c.is_drained();
-            if drained {
-                h3.remove(hd);
-            }
-            !drained
-        });
-    }
+    let _ = udp.send(&transmit).await;
 }
 
 const LOCAL_CONTROL_PREFIX: &[u8] = &[0x00, 0x04, 0x00];
@@ -2595,7 +2505,7 @@ fn pump_local_h3_setup<I: LocalUniIo>(io: &mut I, st: &mut H3State) -> Result<()
     Ok(())
 }
 
-/// Service one connection's non-request I/O (shared by the smoke + concurrent drivers):
+/// Service one connection's non-request I/O in the concurrent packet engine:
 /// a due timeout, the endpoint↔connection event feedback loop, app events (Connected →
 /// open the HTTP/3 control + QPACK streams + SETTINGS per RFC 9114 §6.2), and accept +
 /// drain client uni (control/QPACK) streams + accept new request bidi streams. Request
@@ -2705,6 +2615,9 @@ fn service_conn(
             Event::Stream(StreamEvent::Writable { id }) => writable.push(id),
             Event::Stream(StreamEvent::Readable { id }) => readable.push(id),
             Event::Stream(StreamEvent::Stopped { id, .. }) => stopped.push(id),
+            Event::Stream(StreamEvent::Finished { id }) => {
+                st.response_fins.remove(&id);
+            }
             Event::ConnectionLost { .. } => connection_lost = true,
             _ => {}
         }
@@ -2949,35 +2862,32 @@ fn certificate_chain_present(certificates: &[rustls::pki_types::CertificateDer<'
     !certificates.is_empty()
 }
 
-/// GSO segments per `poll_transmit` and datagrams per flush — mirrors quinn's own driver
-/// (`MAX_TRANSMIT_SEGMENTS` / `MAX_TRANSMIT_DATAGRAMS`). The point is NOT batch size — it's
-/// that draining the WHOLE congestion window in one synchronous burst (our old behavior, GSO
+/// Datagrams per cooperative flush, matching Quinn's driver budget. GSO grouping
+/// is selected at startup (default10, experimental20). Draining the
+/// WHOLE congestion window in one synchronous burst (our old behavior, GSO
 /// 64, loop-until-None) starves incoming ACK processing, so quinn-proto's loss detection
 /// misfires → spurious loss → cwnd collapse (measured ~48% "loss" on large transfers). Sending
 /// a bounded chunk then RETURNING lets the loop process ACKs (recv arm) before sending more,
 /// exactly like quinn's send/yield interleave. Returns true if more remains (caller re-drives).
-const MAX_TX_SEGMENTS: usize = 10;
 const MAX_TX_DATAGRAMS: usize = 20;
 
-/// Read per transmit, never cached: quinn-udp drops its GSO cap to 1 after a
-/// segmented send fails with EIO/EINVAL (IPsec, no checksum offload), and every
-/// later multi-segment transmit would fail the same way (#1048).
-fn tx_segment_cap(udp_state: &UdpSocketState) -> usize {
-    udp_state.max_gso_segments().clamp(1, MAX_TX_SEGMENTS)
-}
-
 async fn flush_conn(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
+    udp: &IoUringDatagram,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     hd: ConnectionHandle,
     now: Instant,
     tbuf: &mut Vec<u8>,
 ) -> bool {
+    if udp.batch_enabled() {
+        return flush_conn_batched(udp, conns, hd, now, tbuf);
+    }
     let mut datagrams = 0usize;
     loop {
         tbuf.clear();
-        let seg_cap = tx_segment_cap(udp_state);
+        // Count individual datagrams, not send syscalls. A larger GSO batch
+        // never extends the existing cooperative budget, including after an
+        // earlier short batch. Quinn still enforces cwnd/pacing per datagram.
+        let seg_cap = udp.transmit_segment_cap(MAX_TX_DATAGRAMS - datagrams);
         let t = match conns
             .get_mut(&hd)
             .and_then(|c| c.poll_transmit(now, seg_cap, tbuf))
@@ -2997,17 +2907,8 @@ async fn flush_conn(
             segment_size: t.segment_size,
             src_ip: t.src_ip,
         };
-        loop {
-            let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
-            match udp_state.try_send(UdpSockRef::from(&bfd), &transmit) {
-                Ok(()) => break,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if udp.writable(false).await.is_err() {
-                        return false;
-                    }
-                }
-                Err(_) => break, // drop this transmit; QUIC loss recovery retransmits
-            }
+        if udp.send(&transmit).await == SendOutcome::Unavailable {
+            return false;
         }
         if datagrams >= MAX_TX_DATAGRAMS {
             return true; // more may remain — yield so ACKs are processed before sending more
@@ -3015,71 +2916,45 @@ async fn flush_conn(
     }
 }
 
-/// The SMOKE driver (fixed-response A/B): service each connection, serve request streams
-/// INLINE (await the handler in the connection loop — serializes requests per core), flush.
-/// The production path is [`drive_connections_concurrent`].
-#[allow(clippy::too_many_arguments)]
-async fn drive_connections<H, Fut>(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
-    endpoint: &mut Endpoint,
+/// Gather one connection's existing cooperative budget into owned buffers.
+/// A short send or EAGAIN retains the unaccepted prefix in the endpoint queue;
+/// it never asks Quinn to regenerate packets already removed by poll_transmit.
+fn flush_conn_batched(
+    udp: &IoUringDatagram,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &mut HashMap<ConnectionHandle, H3State>,
+    hd: ConnectionHandle,
     now: Instant,
-    handle_request: &H,
-    tx_scratch: &mut Vec<u8>,
-) where
-    H: Fn(Bytes, bool, SocketAddr) -> Fut,
-    Fut: std::future::Future<Output = Vec<u8>>,
-{
-    let handles: Vec<ConnectionHandle> = conns.keys().copied().collect();
-    for hd in handles {
-        // The fixed-response smoke driver has no ServerState/config generation;
-        // production deadlines are enforced by endpoint_loop_concurrent below.
-        let smoke_config =
-            H3RequestConfig::new(H3RequestLimits::new(64 * 1024, MAX_H3_REQ_BYTES), None);
-        service_conn(endpoint, conns, h3, hd, now, true, smoke_config);
-        if h3.get(&hd).is_some_and(|state| state.rejected) {
-            flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
-            continue;
-        }
-        let st = h3.entry(hd).or_default();
-        let finished = match conns.get_mut(&hd) {
-            Some(c) => receive_request_streams(c, st, now),
-            None => Vec::new(),
-        };
-        if st.rejected {
-            for id in finished {
-                reclaim_request(st, id);
-            }
-        } else {
-            for id in finished {
-                let req_bytes = reclaim_request(st, id);
-                let peer = conns
-                    .get(&hd)
-                    .map(|c| c.remote_address())
-                    .unwrap_or_else(|| "0.0.0.0:0".parse().unwrap());
-                let has_client_cert = conns
-                    .get(&hd)
-                    .map(|c| c.crypto_session().peer_identity().is_some())
-                    .unwrap_or(false);
-                let resp = handle_request(req_bytes, has_client_cert, peer).await;
-                if let Some(c) = conns.get_mut(&hd) {
-                    let mut ss = c.send_stream(id);
-                    let _ = ss.write(&resp);
-                    let _ = ss.finish();
-                }
-            }
-        }
-        flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
+    tbuf: &mut Vec<u8>,
+) -> bool {
+    if udp.has_pending_sends() {
+        // Completing the previous flush consumes this turn's send budget.
+        udp.flush_pending();
+        return true;
     }
-}
-
-/// A future that resolves at `deadline` (a quinn-proto timer), or never if `None`.
-async fn sleep_until_opt(deadline: Option<Instant>, now: Instant) {
-    match deadline {
-        Some(t) => monoio::time::sleep(t.saturating_duration_since(now)).await,
-        None => std::future::pending::<()>().await,
+    let mut datagrams = 0;
+    loop {
+        tbuf.clear();
+        let cap = udp.transmit_segment_cap(MAX_TX_DATAGRAMS - datagrams);
+        let transmit = conns.get_mut(&hd).and_then(|conn| {
+            // Each pooled wire buffer is bounded at 64 KiB, even if a path
+            // discovers a jumbo MTU. Quinn's MTU probes remain single datagrams.
+            let cap = cap.min(MAX_DATAGRAM / usize::from(conn.current_mtu()).max(1));
+            conn.poll_transmit(now, cap.max(1), tbuf)
+        });
+        let Some(transmit) = transmit else {
+            // Flush a short batch promptly: no deadline or another connection
+            // is needed to release the final packet.
+            return !udp.flush_pending();
+        };
+        datagrams += transmit
+            .segment_size
+            .map_or(1, |size| transmit.size.div_ceil(size));
+        udp.queue_transmit(transmit, tbuf);
+        if !udp.batch_has_room() || datagrams >= MAX_TX_DATAGRAMS {
+            if !udp.flush_pending() || datagrams >= MAX_TX_DATAGRAMS {
+                return true;
+            }
+        }
     }
 }
 
@@ -3109,10 +2984,14 @@ fn pump_stream(conn: &mut quinn_proto::Connection, st: &mut H3State, id: StreamI
     };
     let mut ss = conn.send_stream(id);
     let mut cancelled = false;
+    let mut fin_accepted = false;
     let mut sent = 0u64;
     let done = loop {
         let Some(part) = entry.parts.front_mut() else {
-            break entry.finish_if_drained(|| ss.finish().is_ok());
+            break entry.finish_if_drained(|| {
+                fin_accepted = ss.finish().is_ok();
+                fin_accepted
+            });
         };
         match part.write(&mut ss, &mut sent) {
             Ok(true) => {
@@ -3132,6 +3011,9 @@ fn pump_stream(conn: &mut quinn_proto::Connection, st: &mut H3State, id: StreamI
         cancel_dispatched_request(st, id);
     } else if done {
         st.pending.remove(&id);
+        if fin_accepted && id.dir() == Dir::Bi && id.initiator() == quinn_proto::Side::Client {
+            st.response_fins.insert(id);
+        }
     } else {
         entry.stall =
             advance_send_stall(entry.stall, sent, !entry.parts.is_empty(), Instant::now());
@@ -3195,6 +3077,16 @@ fn write_completion(
                 },
             );
         }
+        CompletionKind::Buffered {
+            head,
+            body,
+            completion,
+            lease,
+        } => {
+            st.request_cancellations.remove(&stream);
+            st.pending
+                .insert(stream, PendingSend::buffered(head, body, completion, lease));
+        }
         // HEADERS of a streamed response: DATA chunks follow, so don't finish yet.
         CompletionKind::Head(head, completion, lease) => {
             st.pending.insert(
@@ -3232,6 +3124,7 @@ fn write_completion(
         // peer sees the body was truncated (mirrors the H1 path).
         CompletionKind::Abort(code) => {
             st.request_cancellations.remove(&stream);
+            st.response_fins.remove(&stream);
             if let Some(mut pending) = st.pending.remove(&stream) {
                 if let Some(completion) = pending.completion.take() {
                     completion.finish(hj_core::ResponseEnd::Error);
@@ -3384,8 +3277,7 @@ fn refuse_request_stream(
 /// large-transfer throughput to ~0.34× tokio/quinn).
 #[allow(clippy::too_many_arguments)]
 async fn drive_one_conn(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
+    udp: &IoUringDatagram,
     endpoint: &mut Endpoint,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     h3: &mut HashMap<ConnectionHandle, H3State>,
@@ -3395,6 +3287,8 @@ async fn drive_one_conn(
     bridge: &Bridge,
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     comp_tx: &flume::Sender<Completion>,
+    comp_rx: &flume::Receiver<Completion>,
+    other_work: &mut std::collections::HashSet<ConnectionHandle>,
     fallback_request_config: H3RequestConfig,
     accepting_requests: bool,
     tx_scratch: &mut Vec<u8>,
@@ -3416,7 +3310,7 @@ async fn drive_one_conn(
             cancel_all_dispatched_requests(state);
             reclaim_buffered_requests(state);
         }
-        return flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
+        return flush_conn(udp, conns, hd, now, tx_scratch).await;
     }
     let epoch = h3.get(&hd).map(|s| s.epoch).unwrap_or(0);
     let st = h3.entry(hd).or_default();
@@ -3452,8 +3346,9 @@ async fn drive_one_conn(
         }
         cancel_all_dispatched_requests(st);
         reclaim_buffered_requests(st);
-        return flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
+        return flush_conn(udp, conns, hd, now, tx_scratch).await;
     }
+    let mut inline_budget = InlineBudget::default();
     for id in finished {
         let TakenRequest {
             body: req_body,
@@ -3505,6 +3400,10 @@ async fn drive_one_conn(
         let tx = comp_tx.clone();
         let request_limits = request_snapshot.config.limits;
         let request_generation = request_snapshot.generation;
+        let request_engine = st.request_engine.clone();
+        let inline = request_engine
+            .as_ref()
+            .is_some_and(H3RequestEngine::allows_inline);
         // spawn() is synchronous (no await) — `st`'s borrow of `h3` is not held across an await.
         let work = async move {
             let _g = guard; // frees the in-flight slot on completion / drop / panic
@@ -3529,6 +3428,7 @@ async fn drive_one_conn(
                 client_auth,
                 request_limits,
                 request_generation,
+                request_engine.as_ref(),
                 egress_budget.clone(),
                 peer_max_field_section,
             )
@@ -3541,6 +3441,16 @@ async fn drive_one_conn(
                         send(CompletionKind::Full(data, completion, lease))
                             .await
                             .map_err(|_| ())?;
+                    }
+                    H3Body::Buffered { head, body, lease } => {
+                        send(CompletionKind::Buffered {
+                            head,
+                            body,
+                            completion,
+                            lease,
+                        })
+                        .await
+                        .map_err(|_| ())?;
                     }
                     H3Body::Stream {
                         head,
@@ -3621,9 +3531,28 @@ async fn drive_one_conn(
             }
             .await;
         };
-        monoio::spawn(run_cancelable_request(cancel, work));
+        dispatch_work(
+            run_cancelable_request(cancel, work),
+            inline,
+            &mut inline_budget,
+        )
+        .await;
     }
-    flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await
+    // Requests that finished inline above already sit in the completion channel.
+    // Writing them now lets their responses leave in this flush rather than an
+    // ACK-only datagram now and the responses only after the whole pump. The
+    // channel is drained in order, so a stream's completions keep their order.
+    for _ in 0..MAX_COMPLETION_DRAIN_BATCH {
+        let Ok(c) = comp_rx.try_recv() else {
+            break;
+        };
+        let owner = c.conn;
+        write_completion(conns, h3, c);
+        if owner != hd {
+            other_work.insert(owner);
+        }
+    }
+    flush_conn(udp, conns, hd, now, tx_scratch).await
 }
 
 /// recvmmsg slots: fixed, initialized storage the kernel writes into on every pass.
@@ -3649,13 +3578,12 @@ fn received_segments(message: &[u8], stride: usize) -> impl Iterator<Item = Byte
 }
 
 /// Non-blocking GRO drain: pull up to [`MAX_RECV_DRAIN_BATCHES`] batches (recvmmsg into
-/// reused slots, GRO-coalesced, split by `stride`), feed quinn-proto, and return the set
-/// of connections that got new state. Connections whose absolute request deadline became
-/// due during the bounded drain are included so the caller drives them immediately.
+/// reused slots, GRO-coalesced, split by `stride`), feed quinn-proto, and merge affected
+/// connections into the caller's pending work. Include absolute request deadlines that
+/// became due during the bounded drain so the caller drives them immediately.
 #[allow(clippy::too_many_arguments)]
 async fn recv_drain(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
+    udp: &IoUringDatagram,
     recv_bufs: &mut RecvSlots,
     recv_metas: &mut [quinn_udp::RecvMeta; GRO_BATCH],
     scratch: &mut Vec<u8>,
@@ -3669,16 +3597,13 @@ async fn recv_drain(
     policy: &QuicServerPolicy,
     accepting_connections: bool,
     now: Instant,
-) -> std::collections::HashSet<ConnectionHandle> {
-    let mut affected: std::collections::HashSet<ConnectionHandle> =
-        std::collections::HashSet::new();
+    affected: &mut std::collections::HashSet<ConnectionHandle>,
+) {
     let mut completed_batches = 0;
     loop {
         let nmsg = {
             let mut iov = recv_iovecs(recv_bufs);
-            // SAFETY: `udp` owns the fd and outlives this borrow.
-            let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
-            match udp_state.recv(UdpSockRef::from(&bfd), &mut iov, recv_metas) {
+            match udp.recv(&mut iov, recv_metas) {
                 Ok(n) => n,
                 Err(_) => break, // WouldBlock (drained) or error → stop
             }
@@ -3701,7 +3626,6 @@ async fn recv_drain(
                         DatagramEvent::Response(t) => {
                             send_endpoint_datagram(
                                 udp,
-                                udp_state,
                                 &scratch[..t.size],
                                 t.destination,
                                 t.src_ip,
@@ -3732,7 +3656,6 @@ async fn recv_drain(
                                 Admission::Transmit(transmit) => {
                                     send_endpoint_datagram(
                                         udp,
-                                        udp_state,
                                         &scratch[..transmit.size],
                                         transmit.destination,
                                         transmit.src_ip,
@@ -3756,8 +3679,7 @@ async fn recv_drain(
             break; // short batch drained the socket; full batches stop at the cooperative cap
         }
     }
-    deadlines.extend_due(&mut affected, Instant::now());
-    affected
+    deadlines.extend_due(affected, Instant::now());
 }
 
 /// Cooperative send/recv pump (mirrors quinn's drive_transmit + wake_by_ref interleave):
@@ -3765,11 +3687,11 @@ async fn recv_drain(
 /// any ACKs those sends elicited, and repeat — so a connection streams its whole
 /// congestion-window of data back-to-back WITHOUT a per-chunk RTT wait, while ACK processing
 /// stays interleaved so loss detection doesn't misfire. Bounded by `MAX_PUMP_ROUNDS` so one
-/// connection can't monopolize the core; the remainder resumes on the next readiness wake.
+/// connection can't monopolize the core; the endpoint retains the remainder and
+/// resumes it after a cooperative yield or another input/completion event.
 #[allow(clippy::too_many_arguments)]
-async fn pump(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
+async fn pump<const ROUND_LIMIT: usize>(
+    udp: &IoUringDatagram,
     recv_bufs: &mut RecvSlots,
     recv_metas: &mut [quinn_udp::RecvMeta; GRO_BATCH],
     scratch: &mut Vec<u8>,
@@ -3784,18 +3706,18 @@ async fn pump(
     bridge: &Bridge,
     local: SocketAddr,
     comp_tx: &flume::Sender<Completion>,
+    comp_rx: &flume::Receiver<Completion>,
     runtime: &H3RuntimeConfig,
     policy: &QuicServerPolicy,
     accepting: bool,
-    mut to_drive: std::collections::HashSet<ConnectionHandle>,
+    to_drive: &mut std::collections::HashSet<ConnectionHandle>,
 ) {
-    const MAX_PUMP_ROUNDS: usize = 64;
     let mut rounds = 0;
     let mut touched: Vec<ConnectionHandle> = Vec::new();
-    while !to_drive.is_empty() && rounds < MAX_PUMP_ROUNDS {
+    let mut next = std::collections::HashSet::new();
+    while !to_drive.is_empty() && rounds < ROUND_LIMIT {
         rounds += 1;
-        let mut next: std::collections::HashSet<ConnectionHandle> =
-            std::collections::HashSet::new();
+        next.clear();
         for hd in to_drive.drain() {
             touched.push(hd);
             // Earlier handles can await UDP writability. Refresh the clock per
@@ -3804,7 +3726,6 @@ async fn pump(
             let now = Instant::now();
             let more_to_send = drive_one_conn(
                 udp,
-                udp_state,
                 endpoint,
                 conns,
                 h3,
@@ -3814,6 +3735,8 @@ async fn pump(
                 bridge,
                 inflight,
                 comp_tx,
+                comp_rx,
+                &mut next,
                 runtime.request_config(),
                 accepting,
                 tx_scratch,
@@ -3826,22 +3749,26 @@ async fn pump(
         }
         // Process ACKs our sends elicited so cwnd/loss-detection stay current.
         let now = Instant::now();
-        for hd in recv_drain(
-            udp, udp_state, recv_bufs, recv_metas, scratch, endpoint, conns, h3, deadlines,
-            epoch_ctr, handshakes, runtime, policy, accepting, now,
+        recv_drain(
+            udp, recv_bufs, recv_metas, scratch, endpoint, conns, h3, deadlines, epoch_ctr,
+            handshakes, runtime, policy, accepting, now, &mut next,
         )
-        .await
-        {
-            next.insert(hd);
+        .await;
+        std::mem::swap(to_drive, &mut next);
+        if udp.send_blocked() {
+            // Pending work and payloads survive until the socket-writable arm;
+            // the endpoint can still process RX, shutdown and absolute timers.
+            break;
         }
-        to_drive = next;
     }
     // A deadline can become due in recv_drain() after the final cooperative
     // round, and that drain's events can move a QUIC timer. extend_due() removes
     // a due node while adding the handle to `to_drive`; if the round cap then ends
     // the loop, re-sync every such handle so the endpoint's outer pre-select check
-    // (or its timer) drives it. Transmit work keeps the pre-existing wakeup path.
-    for hd in &to_drive {
+    // (or its timer) drives it. The endpoint owns `to_drive`, so queued Writable
+    // events and transmit work also survive the cap even without another packet
+    // or a near QUIC timer. Its cooperative select arm resumes that local work.
+    for hd in to_drive.iter() {
         deadlines.sync(*hd, connection_deadline(conns, h3, *hd));
     }
     touched.extend(to_drive.iter().copied());
@@ -3867,11 +3794,38 @@ async fn pump(
         touched
     };
     for hd in drained {
-        if conns.remove(&hd).is_some() {
+        if let Some(conn) = conns.remove(&hd) {
+            tracing::debug!(connection = hd.0, peer = %conn.remote_address(), stats = ?conn.stats(), "H3 transport final stats");
             h3.remove(&hd);
             deadlines.remove(hd);
+            to_drive.remove(&hd);
         }
     }
+}
+
+/// A capped pump retains runnable work. Yield once before resuming it so request
+/// tasks can run and the select's higher-priority input/completion arms can win.
+/// An empty queue never self-wakes: flow-control-blocked connections wait for
+/// genuine credit or timer events instead of spinning.
+async fn pending_work_wait(has_pending: bool) {
+    if !has_pending {
+        return std::future::pending().await;
+    }
+    yield_to_queued_tasks().await;
+}
+
+async fn yield_to_queued_tasks() {
+    // A self-wake puts a running Monoio task at the queue's front. Awaiting a
+    // queued marker lets earlier request tasks run before waking this endpoint.
+    monoio::spawn(async {}).await;
+}
+
+/// An overdue pump can complete synchronously and leave another deadline due. Yield
+/// before taking that continuation so spawned request tasks get their first poll even
+/// when the endpoint never reaches the select's socket wait or pending-work branch.
+async fn complete_overdue_pump(pump: impl std::future::Future<Output = ()>) {
+    pump.await;
+    yield_to_queued_tasks().await;
 }
 
 /// How often [`pump`] also checks every connection for a drained one (see its end).
@@ -3891,13 +3845,13 @@ fn h3_drain_complete(
         && h3.values().all(|state| {
             state.requests.is_empty()
                 && state.pending.is_empty()
+                && state.response_fins.is_empty()
                 && state.total_req_bytes.get() == 0
         })
 }
 
 async fn close_h3_connections(
-    udp: &UdpSocket,
-    udp_state: &UdpSocketState,
+    udp: &IoUringDatagram,
     conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
     reason: &'static [u8],
     tx_scratch: &mut Vec<u8>,
@@ -3906,13 +3860,14 @@ async fn close_h3_connections(
     let handles: Vec<ConnectionHandle> = conns.keys().copied().collect();
     for hd in handles {
         if let Some(conn) = conns.get_mut(&hd) {
+            tracing::debug!(connection = hd.0, peer = %conn.remote_address(), stats = ?conn.stats(), "H3 transport final stats");
             conn.close(
                 now,
                 quinn_proto::VarInt::from_u32(0x0100),
                 bytes::Bytes::from_static(reason),
             );
         }
-        flush_conn(udp, udp_state, conns, hd, now, tx_scratch).await;
+        flush_conn(udp, conns, hd, now, tx_scratch).await;
     }
 }
 
@@ -3942,10 +3897,11 @@ async fn endpoint_loop_concurrent(
     let handshakes = Arc::new(AtomicU64::new(0));
     // quinn-udp socket state for GSO send (probes UDP_SEGMENT support once per core;
     // flush_conn re-reads the cap it may lower later).
-    let udp_state = {
-        let bfd = unsafe { BorrowedFd::borrow_raw(udp.as_raw_fd()) };
-        UdpSocketState::new(UdpSockRef::from(&bfd))?
-    };
+    let udp = IoUringDatagram::new(udp)?;
+    // Retain one poll operation across losing select branches. Recreating it
+    // when completions are continuously ready can cancel every registration
+    // before its CQE arrives. Scalar mode allocates no extra readiness future.
+    let mut writable_wait = udp.batch_enabled().then(|| Box::pin(udp.writable()));
     // GRO recv: drain many datagrams per readiness wake into reused buffers (one recvmmsg
     // returns up to GRO_BATCH messages, each GRO-coalescing up to ~64 segments). Batching ACK
     // processing into ONE flush per wake stops the send-bunching (one flush per ACK) that
@@ -3953,6 +3909,7 @@ async fn endpoint_loop_concurrent(
     let mut recv_bufs = recv_slots();
     let mut recv_metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
     let mut deadlines = ConnectionDeadlineIndex::default();
+    let mut pending_work = std::collections::HashSet::new();
     let mut draining = false;
     let mut drain_deadline: Option<Instant> = None;
     // Socket capability probing and driver allocations belong to preparation,
@@ -3968,31 +3925,25 @@ async fn endpoint_loop_concurrent(
             endpoint.set_server_config(Some(latest.config.clone()));
             policy = latest;
         }
-        if draining && h3_drain_complete(&h3, inflight.get(), comp_rx.is_empty()) {
-            close_h3_connections(&udp, &udp_state, &mut conns, b"shutdown", &mut tx_scratch).await;
+        if draining
+            && !udp.has_pending_sends()
+            && h3_drain_complete(&h3, inflight.get(), comp_rx.is_empty())
+        {
+            close_h3_connections(&udp, &mut conns, b"shutdown", &mut tx_scratch).await;
             return Ok(());
         }
         let now = Instant::now();
         if drain_deadline.is_some_and(|deadline| now >= deadline) {
-            close_h3_connections(
-                &udp,
-                &udp_state,
-                &mut conns,
-                b"drain deadline",
-                &mut tx_scratch,
-            )
-            .await;
+            close_h3_connections(&udp, &mut conns, b"drain deadline", &mut tx_scratch).await;
             return Ok(());
         }
         // The select is intentionally biased toward completions and socket input.
         // Service overdue connections before re-entering it so traffic on unrelated
         // connections cannot starve a QUIC timer or absolute deadline indefinitely.
-        let mut due = std::collections::HashSet::new();
-        deadlines.extend_due(&mut due, now);
-        if !due.is_empty() {
-            pump(
+        if deadlines.next().is_some_and(|deadline| deadline <= now) {
+            deadlines.extend_due(&mut pending_work, now);
+            complete_overdue_pump(pump::<MAX_PUMP_ROUNDS>(
                 &udp,
-                &udp_state,
                 &mut recv_bufs,
                 &mut recv_metas,
                 &mut scratch,
@@ -4007,16 +3958,17 @@ async fn endpoint_loop_concurrent(
                 &bridge,
                 local,
                 &comp_tx,
+                &comp_rx,
                 &runtime,
                 &policy,
                 !draining,
-                due,
-            )
+                &mut pending_work,
+            ))
             .await;
             continue;
         }
         let next_timeout = deadlines.next().into_iter().chain(drain_deadline).min();
-        let timer_base = Instant::now();
+        let has_pending_work = !pending_work.is_empty() && !udp.send_blocked();
         let shutdown_wait = async {
             if draining {
                 std::future::pending::<()>().await;
@@ -4032,18 +3984,34 @@ async fn endpoint_loop_concurrent(
                 draining = true;
                 let now = Instant::now();
                 drain_deadline = Some(now + super::URING_DRAIN_GRACE);
-                let handles = conns.keys().copied().collect();
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, false, handles).await;
+                pending_work.extend(conns.keys().copied());
+                pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, false, &mut pending_work).await;
+            }
+            // Queued sendmmsg payloads wait here instead of monopolizing the
+            // actor in an async send. Readiness waits carry no payload pointers.
+            // This precedes continuously-ready completion/RX branches so a
+            // blocked queue cannot starve its own readiness recovery. Pump still
+            // drains RX and the outer loop checks absolute deadlines first.
+            result = async {
+                match writable_wait.as_mut() {
+                    Some(wait) => wait.as_mut().await,
+                    None => std::future::pending::<io::Result<()>>().await,
+                }
+            }, if udp.has_pending_sends() => {
+                result?;
+                writable_wait.as_mut().expect("a queued batch has a readiness waiter")
+                    .as_mut().set(udp.writable());
+                udp.flush_pending();
+                pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, !draining, &mut pending_work).await;
             }
             // (1) Finished request(s): write each response into its stream, then pump the
             // sends (the response streams out cooperatively, interleaved with ACK processing).
             comp = comp_rx.recv_async() => {
-                let mut to_drive: std::collections::HashSet<ConnectionHandle> = std::collections::HashSet::new();
                 let mut completed = 0;
                 if let Ok(c) = comp {
                     let hd = c.conn;
                     write_completion(&mut conns, &mut h3, c);
-                    to_drive.insert(hd);
+                    pending_work.insert(hd);
                     completed = 1;
                 }
                 while completed < MAX_COMPLETION_DRAIN_BATCH {
@@ -4052,25 +4020,29 @@ async fn endpoint_loop_concurrent(
                     };
                     let hd = c.conn;
                     write_completion(&mut conns, &mut h3, c);
-                    to_drive.insert(hd);
+                    pending_work.insert(hd);
                     completed += 1;
                 }
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, to_drive).await;
+                pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, !draining, &mut pending_work).await;
             }
             // (2) Socket readable: GRO-drain queued datagrams, then pump (drive affected conns
             // + interleave further ACK processing). `readable()` is a poll op (cancel-safe).
-            _ = udp.readable(false) => {
+            _ = udp.readable() => {
                 let now = Instant::now();
-                let affected = recv_drain(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now).await;
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, affected).await;
+                recv_drain(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &runtime, &policy, !draining, now, &mut pending_work).await;
+                pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, !draining, &mut pending_work).await;
             }
             // (3) A QUIC timer (handshake retransmit / idle / pacing) or absolute
             // HTTP/3 deadline fired — pump every connection the index holds as due.
-            _ = sleep_until_opt(next_timeout, timer_base) => {
+            _ = sleep_until_opt(next_timeout) => {
                 let now = Instant::now();
-                let mut due = std::collections::HashSet::new();
-                deadlines.extend_due(&mut due, now);
-                pump(&udp, &udp_state, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &runtime, &policy, !draining, due).await;
+                deadlines.extend_due(&mut pending_work, now);
+                pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, !draining, &mut pending_work).await;
+            }
+            // (4) Locally runnable work left by the cooperative round cap. It
+            // does not depend on a fresh packet or an unrelated QUIC timeout.
+            _ = pending_work_wait(has_pending_work) => {
+                pump::<MAX_PUMP_ROUNDS>(&udp, &mut recv_bufs, &mut recv_metas, &mut scratch, &mut tx_scratch, &mut endpoint, &mut conns, &mut h3, &mut deadlines, &mut epoch_ctr, &handshakes, &inflight, &bridge, local, &comp_tx, &comp_rx, &runtime, &policy, !draining, &mut pending_work).await;
             }
         }
     }
@@ -4146,6 +4118,19 @@ fn prepare_h3_response_headers(
     hj_core::strip_hop_by_hop_response(headers);
     hj_core::sanitize_h2_h3_body_headers(headers, is_head, status, streaming_unknown_len);
     hj_core::response_body_forbidden(is_head, status)
+}
+
+/// Keep the shared allocation for whole responses, but compact a partial body.
+/// A cached byte range can be a tiny slice of a very large file; charging only
+/// the slice while retaining that backing allocation would defeat egress bounds.
+fn buffered_h3_body(status: http::StatusCode, forbidden: bool, body: Bytes) -> Bytes {
+    if forbidden {
+        Bytes::new()
+    } else if status == http::StatusCode::PARTIAL_CONTENT {
+        Bytes::copy_from_slice(&body)
+    } else {
+        body
+    }
 }
 
 /// Encode an HTTP/3 response HEADERS frame (QPACK field section using static-table
@@ -4262,6 +4247,11 @@ impl H3Outcome {
 enum H3Body {
     Full {
         data: Vec<u8>,
+        lease: Option<H3EgressLease>,
+    },
+    Buffered {
+        head: Vec<u8>,
+        body: Bytes,
         lease: Option<H3EgressLease>,
     },
     Stream {
@@ -4425,8 +4415,8 @@ fn build_h3_request_head(head: H3RequestHeaders) -> Option<http::request::Builde
     Some(builder)
 }
 
-/// Decode one io_uring-H3 request, dispatch it through the bridge (real pipeline), and
-/// encode the response. App-layer mTLS mirrors the TCP TLS path.
+/// Validate one H3 request and dispatch it through the selected application
+/// engine. App-layer mTLS and response framing are shared by both engines.
 async fn handle_h3_request(
     req_frames: H3FrameCounter,
     req_body: Vec<u8>,
@@ -4440,6 +4430,7 @@ async fn handle_h3_request(
     client_auth: crate::uring::ClientAuth,
     request_limits: H3RequestLimits,
     request_generation: Option<crate::serving_generation::RequestGeneration>,
+    request_engine: Option<&H3RequestEngine>,
     egress_budget: Option<H3EgressBudget>,
     max_field_section_size: std::rc::Rc<std::cell::Cell<Option<u64>>>,
 ) -> H3Outcome {
@@ -4529,11 +4520,11 @@ async fn handle_h3_request(
     // A HEAD response must carry no DATA (RFC 9114): even if the pipeline streams a body,
     // emit headers only and don't open a streamed body.
     let is_head = req.method() == http::Method::HEAD;
-    match bridge
-        .dispatch(req, ctx)
-        .await
-        .map(crate::uring::bridge::no_upgrade_final)
-    {
+    let response = match request_engine {
+        Some(engine) => engine.dispatch(bridge, req, ctx).await,
+        None => bridge.dispatch(req, ctx).await,
+    };
+    match response.map(crate::uring::bridge::no_upgrade_final) {
         Some(mut r) => {
             let mut completion = r.completion;
             let status = r.status;
@@ -4569,9 +4560,9 @@ async fn handle_h3_request(
                 // Small / HIT / sub-threshold dynamic bodies: buffered + sent whole — byte-identical
                 // to the previous path.
                 crate::uring::bridge::BridgeBody::Full(b) => {
-                    let body = if body_forbidden { &[][..] } else { &b[..] };
-                    let mut data = encode_h3_headers_frame(status, &headers);
-                    let retained = data.len().saturating_add(if body.is_empty() {
+                    let body = buffered_h3_body(status, body_forbidden, b);
+                    let head = encode_h3_headers_frame(status, &headers);
+                    let retained = head.len().saturating_add(if body.is_empty() {
                         0
                     } else {
                         body.len().saturating_add(16)
@@ -4587,11 +4578,12 @@ async fn handle_h3_request(
                             ));
                         }
                     };
-                    if !body.is_empty() {
-                        encode_h3_data_frame(&mut data, body);
-                    }
                     H3Outcome {
-                        body: H3Body::Full { data, lease },
+                        body: if body.is_empty() {
+                            H3Body::Full { data: head, lease }
+                        } else {
+                            H3Body::Buffered { head, body, lease }
+                        },
                         completion,
                     }
                 }
@@ -4945,6 +4937,7 @@ mod h3_codec_tests {
                 H3RequestLimits::new(4096, 4096),
                 None,
                 None,
+                None,
                 Default::default(),
             )
         };
@@ -5010,6 +5003,7 @@ mod h3_codec_tests {
             &bridge,
             crate::uring::ClientAuth::None,
             H3RequestLimits::new(4096, 4096),
+            None,
             None,
             None,
             limit,
@@ -5499,6 +5493,7 @@ mod h3_codec_tests {
             crate::uring::ClientAuth::None,
             request_snapshot.config.limits,
             request_snapshot.generation,
+            None,
             None,
             Default::default(),
         )
@@ -6437,6 +6432,7 @@ mod h3_codec_tests {
                 crate::uring::ClientAuth::None,
                 H3RequestLimits::new(4096, 4096),
                 None,
+                None,
                 Some(egress.clone()),
                 Default::default(),
             )
@@ -6468,6 +6464,178 @@ mod h3_codec_tests {
         assert_eq!(global.in_flight(), 8);
         drop(pending);
         assert_eq!(global.in_flight(), 0);
+    }
+
+    #[test]
+    fn buffered_response_retains_shared_body_and_identical_wire_frames() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/plain"),
+        );
+        let body = Bytes::from(vec![b'x'; 32 * 1024]);
+        let expected = encode_h3_response(http::StatusCode::OK, &headers, &body);
+        let body_ptr = body.as_ptr();
+        let pending = PendingSend::buffered(
+            encode_h3_headers_frame(http::StatusCode::OK, &headers),
+            body,
+            None,
+            None,
+        );
+        assert_eq!(pending.parts.len(), 2);
+        let mut wire = Vec::new();
+        for part in &pending.parts {
+            match part {
+                PendingPart::Contiguous { data, .. } => wire.extend_from_slice(data),
+                PendingPart::DataFrame {
+                    header,
+                    header_len,
+                    data,
+                    ..
+                } => {
+                    assert_eq!(data.as_ptr(), body_ptr, "cached body must not be copied");
+                    wire.extend_from_slice(&header[..*header_len]);
+                    wire.extend_from_slice(data);
+                }
+            }
+        }
+        assert_eq!(wire, expected);
+    }
+
+    #[test]
+    fn buffered_combined_lease_survives_either_transport_allocation() {
+        for retain_body in [false, true] {
+            let global = Arc::new(hj_core::budget::BodyBufferBudget::new(64));
+            let budget = H3EgressBudget::new(global.clone());
+            let pending = PendingSend::buffered(
+                vec![1, 2, 3],
+                Bytes::from_static(b"retained body"),
+                None,
+                Some(budget.reserve(32).unwrap()),
+            );
+            let retained = match &pending.parts[usize::from(retain_body)] {
+                PendingPart::Contiguous { data, .. } | PendingPart::DataFrame { data, .. } => {
+                    data.clone()
+                }
+            };
+            drop(pending);
+            assert_eq!(
+                global.in_flight(),
+                32,
+                "either lost packet can retain the reservation"
+            );
+            drop(retained);
+            assert_eq!(global.in_flight(), 0);
+        }
+    }
+
+    #[test]
+    fn partial_buffered_body_releases_large_backing_while_range_remains_queued() {
+        struct Backing {
+            bytes: Vec<u8>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl AsRef<[u8]> for Backing {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for Backing {
+            fn drop(&mut self) {
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let large = Bytes::from_owner(Backing {
+            bytes: vec![b'x'; 4 * 1024 * 1024],
+            dropped: dropped.clone(),
+        });
+        let range = large.slice(1024..1037);
+        let compact = buffered_h3_body(http::StatusCode::PARTIAL_CONTENT, false, range);
+        assert_eq!(compact, b"xxxxxxxxxxxxx"[..]);
+        drop(large);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "queued range must not retain the 4 MiB backing allocation"
+        );
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(64));
+        let budget = H3EgressBudget::new(global.clone());
+        let pending = PendingSend::buffered(
+            vec![1, 2, 3],
+            compact,
+            None,
+            Some(budget.reserve(32).unwrap()),
+        );
+        assert_eq!(global.in_flight(), 32);
+        drop(pending);
+        assert_eq!(global.in_flight(), 0);
+    }
+
+    #[test]
+    fn full_buffered_body_stays_shared_and_forbidden_body_is_empty() {
+        let body = Bytes::from(vec![b'y'; 4096]);
+        let pointer = body.as_ptr();
+        let selected = buffered_h3_body(http::StatusCode::OK, false, body);
+        assert_eq!(selected.as_ptr(), pointer, "whole body must remain shared");
+        let forbidden = buffered_h3_body(http::StatusCode::OK, true, selected);
+        assert!(forbidden.is_empty());
+    }
+
+    #[test]
+    fn buffered_response_cancellation_releases_lease_after_headers_drain() {
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(64));
+        let budget = H3EgressBudget::new(global.clone());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let completion = hj_core::ResponseCompletion::new(move |end| {
+            copy.lock().unwrap().push(end);
+        });
+        let mut pending = PendingSend::buffered(
+            vec![1, 2, 3],
+            Bytes::from_static(b"retained body"),
+            Some(completion),
+            Some(budget.reserve(32).unwrap()),
+        );
+        assert_eq!(global.in_flight(), 32);
+        assert!(acknowledge_front_part(&mut pending));
+        assert_eq!(global.in_flight(), 32, "body retains the combined lease");
+        assert!(!pending.finish_if_drained(|| panic!("DATA is still queued")));
+        drop(pending);
+        assert_eq!(global.in_flight(), 0);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![hj_core::ResponseEnd::Cancelled]
+        );
+    }
+
+    #[test]
+    fn buffered_response_completes_only_after_both_parts_and_fin() {
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(64));
+        let budget = H3EgressBudget::new(global.clone());
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copy = events.clone();
+        let completion = hj_core::ResponseCompletion::new(move |end| {
+            copy.lock().unwrap().push(end);
+        });
+        let mut pending = PendingSend::buffered(
+            vec![1, 2, 3],
+            Bytes::from_static(b"body"),
+            Some(completion),
+            Some(budget.reserve(23).unwrap()),
+        );
+        assert!(!pending.finish_if_drained(|| panic!("HEADERS are still queued")));
+        assert!(acknowledge_front_part(&mut pending));
+        assert!(!pending.finish_if_drained(|| panic!("DATA is still queued")));
+        assert!(events.lock().unwrap().is_empty());
+        assert!(acknowledge_front_part(&mut pending));
+        assert_eq!(global.in_flight(), 0);
+        assert!(pending.finish_if_drained(|| true));
+        drop(pending);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![hj_core::ResponseEnd::Complete]
+        );
     }
 
     #[test]
@@ -6982,6 +7150,45 @@ mod h3_codec_tests {
         deadlines.remove(deadline_future);
         assert!(deadlines.ordered.is_empty());
         assert!(deadlines.by_connection.is_empty());
+    }
+
+    #[test]
+    fn empty_pending_work_does_not_self_wake() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+        struct WakeCount(AtomicUsize);
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut empty = Box::pin(pending_work_wait(false));
+        assert_eq!(empty.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(empty.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn pending_work_runs_a_deferred_request_before_resuming() {
+        let resumed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut runtime = crate::uring::build_core_runtime().unwrap();
+        runtime.block_on(async {
+            for turn in 0..4 {
+                let child = resumed.clone();
+                scheduling::inline_or_spawn(async move {
+                    scheduling::defer_bridge_from_inline().await;
+                    child.set(child.get() + 1);
+                })
+                .await;
+                assert_eq!(resumed.get(), turn);
+                pending_work_wait(true).await;
+                assert_eq!(resumed.get(), turn + 1);
+            }
+        });
     }
 
     // Full H3 request stream: HEADERS frame + DATA frame -> (field section, body).
@@ -7628,6 +7835,378 @@ mod admission_tests {
     }
 
     #[test]
+    fn transferred_body_keeps_its_full_lease_until_quic_releases_it() {
+        let mut h = Harness::new(65_000);
+        let mut e = h.establish(spoofed(88), Instant::now());
+        let conn = e.conns.get_mut(&e.hd).unwrap();
+        let id = conn.streams().open(Dir::Uni).unwrap();
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(64 * 1024));
+        let budget = H3EgressBudget::new(global.clone());
+        let body = Bytes::from(vec![0x5a; 32 * 1024]);
+        let pointer = body.as_ptr();
+        let mut part =
+            PendingPart::data_frame(body, None, Some(budget.reserve(40 * 1024).unwrap()));
+        let PendingPart::DataFrame { data, .. } = &part else {
+            unreachable!()
+        };
+        assert_eq!(data.as_ptr(), pointer);
+        let mut sent = 0;
+        assert_eq!(part.write(&mut conn.send_stream(id), &mut sent), Ok(true));
+        assert!(sent > 32 * 1024);
+        drop(part);
+        assert_eq!(
+            global.in_flight(),
+            40 * 1024,
+            "QUIC retains the shared body and its lease"
+        );
+        e.conns.clear();
+        assert_eq!(
+            global.in_flight(),
+            0,
+            "connection disposal releases all retained slices"
+        );
+    }
+
+    #[test]
+    fn shared_body_partial_writes_register_credit_and_resume_without_duplicates() {
+        let mut h = Harness::new(65_000);
+        let mut transport = quinn_proto::TransportConfig::default();
+        transport.receive_window(1024u32.into());
+        transport.stream_receive_window(1024u32.into());
+        h.client_config.transport_config(Arc::new(transport));
+        let start = Instant::now();
+        let peer = spoofed(89);
+        let mut e = h.establish(peer, start);
+        let id = e
+            .conns
+            .get_mut(&e.hd)
+            .unwrap()
+            .streams()
+            .open(Dir::Uni)
+            .unwrap();
+        let body = Bytes::from(vec![0x3c; 4096]);
+        let mut expected = Vec::new();
+        encode_h3_data_frame(&mut expected, &body);
+        let mut part = PendingPart::data_frame(body, None, None);
+        let mut sent = 0;
+        assert_eq!(
+            part.write(
+                &mut e.conns.get_mut(&e.hd).unwrap().send_stream(id),
+                &mut sent
+            ),
+            Err(WriteError::Blocked)
+        );
+        assert!(sent > 0 && sent < expected.len() as u64);
+        let mut received = Vec::new();
+        let mut saw_writable = false;
+        let mut finished = false;
+        let mut peer_fin = false;
+        for tick in 1..=500 {
+            let now = start + Duration::from_millis(tick);
+            for connection in [&mut e.client, e.conns.get_mut(&e.hd).unwrap()] {
+                if connection
+                    .poll_timeout()
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    connection.handle_timeout(now);
+                }
+            }
+            h.to_client(
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.client_handle,
+                &mut e.client,
+                now,
+            );
+            if let Ok(mut chunks) = e.client.recv_stream(id).read(true) {
+                loop {
+                    match chunks.next(usize::MAX) {
+                        Ok(Some(chunk)) => received.extend_from_slice(&chunk.bytes),
+                        Ok(None) => {
+                            peer_fin = true;
+                            break;
+                        }
+                        Err(quinn_proto::ReadError::Blocked) => break,
+                        Err(error) => panic!("unexpected receive error: {error:?}"),
+                    }
+                }
+                let _ = chunks.finalize();
+            }
+            h.to_server(&mut e.conns, &mut e.client, peer, now);
+            let conn = e.conns.get_mut(&e.hd).unwrap();
+            while let Some(event) = conn.poll() {
+                if matches!(event, Event::Stream(StreamEvent::Writable { id: stream }) if stream == id)
+                {
+                    saw_writable = true;
+                }
+            }
+            if !finished {
+                match part.write(&mut conn.send_stream(id), &mut sent) {
+                    Ok(true) => {
+                        conn.send_stream(id).finish().unwrap();
+                        finished = true;
+                    }
+                    Err(WriteError::Blocked) => {}
+                    result => panic!("unexpected send result: {result:?}"),
+                }
+            }
+            if peer_fin {
+                break;
+            }
+        }
+        assert!(
+            saw_writable,
+            "the exhausted connection window must register for credit"
+        );
+        assert!(
+            finished && peer_fin,
+            "flow-control updates must let the response finish"
+        );
+        assert_eq!(received, expected);
+        assert_eq!(sent, expected.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn overdue_pump_yields_to_a_deferred_request_before_the_next_turn() {
+        let mut h = Harness::new(65_000);
+        let bridge = crate::uring::bridge::spawn_on_current(1, |_, _| async {
+            panic!("this regression expires handshakes, not application requests")
+        });
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let local = socket.local_addr().unwrap();
+        let peer_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = peer_socket.local_addr().unwrap();
+        let policy = h.policy();
+        let mut slots = recv_slots();
+        let mut metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
+        let mut scratch = Vec::new();
+        let mut tx_scratch = Vec::new();
+        let mut conns = HashMap::new();
+        let mut states = HashMap::new();
+        let mut deadlines = ConnectionDeadlineIndex::default();
+        let mut epoch = 1;
+        let inflight = std::rc::Rc::new(std::cell::Cell::new(1));
+        let resumed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (tx, rx) = flume::bounded(1);
+        let mut work = std::collections::HashSet::new();
+        let mut runtime = crate::uring::build_core_runtime().unwrap();
+        runtime.block_on(async {
+            let udp = IoUringDatagram::new(UdpSocket::from_std(socket).unwrap()).unwrap();
+            let child_resumed = resumed.clone();
+            let child_inflight = inflight.clone();
+            scheduling::inline_or_spawn(async move {
+                let _guard = InflightGuard(child_inflight);
+                // The same handoff as a cache-expiry decline: the first poll
+                // returns Pending and the spawned task must receive a fresh poll.
+                scheduling::defer_bridge_from_inline().await;
+                child_resumed.set(true);
+            })
+            .await;
+            assert!(!resumed.get());
+
+            for turn in 0..3 {
+                // Each turn contains a genuine expired handshake in the real
+                // deadline index. Its QUIC work is synchronous: no socket wait
+                // happens to provide the missing scheduler boundary for us.
+                let accepted_at = Instant::now() - H3_HANDSHAKE_TIMEOUT - Duration::from_secs(1);
+                let (_, mut client) = h.connect(accepted_at);
+                let initial = Harness::first_datagram(&mut client, accepted_at);
+                let incoming = h.incoming(peer, &initial, accepted_at);
+                let Admission::Accepted(hd, conn, slot) = h.admit(incoming, accepted_at) else {
+                    panic!("fixture must admit the unfinished handshake");
+                };
+                conns.insert(hd, conn);
+                states.insert(
+                    hd,
+                    h.runtime
+                        .accepted_state_with_policy(slot, accepted_at, epoch, &policy),
+                );
+                epoch += 1;
+                deadlines.sync(hd, connection_deadline(&mut conns, &states, hd));
+                let now = Instant::now();
+                assert!(deadlines.next().is_some_and(|deadline| deadline <= now));
+                deadlines.extend_due(&mut work, now);
+                assert!(work.contains(&hd));
+                let pump = pump::<MAX_PUMP_ROUNDS>(
+                    &udp,
+                    &mut slots,
+                    &mut metas,
+                    &mut scratch,
+                    &mut tx_scratch,
+                    &mut h.server,
+                    &mut conns,
+                    &mut states,
+                    &mut deadlines,
+                    &mut epoch,
+                    &h.handshakes,
+                    &inflight,
+                    &bridge,
+                    local,
+                    &tx,
+                    &rx,
+                    &h.runtime,
+                    &policy,
+                    true,
+                    &mut work,
+                );
+                if turn < 2 {
+                    // The old continuation can keep handling new due work in
+                    // this same parent poll while the child remains queued.
+                    pump.await;
+                    assert!(!resumed.get(), "old control unexpectedly yielded");
+                    assert_eq!(inflight.get(), 1);
+                } else {
+                    complete_overdue_pump(pump).await;
+                    assert!(
+                        resumed.get(),
+                        "deferred request missed the scheduler boundary"
+                    );
+                    assert_eq!(inflight.get(), 0);
+                }
+                assert!(states.get(&hd).is_none_or(|state| state.rejected));
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn capped_pump_retains_writable_work_without_a_near_timer() {
+        let mut h = Harness::new(65_000);
+        let mut transport = quinn_proto::TransportConfig::default();
+        transport.receive_window(1024u32.into());
+        transport.stream_receive_window(1024u32.into());
+        h.client_config.transport_config(Arc::new(transport));
+        let peer_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = peer_socket.local_addr().unwrap();
+        // Exchange the modeled datagrams under a fixed clock, with no network
+        // delivery or scheduling race deciding whether the Writable event exists.
+        let start = Instant::now() - Duration::from_secs(2);
+        let mut e = h.establish(peer, start);
+        let conn = e.conns.get_mut(&e.hd).unwrap();
+        let id = conn.streams().open(Dir::Uni).unwrap();
+        e.h3.get_mut(&e.hd).unwrap().pending.insert(
+            id,
+            PendingSend {
+                completion: None,
+                parts: std::iter::once(PendingPart::contiguous(vec![0x3c; 4096], None)).collect(),
+                fin: true,
+                stall: None,
+            },
+        );
+        pump_stream(conn, e.h3.get_mut(&e.hd).unwrap(), id);
+        let remaining = |state: &H3State| match state.pending[&id].parts.front().unwrap() {
+            PendingPart::Contiguous { data, .. } => data.len(),
+            _ => unreachable!(),
+        };
+        let before = remaining(&e.h3[&e.hd]);
+        assert!(before > 0 && before < 4096);
+        let mut received = 0;
+        for tick in 1..=16 {
+            let now = start + Duration::from_millis(tick * 100);
+            for connection in [&mut e.client, e.conns.get_mut(&e.hd).unwrap()] {
+                if connection
+                    .poll_timeout()
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    connection.handle_timeout(now);
+                }
+            }
+            h.to_client(
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.client_handle,
+                &mut e.client,
+                now,
+            );
+            if let Ok(mut chunks) = e.client.recv_stream(id).read(true) {
+                while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                    received += chunk.bytes.len();
+                }
+                let _ = chunks.finalize();
+            }
+            h.to_server(&mut e.conns, &mut e.client, peer, now);
+        }
+        assert!(received > 0);
+        assert_eq!(remaining(&e.h3[&e.hd]), before);
+        let near = Instant::now() + Duration::from_secs(1);
+        assert!(
+            connection_deadline(&mut e.conns, &e.h3, e.hd).is_none_or(|deadline| deadline > near)
+        );
+
+        let bridge = crate::uring::bridge::spawn_on_current(1, |_, _| async {
+            panic!("this regression has no application requests")
+        });
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let local = socket.local_addr().unwrap();
+        let policy = h.policy();
+        let mut slots = recv_slots();
+        let mut metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
+        let mut scratch = Vec::new();
+        let mut tx_scratch = Vec::new();
+        let mut deadlines = ConnectionDeadlineIndex::default();
+        let mut epoch = 1;
+        let inflight = std::rc::Rc::new(std::cell::Cell::new(0));
+        let (tx, rx) = flume::bounded(1);
+        let mut work = std::collections::HashSet::from([e.hd]);
+        let mut runtime = crate::uring::build_core_runtime().unwrap();
+        runtime.block_on(async {
+            let udp = IoUringDatagram::new(UdpSocket::from_std(socket).unwrap()).unwrap();
+            // The final drain of a capped pump already consumed the credit
+            // datagram. No rounds remain, but its queued Writable must survive.
+            pump::<0>(
+                &udp,
+                &mut slots,
+                &mut metas,
+                &mut scratch,
+                &mut tx_scratch,
+                &mut h.server,
+                &mut e.conns,
+                &mut e.h3,
+                &mut deadlines,
+                &mut epoch,
+                &h.handshakes,
+                &inflight,
+                &bridge,
+                local,
+                &tx,
+                &rx,
+                &h.runtime,
+                &policy,
+                true,
+                &mut work,
+            )
+            .await;
+            assert_eq!(work, std::collections::HashSet::from([e.hd]));
+            assert!(deadlines.next().is_none_or(|deadline| deadline > near));
+            pending_work_wait(!work.is_empty()).await;
+            pump::<1>(
+                &udp,
+                &mut slots,
+                &mut metas,
+                &mut scratch,
+                &mut tx_scratch,
+                &mut h.server,
+                &mut e.conns,
+                &mut e.h3,
+                &mut deadlines,
+                &mut epoch,
+                &h.handshakes,
+                &inflight,
+                &bridge,
+                local,
+                &tx,
+                &rx,
+                &h.runtime,
+                &policy,
+                true,
+                &mut work,
+            )
+            .await;
+            assert!(remaining(&e.h3[&e.hd]) < before, "queued Writable was lost");
+            assert!(work.is_empty(), "a genuinely blocked stream was requeued");
+        });
+    }
+
+    #[test]
     fn recv_drain_hands_quinn_owned_copies_of_each_datagram() {
         let mut h = Harness::new(65_000);
         let now = Instant::now();
@@ -7635,7 +8214,6 @@ mod admission_tests {
         let server_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         server_sock.set_nonblocking(true).unwrap();
         let server_addr = server_sock.local_addr().unwrap();
-        let udp_state = UdpSocketState::new(UdpSockRef::from(&server_sock)).unwrap();
         let client_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let (_, mut client) = h
             .client
@@ -7659,12 +8237,18 @@ mod admission_tests {
         let mut h3 = HashMap::new();
         let mut deadlines = ConnectionDeadlineIndex::default();
         let mut epoch = 0;
+        let mut affected = std::collections::HashSet::new();
+        let pending_send = ConnectionHandle(usize::MAX);
+        affected.insert(pending_send);
         let mut rt = crate::uring::build_core_runtime().unwrap();
-        let affected = rt.block_on(async {
-            let udp = UdpSocket::from_std(server_sock).unwrap();
+        rt.block_on(async {
+            let udp = IoUringDatagram::new(UdpSocket::from_std(server_sock).unwrap()).unwrap();
+            monoio::time::timeout(Duration::from_secs(1), udp.readable())
+                .await
+                .unwrap()
+                .unwrap();
             recv_drain(
                 &udp,
-                &udp_state,
                 &mut slots,
                 &mut metas,
                 &mut scratch,
@@ -7678,14 +8262,16 @@ mod admission_tests {
                 &policy,
                 true,
                 now,
+                &mut affected,
             )
-            .await
+            .await;
         });
         assert_eq!(
             affected.len(),
-            1,
-            "the client's Initial opened a connection"
+            2,
+            "the client's Initial is merged with already pending send work"
         );
+        assert!(affected.contains(&pending_send));
         assert_eq!(conns.len(), 1);
         let after: Vec<*const u8> = slots.iter().map(|slot| slot.as_ptr()).collect();
         assert_eq!(bases, after, "recv slots are reused in place");
@@ -7694,72 +8280,292 @@ mod admission_tests {
 
     #[test]
     fn flush_conn_follows_quinn_udp_disabling_segmentation_offload() {
-        let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        sink.set_nonblocking(true).unwrap();
-        let sink_addr = sink.local_addr().unwrap();
-        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        sock.set_nonblocking(true).unwrap();
-        // The kernel refuses UDP GSO on a socket that sends without checksums
-        // (EINVAL), the failure shape of a route or NIC without segmentation offload.
-        let one: libc::c_int = 1;
-        // SAFETY: `sock` owns a live fd; the option value is a c_int of the stated size.
-        let rc = unsafe {
-            libc::setsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_NO_CHECK,
-                (&one as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(rc, 0);
-        let udp_state = UdpSocketState::new(UdpSockRef::from(&sock)).unwrap();
-        let at_startup = udp_state.max_gso_segments();
-        if at_startup < 2 {
-            eprintln!("skipped: this kernel has no UDP GSO");
-            return;
-        }
-        assert_eq!(tx_segment_cap(&udp_state), at_startup.min(MAX_TX_SEGMENTS));
-        let probe = [0u8; 2400];
-        let segmented = UdpTransmit {
-            destination: sink_addr,
-            ecn: None,
-            contents: &probe,
-            segment_size: Some(1200),
-            src_ip: None,
-        };
-        assert!(
-            udp_state
-                .try_send(UdpSockRef::from(&sock), &segmented)
-                .is_err()
-        );
-        assert_eq!(udp_state.max_gso_segments(), 1, "quinn-udp halted GSO");
-        assert_eq!(tx_segment_cap(&udp_state), 1);
+        for (requested, batch) in [GsoSegments::Ten, GsoSegments::Twenty]
+            .into_iter()
+            .flat_map(|requested| {
+                [SendBatch::One, SendBatch::Four, SendBatch::Sixteen]
+                    .map(|batch| (requested, batch))
+            })
+        {
+            let sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sink.set_nonblocking(true).unwrap();
+            let sink_addr = sink.local_addr().unwrap();
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sock.set_nonblocking(true).unwrap();
+            // The kernel refuses UDP GSO on a socket that sends without checksums
+            // (EINVAL), the failure shape of a route or NIC without segmentation offload.
+            let one: libc::c_int = 1;
+            // SAFETY: `sock` owns a live fd; the option value is a c_int of the stated size.
+            let rc = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NO_CHECK,
+                    (&one as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(rc, 0);
+            let udp_state = UdpSocketState::new(UdpSockRef::from(&sock)).unwrap();
+            let at_startup = udp_state.max_gso_segments();
+            if at_startup < 2 {
+                eprintln!("skipped: this kernel has no UDP GSO");
+                return;
+            }
+            assert_eq!(
+                datagram::segment_cap(udp_state.max_gso_segments(), requested, MAX_TX_DATAGRAMS),
+                at_startup.min(requested as usize)
+            );
+            let probe = [0u8; 2400];
+            let segmented = UdpTransmit {
+                destination: sink_addr,
+                ecn: None,
+                contents: &probe,
+                segment_size: Some(1200),
+                src_ip: None,
+            };
+            assert!(
+                udp_state
+                    .try_send(UdpSockRef::from(&sock), &segmented)
+                    .is_err()
+            );
+            assert_eq!(udp_state.max_gso_segments(), 1, "quinn-udp halted GSO");
+            assert_eq!(
+                datagram::segment_cap(udp_state.max_gso_segments(), requested, MAX_TX_DATAGRAMS),
+                1
+            );
 
-        // A connection with many datagrams queued must still reach its peer.
+            // A connection with many datagrams queued must still reach its peer.
+            let mut h = Harness::new(65_000);
+            let now = Instant::now();
+            let mut e = h.establish(sink_addr, now);
+            let conn = e.conns.get_mut(&e.hd).unwrap();
+            let id = conn.streams().open(Dir::Uni).unwrap();
+            let written = conn.send_stream(id).write(&[0x5a; 16 * 1024]).unwrap();
+            assert!(written > 4 * 1200);
+            let mut tbuf = Vec::new();
+            let mut rt = crate::uring::build_core_runtime().unwrap();
+            rt.block_on(async {
+                let udp = IoUringDatagram::from_parts_with_limit(
+                    UdpSocket::from_std(sock).unwrap(),
+                    udp_state,
+                    requested,
+                    batch,
+                );
+                assert_eq!(udp.transmit_segment_cap(MAX_TX_DATAGRAMS), 1);
+                flush_conn(&udp, &mut e.conns, e.hd, now, &mut tbuf).await;
+            });
+            // A successful send need not be immediately visible to a nonblocking
+            // loopback receiver on a virtualized host.
+            sink.set_nonblocking(false).unwrap();
+            sink.set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut received = 0;
+            let mut datagram = [0u8; MAX_DATAGRAM];
+            while let Ok(n) = sink.recv(&mut datagram) {
+                assert!(n <= 1500, "a {n}-byte receive was not a single datagram");
+                received += 1;
+            }
+            assert!(
+                received >= 2,
+                "only {received} datagrams arrived: transmits kept requesting GSO"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_batch_yields_to_timer_preserves_other_connection_and_drains_on_writable() {
+        let first_sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let second_sink = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let state = UdpSocketState::new((&socket).into()).unwrap();
         let mut h = Harness::new(65_000);
         let now = Instant::now();
-        let mut e = h.establish(sink_addr, now);
-        let conn = e.conns.get_mut(&e.hd).unwrap();
-        let id = conn.streams().open(Dir::Uni).unwrap();
-        let written = conn.send_stream(id).write(&[0x5a; 16 * 1024]).unwrap();
-        assert!(written > 4 * 1200);
-        let mut tbuf = Vec::new();
-        let mut rt = crate::uring::build_core_runtime().unwrap();
-        rt.block_on(async {
-            let udp = UdpSocket::from_std(sock).unwrap();
-            flush_conn(&udp, &udp_state, &mut e.conns, e.hd, now, &mut tbuf).await;
-        });
-        let mut received = 0;
-        let mut datagram = [0u8; MAX_DATAGRAM];
-        while let Ok(n) = sink.recv(&mut datagram) {
-            assert!(n <= 1500, "a {n}-byte receive was not a single datagram");
-            received += 1;
+        let mut first = h.establish(first_sink.local_addr().unwrap(), now);
+        let mut second = h.establish(second_sink.local_addr().unwrap(), now);
+        let second_hd = second.hd;
+        let first_stream = first
+            .conns
+            .get_mut(&first.hd)
+            .unwrap()
+            .streams()
+            .open(Dir::Uni)
+            .unwrap();
+        let second_stream = second
+            .conns
+            .get_mut(&second.hd)
+            .unwrap()
+            .streams()
+            .open(Dir::Uni)
+            .unwrap();
+        let body = [0x5a; 1024];
+        for (connections, handle, stream) in [
+            (&mut first.conns, first.hd, first_stream),
+            (&mut second.conns, second.hd, second_stream),
+        ] {
+            let mut send = connections.get_mut(&handle).unwrap().send_stream(stream);
+            assert_eq!(send.write(&body).unwrap(), body.len());
+            send.finish().unwrap();
         }
-        assert!(
-            received >= 2,
-            "only {received} datagrams arrived: transmits kept requesting GSO"
+        first.conns.extend(second.conns);
+        let before_second = first.conns[&second_hd].stats().udp_tx.datagrams;
+        let mut scratch = Vec::with_capacity(MAX_DATAGRAM);
+        let mut runtime = crate::uring::build_core_runtime().unwrap();
+        runtime.block_on(async {
+            let udp = IoUringDatagram::from_parts_with_limit(
+                UdpSocket::from_std(socket).unwrap(),
+                state,
+                GsoSegments::Ten,
+                SendBatch::Four,
+            );
+            // Inject a no-acceptance EAGAIN at the actual adapter boundary. The
+            // subsequent readiness wait and sendmmsg are real loopback I/O.
+            udp.defer_next_batch_for_test();
+            assert!(flush_conn(&udp, &mut first.conns, first.hd, now, &mut scratch).await);
+            assert!(udp.send_blocked());
+            let queued = udp.pending_send_count();
+            assert!(queued > 0);
+            assert!(flush_conn(&udp, &mut first.conns, second_hd, now, &mut scratch).await);
+            assert_eq!(
+                first.conns[&second_hd].stats().udp_tx.datagrams,
+                before_second
+            );
+            assert_eq!(udp.pending_send_count(), queued);
+            // Poll then retain the actual PollAdd future across another ready
+            // branch, matching the endpoint's persistent select waiter.
+            use std::future::Future;
+            let mut writable_wait = Box::pin(udp.writable());
+            let initial =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(writable_wait.as_mut().poll(cx)))
+                    .await;
+            assert!(initial.is_pending(), "initial io_uring poll is submitted");
+            // Neither the blocked sender nor another runnable connection waits
+            // inside flush_conn. The actor can still observe an elapsed timer.
+            monoio::time::timeout(
+                Duration::from_secs(1),
+                monoio::time::sleep(Duration::from_millis(1)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(udp.pending_send_count(), queued);
+            monoio::time::timeout(Duration::from_secs(1), writable_wait.as_mut())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(writable_wait);
+            assert!(udp.flush_pending());
+            assert!(!udp.send_blocked());
+            assert_eq!(udp.pending_send_count(), 0);
+            flush_conn(
+                &udp,
+                &mut first.conns,
+                second_hd,
+                Instant::now(),
+                &mut scratch,
+            )
+            .await;
+            assert_eq!(udp.pending_send_count(), 0);
+
+            // A forced grace deadline must not hang waiting for a queued send.
+            let conn = first.conns.get_mut(&first.hd).unwrap();
+            let more = conn.streams().open(Dir::Uni).unwrap();
+            conn.send_stream(more)
+                .write(b"forced-close-pending")
+                .unwrap();
+            udp.defer_next_batch_for_test();
+            flush_conn(
+                &udp,
+                &mut first.conns,
+                first.hd,
+                Instant::now(),
+                &mut scratch,
+            )
+            .await;
+            assert!(udp.has_pending_sends());
+            monoio::time::timeout(
+                Duration::from_secs(1),
+                close_h3_connections(&udp, &mut first.conns, b"drain deadline", &mut scratch),
+            )
+            .await
+            .unwrap();
+            assert!(
+                first
+                    .conns
+                    .values()
+                    .all(|connection| connection.is_closed())
+            );
+            assert!(udp.has_pending_sends());
+            // Owned pending payloads die with the driver after forced closure.
+            drop(udp);
+        });
+        for (sink, client) in [
+            (first_sink, &mut first.client),
+            (second_sink, &mut second.client),
+        ] {
+            sink.set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            let mut bytes = [0u8; MAX_DATAGRAM];
+            while let Ok(count) = sink.recv(&mut bytes) {
+                if let Some(DatagramEvent::ConnectionEvent(_, event)) = h.client.handle(
+                    Instant::now(),
+                    SERVER,
+                    None,
+                    None,
+                    BytesMut::from(&bytes[..count]),
+                    &mut h.scratch,
+                ) {
+                    client.handle_event(event);
+                }
+            }
+        }
+        assert_eq!(
+            read_response(&mut first.client, first_stream).unwrap(),
+            body
         );
+        assert_eq!(
+            read_response(&mut second.client, second_stream).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn either_gso_cap_stops_at_quinn_congestion_or_pacing_without_acks() {
+        for cap in [10, 20] {
+            let mut h = Harness::new(65_000);
+            let now = Instant::now();
+            let mut e = h.establish(spoofed(99), now);
+            let conn = e.conns.get_mut(&e.hd).unwrap();
+            let id = conn.streams().open(Dir::Uni).unwrap();
+            let body = vec![0x5a; 256 * 1024];
+            assert_eq!(conn.send_stream(id).write(&body).unwrap(), body.len());
+            let window = conn.stats().path.cwnd;
+            let mut bytes = 0usize;
+            let mut datagrams = 0;
+            let mut stopped = false;
+            let mut buffer = Vec::new();
+            for _ in 0..64 {
+                buffer.clear();
+                let Some(tx) = conn.poll_transmit(now, cap, &mut buffer) else {
+                    stopped = true;
+                    break;
+                };
+                let segments = tx.segment_size.map_or(1, |size| tx.size.div_ceil(size));
+                assert!(segments <= cap);
+                datagrams += segments;
+                bytes += tx.size;
+            }
+            assert!(stopped, "GSO{cap} ignored congestion/pacing without ACKs");
+            assert!(bytes > 0 && bytes < body.len() / 2);
+            // ACK-only/control/probe traffic is not charged identically to new
+            // STREAM data. Allow a few control datagrams above the initial cwnd,
+            // while proving the GSO limit cannot drain the queued response.
+            assert!(
+                bytes as u64 <= window + 4 * 1500,
+                "{bytes}bytes exceed cwnd{window} under GSO{cap}"
+            );
+            assert!(datagrams <= 20);
+        }
     }
 
     fn read_response(conn: &mut quinn_proto::Connection, id: StreamId) -> Result<Vec<u8>, u64> {
@@ -7945,6 +8751,179 @@ mod admission_tests {
         }
         let conn = e.conns.get_mut(&e.hd).unwrap();
         receive_request_streams(conn, st, now)
+    }
+
+    /// A real request/response exchange up to the point where the entire body
+    /// and FIN are accepted by QUIC, before the server transmits the response.
+    fn queued_response(
+        h: &mut Harness,
+        peer: SocketAddr,
+        now: Instant,
+    ) -> (
+        Established,
+        StreamId,
+        Vec<u8>,
+        Arc<hj_core::budget::BodyBufferBudget>,
+    ) {
+        let mut e = h.establish(peer, now);
+        let id = e.client.streams().open(Dir::Bi).unwrap();
+        let request = super::h3_codec_tests::request_stream(&GET_HEAD, &[]);
+        let mut send = e.client.send_stream(id);
+        assert_eq!(send.write(&request).unwrap(), request.len());
+        send.finish().unwrap();
+        h.to_server(&mut e.conns, &mut e.client, peer, now);
+        assert_eq!(serve_pass(h, &mut e, now), vec![id]);
+        drop(reclaim_request(e.h3.get_mut(&e.hd).unwrap(), id));
+        e.h3.get_mut(&e.hd)
+            .unwrap()
+            .request_cancellations
+            .insert(id, CancellationToken::new());
+        let wire = encode_h3_response(
+            http::StatusCode::OK,
+            &http::HeaderMap::new(),
+            &vec![0x6b; 64 * 1024],
+        );
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(128 * 1024));
+        let lease = H3EgressBudget::new(global.clone())
+            .reserve(wire.len())
+            .unwrap();
+        let epoch = e.h3[&e.hd].epoch;
+        let completion = Completion {
+            conn: e.hd,
+            stream: id,
+            epoch,
+            kind: CompletionKind::Full(wire.clone(), None, Some(lease)),
+        };
+        write_completion(&mut e.conns, &mut e.h3, completion);
+        assert!(e.h3[&e.hd].pending.is_empty());
+        assert_eq!(
+            e.h3[&e.hd].response_fins,
+            std::collections::HashSet::from([id])
+        );
+        (e, id, wire, global)
+    }
+
+    #[test]
+    fn graceful_drain_waits_for_the_response_fin_acknowledgement() {
+        let mut h = Harness::new(65_000);
+        let start = Instant::now();
+        let peer = spoofed(90);
+        let (mut e, id, expected, global) = queued_response(&mut h, peer, start);
+        assert!(
+            !h3_drain_complete(&e.h3, 0, true),
+            "QUIC has not sent the accepted body"
+        );
+        assert_eq!(global.in_flight(), expected.len() as u64);
+        let mut received = Vec::new();
+        let mut peer_fin = false;
+        let collect = |client: &mut quinn_proto::Connection, received: &mut Vec<u8>| {
+            let mut stream = client.recv_stream(id);
+            let Ok(mut chunks) = stream.read(true) else {
+                return false;
+            };
+            let fin = loop {
+                match chunks.next(usize::MAX) {
+                    Ok(Some(chunk)) => received.extend_from_slice(&chunk.bytes),
+                    Ok(None) => break true,
+                    Err(quinn_proto::ReadError::Blocked) => break false,
+                    Err(error) => panic!("unexpected response read: {error:?}"),
+                }
+            };
+            let _ = chunks.finalize();
+            fin
+        };
+        h.to_client(
+            e.conns.get_mut(&e.hd).unwrap(),
+            e.client_handle,
+            &mut e.client,
+            start,
+        );
+        peer_fin |= collect(&mut e.client, &mut received);
+        assert!(
+            received.len() < expected.len(),
+            "fixture must exceed the initial congestion window"
+        );
+        assert!(!peer_fin && !h3_drain_complete(&e.h3, 0, true));
+
+        // No real network or sleep: model delayed ACKs, congestion and transport
+        // timers under a fixed advancing clock while the server is draining.
+        for tick in 1..=500 {
+            let now = start + Duration::from_millis(tick);
+            for connection in [&mut e.client, e.conns.get_mut(&e.hd).unwrap()] {
+                if connection
+                    .poll_timeout()
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    connection.handle_timeout(now);
+                }
+            }
+            h.to_client(
+                e.conns.get_mut(&e.hd).unwrap(),
+                e.client_handle,
+                &mut e.client,
+                now,
+            );
+            peer_fin |= collect(&mut e.client, &mut received);
+            h.to_server(&mut e.conns, &mut e.client, peer, now);
+            service_conn(
+                &mut h.server,
+                &mut e.conns,
+                &mut e.h3,
+                e.hd,
+                now,
+                false,
+                H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None),
+            );
+            if e.h3[&e.hd].response_fins.is_empty() {
+                break;
+            }
+        }
+        assert!(peer_fin);
+        assert_eq!(received, expected);
+        assert!(!e.h3[&e.hd].rejected);
+        assert!(e.h3[&e.hd].response_fins.is_empty());
+        assert_eq!(global.in_flight(), 0);
+        assert!(h3_drain_complete(&e.h3, 0, true));
+        assert!(e.h3[&e.hd].control_stream.is_some());
+        assert!(e.h3[&e.hd].qpack_encoder_stream.is_some());
+        assert!(e.h3[&e.hd].qpack_decoder_stream.is_some());
+    }
+
+    #[test]
+    fn peer_stop_retires_a_queued_response_fin_and_its_body_budget() {
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let peer = spoofed(91);
+        let (mut e, id, _, global) = queued_response(&mut h, peer, now);
+        e.client
+            .recv_stream(id)
+            .stop(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED))
+            .unwrap();
+        h.to_server(&mut e.conns, &mut e.client, peer, now);
+        assert!(serve_pass(&mut h, &mut e, now).is_empty());
+        assert!(e.h3[&e.hd].response_fins.is_empty());
+        assert_eq!(global.in_flight(), 0);
+        assert!(h3_drain_complete(&e.h3, 0, true));
+    }
+
+    #[test]
+    fn connection_loss_retires_queued_response_fins() {
+        let mut h = Harness::new(65_000);
+        let now = Instant::now();
+        let peer = spoofed(92);
+        let (mut e, _, _, global) = queued_response(&mut h, peer, now);
+        e.client.close(
+            now,
+            quinn_proto::VarInt::from_u32(H3_NO_ERROR),
+            Bytes::new(),
+        );
+        h.to_server(&mut e.conns, &mut e.client, peer, now);
+        assert!(serve_pass(&mut h, &mut e, now).is_empty());
+        assert!(e.h3[&e.hd].rejected);
+        assert!(e.h3[&e.hd].response_fins.is_empty());
+        assert!(h3_drain_complete(&e.h3, 0, true));
+        e.conns.clear();
+        assert_eq!(global.in_flight(), 0);
     }
 
     #[test]

@@ -169,6 +169,25 @@ struct ServeArgs {
     /// Number of accept-loop workers (SO_REUSEPORT sockets). Defaults to CPUs.
     #[arg(long)]
     workers: Option<usize>,
+    /// HTTP/3 request engine. The accelerated engine tries the shared on-core
+    /// cache path before dispatching misses through the io_uring bridge.
+    #[arg(long, value_enum, default_value_t = uring::h3::H3EngineMode::Legacy)]
+    h3_engine: uring::h3::H3EngineMode,
+    /// Maximum HTTP/3 datagrams in one GSO transmit. The experimental value 20
+    /// retains the same 20-datagram flush budget; the default remains 10.
+    #[arg(long, value_enum, default_value_t = uring::h3::GsoSegments::Ten)]
+    h3_gso_segments: uring::h3::GsoSegments,
+    /// Maximum UDP messages per send syscall; 1 retains the scalar path.
+    #[arg(long, value_enum, default_value_t = uring::h3::SendBatch::One)]
+    h3_send_batch: uring::h3::SendBatch,
+    /// Ask HTTP/3 peers that support QUIC ACK_FREQUENCY to acknowledge every N
+    /// ack-eliciting packets instead of every second one. 0 (default) asks nothing.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=255))]
+    h3_ack_eliciting_threshold: u32,
+    /// The max_ack_delay requested along with --h3-ack-eliciting-threshold.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=25_000))]
+    h3_max_ack_delay_us: u32,
+
     /// Local testing / explicit rollback only: drop the mandatory Cloudflare
     /// client-cert requirement so TLS content can be tested locally without a
     /// Cloudflare-issued client cert.
@@ -179,10 +198,16 @@ struct ServeArgs {
     no_mtls: bool,
     /// (#296) Do not pin the per-core io_uring transport threads to their CPU
     /// cores. Pinning is automatic (and only) when the worker count equals the
-    /// machine's CPU count; this flag is the kill switch if pinned placement
+    /// number of CPUs the process may run on (its affinity mask); worker N then
+    /// owns the mask's Nth CPU. This flag is the kill switch if pinned placement
     /// worsens tail latency.
     #[arg(long)]
     no_core_pinning: bool,
+    /// Kill switch for listener CPU steering. Pinned TCP workers normally ask the
+    /// kernel (SO_INCOMING_CPU) for the connections whose SYN arrived on their
+    /// CPU, so RSS/RPS placement and the serving core coincide.
+    #[arg(long)]
+    no_cpu_steering: bool,
     /// (#486) Idle window in seconds for connections whose peer presented a VERIFIED client
     /// certificate (in prod, only Cloudflare's authenticated-origin-pull cert). Cloudflare never
     /// resumes TLS to the origin, so closing a connection it would have reused costs a full
@@ -201,14 +226,14 @@ struct ServeArgs {
     #[arg(long, default_value_t = 2)]
     tls_session_tickets: usize,
     /// (#330) io_uring ring setup for the per-core transport runtimes.
-    /// `legacy` (default) = flagless rings — the A/B measured `coop`
-    /// (COOP_TASKRUN + SUBMIT_ALL) as noise and `defer` (+SINGLE_ISSUER +
-    /// DEFER_TASKRUN) as a consistent ~-2% on this virtualized guest; both
-    /// stay available for other hardware. Ring size always stays default —
-    /// ring memory is memlock-charged and bigger rings under the prod unit's
-    /// LimitMEMLOCK bankrupt late runtimes (2026-08-27 crash-loop).
-    /// Unsupported flags fall back to plain rings per-thread with a warning.
-    #[arg(long, default_value = "legacy", value_parser = ["legacy", "coop", "defer"])]
+    /// `coop` (default) = COOP_TASKRUN + SUBMIT_ALL. With the default response memo
+    /// it measured +28% RPS / -27% CPU per cookieless H2 cache hit on x86
+    /// (2026-11-07); alone it was neutral on aarch64. `legacy` = flagless rings;
+    /// `defer` (+SINGLE_ISSUER + DEFER_TASKRUN) measured ~-2% on the GCE guest.
+    /// Ring size always stays default — ring memory is memlock-charged and bigger
+    /// rings under the prod unit's LimitMEMLOCK bankrupt late runtimes (2026-08-27
+    /// crash-loop). Unsupported flags fall back to plain rings per-thread with a warning.
+    #[arg(long, default_value = "coop", value_parser = ["legacy", "coop", "defer"])]
     uring_ring: String,
     /// (#334) Disable multishot accept: submit one accept SQE per connection
     /// (the pre-multishot behavior) instead of one armed SQE per listener.
@@ -424,6 +449,14 @@ struct PageCacheArgs {
     /// `X-LiteSpeed-Cache-Control`. With this flag absent the cache is inert.
     #[arg(long = "page-cache")]
     enabled: bool,
+    /// Disable the default-on per-worker memo of finalized public page-cache hits
+    /// (cookieless GET only; entries keep exact freshness/Age/purge fences and the
+    /// fast-memo budget).
+    #[arg(long = "no-page-cache-response-memo")]
+    no_response_memo: bool,
+    /// Accepted for existing units; the response memo is on by default.
+    #[arg(long = "page-cache-response-memo", hide = true)]
+    _response_memo: bool,
     /// RAM budget (bytes) for the in-process index: entry metadata + precompressed
     /// variants + any in-RAM body. With --page-cache-store-path, persisted (tmpfs)
     /// bodies do NOT count here — they are bounded by --page-cache-disk-mem instead —
@@ -758,16 +791,6 @@ fn main() -> anyhow::Result<()> {
         uring::serve_uring(std::path::Path::new(&root), addr, 2)?;
         return Ok(());
     }
-    // H3 over monoio io_uring via the quinn-proto driver.
-    if let Ok(addr) = std::env::var("HJ_URING_H3_SMOKE") {
-        tracing_subscriber::fmt()
-            .with_env_filter(default_env_filter())
-            .init();
-        let addr: std::net::SocketAddr = addr.parse()?;
-        let cfg = uring::h3::self_signed_config()?;
-        uring::h3::serve_h3_smoke(addr, 2, cfg)?;
-        return Ok(());
-    }
     // H2 (h2c) over monoio io_uring via hj-h2's serve_local.
     if let Ok(addr) = std::env::var("HJ_URING_H2_SMOKE") {
         tracing_subscriber::fmt()
@@ -1079,6 +1102,14 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
 
     let mut cfg = hj_config::load(root)?;
 
+    uring::h3::configure_engine_mode(args.h3_engine);
+    uring::h3::configure_gso_segments(args.h3_gso_segments);
+    uring::h3::configure_ack_frequency(args.h3_ack_eliciting_threshold, args.h3_max_ack_delay_us);
+    uring::h3::configure_send_batch(args.h3_send_batch);
+    tracing::info!(segments = ?args.h3_gso_segments, "HTTP/3 GSO segment limit selected");
+
+    tracing::info!(engine = ?args.h3_engine, "HTTP/3 request engine selected");
+
     uring::configure_trusted_proxy_idle(
         args.trusted_proxy_idle_secs,
         args.trusted_proxy_idle_max_conns,
@@ -1089,6 +1120,12 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         uring::CORE_PINNING.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("--no-core-pinning: per-core transport threads left unpinned");
     }
+    if args.no_cpu_steering {
+        uring::CPU_STEERING.store(false, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!("--no-cpu-steering: listeners keep hash placement");
+    }
+    // Capture the process CPU mask before any transport thread pins itself.
+    let _ = uring::allowed_cpus();
 
     if args.no_multishot_accept {
         uring::MULTISHOT_ACCEPT.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1123,7 +1160,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         _ => uring::RING_COOP,
     };
     uring::RING_MODE.store(ring_mode, std::sync::atomic::Ordering::Relaxed);
-    if ring_mode != uring::RING_LEGACY {
+    if ring_mode != uring::RING_COOP {
         tracing::info!(mode = %args.uring_ring, "--uring-ring: non-default ring setup selected");
     }
 
@@ -1467,6 +1504,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             }
             let static_caps = hj_cache::CacheCaps::from_tuning(&server.tuning);
             let store_cfg = hj_pagecache::StoreConfig {
+                response_memo: !args.page_cache.no_response_memo,
                 max_mem_bytes: args.page_cache.mem,
                 max_disk_bytes: args.page_cache.disk_mem,
                 store_path: store_path.clone(),
@@ -3788,6 +3826,31 @@ mod tests {
             panic!("expected serve command");
         };
         args.ktls
+    }
+
+    #[test]
+    fn ring_and_response_memo_default_on_and_stay_selectable() {
+        let serve = |args: &[&str]| {
+            let cli =
+                Cli::try_parse_from(["httpjet", "serve"].into_iter().chain(args.iter().copied()))
+                    .expect("serve CLI should parse");
+            let Some(Command::Serve(args)) = cli.command else {
+                panic!("expected serve command");
+            };
+            args
+        };
+        let default = serve(&[]);
+        assert_eq!(default.uring_ring, "coop");
+        assert!(!default.page_cache.no_response_memo);
+        // Existing unit files keep parsing.
+        let legacy = serve(&["--uring-ring", "legacy", "--page-cache-response-memo"]);
+        assert_eq!(legacy.uring_ring, "legacy");
+        assert!(!legacy.page_cache.no_response_memo);
+        assert!(
+            serve(&["--no-page-cache-response-memo"])
+                .page_cache
+                .no_response_memo
+        );
     }
 
     #[test]

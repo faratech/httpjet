@@ -1,3 +1,16 @@
+httpjet (0.1.11-1) stable; urgency=medium
+
+  * Default the io_uring transport to cooperative task running
+    (--uring-ring coop) and enable the page-cache response memo for cookieless
+    public hits (--no-page-cache-response-memo disables it).
+  * Steer accepted connections to the CPU that received them (SO_INCOMING_CPU;
+    --no-cpu-steering disables it), reuse HTTP/1.1 write buffers, reuse the
+    encoded HPACK Date literal and format access-log lines without core::fmt.
+  * Schedule HTTP/3 streams fairly and add opt-in HTTP/3 send experiments:
+    --h3-engine, --h3-send-batch and --h3-gso-segments.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Sat, 07 Nov 2026 00:00:00 +0000
+
 httpjet (0.1.10-11) stable; urgency=medium
 
   * Amend the release: enable fresh-install HTTPS using unique self-signed

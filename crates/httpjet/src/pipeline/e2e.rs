@@ -3508,6 +3508,7 @@ async fn fast_serve_runs_rewrite_before_serving_a_cache_hit() {
     .unwrap();
 
     let mut cfg = hj_pagecache::StoreConfig::default();
+    cfg.response_memo = true;
     cfg.standard_cc_vhosts.push(VHOST.into());
     let store = Arc::new(hj_pagecache::PageStore::new(cfg));
     let state = build_state_full(
@@ -3530,6 +3531,41 @@ async fn fast_serve_runs_rewrite_before_serving_a_cache_hit() {
     let ok = fast_serve_req(&state, &get_with_ua("/pages/index.html", "Mozilla/5.0")).await;
     assert!(is_cache_hit(ok.as_ref()), "baseline must be a Branch-1 hit");
 
+    let memo_before = state
+        .metrics
+        .fast_memo_hits
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let again = fast_serve_req(&state, &get_with_ua("/pages/index.html", "Mozilla/5.0")).await;
+    assert!(is_cache_hit(again.as_ref()));
+    assert_eq!(
+        state
+            .metrics
+            .fast_memo_hits
+            .load(std::sync::atomic::Ordering::Relaxed),
+        memo_before + 1,
+        "a fresh public response should use the finalized-response memo"
+    );
+    assert_eq!(
+        state
+            .metrics
+            .pagecache_lookup
+            .snapshot()
+            .find(|(path, result, _)| *path == "response_memo" && *result == "hit")
+            .unwrap()
+            .2,
+        1
+    );
+
+    let mut cookied = get_with_ua("/pages/index.html", "Mozilla/5.0");
+    cookied.headers_mut().insert(
+        header::COOKIE,
+        http::HeaderValue::from_static("xf_user=7; xf_session=member"),
+    );
+    assert!(
+        !is_cache_hit(fast_serve_req(&state, &cookied).await.as_ref()),
+        "a member request cannot consume the public response memo"
+    );
+
     // The RewriteCond-gated [F] must bridge (dispatch renders the 403), never serve the hit.
     let banned = get_with_ua("/pages/index.html", "BadBot/1.0");
     assert!(
@@ -3549,6 +3585,13 @@ async fn fast_serve_runs_rewrite_before_serving_a_cache_hit() {
     assert!(
         !is_cache_hit(bypass.as_ref()),
         "a rewrite-set no-cache env must bypass the on-core hit"
+    );
+
+    store.purge_all();
+    let purged = fast_serve_req(&state, &get_with_ua("/pages/index.html", "Mozilla/5.0")).await;
+    assert!(
+        !is_cache_hit(purged.as_ref()),
+        "purge acknowledgement must revoke the response memo"
     );
 
     let _ = std::fs::remove_dir_all(doc_root);
