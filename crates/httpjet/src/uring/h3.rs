@@ -3531,12 +3531,13 @@ async fn drive_one_conn(
             }
             .await;
         };
-        dispatch_work(
+        if let Some(future) = dispatch_work(
             run_cancelable_request(cancel, work),
             inline,
             &mut inline_budget,
-        )
-        .await;
+        ) {
+            scheduling::inline_recycled(future).await;
+        }
     }
     // Requests that finished inline above already sit in the completion channel.
     // Writing them now lets their responses leave in this flush rather than an

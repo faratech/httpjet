@@ -291,7 +291,7 @@ impl UdpSocketState {
                     socket.0.as_raw_fd(),
                     headers.as_mut_ptr(),
                     count as _,
-                    libc::MSG_DONTWAIT,
+                    libc::MSG_DONTWAIT as _,
                 )
             };
             if sent >= 0 {

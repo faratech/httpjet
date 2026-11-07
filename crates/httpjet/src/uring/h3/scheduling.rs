@@ -68,18 +68,27 @@ impl Default for InlineBudget {
     }
 }
 
-pub(super) async fn dispatch_work<F>(future: F, eligible: bool, budget: &mut InlineBudget)
+/// Spawn `future`, or return it boxed for one inline poll (`inline_recycled`).
+/// Deciding synchronously keeps the request future out of the connection loop's
+/// async state, so unoptimized builds do not copy it through extra stack frames.
+pub(super) fn dispatch_work<F>(
+    future: F,
+    eligible: bool,
+    budget: &mut InlineBudget,
+) -> Option<hj_core::Recycled<F>>
 where
     F: Future<Output = ()> + 'static,
 {
     if !eligible {
         monoio::spawn(future);
+        None
     } else if budget.0 == 0 {
         INLINE_SPILLED.fetch_add(1, Ordering::Relaxed);
         monoio::spawn(future);
+        None
     } else {
         budget.0 -= 1;
-        inline_or_spawn(future).await;
+        Some(hj_core::Recycled::new(future))
     }
 }
 
@@ -94,9 +103,15 @@ pub(super) async fn inline_or_spawn<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
 {
+    inline_recycled(hj_core::Recycled::new(future)).await
+}
+
+pub(super) async fn inline_recycled<F>(mut future: hj_core::Recycled<F>)
+where
+    F: Future<Output = ()> + 'static,
+{
     // A pending future may already hold internal references after its first poll.
     // Moving only the recycled handle preserves its pinned allocation and progress.
-    let mut future = hj_core::Recycled::new(future);
     let first = poll_fn(|cx| {
         let _scope = InlinePollScope::enter();
         Poll::Ready(Pin::new(&mut future).poll(cx))
@@ -338,7 +353,7 @@ mod tests {
                 let done = done_tx.clone();
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 release.push(tx);
-                dispatch_work(
+                if let Some(future) = dispatch_work(
                     async move {
                         started.set(started.get() + 1);
                         if index % 2 == 1 {
@@ -349,8 +364,9 @@ mod tests {
                     },
                     true,
                     &mut budget,
-                )
-                .await;
+                ) {
+                    inline_recycled(future).await;
+                }
             }
             assert_eq!(started.get(), MAX_INLINE_ATTEMPTS);
             assert_eq!(completed.get(), MAX_INLINE_ATTEMPTS / 2);
