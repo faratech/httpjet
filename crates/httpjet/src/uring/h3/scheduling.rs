@@ -99,6 +99,7 @@ pub(super) async fn sleep_until_opt(deadline: Option<Instant>) {
     }
 }
 
+#[cfg(test)]
 pub(super) async fn inline_or_spawn<F>(future: F)
 where
     F: Future<Output = ()> + 'static,

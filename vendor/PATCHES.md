@@ -27,4 +27,6 @@ with that release, run `cargo update`, confirm the old package version disappear
 
 Pinned with `try_send_batch` for Linux/Android. Preserves scalar ancillary and
 GSO fallback behavior, and reports only accepted prefixes. See
-[`quinn-udp/HTTPJET-VENDOR.md`](quinn-udp/HTTPJET-VENDOR.md).
+[`quinn-udp/HTTPJET-VENDOR.md`](quinn-udp/HTTPJET-VENDOR.md). The crates.io
+`Cargo.toml.orig` is not kept: Debian's `dh_clean` deletes `*.orig` files, which
+changed the release source tree under the package build.
