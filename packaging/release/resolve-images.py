@@ -13,10 +13,15 @@ def text(url):
         return response.read().decode()
 
 def sums(document,algorithm):
-    result={};length={'sha256':64,'sha512':128}[algorithm]
+    result={};length={'sha256':64,'sha512':128}[algorithm];section=None
     for line in document.splitlines():
+        # Gentoo DIGESTS lists SHA512 and BLAKE2B digests (both 128 hex digits) under
+        # "# <ALG> HASH" headers; take bare digests only from the requested section.
+        header=re.fullmatch(r'#\s*([A-Za-z0-9]+)\s+HASH',line.strip())
+        if header:section=header[1].lower();continue
         match=re.fullmatch(r'(?:SHA256|SHA512) \(([^)]+)\) = ([0-9a-fA-F]+)',line.strip())
         if match and len(match[2])==length:result[match[1]]=match[2].lower();continue
+        if section is not None and section!=algorithm:continue
         match=re.match(r'^([0-9a-fA-F]{'+str(length)+r'})\s+\*?(.+?)\s*$',line)
         if match:result[match[2].removeprefix('./')]=match[1].lower()
     return result

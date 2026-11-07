@@ -73,4 +73,18 @@ class GuixImageBootstrap(unittest.TestCase):
                 self.assertEqual(lock['definition']['system'],system)
 
 
+class PublisherChecksumLists(unittest.TestCase):
+    def test_gentoo_digests_take_the_requested_section_in_either_order(self):
+        name = 'stage3-arm64-openrc-20261101T233055Z.tar.xz'
+        sha512, blake2b = 'a' * 128, 'b' * 128
+        for first, second in ((('SHA512', sha512), ('BLAKE2B', blake2b)),
+                              (('BLAKE2B', blake2b), ('SHA512', sha512))):
+            document = ''.join(f'# {alg} HASH\n{digest}  {name}\n' for alg, digest in (first, second))
+            self.assertEqual(resolver.sums(document, 'sha512'), {name: sha512})
+
+    def test_unlabelled_lists_parse_as_before(self):
+        document = f"{'c' * 64}  archlinux-bootstrap-x86_64.tar.zst\n{'d' * 64} *./other.iso\n"
+        self.assertEqual(resolver.sums(document, 'sha256'),
+                         {'archlinux-bootstrap-x86_64.tar.zst': 'c' * 64, 'other.iso': 'd' * 64})
+
 if __name__ == '__main__': unittest.main()
