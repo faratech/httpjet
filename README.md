@@ -100,7 +100,7 @@ raw logs are published with the receipts. The full
 methodology, the per-release speed curve, per-round TSVs, checks, and all
 raw logs are at
 [httpjet.net/docs/performance](https://httpjet.net/docs/performance) and on
-the [benchmark page](https://windowsforum.com/admin/httpjet/benchmarks/).
+the [benchmark page](https://httpjet.net/benchmarks/).
 
 ## Install on Linux
 
