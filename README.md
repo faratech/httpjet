@@ -78,14 +78,27 @@ Three rounds per cell, median shown; 1M requests per HTTP/2 cell.
 | HTTP/1.1, 1 KiB file, c=100 (`h2load --h1`) | **426,956 req/s** | 302,600 req/s | 346,844 req/s |
 | HTTP/1.1, 1 KiB file, c=100 (`wrk`, 15 s) | **540,911 req/s** | 341,344 req/s | 439,433 req/s |
 
-In a paired same-host run against 0.1.11 (server pinned to 4 cores, load
-generator on the other 4, median of 3 rounds), the 0.1.12 hot-path changes
-moved static throughput +13.8% (HTTP/2) and +10.7% (HTTP/1.1), PHP/LSAPI
-+3.3%, with page-cache hits at ~101K req/s over HTTP/2.
+For version-to-version comparison, every release from v0.0.1 to v0.1.12 was
+also re-measured under **identical conditions** on a dedicated lab VM
+(c4-highmem-8, loopback, server pinned to 4 cores, load generator on the
+other 4, each release PGO-built from its tag the same way, 3 rotated rounds,
+median shown). Before benching, each binary passed the same functional
+checks (start, static file, `.htaccess` page, PHP page, page-cache hit,
+empty and 64 KiB files, config lint) — 10 of 10 pass. Lab medians for
+0.1.12: 550K req/s HTTP/2 1 KiB static, 486K page-cache hits, 284K HTTP/1.1
+static, 27.8K PHP/LSAPI. In the same lab, nginx reached 190K (HTTP/2 1 KiB),
+274K (empty), and 270K (`wrk` HTTP/1.1) against httpjet 0.1.12's 517K, 593K,
+and 328K. (OpenLiteSpeed does not run in the lab layout; its cross-server
+comparison is the dedicated-client table above.) Two caveats travel with
+the lab data: absolute numbers move with VM placement — compare within a
+run, not across runs — and PHP for v0.0.1–v0.0.3 measures cold `lsphp`-pool
+ramp rather than steady state (warm, v0.0.1 sustains ~32K req/s).
 
 These are loopback-class synthetic numbers: they isolate the server's code
-path, not end-user latency. The full methodology, the per-release speed
-curve, and CSV receipts are at
+path, not end-user latency. The lab drivers, per-round TSVs, checks, and all
+raw logs are published with the receipts. The full
+methodology, the per-release speed curve, per-round TSVs, checks, and all
+raw logs are at
 [httpjet.net/docs/performance](https://httpjet.net/docs/performance) and on
 the [benchmark page](https://windowsforum.com/admin/httpjet/benchmarks/).
 
