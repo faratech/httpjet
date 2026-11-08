@@ -1,19 +1,23 @@
 # httpjet
 
-An experimental Linux web server written in Rust: it reads LiteSpeed-compatible
+A Linux web server written in Rust: it reads LiteSpeed-compatible
 XML, speaks LSAPI to `lsphp`, and serves HTTP/1.1, HTTP/2, and HTTP/3 with TLS,
 static files, proxying, rewrites, compression, and an opt-in page cache.
 
-> **Production note.** httpjet is early-stage software built around one
-> production configuration. It powers
-> [WindowsForum.com](https://windowsforum.com) in production. Test on alternate
-> ports before using it elsewhere. Visit **[httpjet.net](https://httpjet.net)**
-> and read the full documentation at **[httpjet.net/docs/](https://httpjet.net/docs/)**.
+> **Production note.** httpjet runs in production: it replaced LiteSpeed as
+> the origin server for [WindowsForum.com](https://windowsforum.com) on an
+> x86_64 origin and for [MoonTimeNow.com](https://moontimenow.com) and
+> [ThisDayInHistory.ai](https://thisdayinhistory.ai) on an ARM64 origin, all
+> behind Cloudflare. Validate your configuration with `check --strict` and
+> test on alternate ports before cutover. Visit
+> **[httpjet.net](https://httpjet.net)** and read the full documentation at
+> **[httpjet.net/docs/](https://httpjet.net/docs/)**.
 
 ## Contents
 
 - [Documentation](#documentation)
 - [Features at a glance](#features-at-a-glance)
+- [Performance](#performance)
 - [Install on Linux](#install-on-linux)
 - [Build and try it](#build-and-try-it)
 - [Configuration](#configuration)
@@ -34,7 +38,7 @@ Complete technical documentation, architecture diagrams, interactive `.htaccess`
 - **[Rewrite & `.htaccess`](https://httpjet.net/docs/rewrite)** — Apache `mod_rewrite` engine, dense-DFA prefilter, `fast_memo` eligibility, and interactive `.htaccess` inspector.
 - **[Origin Page Cache](https://httpjet.net/docs/page-cache)** — LSCache-compatible public/private tiers, W-TinyLFU admission, `jetcache` tmpfs file tier, and per-vhost zstd dictionaries.
 - **[Configuration Reference](https://httpjet.net/docs/configuration)** & **[CLI Reference](https://httpjet.net/docs/cli)** — Filterable LiteSpeed XML directive and `httpjet` flag references.
-- **[Performance Benchmarks](https://httpjet.net/docs/performance)** & **[Migrating from LiteSpeed](https://httpjet.net/docs/migration)** — Loopback 3-way benchmarks, production attribution, and validation-first cutover guide.
+- **[Performance Benchmarks](https://httpjet.net/docs/performance)** & **[Migrating from LiteSpeed](https://httpjet.net/docs/migration)** — Three-way benchmarks (dedicated-client and loopback), production attribution, and validation-first cutover guide.
 - **[LLM Documentation Corpus (`llms-full.txt`)](https://httpjet.net/llms-full.txt)** — Single-file Markdown reference of all 21 documentation pages.
 
 ## Features at a glance
@@ -58,6 +62,32 @@ The `httpjet` binary is under `crates/httpjet`; reusable components are the
 `hj-rewrite`, `hj-tls`, and others). Optional Cargo features are off by
 default: `acme`, `ocsp`, `otel`, `profiling`, `allocount`, and the staged
 `ktls`.
+
+## Performance
+
+Measured 2026-11-08 for the 0.1.12 release in the topology LiteSpeed and nginx
+publish their benchmarks in: `h2load` (nghttp2) on a **dedicated
+load-generator VM** (c4-highcpu-8, same cloud zone) against servers unpinned
+on the full host, over the private network, with production traffic live.
+Three rounds per cell, median shown; 1M requests per HTTP/2 cell.
+
+| Workload | httpjet 0.1.12 | OpenLiteSpeed | nginx |
+|---|---:|---:|---:|
+| HTTP/2, empty body, c=50 ×100 | **1,182,673 req/s** | 892,073 req/s | 387,982 req/s |
+| HTTP/2, 1 KiB file, c=50 ×100 | **1,097,084 req/s** | 740,271 req/s | 319,240 req/s |
+| HTTP/1.1, 1 KiB file, c=100 (`h2load --h1`) | **426,956 req/s** | 302,600 req/s | 346,844 req/s |
+| HTTP/1.1, 1 KiB file, c=100 (`wrk`, 15 s) | **540,911 req/s** | 341,344 req/s | 439,433 req/s |
+
+In a paired same-host run against 0.1.11 (server pinned to 4 cores, load
+generator on the other 4, median of 3 rounds), the 0.1.12 hot-path changes
+moved static throughput +13.8% (HTTP/2) and +10.7% (HTTP/1.1), PHP/LSAPI
++3.3%, with page-cache hits at ~101K req/s over HTTP/2.
+
+These are loopback-class synthetic numbers: they isolate the server's code
+path, not end-user latency. The full methodology, the per-release speed
+curve, and CSV receipts are at
+[httpjet.net/docs/performance](https://httpjet.net/docs/performance) and on
+the [benchmark page](https://windowsforum.com/admin/httpjet/benchmarks/).
 
 ## Install on Linux
 
