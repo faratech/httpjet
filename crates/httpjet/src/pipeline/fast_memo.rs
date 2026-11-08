@@ -39,7 +39,7 @@
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -47,6 +47,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use hj_core::{Body, Request, Response};
 use hj_rewrite::{Htaccess, RuleSet};
+use rustc_hash::{FxHashMap, FxHasher};
 
 use super::UaClassifyCache;
 
@@ -197,6 +198,7 @@ fn vary_same(a: &[VaryItem], b: &[VaryItem]) -> bool {
 struct MemoEntry {
     generation: u64,
     page: Option<crate::lscache::PublicResponseMemo>,
+    variant_codec: Option<u8>,
     response_epoch: Option<Arc<str>>,
     purge_epoch: u64,
     listener: String,
@@ -213,6 +215,8 @@ struct MemoEntry {
     headers: http::HeaderMap,
     /// `headers` ends with a placeholder `Date` that each replay overwrites in place.
     stamp_date: bool,
+    /// Unix epoch second of the `Date` currently stamped into `headers` (0 if none).
+    stamped_date_sec: u64,
     body: Bytes,
     expires: Instant,
 }
@@ -220,7 +224,7 @@ struct MemoEntry {
 #[derive(Default)]
 struct Memo {
     /// Base-key hash → the variants (distinct vary-sets) stored under it.
-    map: HashMap<u64, Vec<MemoEntry>>,
+    map: FxHashMap<u64, Vec<MemoEntry>>,
     /// Sum of `body.len()` across every variant (the [`MAX_BYTES`] budget).
     bytes: usize,
     /// Number of variants across `map` (the [`MAX_ENTRIES`] cap).
@@ -280,7 +284,7 @@ thread_local! {
 }
 
 fn key_hash(k: &MemoKey) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut h = FxHasher::default();
     k.generation.hash(&mut h);
     {
         k.response_epoch.hash(&mut h);
@@ -316,6 +320,73 @@ fn matches(e: &MemoEntry, k: &MemoKey) -> bool {
         && e.ae == k.ae
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PageMemoServe {
+    pub key_hash: u64,
+    pub variant_codec: Option<u8>,
+}
+
+pub(super) fn probe_serve<E>(
+    k: &MemoKey,
+    req: &Request,
+    ua_cache: &UaClassifyCache,
+    now: Instant,
+    check_acl: impl FnOnce() -> Result<std::net::IpAddr, E>,
+    purge_epoch_current: impl Fn(u64) -> bool,
+    memo_changed_err: E,
+) -> Option<Result<(Response, std::net::IpAddr, Option<PageMemoServe>), E>> {
+    let h = key_hash(k);
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        m.reclaim_expired(now);
+        if !m.drop_expired(h, now) {
+            return None;
+        }
+        let e = m.map.get_mut(&h)?.iter_mut().find(|e| {
+            (k.allow_page_responses || e.page.is_none())
+                && e.page.as_ref().is_none_or(|page| page.lease.is_current())
+                && matches(e, k)
+                && e.vary.iter().all(|v| v.matches(req, ua_cache))
+        })?;
+        if e.page.is_some() && Instant::now() >= e.expires {
+            return None;
+        }
+        if !purge_epoch_current(k.purge_epoch) {
+            return None;
+        }
+        let client_ip = match check_acl() {
+            Ok(ip) => ip,
+            Err(err) => return Some(Err(err)),
+        };
+        let page_serve = if let Some(page) = &e.page {
+            if Instant::now() >= page.deadline
+                || !page.lease.is_current()
+                || !purge_epoch_current(page.purge_epoch)
+            {
+                return Some(Err(memo_changed_err));
+            }
+            Some(PageMemoServe {
+                key_hash: page.key_hash,
+                variant_codec: e.variant_codec,
+            })
+        } else {
+            None
+        };
+        if e.stamp_date {
+            let (sec, date_val) = hj_core::http_date_now_with_sec();
+            if e.stamped_date_sec != sec {
+                e.headers.insert(http::header::DATE, date_val);
+                e.stamped_date_sec = sec;
+            }
+        }
+        let mut resp = http::Response::new(Body::Full(e.body.clone()));
+        *resp.status_mut() = e.status;
+        *resp.headers_mut() = e.headers.clone();
+        Some(Ok((resp, client_ip, page_serve)))
+    })
+}
+
+#[cfg(test)]
 pub(super) fn probe(
     k: &MemoKey,
     req: &Request,
@@ -329,7 +400,7 @@ pub(super) fn probe(
         if !m.drop_expired(h, now) {
             return None;
         }
-        let e = m.map.get(&h)?.iter().find(|e| {
+        let e = m.map.get_mut(&h)?.iter_mut().find(|e| {
             (k.allow_page_responses || e.page.is_none())
                 && e.page.as_ref().is_none_or(|page| page.lease.is_current())
                 && matches(e, k)
@@ -338,13 +409,16 @@ pub(super) fn probe(
         if e.page.is_some() && Instant::now() >= e.expires {
             return None;
         }
+        if e.stamp_date {
+            let (sec, date_val) = hj_core::http_date_now_with_sec();
+            if e.stamped_date_sec != sec {
+                e.headers.insert(http::header::DATE, date_val);
+                e.stamped_date_sec = sec;
+            }
+        }
         let mut resp = http::Response::new(Body::Full(e.body.clone()));
         *resp.status_mut() = e.status;
         *resp.headers_mut() = e.headers.clone();
-        if e.stamp_date {
-            resp.headers_mut()
-                .insert(http::header::DATE, hj_core::http_date_now());
-        }
         Some((resp, e.page.clone()))
     })
 }
@@ -422,13 +496,23 @@ pub(super) fn store_until(
         resp.headers().clone()
     };
     let stamp_date = !headers.contains_key(http::header::DATE);
-    if stamp_date {
-        headers.insert(http::header::DATE, hj_core::http_date_now());
-    }
+    let stamped_date_sec = if stamp_date {
+        let (sec, date_val) = hj_core::http_date_now_with_sec();
+        headers.insert(http::header::DATE, date_val);
+        sec
+    } else {
+        0
+    };
     let is_page = page.is_some();
+    let variant_codec = if is_page {
+        crate::lscache::response_variant_codec(resp)
+    } else {
+        None
+    };
     let entry = MemoEntry {
         generation: k.generation,
         page,
+        variant_codec,
         response_epoch: k.response_epoch.map(Arc::from),
         purge_epoch: k.purge_epoch,
         listener: k.listener.to_owned(),
@@ -444,6 +528,7 @@ pub(super) fn store_until(
         status: resp.status(),
         headers,
         stamp_date,
+        stamped_date_sec,
         // Held for the memo's TTL. A pooled egress buffer (marked `FreshBody` by its producer)
         // is copied out, or the entry would pin it whole while the byte budget counted only
         // its length; any other body (the static cache's exact-size bytes) is shared.

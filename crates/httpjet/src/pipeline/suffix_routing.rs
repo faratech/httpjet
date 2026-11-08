@@ -93,9 +93,12 @@ fn has_executable_segment(path: &str, php_suffixes: &std::collections::HashSet<S
 /// is used only while script execution is disabled, where constructing the full
 /// effective suffix set would be wasted: every possible script route fails
 /// closed before a backend or filesystem target is consulted.
-fn configured_extension_is_executable(state: &ServerState, ctx: &ReqCtx, extension: &str) -> bool {
-    if let Some(handler) = ctx
-        .vhost
+fn configured_extension_is_executable_vhost(
+    state: &ServerState,
+    vhost: &hj_core::config::VHostConfig,
+    extension: &str,
+) -> bool {
+    if let Some(handler) = vhost
         .script_handlers
         .iter()
         .rev()
@@ -111,14 +114,26 @@ fn configured_extension_is_executable(state: &ServerState, ctx: &ReqCtx, extensi
                 .any(|suffix| suffix.eq_ignore_ascii_case(extension)))
 }
 
+fn configured_extension_is_executable(state: &ServerState, ctx: &ReqCtx, extension: &str) -> bool {
+    configured_extension_is_executable_vhost(state, &ctx.vhost, extension)
+}
+
 /// The URL's last segment carries an extension this vhost maps to a script handler
 /// (string-only: no suffix set, candidate path, or filesystem probe).
 pub(super) fn last_segment_is_script(state: &ServerState, ctx: &ReqCtx, path: &str) -> bool {
+    last_segment_is_script_vhost(state, &ctx.vhost, path)
+}
+
+pub(super) fn last_segment_is_script_vhost(
+    state: &ServerState,
+    vhost: &hj_core::config::VHostConfig,
+    path: &str,
+) -> bool {
     let last = path.rsplit('/').next().unwrap_or("");
     matches!(
         last.rsplit_once('.'),
         Some((_, extension))
-            if !extension.is_empty() && configured_extension_is_executable(state, ctx, extension)
+            if !extension.is_empty() && configured_extension_is_executable_vhost(state, vhost, extension)
     )
 }
 

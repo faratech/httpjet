@@ -646,12 +646,28 @@ impl LookupCounters {
     }
 }
 
-pub(crate) fn record_response_memo_hit(state: &ServerState, key_hash: u64, response: &Response) {
+pub(crate) fn response_variant_codec(response: &Response) -> Option<u8> {
+    response
+        .headers()
+        .get(CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .and_then(variant_codec_index)
+        .map(|i| i as u8)
+}
+
+pub(crate) fn record_response_memo_hit_codec(
+    state: &ServerState,
+    key_hash: u64,
+    variant_codec: Option<u8>,
+) {
     if let Some(store) = state.page_cache.as_ref() {
         store.record_hit();
         state.page_cache_admission.record(key_hash);
         state.metrics.pagecache_lookup.record_result(2, 0);
-        note_variant_serve(state, response);
+        if let Some(index) = variant_codec {
+            state.metrics.pagecache_variant_serves[index as usize]
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

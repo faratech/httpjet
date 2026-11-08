@@ -508,7 +508,7 @@ pub struct Telemetry {
     /// Dense vhost name → bucket index. Built once at boot and carried across a
     /// SIGHUP reload via the shared `Arc` (so counters stay monotonic); a vhost
     /// added at reload routes to the overflow bucket until a full restart.
-    vhost_index: std::collections::HashMap<String, usize>,
+    vhost_index: rustc_hash::FxHashMap<String, usize>,
     /// Bucket index → render label (length `MAX_VHOSTS`; empty slot = unused;
     /// `VHOST_OVERFLOW` = `__other__`).
     vhost_names: Vec<String>,
@@ -526,7 +526,7 @@ impl Telemetry {
     /// order); the rest — and any unmapped/foreign host at request time — fold into
     /// the reserved `__other__` overflow bucket.
     pub fn new(vhosts: impl IntoIterator<Item = String>) -> Self {
-        let mut vhost_index = std::collections::HashMap::new();
+        let mut vhost_index = rustc_hash::FxHashMap::default();
         let mut vhost_names = vec![String::new(); MAX_VHOSTS];
         for name in vhosts {
             if vhost_index.len() >= VHOST_OVERFLOW {
@@ -587,9 +587,14 @@ impl Telemetry {
     /// `vhost` (the resolved request host) also bumps that vhost's series; an unmapped name
     /// lands in `__other__`.
     pub fn record_cache_hit(&self, loopback: bool, vhost: &str) {
+        self.record_cache_hit_idx(loopback, self.vhost_idx(vhost));
+    }
+
+    #[inline]
+    pub fn record_cache_hit_idx(&self, loopback: bool, vhost_idx: usize) {
         let s = self.shard();
         s.cache_hits.fetch_add(1, Relaxed);
-        s.per_vhost[self.vhost_idx(vhost)]
+        s.per_vhost[vhost_idx.min(VHOST_OVERFLOW)]
             .cache_hits
             .fetch_add(1, Relaxed);
         if loopback {

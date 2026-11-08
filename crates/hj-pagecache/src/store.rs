@@ -1757,15 +1757,45 @@ impl PathPresence {
 /// 2^22 bits (512 KiB): about 1.5% false positives at 64k resident paths, 4% at 160k.
 const PATH_PRESENCE_LOG2_BITS: u32 = 22;
 
-/// One cache line (64 B) of storage for an [`AtomicU64`], so hot per-request
-/// counters never share a line with each other.
-#[repr(align(64))]
-struct CachePaddedAtomic(AtomicU64);
+const COUNTER_SHARDS: usize = 64;
 
-impl std::ops::Deref for CachePaddedAtomic {
-    type Target = AtomicU64;
-    fn deref(&self) -> &AtomicU64 {
-        &self.0
+#[repr(align(128))]
+#[derive(Default)]
+struct CounterShard(AtomicU64);
+
+#[inline]
+fn counter_shard_index() -> usize {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    thread_local! {
+        static IDX: usize = (NEXT.fetch_add(1, Ordering::Relaxed) as usize) & (COUNTER_SHARDS - 1);
+    }
+    IDX.with(|&i| i)
+}
+
+/// Sharded per-thread counter (64 × 128 B lines) so hot per-request counters
+/// (`hits`, `misses`, `stores`, `purges`) never bounce cache lines across cores.
+struct CachePaddedAtomic(Box<[CounterShard; COUNTER_SHARDS]>);
+
+impl CachePaddedAtomic {
+    fn new(val: u64) -> Self {
+        let shards: Box<[CounterShard; COUNTER_SHARDS]> =
+            Box::new(std::array::from_fn(|_| CounterShard::default()));
+        if val != 0 {
+            shards[0].0.store(val, Ordering::Relaxed);
+        }
+        Self(shards)
+    }
+
+    #[inline]
+    fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
+        self.0[counter_shard_index()].0.fetch_add(val, order)
+    }
+
+    #[inline]
+    fn load(&self, order: Ordering) -> u64 {
+        self.0
+            .iter()
+            .fold(0u64, |acc, s| acc.wrapping_add(s.0.load(order)))
     }
 }
 
@@ -1918,12 +1948,12 @@ impl PageStore {
             purge_all_teardown_probe: Mutex::new(None),
             scan_loaded: AtomicU64::new(0),
             body_id_seq: AtomicU64::new(1),
-            hits: CachePaddedAtomic(AtomicU64::new(0)),
-            misses: CachePaddedAtomic(AtomicU64::new(0)),
-            stores: CachePaddedAtomic(AtomicU64::new(0)),
-            purges: CachePaddedAtomic(AtomicU64::new(0)),
-            store_commit_hold_us: CachePaddedAtomic(AtomicU64::new(0)),
-            store_commit_calls: CachePaddedAtomic(AtomicU64::new(0)),
+            hits: CachePaddedAtomic::new(0),
+            misses: CachePaddedAtomic::new(0),
+            stores: CachePaddedAtomic::new(0),
+            purges: CachePaddedAtomic::new(0),
+            store_commit_hold_us: CachePaddedAtomic::new(0),
+            store_commit_calls: CachePaddedAtomic::new(0),
             store_purge_rejections: AtomicU64::new(0),
             disk_evictions,
             evictions,

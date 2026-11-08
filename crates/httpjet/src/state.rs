@@ -379,15 +379,33 @@ pub struct ServerState {
 /// across a SIGHUP reload by a single `Arc` clone (so every config generation, every
 /// `ConnGuard`/`RequestGuard`, and the drain loop share the same atomics). Each field is
 /// itself an `Arc<AtomicU64>` so the guards capture exactly the handle they need.
-/// One full cache line, so a hot atomic never shares its line with neighbors.
-#[repr(align(64))]
+#[repr(align(128))]
 #[derive(Default)]
-pub struct PaddedAtomic(pub AtomicU64);
+struct AtomicShard(AtomicU64);
 
-impl std::ops::Deref for PaddedAtomic {
-    type Target = AtomicU64;
-    fn deref(&self) -> &AtomicU64 {
-        &self.0
+/// Sharded per-worker counter across [`crate::telemetry::SHARDS`] 128 B cache lines
+/// so hot per-request counters never ping-pong across cores.
+pub struct PaddedAtomic(Box<[AtomicShard; crate::telemetry::SHARDS]>);
+
+impl Default for PaddedAtomic {
+    fn default() -> Self {
+        Self(Box::new(std::array::from_fn(|_| AtomicShard::default())))
+    }
+}
+
+impl PaddedAtomic {
+    #[inline]
+    pub fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
+        self.0[crate::telemetry::shard_index()]
+            .0
+            .fetch_add(val, order)
+    }
+
+    #[inline]
+    pub fn load(&self, order: Ordering) -> u64 {
+        self.0
+            .iter()
+            .fold(0u64, |acc, s| acc.wrapping_add(s.0.load(order)))
     }
 }
 
@@ -407,21 +425,21 @@ pub struct Metrics {
     /// (OPS3) Local loopback purges received on /__hj_cache_purge and applied.
     pub purges_received: Arc<AtomicU64>,
     /// (#349) Finished-response memo hits served on the on-core fast path.
-    pub fast_memo_hits: Arc<AtomicU64>,
+    pub fast_memo_hits: Arc<PaddedAtomic>,
     /// (#349) Finished-response memo stores (first full-pipeline serve per key/TTL).
     pub fast_memo_stores: Arc<AtomicU64>,
     /// (#349) Memo-eligible static requests whose `.htaccess` chain refused the store
     /// (a `MemoClass` blocker) — "why is this vhost not memoizing" in one number.
     pub fast_memo_ineligible: Arc<AtomicU64>,
     /// (#343 Step 1) Fast-path GET/HEAD requests carrying NO Cookie header.
-    pub fast_cookie_none: Arc<AtomicU64>,
+    pub fast_cookie_none: Arc<PaddedAtomic>,
     /// (#343 Step 1) Cookied GET/HEAD requests whose cookie names include the
     /// configured member/session markers — presumed logged-in, not a fast-path
     /// extension candidate.
-    pub fast_cookie_member_session: Arc<AtomicU64>,
+    pub fast_cookie_member_session: Arc<PaddedAtomic>,
     /// (#343 Step 1) Cookied GET/HEAD requests with NO member/session marker — the
     /// benign-cookie population an on-core fast-path extension could serve.
-    pub fast_cookie_benign_only: Arc<AtomicU64>,
+    pub fast_cookie_benign_only: Arc<PaddedAtomic>,
     /// Why on-core `fast_serve` requests bridged to the tokio pipeline, per reason.
     pub fast_bridge: Arc<crate::pipeline::fast_bridge::FastBridgeCounters>,
     /// Page-cache lookups split by caller (on-core probe vs dispatch) and outcome.
@@ -474,8 +492,8 @@ pub struct Metrics {
     pub xf_capsule_dedicated_stores: Arc<AtomicU64>,
     /// Precompressed page-cache variants built by first-hit fills, and hits served from one,
     /// per codec (zstd, br, gzip — see `lscache::VARIANT_CODECS`).
-    pub pagecache_variant_fills: Arc<[AtomicU64; 3]>,
-    pub pagecache_variant_serves: Arc<[AtomicU64; 3]>,
+    pub pagecache_variant_fills: Arc<[PaddedAtomic; 3]>,
+    pub pagecache_variant_serves: Arc<[PaddedAtomic; 3]>,
     /// Cacheable misses forwarded while the backend was still writing them
     /// (`--page-cache-stream-fill-vhosts`), and how many of those were stored at the end.
     pub pagecache_stream_fills: Arc<AtomicU64>,

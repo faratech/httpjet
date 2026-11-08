@@ -27,6 +27,30 @@ pub fn is_trusted_internal_peer(ip: IpAddr) -> bool {
 
 /// Extract the host from a `Host` / `:authority` value, dropping any `:port` and
 /// the brackets around an IPv6 literal, lowercased and with a trailing root dot
+/// removed (`example.com.` → `example.com`), borrowing when already lowercase.
+#[inline]
+pub fn host_without_port_cow(authority: &str) -> std::borrow::Cow<'_, str> {
+    let a = authority.trim();
+    let host = if let Some(rest) = a.strip_prefix('[') {
+        // `[ipv6]` or `[ipv6]:port` — take up to the closing bracket.
+        rest.split(']').next().unwrap_or(rest)
+    } else if a.as_bytes().iter().filter(|&&b| b == b':').count() > 1 {
+        // Unbracketed multi-colon: a bare IPv6 literal (malformed in a Host header
+        // per RFC 7230, but don't mangle it) — there is no port to strip.
+        a
+    } else {
+        a.split(':').next().unwrap_or(a)
+    };
+    let trimmed = host.trim_end_matches('.');
+    if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+        std::borrow::Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    }
+}
+
+/// Extract the host from a `Host` / `:authority` value, dropping any `:port` and
+/// the brackets around an IPv6 literal, lowercased and with a trailing root dot
 /// removed (`example.com.` → `example.com`).
 ///
 /// Handles `example.com`, `example.com:443`, `[::1]`, and `[::1]:8443`. A plain
@@ -34,18 +58,7 @@ pub fn is_trusted_internal_peer(ip: IpAddr) -> bool {
 /// normalizer shared by vhost routing, the mTLS HTTP→HTTPS redirect, and the
 /// page-cache key host.
 pub fn host_without_port(authority: &str) -> String {
-    let a = authority.trim();
-    let host = if let Some(rest) = a.strip_prefix('[') {
-        // `[ipv6]` or `[ipv6]:port` — take up to the closing bracket.
-        rest.split(']').next().unwrap_or(rest)
-    } else if a.matches(':').count() > 1 {
-        // Unbracketed multi-colon: a bare IPv6 literal (malformed in a Host header
-        // per RFC 7230, but don't mangle it) — there is no port to strip.
-        a
-    } else {
-        a.split(':').next().unwrap_or(a)
-    };
-    host.trim_end_matches('.').to_ascii_lowercase()
+    host_without_port_cow(authority).into_owned()
 }
 
 /// RFC 3986 §3.1 URI scheme syntax. HTTP/2 permits valid non-HTTP schemes, so
@@ -148,7 +161,7 @@ pub fn valid_uri_authority(value: &str) -> bool {
 /// neither. Keep the generic validator separate so HTTP/2 can still carry valid
 /// non-HTTP schemes.
 pub fn valid_http_authority(value: &str) -> bool {
-    !value.contains('@') && valid_uri_authority(value) && !host_without_port(value).is_empty()
+    !value.contains('@') && valid_uri_authority(value) && !host_without_port_cow(value).is_empty()
 }
 
 #[cfg(test)]

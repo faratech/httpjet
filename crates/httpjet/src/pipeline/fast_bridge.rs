@@ -139,17 +139,30 @@ impl FastBridge {
     }
 }
 
-pub struct FastBridgeCounters([AtomicU64; FastBridge::ALL.len()]);
+#[repr(align(128))]
+struct FastBridgeShard([AtomicU64; FastBridge::ALL.len()]);
 
-impl Default for FastBridgeCounters {
+impl Default for FastBridgeShard {
     fn default() -> Self {
         Self(std::array::from_fn(|_| AtomicU64::new(0)))
     }
 }
 
+pub struct FastBridgeCounters(Box<[FastBridgeShard; crate::telemetry::SHARDS]>);
+
+impl Default for FastBridgeCounters {
+    fn default() -> Self {
+        Self(Box::new(std::array::from_fn(|_| {
+            FastBridgeShard::default()
+        })))
+    }
+}
+
 impl FastBridgeCounters {
+    #[inline]
     pub(crate) fn bump(&self, why: FastBridge) {
-        if let Some(counter) = self.0.get(why as usize) {
+        let shard = &self.0[crate::telemetry::shard_index()];
+        if let Some(counter) = shard.0.get(why as usize) {
             counter.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -158,8 +171,10 @@ impl FastBridgeCounters {
         FastBridge::ALL.iter().map(|&r| {
             let n = self
                 .0
-                .get(r as usize)
-                .map_or(0, |c| c.load(Ordering::Relaxed));
+                .iter()
+                .filter_map(|shard| shard.0.get(r as usize))
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum();
             (r.label(), n)
         })
     }

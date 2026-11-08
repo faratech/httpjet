@@ -216,6 +216,65 @@ pub fn get(index: usize) -> Option<(&'static str, &'static str)> {
     TABLE.get(index - 1).copied()
 }
 
+/// Pre-validated `http::HeaderName` for a 1-based static-table index when the entry
+/// names a valid, non-connection-specific regular HTTP/2 request header.
+/// Pseudo-headers (`1..=14`) and `transfer-encoding` (`57`, connection-specific)
+/// return `None` so the caller handles pseudo-headers or rejects `transfer-encoding`.
+#[inline]
+pub fn request_header_name(index: usize) -> Option<http::HeaderName> {
+    use http::header;
+    Some(match index {
+        15 => header::ACCEPT_CHARSET,
+        16 => header::ACCEPT_ENCODING,
+        17 => header::ACCEPT_LANGUAGE,
+        18 => header::ACCEPT_RANGES,
+        19 => header::ACCEPT,
+        20 => header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        21 => header::AGE,
+        22 => header::ALLOW,
+        23 => header::AUTHORIZATION,
+        24 => header::CACHE_CONTROL,
+        25 => header::CONTENT_DISPOSITION,
+        26 => header::CONTENT_ENCODING,
+        27 => header::CONTENT_LANGUAGE,
+        28 => header::CONTENT_LENGTH,
+        29 => header::CONTENT_LOCATION,
+        30 => header::CONTENT_RANGE,
+        31 => header::CONTENT_TYPE,
+        32 => header::COOKIE,
+        33 => header::DATE,
+        34 => header::ETAG,
+        35 => header::EXPECT,
+        36 => header::EXPIRES,
+        37 => header::FROM,
+        38 => header::HOST,
+        39 => header::IF_MATCH,
+        40 => header::IF_MODIFIED_SINCE,
+        41 => header::IF_NONE_MATCH,
+        42 => header::IF_RANGE,
+        43 => header::IF_UNMODIFIED_SINCE,
+        44 => header::LAST_MODIFIED,
+        45 => header::LINK,
+        46 => header::LOCATION,
+        47 => header::MAX_FORWARDS,
+        48 => header::PROXY_AUTHENTICATE,
+        49 => header::PROXY_AUTHORIZATION,
+        50 => header::RANGE,
+        51 => header::REFERER,
+        52 => header::REFRESH,
+        53 => header::RETRY_AFTER,
+        54 => header::SERVER,
+        55 => header::SET_COOKIE,
+        56 => header::STRICT_TRANSPORT_SECURITY,
+        // 57 is "transfer-encoding" (connection-specific, illegal in HTTP/2 requests).
+        58 => header::USER_AGENT,
+        59 => header::VARY,
+        60 => header::VIA,
+        61 => header::WWW_AUTHENTICATE,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +340,18 @@ mod tests {
         assert_eq!(get(8), Some((":status", "200")));
         assert_eq!(get(0), None);
         assert_eq!(get(62), None);
+        for idx in 1..=TABLE.len() {
+            let (name, _) = get(idx).unwrap();
+            let got = request_header_name(idx);
+            if name.starts_with(':') || hj_core::is_connection_specific_request_header(name) {
+                assert_eq!(got, None, "idx={idx} name={name}");
+            } else {
+                assert_eq!(
+                    got.as_ref().map(|h| h.as_str()),
+                    Some(name),
+                    "idx={idx} name={name}"
+                );
+            }
+        }
     }
 }

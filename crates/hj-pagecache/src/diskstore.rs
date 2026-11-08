@@ -160,7 +160,8 @@ pub(crate) struct PreparedEntry {
     tmp_file: fs::File,
     tmp_name: String,
     tmp_path: PathBuf,
-    live_tmp_files: Arc<Mutex<HashSet<PathBuf>>>,
+    live_tmp_files: Option<Arc<Mutex<HashSet<PathBuf>>>>,
+    tmp_unlinked: bool,
     dir: PathBuf,
     hex: String,
     final_ext: &'static str,
@@ -170,12 +171,16 @@ pub(crate) struct PreparedEntry {
 
 impl Drop for PreparedEntry {
     fn drop(&mut self) {
-        self.live_tmp_files.lock().remove(&self.tmp_path);
-        let _ = rustix::fs::unlinkat(
-            &self.leaf,
-            self.tmp_name.as_str(),
-            rustix::fs::AtFlags::empty(),
-        );
+        if let Some(live_tmp_files) = &self.live_tmp_files {
+            live_tmp_files.lock().remove(&self.tmp_path);
+        }
+        if !self.tmp_unlinked {
+            let _ = rustix::fs::unlinkat(
+                &self.leaf,
+                self.tmp_name.as_str(),
+                rustix::fs::AtFlags::empty(),
+            );
+        }
     }
 }
 
@@ -211,6 +216,29 @@ pub struct DiskStore {
 
 fn rustix_io(error: rustix::io::Errno) -> io::Error {
     io::Error::from_raw_os_error(error.raw_os_error())
+}
+
+fn write_all_vectored3(f: &mut fs::File, a: &[u8], b: &[u8], c: &[u8]) -> io::Result<()> {
+    let mut bufs = [
+        io::IoSlice::new(a),
+        io::IoSlice::new(b),
+        io::IoSlice::new(c),
+    ];
+    let mut slices: &mut [io::IoSlice<'_>] = &mut bufs;
+    while !slices.is_empty() {
+        match f.write_vectored(slices) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => io::IoSlice::advance_slices(&mut slices, n),
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn openat2_unavailable(error: rustix::io::Errno) -> bool {
@@ -578,17 +606,28 @@ impl DiskStore {
         let dir = self.display_dir(&hex);
         let first_seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let tmp_name = format!("{hex}-{first_seq}{final_ext}.tmp");
-        let mut live_tmp_files = self.live_tmp_files.lock();
-        let tmp_file = create_private_file_at(&leaf, &tmp_name)?;
         let tmp_path = dir.join(&tmp_name);
-        live_tmp_files.insert(tmp_path.clone());
-        drop(live_tmp_files);
+        let (tmp_file, live_tmp_files) = if self.boot_scan_pending.load(Ordering::Acquire) {
+            let mut live_tmp_files = self.live_tmp_files.lock();
+            let tmp_file = create_private_file_at(&leaf, &tmp_name)?;
+            if self.boot_scan_pending.load(Ordering::Acquire) {
+                live_tmp_files.insert(tmp_path.clone());
+                drop(live_tmp_files);
+                (tmp_file, Some(self.live_tmp_files.clone()))
+            } else {
+                (tmp_file, None)
+            }
+        } else {
+            let tmp_file = create_private_file_at(&leaf, &tmp_name)?;
+            (tmp_file, None)
+        };
         let mut prepared = PreparedEntry {
             leaf,
             tmp_file,
             tmp_name,
             tmp_path,
-            live_tmp_files: self.live_tmp_files.clone(),
+            live_tmp_files,
+            tmp_unlinked: false,
             dir,
             hex,
             final_ext,
@@ -730,41 +769,50 @@ impl DiskStore {
 
         let logical_total = HEADER_LEN + meta.len() as u64 + body.len() as u64;
         self.prepare_container(hex, ".pc", logical_total, |f| {
-            f.write_all(&header)?;
-            f.write_all(&meta)?;
-            f.write_all(body)?;
-            Ok(())
+            write_all_vectored3(f, &header, &meta, body)
         })
     }
 
     /// Atomically publish a prepared entry. A dropped/unpublished preparation
     /// removes only its private temp file.
-    pub(crate) fn publish_entry(&self, prepared: PreparedEntry) -> io::Result<(PathBuf, u32)> {
+    pub(crate) fn publish_entry(&self, mut prepared: PreparedEntry) -> io::Result<(PathBuf, u32)> {
         // Publish by HARD-LINKING the tmp into its final name, which FAILS if that name already
         // exists — so a published version file is never silently overwritten (the warm-window bug;
         // plain `rename` clobbers). Then drop the tmp name. `seq` is seeded past any prior run at
         // open(), so a collision (hence a retry) is effectively never hit; the loop is a backstop.
+        let metadata = prepared.tmp_file.metadata()?;
+        let disk_total = allocated_bytes_from_metadata(&metadata, prepared.logical_total);
         let mut seq = prepared.first_seq;
         loop {
             let final_name = format!("{}-{seq}{}", prepared.hex, prepared.final_ext);
             let final_path = prepared.dir.join(&final_name);
-            let mut live_files = self.live_files.lock();
-            match rustix::fs::linkat(
-                &prepared.leaf,
-                prepared.tmp_name.as_str(),
-                &prepared.leaf,
-                final_name.as_str(),
-                rustix::fs::AtFlags::empty(),
-            ) {
+            let link_res = if self.boot_scan_pending.load(Ordering::Acquire) {
+                let mut live_files = self.live_files.lock();
+                let res = rustix::fs::linkat(
+                    &prepared.leaf,
+                    prepared.tmp_name.as_str(),
+                    &prepared.leaf,
+                    final_name.as_str(),
+                    rustix::fs::AtFlags::empty(),
+                );
+                if res.is_ok() && self.boot_scan_pending.load(Ordering::Acquire) {
+                    live_files.insert(final_path.clone());
+                }
+                res
+            } else {
+                rustix::fs::linkat(
+                    &prepared.leaf,
+                    prepared.tmp_name.as_str(),
+                    &prepared.leaf,
+                    final_name.as_str(),
+                    rustix::fs::AtFlags::empty(),
+                )
+            };
+            match link_res {
                 Ok(()) => {
-                    let metadata = prepared.tmp_file.metadata()?;
-                    let disk_total =
-                        allocated_bytes_from_metadata(&metadata, prepared.logical_total);
-                    if self.boot_scan_pending.load(Ordering::Acquire) {
-                        live_files.insert(final_path.clone());
+                    if Self::unlink_at(&prepared.leaf, OsStr::new(&prepared.tmp_name)).is_ok() {
+                        prepared.tmp_unlinked = true;
                     }
-                    drop(live_files);
-                    let _ = Self::unlink_at(&prepared.leaf, OsStr::new(&prepared.tmp_name));
                     return Ok((final_path, disk_total));
                 }
                 Err(rustix::io::Errno::EXIST) => {
@@ -883,10 +931,7 @@ impl DiskStore {
 
         let logical_total = HEADER_LEN + meta.len() as u64 + body.len() as u64;
         let prepared = self.prepare_container(hex, ".sc", logical_total, |f| {
-            f.write_all(&header)?;
-            f.write_all(&meta)?;
-            f.write_all(body)?;
-            Ok(())
+            write_all_vectored3(f, &header, &meta, body)
         })?;
         self.publish_entry(prepared)
     }

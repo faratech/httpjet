@@ -119,8 +119,15 @@ pub const CONNECTION_SPECIFIC_REQUEST_HEADERS: [&str; 5] = [
 
 /// Whether a lowercase request header `name` is connection-specific and thus illegal over h2/h3.
 /// See [`CONNECTION_SPECIFIC_REQUEST_HEADERS`].
+#[inline]
 pub fn is_connection_specific_request_header(name: &str) -> bool {
-    CONNECTION_SPECIFIC_REQUEST_HEADERS.contains(&name)
+    match name.len() {
+        7 => name == "upgrade",
+        10 => name == "connection" || name == "keep-alive",
+        16 => name == "proxy-connection",
+        17 => name == "transfer-encoding",
+        _ => false,
+    }
 }
 
 /// RFC 3986 percent-decoding of `input`. Returns the raw decoded bytes, or
@@ -187,7 +194,11 @@ fn hex_val(b: u8) -> Option<u8> {
 /// serve path, so the value is rebuilt only when the wall-clock second changes
 /// (the same coarse-memo trick the `expiresByType` transform uses); within a
 /// second every caller clones a cached `HeaderValue`.
-pub fn http_date_now() -> HeaderValue {
+/// Like [`http_date_now`], also returning the coarse wall-clock second (`secs`) so
+/// per-worker response memos can skip re-inserting `Date` into a cached `HeaderMap`
+/// when the second has not ticked.
+#[inline]
+pub fn http_date_now_with_sec() -> (u64, HeaderValue) {
     thread_local! {
         static DATE_MEMO: RefCell<(u64, HeaderValue)> =
             const { RefCell::new((0, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"))) };
@@ -206,8 +217,12 @@ pub fn http_date_now() -> HeaderValue {
                 *m = (secs, v);
             }
         }
-        m.1.clone()
+        (m.0, m.1.clone())
     })
+}
+
+pub fn http_date_now() -> HeaderValue {
+    http_date_now_with_sec().1
 }
 
 /// Insert a `Date` header (RFC 9110 §6.6.1) if the response has none, returning the

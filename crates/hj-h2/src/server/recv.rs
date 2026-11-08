@@ -978,11 +978,14 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
     let mut scheme_is_http = false;
     let mut path_is_asterisk = false;
     let mut seen = [false; 4]; // :method, :scheme, :path, :authority
-    let result = dec.decode_octets(block, |name, value| {
+    let result = dec.decode_octets_with_header_name(block, |name, pre_validated, value| {
         if malformed {
             return;
         }
-        if name.first() == Some(&b':') {
+        let n = if let Some(n) = pre_validated {
+            seen_regular = true;
+            n
+        } else if name.first() == Some(&b':') {
             if is_trailers || seen_regular {
                 malformed = true; // pseudo-header in trailers, or after a regular field
                 return;
@@ -1069,77 +1072,69 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
                 }
                 _ => unreachable!("known pseudo-header matched above"),
             }
+            return;
         } else {
             seen_regular = true;
-            let Ok(name) = std::str::from_utf8(name) else {
-                malformed = true; // not a token
+            let Some(n) = crate::hpack::validate_request_header_name(name) else {
+                malformed = true;
                 return;
             };
-            if name.bytes().any(|b| b.is_ascii_uppercase()) {
-                malformed = true; // §8.1.2: field names must be lowercase
-                return;
-            }
-            if hj_core::is_connection_specific_request_header(name) {
-                malformed = true; // §8.1.2.2: connection-specific header (shared h2/h3 list)
-                return;
-            }
-            if name == "te" && !value.eq_ignore_ascii_case(b"trailers") {
-                malformed = true; // §8.1.2.2: TE may only be "trailers"
-                return;
-            }
-            // §8.2.1 (RFC 9113): a field name/value that fails validation makes the message
-            // malformed — it is NOT silently dropped — because an unvalidated field can enable
-            // request smuggling once forwarded to a backend over HTTP/1.x (httpjet is an
-            // intermediary; cf. §10.3). `HeaderName::from_bytes` rejects control/non-token bytes
-            // and a bare colon; `HeaderValue::from_bytes` rejects NUL/CR/LF but, like H1 and H3,
-            // admits obs-text; we add the §8.2.1 rule that a value MUST NOT start or end with
-            // SP/HTAB.
-            let vb = value;
-            let edge_ws =
-                matches!(vb.first(), Some(b' ' | b'\t')) || matches!(vb.last(), Some(b' ' | b'\t'));
-            match (
-                http::HeaderName::from_bytes(name.as_bytes()),
-                http::HeaderValue::from_bytes(value),
-            ) {
-                (Ok(n), Ok(v)) if !edge_ws => {
-                    if is_trailers {
-                        // Trailer fields obey the same field syntax and connection-header
-                        // rules, but valid trailers are discarded after HPACK decoding. This
-                        // keeps the dynamic table synchronized without forwarding trailers as
-                        // ordinary request headers.
+            n
+        };
+        if n == http::header::TE && !value.eq_ignore_ascii_case(b"trailers") {
+            malformed = true; // §8.1.2.2: TE may only be "trailers"
+            return;
+        }
+        // §8.2.1 (RFC 9113): a field name/value that fails validation makes the message
+        // malformed — it is NOT silently dropped — because an unvalidated field can enable
+        // request smuggling once forwarded to a backend over HTTP/1.x (httpjet is an
+        // intermediary; cf. §10.3). `HeaderName::from_bytes` rejects control/non-token bytes
+        // and a bare colon; `HeaderValue::from_bytes` rejects NUL/CR/LF but, like H1 and H3,
+        // admits obs-text; we add the §8.2.1 rule that a value MUST NOT start or end with
+        // SP/HTAB.
+        let vb = value;
+        let edge_ws =
+            matches!(vb.first(), Some(b' ' | b'\t')) || matches!(vb.last(), Some(b' ' | b'\t'));
+        match http::HeaderValue::from_bytes(value) {
+            Ok(v) if !edge_ws => {
+                if is_trailers {
+                    // Trailer fields obey the same field syntax and connection-header
+                    // rules, but valid trailers are discarded after HPACK decoding. This
+                    // keeps the dynamic table synchronized without forwarding trailers as
+                    // ordinary request headers.
+                    return;
+                }
+                if n == http::header::CONTENT_LENGTH {
+                    // (security #264) Digit-only, mirroring hj-core/H1's #232 strict
+                    // resolver: Rust's unsigned parse() accepts a leading '+', which
+                    // H1/H3 reject for the same bytes — a per-protocol divergence.
+                    if value.is_empty() || !value.iter().all(|b| b.is_ascii_digit()) {
+                        malformed = true;
                         return;
                     }
-                    if name == "content-length" {
-                        // (security #264) Digit-only, mirroring hj-core/H1's #232 strict
-                        // resolver: Rust's unsigned parse() accepts a leading '+', which
-                        // H1/H3 reject for the same bytes — a per-protocol divergence.
-                        if value.is_empty() || !value.iter().all(|b| b.is_ascii_digit()) {
+                    // Overflow (not encoding) is the only parse failure left.
+                    match std::str::from_utf8(value).unwrap_or("").parse::<u64>() {
+                        // A second, conflicting content-length is malformed (§8.1.2.6).
+                        Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
+                            st.content_length = Some(cl)
+                        }
+                        _ => {
                             malformed = true;
                             return;
                         }
-                        // Overflow (not encoding) is the only parse failure left.
-                        match std::str::from_utf8(value).unwrap_or("").parse::<u64>() {
-                            // A second, conflicting content-length is malformed (§8.1.2.6).
-                            Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
-                                st.content_length = Some(cl)
-                            }
-                            _ => {
-                                malformed = true;
-                                return;
-                            }
-                        }
                     }
-                    if n == http::header::HOST {
-                        if host_value.is_some() {
-                            malformed = true; // duplicate Host line
-                            return;
-                        }
-                        host_value = Some(v.clone());
+                } else if n == http::header::HOST {
+                    if host_value.is_some() {
+                        malformed = true; // duplicate Host line
+                        return;
                     }
-                    st.headers.append(n, v);
+                    host_value = Some(v.clone());
+                } else if n == http::header::COOKIE {
+                    st.cookie_count = st.cookie_count.saturating_add(1).min(2);
                 }
-                _ => malformed = true,
+                st.headers.append(n, v);
             }
+            _ => malformed = true,
         }
     });
     match result {
@@ -1168,13 +1163,12 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
         }
         // RFC 3986 permits userinfo and an empty reg-name for a generic
         // :authority, while RFC 9113 forbids both for HTTP(S).
-        if let Some(authority) = st.authority.as_ref() {
+        // (`valid_uri_authority` was already verified when `:authority` was decoded above.)
+        if scheme_is_http && let Some(authority) = st.authority.as_ref() {
             let Ok(text) = authority.to_str() else {
                 return Decoded::Malformed;
             };
-            if !hj_core::valid_uri_authority(text)
-                || (scheme_is_http && !hj_core::valid_http_authority(text))
-            {
+            if text.contains('@') || hj_core::host_without_port_cow(text).is_empty() {
                 return Decoded::Malformed;
             }
         }
@@ -1426,7 +1420,9 @@ fn build_request(mut st: StreamState) -> Option<Request> {
     *req.headers_mut() = std::mem::take(&mut st.headers);
     // §8.2.3: rejoin split `cookie` field lines with "; " so PHP/cache/rewrite see
     // the standard single-line form (the generic ", " join corrupts sessions).
-    hj_core::coalesce_cookie_crumbs(req.headers_mut());
+    if st.cookie_count > 1 {
+        hj_core::coalesce_cookie_crumbs(req.headers_mut());
+    }
     Some(req)
 }
 

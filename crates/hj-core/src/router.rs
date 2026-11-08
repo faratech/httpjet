@@ -9,7 +9,7 @@ use rustc_hash::FxHashMap;
 
 use hj_config::model::{ServerConfig, VHostConfig};
 
-use crate::net::host_without_port;
+use crate::net::host_without_port_cow;
 
 /// A resolved virtual host for a request.
 #[derive(Clone)]
@@ -18,11 +18,13 @@ pub struct ResolvedVhost {
     pub config: Arc<VHostConfig>,
 }
 
+type RouteTarget = (String, Option<Arc<VHostConfig>>);
+
 struct ListenerRoutes {
-    /// lowercased exact domain -> vhost name
-    exact: FxHashMap<String, String>,
+    /// lowercased exact domain -> (vhost name, pre-resolved VHostConfig)
+    exact: FxHashMap<String, RouteTarget>,
     /// the `*` wildcard vhost name (catch-all default)
-    default: Option<String>,
+    default: Option<RouteTarget>,
 }
 
 pub struct Router {
@@ -32,21 +34,26 @@ pub struct Router {
 
 impl Router {
     pub fn build(server: Arc<ServerConfig>) -> Self {
+        let target_for = |vhost: String| -> RouteTarget {
+            let cfg = server.vhosts.get(&vhost).and_then(|d| d.config.clone());
+            (vhost, cfg)
+        };
         let mut listeners = FxHashMap::default();
         for l in &server.listeners {
             let mut exact = FxHashMap::default();
             let mut default = None;
             for m in &l.vhost_map {
                 if m.domains.iter().any(|d| d.trim() == "*") {
-                    default.get_or_insert_with(|| m.vhost.clone());
+                    default.get_or_insert_with(|| target_for(m.vhost.clone()));
                 }
             }
             // OLS mapDomainList: port ignored, `www.` stripped for the key, first mapping of a
             // key wins. The configured `www.` spelling stays an exact (cacheable) alias; an
             // unconfigured `www.` only reaches the apex via the parent fallback (foreign).
             for r in l.domain_routes().routes {
-                exact.entry(r.key).or_insert_with(|| r.vhost.clone());
-                exact.entry(r.literal).or_insert(r.vhost);
+                let target = target_for(r.vhost);
+                exact.entry(r.key).or_insert_with(|| target.clone());
+                exact.entry(r.literal).or_insert(target);
             }
             listeners.insert(l.name.clone(), ListenerRoutes { exact, default });
         }
@@ -71,20 +78,31 @@ impl Router {
     /// bypass + CDN de-cache), so the backend issues its own canonical redirect to the
     /// parent root; a fallback never serves another brand's body.
     pub fn resolve(&self, listener: &str, key_host: Option<&str>) -> Option<ResolvedVhost> {
+        let (name, config) = self.resolve_ref(listener, key_host)?;
+        Some(ResolvedVhost {
+            name: name.to_owned(),
+            config: config.clone(),
+        })
+    }
+
+    /// Zero-allocation / zero-refcount-bump vhost resolution for the on-core fast path:
+    /// borrows both the canonical vhost name and its `Arc<VHostConfig>` directly from the
+    /// router table.
+    #[inline]
+    pub fn resolve_ref<'a>(
+        &'a self,
+        listener: &str,
+        key_host: Option<&str>,
+    ) -> Option<(&'a str, &'a Arc<VHostConfig>)> {
         let routes = self.listeners.get(listener)?;
         // Use the shared IPv6-aware helper; plain split(':').next() mangles
         // bracketed literals like [::1]:443 down to '[', missing every vhost match.
-        let key = key_host.map(host_without_port);
-        let vhost_name = key
+        let key = key_host.map(host_without_port_cow);
+        let (name, config) = key
             .as_deref()
             .and_then(|k| Self::match_exact_or_parent(routes, k))
-            .or_else(|| routes.default.clone())?;
-        let decl = self.server.vhosts.get(&vhost_name)?;
-        let config = decl.config.clone()?;
-        Some(ResolvedVhost {
-            name: vhost_name,
-            config,
-        })
+            .or(routes.default.as_ref())?;
+        Some((name.as_str(), config.as_ref()?))
     }
 
     /// When [`resolve`](Self::resolve) returns `None`, distinguish "the host is genuinely unknown"
@@ -97,17 +115,13 @@ impl Router {
         let Some(routes) = self.listeners.get(listener) else {
             return false;
         };
-        let key = key_host.map(host_without_port);
-        let name = key
+        let key = key_host.map(host_without_port_cow);
+        let target = key
             .as_deref()
             .and_then(|k| Self::match_exact_or_parent(routes, k))
-            .or_else(|| routes.default.clone());
-        match name {
-            Some(n) => self
-                .server
-                .vhosts
-                .get(&n)
-                .is_some_and(|d| d.config.is_none()),
+            .or(routes.default.as_ref());
+        match target {
+            Some((n, cfg)) => cfg.is_none() && self.server.vhosts.contains_key(n),
             None => false,
         }
     }
@@ -118,9 +132,12 @@ impl Router {
     /// (`example.com`), so a single-label registry suffix (`com`) is never looked up — and
     /// even if it were, only an explicitly-mapped domain is ever in `exact`, so a bare TLD
     /// can't match. `host` is already port-stripped + lowercased by the caller.
-    fn match_exact_or_parent(routes: &ListenerRoutes, host: &str) -> Option<String> {
+    fn match_exact_or_parent<'a>(
+        routes: &'a ListenerRoutes,
+        host: &str,
+    ) -> Option<&'a RouteTarget> {
         if let Some(v) = routes.exact.get(host) {
-            return Some(v.clone());
+            return Some(v);
         }
         let mut rest = host;
         while let Some((_, parent)) = rest.split_once('.') {
@@ -128,7 +145,7 @@ impl Router {
                 break;
             }
             if let Some(v) = routes.exact.get(parent) {
-                return Some(v.clone());
+                return Some(v);
             }
             rest = parent;
         }
@@ -137,16 +154,26 @@ impl Router {
 
     /// The default (wildcard) vhost name for a listener, if any.
     pub fn default_vhost(&self, listener: &str) -> Option<&str> {
-        self.listeners.get(listener)?.default.as_deref()
+        self.listeners
+            .get(listener)?
+            .default
+            .as_ref()
+            .map(|(n, _)| n.as_str())
     }
 
     /// True when `host` is an exact `<vhostMap>` domain routed to `vhost` on any
     /// listener: an explicitly configured alias, never a wildcard-routed foreign host.
     pub fn host_maps_to_vhost(&self, host: &str, vhost: &str) -> bool {
-        let host = host.to_ascii_lowercase();
-        self.listeners
-            .values()
-            .any(|r| r.exact.get(&host).is_some_and(|v| v == vhost))
+        if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            let host = host.to_ascii_lowercase();
+            self.listeners
+                .values()
+                .any(|r| r.exact.get(&host).is_some_and(|(v, _)| v == vhost))
+        } else {
+            self.listeners
+                .values()
+                .any(|r| r.exact.get(host).is_some_and(|(v, _)| v == vhost))
+        }
     }
 
     /// True when `host` is an EXACT `<vhostMap>` domain on this listener — i.e. it was

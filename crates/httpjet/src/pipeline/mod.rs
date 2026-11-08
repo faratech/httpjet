@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hj_compress::ExpiresHeaders;
@@ -64,8 +64,8 @@ use proxy_glue::{ProxyHandler, matching_proxy_context, proxy_websocket, resolve_
 use response_util::{
     apply_error_document, apply_static_context_headers, apply_static_context_request,
     cache_identity_for, context_refusal, context_slash_redirect, error_doc_or_page,
-    matching_static_context, redirect, static_context_extra_headers, static_location_override,
-    status_response,
+    matching_static_context, matching_static_context_vhost, redirect, static_context_extra_headers,
+    static_location_override, status_response,
 };
 use rewrite_glue::{
     RewriteTrace, RwResult, build_uri, decode_request_path, normalized_request_path,
@@ -301,23 +301,54 @@ pub(crate) async fn fast_serve(
     if target_len > state.serve_config.max_req_url_len {
         return bridge(state, FastBridge::UrlTooLong);
     }
-    let (route_key, host_src): (Option<String>, fast_memo::HostSource) = match req
-        .headers()
-        .get(http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-    {
-        Some(h) => (Some(h.to_owned()), fast_memo::HostSource::Header),
-        None => match req.uri().authority().map(|a| a.host().to_string()) {
+    let mut seen_host = false;
+    let mut host_hdr: Option<&str> = None;
+    let mut seen_ae = false;
+    let mut ae_bytes: &[u8] = b"";
+    let mut cookie_hdr: Option<&http::HeaderValue> = None;
+    let mut has_conditional_or_auth = false;
+    let mut has_cc_or_pragma = false;
+    for (name, val) in req.headers() {
+        if name == http::header::HOST {
+            if !seen_host {
+                seen_host = true;
+                host_hdr = val.to_str().ok();
+            }
+        } else if name == http::header::ACCEPT_ENCODING {
+            if !seen_ae {
+                seen_ae = true;
+                ae_bytes = val.as_bytes();
+            }
+        } else if name == http::header::COOKIE {
+            if cookie_hdr.is_none() {
+                cookie_hdr = Some(val);
+            }
+        } else if name == http::header::IF_NONE_MATCH
+            || name == http::header::IF_MODIFIED_SINCE
+            || name == http::header::IF_MATCH
+            || name == http::header::IF_RANGE
+            || name == http::header::IF_UNMODIFIED_SINCE
+            || name == http::header::AUTHORIZATION
+        {
+            has_conditional_or_auth = true;
+        } else if name == http::header::CACHE_CONTROL || name == http::header::PRAGMA {
+            has_cc_or_pragma = true;
+        }
+    }
+    let has_cookie = cookie_hdr.is_some();
+    let (route_key, host_src): (Option<&str>, fast_memo::HostSource) = match host_hdr {
+        Some(h) => (Some(h), fast_memo::HostSource::Header),
+        None => match req.uri().authority().map(|a| a.host()) {
             Some(a) => (Some(a), fast_memo::HostSource::Authority),
             // No Host and no authority (HTTP/1.0): `handle()` routes by the TLS SNI
             // next, which this path does not see; bridge so both agree on the vhost.
             None => return bridge(state, FastBridge::NoHost),
         },
     };
-    let Some(resolved) = state.router.resolve(listener, route_key.as_deref()) else {
+    let Some((vhost_name, vhost_cfg)) = state.router.resolve_ref(listener, route_key) else {
         return bridge(state, FastBridge::NoVhost);
     };
-    if resolved.config.disabled {
+    if vhost_cfg.disabled {
         return bridge(state, FastBridge::VhostDisabled);
     }
     if !state.acl.check_peer(peer_ip).is_allowed() {
@@ -331,32 +362,15 @@ pub(crate) async fn fast_serve(
     // decline and let the full pipeline enforce the gate — otherwise a direct-to-:80
     // client would be served public cache/static content over cleartext that policy
     // says must be HTTPS.
-    if mtls_gate_redirects(
-        effective_https,
-        state.mtls_required_vhosts.contains(&resolved.name),
-        peer_ip,
-    ) {
+    if !effective_https
+        && mtls_gate_redirects(
+            effective_https,
+            state.mtls_required_vhosts.contains(vhost_name),
+            peer_ip,
+        )
+    {
         return bridge(state, FastBridge::MtlsRedirect);
     }
-    let mut ctx = ReqCtx {
-        server: state.server.clone(),
-        vhost_name: resolved.name,
-        vhost: resolved.config,
-        peer_ip,
-        client_ip: peer_ip,
-        is_tls: effective_https,
-        peer_unix,
-        protocol: proto,
-        forwarding_trusted: forwarding_trusted(trusted_proxy, client_auth_requested, tls.as_ref()),
-        trusted_proxy,
-        env: Vec::with_capacity(8),
-        local_addr,
-        peer_port,
-        tls,
-        request_time: std::time::SystemTime::now(),
-        request_id: hj_core::reqid::next(),
-        redirect_guard: None,
-    };
     // (#349) Finished-response memo (default-on; `--no-fast-memo` / HJ_FAST_MEMO=0
     // kill switch). The request gates here are HALF the correctness contract;
     // the other half is the chain/inline eligibility enforced at the store site
@@ -368,26 +382,17 @@ pub(crate) async fn fast_serve(
     // common ones — a replayed 200 would silently override that verdict.
     let memo_eligible_req = fast_memo::enabled()
         && method == http::Method::GET
-        && !req.headers().contains_key(http::header::COOKIE)
-        && !req.headers().contains_key(http::header::RANGE)
-        && !req.headers().contains_key(http::header::IF_NONE_MATCH)
-        && !req.headers().contains_key(http::header::IF_MODIFIED_SINCE)
-        && !req.headers().contains_key(http::header::IF_MATCH)
-        && !req.headers().contains_key(http::header::IF_RANGE)
-        && !req
-            .headers()
-            .contains_key(http::header::IF_UNMODIFIED_SINCE)
-        && !req.headers().contains_key(http::header::AUTHORIZATION);
+        && !has_cookie
+        && !has_conditional_or_auth;
     // A `path_cacheable: false` inline set means stores are impossible; skip
     // the probe entirely. Its keyable vars become vary items at the store site.
-    let memo_inline = state.inline_rules.get(&ctx.vhost_name);
+    let memo_inline = state.inline_rules.get(vhost_name);
     let memo_inline_ok = memo_inline.is_none_or(|rs| rs.path_cacheable);
     let allow_page_responses = state
         .page_cache
         .as_ref()
         .is_some_and(|store| store.config().response_memo)
-        && !req.headers().contains_key(http::header::CACHE_CONTROL)
-        && !req.headers().contains_key(http::header::PRAGMA);
+        && !has_cc_or_pragma;
     if memo_eligible_req && memo_inline_ok {
         let mk = fast_memo::MemoKey {
             generation: state.generation,
@@ -397,52 +402,48 @@ pub(crate) async fn fast_serve(
             listener,
             https: effective_https,
             trusted_proxy,
-            vhost: &ctx.vhost_name,
+            vhost: vhost_name,
             host_src,
-            host: route_key.as_deref().unwrap_or("").as_bytes(),
+            host: route_key.unwrap_or("").as_bytes(),
             path: req.uri().path(),
             query: req.uri().query().unwrap_or(""),
-            ae: req
-                .headers()
-                .get(http::header::ACCEPT_ENCODING)
-                .map(|v| v.as_bytes())
-                .unwrap_or(b""),
+            ae: ae_bytes,
         };
-        if let Some((mut resp, page)) = fast_memo::probe(&mk, req, &state.ua_classify, req_start)
-            && state
-                .page_cache
-                .as_ref()
-                .is_none_or(|store| store.purge_epoch() == mk.purge_epoch)
-        {
-            let mtls_ok = mtls_ok(client_auth_requested, is_tls, ctx.tls.as_ref());
-            ctx.client_ip = state.acl.resolve_client_ip(
-                peer_ip,
-                req.headers(),
-                state.server.use_ip_in_proxy_header,
-                mtls_ok,
-            );
-            if !state.acl.check_client(peer_ip, ctx.client_ip).is_allowed() {
-                return bridge(state, FastBridge::Acl); // the full pipeline renders the identical ACL 403
-            }
-            if !state.geo.allows(ctx.client_ip) {
-                return bridge(state, FastBridge::Acl); // the full pipeline renders the identical geo 403
-            }
-            // ACL resolution can outlive the cached selection. Check again before
-            // consuming a rate token, so fallback never charges admission twice.
-            if page.as_ref().is_some_and(|page| {
-                Instant::now() >= page.deadline
-                    || !page.lease.is_current()
-                    || state
-                        .page_cache
-                        .as_ref()
-                        .is_none_or(|store| store.purge_epoch() != page.purge_epoch)
-            }) {
-                return bridge(state, FastBridge::MemoChanged);
-            }
-            if !state
-                .client_throttle
-                .allow_deferring_rejection(ctx.client_ip)
-            {
+        let tls_ref = tls.as_ref();
+        if let Some(probed) = fast_memo::probe_serve(
+            &mk,
+            req,
+            &state.ua_classify,
+            req_start,
+            || {
+                let mtls_ok = mtls_ok(client_auth_requested, is_tls, tls_ref);
+                let client_ip = state.acl.resolve_client_ip(
+                    peer_ip,
+                    req.headers(),
+                    state.server.use_ip_in_proxy_header,
+                    mtls_ok,
+                );
+                if !state.acl.check_client(peer_ip, client_ip).is_allowed() {
+                    return Err(FastBridge::Acl);
+                }
+                if !state.geo.allows(client_ip) {
+                    return Err(FastBridge::Acl);
+                }
+                Ok(client_ip)
+            },
+            |want_epoch| {
+                state
+                    .page_cache
+                    .as_ref()
+                    .is_none_or(|store| store.purge_epoch() == want_epoch)
+            },
+            FastBridge::MemoChanged,
+        ) {
+            let (mut resp, client_ip, page_serve) = match probed {
+                Ok(hit) => hit,
+                Err(why) => return bridge(state, why),
+            };
+            if !state.client_throttle.allow_deferring_rejection(client_ip) {
                 return bridge(state, FastBridge::Throttle); // over the per-IP rate: dispatch() renders the 429
             }
             // Counted only once admitted: a refused probe is rendered (and counted) by handle().
@@ -450,54 +451,42 @@ pub(crate) async fn fast_serve(
                 .metrics
                 .fast_memo_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(page) = &page {
-                lscache::record_response_memo_hit(state, page.key_hash, &resp);
+            let vhost_idx = state.telemetry.vhost_idx(vhost_name);
+            if let Some(page) = page_serve {
+                lscache::record_response_memo_hit_codec(state, page.key_hash, page.variant_codec);
                 state
                     .telemetry
-                    .record_cache_hit(peer_ip.is_loopback(), &ctx.vhost_name);
+                    .record_cache_hit_idx(peer_ip.is_loopback(), vhost_idx);
             }
             // Only memo metadata is restored; re-derive the context egress rate.
-            if has_bandwidth_context(&ctx.vhost) {
+            if has_bandwidth_context(vhost_cfg) {
                 let Some(path) = decode_request_path(req.uri().path()) else {
                     return bridge(state, FastBridge::MalformedPath);
                 };
-                stamp_bandwidth(
-                    &ctx,
+                stamp_bandwidth_vhost(
+                    vhost_cfg,
                     &normalized_request_path(&path),
                     state.serve_config.bandwidth_limit,
                     &mut resp,
                 );
             }
-            return Some(record_fast_serve(state, &ctx, proto, req, req_start, resp));
+            return Some(record_fast_memo_serve(
+                state, vhost_name, vhost_idx, client_ip, peer_unix, proto, req, req_start, resp,
+            ));
         }
     }
-    if let Some(ae) = req
-        .headers()
-        .get(http::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-    {
-        ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
-    }
-    let req_host = lscache::request_host(req, &ctx);
-    let host_foreign = !req_host.eq_ignore_ascii_case(&ctx.vhost_name)
-        && !state.router.host_is_exact(listener, &req_host);
-    set_redirect_guard(&mut ctx, req.uri(), &req_host);
     let orig_path = match decode_request_path(req.uri().path()) {
         Some(p) => normalized_request_path(&p),
         None => return bridge(state, FastBridge::MalformedPath), // let the bridge render the error
     };
-    let orig_query = req.uri().query().unwrap_or("").to_string();
+    let orig_query = req.uri().query().unwrap_or("");
     // (#343 Step 1) Cookie census on every fast-path GET/HEAD that reaches the routed
     // prefix: names only, values never read — the benign-only share among cookied
     // requests decides whether extending the fast path past literally-cookieless guests
     // is worth building.
     if let Some(store) = state.page_cache.as_ref() {
         let cfg = store.config();
-        let class = match req
-            .headers()
-            .get(http::header::COOKIE)
-            .and_then(|v| v.to_str().ok())
-        {
+        let class = match cookie_hdr.and_then(|v| v.to_str().ok()) {
             None => FastCookieClass::None,
             Some(c)
                 if has_member_session_cookie(
@@ -525,23 +514,43 @@ pub(crate) async fn fast_serve(
     // A script never serves from the static branch either, so a cookied request whose
     // last segment carries a script suffix (`/index.php`, `/css.php`) bridges the same way:
     // its SetEnvIf, access, rewrite and target-policy work is all repeated by dispatch().
-    if req.headers().contains_key(http::header::COOKIE)
-        && suffix_routing::last_segment_is_script(state, &ctx, &orig_path)
-    {
+    if has_cookie && suffix_routing::last_segment_is_script_vhost(state, vhost_cfg, &orig_path) {
         return bridge(state, FastBridge::CookiedScript);
     }
-    if req.headers().contains_key(http::header::COOKIE)
+    if has_cookie
         && looks_like_route(&orig_path)
-        && matching_static_context(&ctx, &orig_path).is_none()
-        && !docroot_target_may_exist(state, &ctx.vhost.doc_root, &orig_path)
+        && matching_static_context_vhost(vhost_cfg, &orig_path).is_none()
+        && !docroot_target_may_exist(state, &vhost_cfg.doc_root, &orig_path)
     {
         return bridge(state, FastBridge::CookiedNoTarget);
     }
+    let mut ctx = ReqCtx {
+        server: state.server.clone(),
+        vhost_name: vhost_name.to_owned(),
+        vhost: vhost_cfg.clone(),
+        peer_ip,
+        client_ip: peer_ip,
+        is_tls: effective_https,
+        peer_unix,
+        protocol: proto,
+        forwarding_trusted: forwarding_trusted(trusted_proxy, client_auth_requested, tls.as_ref()),
+        trusted_proxy,
+        env: Vec::new(),
+        local_addr,
+        peer_port,
+        tls,
+        request_time: std::time::SystemTime::now(),
+        request_id: hj_core::reqid::next(),
+        redirect_guard: None,
+    };
+    let req_host = lscache::request_host(req, &ctx);
+    let host_foreign = !req_host.eq_ignore_ascii_case(&ctx.vhost_name)
+        && !state.router.host_is_exact(listener, &req_host);
     // (--fast-early-bridge) The same certainty for a cookieless request, once the page cache
     // provably cannot answer it either.
     let mut early_predicted = false;
     if state.early_bridge.mode() != early_bridge::Mode::Off
-        && !req.headers().contains_key(http::header::COOKIE)
+        && !has_cookie
         && let Some(why) = early_bridge_reason(state, &ctx, &orig_path, host_foreign)
     {
         if state.early_bridge.mode() == early_bridge::Mode::On {
@@ -612,6 +621,15 @@ pub(crate) async fn fast_serve(
         // pipeline would (fast_serve cannot produce an error page itself).
         return bridge(state, FastBridge::Acl);
     }
+    ctx.env.reserve(8);
+    if let Some(ae) = req
+        .headers()
+        .get(http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    {
+        ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
+    }
+    set_redirect_guard(&mut ctx, req.uri(), &req_host);
     seed_server_env(&mut ctx);
     let set_env_basename = set_env_scope_basename(state, &ctx, &orig_path, &chain);
     if apply_set_env_scoped(
@@ -619,7 +637,7 @@ pub(crate) async fn fast_serve(
         &chain,
         req,
         &orig_path,
-        &orig_query,
+        orig_query,
         set_env_basename.as_deref(),
     )
     .is_err()
@@ -747,7 +765,7 @@ pub(crate) async fn fast_serve(
             &chain,
             &cache_path,
             &cache_rel,
-            ResourceRequest::new(req, rewritten_query.as_deref().unwrap_or(&orig_query)),
+            ResourceRequest::new(req, rewritten_query.as_deref().unwrap_or(orig_query)),
             *cache_path != *orig_path,
             target_policy.script.as_ref(),
         ) {
@@ -1381,6 +1399,84 @@ fn fast_post_rewrite_bridges(
 /// callers resolve the real client IP into `ctx.client_ip` (XFF / CF-Connecting-IP for a
 /// trusted+mTLS peer) before calling, so the fast path does not log the Cloudflare edge
 /// IP for every guest.
+#[allow(clippy::too_many_arguments)]
+fn record_fast_memo_serve(
+    state: &Arc<ServerState>,
+    vhost_name: &str,
+    vhost_idx: usize,
+    client_ip: IpAddr,
+    peer_unix: bool,
+    proto: Proto,
+    req: &Request,
+    req_start: std::time::Instant,
+    mut resp: Response,
+) -> Response {
+    let log = state.access_logger_for(vhost_name);
+    let req_id = if state.request_id_header || log.is_some() {
+        let id = hj_core::reqid::next();
+        if state.request_id_header
+            && let Ok(v) = http::HeaderValue::from_str(&id.to_string())
+        {
+            resp.headers_mut().insert(X_REQUEST_ID, v);
+        }
+        id.as_u64()
+    } else {
+        0
+    };
+    state
+        .metrics
+        .requests_total
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let status = resp.status().as_u16();
+    state
+        .telemetry
+        .record_request(proto, status, req_start.elapsed(), vhost_idx);
+    let Some(log) = log else {
+        return resp;
+    };
+    if let Some(body_bytes) = resp.body().content_length() {
+        let mask = log.format().header_mask();
+        let header = |name| req.headers().get(name).map(http::HeaderValue::as_bytes);
+        let referer = if (mask & 1) != 0 {
+            header(http::header::REFERER)
+        } else {
+            None
+        };
+        let user_agent = if (mask & 2) != 0 {
+            header(http::header::USER_AGENT)
+        } else {
+            None
+        };
+        let host = if (mask & 4) != 0 {
+            header(http::header::HOST)
+        } else {
+            None
+        };
+        let ts = std::time::SystemTime::now();
+        chunk_access_line(log, |buf, format| {
+            hj_log::render_access_line_with_host_reqid_u64_into(
+                buf,
+                format,
+                client_ip,
+                ts,
+                req.method().as_str(),
+                req.uri().path(),
+                req.uri().query(),
+                proto.as_str(),
+                status,
+                body_bytes,
+                referer,
+                user_agent,
+                host,
+                None,
+                req_id,
+                peer_unix,
+            );
+        });
+    }
+    resp
+}
+
 fn record_fast_serve(
     state: &Arc<ServerState>,
     ctx: &ReqCtx,
@@ -1421,12 +1517,25 @@ fn record_served_response(
     // in per-request logging.
     {
         if let Some(body_bytes) = resp.body().content_length() {
+            let mask = log.format().header_mask();
             let header = |name| req.headers().get(name).map(http::HeaderValue::as_bytes);
-            let referer = header(http::header::REFERER);
-            let user_agent = header(http::header::USER_AGENT);
-            let host = header(http::header::HOST);
+            let referer = if (mask & 1) != 0 {
+                header(http::header::REFERER)
+            } else {
+                None
+            };
+            let user_agent = if (mask & 2) != 0 {
+                header(http::header::USER_AGENT)
+            } else {
+                None
+            };
+            let host = if (mask & 4) != 0 {
+                header(http::header::HOST)
+            } else {
+                None
+            };
             chunk_access_line(log, |buf, format| {
-                hj_log::render_access_line_with_host_into(
+                hj_log::render_access_line_with_host_reqid_u64_into(
                     buf,
                     format,
                     ctx.client_ip,
@@ -1441,7 +1550,7 @@ fn record_served_response(
                     user_agent,
                     host,
                     ctx.get_env(hj_lsapi::cgi::AUTH_USER_ENV),
-                    Some(&ctx.request_id as &dyn std::fmt::Display),
+                    ctx.request_id.as_u64(),
                     ctx.peer_unix,
                 );
             });
@@ -1452,10 +1561,11 @@ fn record_served_response(
     // here repeated the trusted-peer scan (incl. per-XFF-entry CIDR checks) for the
     // log record only.
     let client_ip = ctx.client_ip;
-    let log_uri = match req.uri().query() {
-        Some(q) => format!("{}?{}", req.uri().path(), q),
-        None => req.uri().path().to_string(),
-    };
+    let log_uri = req
+        .uri()
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str)
+        .to_owned();
     let record = hj_log::AccessRecord {
         client_ip,
         ts: ctx.request_time,
@@ -1890,10 +2000,11 @@ async fn handle_inner(
 
     // Capture log fields before the request body is consumed downstream.
     let log_method = method_static(req.method());
-    let log_uri = match req.uri().query() {
-        Some(q) => format!("{}?{}", req.uri().path(), q),
-        None => req.uri().path().to_string(),
-    };
+    let log_uri = req
+        .uri()
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str)
+        .to_owned();
     let referer = header_bytes(&req, http::header::REFERER);
     let user_agent = header_bytes(&req, http::header::USER_AGENT);
     let host_hdr = header_bytes(&req, http::header::HOST);
@@ -3387,9 +3498,13 @@ mod proxy_screen_tests {
 /// the server-wide `<tuning>` rate when none matches. A declared context rate is an
 /// OVERRIDE (it may raise as well as lower) — an operator scoping a limit to a subtree
 /// is not served by a min-against-server-default rule that can never raise.
-fn effective_bandwidth(ctx: &ReqCtx, path: &str, server_default: u64) -> u64 {
+fn effective_bandwidth_vhost(
+    vhost: &hj_core::config::VHostConfig,
+    path: &str,
+    server_default: u64,
+) -> u64 {
     let mut best: Option<u64> = None;
-    for c in &ctx.vhost.contexts {
+    for c in &vhost.contexts {
         if !c.enabled || c.bandwidth_limit == 0 {
             continue;
         }
@@ -3412,10 +3527,19 @@ fn has_bandwidth_context(vhost: &hj_core::config::VHostConfig) -> bool {
 /// Stamp the transport-facing egress rate onto a terminal response. Skipped entirely when
 /// no context declares a rate — the connection-wide tuning default then applies.
 fn stamp_bandwidth(ctx: &ReqCtx, path: &str, server_default: u64, resp: &mut Response) {
-    if !has_bandwidth_context(&ctx.vhost) {
+    stamp_bandwidth_vhost(&ctx.vhost, path, server_default, resp);
+}
+
+fn stamp_bandwidth_vhost(
+    vhost: &hj_core::config::VHostConfig,
+    path: &str,
+    server_default: u64,
+    resp: &mut Response,
+) {
+    if !has_bandwidth_context(vhost) {
         return;
     }
-    let rate = effective_bandwidth(ctx, path, server_default);
+    let rate = effective_bandwidth_vhost(vhost, path, server_default);
     if rate > 0 {
         resp.extensions_mut().insert(PerConnBandwidth(rate));
     }

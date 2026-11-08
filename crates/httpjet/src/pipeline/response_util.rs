@@ -625,7 +625,14 @@ pub(super) fn matching_static_context<'a>(
     ctx: &'a ReqCtx,
     path: &str,
 ) -> Option<&'a hj_core::config::Context> {
-    enclosing_static_contexts(&ctx.vhost.contexts, path)
+    matching_static_context_vhost(&ctx.vhost, path)
+}
+
+pub(super) fn matching_static_context_vhost<'a>(
+    vhost: &'a hj_core::config::VHostConfig,
+    path: &str,
+) -> Option<&'a hj_core::config::Context> {
+    enclosing_static_contexts(&vhost.contexts, path)
         .last()
         .copied()
 }

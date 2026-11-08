@@ -39,13 +39,14 @@ const MAGIC: [u8; 4] = *b"HJPM";
 // session hashing to owner 0 previously decoded as Public). RAM-only format, rebuilt each
 // process, so the bump needs no migration.
 const VERSION: u16 = 2;
-/// Level 6, not "free" 19: the encode runs synchronously inside every store — before the miss
+/// Level 3, not "free" 19: the encode runs synchronously inside every store — before the miss
 /// response is built, twice per capsule render — and once per entry in the boot scan. Measured on
 /// 3,000 real prod entries (avg 2.6 KB raw, 2026-09-22, `meta_level_sweep`): L19 309 µs / 1,098 B,
 /// L6 34 µs / 1,109 B (+1%), L3 14 µs / 1,188 B (+8%). Decode speed is level-independent.
-const ZSTD_LEVEL: i32 = 6;
+const ZSTD_LEVEL: i32 = 3;
 const MAX_RAW_META: usize = 4 << 20;
 const MAX_COMP_META: usize = 4 << 20;
+const MAX_SCRATCH_CAP: usize = 64 * 1024;
 
 /// Shared dictionary for the resident metadata blob. It is trained exclusively on deterministic,
 /// synthetic `encode_raw` fixtures using reserved example domains; it contains no traffic captures
@@ -86,6 +87,10 @@ thread_local! {
     static META_DECOMP: RefCell<Decompressor<'static>> = RefCell::new(
         Decompressor::with_prepared_dictionary(&meta_dict().dec).expect("meta decompressor init"),
     );
+    /// Reused per-thread raw metadata scratch buffer to avoid allocating/growing temporary Vecs on encode/decode.
+    static META_RAW_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(4096));
+    /// Reused per-thread compressed metadata scratch buffer so `MetaBlob::encode` allocates once at exact size.
+    static META_COMP_SCRATCH: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(2048));
 }
 
 #[derive(Debug, Clone)]
@@ -127,31 +132,61 @@ pub struct DecodedMeta {
 
 impl MetaBlob {
     pub fn encode(key: &PageCacheKey, entry: &CachedResponse) -> Result<Self, MetaError> {
-        let raw = encode_raw(key, entry)?;
-        let mut compressed = META_COMP
-            .with(|c| c.borrow_mut().compress(&raw))
-            .map_err(|_| MetaError::encode("zstd metadata encode failed"))?;
-        compressed.shrink_to_fit();
-        if compressed.len() > MAX_COMP_META {
-            return Err(MetaError::encode("compressed metadata over format bound"));
-        }
-        Ok(MetaBlob {
-            raw_len: raw.len() as u32,
-            compressed: Bytes::from(compressed),
+        META_RAW_SCRATCH.with(|raw_cell| {
+            let mut raw = raw_cell.borrow_mut();
+            raw.clear();
+            encode_raw_into(&mut raw, key, entry)?;
+            let raw_len = raw.len();
+            let bound = zstd::zstd_safe::compress_bound(raw_len);
+            let compressed = META_COMP_SCRATCH.with(|comp_cell| {
+                let mut comp = comp_cell.borrow_mut();
+                if comp.len() < bound {
+                    comp.resize(bound, 0);
+                }
+                let n = META_COMP
+                    .with(|c| c.borrow_mut().compress_to_buffer(&raw, &mut comp[..bound]))
+                    .map_err(|_| MetaError::encode("zstd metadata encode failed"))?;
+                if n > MAX_COMP_META {
+                    return Err(MetaError::encode("compressed metadata over format bound"));
+                }
+                let bytes = Bytes::copy_from_slice(&comp[..n]);
+                if comp.capacity() > MAX_SCRATCH_CAP {
+                    *comp = Vec::with_capacity(2048);
+                }
+                Ok(bytes)
+            })?;
+            if raw.capacity() > MAX_SCRATCH_CAP {
+                *raw = Vec::with_capacity(4096);
+            }
+            Ok(MetaBlob {
+                raw_len: raw_len as u32,
+                compressed,
+            })
         })
     }
 
     pub fn decode(&self) -> Result<DecodedMeta, MetaError> {
-        if self.compressed.len() > MAX_COMP_META || self.raw_len as usize > MAX_RAW_META {
+        let raw_len = self.raw_len as usize;
+        if self.compressed.len() > MAX_COMP_META || raw_len > MAX_RAW_META {
             return Err(MetaError::decode("metadata length over format bound"));
         }
-        let raw = META_DECOMP
-            .with(|d| {
-                d.borrow_mut()
-                    .decompress(&self.compressed, self.raw_len as usize)
-            })
-            .map_err(|_| MetaError::decode("zstd metadata decode failed"))?;
-        decode_raw(&raw)
+        META_RAW_SCRATCH.with(|raw_cell| {
+            let mut raw = raw_cell.borrow_mut();
+            if raw.len() < raw_len {
+                raw.resize(raw_len, 0);
+            }
+            let n = META_DECOMP
+                .with(|d| {
+                    d.borrow_mut()
+                        .decompress_to_buffer(&self.compressed, &mut raw[..raw_len])
+                })
+                .map_err(|_| MetaError::decode("zstd metadata decode failed"))?;
+            let res = decode_raw(&raw[..n]);
+            if raw.capacity() > MAX_SCRATCH_CAP {
+                *raw = Vec::with_capacity(4096);
+            }
+            res
+        })
     }
 
     /// Decode only the status and identity needed by cache diagnostics. The callback borrows
@@ -161,45 +196,59 @@ impl MetaBlob {
         &self,
         inspect: impl FnOnce(u16, &str) -> R,
     ) -> Result<R, MetaError> {
-        if self.compressed.len() > MAX_COMP_META || self.raw_len as usize > MAX_RAW_META {
+        let raw_len = self.raw_len as usize;
+        if self.compressed.len() > MAX_COMP_META || raw_len > MAX_RAW_META {
             return Err(MetaError::decode("metadata length over format bound"));
         }
-        let raw = META_DECOMP
-            .with(|d| {
-                d.borrow_mut()
-                    .decompress(&self.compressed, self.raw_len as usize)
-            })
-            .map_err(|_| MetaError::decode("zstd metadata decode failed"))?;
-        let mut c = Cursor { buf: &raw, pos: 0 };
-        if c.take(4)? != MAGIC || c.u16()? != VERSION {
-            return Err(MetaError::decode("bad listing metadata header"));
-        }
-        let _ = c.u32()?;
-        let _ = c.u8()?;
-        for _ in 0..4 {
-            let _ = c.lp()?;
-        }
-        let _ = c.u64()?;
-        let status = c.u16()?;
-        let _ = c.u8()?;
-        let _ = c.u64()?;
-        let identity =
-            std::str::from_utf8(c.lp()?).map_err(|_| MetaError::decode("bad identity utf-8"))?;
-        let _ = c.lp()?;
-        let _ = c.lp()?;
-        let tag_count = c.u16()?;
-        for _ in 0..tag_count {
-            let _ = c.lp()?;
-        }
-        let header_count = c.u16()?;
-        for _ in 0..header_count {
-            let _ = c.lp()?;
-            let _ = c.lp()?;
-        }
-        if c.pos != raw.len() {
-            return Err(MetaError::decode("trailing metadata bytes"));
-        }
-        Ok(inspect(status, identity))
+        META_RAW_SCRATCH.with(|raw_cell| {
+            let mut raw_buf = raw_cell.borrow_mut();
+            if raw_buf.len() < raw_len {
+                raw_buf.resize(raw_len, 0);
+            }
+            let n = META_DECOMP
+                .with(|d| {
+                    d.borrow_mut()
+                        .decompress_to_buffer(&self.compressed, &mut raw_buf[..raw_len])
+                })
+                .map_err(|_| MetaError::decode("zstd metadata decode failed"))?;
+            let raw = &raw_buf[..n];
+            let res = (|| {
+                let mut c = Cursor { buf: raw, pos: 0 };
+                if c.take(4)? != MAGIC || c.u16()? != VERSION {
+                    return Err(MetaError::decode("bad listing metadata header"));
+                }
+                let _ = c.u32()?;
+                let _ = c.u8()?;
+                for _ in 0..4 {
+                    let _ = c.lp()?;
+                }
+                let _ = c.u64()?;
+                let status = c.u16()?;
+                let _ = c.u8()?;
+                let _ = c.u64()?;
+                let identity = std::str::from_utf8(c.lp()?)
+                    .map_err(|_| MetaError::decode("bad identity utf-8"))?;
+                let _ = c.lp()?;
+                let _ = c.lp()?;
+                let tag_count = c.u16()?;
+                for _ in 0..tag_count {
+                    let _ = c.lp()?;
+                }
+                let header_count = c.u16()?;
+                for _ in 0..header_count {
+                    let _ = c.lp()?;
+                    let _ = c.lp()?;
+                }
+                if c.pos != raw.len() {
+                    return Err(MetaError::decode("trailing metadata bytes"));
+                }
+                Ok(inspect(status, identity))
+            })();
+            if raw_buf.capacity() > MAX_SCRATCH_CAP {
+                *raw_buf = Vec::with_capacity(4096);
+            }
+            res
+        })
     }
 
     pub fn compressed_len(&self) -> usize {
@@ -247,19 +296,29 @@ impl DecodedMeta {
     }
 }
 
+#[cfg(test)]
 fn encode_raw(key: &PageCacheKey, entry: &CachedResponse) -> Result<Vec<u8>, MetaError> {
+    let mut m = Vec::with_capacity(512);
+    encode_raw_into(&mut m, key, entry)?;
+    Ok(m)
+}
+
+fn encode_raw_into(
+    m: &mut Vec<u8>,
+    key: &PageCacheKey,
+    entry: &CachedResponse,
+) -> Result<(), MetaError> {
     if entry.tags.len() > u16::MAX as usize || entry.headers.len() > u16::MAX as usize {
         return Err(MetaError::encode("tag/header count over format bound"));
     }
-    let mut m = Vec::with_capacity(512);
     m.extend_from_slice(&MAGIC);
     m.extend_from_slice(&VERSION.to_le_bytes());
     m.extend_from_slice(&key.vhost_id.to_le_bytes());
     m.push(key.secure as u8);
-    push_lp(&mut m, key.host.as_bytes())?;
-    push_lp(&mut m, key.path.as_bytes())?;
-    push_lp(&mut m, key.normalized_query.as_bytes())?;
-    push_lp(&mut m, key.vary_value.as_bytes())?;
+    push_lp(m, key.host.as_bytes())?;
+    push_lp(m, key.path.as_bytes())?;
+    push_lp(m, key.normalized_query.as_bytes())?;
+    push_lp(m, key.vary_value.as_bytes())?;
     m.extend_from_slice(&key.private_owner.to_le_bytes());
     m.extend_from_slice(&entry.status.to_le_bytes());
     let (is_private, scope_owner) = match entry.scope {
@@ -268,22 +327,22 @@ fn encode_raw(key: &PageCacheKey, entry: &CachedResponse) -> Result<Vec<u8>, Met
     };
     m.push(is_private);
     m.extend_from_slice(&scope_owner.to_le_bytes());
-    push_lp(&mut m, entry.identity.as_bytes())?;
-    push_lp(&mut m, entry.vary_cookie_name.as_bytes())?;
-    push_lp(&mut m, entry.vary_value.as_bytes())?;
+    push_lp(m, entry.identity.as_bytes())?;
+    push_lp(m, entry.vary_cookie_name.as_bytes())?;
+    push_lp(m, entry.vary_value.as_bytes())?;
     m.extend_from_slice(&(entry.tags.len() as u16).to_le_bytes());
     for t in &entry.tags {
-        push_lp(&mut m, t.as_bytes())?;
+        push_lp(m, t.as_bytes())?;
     }
     m.extend_from_slice(&(entry.headers.len() as u16).to_le_bytes());
     for (n, v) in &entry.headers {
-        push_lp(&mut m, n.as_str().as_bytes())?;
-        push_lp(&mut m, v.as_bytes())?;
+        push_lp(m, n.as_str().as_bytes())?;
+        push_lp(m, v.as_bytes())?;
     }
     if m.len() > MAX_RAW_META {
         return Err(MetaError::encode("raw metadata over format bound"));
     }
-    Ok(m)
+    Ok(())
 }
 
 fn decode_raw(raw: &[u8]) -> Result<DecodedMeta, MetaError> {

@@ -238,7 +238,8 @@ impl LogFormat {
         }
     }
 
-    fn header_mask(self) -> u8 {
+    #[inline]
+    pub fn header_mask(self) -> u8 {
         match self {
             LogFormat::Common | LogFormat::Json => 0,
             LogFormat::Combined => LOG_REFERER | LOG_USERAGENT,
@@ -337,6 +338,7 @@ impl AccessRecord {
                 host: self.host.as_deref(),
                 remote_user: self.remote_user.as_deref(),
                 request_id: reqid.as_ref().map(|r| r as &dyn std::fmt::Display),
+                request_id_u64: None,
                 peer_unix: self.peer_unix,
             },
         );
@@ -414,6 +416,53 @@ pub fn render_access_line_with_host_into(
             host,
             remote_user,
             request_id,
+            request_id_u64: None,
+            peer_unix,
+        },
+    );
+    out.push(b'\n');
+}
+
+/// Fast path for [`render_access_line_with_host_into`] when the request ID is a raw
+/// 64-bit [`hj_core::ReqId`] integer: formats ` reqid=<16-hex>` directly into `out`
+/// without `dyn fmt::Display` vtable dispatch or `core::fmt` overhead.
+#[allow(clippy::too_many_arguments)]
+pub fn render_access_line_with_host_reqid_u64_into(
+    out: &mut Vec<u8>,
+    format: LogFormat,
+    client_ip: std::net::IpAddr,
+    ts: SystemTime,
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    protocol: &str,
+    status: u16,
+    bytes: u64,
+    referer: Option<&[u8]>,
+    user_agent: Option<&[u8]>,
+    host: Option<&[u8]>,
+    remote_user: Option<&str>,
+    request_id_u64: u64,
+    peer_unix: bool,
+) {
+    render_line(
+        out,
+        format,
+        &LineFields {
+            client_ip,
+            ts,
+            method,
+            path,
+            query,
+            protocol,
+            status,
+            bytes,
+            referer,
+            user_agent,
+            host,
+            remote_user,
+            request_id: None,
+            request_id_u64: Some(request_id_u64),
             peer_unix,
         },
     );
@@ -434,6 +483,7 @@ struct LineFields<'a> {
     host: Option<&'a [u8]>,
     remote_user: Option<&'a str>,
     request_id: Option<&'a dyn std::fmt::Display>,
+    request_id_u64: Option<u64>,
     peer_unix: bool,
 }
 
@@ -476,9 +526,17 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
         line.push_str(",\"user_agent\":");
         line.push_str(&jopt(f.user_agent));
         line.push_str(",\"reqid\":");
-        match f.request_id {
-            Some(id) => line.push_str(&format!("\"{}\"", json_escape(&id.to_string()))),
-            None => line.push_str("null"),
+        if let Some(id_u64) = f.request_id_u64 {
+            line.push('"');
+            let mut hex = [0u8; 16];
+            format_hex_u64(id_u64, &mut hex);
+            line.push_str(std::str::from_utf8(&hex).unwrap_or_default());
+            line.push('"');
+        } else {
+            match f.request_id {
+                Some(id) => line.push_str(&format!("\"{}\"", json_escape(&id.to_string()))),
+                None => line.push_str("null"),
+            }
         }
         line.push('}');
         out.extend_from_slice(line.as_bytes());
@@ -501,7 +559,14 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
     out.push(b'[');
     fmt::clf_time_into(f.ts, out);
     out.extend_from_slice(b"] \"");
-    out.extend_from_slice(escape(f.method).as_bytes());
+    if matches!(
+        f.method,
+        "GET" | "HEAD" | "POST" | "PUT" | "DELETE" | "OPTIONS"
+    ) {
+        out.extend_from_slice(f.method.as_bytes());
+    } else {
+        out.extend_from_slice(escape(f.method).as_bytes());
+    }
     out.push(b' ');
     out.extend_from_slice(escape(f.path).as_bytes());
     if let Some(q) = f.query {
@@ -509,10 +574,18 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
         out.extend_from_slice(escape(q).as_bytes());
     }
     out.push(b' ');
-    out.extend_from_slice(escape(f.protocol).as_bytes());
-    out.extend_from_slice(b"\" ");
-    push_decimal(out, u64::from(f.status));
-    out.push(b' ');
+    if matches!(f.protocol, "HTTP/2" | "HTTP/1.1" | "HTTP/3" | "HTTP/1.0") {
+        out.extend_from_slice(f.protocol.as_bytes());
+    } else {
+        out.extend_from_slice(escape(f.protocol).as_bytes());
+    }
+    if f.status == 200 {
+        out.extend_from_slice(b"\" 200 ");
+    } else {
+        out.extend_from_slice(b"\" ");
+        push_decimal(out, u64::from(f.status));
+        out.push(b' ');
+    }
     // `%b`: OLS writes `-` when no body byte was sent (`contentWritten == 0`).
     if f.bytes == 0 {
         out.push(b'-');
@@ -527,14 +600,28 @@ fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
     ] {
         if mask & bit != 0 {
             out.extend_from_slice(b" \"");
-            out.extend_from_slice(quoted_bytes(value).as_bytes());
+            push_quoted_bytes(out, value);
             out.push(b'"');
         }
     }
-    if let Some(id) = f.request_id {
+    if let Some(id_u64) = f.request_id_u64 {
+        let mut buf = [0u8; 23];
+        buf[..7].copy_from_slice(b" reqid=");
+        format_hex_u64(id_u64, &mut buf[7..]);
+        out.extend_from_slice(&buf);
+    } else if let Some(id) = f.request_id {
         // Trailing token in every text format so the line is joinable with the
         // error/php-slow logs; absent ⇒ nothing appended (legacy layout).
         let _ = write!(out, " reqid={}", id);
+    }
+}
+
+#[inline]
+fn format_hex_u64(val: u64, dst: &mut [u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for (i, slot) in dst.iter_mut().take(16).enumerate() {
+        let shift = (15 - i) * 4;
+        *slot = HEX[((val >> shift) & 0x0f) as usize];
     }
 }
 
@@ -557,6 +644,10 @@ fn push_decimal(out: &mut Vec<u8>, mut value: u64) {
 fn push_ip(out: &mut Vec<u8>, ip: IpAddr) {
     match ip {
         IpAddr::V4(v4) => {
+            if v4 == std::net::Ipv4Addr::LOCALHOST {
+                out.extend_from_slice(b"127.0.0.1");
+                return;
+            }
             for (index, octet) in v4.octets().into_iter().enumerate() {
                 if index > 0 {
                     out.push(b'.');
@@ -571,11 +662,20 @@ fn push_ip(out: &mut Vec<u8>, ip: IpAddr) {
     }
 }
 
-/// Quoted optional header value: absent/empty -> `-` (so it reads `"-"`).
-fn quoted_bytes(v: Option<&[u8]>) -> Cow<'_, str> {
+#[inline]
+fn push_quoted_bytes(out: &mut Vec<u8>, v: Option<&[u8]>) {
     match v {
-        Some(s) if !s.is_empty() => escape_bytes(s),
-        _ => Cow::Borrowed("-"),
+        Some(s) if !s.is_empty() => {
+            if !s
+                .iter()
+                .any(|&b| b == b'"' || b == b'\\' || !(0x20..0x7f).contains(&b))
+            {
+                out.extend_from_slice(s);
+            } else {
+                out.extend_from_slice(escape_bytes(s).as_bytes());
+            }
+        }
+        _ => out.push(b'-'),
     }
 }
 

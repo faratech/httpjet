@@ -255,6 +255,9 @@ pub(super) struct StreamState {
     pub(super) headers: http::HeaderMap,
     pub(super) headers_done: bool,
     pub(super) end_stream: bool,
+    /// Number of `cookie` header field lines decoded on this stream (capped at 2);
+    /// `coalesce_cookie_crumbs` only needs to run when `cookie_count > 1`.
+    pub(super) cookie_count: u8,
     /// Refused for exceeding SETTINGS_MAX_CONCURRENT_STREAMS. The header block is STILL decoded
     /// (so the connection-wide HPACK dynamic table stays in sync) and CONTINUATIONs still find
     /// this stream; the RST_STREAM(REFUSED_STREAM) is deferred to the END_HEADERS decode-complete

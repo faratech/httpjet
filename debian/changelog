@@ -1,3 +1,13 @@
+httpjet (0.1.12-1) stable; urgency=medium
+
+  * Reduce hot-path allocation and contention: borrowed vhost routing,
+    a single-pass fast-serve header scan, HPACK header-name reuse, and
+    sharded telemetry and bridge counters.
+  * Refine the page-cache disk store and metadata blob handling, the
+    fast-memo and page-memo serve paths, and access-log rendering.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Sun, 08 Nov 2026 00:00:00 +0000
+
 httpjet (0.1.11-1) stable; urgency=medium
 
   * Default the io_uring transport to cooperative task running

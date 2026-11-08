@@ -518,9 +518,28 @@ impl Encoder {
 
 // ── Decoder (with dynamic table) ─────────────────────────────────────────────
 
+/// Validate `name` as a regular HTTP/2 request header name: non-empty, does not
+/// start with `:`, all lowercase ASCII token bytes, not a connection-specific
+/// request header (`connection`, `keep-alive`, `proxy-connection`,
+/// `transfer-encoding`, `upgrade`), and convertible to [`http::HeaderName`].
+#[inline]
+pub fn validate_request_header_name(name: &[u8]) -> Option<http::HeaderName> {
+    if name.first().is_none_or(|&b| b == b':') {
+        return None;
+    }
+    if name.iter().any(|&b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let s = std::str::from_utf8(name).ok()?;
+    if hj_core::is_connection_specific_request_header(s) {
+        return None;
+    }
+    http::HeaderName::from_bytes(name).ok()
+}
+
 /// HPACK decoder maintaining the dynamic table per RFC 7541 §2.3.2 / §4.
 pub struct Decoder {
-    dynamic: VecDeque<(Box<[u8]>, Box<[u8]>)>,
+    dynamic: VecDeque<(Box<[u8]>, Box<[u8]>, Option<http::HeaderName>)>,
     size: usize,
     /// Current dynamic-table size limit (mutated by §6.3 size updates).
     max_size: usize,
@@ -547,24 +566,31 @@ impl Decoder {
         }
     }
 
-    /// Borrow a table entry's `(name, value)` — static (`'static`) or dynamic (borrowing
-    /// `self.dynamic`). Returning refs lets the decode loop emit indexed/named headers with
-    /// ZERO per-header `String` allocation (the `emit` closure builds the HeaderName/Value),
-    /// instead of materializing a throwaway owned tuple per header on every request decode.
-    fn entry_ref(&self, index: usize) -> Option<(&[u8], &[u8])> {
+    /// Borrow a table entry's `(name, pre_validated_header_name, value)` — static (`'static`)
+    /// or dynamic (borrowing `self.dynamic`). Returning refs lets the decode loop emit
+    /// indexed/named headers with ZERO per-header `String` allocation and skip redundant
+    /// UTF-8/lowercase/connection-specific/HeaderName validation on every indexed hit.
+    #[inline]
+    fn entry_ref(&self, index: usize) -> Option<(&[u8], Option<http::HeaderName>, &[u8])> {
         if let Some((n, v)) = static_table::get(index) {
-            return Some((n.as_bytes(), v.as_bytes()));
+            return Some((
+                n.as_bytes(),
+                static_table::request_header_name(index),
+                v.as_bytes(),
+            ));
         }
         let dyn_idx = index.checked_sub(static_table::TABLE.len() + 1)?;
-        self.dynamic.get(dyn_idx).map(|(n, v)| (&**n, &**v))
+        self.dynamic
+            .get(dyn_idx)
+            .map(|(n, v, hdr)| (&**n, hdr.clone(), &**v))
     }
 
-    fn insert(&mut self, name: Box<[u8]>, value: Box<[u8]>) {
+    fn insert(&mut self, name: Box<[u8]>, value: Box<[u8]>, hdr_name: Option<http::HeaderName>) {
         let entry_size = name.len() + value.len() + ENTRY_OVERHEAD;
         self.evict_to(self.max_size.saturating_sub(entry_size));
         if entry_size <= self.max_size {
             self.size += entry_size;
-            self.dynamic.push_front((name, value));
+            self.dynamic.push_front((name, value, hdr_name));
         }
         // If a single entry exceeds max_size, the table ends up empty (RFC §4.4).
     }
@@ -572,7 +598,7 @@ impl Decoder {
     fn evict_to(&mut self, target: usize) {
         while self.size > target {
             match self.dynamic.pop_back() {
-                Some((n, v)) => self.size -= n.len() + v.len() + ENTRY_OVERHEAD,
+                Some((n, v, _)) => self.size -= n.len() + v.len() + ENTRY_OVERHEAD,
                 None => break,
             }
         }
@@ -615,6 +641,20 @@ impl Decoder {
     where
         F: FnMut(&[u8], &[u8]),
     {
+        self.decode_octets_with_header_name(buf, |n, _, v| emit(n, v))
+    }
+
+    /// Decode a complete header block, passing any pre-validated request [`http::HeaderName`]
+    /// from the static or dynamic table alongside `(name, value)` so the HTTP/2 request
+    /// builder can skip redundant name validation on indexed hits.
+    pub fn decode_octets_with_header_name<F>(
+        &mut self,
+        buf: &[u8],
+        mut emit: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&[u8], Option<http::HeaderName>, &[u8]),
+    {
         let mut pos = 0;
         // §4.2: a dynamic table size update MUST occur at the beginning of a header block,
         // before any header field representation. Once we've emitted a field, a later size
@@ -629,35 +669,36 @@ impl Decoder {
         // whole block is consumed. The wire block itself is bounded by the caller.
         let list_limit = self.max_list_size;
         let listed = std::cell::Cell::new(0usize);
-        let mut emit_checked = |n: &[u8], v: &[u8]| -> Result<(), Error> {
-            let total = listed
-                .get()
-                .saturating_add(n.len() + v.len() + ENTRY_OVERHEAD);
-            listed.set(total);
-            if total <= list_limit {
-                emit(n, v);
-            }
-            Ok(())
-        };
+        let mut emit_checked =
+            |n: &[u8], hdr: Option<http::HeaderName>, v: &[u8]| -> Result<(), Error> {
+                let total = listed
+                    .get()
+                    .saturating_add(n.len() + v.len() + ENTRY_OVERHEAD);
+                listed.set(total);
+                if total <= list_limit {
+                    emit(n, hdr, v);
+                }
+                Ok(())
+            };
         while pos < buf.len() {
             let b = buf[pos];
             if b & 0x80 != 0 {
                 // §6.1 Indexed Header Field.
                 let idx = integer::decode(buf, &mut pos, 7).ok_or(Error::Truncated)? as usize;
-                let (n, v) = self.entry_ref(idx).ok_or(Error::BadIndex)?;
+                let (n, hdr, v) = self.entry_ref(idx).ok_or(Error::BadIndex)?;
                 seen_field = true;
-                emit_checked(n, v)?;
+                emit_checked(n, hdr, v)?;
             } else if b & 0x40 != 0 {
                 // §6.2.1 Literal with incremental indexing (6-bit name index prefix).
-                let (n, v) = self.read_literal(buf, &mut pos, 6)?;
+                let (n, hdr, v) = self.read_literal(buf, &mut pos, 6)?;
                 seen_field = true;
-                emit_checked(&n, &v)?;
+                emit_checked(&n, hdr.clone(), &v)?;
                 // Own the entry before inserting: the table must outlive the block, AND owning in a
                 // separate statement first releases the shared `self`/`buf` borrow the `Cow` held,
                 // so the insert can reborrow `&mut self`. (The non-indexing arm below never owns —
                 // that is the allocation the `Cow` return type saves.)
                 let (n, v) = (n.into_owned().into(), v.into_owned().into());
-                self.insert(n, v);
+                self.insert(n, v, hdr);
             } else if b & 0x20 != 0 {
                 // §6.3 Dynamic table size update (5-bit prefix).
                 if seen_field {
@@ -676,13 +717,14 @@ impl Decoder {
                 DECODE_SCRATCH.with(|cell| -> Result<(), Error> {
                     let mut guard = cell.borrow_mut();
                     let (nb, vb) = &mut *guard;
-                    let name: &[u8] = if name_idx == 0 {
-                        decode_string_into(buf, &mut pos, nb)?
+                    let (name, hdr): (&[u8], Option<http::HeaderName>) = if name_idx == 0 {
+                        (decode_string_into(buf, &mut pos, nb)?, None)
                     } else {
-                        self.entry_ref(name_idx).ok_or(Error::BadIndex)?.0
+                        let (n, hdr, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
+                        (n, hdr)
                     };
                     let value: &[u8] = decode_string_into(buf, &mut pos, vb)?;
-                    emit_checked(name, value)
+                    emit_checked(name, hdr, value)
                 })?;
             }
         }
@@ -699,20 +741,23 @@ impl Decoder {
         buf: &'a [u8],
         pos: &mut usize,
         prefix_bits: u8,
-    ) -> Result<(Cow<'a, [u8]>, Cow<'a, [u8]>), Error> {
+    ) -> Result<(Cow<'a, [u8]>, Option<http::HeaderName>, Cow<'a, [u8]>), Error> {
         let name_idx = integer::decode(buf, pos, prefix_bits).ok_or(Error::Truncated)? as usize;
         // Borrow rather than own: an indexed name borrows the table, a non-Huffman literal
         // borrows the wire buffer (`decode_string` already returns a `Cow`). The caller owns
         // (`into_owned`) ONLY on the incremental-indexing arm, where the entry must outlive the
         // block — the without/never-indexing arms emit straight from the borrow, which is the
         // per-header allocate-then-drop this avoids for un-indexed (per-request-varying) fields.
-        let name = if name_idx == 0 {
-            decode_string(buf, pos)?
+        let (name, hdr) = if name_idx == 0 {
+            let n = decode_string(buf, pos)?;
+            let hdr = validate_request_header_name(&n);
+            (n, hdr)
         } else {
-            Cow::Borrowed(self.entry_ref(name_idx).ok_or(Error::BadIndex)?.0)
+            let (n, hdr, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
+            (Cow::Borrowed(n), hdr)
         };
         let value = decode_string(buf, pos)?;
-        Ok((name, value))
+        Ok((name, hdr, value))
     }
 }
 

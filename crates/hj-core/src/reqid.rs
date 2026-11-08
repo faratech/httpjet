@@ -7,6 +7,7 @@
 //! no lock, no RNG on the hot path (mirrors the lock-free per-thread counter
 //! idiom the metrics shards use).
 
+use std::cell::Cell;
 use std::fmt;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -19,6 +20,13 @@ pub struct ReqId(u64);
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 static SEED: OnceLock<u64> = OnceLock::new();
+
+const BATCH: u64 = 1024;
+
+thread_local! {
+    /// `(next_raw, end_raw, cached_seed)` claimed by this thread.
+    static LOCAL_BATCH: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
+}
 
 /// Per-process seed, minted once. Mixing it into every id keeps ids from
 /// repeating across a restart and from being trivially enumerable, while
@@ -33,11 +41,22 @@ fn seed() -> u64 {
     })
 }
 
-/// Mint a fresh request id: one relaxed `fetch_add` + a finalizing mix.
+/// Mint a fresh request id: claims [`BATCH`] sequential integers per thread from
+/// the global counter and finalizes each through [`splitmix64`], eliminating
+/// cross-core `LOCK XADD` cache-line contention on the global counter.
 #[inline]
 pub fn next() -> ReqId {
-    let n = COUNTER.fetch_add(1, Relaxed);
-    ReqId(splitmix64(seed().wrapping_add(n)))
+    LOCAL_BATCH.with(|cell| {
+        let (cur, end, s) = cell.get();
+        if cur < end {
+            cell.set((cur + 1, end, s));
+            return ReqId(splitmix64(s.wrapping_add(cur)));
+        }
+        let s = seed();
+        let base = COUNTER.fetch_add(BATCH, Relaxed);
+        cell.set((base + 1, base + BATCH, s));
+        ReqId(splitmix64(s.wrapping_add(base)))
+    })
 }
 
 /// SplitMix64 finalizer — turns the sequential counter into a well-distributed
