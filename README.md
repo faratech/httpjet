@@ -65,18 +65,21 @@ default: `acme`, `ocsp`, `otel`, `profiling`, `allocount`, and the staged
 
 ## Performance
 
-Dedicated-client table, measured 2026-11-08 for the 0.1.12 release (not re-run for 0.2.0) in the topology LiteSpeed and nginx
+Dedicated-client table, measured 2026-11-11 for the 0.2.0 release in the topology LiteSpeed and nginx
 publish their benchmarks in: `h2load` (nghttp2) on a **dedicated
 load-generator VM** (c4-highcpu-8, same cloud zone) against servers unpinned
 on the full host, over the private network, with production traffic live.
-Three rounds per cell, median shown; 1M requests per HTTP/2 cell.
+Three rotated passes per cell, median shown; 1M requests per HTTP/2 cell. The
+servers ran one at a time on one port the VPC firewall allows; nginx completes
+50,000 requests per HTTP/2 cell (`keepalive_requests 1000` on 50 connections,
+set for parity), so its HTTP/2 cells are short and noisier.
 
-| Workload | httpjet 0.1.12 | OpenLiteSpeed | nginx |
+| Workload | httpjet 0.2.0 | OpenLiteSpeed | nginx |
 |---|---:|---:|---:|
-| HTTP/2, empty body, c=50 ×100 | **1,182,673 req/s** | 892,073 req/s | 387,982 req/s |
-| HTTP/2, 1 KiB file, c=50 ×100 | **1,097,084 req/s** | 740,271 req/s | 319,240 req/s |
-| HTTP/1.1, 1 KiB file, c=100 (`h2load --h1`) | **426,956 req/s** | 302,600 req/s | 346,844 req/s |
-| HTTP/1.1, 1 KiB file, c=100 (`wrk`, 15 s) | **540,911 req/s** | 341,344 req/s | 439,433 req/s |
+| HTTP/2, empty body, c=50 ×100 | **1,258,411 req/s** | 977,577 req/s | 483,512 req/s |
+| HTTP/2, 1 KiB file, c=50 ×100 | **1,240,530 req/s** | 779,834 req/s | 409,423 req/s |
+| HTTP/1.1, 1 KiB file, c=100 (`h2load --h1`) | **517,643 req/s** | 353,405 req/s | 424,879 req/s |
+| HTTP/1.1, 1 KiB file, c=100 (`wrk`, 15 s) | **571,500 req/s** | 377,631 req/s | 430,111 req/s |
 
 For version-to-version comparison, every release from v0.0.1 to v0.2.0 was
 also re-measured on 2026-11-11 under **identical conditions** on a dedicated lab VM
@@ -92,7 +95,7 @@ page-cache hits, 32.3K vs 27.8K PHP/LSAPI; HTTP/2 64 KiB is flat (89.7K vs
 to 3 ms. In the same lab nginx reached 196K (HTTP/2 1 KiB), 239K (empty) and
 271K (`wrk` HTTP/1.1) against httpjet 0.2.0's 656K, 689K and 354K. (OpenLiteSpeed
 does not run in the lab layout; its cross-server comparison is the
-dedicated-client table above, measured on 0.1.12.) Two caveats travel with
+dedicated-client table above.) Two caveats travel with
 the lab data: absolute numbers move with VM placement — compare within a
 run, not across runs — and PHP for v0.0.1–v0.0.3 measures cold `lsphp`-pool
 ramp rather than steady state (warm, v0.0.1 sustains ~32K req/s).
