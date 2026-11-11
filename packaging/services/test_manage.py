@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Isolated state, archive, signature and privilege-boundary regression tests."""
+import contextlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import signal
 import tarfile
@@ -233,9 +235,10 @@ class GenericStateTests(unittest.TestCase):
         class Identity:
             def lstat(self): return SimpleNamespace(st_mode=0o100644, st_uid=0, st_nlink=1)
             def read_text(self): return '{"uid":12345,"gid":22222}'
+        absent = str(self.root / "absent")
         class Ready:
             def exists(self): return False
-            def is_symlink(self): return False
+            def __fspath__(self): return absent
             def __str__(self): return '/run/httpjet/ready'
         with patch.object(generic, "Path", side_effect=lambda value: Identity() if value.endswith('identity.json') else Ready()), patch.object(generic.os, "geteuid", return_value=0), patch.object(generic.os, "umask"), patch.object(generic.shutil, "which", return_value="/usr/bin/setpriv"), patch.object(generic.os, "execve") as execute, patch.dict(os.environ, {"NOTIFY_SOCKET":"@test-notify","PRIVATE_API_TOKEN":"do-not-forward"}, clear=True):
             generic.launch()
@@ -305,6 +308,117 @@ class GenericStateTests(unittest.TestCase):
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=3)
+
+class ReadinessMarkerTests(unittest.TestCase):
+    """The marker lives in a directory its (unprivileged) writer owns."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="httpjet-marker-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.manager = generic.Manager(self.root / "system")
+        self.manager.ready.parent.mkdir(parents=True)
+        proc = self.manager.path("/proc")
+        proc.mkdir()
+        (proc / "uptime").write_text("100.00 50.00\n")
+        self.state = {"uid": os.geteuid(), "gid": os.getegid()}
+        self.target = self.root / "target"
+        self.target.write_bytes(b"4194303\n")
+        self.target.chmod(0o600)
+        self.identity = {"pid": 4194303, "started": 1, "executable": "test-only"}
+
+    @contextlib.contextmanager
+    def deadline(self, seconds=5):
+        # Not an OSError: ready_identity swallows those, and a blocked open must fail the test.
+        def expired(signum, frame):
+            raise AssertionError("reading the readiness marker blocked")
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def launch(self, uid):
+        class Identity:
+            def lstat(self): return SimpleNamespace(st_mode=0o100644, st_uid=0, st_nlink=1)
+            def read_text(self): return json.dumps({"uid": uid, "gid": uid})
+        def path(value):
+            if value.endswith("identity.json"):
+                return Identity()
+            return self.manager.path(value)
+        with patch.object(generic, "Path", side_effect=path), patch.object(generic.os, "geteuid", return_value=0), \
+             patch.object(generic.os, "umask"), patch.object(generic.shutil, "which", return_value="/usr/bin/setpriv"), \
+             patch.object(generic.os, "execve") as execute:
+            generic.launch()
+        return execute
+
+    def assert_refused(self):
+        with self.deadline(), patch.object(generic.os, "read", wraps=os.read) as read, \
+             patch.object(self.manager, "process", return_value=self.identity):
+            with self.assertRaises(OSError):
+                generic.read_marker(self.manager.ready, self.state["uid"])
+            self.assertIsNone(self.manager.ready_identity(self.state))
+            with self.assertRaisesRegex(generic.InstallError, "^refusing an unowned readiness marker$"):
+                self.manager.prepare(self.state)
+            with self.assertRaisesRegex(generic.InstallError, "^unowned readiness marker$"):
+                self.launch(os.geteuid() or 12345)
+        read.assert_not_called()
+
+    def test_symlink_marker_is_refused_without_reading_its_target(self):
+        self.manager.ready.symlink_to(self.target)
+        self.assert_refused()
+        self.assertTrue(self.manager.ready.is_symlink())
+        self.assertEqual(self.target.read_bytes(), b"4194303\n")
+
+    def test_fifo_marker_is_refused_without_blocking(self):
+        os.mkfifo(self.manager.ready, 0o600)
+        self.assert_refused()
+        self.assertTrue(stat.S_ISFIFO(self.manager.ready.lstat().st_mode))
+
+    def test_hard_linked_marker_is_refused(self):
+        os.link(self.target, self.manager.ready)
+        self.assert_refused()
+        self.assertTrue(self.manager.ready.exists())
+
+    def test_oversized_marker_is_not_read_past_the_bound(self):
+        self.manager.ready.write_bytes(b"7" * (1 << 20))
+        self.manager.ready.chmod(0o600)
+        with patch.object(generic.os, "read", wraps=os.read) as read:
+            self.assertEqual(generic.read_marker(self.manager.ready, self.state["uid"]), b"7" * 64)
+            self.assertIsNone(self.manager.ready_identity(self.state))
+            with self.assertRaisesRegex(generic.InstallError, "live or malformed"):
+                self.manager.prepare(self.state)
+        self.assertEqual([call.args[1] for call in read.call_args_list], [64, 64, 64])
+        self.assertTrue(self.manager.ready.exists())
+
+    def test_opens_without_following_or_waiting(self):
+        with patch.object(generic.os, "open", wraps=os.open) as opened:
+            self.assertIsNone(generic.read_marker(self.manager.ready, self.state["uid"]))
+        required = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        self.assertEqual(opened.call_args.args[1] & (required | os.O_ACCMODE), required | os.O_RDONLY)
+
+    def test_prepare_and_launch_clear_only_a_stale_owned_marker(self):
+        self.manager.prepare(self.state)
+        self.manager.ready.write_bytes(b"123\n")
+        self.manager.prepare(self.state)
+        self.assertFalse(self.manager.ready.exists())
+        uid = os.geteuid() or 12345
+        self.manager.ready.write_bytes(b"123\n")
+        os.chown(self.manager.ready, uid, -1)
+        self.launch(uid).assert_called_once()
+        self.assertFalse(self.manager.ready.exists())
+        self.manager.path("/proc/123").mkdir()
+        for body in (b"123\n", b"123", b"0\n", b""):
+            with self.subTest(body=body):
+                self.manager.ready.write_bytes(body)
+                os.chown(self.manager.ready, uid, -1)
+                with self.assertRaisesRegex(generic.InstallError, "^readiness marker is live or malformed$"):
+                    self.launch(uid)
+                os.chown(self.manager.ready, self.state["uid"], -1)
+                with self.assertRaisesRegex(generic.InstallError, "^readiness marker is live or malformed; stop the recorded service first$"):
+                    self.manager.prepare(self.state)
+                self.assertEqual(self.manager.ready.read_bytes(), body)
 
 class ArchiveBoundaryTests(unittest.TestCase):
     def setUp(self):

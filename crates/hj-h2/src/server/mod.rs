@@ -80,6 +80,120 @@ pub fn rapid_reset_goaways() -> u64 {
     RAPID_RESET_GOAWAYS.load(Ordering::Relaxed)
 }
 
+/// Why a connection of the io_uring (monoio) loop ended. The first cause recorded
+/// for a connection is the one counted, once, when its loop exits.
+#[derive(Clone, Copy)]
+enum ConnEnd {
+    /// Never classified: the task was dropped, or the loop drained after a cause
+    /// that is not tracked.
+    Other,
+    /// Our idle timer sent GOAWAY.
+    Idle,
+    /// The peer closed its side with no GOAWAY first.
+    PeerEof,
+    /// The peer sent GOAWAY.
+    PeerGoaway,
+    /// We sent GOAWAY with an error code.
+    ProtocolError,
+    /// A read or write on the socket failed (reset, timeout, bad preface).
+    IoError,
+    /// This server is shutting down.
+    Shutdown,
+}
+
+const CONN_END_REASONS: [&str; 7] = [
+    "other",
+    "idle",
+    "peer_eof",
+    "peer_goaway",
+    "protocol_error",
+    "io_error",
+    "shutdown",
+];
+
+static CONN_ENDS: [std::sync::atomic::AtomicU64; 7] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Records why a connection ends and counts it when the connection's loop exits.
+struct ConnEndGuard(std::cell::Cell<ConnEnd>);
+
+impl ConnEndGuard {
+    fn new() -> Self {
+        ConnEndGuard(std::cell::Cell::new(ConnEnd::Other))
+    }
+
+    /// Keep the first cause: a peer EOF after our idle GOAWAY is still an idle close.
+    fn note(&self, cause: ConnEnd) {
+        if matches!(self.0.get(), ConnEnd::Other) {
+            self.0.set(cause);
+        }
+    }
+}
+
+impl Drop for ConnEndGuard {
+    fn drop(&mut self) {
+        if let Some(counter) = CONN_ENDS.get(self.0.get() as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Connections of the io_uring (monoio) loop that ended, by cause. Behind a pooling
+/// proxy that never resumes TLS every ended connection costs a full handshake, and
+/// this split shows whether this server or the peer ends them.
+pub fn connection_end_counts() -> [(&'static str, u64); 7] {
+    let mut counts = [("", 0); 7];
+    for ((slot, reason), counter) in counts.iter_mut().zip(CONN_END_REASONS).zip(&CONN_ENDS) {
+        *slot = (reason, counter.load(Ordering::Relaxed));
+    }
+    counts
+}
+
+#[cfg(test)]
+mod conn_end_tests {
+    use super::*;
+
+    fn count(reason: &str) -> u64 {
+        connection_end_counts()
+            .into_iter()
+            .find(|(name, _)| *name == reason)
+            .map(|(_, count)| count)
+            .unwrap()
+    }
+
+    #[test]
+    fn reason_labels_follow_the_enum_order() {
+        for (cause, label) in [
+            (ConnEnd::Other, "other"),
+            (ConnEnd::Idle, "idle"),
+            (ConnEnd::PeerEof, "peer_eof"),
+            (ConnEnd::PeerGoaway, "peer_goaway"),
+            (ConnEnd::ProtocolError, "protocol_error"),
+            (ConnEnd::IoError, "io_error"),
+            (ConnEnd::Shutdown, "shutdown"),
+        ] {
+            assert_eq!(CONN_END_REASONS.get(cause as usize), Some(&label));
+        }
+    }
+
+    /// Other tests end connections concurrently, so only growth is asserted.
+    #[test]
+    fn a_connection_is_counted_under_its_first_cause_when_it_ends() {
+        let before = count("peer_goaway");
+        let end = ConnEndGuard::new();
+        end.note(ConnEnd::PeerGoaway);
+        end.note(ConnEnd::IoError);
+        assert!(matches!(end.0.get(), ConnEnd::PeerGoaway));
+        assert_eq!(
+            count("peer_goaway"),
+            before,
+            "counted at the end, not before"
+        );
+        drop(end);
+        assert!(count("peer_goaway") > before);
+    }
+}
+
 /// `(closed by our idle timer, closed by the peer)` for the io_uring (monoio) loop.
 pub fn connection_close_counts() -> (u64, u64) {
     (
@@ -1617,6 +1731,31 @@ where
     S: Fn(Request) -> F,
     F: Future<Output = Response> + Send + 'static,
 {
+    let end = ConnEndGuard::new();
+    let result = serve_local_conn(stream, prefix, service, config, shutdown, ktls_fd, &end).await;
+    if result.is_err() {
+        end.note(ConnEnd::IoError);
+    }
+    result
+}
+
+#[cfg(feature = "monoio")]
+async fn serve_local_conn<IO, S, F>(
+    stream: IO,
+    prefix: Vec<u8>,
+    service: S,
+    config: Config,
+    shutdown: Option<tokio_util::sync::CancellationToken>,
+    ktls_fd: Option<i32>,
+    end: &ConnEndGuard,
+) -> std::io::Result<()>
+where
+    IO: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRent + monoio::io::Splitable + 'static,
+    IO::OwnedRead: monoio::io::AsyncReadRent + 'static,
+    IO::OwnedWrite: monoio::io::AsyncWriteRent + 'static,
+    S: Fn(Request) -> F,
+    F: Future<Output = Response> + Send + 'static,
+{
     use futures_util::stream::StreamExt;
     use monoio::io::{AsyncReadRent, AsyncWriteRent};
 
@@ -1657,7 +1796,10 @@ where
                 _ = async { match preface_deadline { Some(deadline) => monoio::time::sleep_until(deadline).await, None => std::future::pending::<()>().await } } => {
                     return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "h2 preface timeout"));
                 }
-                _ = shutdown_signal(shutdown.as_ref()) => return Ok(()),
+                _ = shutdown_signal(shutdown.as_ref()) => {
+                    end.note(ConnEnd::Shutdown);
+                    return Ok(());
+                }
             };
             let n = res?;
             if n == 0 {
@@ -1787,6 +1929,7 @@ where
                 {
                     // Report the streams already processed (RFC 9113 §6.8, #876).
                     let last = recv.goaway_last_stream_id();
+                    end.note(ConnEnd::ProtocolError);
                     out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
                 }
                 reading = false;
@@ -1797,6 +1940,7 @@ where
                 {
                     // Report the streams already processed (RFC 9113 §6.8, #876).
                     let last = recv.goaway_last_stream_id();
+                    end.note(ConnEnd::ProtocolError);
                     out.frames(|b| frame::write_goaway(b, last, error_code::FRAME_SIZE_ERROR));
                 }
                 reading = false;
@@ -1836,11 +1980,13 @@ where
             match outcome {
                 FrameOutcome::Continue => {}
                 FrameOutcome::StopReading => {
+                    end.note(ConnEnd::ProtocolError);
                     reading = false;
                     accepting = false;
                     break;
                 }
                 FrameOutcome::PeerGoaway => {
+                    end.note(ConnEnd::PeerGoaway);
                     if !draining {
                         draining = true;
                         peer_goaway_deadline =
@@ -1864,6 +2010,7 @@ where
                         {
                             // Report the streams already processed (RFC 9113 §6.8, #876).
                             let last = recv.goaway_last_stream_id();
+                            end.note(ConnEnd::ProtocolError);
                             out.frames(|b| {
                                 frame::write_goaway(b, last, error_code::FLOW_CONTROL_ERROR)
                             });
@@ -1923,6 +2070,7 @@ where
                                 // (#905) Same rapid-reset charge as the tokio loop.
                                 if recv.charge_inflight_reset() {
                                     let last = recv.goaway_last_stream_id();
+                                    end.note(ConnEnd::ProtocolError);
                                     out.frames(|b| {
                                         frame::write_goaway(b, last, error_code::ENHANCE_YOUR_CALM)
                                     });
@@ -1944,6 +2092,7 @@ where
                         {
                             // Report the streams already processed (RFC 9113 §6.8, #876).
                             let last = recv.goaway_last_stream_id();
+                            end.note(ConnEnd::ProtocolError);
                             out.frames(|b| {
                                 frame::write_goaway(b, last, error_code::FLOW_CONTROL_ERROR)
                             });
@@ -1976,6 +2125,7 @@ where
         // biased read arm ready cannot starve it.
         if reading && header_block_deadline.is_some_and(|d| d <= std::time::Instant::now()) {
             let last = recv.goaway_last_stream_id();
+            end.note(ConnEnd::ProtocolError);
             out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
             reading = false;
             accepting = false;
@@ -2104,7 +2254,8 @@ where
             // PROTOCOL_ERROR, stop reading.
             _ = async { match frame_wait { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading && frame_wait.is_some() => {
                 let last = recv.goaway_last_stream_id();
-                out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
+                end.note(ConnEnd::ProtocolError);
+                    out.frames(|b| frame::write_goaway(b, last, error_code::PROTOCOL_ERROR));
                 reading = false;
                 accepting = false;
             }
@@ -2133,6 +2284,7 @@ where
             apply_pull(sid, body, res, &mut outstreams, &mut out);
             }
             _ = shutdown_signal(shutdown.as_ref()), if !shutdown_drain => {
+                end.note(ConnEnd::Shutdown);
                 shutdown_drain = true;
                 if reading && accepting {
                     let last = recv.goaway_last_stream_id();
@@ -2149,6 +2301,7 @@ where
             _ = async { match config.conn_idle_timeout { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading => {
                 if accepting {
                     IDLE_CLOSES.fetch_add(1, Ordering::Relaxed);
+                    end.note(ConnEnd::Idle);
                     let last = recv.goaway_last_stream_id();
                     out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
                     accepting = false;
@@ -2164,6 +2317,7 @@ where
                     if accepting {
                         PEER_CLOSES.fetch_add(1, Ordering::Relaxed);
                     }
+                    end.note(ConnEnd::PeerEof);
                     reading = false;
                     accepting = false;
                     read_eof = true;
@@ -2173,6 +2327,7 @@ where
                     if accepting {
                         PEER_CLOSES.fetch_add(1, Ordering::Relaxed);
                     }
+                    end.note(ConnEnd::PeerEof);
                     reading = false;
                     accepting = false;
                     read_eof = true;

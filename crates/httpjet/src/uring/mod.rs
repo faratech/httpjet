@@ -710,7 +710,7 @@ pub(crate) fn spawn_uring_http(
                 .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
             move |shutdown| {
                 if let Some(cpu) = maybe_pin_core_thread(core_i, worker_count) {
-                    steer_listener(&std_listener, cpu);
+                    steer_listener(&std_listener, cpu, worker_count);
                 }
                 per_core_bridged(
                     core_i,
@@ -855,14 +855,137 @@ pub(crate) fn maybe_pin_core_thread(core: usize, workers: usize) -> Option<usize
     Some(cpu)
 }
 
+/// A network interface's receive fan-out: how many CPUs can run the receive
+/// softirq for its packets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RxFanout {
+    interface: String,
+    /// Hardware receive queues (RSS).
+    queues: usize,
+    /// CPUs enabled in the queues' `rps_cpus` masks (RPS), 0 when it is off.
+    rps_cpus: usize,
+}
+
+/// The receive fan-out of every device-backed interface that is not down, read from
+/// `sys_net` (`/sys/class/net`). Virtual interfaces (loopback, tunnels, bridges, veth)
+/// have no `device` link: loopback delivers on the sender's CPU, and the others do not
+/// decide where a NIC's packets are processed.
+fn physical_rx_fanouts(sys_net: &std::path::Path) -> Vec<RxFanout> {
+    let Ok(interfaces) = std::fs::read_dir(sys_net) else {
+        return Vec::new();
+    };
+    let mut fanouts = Vec::new();
+    for entry in interfaces.flatten() {
+        let path = entry.path();
+        if !path.join("device").exists() {
+            continue;
+        }
+        let down = std::fs::read_to_string(path.join("operstate"))
+            .is_ok_and(|state| state.trim() == "down");
+        if down {
+            continue;
+        }
+        let mut queues = 0;
+        let mut rps_mask: Vec<u8> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(path.join("queues")) {
+            for queue in entries.flatten() {
+                if !queue.file_name().to_string_lossy().starts_with("rx-") {
+                    continue;
+                }
+                queues += 1;
+                // `rps_cpus` is a hex CPU mask, words separated by commas. The union
+                // over the queues is the set of CPUs RPS can use for this interface.
+                let mask =
+                    std::fs::read_to_string(queue.path().join("rps_cpus")).unwrap_or_default();
+                let digits: Vec<u8> = mask
+                    .trim()
+                    .bytes()
+                    .rev()
+                    .filter_map(|byte| (byte as char).to_digit(16).map(|digit| digit as u8))
+                    .collect();
+                if rps_mask.len() < digits.len() {
+                    rps_mask.resize(digits.len(), 0);
+                }
+                for (slot, digit) in rps_mask.iter_mut().zip(digits) {
+                    *slot |= digit;
+                }
+            }
+        }
+        fanouts.push(RxFanout {
+            interface: entry.file_name().to_string_lossy().into_owned(),
+            queues,
+            rps_cpus: rps_mask
+                .iter()
+                .map(|digit| digit.count_ones() as usize)
+                .sum(),
+        });
+    }
+    fanouts.sort_by(|a, b| a.interface.cmp(&b.interface));
+    fanouts
+}
+
+/// Why steering `workers` listeners would concentrate connections, if it would.
+///
+/// A steered reuseport group hands a connection to the listener whose CPU ran the
+/// SYN's receive softirq, and falls back to the hash only when NO listener matches.
+/// Every pinned worker has a listener, so one always matches: if an interface's
+/// packets are processed on fewer CPUs than there are workers, only that many
+/// workers ever accept its connections and the rest idle. Hash placement spreads
+/// them over all workers instead.
+fn steering_concentrates(workers: usize, fanouts: &[RxFanout]) -> Option<String> {
+    if fanouts.is_empty() {
+        return Some("no device-backed network interface is visible".into());
+    }
+    fanouts
+        .iter()
+        .find(|fanout| fanout.queues < workers && fanout.rps_cpus < workers)
+        .map(|fanout| {
+            format!(
+                "{} processes receives on {} CPU(s) ({} queue(s), RPS over {}) for {} workers",
+                fanout.interface,
+                fanout.queues.max(fanout.rps_cpus),
+                fanout.queues,
+                fanout.rps_cpus,
+                workers
+            )
+        })
+}
+
+/// Whether steering is safe for a group of `workers` listeners on this host, decided
+/// (and logged) once per group size.
+fn steering_keeps_spread(workers: usize) -> bool {
+    static DECISIONS: std::sync::Mutex<Vec<(usize, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut decisions = DECISIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((_, keeps)) = decisions.iter().find(|(size, _)| *size == workers) {
+        return *keeps;
+    }
+    let reason = steering_concentrates(
+        workers,
+        &physical_rx_fanouts(std::path::Path::new("/sys/class/net")),
+    );
+    if let Some(reason) = &reason {
+        tracing::info!(
+            %reason,
+            "uring: listener CPU steering off, connections placed by hash"
+        );
+    }
+    decisions.push((workers, reason.is_none()));
+    reason.is_none()
+}
+
 /// Ask the kernel to hand this listener the connections whose SYN was
 /// processed on `cpu` (Linux 6.1+ reuseport selection; older kernels ignore
 /// it). With RSS or RPS spreading flows over the pinned workers' CPUs, every
 /// connection then lives on the core that receives its packets: no
 /// cross-core wakeup per request. Only connection placement changes, so it is
 /// safe for TCP. UDP stays on reuseport hashing: a datagram flow must never move.
-pub(crate) fn steer_listener(listener: &impl std::os::fd::AsRawFd, cpu: usize) {
-    if !CPU_STEERING.load(std::sync::atomic::Ordering::Relaxed) {
+///
+/// Skipped when the host's receive fan-out does not reach all `workers` CPUs (see
+/// [`steering_concentrates`]): steering would then leave workers without connections.
+pub(crate) fn steer_listener(listener: &impl std::os::fd::AsRawFd, cpu: usize, workers: usize) {
+    if !CPU_STEERING.load(std::sync::atomic::Ordering::Relaxed) || !steering_keeps_spread(workers) {
         return;
     }
     let Ok(cpu) = libc::c_int::try_from(cpu) else {
@@ -1147,7 +1270,7 @@ pub(crate) fn spawn_uring_https(
                 .stack_size(crate::RUNTIME_THREAD_STACK_BYTES),
             move |shutdown| {
                 if let Some(cpu) = maybe_pin_core_thread(core_i, worker_count) {
-                    steer_listener(&std_listener, cpu);
+                    steer_listener(&std_listener, cpu, worker_count);
                 }
                 per_core_https(
                     core_i,
@@ -3049,6 +3172,92 @@ fn with_interim(interim: Option<Vec<u8>>, head: Vec<u8>) -> Vec<u8> {
             wire
         }
         None => head,
+    }
+}
+
+#[cfg(test)]
+mod steering_tests {
+    use super::*;
+
+    /// A sysfs-shaped fixture: `(interface, device-backed, operstate, [rps_cpus per rx queue])`.
+    fn sys_net(tag: &str, interfaces: &[(&str, bool, &str, &[&str])]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("hj-steer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (name, device, state, queues) in interfaces {
+            let dir = root.join(name);
+            std::fs::create_dir_all(dir.join("queues")).unwrap();
+            if *device {
+                std::fs::create_dir_all(dir.join("device")).unwrap();
+            }
+            std::fs::write(dir.join("operstate"), format!("{state}\n")).unwrap();
+            for (index, mask) in queues.iter().enumerate() {
+                let queue = dir.join("queues").join(format!("rx-{index}"));
+                std::fs::create_dir_all(&queue).unwrap();
+                std::fs::write(queue.join("rps_cpus"), format!("{mask}\n")).unwrap();
+            }
+            std::fs::create_dir_all(dir.join("queues").join("tx-0")).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn only_device_backed_interfaces_that_are_not_down_count() {
+        let root = sys_net(
+            "filter",
+            &[
+                ("ens3", true, "up", &["00", "00"]),
+                ("wg0", false, "unknown", &["0"]),
+                ("lo", false, "unknown", &["0"]),
+                ("eth9", true, "down", &["0"]),
+            ],
+        );
+        assert_eq!(
+            physical_rx_fanouts(&root),
+            vec![RxFanout {
+                interface: "ens3".into(),
+                queues: 2,
+                rps_cpus: 0
+            }]
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rps_masks_are_joined_across_queues_and_words() {
+        // Two queues: CPUs 0-3 and CPUs 4-7 plus CPU 32 in the second word.
+        let root = sys_net("rps", &[("eth0", true, "up", &["0f", "00000001,000000f0"])]);
+        let fanouts = physical_rx_fanouts(&root);
+        assert_eq!(fanouts.len(), 1);
+        assert_eq!((fanouts[0].queues, fanouts[0].rps_cpus), (2, 9));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// (#1226) Fewer receive CPUs than workers: a steered group would hand every
+    /// connection to the same few listeners.
+    #[test]
+    fn steering_is_refused_when_receives_cannot_reach_every_worker() {
+        let nic = |queues, rps_cpus| RxFanout {
+            interface: "eth0".into(),
+            queues,
+            rps_cpus,
+        };
+        assert_eq!(steering_concentrates(8, &[nic(8, 0)]), None);
+        assert_eq!(steering_concentrates(4, &[nic(8, 0)]), None);
+        assert_eq!(
+            steering_concentrates(4, &[nic(1, 4)]),
+            None,
+            "RPS covers the workers"
+        );
+        assert!(steering_concentrates(4, &[nic(2, 0)]).is_some());
+        assert!(steering_concentrates(8, &[nic(1, 2)]).is_some());
+        assert!(
+            steering_concentrates(4, &[nic(4, 0), nic(1, 0)]).is_some(),
+            "one narrow interface is enough to concentrate its connections"
+        );
+        assert!(
+            steering_concentrates(2, &[]).is_some(),
+            "nothing known: keep the hash"
+        );
     }
 }
 

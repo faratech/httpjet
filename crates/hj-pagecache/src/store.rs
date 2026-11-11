@@ -1308,6 +1308,12 @@ pub struct CacheStats {
     pub disk_max_bytes: u64,
     /// `File` entries evicted by the disk LRU because tmpfs hit its cap.
     pub disk_evictions: u64,
+    /// Counted misses on a key the disk LRU had evicted while its copy was still fresh:
+    /// misses a larger file-tier cap could have served. An estimate, to compare with
+    /// `disk_evictions`: the record of recent evictions is a bounded sample (slot
+    /// collisions lose some), and a key that a later tag purge would have removed
+    /// anyway is still counted.
+    pub ghost_hits: u64,
     /// Every entry torn down through the eviction funnel (RAM budget, disk budget, expiry,
     /// purge): the count the RAM-budget LRU was missing from the exported metrics.
     pub evictions: u64,
@@ -1521,10 +1527,69 @@ struct StoreEvict {
     /// answers "are entries evicted before their would-be second hit?" — the capacity
     /// question — without offline mtime sampling.
     disk_evict_ages: Arc<[AtomicU64; 4]>,
+    /// Keys evicted by the disk LRU, for the ghost-hit counter.
+    ghosts: Arc<GhostTable>,
     /// Total teardowns through the funnel. Diagnostic-only — not surfaced in [`CacheStats`]
     /// today (it was the old `PageStore.evictions`), kept so the teardown path stays cheap to
     /// instrument if a counter is ever wanted.
     evictions: Arc<AtomicU64>,
+}
+
+/// Slots of the [`GhostTable`]; a power of two.
+const GHOST_SLOTS: usize = 1 << 16;
+
+/// A bounded, lock-free sample of the page keys the disk LRU evicted most recently,
+/// to answer whether the file-tier cap costs hits. A lookup miss that finds its key
+/// here while the evicted copy would still have been fresh is a "ghost hit": a miss
+/// that a larger `max_disk_bytes` could have served. Direct-mapped, so an eviction
+/// overwrites whatever shared its slot; purges are not tracked, so a key that a tag
+/// purge would have removed after its eviction still counts. An estimate, not a bound.
+struct GhostTable {
+    /// The evicted key id with bit 63 set (page ids keep it clear), 0 = empty.
+    keys: Box<[AtomicU64]>,
+    /// Until when the evicted copy would have been fresh, in ms since `epoch`.
+    fresh_until_ms: Box<[AtomicU64]>,
+    epoch: Instant,
+}
+
+impl GhostTable {
+    /// `enabled` only with a file tier: without one nothing is ever disk-evicted.
+    fn new(enabled: bool) -> Self {
+        let slots = if enabled { GHOST_SLOTS } else { 0 };
+        GhostTable {
+            keys: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            fresh_until_ms: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            epoch: Instant::now(),
+        }
+    }
+
+    fn slot(&self, id: u64) -> Option<usize> {
+        (!self.keys.is_empty()).then(|| id as usize & (self.keys.len() - 1))
+    }
+
+    fn record(&self, id: u64, fresh_until: Instant) {
+        let Some(slot) = self.slot(id) else { return };
+        let until = fresh_until
+            .saturating_duration_since(self.epoch)
+            .as_millis() as u64;
+        self.fresh_until_ms[slot].store(until, Ordering::Relaxed);
+        self.keys[slot].store(id | (1 << 63), Ordering::Relaxed);
+    }
+
+    /// Whether `id` was evicted and would still be fresh at `now`. Consumes the
+    /// record, so one eviction is counted at most once.
+    fn take(&self, id: u64, now: Instant) -> bool {
+        let Some(slot) = self.slot(id) else {
+            return false;
+        };
+        let tag = id | (1 << 63);
+        self.keys[slot].load(Ordering::Relaxed) == tag
+            && (now.saturating_duration_since(self.epoch).as_millis() as u64)
+                < self.fresh_until_ms[slot].load(Ordering::Relaxed)
+            && self.keys[slot]
+                .compare_exchange(tag, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
 }
 
 /// Bucket index for [`StoreEvict::disk_evict_ages`].
@@ -1575,6 +1640,7 @@ impl OnEvict<CacheKeyId, CacheEntry> for StoreEvict {
                 if cause == EvictCause::Disk {
                     let b = evict_age_bucket(node.stored_at.elapsed());
                     self.disk_evict_ages[b].fetch_add(1, Ordering::Relaxed);
+                    self.ghosts.record(id.0, node.stored_at + node.ttl);
                 }
                 self.unlink_body(&node.body, cause);
                 for tag in &node.tags {
@@ -1715,6 +1781,10 @@ pub struct PageStore {
     evictions: Arc<AtomicU64>,
     /// `Arc`-shared with [`StoreEvict`]: age-at-eviction buckets (<1h, 1-6h, 6-24h, >=24h).
     disk_evict_ages: Arc<[AtomicU64; 4]>,
+    /// `Arc`-shared with [`StoreEvict`]: the keys it disk-evicted most recently.
+    ghosts: Arc<GhostTable>,
+    /// Counted misses on a key the disk LRU evicted while it was still fresh.
+    ghost_hits: AtomicU64,
     swept_expired: AtomicU64,
     /// Counted lookups that met an entry past its full retention (TTL+SWR+SIE) — the
     /// direct "this miss was a TTL re-render" signal (the sweep usually reaps first;
@@ -1897,6 +1967,7 @@ impl PageStore {
         }
         let disk_evictions = Arc::new(AtomicU64::new(0));
         let disk_evict_ages: Arc<[AtomicU64; 4]> = Arc::new(Default::default());
+        let ghosts = Arc::new(GhostTable::new(disk.is_some()));
         let evictions = Arc::new(AtomicU64::new(0));
 
         // The primitive divides each configured TOTAL by SHARDS internally, reproducing the page
@@ -1912,6 +1983,7 @@ impl PageStore {
                 tag_index: tag_index.clone(),
                 disk_evictions: disk_evictions.clone(),
                 disk_evict_ages: disk_evict_ages.clone(),
+                ghosts: ghosts.clone(),
                 evictions: evictions.clone(),
             },
         );
@@ -1959,6 +2031,8 @@ impl PageStore {
             evictions,
             disk_evict_ages,
             swept_expired: AtomicU64::new(0),
+            ghosts,
+            ghost_hits: AtomicU64::new(0),
             expired_misses: AtomicU64::new(0),
             disk_read_errors: AtomicU64::new(0),
             disk_read_swap_retries: AtomicU64::new(0),
@@ -2574,6 +2648,9 @@ impl PageStore {
             None => {
                 if count {
                     self.misses.fetch_add(1, Ordering::Relaxed);
+                    if self.ghosts.take(id.0, now) {
+                        self.ghost_hits.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 EntryState::Miss
             }
@@ -3363,7 +3440,18 @@ impl PageStore {
                 |hash| self.invalidate_page_hash(hash),
             );
             if matches!(verdict, crate::urlvary::ScanVerdict::Drop) {
-                self.invalidate_key(&se.key);
+                // Only the entry this scan installed: no lock is held since the install,
+                // so a live store may already have replaced it with a newer one.
+                let id = CacheKeyId::new(&se.key);
+                self.inner.with_shard(&id, |acc| {
+                    let installed = acc
+                        .get(&id)
+                        .and_then(CacheEntry::as_page)
+                        .is_some_and(|node| node.stored_at == stored_at);
+                    if installed {
+                        acc.teardown(&id, EvictCause::Explicit);
+                    }
+                });
                 return false;
             }
             on_loaded(&se.key);
@@ -3983,6 +4071,7 @@ impl PageStore {
             disk_bytes,
             disk_max_bytes: self.disk.as_ref().map_or(0, |_| self.disk_max_bytes),
             disk_evictions: self.disk_evictions.load(Ordering::Relaxed),
+            ghost_hits: self.ghost_hits.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             swept_expired: self.swept_expired.load(Ordering::Relaxed),
             expired_misses: self.expired_misses.load(Ordering::Relaxed),

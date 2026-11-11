@@ -520,6 +520,18 @@ impl RuleSet {
     /// Non-rewrite directives are ignored here (see [`crate::Htaccess`] for the
     /// directive-aware parser). Line continuations (`\` at EOL) are joined.
     pub fn parse(rules: &str) -> Result<RuleSet, RewriteError> {
+        Self::parse_with(rules, false)
+    }
+
+    /// [`parse`](Self::parse) without building the prefilter: the caller runs
+    /// [`build_prefilter`](Self::build_prefilter) off the request path (or never, for
+    /// a rule set that is only inspected). Everything else, including the rule set's
+    /// identity and cache classification, is identical to an eager parse.
+    pub fn parse_deferred(rules: &str) -> Result<RuleSet, RewriteError> {
+        Self::parse_with(rules, true)
+    }
+
+    fn parse_with(rules: &str, defer_prefilter: bool) -> Result<RuleSet, RewriteError> {
         let rules = rules.strip_prefix('\u{FEFF}').unwrap_or(rules);
         let mut set = RuleSet::default();
         let mut pending_conds: Vec<Cond> = Vec::new();
@@ -594,14 +606,13 @@ impl RuleSet {
             }
         }
         if !prefilter_pats.is_empty() {
-            set.prefilter = PrefilterSet::new(&prefilter_pats);
-            if set.prefilter.is_none() {
-                // DFA determinization exceeded the size limit — disable the prefilter
-                // (rules are still evaluated per-rule, just unfiltered).
-                for rule in &mut set.rules {
-                    rule.prefilter_idx = None;
-                }
-            }
+            // A build over the DFA size limit leaves the slot empty for good: the
+            // rules are then evaluated one by one, unfiltered.
+            set.prefilter = if defer_prefilter {
+                PrefilterSlot::deferred(prefilter_pats)
+            } else {
+                PrefilterSlot::built(PrefilterSet::new(&prefilter_pats))
+            };
         }
 
         // Outcome-cacheability: safe to memoize by (vhost, scheme, method, host,

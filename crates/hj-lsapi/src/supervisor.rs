@@ -2269,6 +2269,7 @@ struct BoundSocketPath {
     pinned: PathBuf,
     device: u64,
     inode: u64,
+    _path_lock: SocketPathLock,
 }
 
 impl Drop for BoundSocketPath {
@@ -2328,6 +2329,151 @@ pub fn validate_operator_dir(dir: &Path, what: &str) -> io::Result<()> {
     Ok(())
 }
 
+struct HeldPathLock {
+    /// Owns the `flock`; closing it releases the lock.
+    _file: std::fs::File,
+    holders: usize,
+}
+
+/// Exclusive `flock`s this process holds on LSAPI socket lock files, keyed by the lock
+/// file's (device, inode). Supervisors of one process share a path (a reload starts
+/// the next pool while the previous one drains), so the lock belongs to the process
+/// and is counted per bound socket.
+static SOCKET_PATH_LOCKS: std::sync::Mutex<Vec<((u64, u64), HeldPathLock)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// One bound socket's share of this process's lock on its path; see [`lock_socket_path`].
+struct SocketPathLock {
+    key: (u64, u64),
+    directory: std::fs::File,
+    lock_name: std::ffi::OsString,
+}
+
+impl SocketPathLock {
+    fn lock_path(directory: &std::fs::File, lock_name: &std::ffi::OsStr) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(lock_name)
+    }
+}
+
+impl Drop for SocketPathLock {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        let mut held = SOCKET_PATH_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(index) = held.iter().position(|(key, _)| *key == self.key) else {
+            return;
+        };
+        let Some((_, lock)) = held.get_mut(index) else {
+            return;
+        };
+        lock.holders -= 1;
+        if lock.holders > 0 {
+            return;
+        }
+        // Unlink before the lock is released: a process that locks this inode
+        // afterwards sees that the name no longer leads to it and starts over.
+        let lock_path = Self::lock_path(&self.directory, &self.lock_name);
+        if std::fs::symlink_metadata(&lock_path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.key)
+        {
+            let _ = std::fs::remove_file(&lock_path);
+        }
+        held.swap_remove(index);
+    }
+}
+
+/// Take this process's exclusive lock for the socket `name` inside `directory`.
+///
+/// Binding replaces whatever socket is at the path, which is right for this process's
+/// own previous generation and for the leftover of a killed supervisor (its lock died
+/// with it). A second live supervisor process on the same path is refused here instead:
+/// it would unlink a socket the first one is still serving, leaving that pool's workers
+/// on an unreachable inode while new requests silently went to the other pool.
+fn lock_socket_path(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    path: &Path,
+) -> io::Result<SocketPathLock> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".lock");
+    let lock_path = SocketPathLock::lock_path(directory, &lock_name);
+    let mut held = SOCKET_PATH_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A holder unlinks the file as it lets go, so an open can land on a name that is
+    // gone by the time it is locked; that attempt starts over.
+    for _ in 0..8 {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock_path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != rustix::process::geteuid().as_raw()
+            || metadata.nlink() > 1
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "LSAPI socket lock for {} is not a private regular file of this user",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.nlink() == 0 {
+            continue;
+        }
+        let key = (metadata.dev(), metadata.ino());
+        let share = || -> io::Result<SocketPathLock> {
+            Ok(SocketPathLock {
+                key,
+                directory: directory.try_clone()?,
+                lock_name: lock_name.clone(),
+            })
+        };
+        if let Some((_, lock)) = held.iter_mut().find(|(existing, _)| *existing == key) {
+            let share = share()?;
+            lock.holders += 1;
+            return Ok(share);
+        }
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "LSAPI socket path {} is served by another httpjet process",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if std::fs::symlink_metadata(&lock_path)
+            .is_ok_and(|current| (current.dev(), current.ino()) == key)
+        {
+            let share = share()?;
+            held.push((
+                key,
+                HeldPathLock {
+                    _file: file,
+                    holders: 1,
+                },
+            ));
+            return Ok(share);
+        }
+    }
+    Err(io::Error::other(format!(
+        "LSAPI socket lock for {} kept being replaced",
+        path.display()
+    )))
+}
+
 fn bind_private_socket(path: &Path, backlog: i32) -> io::Result<(OwnedFd, BoundSocketPath)> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
     use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -2352,6 +2498,7 @@ fn bind_private_socket(path: &Path, backlog: i32) -> io::Result<(OwnedFd, BoundS
         ));
     }
     let pinned = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+    let path_lock = lock_socket_path(&directory, name, path)?;
     prepare_bind_socket_path(&pinned)?;
     let listener = rustix::net::socket_with(
         AddressFamily::UNIX,
@@ -2374,6 +2521,7 @@ fn bind_private_socket(path: &Path, backlog: i32) -> io::Result<(OwnedFd, BoundS
         pinned,
         device: metadata.dev(),
         inode: metadata.ino(),
+        _path_lock: path_lock,
     };
     // std's UnixListener::bind already listens. Restrict the pinned pathname
     // first so even umask zero cannot admit another uid before chmod.
@@ -3182,6 +3330,72 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         assert!(prepare_bind_socket_path(&path).is_err());
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    /// (#1200) A socket path another live process holds the lock for is refused and
+    /// its socket left alone; the same process may rebind, and a dead holder's
+    /// leftover is replaced.
+    #[test]
+    fn bind_refuses_a_path_locked_by_another_live_process() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::fs::MetadataExt;
+        let directory = std::env::temp_dir().join(format!("hj-path-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("php.sock");
+        let lock = directory.join("php.sock.lock");
+
+        // Another process serving the path: it holds the lock and a live socket.
+        let other_socket = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        let mut other = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import fcntl, sys, time\n\
+                 f = open(sys.argv[1], 'a')\n\
+                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n\
+                 print('locked', flush=True)\n\
+                 time.sleep(60)\n",
+            )
+            .arg(&lock)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 is needed to hold the lock from another process");
+        let mut line = String::new();
+        BufReader::new(other.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "locked");
+
+        let error = bind_private_socket(&path, 16)
+            .err()
+            .expect("a path locked by another process is refused");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse, "{error}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode,
+            "the other process's socket must not be unlinked"
+        );
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+
+        // The holder dies without cleaning up: its lock is gone, its socket file is not.
+        other.kill().unwrap();
+        other.wait().unwrap();
+        let (first_fd, first) = bind_private_socket(&path, 16).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        drop(other_socket);
+
+        // This process's next generation rebinds the same path while the first is live.
+        let (second_fd, second) = bind_private_socket(&path, 16).unwrap();
+        assert!(std::os::unix::net::UnixStream::connect(&path).is_ok());
+        drop((first_fd, first));
+        assert!(
+            lock.exists(),
+            "the lock stays while a generation holds the path"
+        );
+        drop((second_fd, second));
+        assert!(!lock.exists(), "the last holder removes the lock file");
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

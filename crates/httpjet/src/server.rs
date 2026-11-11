@@ -79,13 +79,18 @@ enum Adopted {
 }
 
 /// (Tier 2) Classify ONE socket-activated fd by family/type/address: TCP STREAM
-/// by port (http/https), UDP DGRAM by port (quic), and AF_UNIX STREAM by exact
-/// pathname match against the configured UDS path. Everything else is
-/// `Unknown` and gets closed.
+/// (http/https) and UDP DGRAM (quic) against the configured addresses, and AF_UNIX
+/// STREAM by exact pathname match against the configured UDS path. Everything else
+/// is `Unknown` and gets closed.
+///
+/// The two roles normally use different ports, and then the port alone decides, so a
+/// `.socket` unit may bind any address for it (wildcard, dual-stack, one interface).
+/// When both roles share a port only the full address can tell them apart: matching
+/// on the port there adopted the TLS listener's fds as plain HTTP.
 fn classify_activated(
     sock: Socket,
-    http_port: u16,
-    https_port: u16,
+    http: std::net::SocketAddr,
+    https: std::net::SocketAddr,
     uds_path: Option<&std::path::Path>,
 ) -> io::Result<Adopted> {
     let ty = sock.r#type()?;
@@ -100,14 +105,23 @@ fn classify_activated(
         }
         return Ok(Adopted::Unknown);
     }
-    let port = local.as_socket().map(|a| a.port()).unwrap_or(0);
-    if ty == Type::STREAM && port == http_port {
+    let Some(local) = local.as_socket() else {
+        return Ok(Adopted::Unknown);
+    };
+    let serves = |role: std::net::SocketAddr| {
+        if http.port() == https.port() {
+            local == role
+        } else {
+            local.port() == role.port()
+        }
+    };
+    if ty == Type::STREAM && serves(http) {
         return Ok(Adopted::Http(TcpListener::from_std(sock.into())?));
     }
-    if ty == Type::STREAM && port == https_port {
+    if ty == Type::STREAM && serves(https) {
         return Ok(Adopted::Https(TcpListener::from_std(sock.into())?));
     }
-    if ty == Type::DGRAM && port == https_port {
+    if ty == Type::DGRAM && serves(https) {
         return Ok(Adopted::Quic(sock.into()));
     }
     Ok(Adopted::Unknown)
@@ -116,8 +130,8 @@ fn classify_activated(
 /// Must be called within the tokio runtime (`TcpListener::from_std`); the io_uring cores
 /// convert each adopted listener back to `std` (`into_std`) and re-adopt it on their core.
 pub fn listeners_from_env(
-    http_port: u16,
-    https_port: u16,
+    http_addr: std::net::SocketAddr,
+    https_addr: std::net::SocketAddr,
     uds_path: Option<&std::path::Path>,
 ) -> io::Result<Option<InheritedListeners>> {
     // The fds are ours only if LISTEN_PID matches; otherwise they were meant for a
@@ -138,7 +152,7 @@ pub fn listeners_from_env(
         let sock = unsafe { Socket::from_raw_fd(fd) };
         set_cloexec(&sock)?;
         sock.set_nonblocking(true)?;
-        match classify_activated(sock, http_port, https_port, uds_path)? {
+        match classify_activated(sock, http_addr, https_addr, uds_path)? {
             Adopted::Http(l) => http.push(l),
             Adopted::Https(l) => https.push(l),
             Adopted::Quic(s) => quic.push(s),
@@ -231,6 +245,46 @@ mod classify_tests {
         s.local_addr().unwrap().as_socket().unwrap().port()
     }
 
+    /// The configured address of a role: the wildcard, as the shipped units pass it.
+    fn at(port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port)
+    }
+
+    fn tcp_on(address: &str) -> Socket {
+        let s = Socket::new(Domain::IPV4, Type::STREAM, Some(S2Protocol::TCP)).unwrap();
+        s.set_reuse_address(true).unwrap();
+        s.bind(&address.parse::<std::net::SocketAddr>().unwrap().into())
+            .unwrap();
+        s.set_nonblocking(true).unwrap();
+        s.listen(8).unwrap();
+        s
+    }
+
+    /// (#1198) Two roles on one port: the port cannot tell the TLS listener's fd from
+    /// the plain one, so each is matched by its full address.
+    #[tokio::test]
+    async fn roles_sharing_a_port_classify_by_full_address() {
+        let plain = tcp();
+        let port = port_of(&plain);
+        let http: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let https: std::net::SocketAddr = format!("127.0.0.2:{port}").parse().unwrap();
+        let secure = tcp_on(&https.to_string());
+        let other = tcp_on(&format!("127.0.0.3:{port}"));
+
+        assert!(matches!(
+            classify_activated(secure, http, https, None).unwrap(),
+            Adopted::Https(_)
+        ));
+        assert!(matches!(
+            classify_activated(plain, http, https, None).unwrap(),
+            Adopted::Http(_)
+        ));
+        assert!(matches!(
+            classify_activated(other, http, https, None).unwrap(),
+            Adopted::Unknown
+        ));
+    }
+
     #[tokio::test]
     async fn tcp_and_udp_fds_classify_by_port_and_type() {
         let http = tcp();
@@ -238,25 +292,25 @@ mod classify_tests {
         let https = tcp();
         let https_port = port_of(&https);
 
-        match classify_activated(http, http_port, https_port, None).unwrap() {
+        match classify_activated(http, at(http_port), at(https_port), None).unwrap() {
             Adopted::Http(_) => {}
             _ => panic!("a TCP stream on the http port must classify as Http"),
         }
-        match classify_activated(https, http_port, https_port, None).unwrap() {
+        match classify_activated(https, at(http_port), at(https_port), None).unwrap() {
             Adopted::Https(_) => {}
             _ => panic!("a TCP stream on the https port must classify as Https"),
         }
         // A UDP socket on the https port is the QUIC listener — but a UDP fd on
         // some third port is Unknown, not a listener we serve.
         let quic = udp(https_port);
-        match classify_activated(quic, http_port, https_port, None).unwrap() {
+        match classify_activated(quic, at(http_port), at(https_port), None).unwrap() {
             Adopted::Quic(_) => {}
             _ => panic!("UDP on the https port must classify as Quic"),
         }
         let stray_udp = udp(0);
         let stray_port = port_of(&stray_udp);
         assert!(matches!(
-            classify_activated(stray_udp, http_port, https_port, None).unwrap(),
+            classify_activated(stray_udp, at(http_port), at(https_port), None).unwrap(),
             Adopted::Unknown
         ));
         let _ = stray_port;
@@ -278,20 +332,20 @@ mod classify_tests {
 
         // Exact pathname match adopts.
         let mine = unix(&configured);
-        match classify_activated(mine, 80, 443, Some(&configured)).unwrap() {
+        match classify_activated(mine, at(80), at(443), Some(&configured)).unwrap() {
             Adopted::Unix(_) => {}
             _ => panic!("the configured UDS path must classify as Unix"),
         }
         // A DIFFERENT unix path is Unknown even when a UDS path is configured.
         let stranger = unix(&other);
         assert!(matches!(
-            classify_activated(stranger, 80, 443, Some(&configured)).unwrap(),
+            classify_activated(stranger, at(80), at(443), Some(&configured)).unwrap(),
             Adopted::Unknown
         ));
         // No UDS configured at all: every AF_UNIX fd is Unknown.
         let unconfigured = unix(&configured);
         assert!(matches!(
-            classify_activated(unconfigured, 80, 443, None).unwrap(),
+            classify_activated(unconfigured, at(80), at(443), None).unwrap(),
             Adopted::Unknown
         ));
 

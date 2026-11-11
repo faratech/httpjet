@@ -1,3 +1,22 @@
+httpjet (0.2.0-1) stable; urgency=medium
+
+  * Security: validate the upstream WebSocket handshake; strip credentials and
+    keep non-ASCII cookie lines in capsule revalidation; decode every gzip
+    member of a backend response; fail an LSAPI response whose stream packet
+    precedes its header; escape control characters in the text error log;
+    refuse an LSAPI socket path another live process serves.
+  * QUIC: drop connections lost before their handshake and keep their slot
+    counted; send Drained exactly once; charge shared cache bodies to the
+    connection only.
+  * Startup: build the rewrite prefilter off the request path, parse each
+    .htaccess once and before serving, and reuse parsed files across reloads.
+  * Steer listeners by CPU only when the NIC's receive fan-out reaches every
+    worker; count HTTP/2 connection ends and page-cache ghost hits.
+  * Packaging: fix the lsphp reload unit, readiness-marker reads, TLS pair
+    validation and the installer tests.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Wed, 11 Nov 2026 00:00:00 +0000
+
 httpjet (0.1.12-1) stable; urgency=medium
 
   * Reduce hot-path allocation and contention: borrowed vhost routing,

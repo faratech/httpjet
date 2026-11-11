@@ -43,9 +43,12 @@ elif name == "apt-get":
     if args[0] == "update" and state.get("apt_update_failure"): sys.exit(100)
     if args[0] == "install" and state.get("apt_install_failure"): sys.exit(100)
 elif name == "curl":
-    if state.get("curl_failure"): sys.exit(7)
-    pathlib.Path(args[args.index("--output") + 1]).write_bytes(bytes.fromhex(state["welcome"]) if not state.get("wrong_welcome") else b"another website")
-    print(state.get("http_status", "200"), end="")
+    tls = args[-1].startswith("https://")
+    if state.get("curl_failure") or tls and state.get("tls_failure"): sys.exit(7)
+    body = b"another website" if state.get("wrong_tls_welcome" if tls else "wrong_welcome") else bytes.fromhex(state["welcome"])
+    if "--output" in args: pathlib.Path(args[args.index("--output") + 1]).write_bytes(body)
+    else: sys.stdout.buffer.write(body)
+    if "--write-out" in args: print(state.get("http_status", "200"), end="")
 elif name == "timeout": sys.exit(subprocess.run(args[3:] if args[0] == "-k" else args[2:] if args[0].startswith("--kill-after=") else args[1:]).returncode)
 elif name == "rpm":
     if args[0] == "--import": pass
@@ -135,7 +138,7 @@ class InstallerTests(unittest.TestCase):
     def test_fresh_install_uses_scoped_signed_archive_and_exact_http_probe(self):
         result, calls = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("welcome page passed", result.stdout)
+        self.assertIn("httpjet is running at http://SERVER-IP/ and https://SERVER-IP/", result.stdout)
         source = (self.root / "etc/apt/sources.list.d/httpjet.sources").read_text()
         self.assertEqual(source, "Types: deb\nURIs: https://httpjet-packages.pages.dev/apt\nSuites: stable\nComponents: main\nArchitectures: amd64\nSigned-By: /usr/share/keyrings/httpjet-archive-keyring.asc\n")
         self.assertNotIn("Trusted:", source)
@@ -143,7 +146,10 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.root / "usr/share/keyrings").stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.root / "etc/apt/sources.list.d").stat().st_mode & 0o777, 0o755)
         self.assertEqual([call for call in calls if call[:2] == ["apt-get", "install"]], [["apt-get", "install", "--yes", "--no-install-recommends", "-o", "Dpkg::Options::=--force-confdef", "-o", "Dpkg::Options::=--force-confold", "httpjet-archive-keyring", "httpjet"]])
-        self.assertTrue(any(call[0] == "curl" and "--noproxy" in call and "--max-time" in call for call in calls))
+        probes = [call for call in calls if call[0] == "curl"]
+        self.assertEqual([call[-1] for call in probes], ["http://127.0.0.1/", "https://127.0.0.1/"])
+        self.assertTrue(all("--noproxy" in call and "--max-time" in call for call in probes))
+        self.assertEqual(["--insecure" in call for call in probes], [False, True])
         self.assertFalse(any(call[0] == "journalctl" for call in calls))
         self.assert_clean()
 
@@ -219,15 +225,17 @@ class InstallerTests(unittest.TestCase):
         proc = self.root / "proc/net"
         proc.mkdir(parents=True)
         (proc / "tcp").write_text("sl local_address rem_address st\n")
-        (proc / "tcp6").write_text("0: 00000000000000000000000000000000:0050 00000000000000000000000000000000:0000 0A\n")
-        result, calls = self.run_installer(missing_ss=True)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("TCP port 80 is occupied", result.stderr)
-        self.assert_no_apt(calls)
+        for port in ("0050", "01BB"):
+            with self.subTest(port=port):
+                (proc / "tcp6").write_text(f"0: 00000000000000000000000000000000:{port} 00000000000000000000000000000000:0000 0A\n")
+                result, calls = self.run_installer(missing_ss=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("TCP port 80 or 443 is occupied", result.stderr)
+                self.assert_no_apt(calls)
         (proc / "tcp6").write_text("sl local_address rem_address st\n")
         result, calls = self.run_installer(missing_ss=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(["apt-get", "install", "--yes", "--no-install-recommends", "ca-certificates", "curl", "iproute2"], calls)
+        self.assertIn(["apt-get", "install", "--yes", "--no-install-recommends", "ca-certificates", "curl", "iproute2", "openssl"], calls)
 
     def test_failed_port_inspection_and_incomplete_package_are_refused(self):
         for state in ({"ss_failure": True}, {"missing_ss": True}, {"package_status": "install ok unpacked"}):
@@ -312,7 +320,8 @@ class InstallerTests(unittest.TestCase):
         self.assert_clean()
 
     def test_wrong_welcome_non200_and_unready_service_fail_with_bound(self):
-        for state in ({"wrong_welcome": True}, {"http_status": "201"}, {"active": False}):
+        for state in ({"wrong_welcome": True}, {"http_status": "201"}, {"active": False},
+                      {"wrong_tls_welcome": True}, {"tls_failure": True}):
             with self.subTest(state=state):
                 result, calls = self.run_installer(**state)
                 self.assertNotEqual(result.returncode, 0)
@@ -392,6 +401,14 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / "etc/zypp/repos.d/httpjet.repo").exists())
         self.assertTrue(any(call[0] == "zypper" and "--oldpackage" in call and "httpjet=1.2.3-2" in call for call in calls))
+        # The pinned key is imported through rpm before the refresh; the repository
+        # must never be able to add a signing key of its own.
+        self.assertIn(["rpm", "--import", str(self.root / "etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet")], calls)
+        self.assertIn(["zypper", "--non-interactive", "refresh", "httpjet"], calls)
+        self.assertFalse(any("--gpg-auto-import-keys" in call or "--no-gpg-checks" in call for call in calls), calls)
+        source = (self.root / "etc/zypp/repos.d/httpjet.repo").read_text()
+        for setting in ("gpgcheck=1\n", "repo_gpgcheck=1\n", "pkg_gpgcheck=1\n", "gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-httpjet\n"):
+            self.assertIn(setting, source)
 
 if __name__ == "__main__":
     unittest.main()

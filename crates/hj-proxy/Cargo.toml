@@ -27,6 +27,9 @@ thiserror = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
+# RFC 6455 Sec-WebSocket-Accept check on the upstream's 101 (same versions hj-rewrite uses).
+base64 = "0.23"
+sha1 = "0.11"
 
 [dev-dependencies]
 # Test-only upstream stubs (hyper::server::conn::http1) — prod never serves via hyper.

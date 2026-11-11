@@ -937,7 +937,7 @@ mod semantics {
         rs.rules[0].pattern = crate::rules::CompiledRegex::Fancy(builder.build().unwrap());
         rs.rules[0].prefilter_idx = None;
         rs.rules[0].literal_prefix = Box::from(&b""[..]);
-        rs.prefilter = None;
+        rs.prefilter = Default::default();
         let input = RewriteInput::new("/aaaaaaaaaaaaaaaaX", "/var/www");
         assert!(matches!(
             evaluate(&rs, &input),

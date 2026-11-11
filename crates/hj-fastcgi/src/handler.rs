@@ -180,22 +180,53 @@ impl Handler for FastCgi {
         // connection (a forged BEGIN_REQUEST with attacker-chosen params). Without
         // KEEP_CONN the application closes after END_REQUEST, discarding any tail.
         let keep_conn = body.is_empty();
+        // A kept connection can be closed by the application (idle reap, request cap)
+        // after the pool's liveness probe and before it reads this request: the write
+        // fails or the first read is EOF/reset with no response byte. The application
+        // never ran the request, so a bodyless GET/HEAD is sent once more, on a fresh
+        // dial. Anything else on a reused connection, and every failure on a fresh one,
+        // is reported as before.
+        let replayable =
+            keep_conn && matches!(*req.method(), http::Method::GET | http::Method::HEAD);
+        let mut wire = BytesMut::with_capacity(16 * 1024);
         let mut conn = self.pool.acquire().await.map_err(map_pool_error)?;
-        let mut conn = if body.len() > STDIN_INLINE_WRITE_MAX {
-            write_head(&mut conn, params, self.read_timeout).await?;
-            Conn::split(conn, body, lease, self.read_timeout)
+        let (mut conn, mut record) = if body.len() > STDIN_INLINE_WRITE_MAX {
+            write_head(&mut conn, &params, self.read_timeout).await?;
+            let mut conn = Conn::split(conn, body, lease, self.read_timeout);
+            let record = next_record(conn.reader(), &mut wire, self.read_timeout).await?;
+            (conn, record)
         } else {
-            write_request(&mut conn, params, &body, keep_conn, self.read_timeout).await?;
-            drop(lease);
-            Conn::Whole { conn, keep_conn }
+            let mut replayed = false;
+            let mut lease = Some(lease);
+            let record = loop {
+                let first = async {
+                    write_request(&mut conn, &params, &body, keep_conn, self.read_timeout).await?;
+                    lease.take();
+                    next_record(&mut conn, &mut wire, self.read_timeout).await
+                }
+                .await;
+                match first {
+                    Ok(record) => break record,
+                    Err(error)
+                        if replayable
+                            && !replayed
+                            && conn.was_reused()
+                            && closed_unanswered(&error, &wire) =>
+                    {
+                        replayed = true;
+                        drop(conn);
+                        conn = self.pool.acquire_fresh().await.map_err(map_pool_error)?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            (Conn::Whole { conn, keep_conn }, record)
         };
 
-        let mut wire = BytesMut::with_capacity(16 * 1024);
         let mut header = BytesMut::new();
         let mut header_boundary = CgiHeadBoundary::default();
         let mut stderr_seen = 0_usize;
         let parsed = loop {
-            let record = next_record(conn.reader(), &mut wire, self.read_timeout).await?;
             require_response_record(&record)?;
             match record.kind {
                 RecordType::Stdout if record.content.is_empty() => {
@@ -234,6 +265,7 @@ impl Handler for FastCgi {
                     ));
                 }
             }
+            record = next_record(conn.reader(), &mut wire, self.read_timeout).await?;
         };
 
         let status = parsed.status;
@@ -340,14 +372,14 @@ fn safe_extra_env_name(name: &str) -> bool {
 
 async fn write_head(
     conn: &mut PooledConnection,
-    params: Vec<Bytes>,
+    params: &[Bytes],
     timeout: Duration,
 ) -> Result<(), HandlerError> {
     let operation = async {
         conn.write_all(&begin_request(REQUEST_ID, false).expect("constant request id"))
             .await?;
         for record in params {
-            conn.write_all(&record).await?;
+            conn.write_all(record).await?;
         }
         conn.flush().await
     };
@@ -359,7 +391,7 @@ async fn write_head(
 
 async fn write_request(
     conn: &mut PooledConnection,
-    params: Vec<Bytes>,
+    params: &[Bytes],
     body: &[u8],
     keep_conn: bool,
     timeout: Duration,
@@ -368,7 +400,7 @@ async fn write_request(
         conn.write_all(&begin_request(REQUEST_ID, keep_conn).expect("constant request id"))
             .await?;
         for record in params {
-            conn.write_all(&record).await?;
+            conn.write_all(record).await?;
         }
         for record in encode_stream(RecordType::Stdin, REQUEST_ID, body)
             .expect("bounded request id and chunks")
@@ -514,11 +546,29 @@ async fn next_record(
             .map_err(|_| HandlerError::GatewayTimeout)?
             .map_err(HandlerError::Io)?;
         if read == 0 {
-            return Err(HandlerError::BadGateway(
-                "FastCGI connection closed before END_REQUEST".into(),
-            ));
+            return Err(HandlerError::BadGateway(CLOSED_BEFORE_END_REQUEST.into()));
         }
     }
+}
+
+const CLOSED_BEFORE_END_REQUEST: &str = "FastCGI connection closed before END_REQUEST";
+
+/// The peer closed or reset the connection and not one response byte arrived.
+fn closed_unanswered(error: &HandlerError, wire: &BytesMut) -> bool {
+    use std::io::ErrorKind;
+    wire.is_empty()
+        && match error {
+            HandlerError::Io(error) => matches!(
+                error.kind(),
+                ErrorKind::BrokenPipe
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::NotConnected
+                    | ErrorKind::UnexpectedEof
+            ),
+            HandlerError::BadGateway(message) => message == CLOSED_BEFORE_END_REQUEST,
+            _ => false,
+        }
 }
 
 fn require_response_record(record: &Record) -> Result<(), HandlerError> {
@@ -1176,6 +1226,92 @@ mod tests {
         }
         // One accept served both requests: the first connection was re-pooled.
         server.await.unwrap();
+    }
+
+    /// Serves one kept request on the first connection, then drops that connection
+    /// as soon as the next request starts arriving on it (the application closed a
+    /// kept connection after the pool's liveness probe). Returns how many requests
+    /// it then served on fresh connections.
+    async fn stale_after_first_request(
+        listener: tokio::net::TcpListener,
+        fresh_requests: usize,
+    ) -> usize {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut wire = BytesMut::new();
+        let (keep, _) = read_whole_request(&mut stream, &mut wire).await;
+        assert!(keep);
+        write_php_response(&mut stream, "Content-Length: 5\r\n\r\nfirst").await;
+        let mut byte = [0u8; 1];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+        drop(stream);
+
+        let mut served = 0;
+        while served < fresh_requests {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_secs(2), listener.accept()).await
+            else {
+                break;
+            };
+            let mut wire = BytesMut::new();
+            read_whole_request(&mut stream, &mut wire).await;
+            write_php_response(&mut stream, "Content-Length: 6\r\n\r\nsecond").await;
+            served += 1;
+        }
+        served
+    }
+
+    /// (#1196) A bodyless GET that a reused connection drops unanswered is replayed
+    /// once on a fresh dial instead of surfacing as a 502.
+    #[tokio::test]
+    async fn unanswered_get_on_a_stale_kept_connection_is_replayed_on_a_fresh_dial() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(stale_after_first_request(listener, 1));
+        let handler = FastCgi::new(fastcgi_pool(address));
+
+        let first = handler
+            .handle(&mut context(), get_request("/index.php"))
+            .await
+            .unwrap();
+        assert_eq!(streamed_body(first).await.unwrap(), "first");
+        let second = handler
+            .handle(&mut context(), get_request("/index.php"))
+            .await
+            .expect("the unanswered request is replayed");
+        assert_eq!(second.status(), http::StatusCode::OK);
+        assert_eq!(streamed_body(second).await.unwrap(), "second");
+        assert_eq!(server.await.unwrap(), 1);
+    }
+
+    /// (#1196) Only GET/HEAD are replayed: the application may already hold a POST.
+    #[tokio::test]
+    async fn unanswered_post_on_a_stale_kept_connection_is_not_replayed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(stale_after_first_request(listener, 1));
+        let handler = FastCgi::new(fastcgi_pool(address));
+
+        let first = handler
+            .handle(&mut context(), get_request("/index.php"))
+            .await
+            .unwrap();
+        assert_eq!(streamed_body(first).await.unwrap(), "first");
+        let mut post = get_request("/index.php");
+        *post.method_mut() = http::Method::POST;
+        let error = handler
+            .handle(&mut context(), post)
+            .await
+            .err()
+            .expect("a POST is never sent twice");
+        assert!(
+            matches!(error, HandlerError::BadGateway(_) | HandlerError::Io(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            server.await.unwrap(),
+            0,
+            "no second connection carried the POST"
+        );
     }
 
     #[tokio::test]

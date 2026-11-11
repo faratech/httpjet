@@ -8,7 +8,10 @@
 //! The transform is applied by the pipeline *after* the terminal handler has
 //! produced a [`Response`]. It decides whether to compress based on:
 //!
-//! 1. The client `Accept-Encoding` (q-values honored, `identity;q=0` etc.).
+//! 1. The client `Accept-Encoding`: q-values are honored for the codings above
+//!    (`gzip;q=0`, `*;q=0`). A refusal of `identity` is not acted on — when no
+//!    coding is acceptable the body goes out uncoded, as nginx and Apache do,
+//!    rather than as a 406 (RFC 9110 §12.5.3 permits either).
 //! 2. The response `Content-Type` being in a configurable *compressible set*.
 //!    The default set is LiteSpeed/OLS's `compressibleTypes=default` list
 //!    verbatim (`text/*`, `application/x-javascript`, `application/javascript`,

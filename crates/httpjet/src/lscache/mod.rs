@@ -664,9 +664,10 @@ pub(crate) fn record_response_memo_hit_codec(
         store.record_hit();
         state.page_cache_admission.record(key_hash);
         state.metrics.pagecache_lookup.record_result(2, 0);
-        if let Some(index) = variant_codec {
-            state.metrics.pagecache_variant_serves[index as usize]
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(counter) = variant_codec
+            .and_then(|index| state.metrics.pagecache_variant_serves.get(index as usize))
+        {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -2746,12 +2747,15 @@ fn record_capsule_hit(state: &ServerState, source: &'static str, member: bool, a
 }
 
 pub(crate) fn capsule_public_refresh_cookie(
-    cookie: Option<&str>,
+    cookie: Option<&HeaderValue>,
     store: &hj_pagecache::PageStore,
 ) -> Option<HeaderValue> {
     let cfg = store.config();
     let mut pairs = Vec::new();
-    for pair in cookie?.split(';') {
+    // Lossy, like every other Cookie consumer: one non-ASCII crumb must not hide the
+    // vary cookies beside it, or the stale slot is never refreshed.
+    let cookie = hj_core::header_value_lossy(cookie?);
+    for pair in cookie.split(';') {
         let pair = pair.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
         let (raw_name, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
         // Array-form cookies key their own slot (#656); re-emitting them as a
@@ -7002,8 +7006,9 @@ mod tests {
         let store = hj_pagecache::PageStore::new(cfg);
         let original = "XF_STYLE_ID=; xf_style_id=4; xf_language_id=2; \
                         xf_user=secret; xf_session=session; unrelated=x";
-        let rebuilt = capsule_public_refresh_cookie(Some(original), &store)
-            .expect("public vary pairs remain");
+        let rebuilt =
+            capsule_public_refresh_cookie(Some(&HeaderValue::from_static(original)), &store)
+                .expect("public vary pairs remain");
         assert_eq!(rebuilt, "xf_style_id=4; xf_language_id=2");
 
         let public_vary: Vec<String> = vec!["xf_style_id".into(), "xf_language_id".into()];
@@ -7011,6 +7016,34 @@ mod tests {
         let after = hj_pagecache::compute_vary_value(rebuilt.to_str().ok(), &public_vary);
         assert_eq!(
             after, before,
+            "rebuilt Cookie must target the exact stale key"
+        );
+    }
+
+    #[test]
+    fn capsule_refresh_cookie_survives_a_non_ascii_crumb() {
+        let mut cfg = hj_pagecache::StoreConfig::default();
+        cfg.vary_cookies = vec!["xf_style_id".into(), "xf_user".into()];
+        cfg.private_user_cookie = "xf_user".into();
+        let store = hj_pagecache::PageStore::new(cfg);
+        let original = HeaderValue::from_bytes(
+            b"consent=caf\xc3\xa9; xf_style_id=4; xf_user=secret; raw=\xff",
+        )
+        .unwrap();
+        assert!(
+            original.to_str().is_err(),
+            "the header is not visible ASCII"
+        );
+
+        let rebuilt = capsule_public_refresh_cookie(Some(&original), &store)
+            .expect("the public vary pair survives a non-ASCII neighbour");
+        assert_eq!(rebuilt, "xf_style_id=4");
+
+        let public_vary: Vec<String> = vec!["xf_style_id".into()];
+        let lossy = hj_core::header_value_lossy(&original);
+        assert_eq!(
+            hj_pagecache::compute_vary_value(rebuilt.to_str().ok(), &public_vary),
+            hj_pagecache::compute_vary_value(Some(&lossy), &public_vary),
             "rebuilt Cookie must target the exact stale key"
         );
     }

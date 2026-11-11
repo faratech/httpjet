@@ -71,6 +71,39 @@ const H3_HANDSHAKING_CAP_PER_CORE: u32 = 256;
 /// spoofed Initial would hold its handshake slot for the whole idle timeout.
 const H3_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a handshake that failed before completing keeps counting against its
+/// core's handshake slots. A connection that closes itself in its first Initial is
+/// gone within one pump; if its slot were freed with it, a flood of such Initials
+/// (spoofable, each costing a TLS flight) would never reach the Retry threshold.
+const H3_ABORTED_HANDSHAKE_HOLD: Duration = Duration::from_secs(2);
+
+thread_local! {
+    /// Slots of handshakes that failed before completing, with their release time.
+    /// Per core, and bounded by [`H3_HANDSHAKING_CAP_PER_CORE`]: every slot here was
+    /// acquired under that cap.
+    static ABORTED_HANDSHAKE_SLOTS: std::cell::RefCell<std::collections::VecDeque<(Instant, super::ConnectionPermit)>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Keep `slot` counted until [`H3_ABORTED_HANDSHAKE_HOLD`] after `now`.
+fn hold_aborted_handshake_slot(slot: super::ConnectionPermit, now: Instant) {
+    ABORTED_HANDSHAKE_SLOTS.with(|slots| {
+        slots
+            .borrow_mut()
+            .push_back((now + H3_ABORTED_HANDSHAKE_HOLD, slot))
+    });
+}
+
+/// Release the held slots whose time is up. Called before every admission decision.
+fn release_aborted_handshake_slots(now: Instant) {
+    ABORTED_HANDSHAKE_SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        while slots.front().is_some_and(|(until, _)| *until <= now) {
+            slots.pop_front();
+        }
+    });
+}
+
 static H3_RETRIES_SENT: AtomicU64 = AtomicU64::new(0);
 static H3_REFUSED_BUDGET: AtomicU64 = AtomicU64::new(0);
 static H3_REFUSED_HANDSHAKES: AtomicU64 = AtomicU64::new(0);
@@ -150,6 +183,7 @@ fn admit_incoming(
     handshakes: &Arc<AtomicU64>,
 ) -> Admission {
     use std::sync::atomic::Ordering::Relaxed;
+    release_aborted_handshake_slots(now);
     let decision = incoming_decision(
         accepting,
         connection_budget_available(&runtime.active_conns, runtime.max_connections()),
@@ -536,13 +570,24 @@ impl H3EgressBudget {
     }
 
     fn reserve(&self, bytes: usize) -> Option<H3EgressLease> {
-        let bytes = u64::try_from(bytes).ok()?;
+        self.reserve_with_shared(bytes, 0)
+    }
+
+    /// Reserve `owned` bytes that this response alone keeps in memory plus `shared`
+    /// bytes it only references (a cached body that stays alive either way). Both
+    /// count against the connection, so one peer cannot retain an arbitrary amount
+    /// by withholding flow-control credit. Only `owned` counts against the
+    /// server-wide budget: charged for shared bodies, a few stalled connections
+    /// could exhaust it for every transport without holding any memory of their own.
+    fn reserve_with_shared(&self, owned: usize, shared: usize) -> Option<H3EgressLease> {
+        let owned = u64::try_from(owned).ok()?;
+        let total = owned.checked_add(u64::try_from(shared).ok()?)?;
         let mut connection = hj_core::budget::BodyBufferLease::new(self.connection.clone());
-        if !connection.reserve(bytes) {
+        if !connection.reserve(total) {
             return None;
         }
         let mut global = hj_core::budget::BodyBufferLease::new(self.global.clone());
-        if !global.reserve(bytes) {
+        if !global.reserve(owned) {
             return None;
         }
         Some(H3EgressLease {
@@ -755,6 +800,13 @@ struct H3State {
     total_req_bytes: std::rc::Rc<std::cell::Cell<usize>>,
     /// Set once a required-client-certificate decision closes the connection.
     rejected: bool,
+    /// The connection was lost before its handshake completed. quinn can keep such a
+    /// connection in its draining state until the idle timeout (a CONNECTION_CLOSE in
+    /// the first Initial arms no close timer), so the reap removes it itself.
+    discard: bool,
+    /// The endpoint has received this connection's `Drained` event and must get no
+    /// further event for its handle.
+    endpoint_drained: bool,
     /// Accept-time mTLS policy. Established connections retain the decision
     /// from the QUIC configuration that authenticated their handshake.
     client_auth: crate::uring::ClientAuth,
@@ -2528,7 +2580,9 @@ fn service_conn(
             c.handle_timeout(now);
         }
     }
+    let mut endpoint_drained = false;
     while let Some(ev) = conns.get_mut(&hd).and_then(|c| c.poll_endpoint_events()) {
+        endpoint_drained |= ev.is_drained();
         if let Some(cev) = endpoint.handle_event(hd, ev) {
             if let Some(c) = conns.get_mut(&hd) {
                 c.handle_event(cev);
@@ -2536,6 +2590,7 @@ fn service_conn(
         }
     }
     let st = h3.entry(hd).or_default();
+    st.endpoint_drained |= endpoint_drained;
     if !accepting_requests {
         st.draining = true;
     }
@@ -2625,8 +2680,15 @@ fn service_conn(
     if connection_lost {
         cancel_all_dispatched_requests(st);
         reclaim_buffered_requests(st);
+        if !st.connected && !st.rejected {
+            // Lost before the handshake completed and not closed by us: there is
+            // nothing to drain. The reap drops it now and holds its handshake slot
+            // for a moment instead of freeing it here.
+            st.discard = true;
+        } else {
+            st.handshake_slot = None;
+        }
         st.rejected = true;
-        st.handshake_slot = None;
         return;
     }
     if st
@@ -3773,34 +3835,81 @@ async fn pump<const ROUND_LIMIT: usize>(
         deadlines.sync(*hd, connection_deadline(conns, h3, *hd));
     }
     touched.extend(to_drive.iter().copied());
-    // A connection drains only inside a quinn call on its own handle, and this pump made
-    // those calls on the handles it touched; scanning every connection after every event
-    // made each wakeup cost O(connections). A full scan still runs at most once a second.
+    reap_connections(endpoint, conns, h3, deadlines, to_drive, touched);
+}
+
+/// Whether `hd` is finished: quinn drained it, or it was lost before its handshake
+/// completed (see [`H3State::discard`]).
+fn connection_finished(
+    conns: &HashMap<ConnectionHandle, quinn_proto::Connection>,
+    h3: &HashMap<ConnectionHandle, H3State>,
+    hd: &ConnectionHandle,
+) -> bool {
+    conns.get(hd).is_some_and(|c| c.is_drained()) || h3.get(hd).is_some_and(|st| st.discard)
+}
+
+/// Remove finished connections from every index. A connection finishes only inside a
+/// quinn call on its own handle, and the pump made those calls on the handles it
+/// `touched`; scanning every connection after every event made each wakeup cost
+/// O(connections). A full scan still runs at most once a second.
+fn reap_connections(
+    endpoint: &mut Endpoint,
+    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+    h3: &mut HashMap<ConnectionHandle, H3State>,
+    deadlines: &mut ConnectionDeadlineIndex,
+    to_drive: &mut std::collections::HashSet<ConnectionHandle>,
+    mut touched: Vec<ConnectionHandle>,
+) {
+    let now = Instant::now();
     let full = LAST_FULL_REAP.with(|last| {
-        let now = Instant::now();
         let due = now.duration_since(last.get()) >= FULL_REAP_EVERY;
         if due {
             last.set(now);
         }
         due
     });
-    let drained: Vec<ConnectionHandle> = if full {
+    let finished: Vec<ConnectionHandle> = if full {
         conns
-            .iter()
-            .filter(|(_, c)| c.is_drained())
-            .map(|(hd, _)| *hd)
+            .keys()
+            .filter(|hd| connection_finished(conns, h3, hd))
+            .copied()
             .collect()
     } else {
-        touched.retain(|hd| conns.get(hd).is_some_and(|c| c.is_drained()));
+        touched.retain(|hd| connection_finished(conns, h3, hd));
+        touched.sort_unstable_by_key(|hd| hd.0);
+        touched.dedup();
         touched
     };
-    for hd in drained {
-        if let Some(conn) = conns.remove(&hd) {
-            tracing::debug!(connection = hd.0, peer = %conn.remote_address(), stats = ?conn.stats(), "H3 transport final stats");
-            h3.remove(&hd);
-            deadlines.remove(hd);
-            to_drive.remove(&hd);
+    for hd in finished {
+        let Some(mut conn) = conns.remove(&hd) else {
+            continue;
+        };
+        tracing::debug!(connection = hd.0, peer = %conn.remote_address(), stats = ?conn.stats(), "H3 transport final stats");
+        let state = h3.remove(&hd);
+        // The endpoint frees a connection's routing state only on its `Drained` event,
+        // exactly once. A connection killed inside `handle_event` queues that event
+        // after its last service pass, and a discarded one never emits it.
+        if !state.as_ref().is_some_and(|st| st.endpoint_drained) {
+            let mut told = false;
+            while let Some(event) = conn.poll_endpoint_events() {
+                told = event.is_drained();
+                let _ = endpoint.handle_event(hd, event);
+                if told {
+                    break;
+                }
+            }
+            if !told {
+                let _ = endpoint.handle_event(hd, quinn_proto::EndpointEvent::drained());
+            }
         }
+        if let Some(slot) = state
+            .filter(|st| st.discard)
+            .and_then(|mut st| st.handshake_slot.take())
+        {
+            hold_aborted_handshake_slot(slot, now);
+        }
+        deadlines.remove(hd);
+        to_drive.remove(&hd);
     }
 }
 
@@ -4563,12 +4672,26 @@ async fn handle_h3_request(
                 crate::uring::bridge::BridgeBody::Full(b) => {
                     let body = buffered_h3_body(status, body_forbidden, b);
                     let head = encode_h3_headers_frame(status, &headers);
-                    let retained = head.len().saturating_add(if body.is_empty() {
+                    let framed_body = if body.is_empty() {
                         0
                     } else {
                         body.len().saturating_add(16)
-                    });
-                    let lease = match reserve_h3_egress(egress_budget.as_ref(), retained) {
+                    };
+                    // A body with another owner (page cache, static cache, memo, or a
+                    // buffer the bridge already leased) adds no memory of its own.
+                    let (owned, shared) = if body.is_unique() {
+                        (head.len().saturating_add(framed_body), 0)
+                    } else {
+                        (head.len(), framed_body)
+                    };
+                    let reserved = match egress_budget.as_ref() {
+                        Some(budget) => budget
+                            .reserve_with_shared(owned, shared)
+                            .map(Some)
+                            .ok_or(()),
+                        None => Ok(None),
+                    };
+                    let lease = match reserved {
                         Ok(lease) => lease,
                         Err(()) => {
                             if let Some(completion) = completion.take() {
@@ -6397,6 +6520,98 @@ mod h3_codec_tests {
         drop(extra);
     }
 
+    /// (#1229) A cached body is referenced, not copied: it counts against the connection that
+    /// retains it, never against the budget every transport's fresh bodies draw from.
+    #[test]
+    fn a_shared_body_is_charged_to_its_connection_only() {
+        const MIB: usize = 1024 * 1024;
+        let global = Arc::new(hj_core::budget::BodyBufferBudget::new(MIB as u64));
+        let connection = H3EgressBudget::new(global.clone());
+
+        let lease = connection
+            .reserve_with_shared(100, 100 * MIB)
+            .expect("a shared body larger than the server-wide budget still fits");
+        assert_eq!(global.in_flight(), 100);
+        assert!(
+            connection.reserve_with_shared(0, 29 * MIB).is_none(),
+            "the connection cap still bounds what one peer can retain"
+        );
+        drop(lease);
+        assert_eq!(global.in_flight(), 0);
+
+        let owned = connection
+            .reserve_with_shared(MIB, 0)
+            .expect("fits exactly");
+        assert_eq!(global.in_flight(), MIB as u64);
+        assert!(connection.reserve_with_shared(1, 0).is_none());
+        drop(owned);
+    }
+
+    /// End to end: a response whose body another owner keeps alive leaves the
+    /// server-wide budget untouched; a body of its own is charged there.
+    #[tokio::test]
+    async fn h3_full_responses_charge_the_server_budget_only_for_owned_bodies() {
+        let cached = Bytes::from(vec![b'c'; 8 * 1024]);
+        let served = cached.clone();
+        let shared_bridge =
+            crate::uring::bridge::spawn_on_current(2, move |_req, _ctx: BridgeCtx| {
+                let body = served.clone();
+                async move { http::Response::new(hj_core::Body::Full(body)) }
+            });
+        let owned_bridge =
+            crate::uring::bridge::spawn_on_current(2, |_req, _ctx: BridgeCtx| async {
+                http::Response::new(hj_core::Body::Full(Bytes::from(vec![b'o'; 8 * 1024])))
+            });
+        let mut in_flight = Vec::new();
+        for bridge in [&shared_bridge, &owned_bridge] {
+            let global = Arc::new(hj_core::budget::BodyBufferBudget::new(1 << 20));
+            let egress = H3EgressBudget::new(global.clone());
+            let fields = literal_qpack_fields(&[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"a.test"),
+                (b":path", b"/"),
+            ]);
+            let mut wire = Vec::new();
+            write_varint(&mut wire, 1);
+            write_varint(&mut wire, fields.len() as u64);
+            wire.extend(fields);
+            let (frames, body) = received_request(&wire);
+            let outcome = handle_h3_request(
+                frames,
+                body,
+                None,
+                false,
+                None,
+                None,
+                "127.0.0.1:32000".parse().unwrap(),
+                "127.0.0.1:8443".parse().unwrap(),
+                bridge,
+                crate::uring::ClientAuth::None,
+                H3RequestLimits::new(4096, 4096),
+                None,
+                None,
+                Some(egress.clone()),
+                Default::default(),
+            )
+            .await;
+            in_flight.push((global.in_flight(), egress.connection.in_flight()));
+            drop(outcome);
+            assert_eq!(
+                global.in_flight(),
+                0,
+                "the lease is released with the response"
+            );
+        }
+        let (shared_global, shared_connection) = in_flight[0];
+        let (owned_global, owned_connection) = in_flight[1];
+        assert!(shared_global < 1024, "only the head: {shared_global}");
+        assert!(shared_connection >= 8 * 1024, "{shared_connection}");
+        assert!(owned_global >= 8 * 1024, "{owned_global}");
+        assert_eq!(owned_global, owned_connection);
+        drop(cached);
+    }
+
     #[tokio::test]
     async fn bridged_h3_requests_share_their_connections_response_budget() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -7690,6 +7905,22 @@ mod admission_tests {
             )
         }
 
+        fn accepted(
+            &mut self,
+            from: SocketAddr,
+            datagram: &[u8],
+            now: Instant,
+        ) -> (ConnectionHandle, quinn_proto::Connection, H3State) {
+            let incoming = self.incoming(from, datagram, now);
+            let Admission::Accepted(hd, conn, slot) = self.admit(incoming, now) else {
+                panic!("the Initial must be accepted");
+            };
+            let state = self
+                .runtime
+                .accepted_state_with_policy(slot, now, 1, &self.policy());
+            (hd, conn, state)
+        }
+
         /// Exchange datagrams until the server reports the handshake outcome.
         fn drive_handshake(
             &mut self,
@@ -7818,6 +8049,136 @@ mod admission_tests {
         hd: ConnectionHandle,
         client_handle: ConnectionHandle,
         client: quinn_proto::Connection,
+    }
+
+    /// (#1228) A first Initial that carries CONNECTION_CLOSE leaves quinn's connection in its
+    /// draining state with no close timer: only the 60 s idle timeout would remove it,
+    /// while its handshake slot used to be freed at once. A flood of such spoofable
+    /// datagrams then grew memory without ever reaching the Retry threshold.
+    #[test]
+    fn a_handshake_closed_in_its_first_packet_is_dropped_and_still_counts() {
+        let mut h = Harness::new(0);
+        let now = Instant::now();
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        let (_, mut client) = h.connect(now);
+        client.close(now, 0u32.into(), Bytes::new());
+        let datagram = Harness::first_datagram(&mut client, now);
+
+        let (hd, conn, state) = h.accepted(spoofed(1), &datagram, now);
+        let mut conns = HashMap::from([(hd, conn)]);
+        let mut h3 = HashMap::from([(hd, state)]);
+        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        assert!(
+            !conns[&hd].is_drained(),
+            "precondition: quinn would keep this connection until its idle timeout"
+        );
+        assert!(h3[&hd].discard);
+        assert_eq!(
+            h.handshakes.load(Relaxed),
+            1,
+            "the slot is not freed with the event"
+        );
+
+        let mut deadlines = ConnectionDeadlineIndex::default();
+        let mut to_drive = std::collections::HashSet::from([hd]);
+        reap_connections(
+            &mut h.server,
+            &mut conns,
+            &mut h3,
+            &mut deadlines,
+            &mut to_drive,
+            vec![hd, hd],
+        );
+        assert!(conns.is_empty() && h3.is_empty() && to_drive.is_empty());
+        assert_eq!(h.server.open_connections(), 0, "the endpoint forgot it too");
+
+        // The aborted handshake keeps pressing on admission, then lets go.
+        assert_eq!(h.handshakes.load(Relaxed), 1);
+        release_aborted_handshake_slots(now + H3_ABORTED_HANDSHAKE_HOLD - Duration::from_millis(1));
+        assert_eq!(h.handshakes.load(Relaxed), 1);
+        release_aborted_handshake_slots(Instant::now() + H3_ABORTED_HANDSHAKE_HOLD);
+        assert_eq!(h.handshakes.load(Relaxed), 0);
+    }
+
+    /// (#1230) A connection that drains outside a service pass still has its `Drained`
+    /// event queued; the reap must forward it, or the endpoint keeps the connection's
+    /// routing state for good.
+    #[test]
+    fn a_connection_drained_after_its_last_service_pass_is_released_by_the_endpoint() {
+        let mut h = Harness::new(0);
+        let now = Instant::now();
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        let (_, mut client) = h.connect(now);
+        let datagram = Harness::first_datagram(&mut client, now);
+        let (hd, conn, state) = h.accepted(spoofed(2), &datagram, now);
+        let mut conns = HashMap::from([(hd, conn)]);
+        let mut h3 = HashMap::from([(hd, state)]);
+        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        assert_eq!(h.server.open_connections(), 1);
+
+        // The idle timer fires with no service pass afterwards.
+        let later = now + Duration::from_secs(120);
+        conns.get_mut(&hd).unwrap().handle_timeout(later);
+        assert!(conns[&hd].is_drained());
+        assert!(!h3[&hd].endpoint_drained);
+
+        reap_connections(
+            &mut h.server,
+            &mut conns,
+            &mut h3,
+            &mut ConnectionDeadlineIndex::default(),
+            &mut std::collections::HashSet::new(),
+            vec![hd],
+        );
+        assert!(conns.is_empty());
+        assert_eq!(h.server.open_connections(), 0);
+    }
+
+    /// A flood of self-closing Initials from spoofed sources reaches the Retry
+    /// threshold instead of being accepted without limit, and leaves nothing behind.
+    #[test]
+    fn a_flood_of_self_closing_initials_draws_retries_and_holds_no_connections() {
+        let mut h = Harness::new(0);
+        let now = Instant::now();
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        let mut conns = HashMap::new();
+        let mut h3 = HashMap::new();
+        let mut deadlines = ConnectionDeadlineIndex::default();
+        let mut to_drive = std::collections::HashSet::new();
+        let (mut accepted, mut retried) = (0u64, 0u64);
+        for i in 0..200u16 {
+            let (_, mut client) = h.connect(now);
+            client.close(now, 0u32.into(), Bytes::new());
+            let datagram = Harness::first_datagram(&mut client, now);
+            let incoming = h.incoming(spoofed(i), &datagram, now);
+            match h.admit(incoming, now) {
+                Admission::Accepted(hd, conn, slot) => {
+                    accepted += 1;
+                    let state = h
+                        .runtime
+                        .accepted_state_with_policy(slot, now, 1, &h.policy());
+                    conns.insert(hd, conn);
+                    h3.insert(hd, state);
+                    service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+                    reap_connections(
+                        &mut h.server,
+                        &mut conns,
+                        &mut h3,
+                        &mut deadlines,
+                        &mut to_drive,
+                        vec![hd],
+                    );
+                }
+                Admission::Transmit(_) => retried += 1,
+                Admission::Dropped => panic!("an Initial is answered or accepted"),
+            }
+        }
+        assert_eq!(accepted, H3_RETRY_THRESHOLD_PER_CORE);
+        assert_eq!(retried, 200 - H3_RETRY_THRESHOLD_PER_CORE);
+        assert!(conns.is_empty() && h3.is_empty());
+        assert_eq!(h.server.open_connections(), 0);
+        release_aborted_handshake_slots(Instant::now() + H3_ABORTED_HANDSHAKE_HOLD);
+        assert_eq!(h.handshakes.load(Relaxed), 0);
     }
 
     #[test]

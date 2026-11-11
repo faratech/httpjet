@@ -13,7 +13,9 @@ RuntimeDirectory=httpjet
 RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 ExecStart=/usr/bin/httpjet --root /etc/httpjet/litespeed lsphp --php-socket /run/httpjet/lsphp.sock --php-children 32 --control-socket /run/httpjet/lsphp-control.sock --generation-file /run/httpjet/lsphp.generation
-ExecReload=/usr/bin/httpjet lsphp-reload --control-socket /run/httpjet/lsphp-control.sock --timeout-secs 90
+# The control socket accepts only uid 0 (PHP shares the pool's account), so the
+# reload client needs "+" to run as root instead of User=.
+ExecReload=+/usr/bin/httpjet lsphp-reload --control-socket /run/httpjet/lsphp-control.sock --timeout-secs 90
 Restart=on-failure
 RestartSec=2
 KillMode=mixed

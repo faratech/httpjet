@@ -834,12 +834,12 @@ fn apply_rule(
     // Prefilter fast-reject: if the multi-pattern set says this rule's pattern
     // did not match the (initial) target, skip the per-rule regex entirely. Skipped
     // for total-match rules (they match every target, so the lookup is pure waste).
-    if state.prefilter_valid && rule.match_total.is_none() {
-        if let (Some(idx), Some(h), Some(pf)) = (rule.prefilter_idx, hits, rs.prefilter.as_ref()) {
-            if !pf.contains(h, idx) {
-                return None;
-            }
-        }
+    if state.prefilter_valid
+        && rule.match_total.is_none()
+        && let (Some(idx), Some(h), Some(pf)) = (rule.prefilter_idx, hits, rs.prefilter.get())
+        && !pf.contains(h, idx)
+    {
+        return None;
     }
     // Fast reject before the regex: an anchored, case-sensitive, non-negated pattern
     // can only match a target that begins with its literal prefix. `literal_prefix`

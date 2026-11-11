@@ -287,21 +287,18 @@ pub fn decode_bytes_sized(
     let mut out = Vec::with_capacity(expected.min(cap));
     match enc {
         Encoding::Gzip => {
-            let mut decoder = flate2::read::GzDecoder::new(input).take(read_cap as u64);
+            // RFC 1952 allows concatenated members; `GzDecoder` stops after the first
+            // and ignores whatever follows, so a multi-member body decoded short and
+            // the short identity was cached. `MultiGzDecoder` reads every member and
+            // fails on trailing bytes that are not one.
+            let mut decoder = flate2::read::MultiGzDecoder::new(input).take(read_cap as u64);
             decoder.read_to_end(&mut out).ok()?;
             if out.len() > cap {
                 return None;
             }
             Some(out)
         }
-        Encoding::Brotli => {
-            let mut decoder = brotli::Decompressor::new(input, 4096).take(read_cap as u64);
-            decoder.read_to_end(&mut out).ok()?;
-            if out.len() > cap {
-                return None;
-            }
-            Some(out)
-        }
+        Encoding::Brotli => brotli_decode_exact(input, cap, out),
         Encoding::Zstd => {
             // zstd::stream::read::Decoder implements Read; wrap with take() so
             // the decompressor never writes more than MAX_DECODE bytes.
@@ -317,6 +314,54 @@ pub fn decode_bytes_sized(
                 return None;
             }
             Some(out)
+        }
+    }
+}
+
+/// Decode exactly one complete brotli stream into `out` (empty, pre-sized by the
+/// caller). `None` for a malformed or truncated stream, for more than `cap` output
+/// bytes, and for input left over after the stream's end: the `Read` adapter stops at
+/// the end of the stream and cannot report unread input.
+fn brotli_decode_exact(input: &[u8], cap: usize, mut out: Vec<u8>) -> Option<Vec<u8>> {
+    use brotli::enc::StandardAlloc;
+    use brotli::{BrotliDecompressStream, BrotliResult, BrotliState};
+
+    let limit = cap.saturating_add(1);
+    let mut state = BrotliState::new(
+        StandardAlloc::default(),
+        StandardAlloc::default(),
+        StandardAlloc::default(),
+    );
+    out.resize(out.capacity().max(4096).min(limit), 0);
+    let (mut available_in, mut input_offset) = (input.len(), 0);
+    let (mut filled, mut total_out) = (0, 0);
+    loop {
+        let mut available_out = out.len() - filled;
+        match BrotliDecompressStream(
+            &mut available_in,
+            &mut input_offset,
+            input,
+            &mut available_out,
+            &mut filled,
+            &mut out,
+            &mut total_out,
+            &mut state,
+        ) {
+            BrotliResult::ResultSuccess => {
+                if filled > cap || available_in != 0 {
+                    return None;
+                }
+                out.truncate(filled);
+                return Some(out);
+            }
+            BrotliResult::NeedsMoreOutput => {
+                if out.len() >= limit {
+                    return None;
+                }
+                let grown = out.len().saturating_mul(2).min(limit);
+                out.resize(grown, 0);
+            }
+            BrotliResult::NeedsMoreInput | BrotliResult::ResultFailure => return None,
         }
     }
 }
@@ -544,6 +589,57 @@ mod tests {
         let small = decode_bytes_sized(Encoding::Zstd, &z, MAX_DECODE, 16).unwrap();
         assert_eq!(small, identity);
         assert!(decode_bytes_sized(Encoding::Zstd, &z, 1000, identity.len()).is_none());
+    }
+
+    #[test]
+    fn gzip_decode_reads_every_member_and_rejects_trailing_bytes() {
+        let mut two = gzip_bytes_level(b"hello ", 6);
+        two.extend_from_slice(&gzip_bytes_level(b"world", 6));
+        assert_eq!(
+            decode_bytes(Encoding::Gzip, &two).as_deref(),
+            Some(&b"hello world"[..]),
+            "a second member must not be dropped"
+        );
+
+        let mut trailing = gzip_bytes_level(b"clean-body", 6);
+        trailing.extend_from_slice(b"GARBAGE");
+        assert_eq!(decode_bytes(Encoding::Gzip, &trailing), None);
+
+        // The output bound covers the members together.
+        assert_eq!(
+            decode_bytes_bounded(Encoding::Gzip, &two, 11).map(|b| b.len()),
+            Some(11)
+        );
+        assert_eq!(decode_bytes_bounded(Encoding::Gzip, &two, 10), None);
+    }
+
+    #[test]
+    fn brotli_decode_is_exact_and_rejects_trailing_bytes() {
+        let identity = b"<p>brotli body</p>".repeat(3000);
+        let br = brotli_bytes(&identity, 5, 22);
+        assert_eq!(
+            decode_bytes(Encoding::Brotli, &br).as_deref(),
+            Some(&identity[..])
+        );
+        // A known length decodes in one pass; a wrong guess only grows.
+        for expected in [identity.len(), 16, identity.len() * 2] {
+            assert_eq!(
+                decode_bytes_sized(Encoding::Brotli, &br, MAX_DECODE, expected).as_deref(),
+                Some(&identity[..])
+            );
+        }
+        let exact = identity.len() as u64;
+        assert!(decode_bytes_bounded(Encoding::Brotli, &br, exact).is_some());
+        assert!(decode_bytes_bounded(Encoding::Brotli, &br, exact - 1).is_none());
+
+        let mut trailing = br.clone();
+        trailing.extend_from_slice(b"GARBAGE");
+        assert_eq!(decode_bytes(Encoding::Brotli, &trailing), None);
+        let mut doubled = br.clone();
+        doubled.extend_from_slice(&br);
+        assert_eq!(decode_bytes(Encoding::Brotli, &doubled), None);
+        assert_eq!(decode_bytes(Encoding::Brotli, &br[..br.len() - 1]), None);
+        assert_eq!(decode_bytes(Encoding::Brotli, b""), None);
     }
 
     #[test]
@@ -913,6 +1009,20 @@ mod tests {
         assert_eq!(
             negotiate_with("gzip", &[Encoding::Zstd, Encoding::Brotli]),
             None
+        );
+    }
+
+    #[test]
+    fn refusing_identity_negotiates_no_coding() {
+        // `None` means "send the body uncoded": a refusal of identity is not turned
+        // into a 406 (see the crate docs).
+        for ae in ["identity;q=0", "gzip;q=0, identity;q=0, *;q=0", "*;q=0"] {
+            assert_eq!(negotiate_with(ae, DEFAULT_PRIORITY), None, "{ae}");
+        }
+        // Refusing identity does not refuse a coding offered beside it.
+        assert_eq!(
+            negotiate_with("identity;q=0, gzip", DEFAULT_PRIORITY),
+            Some(Encoding::Gzip)
         );
     }
 }

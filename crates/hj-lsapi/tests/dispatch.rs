@@ -495,6 +495,66 @@ async fn streamed_response_content_length_caps_overflow_and_aborts_truncation() 
     assert_eq!(pool.idle_count(), 0);
 }
 
+/// (#1197) A frame that may not precede `RESP_HEADER`, followed by an otherwise valid
+/// response: the request must fail rather than deliver a body missing that frame.
+async fn assert_out_of_order_packet_is_bad_gateway(ptype: PacketType, tag: &str) {
+    let path = tmp_sock(tag);
+    let listener = UnixListener::bind(&path).unwrap();
+    let server_task = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let (begin_type, _) = read_packet(&mut s).await.unwrap();
+        assert_eq!(begin_type, PacketType::BeginRequest as u8);
+        let mut out = BytesMut::new();
+        put_packet(&mut out, ptype, b"chunk-1 ");
+        put_packet(
+            &mut out,
+            PacketType::RespHeader,
+            &resp_header_body(200, &[]),
+        );
+        put_packet(&mut out, PacketType::RespStream, b"chunk-2");
+        put_packet(&mut out, PacketType::RespEnd, b"");
+        s.write_all(&out).await.unwrap();
+        s.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    });
+
+    let pool = Arc::new(LsapiPool::new(&path, 1, Duration::from_secs(2)));
+    let handler = Lsapi::new(pool.clone()).read_timeout(Duration::from_secs(2));
+    let req = http::Request::builder()
+        .method("GET")
+        .uri("/index.php")
+        .header("Host", "test")
+        .body(empty_incoming())
+        .unwrap();
+    let mut c = ctx("/web/test");
+
+    let result = tokio::time::timeout(Duration::from_millis(250), handler.handle(&mut c, req))
+        .await
+        .expect("an out-of-order packet must fail immediately");
+    match result {
+        Err(HandlerError::BadGateway(message)) => {
+            assert!(message.contains("before headers"), "{message}");
+        }
+        Err(other) => panic!("expected BadGateway, got {other:?}"),
+        Ok(_) => panic!("a body missing its first frame must not be served"),
+    }
+    assert_eq!(pool.idle_count(), 0, "failed connection must not re-pool");
+
+    server_task.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn resp_stream_before_resp_header_is_bad_gateway() {
+    assert_out_of_order_packet_is_bad_gateway(PacketType::RespStream, "early-stream").await;
+}
+
+#[tokio::test]
+async fn request_side_packet_before_resp_header_is_bad_gateway() {
+    assert_out_of_order_packet_is_bad_gateway(PacketType::BeginRequest, "early-begin").await;
+    assert_out_of_order_packet_is_bad_gateway(PacketType::AbortRequest, "early-abort").await;
+}
+
 async fn assert_pre_header_terminator_is_bad_gateway(ptype: PacketType, tag: &str) {
     let path = tmp_sock(tag);
     let listener = UnixListener::bind(&path).unwrap();

@@ -70,6 +70,26 @@ def atomic_json(path, value):
         if os.path.exists(temporary):
             os.unlink(temporary)
 
+def read_marker(path, uid, private=False):
+    """Return a readiness marker's first 64 bytes, or None when none exists.
+
+    The service account owns the marker's directory and can replace the path at
+    any moment, so the open never follows a symlink or waits on a FIFO and every
+    check runs on the opened descriptor. Anything but a singly linked regular
+    file owned by `uid` (and, with `private`, closed to group/other) is an OSError.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_nlink != 1 or (private and info.st_mode & 0o077):
+            raise PermissionError(errno.EPERM, "unsafe readiness marker", os.fspath(path))
+        return os.read(descriptor, 64)
+    finally:
+        os.close(descriptor)
+
 def checked_url(base, relative):
     parsed = urllib.parse.urlsplit(base)
     if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
@@ -382,10 +402,8 @@ class Manager:
 
     def ready_identity(self, state, after=0):
         try:
-            descriptor = os.open(self.ready, os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(descriptor, "rb") as stream:
-                info, body = os.fstat(stream.fileno()), stream.read(64)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != state["uid"] or info.st_nlink != 1 or info.st_mode & 0o077 or not re.fullmatch(rb"[1-9][0-9]*\n", body):
+            body = read_marker(self.ready, state["uid"], private=True)
+            if body is None or not re.fullmatch(rb"[1-9][0-9]*\n", body):
                 return None
             identity = self.process(int(body), state)
             if not identity or identity["started"] < after:
@@ -411,11 +429,11 @@ class Manager:
                 raise InstallError("unsafe service directory: " + str(directory))
             os.chown(directory, state["uid"], state["gid"])
             directory.chmod(0o750)
-        if self.ready.exists() or self.ready.is_symlink():
-            info = self.ready.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != state["uid"] or info.st_nlink != 1:
-                raise InstallError("refusing an unowned readiness marker")
-            body = self.ready.read_bytes()
+        try:
+            body = read_marker(self.ready, state["uid"])
+        except OSError as error:
+            raise InstallError("refusing an unowned readiness marker") from error
+        if body is not None:
             if not re.fullmatch(rb"[1-9][0-9]*\n", body) or self.path("/proc/" + body.decode().strip()).exists():
                 raise InstallError("readiness marker is live or malformed; stop the recorded service first")
             self.ready.unlink()
@@ -878,11 +896,11 @@ def launch():
     if not isinstance(uid, int) or uid <= 0 or not isinstance(gid, int) or gid <= 0:
         raise InstallError("service identity must be non-root")
     ready = Path("/run/httpjet/ready")
-    if ready.exists() or ready.is_symlink():
-        old = ready.lstat()
-        if not stat.S_ISREG(old.st_mode) or old.st_uid != uid or old.st_nlink != 1:
-            raise InstallError("unowned readiness marker")
-        body = ready.read_bytes()
+    try:
+        body = read_marker(ready, uid)
+    except OSError as error:
+        raise InstallError("unowned readiness marker") from error
+    if body is not None:
         if not re.fullmatch(rb"[1-9][0-9]*\n", body) or Path("/proc/" + body.decode().strip()).exists():
             raise InstallError("readiness marker is live or malformed")
         ready.unlink()

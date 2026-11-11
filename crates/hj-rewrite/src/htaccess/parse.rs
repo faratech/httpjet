@@ -20,6 +20,28 @@ impl Htaccess {
     /// directives are treated as no-ops (but `RewriteRule ... [E=...]` inside
     /// their blocks is still parsed into `rules`).
     pub fn parse(text: &str) -> Result<Htaccess, RewriteError> {
+        Self::parse_with(text, false)
+    }
+
+    /// [`parse`](Self::parse) without building the rewrite prefilter, which is most of
+    /// the cost of parsing a long rule chain. The caller builds it afterwards with
+    /// [`build_prefilter`](Self::build_prefilter), off the request path; until then
+    /// the rules evaluate unfiltered, with the same results.
+    pub fn parse_deferred(text: &str) -> Result<Htaccess, RewriteError> {
+        Self::parse_with(text, true)
+    }
+
+    /// Build the rewrite prefilter left out by [`parse_deferred`](Self::parse_deferred).
+    pub fn build_prefilter(&self) {
+        self.rules.build_prefilter();
+    }
+
+    /// Whether the rewrite prefilter still waits for [`build_prefilter`](Self::build_prefilter).
+    pub fn prefilter_pending(&self) -> bool {
+        self.rules.prefilter_pending()
+    }
+
+    fn parse_with(text: &str, defer_prefilter: bool) -> Result<Htaccess, RewriteError> {
         // Apache skips a leading UTF-8 BOM; kept, it would hide the first directive.
         let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         let mut h = Htaccess::default();
@@ -437,7 +459,11 @@ impl Htaccess {
         h.header_index = build_header_index(&h.headers);
         finish_set_env_if(&mut h);
 
-        h.rules = RuleSet::parse(&rewrite_stream)?;
+        h.rules = if defer_prefilter {
+            RuleSet::parse_deferred(&rewrite_stream)?
+        } else {
+            RuleSet::parse(&rewrite_stream)?
+        };
         classify_rules_for_memo(&mut h.memo, &h.rules);
         Ok(h)
     }

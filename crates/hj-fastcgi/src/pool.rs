@@ -145,12 +145,20 @@ impl FastCgiPool {
     }
 
     pub async fn acquire(&self) -> Result<PooledConnection, PoolError> {
-        tokio::time::timeout(self.0.acquire_timeout, self.acquire_inner())
+        tokio::time::timeout(self.0.acquire_timeout, self.acquire_inner(true))
             .await
             .map_err(|_| PoolError::Timeout)?
     }
 
-    async fn acquire_inner(&self) -> Result<PooledConnection, PoolError> {
+    /// A newly dialed connection, never an idle one: the replay of a request that a
+    /// reused connection dropped unanswered must not land on another stale socket.
+    pub(crate) async fn acquire_fresh(&self) -> Result<PooledConnection, PoolError> {
+        tokio::time::timeout(self.0.acquire_timeout, self.acquire_inner(false))
+            .await
+            .map_err(|_| PoolError::Timeout)?
+    }
+
+    async fn acquire_inner(&self, reuse_idle: bool) -> Result<PooledConnection, PoolError> {
         loop {
             let notified = self.0.changed.notified();
             let reserve = {
@@ -164,16 +172,22 @@ impl FastCgiPool {
                     state.idle.pop_front();
                     state.open -= 1;
                 }
-                while let Some(idle) = state.idle.pop_back() {
+                while reuse_idle && let Some(idle) = state.idle.pop_back() {
                     if idle.stream.is_healthy() {
                         return Ok(PooledConnection {
                             inner: self.0.clone(),
                             stream: Some(idle.stream),
                             reusable: false,
+                            reused: true,
                         });
                     }
                     // #629: peer closed while idle — discard and keep looking
                     // (falls through to a fresh dial when no idle survives).
+                    state.open -= 1;
+                }
+                // A fresh dial at the cap gives up the oldest idle connection for its slot.
+                if !reuse_idle && state.open >= self.0.max_open && state.idle.pop_front().is_some()
+                {
                     state.open -= 1;
                 }
                 if state.open < self.0.max_open {
@@ -206,6 +220,7 @@ impl FastCgiPool {
                             inner: self.0.clone(),
                             stream: Some(stream),
                             reusable: false,
+                            reused: false,
                         })
                     }
                     Err(_) => Err(PoolError::Connect),
@@ -235,12 +250,18 @@ pub struct PooledConnection {
     inner: Arc<Inner>,
     stream: Option<Stream>,
     reusable: bool,
+    /// Taken from the idle list rather than dialed for this request.
+    reused: bool,
 }
 
 impl PooledConnection {
     /// Mark this connection reusable only after a matching clean END_REQUEST.
     pub(crate) fn mark_reusable(&mut self) {
         self.reusable = true;
+    }
+
+    pub(crate) fn was_reused(&self) -> bool {
+        self.reused
     }
 }
 

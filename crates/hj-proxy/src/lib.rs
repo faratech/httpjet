@@ -544,6 +544,10 @@ impl Proxy {
         // not build_forward_request which replays the inbound body verbatim. A client sending an
         // upgrade WITH a body would otherwise produce a non-conformant upstream handshake.
         let out_req = Self::build_upstream_upgrade_request(ctx, req, target)?;
+        let expected_accept = out_req
+            .headers()
+            .get(SEC_WEBSOCKET_KEY)
+            .map(|key| websocket_accept(key.as_bytes()));
 
         let io = hyper_util::rt::TokioIo::new(stream);
         let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
@@ -572,6 +576,16 @@ impl Proxy {
             r.response_received();
         }
         if status == http::StatusCode::SWITCHING_PROTOCOLS {
+            // A 101 only starts the byte relay when it is the WebSocket handshake the
+            // client asked for (RFC 6455 §4.1): an upstream that switched to another
+            // protocol, or never saw the key, must not be relayed as a WebSocket.
+            if !is_websocket_handshake_response(upstream_resp.headers(), expected_accept.as_deref())
+            {
+                driver.abort();
+                return Err(HandlerError::BadGateway(
+                    "ws upstream answered 101 without a valid websocket handshake".into(),
+                ));
+            }
             // Capture the upstream's exact 101 head (incl. Sec-WebSocket-Accept,
             // Sec-WebSocket-Protocol/-Extensions) BEFORE consuming the response
             // for the upgrade — the client must receive these verbatim.
@@ -607,13 +621,26 @@ impl Proxy {
         // Non-101: surface the upstream's response (buffered) to the client.
         drop(driver);
         let mut resp = into_streaming_response(upstream_resp, None);
-        if let Body::Stream(body) = std::mem::replace(resp.body_mut(), Body::Empty) {
-            *resp.body_mut() = Body::Stream(ReservedBody { body, reservation }.boxed());
+        // The rejection body is still in flight when the caller returns the response and
+        // drops the rest of the upgrade, so the maxConns hold (reservation or plain
+        // permit) rides in the body until it ends, as `forward` does.
+        match std::mem::replace(resp.body_mut(), Body::Empty) {
+            Body::Stream(body) => {
+                *resp.body_mut() = Body::Stream(
+                    ReservedBody {
+                        body,
+                        reservation,
+                        permit: ws_permit,
+                    }
+                    .boxed(),
+                );
+            }
+            other => *resp.body_mut() = other,
         }
         headers::sanitize_response_headers(resp.headers_mut(), false);
         Ok(WebSocketUpgrade {
             reservation: None,
-            permit: ws_permit,
+            permit: None,
             response: resp,
             upstream: UpstreamUpgraded::Rejected(status),
         })
@@ -724,6 +751,8 @@ impl UpstreamUpgraded {
 struct ReservedBody {
     body: StreamBody,
     reservation: Option<RequestReservation>,
+    /// maxConns permit of a default (non-load-balanced) target, which has no reservation.
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl HttpBody for ReservedBody {
     type Data = Bytes;
@@ -735,6 +764,7 @@ impl HttpBody for ReservedBody {
         let result = std::pin::Pin::new(&mut self.body).poll_frame(cx);
         if matches!(result, std::task::Poll::Ready(None | Some(Err(_)))) {
             self.reservation.take();
+            self.permit.take();
         }
         result
     }
@@ -744,6 +774,39 @@ impl HttpBody for ReservedBody {
     fn size_hint(&self) -> SizeHint {
         self.body.size_hint()
     }
+}
+
+const SEC_WEBSOCKET_KEY: &str = "sec-websocket-key";
+const SEC_WEBSOCKET_ACCEPT: &str = "sec-websocket-accept";
+
+/// RFC 6455 §4.2.2: the `Sec-WebSocket-Accept` value a server returns for `key`.
+fn websocket_accept(key: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(key.trim_ascii());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+/// Whether a `101` head completes the WebSocket handshake for the key we sent: an
+/// `Upgrade: websocket` token and the matching accept value. `expected_accept` is
+/// `None` when the request carried no key, which no valid handshake can answer.
+fn is_websocket_handshake_response(
+    headers: &http::HeaderMap,
+    expected_accept: Option<&str>,
+) -> bool {
+    let upgrades_to_websocket = headers.get_all(http::header::UPGRADE).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|token| token.trim_ascii().eq_ignore_ascii_case(b"websocket"))
+    });
+    let accept_matches = match (expected_accept, headers.get(SEC_WEBSOCKET_ACCEPT)) {
+        (Some(expected), Some(got)) => got.as_bytes().trim_ascii() == expected.as_bytes(),
+        _ => false,
+    };
+    upgrades_to_websocket && accept_matches
 }
 
 /// Compute the upstream request URI: use the target's explicit path-and-query
@@ -1749,7 +1812,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        // Raw upstream: answer every handshake with a plain 200 (non-101).
+        // Raw upstream: complete every handshake, then hold the socket open.
         let server = tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else {
@@ -1764,9 +1827,8 @@ mod tests {
                             Ok(n) => used += n,
                         }
                     }
-                    let _ = sock
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                        .await;
+                    let _ = sock.write_all(WS_101_FOR_SAMPLE_KEY).await;
+                    let _ = sock.read(&mut buf).await;
                 });
             }
         });
@@ -1793,6 +1855,7 @@ mod tests {
             .proxy_websocket(&c, make_request(), &target)
             .await
             .expect("first upgrade attempt completes");
+        assert!(first.is_switching());
         assert!(first.permit.is_some(), "default target carries a permit");
         // While the first permit is held, maxConns=1 refuses a second attempt.
         let second = proxy.proxy_websocket(&c, make_request(), &target).await;
@@ -1801,6 +1864,180 @@ mod tests {
             "second attempt must be refused at maxConns"
         );
         drop(first);
+        server.abort();
+    }
+
+    /// RFC 6455 §1.3: the accept value for the key `dGhlIHNhbXBsZSBub25jZQ==`.
+    const WS_101_FOR_SAMPLE_KEY: &[u8] = b"HTTP/1.1 101 Switching Protocols\r\n\
+        Upgrade: websocket\r\nConnection: Upgrade\r\n\
+        Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+
+    fn sample_ws_request() -> Request {
+        let body: hj_core::IncomingBody = Empty::<Bytes>::new()
+            .map_err(|e| Box::new(e) as BoxError)
+            .boxed();
+        http::Request::builder()
+            .uri("/socket")
+            .header(HOST, "client.example")
+            .header(http::header::CONNECTION, "Upgrade")
+            .header(http::header::UPGRADE, "websocket")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(body)
+            .unwrap()
+    }
+
+    /// One-shot raw upstream: reads a request head, writes `response`, then holds the
+    /// socket until the peer closes it.
+    async fn raw_upstream_once(response: &'static [u8]) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let mut used = 0;
+            while !buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf[used..]).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => used += n,
+                }
+            }
+            let _ = sock.write_all(response).await;
+            let _ = sock.read(&mut buf).await;
+        });
+        addr
+    }
+
+    #[test]
+    fn websocket_accept_matches_the_rfc_example() {
+        assert_eq!(
+            websocket_accept(b" dGhlIHNhbXBsZSBub25jZQ== "),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+    }
+
+    /// (#1193) A 101 is relayed as a WebSocket only when it answers the key we sent.
+    #[tokio::test]
+    async fn websocket_101_must_complete_the_handshake() {
+        let c = ctx("192.0.2.1", false);
+        let attempt = |response: &'static [u8]| {
+            let c = &c;
+            async move {
+                let addr = raw_upstream_once(response).await;
+                let mut target = ProxyTarget::parse_url(&format!("http://{addr}/socket")).unwrap();
+                target.connect_timeout = Some(Duration::from_millis(500));
+                Proxy::new()
+                    .proxy_websocket(c, sample_ws_request(), &target)
+                    .await
+            }
+        };
+
+        let good = attempt(WS_101_FOR_SAMPLE_KEY)
+            .await
+            .expect("valid handshake");
+        assert!(good.is_switching());
+        assert_eq!(
+            good.response.headers().get("sec-websocket-accept").unwrap(),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
+
+        for (what, response) in [
+            (
+                "wrong accept",
+                &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                   Connection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n"[..],
+            ),
+            (
+                "missing accept",
+                &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                   Connection: Upgrade\r\n\r\n"[..],
+            ),
+            (
+                "another protocol",
+                &b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: h2c\r\n\
+                   Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"[..],
+            ),
+        ] {
+            match attempt(response).await {
+                Err(HandlerError::BadGateway(_)) => {}
+                Err(other) => panic!("{what}: expected BadGateway, got {other:?}"),
+                Ok(_) => panic!("{what}: an invalid 101 must not start a relay"),
+            }
+        }
+    }
+
+    /// (#1194) The caller returns a rejected upgrade's response and drops the rest, so
+    /// the maxConns permit must live in the body until it ends.
+    #[tokio::test]
+    async fn rejected_websocket_upgrade_holds_max_conns_until_its_body_ends() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let server = {
+            let finish = finish.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let finish = finish.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        let mut used = 0;
+                        while !buf[..used].windows(4).any(|w| w == b"\r\n\r\n") {
+                            match sock.read(&mut buf[used..]).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => used += n,
+                            }
+                        }
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 5\r\n\r\nhe")
+                            .await;
+                        finish.notified().await;
+                        let _ = sock.write_all(b"llo").await;
+                    });
+                }
+            })
+        };
+        let mut target = ProxyTarget::parse_url(&format!("http://{addr}/socket")).unwrap();
+        target.max_conns = Some(1);
+        target.connect_timeout = Some(Duration::from_millis(300));
+        let c = ctx("192.0.2.1", false);
+        let proxy = Proxy::new();
+
+        let response = {
+            let upgrade = proxy
+                .proxy_websocket(&c, sample_ws_request(), &target)
+                .await
+                .expect("the rejection is relayed");
+            assert!(!upgrade.is_switching());
+            upgrade.response
+        };
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+        let second = proxy
+            .proxy_websocket(&c, sample_ws_request(), &target)
+            .await;
+        assert!(
+            matches!(second, Err(HandlerError::ServiceUnavailable)),
+            "the in-flight rejection body still counts against maxConns"
+        );
+
+        finish.notify_one();
+        let Body::Stream(body) = response.into_body() else {
+            panic!("a rejection with a pending body streams");
+        };
+        assert_eq!(&body.collect().await.unwrap().to_bytes()[..], b"hello");
+        let third = proxy
+            .proxy_websocket(&c, sample_ws_request(), &target)
+            .await;
+        assert!(
+            !matches!(third, Err(HandlerError::ServiceUnavailable)),
+            "the permit is released once the body ends"
+        );
         server.abort();
     }
 

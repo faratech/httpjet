@@ -2,8 +2,8 @@
 //! invalidation, plus chain assembly for a request path.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use dashmap::DashMap;
@@ -117,6 +117,43 @@ pub struct HtaccessCache {
     created: Instant,
     /// Milliseconds after `created` of the last negative sweep (+1; 0 = never).
     last_sweep_ms: std::sync::atomic::AtomicU64,
+    /// Serializes the read + parse of one access file (striped by path): requests
+    /// that miss together wait for the first parse instead of each repeating it.
+    parse_locks: Box<[Mutex<()>]>,
+    /// Access files parsed since this cache was created.
+    parses: AtomicU64,
+}
+
+/// Stripes of [`HtaccessCache::parse_locks`].
+const PARSE_LOCK_STRIPES: usize = 64;
+
+/// Hand a freshly parsed access file to the thread that builds deferred rewrite
+/// prefilters, one at a time and off the request path. The job holds only a weak
+/// reference, so an entry replaced before its turn is skipped.
+fn queue_prefilter_build(parsed: &Arc<Htaccess>) {
+    static BUILDER: OnceLock<Option<mpsc::Sender<Weak<Htaccess>>>> = OnceLock::new();
+    if !parsed.prefilter_pending() {
+        return;
+    }
+    let builder = BUILDER.get_or_init(|| {
+        let (jobs, queue) = mpsc::channel::<Weak<Htaccess>>();
+        std::thread::Builder::new()
+            .name("hj-prefilter".into())
+            .spawn(move || {
+                for job in queue {
+                    if let Some(parsed) = job.upgrade() {
+                        parsed.build_prefilter();
+                    }
+                }
+            })
+            .ok()
+            .map(|_| jobs)
+    });
+    match builder {
+        Some(jobs) if jobs.send(Arc::downgrade(parsed)).is_ok() => {}
+        // No builder thread: build here, as an eager parse would have.
+        _ => parsed.build_prefilter(),
+    }
 }
 
 impl Default for HtaccessCache {
@@ -156,7 +193,65 @@ impl HtaccessCache {
             negative_count: AtomicUsize::new(0),
             created: Instant::now(),
             last_sweep_ms: std::sync::atomic::AtomicU64::new(0),
+            parse_locks: (0..PARSE_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
+            parses: AtomicU64::new(0),
         }
+    }
+
+    /// An empty cache for a new configuration generation that starts with
+    /// `previous`'s parsed files, so a reload does not parse every access file
+    /// again. A seeded entry is `stat`ed before its first use (an edit made around
+    /// the reload still applies); absent files and failed reads are not carried over.
+    pub fn seeded_from(previous: &HtaccessCache) -> Self {
+        let cache = Self::with_revalidate_ttl(previous.revalidate_ttl);
+        let Some(expired) =
+            Instant::now().checked_sub(previous.revalidate_ttl + Duration::from_secs(1))
+        else {
+            return cache;
+        };
+        for entry in previous.inner.iter() {
+            if entry.parsed.is_none() || entry.read_failed || entry.mtime.is_none() {
+                continue;
+            }
+            cache.inner.insert(
+                entry.key().clone(),
+                Entry {
+                    parsed: entry.parsed.clone(),
+                    mtime: entry.mtime,
+                    checked_at: expired,
+                    read_failed: false,
+                    dir_missing: false,
+                },
+            );
+            cache.count.fetch_add(1, Ordering::Relaxed);
+        }
+        cache
+    }
+
+    /// Access files parsed since this cache was created (re-parses included).
+    pub fn parse_count(&self) -> u64 {
+        self.parses.load(Ordering::Relaxed)
+    }
+
+    /// The cached entry for `file` if it is still the file at `cur_mtime`, with its
+    /// check time refreshed.
+    fn revalidated(
+        &self,
+        file: &Path,
+        dir: &Path,
+        cur_mtime: Option<SystemTime>,
+    ) -> Option<(Option<Arc<Htaccess>>, bool, Instant)> {
+        let mut entry = self.inner.get_mut(file)?;
+        // A missing directory must still be missing: a newly created one may carry rules.
+        if entry.mtime == cur_mtime && !entry.read_failed && (!entry.dir_missing || !is_dir(dir)) {
+            entry.checked_at = Instant::now();
+            return Some((
+                entry.parsed.clone(),
+                entry.dir_missing,
+                entry.checked_at + self.revalidate_ttl,
+            ));
+        }
+        None
     }
 
     /// Load (and cache) the access-file chain that applies to `request_path`
@@ -294,32 +389,42 @@ impl HtaccessCache {
         let cur_mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
 
         // Revalidate: if mtime is unchanged, refresh the check timestamp and reuse.
-        // A missing directory must still be missing: a newly created one may carry rules.
-        {
-            if let Some(mut entry) = self.inner.get_mut(&file) {
-                if entry.mtime == cur_mtime
-                    && !entry.read_failed
-                    && (!entry.dir_missing || !is_dir(dir))
-                {
-                    entry.checked_at = Instant::now();
-                    return (
-                        entry.parsed.clone(),
-                        entry.dir_missing,
-                        entry.checked_at + self.revalidate_ttl,
-                    );
-                }
-            }
+        if let Some(hit) = self.revalidated(&file, dir, cur_mtime) {
+            return hit;
         }
 
-        // Cache miss or stale: (re)parse (no map guard held during the read/parse).
+        // Cache miss or stale. An existing file is read and parsed by one thread at a
+        // time; the others wait and then find its entry, instead of every request that
+        // arrives after a restart or an edit parsing the same file on its own thread.
+        let parse_guard = cur_mtime.is_some().then(|| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            file.hash(&mut hasher);
+            self.parse_locks[hasher.finish() as usize % PARSE_LOCK_STRIPES]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        if parse_guard.is_some()
+            && let Some(hit) = self.revalidated(&file, dir, cur_mtime)
+        {
+            return hit;
+        }
+
+        // (Re)parse, with no map guard held during the read/parse.
         // Bytes, not read_to_string: a non-UTF-8 byte (any comment in a legacy
         // encoding) must not downgrade a protected directory to "no rules".
         let read_result =
             read_htaccess_capped(&file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
         let read_failed = cur_mtime.is_some() && read_result.is_err();
         let dir_missing = cur_mtime.is_none() && !is_dir(dir);
+        if cur_mtime.is_some() && read_result.is_ok() {
+            self.parses.fetch_add(1, Ordering::Relaxed);
+        }
         let parsed = match (cur_mtime, read_result) {
-            (Some(_), Ok(text)) => match Htaccess::parse(&text) {
+            // The rewrite prefilter is built afterwards, off this thread: it is most
+            // of the cost of a long rule chain, and the rules give the same result
+            // without it.
+            (Some(_), Ok(text)) => match Htaccess::parse_deferred(&text) {
                 Ok(h) => Some(Arc::new(h)),
                 Err(e) => {
                     tracing::warn!(path = %file.display(), error = %e, "failed to parse .htaccess");
@@ -362,6 +467,9 @@ impl HtaccessCache {
                 class.load(Ordering::Relaxed) < MAX_HTACCESS_ENTRIES
             };
         if admit {
+            if let Some(parsed) = &parsed {
+                queue_prefilter_build(parsed);
+            }
             let prev = self.inner.insert(
                 file,
                 Entry {

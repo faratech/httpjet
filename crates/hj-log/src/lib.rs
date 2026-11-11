@@ -1095,9 +1095,29 @@ impl ErrorLogger {
     }
 }
 
-/// Keep error messages to a single physical line.
-fn sanitize_msg(s: &str) -> String {
-    s.replace('\r', "").replace('\n', " ")
+/// Keep an error message to one physical line with no terminal control characters.
+/// lsphp stderr and request-derived field values reach the text error log, and a raw
+/// ESC there is replayed by whatever terminal later views the file. `\r` is dropped,
+/// `\n` becomes a space, tab stays, and every other C0, DEL or C1 character is written
+/// as `\xNN` (the access log's notation).
+fn sanitize_msg(s: &str) -> Cow<'_, str> {
+    fn is_control(c: char) -> bool {
+        let c = c as u32;
+        (c < 0x20 && c != 0x09) || c == 0x7f || (0x80..=0x9f).contains(&c)
+    }
+    if !s.chars().any(is_control) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\r' => {}
+            '\n' => out.push(' '),
+            c if is_control(c) => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -1246,6 +1266,16 @@ mod tests {
             sanitize_msg("server\nstarted"),
         );
         assert_eq!(line, "2000-10-10 13:55:36.000000 [NOTICE] server started");
+    }
+
+    #[test]
+    fn error_text_escapes_terminal_control_characters() {
+        assert!(matches!(sanitize_msg("plain\ttext é"), Cow::Borrowed(_)));
+        assert_eq!(sanitize_msg("a\r\nb"), "a b");
+        assert_eq!(
+            sanitize_msg("PHP Warning: \x1b[2J\x1b]0;owned\x07 \0 \x7f \u{9b}31m"),
+            "PHP Warning: \\x1b[2J\\x1b]0;owned\\x07 \\x00 \\x7f \\x9b31m"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ class GnuPGPrerequisite(unittest.TestCase):
         for gpg in ('gpg2','gpg'):
             with self.subTest(gpg=gpg),tempfile.TemporaryDirectory(prefix='httpjet-gpg-prerequisite-') as temporary:
                 directory=Path(temporary)
-                for name in ('curl','python3','setpriv',gpg):
+                for name in ('curl','python3','setpriv','openssl',gpg):
                     tool=directory/name;tool.write_text('#!/bin/sh\nprintf "%s\\n" --ambient-caps\n');tool.chmod(0o755)
                 (directory/'grep').symlink_to(shutil.which('grep'))
                 script='fail() { printf "%s\\n" "$*" >&2; exit 1; }\nrequire_command() { command -v "$1" >/dev/null || fail "$1"; }\ngeneric_prerequisites() {'+body+'\n}\ngeneric_prerequisites\n'

@@ -1192,6 +1192,15 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         ),
     };
 
+    // Both transports bind with SO_REUSEPORT, so one address for both would not fail:
+    // the kernel would split connections between the plain and the TLS listener.
+    if https_addr == Some(args.http_addr) {
+        anyhow::bail!(
+            "--http-addr and --https-addr are both {}: plain HTTP and TLS cannot share a socket address",
+            args.http_addr
+        );
+    }
+
     let tcp_launch_policy = listener_plan::TcpLaunchPolicy {
         http: args.http_addr,
         https: https_addr,
@@ -1738,6 +1747,8 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
                 }
             });
         }
+        prewarm_access_files(&state).await;
+
         // (OPS6) Hold the live config behind an ArcSwap so a SIGHUP reload can swap
         // it under the accept loops without disturbing in-flight connections. Keep
         // the gen-0 `state` Arc for the metrics endpoint + the drain loop (the
@@ -1772,12 +1783,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         // deploy (`systemctl restart httpjet.service`) never closes the listen
         // sockets → zero backlog / new-connection RST at the origin. Absent
         // LISTEN_FDS (alt-port test instances, manual runs) we self-bind exactly
-        // as before. Inherited fds are classified by the configured ports.
-        let https_listen_port = https_addr.map(|a| a.port()).unwrap_or(443);
+        // as before. Inherited fds are classified by the configured addresses.
+        let https_listen = https_addr
+            .unwrap_or_else(|| SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), 443));
         // `inh_quic` is `mut` so the io_uring H3 path can `.take()` the inherited UDP
         // fds for the quinn-proto driver.
         let (inh_http, inh_https, mut inh_quic, inh_unix) =
-            match server::listeners_from_env(args.http_addr.port(), https_listen_port, args.http_uds.as_deref())? {
+            match server::listeners_from_env(args.http_addr, https_listen, args.http_uds.as_deref())? {
                 Some(i) => (Some(i.http), Some(i.https), Some(i.quic), Some(i.unix)),
                 None => (None, None, None, None),
             };
@@ -2850,7 +2862,7 @@ fn check(root: &std::path::Path, strict: bool) -> anyhow::Result<()> {
             && vhost.rewrite.enable
             && !vhost.rewrite.rules.trim().is_empty()
         {
-            hj_rewrite::RuleSet::parse(&vhost.rewrite.rules).map_err(|e| {
+            hj_rewrite::RuleSet::parse_deferred(&vhost.rewrite.rules).map_err(|e| {
                 anyhow::anyhow!("vhost {name}: inline rewrite rules do not parse: {e}")
             })?;
         }
@@ -3269,7 +3281,7 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
         }
 
         if config.rewrite.enable
-            && let Ok(rules) = hj_rewrite::RuleSet::parse(&config.rewrite.rules)
+            && let Ok(rules) = hj_rewrite::RuleSet::parse_deferred(&config.rewrite.rules)
         {
             for subst in rules.substituted_proxy_authorities() {
                 warnings.push(substituted_proxy_warning(
@@ -3286,7 +3298,7 @@ fn lint_unsupported_features(cfg: &hj_config::ServerConfig, root: &std::path::Pa
         if config.overrides_enabled(config.rewrite.auto_load_htaccess)
             && let Ok(text) = std::fs::read_to_string(&htaccess)
         {
-            match hj_rewrite::Htaccess::parse(&text) {
+            match hj_rewrite::Htaccess::parse_deferred(&text) {
                 Ok(ht) => {
                     // (#603) The page cache folds a UA *class* into its key only for
                     // classifiable RewriteCond reads (under --rewrite-ua-classify); any
@@ -3354,7 +3366,7 @@ fn substituted_proxy_warning(vhost: &str, source: &str, subst: &str) -> String {
 fn describe_page_cache_keying(c: &hj_core::config::VHostConfig, htaccess: Option<&str>) -> String {
     if c.rewrite.enable
         && !c.rewrite.rules.trim().is_empty()
-        && let Ok(rs) = hj_rewrite::RuleSet::parse(&c.rewrite.rules)
+        && let Ok(rs) = hj_rewrite::RuleSet::parse_deferred(&c.rewrite.rules)
         && !rs.page_cache_keyed()
         && let Some(var) = rs.page_cache_unkeyed.as_deref()
     {
@@ -3363,7 +3375,7 @@ fn describe_page_cache_keying(c: &hj_core::config::VHostConfig, htaccess: Option
     let Some(text) = htaccess else {
         return "keyed".to_string();
     };
-    match hj_rewrite::Htaccess::parse(text) {
+    match hj_rewrite::Htaccess::parse_deferred(text) {
         Ok(h) => match h.page_cache_unkeyed_reason() {
             Some(reason) => format!("bypass — {reason}"),
             None => "keyed".to_string(),
@@ -3373,7 +3385,7 @@ fn describe_page_cache_keying(c: &hj_core::config::VHostConfig, htaccess: Option
 }
 
 fn describe_memo_eligibility(text: &str) -> String {
-    let h = match hj_rewrite::Htaccess::parse(text) {
+    let h = match hj_rewrite::Htaccess::parse_deferred(text) {
         Ok(h) => h,
         Err(e) => return format!("ineligible — .htaccess parse error: {e}"),
     };
@@ -3451,6 +3463,54 @@ fn reload_would_brick_vhosts(
     (!regressed.is_empty()).then(|| regressed.join(", "))
 }
 
+/// How long startup waits for [`prewarm_access_files`] before serving without it.
+const ACCESS_FILE_PREWARM_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Parse every vhost's docroot access file before the first connection is accepted.
+/// The requests that arrive right after a (re)start then find it cached instead of
+/// each waiting on the parse. The rewrite prefilters are built in the background.
+async fn prewarm_access_files(state: &Arc<ServerState>) {
+    let mut files: Vec<(std::path::PathBuf, String)> = Vec::new();
+    for decl in state.server.vhosts.values() {
+        let Some(config) = decl.config.as_ref() else {
+            continue;
+        };
+        if !config.overrides_enabled(config.rewrite.auto_load_htaccess) {
+            continue;
+        }
+        let file = (
+            config.doc_root.clone(),
+            config.access_file_name_or_default().to_owned(),
+        );
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
+    if files.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let cache = state.rewrite_cache.clone();
+    let warmed = tokio::task::spawn_blocking(move || {
+        files
+            .iter()
+            .filter(|(dir, name)| cache.get_or_load_named(dir, name).is_some())
+            .count()
+    });
+    match tokio::time::timeout(ACCESS_FILE_PREWARM_BUDGET, warmed).await {
+        Ok(Ok(files)) => tracing::info!(
+            files,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "docroot access files parsed before serving"
+        ),
+        Ok(Err(error)) => tracing::warn!(%error, "docroot access file pre-warm failed"),
+        Err(_) => tracing::warn!(
+            budget_secs = ACCESS_FILE_PREWARM_BUDGET.as_secs(),
+            "docroot access file pre-warm is still running; serving starts without it"
+        ),
+    }
+}
+
 /// Vhost/listener topology lints + a local topology fingerprint. Every shape
 /// here is a generalization of a real foreign-host leak; the test names use reserved domains.
 /// a missing `www.` mapping falling to the `*` catch-all.
@@ -3517,6 +3577,69 @@ fn lint_topology(
         if !mapped.contains(name.as_str()) {
             warnings.push(format!(
                 "vhost '{name}' has no exact vhostMap domain on any listener"
+            ));
+        }
+    }
+
+    // `serve` starts one plain and one TLS listener: the first of each kind, the plain
+    // role falling back to the first listener (`TcpLaunchPolicy::plan`). The lints above
+    // read every listener, so a host mapped only on a later one looked routable while
+    // it actually fell to the served listener's catch-all or a 404.
+    let served_plain = cfg
+        .listeners
+        .iter()
+        .position(|l| !l.secure)
+        .or((!cfg.listeners.is_empty()).then_some(0));
+    let served_secure = cfg.listeners.iter().position(|l| l.secure);
+    let pairs = |l: &hj_config::Listener| -> std::collections::BTreeSet<(String, String)> {
+        l.vhost_map
+            .iter()
+            .flat_map(|m| {
+                m.domains
+                    .iter()
+                    .map(move |d| (d.to_ascii_lowercase(), m.vhost.clone()))
+            })
+            .collect()
+    };
+    for (index, l) in cfg.listeners.iter().enumerate() {
+        if Some(index) == served_plain || Some(index) == served_secure || l.uds_path.is_some() {
+            continue;
+        }
+        let served = if l.secure {
+            served_secure
+        } else {
+            served_plain
+        };
+        let served_pairs = served
+            .and_then(|i| cfg.listeners.get(i))
+            .map(pairs)
+            .unwrap_or_default();
+        let unserved: Vec<String> = pairs(l)
+            .difference(&served_pairs)
+            .map(|(domain, vhost)| format!("{domain} -> {vhost}"))
+            .collect();
+        if unserved.is_empty() {
+            warnings.push(format!(
+                "listener '{}' ({}) is never started: only the first plain and the first TLS listener are served",
+                l.name, l.address
+            ));
+        } else {
+            errors.push(format!(
+                "listener '{}' ({}) is never started, so its mappings are not routed as written: {}",
+                l.name,
+                l.address,
+                unserved.join(", ")
+            ));
+        }
+    }
+    // The router keys routes by listener name, so a second listener of the same name
+    // replaces the first one's routes while TLS still comes from the first.
+    let mut listener_names = std::collections::HashSet::new();
+    for l in &cfg.listeners {
+        if !listener_names.insert(l.name.as_str()) {
+            errors.push(format!(
+                "listener name '{}' is declared more than once",
+                l.name
             ));
         }
     }
@@ -4180,6 +4303,54 @@ mod tests {
             proxy_protocol_peers: vec![],
         });
         cfg
+    }
+
+    /// (#1199) Only the first plain and the first TLS listener are served. A later
+    /// listener that maps something the served one does not is a strict error; one
+    /// that repeats it is only noted; a repeated listener name is always an error.
+    #[test]
+    fn listeners_serve_never_starts_fail_the_strict_check() {
+        let dir = std::env::temp_dir().join(format!("hj-extra-listener-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = topology_config(&dir, "real");
+        let extra = |name: &str, secure: bool, domain: &str| hj_config::Listener {
+            name: name.into(),
+            secure,
+            address: "127.0.0.1:2".into(),
+            vhost_map: vec![hj_config::VhostMap {
+                vhost: "real".into(),
+                domains: vec![domain.into()],
+            }],
+            tls: None,
+            uds_path: None,
+            proxy_protocol: false,
+            proxy_protocol_peers: vec![],
+        };
+
+        // The first TLS listener is served; so is the first plain one.
+        let mut served = base.clone();
+        served.listeners.push(extra("TLS", true, "example.com"));
+        assert!(lint_topology(&served, &[], true).is_ok());
+
+        // A second plain listener with a host of its own: never routed as written.
+        let mut unrouted = base.clone();
+        unrouted
+            .listeners
+            .push(extra("Second", false, "new.example.com"));
+        assert!(lint_topology(&unrouted, &[], true).is_err());
+        assert!(lint_topology(&unrouted, &[], false).is_ok());
+
+        // A twin that only repeats the served listener's mapping changes no routing.
+        let mut twin = base.clone();
+        twin.listeners.push(extra("Twin", false, "example.com"));
+        assert!(lint_topology(&twin, &[], true).is_ok());
+
+        let mut duplicate = base.clone();
+        duplicate
+            .listeners
+            .push(extra("Default", true, "example.com"));
+        assert!(lint_topology(&duplicate, &[], true).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Regression (#885): a vhostMap naming an undeclared vhost is a hard check

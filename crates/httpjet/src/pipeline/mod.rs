@@ -380,7 +380,10 @@ pub(crate) async fn fast_serve(
     // observability funnel as every other serve. Every conditional header the
     // static handler answers with 304/412/206 is excluded, not just the two
     // common ones — a replayed 200 would silently override that verdict.
+    // A compile-time response transform sees the whole request context, which the
+    // memo key does not cover, so its output is never memoized.
     let memo_eligible_req = fast_memo::enabled()
+        && state.extensions.is_empty()
         && method == http::Method::GET
         && !has_cookie
         && !has_conditional_or_auth;
@@ -401,6 +404,7 @@ pub(crate) async fn fast_serve(
             purge_epoch: memo_purge_epoch,
             listener,
             https: effective_https,
+            h3: proto == Proto::Http3,
             trusted_proxy,
             vhost: vhost_name,
             host_src,
@@ -867,6 +871,7 @@ pub(crate) async fn fast_serve(
                         purge_epoch: memo_purge_epoch,
                         listener,
                         https: effective_https,
+                        h3: proto == Proto::Http3,
                         trusted_proxy,
                         vhost: &ctx.vhost_name,
                         host_src,
@@ -1046,8 +1051,8 @@ pub(crate) async fn fast_serve(
     apply_response_transforms(state, &ctx, &mut resp).await;
     if resp.status() == StatusCode::OK && !resp.headers().contains_key(http::header::SET_COOKIE) {
         if memo_store_ok {
-            if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs) {
-                fast_memo::store_until(
+            if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs)
+                && fast_memo::store_until(
                     &fast_memo::MemoKey {
                         generation: state.generation,
                         allow_page_responses,
@@ -1055,6 +1060,7 @@ pub(crate) async fn fast_serve(
                         purge_epoch: memo_purge_epoch,
                         listener,
                         https: effective_https,
+                        h3: proto == Proto::Http3,
                         trusted_proxy,
                         vhost: &ctx.vhost_name,
                         host_src,
@@ -1071,7 +1077,8 @@ pub(crate) async fn fast_serve(
                     &resp,
                     req_start,
                     policy_deadline,
-                );
+                )
+            {
                 state
                     .metrics
                     .fast_memo_stores
@@ -2839,6 +2846,10 @@ fn build_revalidation_request(req: &Request, cookie: RefreshCookie) -> Request {
     }
     if let RefreshCookie::Replace(cookie) = cookie {
         sub.headers_mut().remove(COOKIE);
+        // The replaced-cookie render is stored as the public shell, so it must carry no
+        // visitor credential: PHP receives these headers too (HTTP_AUTHORIZATION).
+        sub.headers_mut().remove(http::header::AUTHORIZATION);
+        sub.headers_mut().remove(http::header::PROXY_AUTHORIZATION);
         if let Some(cookie) = cookie {
             sub.headers_mut().insert(COOKIE, cookie);
         }
@@ -3583,10 +3594,10 @@ fn spawn_capsule_revalidate(
     let Some(guard) = state.page_cache_refresh.try_begin(key_hash) else {
         return;
     };
-    let public_cookie: Option<HeaderValue> = state.page_cache.as_ref().and_then(|store| {
-        let raw = req.headers().get(COOKIE).and_then(|v| v.to_str().ok());
-        lscache::capsule_public_refresh_cookie(raw, store)
-    });
+    let public_cookie: Option<HeaderValue> = state
+        .page_cache
+        .as_ref()
+        .and_then(|store| lscache::capsule_public_refresh_cookie(req.headers().get(COOKIE), store));
     let sub = build_revalidation_request(req, RefreshCookie::Replace(public_cookie));
     let state = state.clone();
     let mut ctx = ctx.clone();
@@ -7427,6 +7438,31 @@ mod tests {
 
         let without_public_cookie = build_revalidation_request(&req, RefreshCookie::Replace(None));
         assert!(!without_public_cookie.headers().contains_key(COOKIE));
+    }
+
+    #[test]
+    fn capsule_revalidation_drops_request_credentials() {
+        let req = http::Request::builder()
+            .uri("/help/")
+            .header(COOKIE, "xf_session=secret; style=4")
+            .header(http::header::AUTHORIZATION, "Basic bWVtYmVyOnNlY3JldA==")
+            .header(http::header::PROXY_AUTHORIZATION, "Basic cHJveHk6c2VjcmV0")
+            .header(http::header::ACCEPT_LANGUAGE, "en")
+            .body(hj_core::empty_incoming())
+            .unwrap();
+
+        for cookie in [Some(HeaderValue::from_static("style=4")), None] {
+            let sub = build_revalidation_request(&req, RefreshCookie::Replace(cookie));
+            assert!(!sub.headers().contains_key(http::header::AUTHORIZATION));
+            assert!(
+                !sub.headers()
+                    .contains_key(http::header::PROXY_AUTHORIZATION)
+            );
+            assert_eq!(
+                sub.headers().get(http::header::ACCEPT_LANGUAGE).unwrap(),
+                "en"
+            );
+        }
     }
 
     #[test]

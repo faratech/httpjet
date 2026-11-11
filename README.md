@@ -95,8 +95,8 @@ run, not across runs — and PHP for v0.0.1–v0.0.3 measures cold `lsphp`-pool
 ramp rather than steady state (warm, v0.0.1 sustains ~32K req/s).
 
 These are loopback-class synthetic numbers: they isolate the server's code
-path, not end-user latency. The lab drivers, per-round TSVs, checks, and all
-raw logs are published with the receipts. The full
+path, not end-user latency. The lab is reproducible from this repo
+(`scripts/lab/lab-up.sh` brings it up, `lab-down.sh` deletes it). The full
 methodology, the per-release speed curve, per-round TSVs, checks, and all
 raw logs are at
 [httpjet.net/docs/performance](https://httpjet.net/docs/performance) and on

@@ -1313,7 +1313,10 @@ impl DiskStore {
     /// recovery converts any malformed/truncated journal into a conservative restart-time floor.
     pub fn append_tag_purge_stamp(&self, tag_hash: u64, wall_ms: u64) -> io::Result<()> {
         let mut file = self.open_root_file(TAG_STAMP_NAME, true, true)?;
-        writeln!(file, "T {tag_hash:016x} {wall_ms:016x}")
+        // One write(2) per record: `writeln!` on a `File` writes each formatted piece
+        // separately, and a record torn between them costs the whole cache at the next
+        // boot (a malformed journal becomes a restart-time floor).
+        file.write_all(format!("T {tag_hash:016x} {wall_ms:016x}\n").as_bytes())
     }
 
     /// Atomically compact the tag-purge journal. `floor_ms` safely subsumes every removed

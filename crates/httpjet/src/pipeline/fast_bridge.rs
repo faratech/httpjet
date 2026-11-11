@@ -161,8 +161,11 @@ impl Default for FastBridgeCounters {
 impl FastBridgeCounters {
     #[inline]
     pub(crate) fn bump(&self, why: FastBridge) {
-        let shard = &self.0[crate::telemetry::shard_index()];
-        if let Some(counter) = shard.0.get(why as usize) {
+        if let Some(counter) = self
+            .0
+            .get(crate::telemetry::shard_index())
+            .and_then(|shard| shard.0.get(why as usize))
+        {
             counter.fetch_add(1, Ordering::Relaxed);
         }
     }

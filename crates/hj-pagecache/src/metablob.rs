@@ -130,12 +130,22 @@ pub struct DecodedMeta {
     pub scope: PageScope,
 }
 
+/// Run `f` with this thread's scratch buffer — or with a buffer of its own when the
+/// scratch is already in use further up the stack. [`MetaBlob::with_listing_fields`]
+/// runs its caller's closure while it still reads from the scratch, so a closure that
+/// encoded or decoded another blob would otherwise abort the process on a double borrow.
+fn with_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    META_RAW_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => f(&mut scratch),
+        Err(_) => f(&mut Vec::new()),
+    })
+}
+
 impl MetaBlob {
     pub fn encode(key: &PageCacheKey, entry: &CachedResponse) -> Result<Self, MetaError> {
-        META_RAW_SCRATCH.with(|raw_cell| {
-            let mut raw = raw_cell.borrow_mut();
+        with_scratch(|raw| {
             raw.clear();
-            encode_raw_into(&mut raw, key, entry)?;
+            encode_raw_into(raw, key, entry)?;
             let raw_len = raw.len();
             let bound = zstd::zstd_safe::compress_bound(raw_len);
             let compressed = META_COMP_SCRATCH.with(|comp_cell| {
@@ -144,7 +154,7 @@ impl MetaBlob {
                     comp.resize(bound, 0);
                 }
                 let n = META_COMP
-                    .with(|c| c.borrow_mut().compress_to_buffer(&raw, &mut comp[..bound]))
+                    .with(|c| c.borrow_mut().compress_to_buffer(raw, &mut comp[..bound]))
                     .map_err(|_| MetaError::encode("zstd metadata encode failed"))?;
                 if n > MAX_COMP_META {
                     return Err(MetaError::encode("compressed metadata over format bound"));
@@ -170,8 +180,7 @@ impl MetaBlob {
         if self.compressed.len() > MAX_COMP_META || raw_len > MAX_RAW_META {
             return Err(MetaError::decode("metadata length over format bound"));
         }
-        META_RAW_SCRATCH.with(|raw_cell| {
-            let mut raw = raw_cell.borrow_mut();
+        with_scratch(|raw| {
             if raw.len() < raw_len {
                 raw.resize(raw_len, 0);
             }
@@ -200,8 +209,7 @@ impl MetaBlob {
         if self.compressed.len() > MAX_COMP_META || raw_len > MAX_RAW_META {
             return Err(MetaError::decode("metadata length over format bound"));
         }
-        META_RAW_SCRATCH.with(|raw_cell| {
-            let mut raw_buf = raw_cell.borrow_mut();
+        with_scratch(|raw_buf| {
             if raw_buf.len() < raw_len {
                 raw_buf.resize(raw_len, 0);
             }

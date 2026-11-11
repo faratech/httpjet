@@ -38,7 +38,7 @@ pub struct RuleSet {
     /// stripped-target). One search tells us which of those rules' patterns match,
     /// so a request that matches none of the ~N redirect rules skips N individual
     /// regex evaluations. See [`Rule::prefilter_idx`].
-    pub(crate) prefilter: Option<PrefilterSet>,
+    pub(crate) prefilter: PrefilterSlot,
     /// Precomputed at parse time: this ruleset's outcome is a pure function of the
     /// base cache key (vhost, scheme, method, host, path, query) PLUS the values of
     /// [`Self::cache_key_vars`]. True iff every `%{VAR}` read is either cache-safe
@@ -829,6 +829,74 @@ impl FastRegex {
     }
 }
 
+/// A rule set's prefilter: built with the rules, or attached once afterwards.
+///
+/// [`RuleSet::parse`] builds it inline. [`RuleSet::parse_deferred`] leaves the
+/// patterns here for [`RuleSet::build_prefilter`]: determinising the DFA is by far
+/// the largest part of parsing a long rule chain (about half a second for an
+/// 900-line `.htaccess`) and must not run on a thread that is serving requests.
+/// Until the slot is filled, and for good when the build is over its size limit,
+/// evaluation runs each rule's own regex, which gives the same result.
+#[derive(Debug, Default)]
+pub(crate) struct PrefilterSlot {
+    built: std::sync::OnceLock<Option<PrefilterSet>>,
+    /// The patterns of a deferred build, taken by whichever caller builds it.
+    pending: std::sync::Mutex<Option<Vec<String>>>,
+}
+
+impl PrefilterSlot {
+    pub(crate) fn built(prefilter: Option<PrefilterSet>) -> Self {
+        let slot = PrefilterSlot::default();
+        let _ = slot.built.set(prefilter);
+        slot
+    }
+
+    pub(crate) fn deferred(patterns: Vec<String>) -> Self {
+        PrefilterSlot {
+            built: std::sync::OnceLock::new(),
+            pending: std::sync::Mutex::new(Some(patterns)),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&PrefilterSet> {
+        self.built.get().and_then(Option::as_ref)
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn build(&self) {
+        let patterns = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(patterns) = patterns {
+            let _ = self.built.set(PrefilterSet::new(&patterns));
+        }
+    }
+}
+
+impl RuleSet {
+    /// Build the prefilter of a rule set parsed with
+    /// [`parse_deferred`](Self::parse_deferred). Does nothing when there is none to
+    /// build or it is already built; safe to call from any thread while the rule
+    /// set is being evaluated.
+    pub fn build_prefilter(&self) {
+        self.prefilter.build();
+    }
+
+    /// Whether a deferred prefilter still waits for [`build_prefilter`](Self::build_prefilter).
+    pub fn prefilter_pending(&self) -> bool {
+        self.prefilter.is_pending()
+    }
+}
+
 /// The multi-pattern rewrite prefilter: a single **fully-compiled dense DFA**
 /// (`regex_automata::dfa::dense`) over all eligible rule patterns. It is searched
 /// once per request via [`Automaton::try_which_overlapping_matches`], which is
@@ -1141,7 +1209,7 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
     let prefilter_target = rule_match_target(input, &input.uri);
     let hits: Option<PatternSet> = rs
         .prefilter
-        .as_ref()
+        .get()
         .map(|pf| pf.matches(prefilter_target.as_ref()));
     let hits = hits.as_ref();
 

@@ -234,6 +234,8 @@ impl IoUringDatagram {
         if self.send_blocked.get() {
             return false;
         }
+        // SAFETY: `self.socket` owns the descriptor and outlives this borrow, which
+        // ends with the synchronous flush below.
         let fd = unsafe { BorrowedFd::borrow_raw(self.socket.as_raw_fd()) };
         let empty = queue.borrow_mut().flush_with(|pending| {
             #[cfg(test)]

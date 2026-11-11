@@ -1653,8 +1653,17 @@ impl Lsapi {
                             "lsapi internal error".into(),
                         )));
                     }
-                    _ => {
-                        accept_worker_pid = false;
+                    // Body bytes or a request-side packet ahead of the header mean the
+                    // peer is out of step. Skipping the frame delivered a clean 200
+                    // missing its first chunk; the worker already ran the request, so
+                    // this is terminal rather than replayable.
+                    PacketType::RespStream
+                    | PacketType::BeginRequest
+                    | PacketType::AbortRequest => {
+                        fail(&guard, &cancel);
+                        return Err(ReadFail::terminal(HandlerError::BadGateway(
+                            "lsapi response packet before headers".into(),
+                        )));
                     }
                 },
                 Ok(None) => {

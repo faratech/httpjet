@@ -28,6 +28,15 @@ if [ -e "$tls/default.key" ] || [ -L "$tls/default.key" ] || [ -e "$tls/default.
     [ -f "$tls/default.key" ] && [ ! -L "$tls/default.key" ] \
         && [ -f "$tls/default.crt" ] && [ ! -L "$tls/default.crt" ] \
         || { echo 'httpjet: incomplete or unsafe TLS pair; restore it explicitly' >&2; exit 1; }
+    # An interrupted restore can leave a truncated or mixed pair; HTTPS must not be
+    # enabled on one the server cannot load. Only public keys are compared, and
+    # -passin keeps an encrypted key from prompting during installation.
+    certificate_public=$(openssl x509 -in "$tls/default.crt" -noout -pubkey 2>/dev/null) \
+        || { echo 'httpjet: existing TLS certificate is empty or corrupt; restore the pair explicitly' >&2; exit 1; }
+    key_public=$(openssl pkey -in "$tls/default.key" -passin pass: -pubout 2>/dev/null </dev/null) \
+        || { echo 'httpjet: existing TLS private key is empty, corrupt or encrypted; restore the pair explicitly' >&2; exit 1; }
+    [ -n "$certificate_public" ] && [ "$certificate_public" = "$key_public" ] \
+        || { echo 'httpjet: existing TLS private key does not match its certificate; restore the pair explicitly' >&2; exit 1; }
 else
     temporary=$(mktemp -d "$tls/.new.XXXXXX")
     trap 'rm -rf "$temporary"' EXIT HUP INT TERM

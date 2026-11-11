@@ -738,6 +738,15 @@ fn append_dict_recompress_metrics(
 /// handshakes that paid a HelloRetryRequest round trip.
 fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) {
     let (h2_idle, h2_peer) = hj_h2::server::connection_close_counts();
+    out.push_str(
+        "# HELP httpjet_h2_conn_ends_total HTTP/2 connections that ended, by the first cause recorded for them.\n\
+         # TYPE httpjet_h2_conn_ends_total counter\n",
+    );
+    for (reason, count) in hj_h2::server::connection_end_counts() {
+        out.push_str(&format!(
+            "httpjet_h2_conn_ends_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
     let (send_blocked_conn, send_blocked_stream) = hj_h2::server::send_blocked_counts();
     let h1_idle = metrics.h1_idle_closes.load(Ordering::Relaxed);
     let h1_peer = metrics.h1_peer_closes.load(Ordering::Relaxed);
@@ -928,6 +937,12 @@ fn append_rewrite_metrics(out: &mut String, state: &ServerState) {
         "gauge",
         "Directories memoized by the .htaccess cache; at capacity, new directories are re-read per request.",
         state.rewrite_cache.len() as u64,
+    );
+    metric(
+        "httpjet_htaccess_parses_total",
+        "counter",
+        "Access files parsed by the current configuration generation's .htaccess cache (re-parses after an edit included).",
+        state.rewrite_cache.parse_count(),
     );
     metric(
         "httpjet_htaccess_cache_capacity",
@@ -1763,6 +1778,12 @@ fn render_metrics(
             "counter",
             "File entries evicted because the tmpfs file-tier budget was exceeded.",
             s.disk_evictions.to_string(),
+        );
+        metric(
+            "httpjet_pagecache_ghost_hits_total",
+            "counter",
+            "Misses on a key the file tier had evicted while still fresh: misses a larger --page-cache-disk-mem could have served. An estimate (sampled; later tag purges are not subtracted). Compare with httpjet_pagecache_disk_evictions_total.",
+            s.ghost_hits.to_string(),
         );
         metric(
             "httpjet_pagecache_evictions_total",

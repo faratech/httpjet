@@ -100,6 +100,10 @@ pub(super) struct MemoKey<'a> {
     pub purge_epoch: u64,
     pub listener: &'a str,
     pub https: bool,
+    /// The request arrived over HTTP/3. The response transforms run before the store
+    /// and `Alt-Svc` is added for every TLS protocol except HTTP/3, so the two
+    /// classes finish with different headers.
+    pub h3: bool,
     pub trusted_proxy: bool,
     pub vhost: &'a str,
     pub host_src: HostSource,
@@ -203,6 +207,7 @@ struct MemoEntry {
     purge_epoch: u64,
     listener: String,
     https: bool,
+    h3: bool,
     trusted_proxy: bool,
     vhost: String,
     host_src: HostSource,
@@ -292,6 +297,7 @@ fn key_hash(k: &MemoKey) -> u64 {
     }
     k.listener.hash(&mut h);
     k.https.hash(&mut h);
+    k.h3.hash(&mut h);
     k.trusted_proxy.hash(&mut h);
     k.vhost.hash(&mut h);
     k.host_src.hash(&mut h);
@@ -310,6 +316,7 @@ fn matches(e: &MemoEntry, k: &MemoKey) -> bool {
     }
     e.generation == k.generation
         && e.https == k.https
+        && e.h3 == k.h3
         && e.trusted_proxy == k.trusted_proxy
         && e.host_src == k.host_src
         && e.listener == k.listener
@@ -517,6 +524,7 @@ pub(super) fn store_until(
         purge_epoch: k.purge_epoch,
         listener: k.listener.to_owned(),
         https: k.https,
+        h3: k.h3,
         trusted_proxy: k.trusted_proxy,
         vhost: k.vhost.to_owned(),
         host_src: k.host_src,
@@ -592,6 +600,7 @@ mod tests {
             purge_epoch: 0,
             listener: "l1",
             https: true,
+            h3: false,
             trusted_proxy: false,
             vhost: "v",
             host_src: HostSource::Header,
@@ -965,6 +974,32 @@ mod tests {
         assert!(
             matches!(probe(&next, &request, &cache, now).unwrap().0.into_body(), Body::Full(bytes) if bytes.as_ref() == b"new")
         );
+    }
+
+    /// (#1211) `Alt-Svc` is part of the finished response for every TLS protocol but
+    /// HTTP/3, so an entry stored from one class is never replayed to the other.
+    #[test]
+    fn http3_and_earlier_protocols_keep_separate_entries() {
+        let now = Instant::now();
+        let request = req(&[]);
+        let cache = ua_cache();
+        let h2 = key("/alt-svc", b"");
+        let mut h3 = key("/alt-svc", b"");
+        h3.h3 = true;
+
+        let mut advertised = resp(b"page");
+        advertised.headers_mut().insert(
+            http::header::ALT_SVC,
+            http::HeaderValue::from_static("h3=\":443\""),
+        );
+        store(&h2, Vec::new(), &advertised, now);
+        assert!(probe(&h3, &request, &cache, now).is_none());
+
+        store(&h3, Vec::new(), &resp(b"page"), now);
+        let (over_h3, _) = probe(&h3, &request, &cache, now).unwrap();
+        assert!(!over_h3.headers().contains_key(http::header::ALT_SVC));
+        let (over_h2, _) = probe(&h2, &request, &cache, now).unwrap();
+        assert!(over_h2.headers().contains_key(http::header::ALT_SVC));
     }
 
     #[test]

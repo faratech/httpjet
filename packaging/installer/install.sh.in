@@ -406,7 +406,7 @@ RPM_SOURCE
             "$RPM_MANAGER" -y --setopt=httpjet.repo_gpgcheck=1 --setopt=httpjet.gpgcheck=1 "$rpm_action" httpjet-archive-keyring "$rpm_package"
             ;;
         zypper)
-            zypper --non-interactive --gpg-auto-import-keys refresh httpjet
+            zypper --non-interactive refresh httpjet
             if [ -n "$HTTPJET_REQUESTED_VERSION" ]; then
                 zypper --non-interactive install --oldpackage httpjet-archive-keyring "httpjet=$HTTPJET_REQUESTED_VERSION"
             else

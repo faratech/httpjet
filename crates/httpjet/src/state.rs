@@ -396,9 +396,9 @@ impl Default for PaddedAtomic {
 impl PaddedAtomic {
     #[inline]
     pub fn fetch_add(&self, val: u64, order: Ordering) -> u64 {
-        self.0[crate::telemetry::shard_index()]
-            .0
-            .fetch_add(val, order)
+        self.0
+            .get(crate::telemetry::shard_index())
+            .map_or(0, |shard| shard.0.fetch_add(val, order))
     }
 
     #[inline]
@@ -1366,7 +1366,9 @@ impl ServerState {
             proxy,
             // Candidate construction must not clear live caches. Separate generations
             // also prevent an in-flight old request repopulating the new rule memo.
-            rewrite_cache: Arc::new(HtaccessCache::new()),
+            // The new cache starts from the files the old one parsed (each re-stat'd
+            // before use), so a reload does not parse every access file again.
+            rewrite_cache: Arc::new(HtaccessCache::seeded_from(&old.rewrite_cache)),
             static_cache: old.static_cache.clone(),
             stat_cache: old.stat_cache.clone(),
             early_bridge: old.early_bridge.clone(),
