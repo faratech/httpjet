@@ -81,19 +81,21 @@ set for parity), so its HTTP/2 cells are short and noisier.
 | HTTP/1.1, 1 KiB file, c=100 (`h2load --h1`) | **517,643 req/s** | 353,405 req/s | 424,879 req/s |
 | HTTP/1.1, 1 KiB file, c=100 (`wrk`, 15 s) | **571,500 req/s** | 377,631 req/s | 430,111 req/s |
 
-For version-to-version comparison, every release from v0.0.1 to v0.2.0 was
-also re-measured on 2026-11-11 under **identical conditions** on a dedicated lab VM
+For version-to-version comparison, every release from v0.0.1 to v0.2.2 was
+also re-measured on 2026-11-12 under **identical conditions** on a dedicated lab VM
 (c4-highmem-8, loopback, server pinned to 4 cores, load generator on the
 other 4, each release PGO-built from its tag the same way, 3 rotated rounds,
 median shown). Before benching, each binary passed the same functional
 checks (start, static file, `.htaccess` page, PHP page, page-cache hit,
-empty and 64 KiB files, config lint) — 11 of 11 pass. Lab medians, 0.2.0
-against 0.1.12 in the same run: 625K vs 592K req/s HTTP/2 1 KiB static, 311K vs
-273K HTTP/1.1 static, 515K vs 403K heavy `.htaccess` HTTP/2, 545K vs 411K
-page-cache hits, 32.3K vs 27.8K PHP/LSAPI; HTTP/2 64 KiB is flat (89.7K vs
-92.4K). The slowest request of a 64-way burst right after boot fell from 508 ms
-to 3 ms. In the same lab nginx reached 196K (HTTP/2 1 KiB), 239K (empty) and
-271K (`wrk` HTTP/1.1) against httpjet 0.2.0's 656K, 689K and 354K. (OpenLiteSpeed
+empty and 64 KiB files, config lint) — 11 of 11 pass. Lab medians, 0.2.2
+against 0.2.1 in the same run: 666K vs 669K req/s HTTP/2 1 KiB static, 311K vs
+304K HTTP/1.1 static, 538K vs 546K heavy `.htaccess` HTTP/2, 542K vs 541K
+page-cache hits, 32.5K vs 32.6K PHP/LSAPI — flat, as expected for releases
+with no hot-path work (0.2.1 vs 0.2.0: 669K vs 699K, 546K vs 519K, 541K vs
+604K, 32.6K vs 32.3K). Absolute numbers move with VM placement between runs
+(v0.2.0 was 625K on 2026-11-11, 699K here); compare within a run. In the
+same lab nginx reached 185K (HTTP/2 1 KiB), 295K (empty) and
+271K (`wrk` HTTP/1.1) against httpjet 0.2.2's 728K, 695K and 356K. (OpenLiteSpeed
 does not run in the lab layout; its cross-server comparison is the
 dedicated-client table above.) Two caveats travel with
 the lab data: absolute numbers move with VM placement — compare within a
