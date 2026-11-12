@@ -1234,6 +1234,12 @@ impl DiskStore {
         live_files.clear();
     }
 
+    /// The newest version sequence handed out so far: every file that exists was
+    /// written with this sequence or an older one.
+    pub(crate) fn newest_version_seq(&self) -> u64 {
+        self.seq.load(Ordering::Relaxed).saturating_sub(1)
+    }
+
     /// Unlink published versions of `key` through `max_version_seq`. A newer
     /// final file may belong to a render that started after the purge epoch and
     /// has not acquired the index shard yet, so it must survive. In-flight temp

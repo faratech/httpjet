@@ -1,3 +1,27 @@
+httpjet (0.2.2-1) stable; urgency=medium
+
+  * HTTP/3: keep the handshake slot of a connection lost before its handshake
+    when a second datagram has it serviced again before the reap; pairs of
+    spoofed Initials no longer stay under the Retry threshold.
+  * Rewrite: re-parse an access file whose ctime, size or inode changed, not
+    only its mtime (a reload kept the old rules after cp -p or rsync -t);
+    key a cached rewrite outcome by the rule sets that produced it.
+  * subFilter: ask a proxied upstream for the identity entity so its body is
+    filtered; leave a backend HEAD without a length instead of 0; do not
+    advertise byte ranges under a filtered context.
+  * ACME: drop a refused or failed order instead of retrying it forever; cap
+    Retry-After at seven days; vary the renewal jitter between accounts.
+  * Page cache: a shared-path parameter must carry a value; a tag purge of an
+    entry that never reached the file tier keeps the boot scan from restoring
+    an older version; the admission filter takes one counter per quarter of
+    its block (less than half the false positives).
+  * FastCGI: wake one waiting caller per freed pool slot. Basic auth: count
+    an IPv6 /64 as one client.
+  * HTTP/2: find the Link early-hint anchor with memchr. HTTP/1: name
+    truncated requests and body timeouts among the connection-end causes.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Thu, 12 Nov 2026 00:00:00 +0000
+
 httpjet (0.2.1-1) stable; urgency=medium
 
   * Page cache: size the store-admission filter so a never-requested URL

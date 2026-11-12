@@ -1767,6 +1767,9 @@ pub struct PageStore {
     /// read, just before its older files are unlinked.
     #[cfg(test)]
     purge_sweep_probe: Mutex<Option<Box<dyn FnOnce(&PageStore) + Send>>>,
+    /// Makes the next store keep its body in RAM, as a failed write to the file tier does.
+    #[cfg(test)]
+    skip_next_persist: std::sync::atomic::AtomicBool,
     /// Entries the boot warm-scan loaded from the file tier (set once, when the scan finishes).
     scan_loaded: AtomicU64,
     /// Fan-out directories the boot warm-scan could not read (set once, with `scan_loaded`).
@@ -2033,6 +2036,8 @@ impl PageStore {
             purge_all_teardown_probe: Mutex::new(None),
             #[cfg(test)]
             purge_sweep_probe: Mutex::new(None),
+            #[cfg(test)]
+            skip_next_persist: std::sync::atomic::AtomicBool::new(false),
             scan_loaded: AtomicU64::new(0),
             scan_dir_errors: AtomicU64::new(0),
             body_id_seq: AtomicU64::new(1),
@@ -2871,7 +2876,11 @@ impl PageStore {
         // Final publication waits until the key's shard is locked and tag membership is visible,
         // so a concurrent purge can never delete or strand a boot-scannable in-flight version.
         let mut prepared = None;
-        if let (Some(disk), PageBody::InMem(bytes)) = (self.disk.as_ref(), &entry.body) {
+        #[cfg(test)]
+        let persist = !self.skip_next_persist.swap(false, Ordering::Relaxed);
+        #[cfg(not(test))]
+        let persist = true;
+        if persist && let (Some(disk), PageBody::InMem(bytes)) = (self.disk.as_ref(), &entry.body) {
             let stored_unix_ms = wall_ms_of(entry.stored_at);
             match disk.prepare_entry(&key, &entry, entry.dict_gen, bytes, stored_unix_ms) {
                 Ok(p) => prepared = Some((disk.clone(), p, bytes.len() as u32)),
@@ -3835,7 +3844,7 @@ impl PageStore {
         id: CacheKeyId,
         purge_epoch: u64,
         acc: &mut ShardAccess<'_, CacheKeyId, CacheEntry, StoreEvict>,
-    ) -> Option<(PageCacheKey, u64)> {
+    ) -> Option<Option<(PageCacheKey, u64)>> {
         enum Action {
             None,
             KeepFresh,
@@ -3865,7 +3874,7 @@ impl PageStore {
             }
             Action::Remove(version) => {
                 acc.teardown(&id, EvictCause::Explicit);
-                version
+                Some(version)
             }
         }
     }
@@ -3941,12 +3950,20 @@ impl PageStore {
                             // boot-scan install of this key either ran before the teardown
                             // or sees this record. Lock order: shard, then `scan_purge`.
                             if scan_pending {
-                                if let Some(buf) = self.scan_purge.lock().as_mut() {
-                                    let through = buf.swept.entry(*id).or_insert(sweep.1);
-                                    *through = (*through).max(sweep.1);
+                                // An entry whose body never reached the file tier has no
+                                // version of its own, but every inherited file of its key
+                                // is older than it all the same.
+                                let through = sweep.as_ref().map(|(_, seq)| *seq).or_else(|| {
+                                    self.disk.as_ref().map(|disk| disk.newest_version_seq())
+                                });
+                                if let (Some(through), Some(buf)) =
+                                    (through, self.scan_purge.lock().as_mut())
+                                {
+                                    let recorded = buf.swept.entry(*id).or_insert(through);
+                                    *recorded = (*recorded).max(through);
                                 }
                             }
-                            sweeps.push(sweep);
+                            sweeps.extend(sweep);
                         }
                     }
                 });
@@ -7036,6 +7053,44 @@ mod tests {
         }));
         store.purge_tags(&["live"]);
         assert_no_entry_outlived_its_file(dir.path(), &store, &key);
+    }
+
+    /// A live entry whose body stayed in RAM (the write to the file tier failed) has no
+    /// file version to sweep through. The purge that removes it must still keep the scan
+    /// from installing the key's inherited file, which carries other tags.
+    #[test]
+    fn boot_scan_does_not_restore_an_older_version_of_a_purged_entry_that_stayed_in_ram() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = PageCacheKey::public(1, true, "forum.example", "/thread/", "");
+        {
+            let ds = DiskStore::open(dir.path()).unwrap();
+            let e = entry(b"inherited", &["old"], Duration::from_secs(3600));
+            ds.write_entry(
+                &key,
+                &e,
+                0,
+                b"inherited",
+                wall_now_ms().saturating_sub(1_000),
+            )
+            .unwrap();
+        }
+        let store = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        store.skip_next_persist.store(true, Ordering::Relaxed);
+        assert!(store.store(
+            key.clone(),
+            entry(b"live", &["live"], Duration::from_secs(3600))
+        ));
+        assert_eq!(pc_files(dir.path()), 1, "the live body stayed in RAM");
+
+        store.purge_tags(&["live"]);
+        store.load_from_disk(|_| {});
+        assert_eq!(
+            store.scan_loaded(),
+            0,
+            "the page purged was newer than this file"
+        );
+        assert!(store.lookup(&key, "id", Instant::now()).is_none());
+        assert_eq!(pc_files(dir.path()), 0, "and the rejected file is gone");
     }
 
     /// The sweep spares a version newer than the one the purge tore down, so the scan

@@ -51,6 +51,18 @@ const AUTH_RATE_CLIENTS: usize = 1024;
 const AUTH_PENDING_PER_CLIENT: u32 = 16;
 const AUTH_CLIENT_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The address a client is accounted under. An IPv6 host has its whole /64 to send
+/// from, so every address in one is the same client: rotating through them must not
+/// mint a fresh attempt allowance and verification slot each time.
+fn rate_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(v6) => {
+            std::net::IpAddr::V6((u128::from(v6) & !u128::from(u64::MAX)).into())
+        }
+        v4 => v4,
+    }
+}
+
 /// Per-client Basic-auth accounting. An attempt is charged when admitted, before
 /// any work permit or hash, and refunded only when it authenticates. A client
 /// verifies one credential at a time, so it never holds more than one of the
@@ -78,7 +90,7 @@ impl AuthRate {
         ip: std::net::IpAddr,
         now: std::time::Instant,
     ) -> Option<Arc<tokio::sync::Semaphore>> {
-        let ip = ip.to_canonical();
+        let ip = rate_key(ip);
         self.clients.retain(|_, client| {
             if now.duration_since(client.start) < AUTH_RATE_WINDOW {
                 return true;
@@ -113,7 +125,7 @@ impl AuthRate {
     }
 
     fn finish(&mut self, ip: std::net::IpAddr, verified: bool) {
-        if let Some(client) = self.clients.get_mut(&ip.to_canonical()) {
+        if let Some(client) = self.clients.get_mut(&rate_key(ip)) {
             client.pending = client.pending.saturating_sub(1);
             if verified {
                 client.attempts = client.attempts.saturating_sub(1);
@@ -766,6 +778,23 @@ mod admission_tests {
             rate.finish(user, true);
         }
         assert!(rate.admit(client, now + AUTH_RATE_WINDOW).is_some());
+    }
+
+    #[test]
+    fn ipv6_addresses_in_one_slash_64_are_one_client() {
+        let mut rate = AuthRate::default();
+        let now = std::time::Instant::now();
+        for n in 0..AUTH_RATE_ATTEMPTS {
+            let rotated = ip(&format!("2001:db8:1:2::{n:x}"));
+            assert!(rate.admit(rotated, now).is_some());
+            rate.finish(rotated, false);
+        }
+        assert!(
+            rate.admit(ip("2001:db8:1:2:ffff::1"), now).is_none(),
+            "a new address in the same /64 is the same client"
+        );
+        assert_eq!(rate.clients.len(), 1);
+        assert!(rate.admit(ip("2001:db8:1:3::1"), now).is_some());
     }
 
     #[test]

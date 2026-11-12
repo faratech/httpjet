@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 
@@ -74,18 +74,41 @@ fn read_htaccess_capped(file: &Path) -> std::io::Result<Vec<u8>> {
 /// CLOSED: truncating the walk would skip a deeper ancestor's deny and serve).
 const MAX_CHAIN_DEPTH: usize = 64;
 
-/// A cache entry: the parsed `.htaccess`, the mtime it was parsed at, and when
+/// What tells one version of an access file from the next. The modification time
+/// alone survives a content change made by `cp -p`, `rsync -t` or a deploy tree with
+/// fixed timestamps; the inode change time cannot be set from user space.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    size: u64,
+    inode: (u64, u64),
+}
+
+impl FileStamp {
+    fn of(file: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(file).ok()?;
+        Some(Self {
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+            size: m.size(),
+            inode: (m.dev(), m.ino()),
+        })
+    }
+}
+
+/// A cache entry: the parsed `.htaccess`, the stamp it was parsed at, and when
 /// we last validated it (for `REVALIDATE_TTL` coalescing).
 struct Entry {
     /// `None` means "we checked and there is no `.htaccess` in this dir".
     parsed: Option<Arc<Htaccess>>,
-    mtime: Option<SystemTime>,
+    stamp: Option<FileStamp>,
     checked_at: Instant,
     /// The file exists but could not be read, so `parsed` is the deny-all
     /// sentinel standing in for rules we could not see. Re-read on every
-    /// revalidation instead of trusting an unchanged mtime: fixing permissions
-    /// (`chmod`) or recovering from a transient `read()` failure (EMFILE, EIO)
-    /// leaves the mtime untouched.
+    /// revalidation instead of trusting an unchanged stamp: recovering from a
+    /// transient `read()` failure (EMFILE, EIO) changes nothing about the file.
     read_failed: bool,
     /// The directory itself does not exist (or is not a directory), so neither
     /// it nor anything beneath it can hold an access file: the chain walk stops
@@ -210,14 +233,14 @@ impl HtaccessCache {
             return cache;
         };
         for entry in previous.inner.iter() {
-            if entry.parsed.is_none() || entry.read_failed || entry.mtime.is_none() {
+            if entry.parsed.is_none() || entry.read_failed || entry.stamp.is_none() {
                 continue;
             }
             cache.inner.insert(
                 entry.key().clone(),
                 Entry {
                     parsed: entry.parsed.clone(),
-                    mtime: entry.mtime,
+                    stamp: entry.stamp,
                     checked_at: expired,
                     read_failed: false,
                     dir_missing: false,
@@ -233,17 +256,17 @@ impl HtaccessCache {
         self.parses.load(Ordering::Relaxed)
     }
 
-    /// The cached entry for `file` if it is still the file at `cur_mtime`, with its
+    /// The cached entry for `file` if it is still the file at `cur_stamp`, with its
     /// check time refreshed.
     fn revalidated(
         &self,
         file: &Path,
         dir: &Path,
-        cur_mtime: Option<SystemTime>,
+        cur_stamp: Option<FileStamp>,
     ) -> Option<(Option<Arc<Htaccess>>, bool, Instant)> {
         let mut entry = self.inner.get_mut(file)?;
         // A missing directory must still be missing: a newly created one may carry rules.
-        if entry.mtime == cur_mtime && !entry.read_failed && (!entry.dir_missing || !is_dir(dir)) {
+        if entry.stamp == cur_stamp && !entry.read_failed && (!entry.dir_missing || !is_dir(dir)) {
             entry.checked_at = Instant::now();
             return Some((
                 entry.parsed.clone(),
@@ -386,17 +409,17 @@ impl HtaccessCache {
             }
         }
 
-        let cur_mtime = std::fs::metadata(&file).and_then(|m| m.modified()).ok();
+        let cur_stamp = FileStamp::of(&file);
 
-        // Revalidate: if mtime is unchanged, refresh the check timestamp and reuse.
-        if let Some(hit) = self.revalidated(&file, dir, cur_mtime) {
+        // Revalidate: if the file is unchanged, refresh the check timestamp and reuse.
+        if let Some(hit) = self.revalidated(&file, dir, cur_stamp) {
             return hit;
         }
 
         // Cache miss or stale. An existing file is read and parsed by one thread at a
         // time; the others wait and then find its entry, instead of every request that
         // arrives after a restart or an edit parsing the same file on its own thread.
-        let parse_guard = cur_mtime.is_some().then(|| {
+        let parse_guard = cur_stamp.is_some().then(|| {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             file.hash(&mut hasher);
@@ -405,7 +428,7 @@ impl HtaccessCache {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
         if parse_guard.is_some()
-            && let Some(hit) = self.revalidated(&file, dir, cur_mtime)
+            && let Some(hit) = self.revalidated(&file, dir, cur_stamp)
         {
             return hit;
         }
@@ -415,12 +438,12 @@ impl HtaccessCache {
         // encoding) must not downgrade a protected directory to "no rules".
         let read_result =
             read_htaccess_capped(&file).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
-        let read_failed = cur_mtime.is_some() && read_result.is_err();
-        let dir_missing = cur_mtime.is_none() && !is_dir(dir);
-        if cur_mtime.is_some() && read_result.is_ok() {
+        let read_failed = cur_stamp.is_some() && read_result.is_err();
+        let dir_missing = cur_stamp.is_none() && !is_dir(dir);
+        if cur_stamp.is_some() && read_result.is_ok() {
             self.parses.fetch_add(1, Ordering::Relaxed);
         }
-        let parsed = match (cur_mtime, read_result) {
+        let parsed = match (cur_stamp, read_result) {
             // The rewrite prefilter is built afterwards, off this thread: it is most
             // of the cost of a long rule chain, and the rules give the same result
             // without it.
@@ -474,7 +497,7 @@ impl HtaccessCache {
                 file,
                 Entry {
                     parsed: parsed.clone(),
-                    mtime: cur_mtime,
+                    stamp: cur_stamp,
                     checked_at,
                     read_failed,
                     dir_missing,

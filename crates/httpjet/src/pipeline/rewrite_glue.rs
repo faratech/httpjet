@@ -710,6 +710,18 @@ pub(super) fn run_rewrite_with_headers(
             }
         }
     }
+    // Pin the outcome to the rule sets that produced it. A re-parse mints new ids, so
+    // an edited access file is seen at once instead of when the entry expires.
+    {
+        use std::fmt::Write;
+        key_vars.push_str("\nr=");
+        if let Some(rs) = inline {
+            let _ = write!(key_vars, "{:x};", rs.id());
+        }
+        for (_, ht) in chain {
+            let _ = write!(key_vars, "{:x};", ht.rules.id());
+        }
+    }
     // The self-redirect guard reads the Host header's port (#703).
     if let Some(p) = host_header_port(headers) {
         key_vars.push_str("\nhp=");

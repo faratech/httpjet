@@ -2113,7 +2113,9 @@ fn service_conn(
             );
         }
     }
-    if st.connected || st.rejected {
+    // A discarded connection is serviced again when another datagram reaches it before
+    // the reap; its slot must still be there for the reap to hold.
+    if (st.connected || st.rejected) && !st.discard {
         st.handshake_slot = None;
     }
     for id in readable {
@@ -7498,6 +7500,47 @@ mod admission_tests {
         assert_eq!(h.handshakes.load(Relaxed), 1);
         release_aborted_handshake_slots(now + H3_ABORTED_HANDSHAKE_HOLD - Duration::from_millis(1));
         assert_eq!(h.handshakes.load(Relaxed), 1);
+        release_aborted_handshake_slots(Instant::now() + H3_ABORTED_HANDSHAKE_HOLD);
+        assert_eq!(h.handshakes.load(Relaxed), 0);
+    }
+
+    /// A second datagram for a connection that was lost before its handshake (a repeat of
+    /// the same Initial is enough) gets it serviced again before the reap. That pass used
+    /// to free the handshake slot, so a flood of such pairs never reached the Retry
+    /// threshold.
+    #[test]
+    fn a_dropped_handshake_serviced_again_before_the_reap_still_counts() {
+        let mut h = Harness::new(0);
+        let now = Instant::now();
+        let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
+        let (_, mut client) = h.connect(now);
+        client.close(now, 0u32.into(), Bytes::new());
+        let datagram = Harness::first_datagram(&mut client, now);
+
+        let (hd, conn, state) = h.accepted(spoofed(1), &datagram, now);
+        let mut conns = HashMap::from([(hd, conn)]);
+        let mut h3 = HashMap::from([(hd, state)]);
+        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        assert!(h3[&hd].discard);
+        service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
+        assert_eq!(
+            h.handshakes.load(Relaxed),
+            1,
+            "the second pass kept the slot"
+        );
+
+        let mut deadlines = ConnectionDeadlineIndex::default();
+        let mut to_drive = std::collections::HashSet::from([hd]);
+        reap_connections(
+            &mut h.server,
+            &mut conns,
+            &mut h3,
+            &mut deadlines,
+            &mut to_drive,
+            vec![hd],
+        );
+        assert!(conns.is_empty() && h3.is_empty());
+        assert_eq!(h.handshakes.load(Relaxed), 1, "held after the reap");
         release_aborted_handshake_slots(Instant::now() + H3_ABORTED_HANDSHAKE_HOLD);
         assert_eq!(h.handshakes.load(Relaxed), 0);
     }

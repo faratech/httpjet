@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "hj-cache"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hj-config",
  "parking_lot",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "hj-config"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ipnet",
  "quick-xml",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "hj-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "hj-fastcgi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "hj-h2"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "futures-util",
@@ -288,6 +288,7 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "memchr",
  "rustc-hash",
  "rustix",
  "tokio",
@@ -296,7 +297,7 @@ dependencies = [
 
 [[package]]
 name = "hj-lsapi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -316,7 +317,7 @@ dependencies = [
 
 [[package]]
 name = "hj-pagecache"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "dashmap",

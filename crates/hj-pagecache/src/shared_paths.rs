@@ -58,14 +58,16 @@ pub fn path_has_segment_prefix(path: &str, prefix: &str) -> bool {
     }
 }
 
-/// `query` carries the parameter `param` with a value — `param=` as a whole
-/// parameter name at the start of the query or right after `&` (the same shape
-/// the `.htaccess` `(^|&)image=` conditions test). Name match is exact and
-/// case-sensitive; `paramx=…` or a bare `param` (no `=`) do not count.
+/// `query` carries the parameter `param` with a value — `param=…` as a whole
+/// parameter name at the start of the query or right after `&`. Name match is exact
+/// and case-sensitive; `paramx=…`, a bare `param` and an empty `param=` do not count:
+/// an empty value selects nothing, so the endpoint answers for its other parameters
+/// (`proxy.php?image=&link=…` is the link proxy, not an image).
 fn query_has_param(query: &str, param: &str) -> bool {
     query.split('&').any(|kv| {
         kv.strip_prefix(param)
-            .is_some_and(|rest| rest.starts_with('='))
+            .and_then(|rest| rest.strip_prefix('='))
+            .is_some_and(|value| !value.is_empty())
     })
 }
 
@@ -221,6 +223,9 @@ mod tests {
         assert!(!m.matches("/proxy.php", ""));
         // Link-proxy form (no image=) stays unmatched.
         assert!(!m.matches("/proxy.php", "link=https%3A%2F%2Fx&hash=abc"));
+        // So does the link proxy reached with an empty image value.
+        assert!(!m.matches("/proxy.php", "image=&link=https%3A%2F%2Fx&hash=abc"));
+        assert!(!m.matches("/proxy.php", "image="));
     }
 
     #[test]

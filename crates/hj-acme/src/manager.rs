@@ -274,10 +274,19 @@ impl AcmeManager {
             account
         };
         let mut order = if let Some(pending) = &self.state.order {
-            account
-                .order(pending.url.clone().ok_or(ManagerError::UncertainOrder)?)
-                .await
-                .map_err(|_| ManagerError::Authority)?
+            let url = pending.url.clone().ok_or(ManagerError::UncertainOrder)?;
+            match account.order(url).await {
+                Ok(order) => order,
+                Err(_) => {
+                    // The authority no longer serves this order to this account
+                    // (expired or removed), so no retry can finish it.
+                    if matches!(self.http.last_status(), 403 | 404 | 410) {
+                        self.state.order = None;
+                        self.persist()?;
+                    }
+                    return Err(ManagerError::Authority);
+                }
+            }
         } else {
             let key = rcgen::KeyPair::generate().map_err(|_| ManagerError::Crypto)?;
             let mut params = rcgen::CertificateParams::new(self.state.domains.clone())
@@ -299,10 +308,19 @@ impl AcmeManager {
                 .cloned()
                 .map(Identifier::Dns)
                 .collect::<Vec<_>>();
-            let order = account
-                .new_order(&NewOrder::new(&identifiers))
-                .await
-                .map_err(|_| ManagerError::Authority)?;
+            let order = match account.new_order(&NewOrder::new(&identifiers)).await {
+                Ok(order) => order,
+                Err(_) => {
+                    // An error status is the authority's answer: no order exists, so
+                    // the marker for an unknown outcome must not outlive it. Only a
+                    // request that got no answer leaves the outcome unknown.
+                    if self.http.last_status() >= 400 {
+                        self.state.order = None;
+                        self.persist()?;
+                    }
+                    return Err(ManagerError::Authority);
+                }
+            };
             if !order.url().parse().is_ok_and(|u| self.http.permits(&u)) {
                 return Err(ManagerError::Authority);
             }
@@ -310,6 +328,13 @@ impl AcmeManager {
             self.persist()?;
             order
         };
+        // A stored order can have failed since the attempt that created it (its
+        // challenge was never answered). It stays failed: start over next time.
+        if matches!(order.state().status, OrderStatus::Invalid) {
+            self.state.order = None;
+            self.persist()?;
+            return Err(ManagerError::Authority);
+        }
         let mut leases = Vec::new();
         if order.state().authorizations.len() > 100 {
             return Err(ManagerError::Authority);
@@ -330,7 +355,12 @@ impl AcmeManager {
             match auth.status {
                 AuthorizationStatus::Valid => continue,
                 AuthorizationStatus::Pending => {}
-                _ => return Err(ManagerError::Challenge),
+                _ => {
+                    // Final for this order, whatever the order itself still reports.
+                    self.state.order = None;
+                    self.persist()?;
+                    return Err(ManagerError::Challenge);
+                }
             }
             let mut challenge = auth
                 .challenge(if self.config.is_dns01() {
@@ -439,7 +469,7 @@ impl AcmeManager {
             .map_err(|_| ManagerError::State)?
             .as_secs();
         let remaining = validated.expires_unix().saturating_sub(now);
-        let jitter = u64::from(self.state.account_key[0]) * (remaining / 20) / 256;
+        let jitter = renewal_jitter(&self.state.account_key, remaining);
         self.state.next_attempt = now.saturating_add((remaining * 2 / 3).saturating_sub(jitter));
         self.state.installed = Some(issued);
         self.state.failures = 0;
@@ -504,6 +534,12 @@ impl AcmeManager {
         pending.url = Some(url.to_owned());
         self.persist()
     }
+}
+
+/// Up to 5% of the remaining lifetime, fixed per account so hosts renew at different
+/// times. The key's first byte is the same DER tag in every key; its last byte is not.
+fn renewal_jitter(account_key: &[u8], remaining: u64) -> u64 {
+    u64::from(account_key.last().copied().unwrap_or(0)) * (remaining / 20) / 256
 }
 
 #[cfg(test)]

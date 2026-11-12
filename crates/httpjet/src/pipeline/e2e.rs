@@ -2956,6 +2956,48 @@ async fn fast_serve_cookied(state: &Arc<ServerState>, path: &str) -> Option<Resp
     .await
 }
 
+/// An edited access file must change rewrite results as soon as it is parsed again,
+/// not when the outcome cached for the old rules expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edited_rule_set_is_not_answered_from_the_old_rules_outcome() {
+    let doc_root = temp_root("outcome-edit");
+    std::fs::write(doc_root.join("b.txt"), b"b").unwrap();
+    std::fs::write(doc_root.join("c.txt"), b"c").unwrap();
+    let access_file = doc_root.join(".htaccess");
+    std::fs::write(
+        &access_file,
+        "RewriteEngine On\nRewriteRule ^a$ /b.txt [L]\n",
+    )
+    .unwrap();
+    let state = build_state_tuned(
+        doc_root.clone(),
+        Vec::new(),
+        Vec::new(),
+        true,
+        None,
+        None,
+        |_| {},
+        crate::state::RewriteTuning {
+            outcome_ttl: std::time::Duration::from_secs(60),
+            ..Default::default()
+        },
+    );
+    for _ in 0..2 {
+        let resp = run(&state, get(CANON_HOST, "/a", None)).await;
+        assert_eq!(body_bytes(resp.into_body()).as_ref(), b"b");
+    }
+    std::fs::write(
+        &access_file,
+        "RewriteEngine On\nRewriteRule ^a$ /c.txt [L]\n",
+    )
+    .unwrap();
+    // Past the access-file cache's one-second revalidation interval.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let resp = run(&state, get(CANON_HOST, "/a", None)).await;
+    assert_eq!(body_bytes(resp.into_body()).as_ref(), b"c");
+    std::fs::remove_dir_all(doc_root).ok();
+}
+
 /// A cookied request can only be served on-core from a file at its unrewritten path; a
 /// front-controller URL names none, so it bridges before the prefix runs (the rewrite
 /// engine is never consulted) while a cookied static file still serves on-core.
@@ -6783,6 +6825,144 @@ async fn sub_filter_range_serves_full_filtered_entity() {
         );
     }
     std::fs::remove_dir_all(doc_root).ok();
+}
+
+/// No request under a filtered context reaches its handler with `Range`, so no
+/// response there may advertise byte ranges, whether its body was filtered or not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_filter_context_never_advertises_ranges_it_ignores() {
+    let doc_root = temp_root("subfilter-no-ranges");
+    std::fs::write(doc_root.join("clip.bin"), vec![7_u8; 4096]).unwrap();
+    let state = build_state_with(
+        doc_root.clone(),
+        vec![sub_filter_context(
+            "/",
+            &[("SECRET-TOKEN", "redacted")],
+            false,
+        )],
+        Vec::new(),
+    );
+    let resp = run(
+        &state,
+        get_with(CANON_HOST, "/clip.bin", &[("range", "bytes=0-1")]),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get(header::ACCEPT_RANGES).is_none());
+    assert_eq!(body_bytes(resp.into_body()).len(), 4096);
+    std::fs::remove_dir_all(doc_root).ok();
+}
+
+/// Upstream that, like any real backend, compresses when the request allows it and
+/// reports the `Accept-Encoding` values it was sent.
+async fn spawn_compressing_upstream() -> (
+    SocketAddr,
+    Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+            let accept = head
+                .lines()
+                .find_map(|line| line.strip_prefix("accept-encoding:"))
+                .map(|value| value.trim().to_string())
+                .unwrap_or_default();
+            let compress = accept.contains("gzip");
+            record.lock().unwrap().push(accept);
+            let body: &[u8] = if head.starts_with("head ") {
+                b""
+            } else if compress {
+                b"\x1f\x8bopaque"
+            } else {
+                b"SECRET-TOKEN world"
+            };
+            let encoding = if compress {
+                "Content-Encoding: gzip\r\n"
+            } else {
+                ""
+            };
+            let length = if compress { 8 } else { 18 };
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{encoding}Content-Length: {length}\r\n\
+                 ETag: \"upstream\"\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.write_all(body).await;
+        }
+    });
+    (address, seen, task)
+}
+
+fn sub_filter_proxy_state(tag: &str, address: SocketAddr) -> Arc<ServerState> {
+    let mut context = sub_filter_context("/", &[("SECRET-TOKEN", "redacted")], false);
+    context.kind = ContextKind::Proxy;
+    context.handler = Some("test-upstream".into());
+    build_state_inner(
+        temp_root(tag),
+        vec![context],
+        Vec::new(),
+        false,
+        None,
+        None,
+        |server| register_upstream(server, address),
+    )
+}
+
+/// The client chooses `Accept-Encoding`. Forwarded as sent, it made the upstream
+/// answer with compressed bytes, which the filter passes through untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_filter_asks_a_proxied_upstream_for_the_identity_entity() {
+    let (address, seen, upstream) = spawn_compressing_upstream().await;
+    let state = sub_filter_proxy_state("subfilter-proxy-identity", address);
+    let resp = run(
+        &state,
+        get_with(CANON_HOST, "/page", &[("accept-encoding", "gzip")]),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(seen.lock().unwrap().as_slice(), ["identity"]);
+    assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+    assert_eq!(response_text(resp).await, "redacted world");
+    upstream.abort();
+}
+
+/// A proxied HEAD has an empty stream for a body. Filtering "it" replaced the
+/// upstream's length with zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sub_filter_does_not_measure_the_missing_body_of_a_backend_head() {
+    let (address, _seen, upstream) = spawn_compressing_upstream().await;
+    let state = sub_filter_proxy_state("subfilter-proxy-head", address);
+    let head = http::Request::builder()
+        .method("HEAD")
+        .uri("/page")
+        .header(header::HOST, CANON_HOST)
+        .body(hj_core::empty_incoming())
+        .unwrap();
+    let resp = run(&state, head).await;
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get(header::CONTENT_LENGTH).is_none(),
+        "the filtered length of the GET is unknown: {:?}",
+        resp.headers().get(header::CONTENT_LENGTH)
+    );
+    assert!(resp.headers().get(header::ETAG).is_none());
+    upstream.abort();
 }
 
 /// (#784) A precompressed sibling would bypass sub_filter; filtered paths

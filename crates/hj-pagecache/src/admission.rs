@@ -26,6 +26,8 @@ const DEPTH: usize = 4;
 /// Counters per block. A key's [`DEPTH`] counters share one block, and a block is one
 /// cache line, so a record or an estimate costs one cache miss however large the table is.
 const BLOCK: usize = 64;
+/// Counters in each of the [`DEPTH`] quarters of a block.
+const LANE: usize = BLOCK / DEPTH;
 
 /// Counters per record of one aging period. At 16 the share of never-recorded keys that
 /// already read 1 or more stays under 1% in steady state (distinct keys recorded once
@@ -130,12 +132,13 @@ impl AdmissionFilter {
         let h = (key ^ (key >> 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let block = &self.blocks[(h >> self.block_shift) as usize];
         let low = h ^ (h >> 29);
-        let first = (low >> 20) as usize & (BLOCK - 1);
-        // An odd step visits DEPTH distinct slots of the 64.
-        let step = ((low >> 26) as usize & (BLOCK - 1)) | 1;
+        // One counter in each quarter of the block. They are distinct by position, and
+        // a block has 16^4 slot sets: a key that was never recorded rarely finds all
+        // four of its counters raised by one other key. (A start and a step gave 1,024
+        // sets and close to twice the false positives.)
         (
             block,
-            std::array::from_fn(|i| (first + i * step) & (BLOCK - 1)),
+            std::array::from_fn(|i| i * LANE + ((low >> (20 + 4 * i)) as usize & (LANE - 1))),
         )
     }
 
@@ -420,8 +423,10 @@ mod tests {
             ("3 GiB", 3 << 30),
         ] {
             let share = unseen_share_reading_zero(max_mem_bytes, 2);
+            // One slot per quarter of the block reads 99.8% or better here; a start and
+            // a step inside the block read 99.5% at the largest size.
             assert!(
-                share >= 0.97,
+                share >= 0.997,
                 "cache budget {budget}: only {:.1}% of never-requested keys read 0",
                 share * 100.0
             );

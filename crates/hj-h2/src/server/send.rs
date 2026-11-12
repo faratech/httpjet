@@ -91,6 +91,8 @@ async fn pull_next(
 /// validation pass plus a heap copy of every Link value on every response. Every match
 /// site of the four old substring needles starts with `rel=`, so anchoring there and
 /// prefix-testing the (optionally quoted) relation is needle-for-needle equivalent.
+/// The anchor is found by its `=`: a response carries kilobytes of Link values, and
+/// comparing a 4-byte window at every offset was the hottest loop of the cache-hit path.
 pub fn is_early_hint_link(v: &http::HeaderValue) -> bool {
     fn rel_at(rest: &[u8]) -> bool {
         for rel in [&b"preload"[..], b"preconnect"] {
@@ -111,9 +113,12 @@ pub fn is_early_hint_link(v: &http::HeaderValue) -> bool {
         false
     }
     let b = v.as_bytes();
-    b.windows(4)
-        .enumerate()
-        .any(|(i, w)| w.eq_ignore_ascii_case(b"rel=") && rel_at(&b[i + 4..]))
+    memchr::memchr_iter(b'=', b).any(|eq| {
+        eq.checked_sub(3)
+            .and_then(|start| b.get(start..eq))
+            .is_some_and(|name| name.eq_ignore_ascii_case(b"rel"))
+            && b.get(eq + 1..).is_some_and(rel_at)
+    })
 }
 
 /// Write a field block as a HEADERS frame plus any CONTINUATION frames, never exceeding the
@@ -889,6 +894,71 @@ mod tests {
         ] {
             assert!(!is_early_hint_link(&hv(no)), "should NOT hint: {no}");
         }
+    }
+
+    #[test]
+    fn early_hint_link_matcher_agrees_with_the_window_scan() {
+        fn window_scan(b: &[u8]) -> bool {
+            fn rel_at(rest: &[u8]) -> bool {
+                [&b"preload"[..], b"preconnect"].iter().any(|rel| {
+                    (rest.len() >= rel.len() && rest[..rel.len()].eq_ignore_ascii_case(rel))
+                        || (rest.first() == Some(&b'"')
+                            && rest.len() > rel.len() + 1
+                            && rest[1..=rel.len()].eq_ignore_ascii_case(rel)
+                            && rest[rel.len() + 1] == b'"')
+                })
+            }
+            b.windows(4)
+                .enumerate()
+                .any(|(i, w)| w.eq_ignore_ascii_case(b"rel=") && rel_at(&b[i + 4..]))
+        }
+        // Fragments that make matches, near misses and `=` in every position likely.
+        let parts: [&[u8]; 16] = [
+            b"rel=",
+            b"REL=",
+            b"el=",
+            b"=",
+            b"r",
+            b"\"",
+            b"preload",
+            b"PreConnect",
+            b"preloa",
+            b"; ",
+            b"</a.css?v=1&s=2>",
+            b"as=style",
+            b"rel",
+            b"=rel=",
+            b"canonical",
+            b" ",
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let (mut hints, mut plain) = (0u32, 0u32);
+        for _ in 0..20_000 {
+            let mut value = Vec::new();
+            for _ in 0..next() % 9 {
+                value.extend_from_slice(parts[(next() % 16) as usize]);
+            }
+            let expected = window_scan(&value);
+            let header = http::HeaderValue::from_bytes(&value).unwrap();
+            assert_eq!(
+                is_early_hint_link(&header),
+                expected,
+                "{}",
+                String::from_utf8_lossy(&value)
+            );
+            if expected {
+                hints += 1;
+            } else {
+                plain += 1;
+            }
+        }
+        assert!(hints > 500 && plain > 500, "{hints} hints, {plain} plain");
     }
 
     #[test]

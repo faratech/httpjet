@@ -25,6 +25,7 @@ monoio = { workspace = true, optional = true }
 libc = { version = "0.2", optional = true }
 hj-core = { workspace = true }
 bytes = { workspace = true }
+memchr = "2"
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }

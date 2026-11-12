@@ -2059,9 +2059,10 @@ async fn handle_inner(
     let bw_path = (has_bandwidth_context(&ctx.vhost) || has_sub_filter_context(&ctx.vhost))
         .then(|| decode_request_path(req.uri().path()).map(|p| normalized_request_path(&p)))
         .flatten();
-    if let Some(p) = &bw_path
-        && sub_filter_matches(&ctx, p)
-    {
+    let sub_filtered = bw_path
+        .as_ref()
+        .is_some_and(|p| sub_filter_matches(&ctx, p));
+    if sub_filtered {
         // Like nginx sub_filter: a filtered body is a whole new entity, so a
         // byte range of the source file must never be served in its place.
         strip_sub_filter_request(&mut req);
@@ -2087,6 +2088,15 @@ async fn handle_inner(
             .and_then(|v| v.to_str().ok())
         {
             ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
+        }
+        if sub_filtered {
+            // A proxied upstream that honours the client's Accept-Encoding answers
+            // with bytes the filter cannot read, and the body would pass unfiltered.
+            // The client's own encoding is negotiated from the value captured above.
+            req.headers_mut().insert(
+                http::header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
         }
         set_redirect_guard(&mut ctx, req.uri(), &req_host);
         if state.extensions.has_pre_handlers() {
@@ -2481,7 +2491,21 @@ impl hj_core::ResponseTransform for SubFilterTransform {
             return;
         };
         let plan = plan.0;
+        // The request reached its handler without `Range`, so no response on this
+        // path honours one.
+        resp.headers_mut().remove(http::header::ACCEPT_RANGES);
         if !Self::eligible(&plan, resp) {
+            return;
+        }
+        if resp
+            .extensions()
+            .get::<hj_compress::HeadResponse>()
+            .is_some()
+            && !matches!(resp.body(), Body::Empty)
+        {
+            // A backend's reply to HEAD carries an empty stream: "filtering" it would
+            // replace the entity's length with zero.
+            forget_unfiltered_entity(&plan, resp);
             return;
         }
         let body = std::mem::replace(resp.body_mut(), Body::Empty);
@@ -2638,13 +2662,7 @@ fn head_sub_filter(plan: &hj_core::config::SubFilterConfig, resp: &mut Response)
         return;
     };
     let Some(target) = resp.extensions().get::<hj_static::ResolvedTargetPath>() else {
-        // Not a static representation (a backend HEAD): its GET body may be
-        // filtered, so never hand out the unfiltered validators.
-        let h = resp.headers_mut();
-        h.remove(ETAG);
-        if !plan.keep_last_modified {
-            h.remove(LAST_MODIFIED);
-        }
+        forget_unfiltered_entity(plan, resp);
         return;
     };
     let Ok(bytes) = read_regular_file_exact(&target.0, declared) else {
@@ -2655,6 +2673,17 @@ fn head_sub_filter(plan: &hj_core::config::SubFilterConfig, resp: &mut Response)
         return;
     };
     finalize_filtered(resp, plan, filtered.len());
+}
+
+/// A HEAD answered by a backend describes the unfiltered entity. Its GET body may be
+/// filtered, so neither that length nor those validators can be handed out.
+fn forget_unfiltered_entity(plan: &hj_core::config::SubFilterConfig, resp: &mut Response) {
+    let h = resp.headers_mut();
+    h.remove(CONTENT_LENGTH);
+    h.remove(ETAG);
+    if !plan.keep_last_modified {
+        h.remove(LAST_MODIFIED);
+    }
 }
 
 /// Read a regular file of exactly `len` bytes without blocking on a planted FIFO.

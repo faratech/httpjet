@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -17,12 +17,16 @@ use instant_acme::{BodyWrapper, BytesResponse, Error, HttpClient};
 use crate::Directory;
 
 const MAX_BODY: usize = 1024 * 1024;
+/// The longest wait a `Retry-After` may impose. The value is persisted, so an
+/// unbounded one would stop renewal for good.
+const MAX_RETRY_AFTER: u64 = 7 * 24 * 3600;
 
 #[derive(Clone)]
 pub(crate) struct BoundedHttp {
     client: reqwest::Client,
     directory: Directory,
     retry_after: Arc<AtomicU64>,
+    last_status: Arc<AtomicU16>,
 }
 
 impl BoundedHttp {
@@ -49,6 +53,7 @@ impl BoundedHttp {
                 .map_err(|_| Error::Str("ACME HTTP initialization failed"))?,
             directory,
             retry_after: Arc::new(AtomicU64::new(0)),
+            last_status: Arc::new(AtomicU16::new(0)),
         })
     }
 
@@ -77,6 +82,11 @@ impl BoundedHttp {
     pub(crate) fn retry_after(&self) -> u64 {
         self.retry_after.load(Ordering::Relaxed)
     }
+
+    /// The HTTP status of the most recent request, or 0 when it got no response.
+    pub(crate) fn last_status(&self) -> u16 {
+        self.last_status.load(Ordering::Relaxed)
+    }
 }
 
 impl HttpClient for BoundedHttp {
@@ -93,6 +103,7 @@ impl HttpClient for BoundedHttp {
                     "ACME request outside permitted origin or method",
                 ));
             }
+            this.last_status.store(0, Ordering::Relaxed);
             let (parts, body) = req.into_parts();
             let body = body.collect().await.unwrap().to_bytes();
             if body.len() > MAX_BODY {
@@ -106,6 +117,8 @@ impl HttpClient for BoundedHttp {
                 .send()
                 .await
                 .map_err(|_| Error::Str("ACME HTTP request failed"))?;
+            this.last_status
+                .store(response.status().as_u16(), Ordering::Relaxed);
             if response.status().is_redirection() {
                 return Err(Error::Str("ACME redirects are prohibited"));
             }
@@ -130,7 +143,10 @@ impl HttpClient for BoundedHttp {
                             .map(|d| d.as_secs())
                     });
                 if let Some(until) = until {
-                    this.retry_after.fetch_max(until, Ordering::Relaxed);
+                    this.retry_after.fetch_max(
+                        until.min(now.saturating_add(MAX_RETRY_AFTER)),
+                        Ordering::Relaxed,
+                    );
                 }
             }
             if response

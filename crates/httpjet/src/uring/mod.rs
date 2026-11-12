@@ -2238,7 +2238,11 @@ async fn handle_h1_bridged<S>(
                             end.set(H1ConnEnd::RequestTimeout);
                             return;
                         }
-                        _ => {
+                        Ok(_) => {
+                            end.set(H1ConnEnd::Truncated);
+                            return;
+                        }
+                        Err(_) => {
                             end.set(H1ConnEnd::IoError);
                             return;
                         }
@@ -2320,7 +2324,11 @@ async fn handle_h1_bridged<S>(
                 if !outcome.failed {
                     lingering_close(&mut stream, &shutdown).await;
                 }
-                end.set(H1ConnEnd::Refused);
+                end.set(if outcome.failed {
+                    H1ConnEnd::IoError
+                } else {
+                    H1ConnEnd::Refused
+                });
                 return;
             }
         }
@@ -2416,7 +2424,15 @@ async fn handle_h1_bridged<S>(
                                 return;
                             }
                         }
-                        _ => {
+                        Ok(_) => {
+                            end.set(H1ConnEnd::Truncated);
+                            return;
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            end.set(H1ConnEnd::RequestTimeout);
+                            return;
+                        }
+                        Err(_) => {
                             end.set(H1ConnEnd::IoError);
                             return;
                         }
@@ -2495,7 +2511,15 @@ async fn handle_h1_bridged<S>(
                                         deadline.received(acc.len());
                                     }
                                 }
-                                _ => {
+                                Ok(_) => {
+                                    end.set(H1ConnEnd::Truncated);
+                                    return;
+                                }
+                                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                                    end.set(H1ConnEnd::RequestTimeout);
+                                    return;
+                                }
+                                Err(_) => {
                                     end.set(H1ConnEnd::IoError);
                                     return;
                                 }
@@ -2595,6 +2619,8 @@ async fn handle_h1_bridged<S>(
         #[cfg(not(feature = "otel"))]
         let response = dispatch.await;
         let Some(resp) = response else {
+            // The pipeline's runtime is gone: the server is going down.
+            end.set(H1ConnEnd::Shutdown);
             return;
         };
         #[cfg(feature = "otel")]
@@ -7565,6 +7591,22 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
 
         // The peer connects and leaves without a request.
         assert_eq!(h1_end_cause(100, drop), ["no_request"]);
+
+        // The peer closes cleanly part of the way through a head, then through a body.
+        assert_eq!(
+            h1_end_cause(100, move |mut stream| {
+                stream.write_all(b"GET /hint HTTP/1.1\r\nHost:").unwrap();
+            }),
+            ["truncated"]
+        );
+        assert_eq!(
+            h1_end_cause(100, move |mut stream| {
+                stream
+                    .write_all(b"POST /hint HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\nabc")
+                    .unwrap();
+            }),
+            ["truncated"]
+        );
 
         // A keep-alive request, then the peer closes between requests.
         assert_eq!(

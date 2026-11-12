@@ -112,6 +112,212 @@ async fn authority_retry_after_survives_restart() {
     server.await.unwrap();
 }
 
+/// A canned ACME authority on loopback: every reply carries a nonce, `/dir` is the
+/// directory, and `replies` maps a request path to a status line and a JSON body in
+/// which `{base}` stands for the authority's own origin.
+async fn fake_authority(
+    replies: &'static [(&'static str, &'static str, &'static str)],
+) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let origin = base.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut request = Vec::new();
+            let mut chunk = [0; 4096];
+            let head_end = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(end + 4);
+                }
+            };
+            let Some(head_end) = head_end else { continue };
+            let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < head_end + length {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&chunk[..n]);
+            }
+            let mut first = head.lines().next().unwrap().split(' ');
+            let (method, path) = (first.next().unwrap(), first.next().unwrap());
+            let (status, body) = if method == "HEAD" {
+                ("200 OK", String::new())
+            } else if path == "/dir" {
+                (
+                    "200 OK",
+                    format!(
+                        r#"{{"newNonce":"{origin}/nonce","newAccount":"{origin}/account","newOrder":"{origin}/new-order"}}"#
+                    ),
+                )
+            } else {
+                replies
+                    .iter()
+                    .find(|(known, _, _)| *known == path)
+                    .map(|(_, status, body)| (*status, body.replace("{base}", &origin)))
+                    .unwrap_or(("404 Not Found", "{}".into()))
+            };
+            let reply = format!(
+                "HTTP/1.1 {status}\r\nReplay-Nonce: nonce\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(reply.as_bytes()).await.unwrap();
+        }
+    });
+    (base, server)
+}
+
+/// A manager with an account the fake authority accepts, due for an attempt.
+fn manager_for(f: &Fixture, base: &str) -> AcmeManager {
+    let mut manager = AcmeManager::open(f.config(&format!("{base}/dir")), None).unwrap();
+    manager.state.account_id = Some(format!("{base}/account/1"));
+    manager.persist().unwrap();
+    manager
+}
+
+fn stored_order(base: &str) -> PendingOrder {
+    PendingOrder {
+        url: Some(format!("{base}/order/1")),
+        private_key: "pending".into(),
+        csr: vec![],
+    }
+}
+
+#[tokio::test]
+async fn a_refused_new_order_does_not_block_later_attempts() {
+    let f = Fixture::new();
+    let (base, server) = fake_authority(&[(
+        "/new-order",
+        "429 Too Many Requests",
+        r#"{"type":"urn:ietf:params:acme:error:rateLimited"}"#,
+    )])
+    .await;
+    let mut manager = manager_for(&f, &base);
+    assert_eq!(manager.issue().await.err(), Some(ManagerError::Authority));
+    assert!(
+        manager.state.order.is_none(),
+        "the authority refused: there is no order whose outcome is unknown"
+    );
+    manager.state.next_attempt = 0;
+    assert_eq!(manager.issue().await.err(), Some(ManagerError::Authority));
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_order_with_a_failed_authorization_is_abandoned() {
+    let f = Fixture::new();
+    let (base, server) = fake_authority(&[
+        (
+            "/order/1",
+            "200 OK",
+            r#"{"status":"pending","authorizations":["{base}/authz/1"],"finalize":"{base}/finalize/1"}"#,
+        ),
+        (
+            "/authz/1",
+            "200 OK",
+            r#"{"identifier":{"type":"dns","value":"example.test"},"status":"invalid","challenges":[]}"#,
+        ),
+    ])
+    .await;
+    let mut manager = manager_for(&f, &base);
+    manager.state.order = Some(stored_order(&base));
+    assert_eq!(manager.issue().await.err(), Some(ManagerError::Challenge));
+    assert!(
+        manager.state.order.is_none(),
+        "a failed authorization never recovers: the next attempt needs a new order"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_invalid_stored_order_is_abandoned() {
+    let f = Fixture::new();
+    let (base, server) = fake_authority(&[(
+        "/order/1",
+        "200 OK",
+        r#"{"status":"invalid","authorizations":[],"finalize":"{base}/finalize/1"}"#,
+    )])
+    .await;
+    let mut manager = manager_for(&f, &base);
+    manager.state.order = Some(stored_order(&base));
+    assert_eq!(manager.issue().await.err(), Some(ManagerError::Authority));
+    assert!(manager.state.order.is_none());
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_order_the_authority_no_longer_serves_is_abandoned_but_an_outage_keeps_it() {
+    let f = Fixture::new();
+    let (base, server) = fake_authority(&[(
+        "/order/1",
+        "503 Service Unavailable",
+        r#"{"type":"urn:ietf:params:acme:error:serverInternal"}"#,
+    )])
+    .await;
+    let mut manager = manager_for(&f, &base);
+    manager.state.order = Some(stored_order(&base));
+    assert_eq!(manager.issue().await.err(), Some(ManagerError::Authority));
+    assert!(
+        manager.state.order.is_some(),
+        "an outage says nothing about the order"
+    );
+    server.abort();
+
+    let f = Fixture::new();
+    let (base, server) = fake_authority(&[]).await;
+    let mut manager = manager_for(&f, &base);
+    manager.state.order = Some(stored_order(&base));
+    assert_eq!(manager.issue().await.err(), Some(ManagerError::Authority));
+    assert!(manager.state.order.is_none(), "404: the order is gone");
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_huge_retry_after_cannot_stop_renewal_for_good() {
+    let f = Fixture::new();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = f.config(&format!("http://{}/dir", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 4000000000\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+    });
+    let mut manager = AcmeManager::open(config, None).unwrap();
+    assert_eq!(manager.issue().await.err(), Some(ManagerError::Authority));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let wait = manager.next_attempt_unix() - now;
+    assert!(
+        (6 * 24 * 3600..=7 * 24 * 3600).contains(&wait),
+        "waits {wait} s"
+    );
+    server.await.unwrap();
+}
+
+#[test]
+fn renewal_jitter_differs_between_accounts() {
+    let remaining = 90 * 24 * 3600;
+    // Every PKCS#8 key starts with the same DER tag.
+    let jitter = |last: u8| renewal_jitter(&[0x30, 0x81, last], remaining);
+    assert_ne!(jitter(1), jitter(200));
+    assert!(jitter(255) <= remaining / 20);
+    assert_eq!(renewal_jitter(&[], remaining), 0);
+}
+
 struct Process(Child);
 struct FakeDns {
     scope: crate::DnsScope,

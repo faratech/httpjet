@@ -116,6 +116,8 @@ struct Inner {
     idle_timeout: Duration,
     state: Mutex<State>,
     changed: tokio::sync::Notify,
+    #[cfg(test)]
+    yield_before_wait: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone)]
@@ -141,6 +143,8 @@ impl FastCgiPool {
                 idle: VecDeque::new(),
             }),
             changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            yield_before_wait: std::sync::atomic::AtomicBool::new(false),
         })))
     }
 
@@ -161,6 +165,11 @@ impl FastCgiPool {
     async fn acquire_inner(&self, reuse_idle: bool) -> Result<PooledConnection, PoolError> {
         loop {
             let notified = self.0.changed.notified();
+            tokio::pin!(notified);
+            // Register before the state check. A `Notified` that has not been polled is
+            // not a waiter yet, and `notify_one` keeps a single permit: two releases
+            // landing between two callers' checks and their first polls woke only one.
+            notified.as_mut().enable();
             let reserve = {
                 let mut state = self.0.state.lock().expect("FastCGI pool lock poisoned");
                 let now = Instant::now();
@@ -225,6 +234,14 @@ impl FastCgiPool {
                     }
                     Err(_) => Err(PoolError::Connect),
                 };
+            }
+            #[cfg(test)]
+            if self
+                .0
+                .yield_before_wait
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                tokio::task::yield_now().await;
             }
             notified.await;
         }
@@ -355,6 +372,55 @@ mod tests {
         assert_eq!(pool.counts(), (0, 0));
         tokio::task::yield_now().await;
         assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn two_releases_wake_two_callers_that_have_not_started_waiting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let pool = FastCgiPool::new(
+            Endpoint::Tcp(address),
+            2,
+            Duration::from_millis(300),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let first = pool.acquire().await.unwrap();
+        let second = pool.acquire().await.unwrap();
+        // Both callers find the pool full, then give way before they wait.
+        pool.0
+            .yield_before_wait
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let callers = [
+            tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire().await }
+            }),
+            tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire().await }
+            }),
+        ];
+        tokio::task::yield_now().await;
+        drop(first);
+        drop(second);
+        // Each caller keeps its connection, so neither frees a slot for the other.
+        let mut held = Vec::new();
+        for caller in callers {
+            held.push(
+                caller
+                    .await
+                    .unwrap()
+                    .expect("each freed slot must reach a waiting caller"),
+            );
+        }
         server.abort();
     }
 

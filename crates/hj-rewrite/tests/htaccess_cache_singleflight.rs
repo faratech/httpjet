@@ -162,3 +162,37 @@ fn a_reload_starts_from_the_previous_parses_and_still_sees_edits() {
 
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A deploy that replaces an access file but keeps its modification time (`cp -p`,
+/// `rsync -t`, a tree with fixed timestamps) must not leave the old rules in force.
+#[test]
+fn a_replaced_file_with_the_same_modification_time_is_parsed_again() {
+    let dir = temp_dir("same-mtime");
+    let file = dir.join(".htaccess");
+    fs::write(&file, "RewriteEngine On\nRewriteRule ^a$ /b [L]\n").unwrap();
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+
+    let old = HtaccessCache::new();
+    let parsed = old.get_or_load_named(&dir, ".htaccess").unwrap();
+
+    // Same inode, same length, same modification time: only the rule differs.
+    std::thread::sleep(Duration::from_millis(20));
+    fs::write(&file, "RewriteEngine On\nRewriteRule ^a$ /c [L]\n").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), mtime);
+
+    let next = HtaccessCache::seeded_from(&old);
+    let fresh = next.get_or_load_named(&dir, ".htaccess").unwrap();
+    assert!(
+        !Arc::ptr_eq(&fresh, &parsed),
+        "the replaced file kept its old rules"
+    );
+    assert_eq!(next.parse_count(), 1);
+
+    fs::remove_dir_all(&dir).unwrap();
+}

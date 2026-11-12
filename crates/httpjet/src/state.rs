@@ -453,8 +453,10 @@ pub enum H1ConnEnd {
     ResponseClose,
     /// A request we refused with a 4xx and closed.
     Refused,
-    /// The request head did not arrive in time.
+    /// The request head or body did not arrive in time.
     RequestTimeout,
+    /// The peer closed cleanly in the middle of a request.
+    Truncated,
     /// A 503 for an exhausted body-buffer budget.
     Overload,
     /// The connection was handed to an upgraded protocol.
@@ -466,7 +468,7 @@ pub enum H1ConnEnd {
 }
 
 impl H1ConnEnd {
-    pub const ALL: [H1ConnEnd; 13] = [
+    pub const ALL: [H1ConnEnd; 14] = [
         H1ConnEnd::Idle,
         H1ConnEnd::PeerEof,
         H1ConnEnd::NoRequest,
@@ -476,6 +478,7 @@ impl H1ConnEnd {
         H1ConnEnd::ResponseClose,
         H1ConnEnd::Refused,
         H1ConnEnd::RequestTimeout,
+        H1ConnEnd::Truncated,
         H1ConnEnd::Overload,
         H1ConnEnd::Upgrade,
         H1ConnEnd::Shutdown,
@@ -493,6 +496,7 @@ impl H1ConnEnd {
             H1ConnEnd::ResponseClose => "response_close",
             H1ConnEnd::Refused => "refused",
             H1ConnEnd::RequestTimeout => "request_timeout",
+            H1ConnEnd::Truncated => "truncated",
             H1ConnEnd::Overload => "overload",
             H1ConnEnd::Upgrade => "upgrade",
             H1ConnEnd::Shutdown => "shutdown",
