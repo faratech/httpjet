@@ -237,7 +237,8 @@ fn build_begin_request_into<K, V, H>(
         let vb = value.as_bytes();
         let klen = 2 + nb.len() + 1; // \x01 + type + name + NUL
         let vlen = vb.len() + 1;
-        debug_assert!(
+        // Held in release too: a wrapped length prefix desynchronizes lsphp's parser.
+        assert!(
             klen <= u16::MAX as usize && vlen <= u16::MAX as usize,
             "LSAPI special-env field exceeds u16 length prefix (klen={klen}, vlen={vlen})"
         );
@@ -261,9 +262,9 @@ fn build_begin_request_into<K, V, H>(
         let vlen = vb.len() + 1;
         // (#3) The u16 length prefix would silently wrap (desyncing lsphp's env
         // parser) past 65535. The LSAPI handler rejects such requests with 431
-        // before reaching here; this assertion catches any caller that bypasses
-        // that guard during testing.
-        debug_assert!(
+        // before reaching here; a caller that bypasses that guard stops here, in
+        // release builds too, instead of sending a frame lsphp would misparse.
+        assert!(
             klen <= u16::MAX as usize && vlen <= u16::MAX as usize,
             "LSAPI env field exceeds u16 length prefix (klen={klen}, vlen={vlen})"
         );
@@ -348,8 +349,8 @@ fn build_begin_request_into<K, V, H>(
             Some(i) => {
                 // (#3) The known-header index `len` slot is also a u16; a value
                 // over 65535 bytes would truncate it. Guarded by the handler's
-                // 431 reject; assert in debug for any bypassing caller.
-                debug_assert!(
+                // 431 reject; a bypassing caller stops here in every build.
+                assert!(
                     vb.len() <= u16::MAX as usize,
                     "LSAPI known-header value exceeds u16 len slot ({})",
                     vb.len()
@@ -711,5 +712,35 @@ mod tests {
         // fields start at body offset 0 (== packet offset 8).
         assert_eq!(rd(0), 0, "httpHeaderLen == 0");
         assert_eq!(rd(24), 0, "cntUnknownHeaders == 0");
+    }
+
+    /// (#1235) The u16 length prefixes cannot represent these fields; the builder stops
+    /// rather than emit a wrapped length. The handler rejects such requests with 431
+    /// before it builds a frame.
+    #[test]
+    #[should_panic(expected = "LSAPI env field exceeds u16 length prefix")]
+    fn an_env_value_over_the_u16_prefix_is_refused() {
+        let env = vec![("HTTP_X_LONG".to_string(), "v".repeat(u16::MAX as usize))];
+        build_begin_request(&env, &[], &[] as &[(&str, &str)], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "LSAPI special-env field exceeds u16 length prefix")]
+    fn a_special_env_value_over_the_u16_prefix_is_refused() {
+        let env = vec![("REQUEST_METHOD".to_string(), "GET".to_string())];
+        let special_env = vec![(
+            SpecialEnvType::User,
+            "auto_prepend_file".to_string(),
+            "v".repeat(u16::MAX as usize),
+        )];
+        build_begin_request(&env, &special_env, &[] as &[(&str, &str)], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "LSAPI known-header value exceeds u16 len slot")]
+    fn a_known_header_value_over_the_u16_slot_is_refused() {
+        let env = vec![("REQUEST_METHOD".to_string(), "GET".to_string())];
+        let long = "v".repeat(u16::MAX as usize + 1);
+        build_begin_request(&env, &[], &[("Cookie", long.as_str())], 0);
     }
 }

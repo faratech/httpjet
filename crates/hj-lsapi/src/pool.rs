@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use memmap2::{Mmap, MmapMut, MmapOptions};
+use memmap2::{MmapOptions, MmapRaw};
 use parking_lot::Mutex;
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -193,7 +193,7 @@ fn validate_generation_dir(path: &Path) -> io::Result<()> {
 /// Mapping it once keeps generation checks on the request and re-pool paths to
 /// an Acquire atomic load, with no per-request filesystem operation.
 pub struct ExternalGeneration {
-    map: Mmap,
+    map: GenerationMap,
     /// The last two worker families this reader saw published. While a stop's
     /// retirement is current only they are stale: the successor supervisor's
     /// workers answer queued dials before it publishes their family.
@@ -225,14 +225,12 @@ impl ExternalGeneration {
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
         validate_generation_file(&file)?;
-        // SAFETY: the file length and alignment are validated; an mmap starts at
-        // page alignment, which is stricter than AtomicU64's alignment. Writers
-        // retain the fixed 16-byte file size for the lifetime of every mapping.
-        let map = unsafe {
+        // Writers retain the fixed 16-byte file size for the lifetime of every mapping.
+        let map = GenerationMap::new(
             MmapOptions::new()
                 .len(EXTERNAL_GENERATION_BYTES as usize)
-                .map(&file)?
-        };
+                .map_raw_read_only(&file)?,
+        )?;
         let generation = Self {
             map,
             seen_families: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -324,7 +322,7 @@ impl ExternalGeneration {
 /// non-empty malformed file: truncating a file while another process has it
 /// mapped could make that reader fault.
 pub struct ExternalGenerationWriter {
-    map: MmapMut,
+    map: GenerationMap,
     /// Serializes publications and records a stop-time retirement, after which
     /// a late promotion (a reload racing the stop) cannot re-announce a family.
     retired: Mutex<bool>,
@@ -348,13 +346,12 @@ impl ExternalGenerationWriter {
         } else if len != EXTERNAL_GENERATION_BYTES {
             return Err(invalid_generation_len(len));
         }
-        // SAFETY: as in ExternalGeneration::open; this owner never resizes the
-        // file after mapping it.
-        let map = unsafe {
+        // This owner never resizes the file after mapping it.
+        let map = GenerationMap::new(
             MmapOptions::new()
                 .len(EXTERNAL_GENERATION_BYTES as usize)
-                .map_mut(&file)?
-        };
+                .map_raw(&file)?,
+        )?;
         let writer = Self {
             map,
             retired: Mutex::new(false),
@@ -463,18 +460,44 @@ fn invalid_generation_len(len: u64) -> io::Error {
     )
 }
 
-fn mapped_atomic(map: &[u8], offset: usize) -> &AtomicU64 {
-    // SAFETY: callers pass the start of a live, fixed-size shared mmap validated
-    // above. mmap base addresses are page-aligned, and the mapping has room for
-    // exactly one AtomicU64. The returned reference never outlives its owning map
-    // in actual use; it is consumed immediately for one atomic operation.
-    debug_assert_eq!(map.len(), EXTERNAL_GENERATION_BYTES as usize);
-    debug_assert_eq!(offset % std::mem::align_of::<AtomicU64>(), 0);
-    debug_assert!(offset + size_of::<AtomicU64>() <= map.len());
-    unsafe { &*map.as_ptr().add(offset).cast::<AtomicU64>() }
+/// The mapped generation file. It is addressed through raw pointers only: another
+/// process, or the writer in this one, changes these bytes, and a `&[u8]` over them
+/// would promise that they do not change.
+struct GenerationMap(MmapRaw);
+
+impl GenerationMap {
+    fn new(map: MmapRaw) -> io::Result<Self> {
+        let aligned = (map.as_ptr() as usize).is_multiple_of(std::mem::align_of::<AtomicU64>());
+        if map.len() != EXTERNAL_GENERATION_BYTES as usize || !aligned {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lsphp generation mapping has the wrong size or alignment",
+            ));
+        }
+        Ok(Self(map))
+    }
+
+    fn word(&self, offset: usize) -> &AtomicU64 {
+        assert!(
+            offset.is_multiple_of(std::mem::align_of::<AtomicU64>())
+                && offset + size_of::<AtomicU64>() <= EXTERNAL_GENERATION_BYTES as usize,
+            "generation word offset {offset} is outside the mapping"
+        );
+        // SAFETY: `new` checked that the mapping is EXTERNAL_GENERATION_BYTES long and
+        // aligned for AtomicU64, and the assertion above keeps `offset` on an aligned
+        // word inside it. The mapping lives as long as `self`, the file is never
+        // resized while mapped, and every access to these bytes, in any process, is
+        // atomic. The pointer comes straight from mmap, so no shared reference to the
+        // bytes exists that a store through the atomic could invalidate.
+        unsafe { &*self.0.as_mut_ptr().add(offset).cast::<AtomicU64>() }
+    }
 }
 
-fn read_generation_snapshot(map: &[u8]) -> ExternalGenerationSnapshot {
+fn mapped_atomic(map: &GenerationMap, offset: usize) -> &AtomicU64 {
+    map.word(offset)
+}
+
+fn read_generation_snapshot(map: &GenerationMap) -> ExternalGenerationSnapshot {
     loop {
         let state = mapped_atomic(map, EXTERNAL_GENERATION_STATE_OFFSET).load(Ordering::Acquire);
         let epoch = state >> 1;
@@ -2225,6 +2248,44 @@ mod tests {
             }
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    /// (#1236) A reader never pairs an epoch with the worker family of another epoch,
+    /// however its three loads interleave with a publication.
+    #[test]
+    fn a_snapshot_never_pairs_an_epoch_with_another_epochs_family() {
+        let path = tmp_generation("seqlock-interleave");
+        let writer = ExternalGenerationWriter::open_or_create(&path).unwrap();
+        let family = |epoch: u64| epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 2;
+        writer.update(1, Some(family(1)));
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    let reader = ExternalGeneration::open(&path).unwrap();
+                    let mut last = 0;
+                    while !done.load(Ordering::Acquire) {
+                        let seen = read_generation_snapshot(&reader.map);
+                        assert!(seen.epoch >= last, "epochs never go back");
+                        last = seen.epoch;
+                        // A busy publication reports the committed epoch without a family.
+                        if seen.marker_fingerprint != 0 {
+                            assert_eq!(
+                                seen.marker_fingerprint,
+                                family(seen.epoch),
+                                "epoch {} carried another epoch's family",
+                                seen.epoch
+                            );
+                        }
+                    }
+                });
+            }
+            for epoch in 2..200_000u64 {
+                writer.update(epoch, Some(family(epoch)));
+            }
+            done.store(true, Ordering::Release);
+        });
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

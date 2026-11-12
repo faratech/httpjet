@@ -188,3 +188,110 @@ fn monoio_flush_completes_only_after_writing_final_batch() {
     });
     client.join().unwrap();
 }
+
+#[test]
+fn adjacent_inline_frames_share_one_segment() {
+    let mut out = OutQueue::default();
+    out.frames(|b| b.extend_from_slice(b"ab"));
+    out.frames(|b| b.extend_from_slice(b"cd"));
+    out.body(Bytes::from_static(b"body"));
+    out.frames(|b| b.extend_from_slice(b"ef"));
+    out.frames(|_| {});
+    assert_eq!(out.segs.len(), 3);
+    assert!(matches!(out.segs[0], Seg::Inline(0, 4)));
+    assert!(matches!(out.segs[1], Seg::Body(_)));
+    assert!(matches!(out.segs[2], Seg::Inline(4, 2)));
+    assert_eq!(out.total_bytes(), 10);
+}
+
+#[cfg(feature = "monoio")]
+#[test]
+fn monoio_flush_reuses_bounded_metadata_and_releases_bodies() {
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TrackedBody(Arc<AtomicUsize>);
+    impl AsRef<[u8]> for TrackedBody {
+        fn as_ref(&self) -> &[u8] {
+            b"one"
+        }
+    }
+    impl Drop for TrackedBody {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let over = RETAINED_FLUSH_METADATA + 1;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut expected = b"HoneTHoneT".to_vec();
+        expected.extend(std::iter::repeat_n(b'x', over));
+        expected.extend(std::iter::repeat_n(b'y', 1025));
+        let mut received = vec![0; expected.len()];
+        stream.read_exact(&mut received).unwrap();
+        assert_eq!(received, expected);
+    });
+    let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .enable_timer()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let listener = monoio::net::TcpListener::from_std(listener).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut out = OutQueue::default();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let mut previous = None;
+        for iteration in 1..=2 {
+            out.frames(|b| b.extend_from_slice(b"H"));
+            out.body(Bytes::from_owner(TrackedBody(dropped.clone())));
+            out.frames(|b| b.extend_from_slice(b"T"));
+            monoio_flush(&mut stream, &mut out, None).await.unwrap();
+            assert_eq!(dropped.load(Ordering::Relaxed), iteration);
+            assert!(out.is_empty() && out.write_backings.is_empty() && out.write_spans.is_empty());
+            for capacity in [
+                out.segs.capacity(),
+                out.write_backings.capacity(),
+                out.write_spans.capacity(),
+            ] {
+                assert!(capacity > 0 && capacity <= RETAINED_FLUSH_METADATA);
+            }
+            let storage = (
+                out.segs.as_ptr(),
+                out.write_backings.as_ptr(),
+                out.write_spans.as_ptr(),
+            );
+            if let Some(previous) = previous {
+                assert_eq!(
+                    storage, previous,
+                    "small flushes must reuse metadata storage"
+                );
+            }
+            previous = Some(storage);
+        }
+
+        // Below IOV_MAX but above the retained allowance: delivered intact, and no
+        // oversized metadata is kept afterwards.
+        for _ in 0..over {
+            out.body(Bytes::from_static(b"x"));
+        }
+        monoio_flush(&mut stream, &mut out, None).await.unwrap();
+        assert_eq!(out.segs.capacity(), 0);
+        assert_eq!(out.write_backings.capacity(), 0);
+        assert_eq!(out.write_spans.capacity(), 0);
+
+        // Above IOV_MAX takes the coalescing fallback under the same bound.
+        for _ in 0..1025 {
+            out.body(Bytes::from_static(b"y"));
+        }
+        monoio_flush(&mut stream, &mut out, None).await.unwrap();
+        assert_eq!(out.segs.capacity(), 0);
+    });
+    client.join().unwrap();
+}

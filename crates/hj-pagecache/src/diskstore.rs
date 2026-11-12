@@ -190,6 +190,28 @@ pub struct ScanSummary {
     pub rejected: u64,
     pub corrupt_removed: u64,
     pub tmp_removed: u64,
+    /// Fan-out directory opens and listings that failed. Whatever such a directory holds
+    /// stays on tmpfs unindexed and uncharged until the next restart.
+    pub dir_errors: u64,
+}
+
+/// Count and log a fan-out directory the boot scan cannot read. A directory that is not
+/// there is skipped silently: it holds nothing to strand.
+fn scan_dir<T>(result: io::Result<T>, dir: &Path, sum: &mut ScanSummary) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            if error.kind() != io::ErrorKind::NotFound {
+                sum.dir_errors += 1;
+                tracing::warn!(
+                    path = %dir.display(),
+                    %error,
+                    "jetcache: boot scan skipped an unreadable directory"
+                );
+            }
+            None
+        }
+    }
 }
 
 pub struct DiskStore {
@@ -1136,19 +1158,24 @@ impl DiskStore {
         let walk_unit = |&(h0, h1): &(u8, u8), sum: &mut ScanSummary, max_seq: &mut u64| {
             let c0 = format!("{h0:x}");
             let c1 = format!("{h1:x}");
-            let Ok(d0) = open_dir_at(&self.root_fd, &c0) else {
+            let p0 = self.root.join(&c0);
+            let Some(d0) = scan_dir(open_dir_at(&self.root_fd, &c0), &p0, sum) else {
                 return;
             };
-            let Ok(d1) = open_dir_at(&d0, &c1) else {
+            let p1 = p0.join(&c1);
+            let Some(d1) = scan_dir(open_dir_at(&d0, &c1), &p1, sum) else {
                 return;
             };
             for h2 in 0..16 {
                 let c2 = format!("{h2:x}");
-                let Ok(leaf) = open_dir_at(&d1, &c2) else {
+                let dir = p1.join(&c2);
+                let Some(leaf) = scan_dir(open_dir_at(&d1, &c2), &dir, sum) else {
                     continue;
                 };
-                let dir = self.root.join(&c0).join(&c1).join(&c2);
-                for name in read_dir_names(&leaf).unwrap_or_default() {
+                let Some(names) = scan_dir(read_dir_names(&leaf), &dir, sum) else {
+                    continue;
+                };
+                for name in names {
                     let file = dir.join(&name);
                     per_file(&leaf, &name, &file, sum, max_seq);
                 }
@@ -1190,6 +1217,7 @@ impl DiskStore {
                     sum.rejected += s.rejected;
                     sum.corrupt_removed += s.corrupt_removed;
                     sum.tmp_removed += s.tmp_removed;
+                    sum.dir_errors += s.dir_errors;
                     max_seq = max_seq.max(m);
                 }
             });
@@ -1485,6 +1513,57 @@ fn read_meta_file_with_metadata(
     f.read_exact(&mut header)?;
     let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
     let disk_total = allocated_bytes_from_metadata(&md, file_len);
+    let mut meta = vec![0u8; meta_len as usize];
+    f.read_exact(&mut meta)?;
+    let decoded = decode_container(&header, &meta)?;
+    Ok(ScannedEntry {
+        key: decoded.key,
+        status: decoded.status,
+        identity: decoded.identity,
+        headers: decoded.headers,
+        dict_gen: decoded.dict_gen,
+        tags: decoded.tags,
+        vary_cookie_name: decoded.vary_cookie_name,
+        vary_value: decoded.vary_value,
+        scope: decoded.scope,
+        stored_unix_ms: decoded.stored_unix_ms,
+        ttl: decoded.ttl,
+        swr: decoded.swr,
+        sie: decoded.sie,
+        body_len,
+        meta_len,
+        disk_total,
+        version_seq: page_file_seq(path).unwrap_or(0),
+        path: path.to_path_buf(),
+    })
+}
+
+/// A page container's header fields and metadata block, decoded. A [`ScannedEntry`]
+/// adds the two lengths [`validate_header`] returns and what only the file knows: its
+/// path, version and allocated size.
+#[derive(Debug, PartialEq)]
+struct DecodedContainer {
+    key: PageCacheKey,
+    status: u16,
+    identity: String,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    dict_gen: u32,
+    tags: Vec<Arc<str>>,
+    vary_cookie_name: String,
+    vary_value: String,
+    scope: PageScope,
+    stored_unix_ms: u64,
+    ttl: Duration,
+    swr: Duration,
+    sie: Duration,
+}
+
+/// Decode a header that [`validate_header`] accepted and the metadata block it
+/// announces. No I/O: the caller has read both.
+fn decode_container(
+    header: &[u8; HEADER_LEN as usize],
+    meta: &[u8],
+) -> Result<DecodedContainer, ReadError> {
     let flags = u16::from_le_bytes([header[6], header[7]]);
     let status = u16::from_le_bytes([header[16], header[17]]);
     let dict_gen = u32::from_le_bytes(header[20..24].try_into().unwrap());
@@ -1494,14 +1573,12 @@ fn read_meta_file_with_metadata(
     let sie = Duration::from_millis(u64::from_le_bytes(header[48..56].try_into().unwrap()));
     let private_owner = u64::from_le_bytes(header[56..64].try_into().unwrap());
 
-    let mut meta = vec![0u8; meta_len as usize];
-    f.read_exact(&mut meta)?;
     // (security #260) The identity-bearing meta block must carry a valid integrity
     // tag; an adopted/forged container without one is corrupt and gets removed.
-    if !verify_integrity(&header[64..80], &header[..64], &meta) {
+    if !verify_integrity(&header[64..80], &header[..64], meta) {
         return Err(ReadError::Corrupt("integrity tag mismatch"));
     }
-    let mut c = Cursor { buf: &meta, pos: 0 };
+    let mut c = Cursor { buf: meta, pos: 0 };
 
     let vhost_id = c.u32()?;
     let secure = c.u8()? != 0;
@@ -1546,7 +1623,7 @@ fn read_meta_file_with_metadata(
         vary_value: key_vary_value,
         private_owner,
     };
-    Ok(ScannedEntry {
+    Ok(DecodedContainer {
         key,
         status,
         identity,
@@ -1560,12 +1637,84 @@ fn read_meta_file_with_metadata(
         ttl,
         swr,
         sie,
-        body_len,
-        meta_len,
-        disk_total,
-        version_seq: page_file_seq(path).unwrap_or(0),
-        path: path.to_path_buf(),
     })
+}
+
+/// The bytes of a whole container file, decoded with the calls and in the order
+/// [`read_meta_file_with_metadata`] makes them. A short input fails like the short read.
+#[cfg(any(test, fuzzing))]
+fn decode_container_file(file: &[u8]) -> Result<(DecodedContainer, u32, u32), ReadError> {
+    let short = || ReadError::Io(io::ErrorKind::UnexpectedEof.into());
+    let (header, rest) = file
+        .split_first_chunk::<{ HEADER_LEN as usize }>()
+        .ok_or_else(short)?;
+    let (meta_len, body_len) = validate_header(header, HEADER_LEN, file.len() as u64)?;
+    let meta = rest.get(..meta_len as usize).ok_or_else(short)?;
+    Ok((decode_container(header, meta)?, meta_len, body_len))
+}
+
+#[cfg(any(test, fuzzing))]
+impl DecodedContainer {
+    /// The metadata block the store writes for an entry with this key and these fields.
+    fn encode_meta(&self) -> io::Result<Vec<u8>> {
+        let entry = CachedResponse {
+            status: self.status,
+            identity: self.identity.clone(),
+            headers: self.headers.clone(),
+            body: crate::store::PageBody::InMem(Bytes::new()),
+            variants: Vec::new(),
+            variants_filled: false,
+            dict_gen: self.dict_gen,
+            tags: self.tags.clone(),
+            vary_cookie_name: self.vary_cookie_name.clone(),
+            vary_value: self.vary_value.clone(),
+            scope: self.scope,
+            stored_at: std::time::Instant::now(),
+            ttl: self.ttl,
+            swr: self.swr,
+            sie: self.sie,
+        };
+        encode_meta(&self.key, &entry)
+    }
+}
+
+/// Fuzzing seam (cargo-fuzz compiles with `--cfg fuzzing`): the boot scan's container
+/// decode over bytes instead of a file, and the metadata block the store would write
+/// for what it decoded.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::{DecodedContainer, ReadError, decode_container_file};
+
+    #[derive(Debug, PartialEq)]
+    pub struct Container {
+        decoded: DecodedContainer,
+        meta_len: u32,
+        body_len: u32,
+    }
+
+    impl Container {
+        pub fn decode(file: &[u8]) -> Result<Self, ReadError> {
+            let (decoded, meta_len, body_len) = decode_container_file(file)?;
+            Ok(Container {
+                decoded,
+                meta_len,
+                body_len,
+            })
+        }
+
+        pub fn meta_len(&self) -> u32 {
+            self.meta_len
+        }
+
+        pub fn body_len(&self) -> u32 {
+            self.body_len
+        }
+
+        pub fn encode_meta(&self) -> std::io::Result<Vec<u8>> {
+            self.decoded.encode_meta()
+        }
+    }
 }
 
 pub fn read_static_meta(path: &Path) -> Result<ScannedStaticEntry, ReadError> {
@@ -2882,6 +3031,35 @@ mod tests {
         assert!(p3.exists() && p1.exists());
     }
 
+    /// (#1227) A fan-out directory the scan cannot open is counted. One that is missing
+    /// holds nothing and is not, and the rest of the tree still loads.
+    #[test]
+    fn scan_counts_fanout_directories_it_cannot_open() {
+        let (td, ds) = store();
+        let (kept, _) = ds
+            .write_entry(&key(), &entry(PageScope::Public), 0, b"one", 100)
+            .unwrap();
+        let leaf = kept.parent().unwrap();
+        let siblings: Vec<PathBuf> = (0..16)
+            .map(|h| leaf.with_file_name(format!("{h:x}")))
+            .filter(|dir| dir != leaf)
+            .collect();
+
+        // Break the tree after the open, which would otherwise repair or refuse it.
+        let restarted = DiskStore::open(td.path()).unwrap();
+        fs::remove_dir(&siblings[0]).unwrap();
+        fs::write(&siblings[0], b"").unwrap();
+        fs::remove_dir(&siblings[1]).unwrap();
+
+        let sum = restarted.scan(|_| true);
+        assert_eq!(
+            sum.dir_errors, 1,
+            "the entry that is not a directory is counted, the missing one is not"
+        );
+        assert_eq!(sum.loaded, 1, "the walk carries on past it");
+        assert_eq!(restarted.scan_static(|_| true).dir_errors, 1);
+    }
+
     #[test]
     fn boot_scans_ignore_final_files_published_by_the_current_process() {
         let td = tempfile::tempdir().unwrap();
@@ -3016,6 +3194,264 @@ mod tests {
         assert_eq!(state.stamps, HashMap::from([(0x33, 175_000)]));
         assert_eq!(state.stamp_record_count, 1);
         assert!(!state.corrupt);
+    }
+
+    // ---- property tests over what the file tier reads back at boot (#1234) ----
+
+    fn wall_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    /// What a journal of one floor record and these stamp records reads back as: the
+    /// latest wall per tag hash, without the stamps the floor already covers.
+    fn journal_model(floor: u64, stamps: &[(u64, u64)]) -> HashMap<u64, u64> {
+        let mut latest = HashMap::new();
+        for &(hash, wall) in stamps {
+            let seen = latest.entry(hash).or_insert(wall);
+            *seen = (*seen).max(wall);
+        }
+        latest.retain(|_, wall| *wall > floor);
+        latest
+    }
+
+    /// Small values come up often, so that tag hashes repeat and stamps land on, just
+    /// under and just over the floor.
+    fn journal_number() -> impl proptest::strategy::Strategy<Value = u64> {
+        use proptest::prelude::*;
+        prop_oneof![0u64..6, any::<u64>()]
+    }
+
+    fn journal_stamps(max: usize) -> impl proptest::strategy::Strategy<Value = Vec<(u64, u64)>> {
+        proptest::collection::vec((journal_number(), journal_number()), 0..max)
+    }
+
+    /// The reader never panics, and whatever the bytes are its answer is conservative:
+    /// no retained stamp at or below the floor, and a journal it calls corrupt gets a
+    /// floor no older than this read.
+    #[test]
+    fn tag_purge_journal_reader_is_conservative_on_arbitrary_bytes() {
+        use proptest::prelude::*;
+        let (_td, ds) = store();
+        let field = prop_oneof![
+            4 => any::<u64>().prop_map(|n| format!("{n:016x}")),
+            1 => any::<u64>().prop_map(|n| format!("{n:x}")),
+            1 => "[0-9a-fA-FxX+ -]{0,17}",
+        ];
+        let line = prop_oneof![
+            3 => field.clone().prop_map(|wall| format!("F {wall}")),
+            3 => (field.clone(), field).prop_map(|(hash, wall)| format!("T {hash} {wall}")),
+            1 => ".{0,20}",
+        ];
+        let text =
+            (proptest::collection::vec(line, 0..8), any::<bool>()).prop_map(|(lines, newline)| {
+                let mut text = lines.join("\n");
+                if newline {
+                    text.push('\n');
+                }
+                text.into_bytes()
+            });
+        let journal = prop_oneof![text, proptest::collection::vec(any::<u8>(), 0..200)];
+        proptest!(|(bytes in journal)| {
+            fs::write(ds.root.join(TAG_STAMP_NAME), &bytes).unwrap();
+            let before = wall_ms();
+            let state = ds.read_tag_purge_state();
+            prop_assert_eq!(state.byte_len, bytes.len() as u64);
+            prop_assert!(state.stamp_record_count <= state.record_count);
+            prop_assert!(state.stamps.len() as u64 <= state.stamp_record_count);
+            prop_assert!(state.stamps.values().all(|&wall| wall > state.floor_ms));
+            prop_assert!(!(state.corrupt && state.canonical));
+            if state.corrupt {
+                prop_assert!(state.floor_ms >= before);
+            }
+            prop_assert!(!bytes.is_empty() || state.corrupt);
+        });
+    }
+
+    /// A compacted state, with or without stamps appended after it, reads back as written:
+    /// the floor, and per tag the latest stamp the floor does not already cover.
+    #[test]
+    fn tag_purge_journal_reads_back_what_was_written() {
+        use proptest::prelude::*;
+        let (_td, ds) = store();
+        proptest!(|(
+            floor in journal_number(),
+            written in journal_stamps(12),
+            appended in journal_stamps(6),
+        )| {
+            ds.write_tag_purge_state(floor, &written).unwrap();
+            for &(hash, wall) in &appended {
+                ds.append_tag_purge_stamp(hash, wall).unwrap();
+            }
+            let all: Vec<(u64, u64)> = written.iter().chain(&appended).copied().collect();
+            let expected = journal_model(floor, &all);
+            let state = ds.read_tag_purge_state();
+            prop_assert!(!state.corrupt);
+            prop_assert_eq!(state.floor_ms, floor);
+            prop_assert_eq!(&state.stamps, &expected);
+            prop_assert_eq!(state.record_count, 1 + all.len() as u64);
+            prop_assert_eq!(state.stamp_record_count, all.len() as u64);
+            prop_assert_eq!(
+                state.byte_len,
+                TAG_PURGE_FLOOR_RECORD_BYTES + TAG_PURGE_STAMP_RECORD_BYTES * all.len() as u64
+            );
+            // Canonical means nothing a rewrite would drop: no duplicate, no covered stamp.
+            prop_assert_eq!(state.canonical, expected.len() == all.len());
+        });
+    }
+
+    /// A journal cut anywhere reads back as the records that are whole, or as corrupt
+    /// with a floor no older than this read. It never reads back as anything else.
+    #[test]
+    fn a_torn_tag_purge_journal_is_a_record_prefix_or_corrupt() {
+        use proptest::prelude::*;
+        let (_td, ds) = store();
+        let journal = ds.root.join(TAG_STAMP_NAME);
+        proptest!(|(
+            floor in journal_number(),
+            stamps in journal_stamps(8),
+            cut in any::<prop::sample::Index>(),
+        )| {
+            ds.write_tag_purge_state(floor, &stamps).unwrap();
+            let whole = fs::read(&journal).unwrap();
+            let cut = cut.index(whole.len());
+            fs::write(&journal, &whole[..cut]).unwrap();
+            let before = wall_ms();
+            let state = ds.read_tag_purge_state();
+
+            let floor_len = TAG_PURGE_FLOOR_RECORD_BYTES as usize;
+            let stamp_len = TAG_PURGE_STAMP_RECORD_BYTES as usize;
+            // A record is whole once all of it but its newline is there.
+            let whole_stamps = if cut + 1 < floor_len {
+                None
+            } else {
+                let past_floor = cut.saturating_sub(floor_len);
+                let (complete, partial) = (past_floor / stamp_len, past_floor % stamp_len);
+                match partial {
+                    0 => Some(complete),
+                    p if p + 1 == stamp_len => Some(complete + 1),
+                    _ => None,
+                }
+            };
+            match whole_stamps {
+                Some(count) => {
+                    prop_assert!(!state.corrupt);
+                    prop_assert_eq!(state.floor_ms, floor);
+                    prop_assert_eq!(&state.stamps, &journal_model(floor, &stamps[..count]));
+                }
+                None => {
+                    prop_assert!(state.corrupt);
+                    prop_assert!(state.floor_ms >= before);
+                    prop_assert!(state.stamps.values().all(|&wall| wall > state.floor_ms));
+                }
+            }
+        });
+    }
+
+    #[derive(Debug, Clone)]
+    enum ContainerEdit {
+        Set(proptest::sample::Index, u8),
+        Truncate(proptest::sample::Index),
+        Append(Vec<u8>),
+    }
+
+    /// The byte decoder the fuzz target drives is the file reader's decode: a damaged
+    /// container is accepted by both with the same metadata or rejected by both for the
+    /// same reason. What they accept re-encodes to a metadata block of the same length
+    /// that decodes back to the same metadata.
+    #[test]
+    fn damaged_containers_decode_the_same_from_bytes_and_from_a_file() {
+        use proptest::prelude::*;
+        let (_td, ds) = store();
+        let mut private_key = key();
+        private_key.private_owner = 7;
+        let mut bare = entry(PageScope::Public);
+        bare.tags.clear();
+        bare.headers.clear();
+        let pristine: Vec<(PathBuf, Vec<u8>)> = [
+            (key(), entry(PageScope::Public)),
+            (private_key, entry(PageScope::Private { owner_hash: 7 })),
+            (key(), bare),
+        ]
+        .iter()
+        .map(|(k, e)| {
+            let (path, _) = ds.write_entry(k, e, 3, b"body", 1_750_000_000_000).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+
+        let reason = |error: ReadError| match error {
+            ReadError::Corrupt(why) => why.to_owned(),
+            ReadError::Io(error) => format!("{:?}", error.kind()),
+        };
+        let edit = prop_oneof![
+            6 => (any::<prop::sample::Index>(), any::<u8>())
+                .prop_map(|(at, byte)| ContainerEdit::Set(at, byte)),
+            1 => any::<prop::sample::Index>().prop_map(ContainerEdit::Truncate),
+            1 => proptest::collection::vec(any::<u8>(), 1..8).prop_map(ContainerEdit::Append),
+        ];
+        proptest!(|(
+            base in 0..pristine.len(),
+            edits in proptest::collection::vec(edit, 0..4),
+        )| {
+            let (path, bytes) = &pristine[base];
+            let mut bytes = bytes.clone();
+            for edit in edits {
+                match edit {
+                    ContainerEdit::Set(at, byte) if !bytes.is_empty() => {
+                        let at = at.index(bytes.len());
+                        bytes[at] = byte;
+                    }
+                    ContainerEdit::Set(..) => {}
+                    ContainerEdit::Truncate(at) => bytes.truncate(at.index(bytes.len() + 1)),
+                    ContainerEdit::Append(more) => bytes.extend_from_slice(&more),
+                }
+            }
+            fs::write(path, &bytes).unwrap();
+            match (read_meta(path), decode_container_file(&bytes)) {
+                (Ok(scanned), Ok((decoded, meta_len, body_len))) => {
+                    prop_assert_eq!((scanned.meta_len, scanned.body_len), (meta_len, body_len));
+                    prop_assert_eq!(
+                        HEADER_LEN + u64::from(meta_len) + u64::from(body_len),
+                        bytes.len() as u64
+                    );
+                    let from_file = DecodedContainer {
+                        key: scanned.key,
+                        status: scanned.status,
+                        identity: scanned.identity,
+                        headers: scanned.headers,
+                        dict_gen: scanned.dict_gen,
+                        tags: scanned.tags,
+                        vary_cookie_name: scanned.vary_cookie_name,
+                        vary_value: scanned.vary_value,
+                        scope: scanned.scope,
+                        stored_unix_ms: scanned.stored_unix_ms,
+                        ttl: scanned.ttl,
+                        swr: scanned.swr,
+                        sie: scanned.sie,
+                    };
+                    prop_assert_eq!(&from_file, &decoded);
+
+                    let meta = decoded.encode_meta().unwrap();
+                    prop_assert_eq!(meta.len(), meta_len as usize);
+                    let start = HEADER_LEN as usize;
+                    bytes[start..start + meta.len()].copy_from_slice(&meta);
+                    let (again, ..) = decode_container_file(&bytes).map_err(reason).unwrap();
+                    prop_assert_eq!(&again, &decoded);
+                    prop_assert_eq!(again.encode_meta().unwrap(), meta);
+                }
+                (Err(file), Err(bytes)) => prop_assert_eq!(reason(file), reason(bytes)),
+                (file, bytes) => prop_assert!(
+                    false,
+                    "the file reader said {:?}, the byte decoder {:?}",
+                    file.map(|_| ()).map_err(reason),
+                    bytes.map(|_| ()).map_err(reason)
+                ),
+            }
+        });
     }
 
     #[test]

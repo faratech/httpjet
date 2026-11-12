@@ -74,7 +74,7 @@ pub struct Identity {
 }
 impl Identity {
     pub fn new(leaf_der: &[u8], issuer_der: &[u8]) -> Result<Self, Error> {
-        if openssl::version::number() < 0x3000_0000
+        if !ffi::VERIFIED_OPENSSL.contains(&openssl::version::number())
             || leaf_der.is_empty()
             || issuer_der.is_empty()
             || leaf_der.len() > MAX_RESPONSE

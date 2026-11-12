@@ -24,3 +24,6 @@ sha1 = "0.11"
 md5 = { package = "md-5", version = "0.11" }
 bcrypt = "0.19"
 libc = "0.2"
+
+[lints]
+workspace = true

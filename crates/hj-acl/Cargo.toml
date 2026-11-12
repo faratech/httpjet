@@ -14,3 +14,6 @@ http = { workspace = true }
 ipnet = { workspace = true }
 parking_lot = { workspace = true }
 globset = { workspace = true }
+
+[lints]
+workspace = true

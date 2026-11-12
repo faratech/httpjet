@@ -22,3 +22,6 @@ rustc-hash = { workspace = true }
 httpdate = { workspace = true }
 # `sync::Notify`: body-budget waiters wake when a lease releases instead of polling.
 tokio = { workspace = true }
+
+[lints]
+workspace = true

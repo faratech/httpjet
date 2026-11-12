@@ -48,6 +48,45 @@ fn put_idle_box(buf: Box<[MaybeUninit<u8>]>) {
     });
 }
 
+/// Convert rental metadata only for the synchronous rustls plaintext call.
+/// Keep the small H1/H2 stack path and cover the native H2 flush's 64-slice
+/// batch without allocating another descriptor vector. Larger batches retain
+/// every slice: splitting their prefix could reduce TLS record aggregation
+/// and add transport writes. No borrowed descriptor survives an I/O await.
+fn write_plaintext_iovecs<W: Write, T: IoVecBuf>(writer: &mut W, buf: &T) -> io::Result<usize> {
+    let ptr = buf.read_iovec_ptr();
+    let count = buf.read_iovec_len();
+    let slice = |index| {
+        // SAFETY: IoVecBuf owns count readable descriptors and their initialized
+        // bytes for this entire synchronous call. Empty libc iovecs may have a
+        // null base, so do not turn those into a Rust slice from a null pointer.
+        let iov = unsafe { &*ptr.add(index) };
+        if iov.iov_len == 0 {
+            io::IoSlice::new(&[])
+        } else {
+            io::IoSlice::new(unsafe {
+                std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
+            })
+        }
+    };
+    if count <= 8 {
+        let mut slices = [io::IoSlice::new(&[]); 8];
+        for (index, slot) in slices.iter_mut().enumerate().take(count) {
+            *slot = slice(index);
+        }
+        writer.write_vectored(&slices[..count])
+    } else if count <= 64 {
+        let mut slices = [io::IoSlice::new(&[]); 64];
+        for (index, slot) in slices.iter_mut().enumerate().take(count) {
+            *slot = slice(index);
+        }
+        writer.write_vectored(&slices[..count])
+    } else {
+        let slices: Vec<io::IoSlice<'_>> = (0..count).map(slice).collect();
+        writer.write_vectored(&slices)
+    }
+}
+
 #[derive(Debug)]
 pub struct Stream<IO, C> {
     pub(crate) io: IO,
@@ -1247,42 +1286,13 @@ where
                 return (Err(err), buf_vec);
             }
         }
-        let ptr = buf_vec.read_iovec_ptr();
-        let count = buf_vec.read_iovec_len();
-        let total = if count <= 8 {
-            let mut slices = [std::io::IoSlice::new(&[]); 8];
-            for (index, slot) in slices.iter_mut().enumerate().take(count) {
-                *slot = std::io::IoSlice::new(unsafe {
-                    let iov = &*ptr.add(index);
-                    std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
-                });
-            }
-            let result = {
-                let mut session = self.session.borrow_mut();
-                session.writer().write_vectored(&slices[..count])
-            };
-            match result {
-                Ok(n) => n,
-                Err(err) => return (Err(err), buf_vec),
-            }
-        } else {
-            let slices: Vec<std::io::IoSlice<'_>> = (0..count)
-                .map(|index| unsafe {
-                    let iov = &*ptr.add(index);
-                    std::io::IoSlice::new(std::slice::from_raw_parts(
-                        iov.iov_base as *const u8,
-                        iov.iov_len,
-                    ))
-                })
-                .collect();
-            let result = {
-                let mut session = self.session.borrow_mut();
-                session.writer().write_vectored(&slices)
-            };
-            match result {
-                Ok(n) => n,
-                Err(err) => return (Err(err), buf_vec),
-            }
+        let result = {
+            let mut session = self.session.borrow_mut();
+            write_plaintext_iovecs(&mut session.writer(), &buf_vec)
+        };
+        let total = match result {
+            Ok(n) => n,
+            Err(err) => return (Err(err), buf_vec),
         };
         if let Err(err) = self.flush_pending().await {
             return (Err(err), buf_vec);
@@ -1377,56 +1387,10 @@ where
                 return (Err(e), buf_vec);
             }
         }
-        let ptr = buf_vec.read_iovec_ptr();
-        let cnt = buf_vec.read_iovec_len();
-        // Gather all iovecs into ONE rustls `write_vectored` (rustls overrides it to copy
-        // every slice into its plaintext buffer in a single call) — matching tokio-rustls.
-        // SAFETY: the IoVecBuf contract guarantees `cnt` valid iovecs at `ptr`, each over
-        // initialized bytes valid for this call; IoSlice is repr-compatible.
-        // (#322) Typical H1/H2 flushes carry <=4 iovecs; keep those on the stack and
-        // only heap-allocate for pathological counts.
-        if cnt <= 8 {
-            let mut slices = [
-                std::io::IoSlice::new(&[]),
-                std::io::IoSlice::new(&[]),
-                std::io::IoSlice::new(&[]),
-                std::io::IoSlice::new(&[]),
-                std::io::IoSlice::new(&[]),
-                std::io::IoSlice::new(&[]),
-                std::io::IoSlice::new(&[]),
-                std::io::IoSlice::new(&[]),
-            ];
-            for (i, slot) in slices.iter_mut().enumerate().take(cnt) {
-                // SAFETY: same IoVecBuf contract as above — cnt valid iovecs at ptr.
-                *slot = std::io::IoSlice::new(unsafe {
-                    let iov = &*ptr.add(i);
-                    std::slice::from_raw_parts(iov.iov_base as *const u8, iov.iov_len)
-                });
-            }
-            let total = match self.session.writer().write_vectored(&slices[..cnt]) {
-                Ok(n) => n,
-                Err(e) => return (Err(e), buf_vec),
-            };
-            while self.session.wants_write() {
-                match self.write_io().await {
-                    Ok(0) => break,
-                    Ok(_) => (),
-                    Err(e) => return (Err(e), buf_vec),
-                }
-            }
-            self.w_buffer.shrink_to_idle();
-            return (Ok(total), buf_vec);
-        }
-        let slices: Vec<std::io::IoSlice> = (0..cnt)
-            .map(|i| unsafe {
-                let iov = &*ptr.add(i);
-                std::io::IoSlice::new(std::slice::from_raw_parts(
-                    iov.iov_base as *const u8,
-                    iov.iov_len,
-                ))
-            })
-            .collect();
-        let total = match self.session.writer().write_vectored(&slices) {
+        // Rustls consumes/copies plaintext synchronously; only its owned
+        // ciphertext buffer enters the transport, while buf_vec stays rented
+        // through every CQE. Descriptor scratch has already gone out of scope.
+        let total = match write_plaintext_iovecs(&mut self.session.writer(), &buf_vec) {
             Ok(n) => n,
             Err(e) => return (Err(e), buf_vec),
         };

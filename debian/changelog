@@ -1,3 +1,21 @@
+httpjet (0.2.1-1) stable; urgency=medium
+
+  * Page cache: size the store-admission filter so a never-requested URL
+    reads zero; --page-cache-admit-threshold 2 had decayed into storing every
+    cacheable response. Reject a boot-scan install of a file a tag purge
+    swept; count fan-out directories the boot scan cannot read.
+  * Hardening: keep the LSAPI length-prefix guards in release builds; map the
+    lsphp generation file raw; refuse OpenSSL majors the OCSP prototypes were
+    not compared with.
+  * Count HTTP/1 connection ends by cause; expose the admission table's size
+    and occupancy.
+  * HTTP/2: reuse flush metadata and coalesce adjacent inline frames; count
+    in-flight requests on per-worker cache lines.
+  * Tests: fuzz targets for HTTP/2 frames, the HTTP/3 wire parsers, LSAPI
+    packets, FastCGI records and the page-cache container.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Thu, 12 Nov 2026 00:00:00 +0000
+
 httpjet (0.2.0-1) stable; urgency=medium
 
   * Security: validate the upstream WebSocket handshake; strip credentials and

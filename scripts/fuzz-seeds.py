@@ -4,7 +4,17 @@ import hashlib
 from pathlib import Path
 import sys
 
-TARGETS = {"h1_chunked_decode", "h1_request_framing", "proxy_protocol_parse"}
+TARGETS = {
+    "h1_chunked_decode",
+    "h1_request_framing",
+    "proxy_protocol_parse",
+    "h2_frames",
+    "lsapi_packet_stream",
+    "fastcgi_records",
+    "h3_request_stream",
+    "h3_control",
+    "pagecache_container",
+}
 
 
 def main():

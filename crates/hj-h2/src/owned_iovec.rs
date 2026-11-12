@@ -33,6 +33,21 @@ pub struct OwnedIoVec {
     first: usize,
     remaining: usize,
 }
+#[derive(Default)]
+pub struct IoVecStorage(Vec<libc::iovec>);
+// SAFETY: an `IoVecStorage` only exists with its entries cleared (`into_reusable_parts`
+// clears them, `with_storage` refills a fresh array), so it carries capacity, never a
+// live pointer into a backing or an outstanding IO operation.
+unsafe impl Send for IoVecStorage {}
+// SAFETY: as above; a shared reference exposes no pointer at all.
+unsafe impl Sync for IoVecStorage {}
+impl IoVecStorage {
+    pub fn trim(&mut self, maximum: usize) {
+        if self.0.capacity() > maximum {
+            self.0 = Vec::new();
+        }
+    }
+}
 
 impl OwnedIoVec {
     /// Build one full-span iovec per non-empty backing allocation.
@@ -58,7 +73,16 @@ impl OwnedIoVec {
 
     /// Build iovecs over validated ranges of owned backing allocations.
     pub fn from_backings(backings: Vec<Bytes>, spans: Vec<IoVecSpan>) -> io::Result<Self> {
-        let mut iovecs = Vec::with_capacity(spans.len());
+        Self::with_storage(backings, &spans, IoVecStorage::default())
+    }
+    pub fn with_storage(
+        backings: Vec<Bytes>,
+        spans: &[IoVecSpan],
+        storage: IoVecStorage,
+    ) -> io::Result<Self> {
+        let mut iovecs = storage.0;
+        iovecs.clear();
+        iovecs.reserve(spans.len());
         let mut remaining = 0usize;
         for span in spans {
             if span.len == 0 {
@@ -138,6 +162,15 @@ impl OwnedIoVec {
     /// Recover the owned allocations after the final completion.
     pub fn into_backings(self) -> Vec<Bytes> {
         self.backings
+    }
+    pub fn into_reusable_parts(self) -> (Vec<Bytes>, IoVecStorage) {
+        let Self {
+            mut iovecs,
+            backings,
+            ..
+        } = self;
+        iovecs.clear();
+        (backings, IoVecStorage(iovecs))
     }
 }
 

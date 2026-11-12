@@ -1348,6 +1348,9 @@ pub struct CacheStats {
     /// Leaf fanout directories a persist found removed (an external tmpfs cleaner) and
     /// recreated, so the file tier kept persisting instead of falling back to RAM.
     pub fanout_recreations: u64,
+    /// Fan-out directories the boot scan could not open or list (the page and static walks
+    /// each count). Their files stay on tmpfs unindexed and uncharged until a restart.
+    pub scan_dir_errors: u64,
     /// DEPRECATED (always 0): `parking_lot::Mutex` shards do not poison. Kept for format stability.
     pub poisoned_locks: u64,
     /// Compressed resident metadata bytes.
@@ -1433,6 +1436,10 @@ impl Ord for ListingCandidate {
 struct ScanPurgeBuffer {
     tags: HashSet<Arc<str>>,
     purged_all: bool,
+    /// Per key, the newest version a tag purge tore down. That purge unlinks every file
+    /// of the key up to this version whatever its tags, so the scan must not install one.
+    /// Written under the key's shard lock, in the teardown's own critical section.
+    swept: HashMap<CacheKeyId, u64>,
 }
 
 struct TagIndex {
@@ -1756,8 +1763,14 @@ pub struct PageStore {
     /// standing in for a crash mid-purge.
     #[cfg(test)]
     purge_all_teardown_probe: Mutex<Option<Box<dyn FnOnce(&PageStore) + Send>>>,
+    /// Test-only hook fired inside `purge_tags` after a key's teardown and live-version
+    /// read, just before its older files are unlinked.
+    #[cfg(test)]
+    purge_sweep_probe: Mutex<Option<Box<dyn FnOnce(&PageStore) + Send>>>,
     /// Entries the boot warm-scan loaded from the file tier (set once, when the scan finishes).
     scan_loaded: AtomicU64,
+    /// Fan-out directories the boot warm-scan could not read (set once, with `scan_loaded`).
+    scan_dir_errors: AtomicU64,
 
     /// Hot-tier key allocator — unique per body version within this process.
     body_id_seq: AtomicU64,
@@ -2018,7 +2031,10 @@ impl PageStore {
             store_publish_probe: Mutex::new(None),
             #[cfg(test)]
             purge_all_teardown_probe: Mutex::new(None),
+            #[cfg(test)]
+            purge_sweep_probe: Mutex::new(None),
             scan_loaded: AtomicU64::new(0),
+            scan_dir_errors: AtomicU64::new(0),
             body_id_seq: AtomicU64::new(1),
             hits: CachePaddedAtomic::new(0),
             misses: CachePaddedAtomic::new(0),
@@ -3471,15 +3487,19 @@ impl PageStore {
         sum.rejected += static_sum.rejected;
         sum.corrupt_removed += static_sum.corrupt_removed;
         sum.tmp_removed += static_sum.tmp_removed;
+        sum.dir_errors += static_sum.dir_errors;
         disk.finish_boot_scan();
         // Scan complete: record the loaded count (gate signal), then drop the purge buffer.
         self.scan_loaded.store(sum.loaded, Ordering::Relaxed);
+        self.scan_dir_errors
+            .store(sum.dir_errors, Ordering::Relaxed);
         *self.scan_purge.lock() = None;
         tracing::info!(
             loaded = sum.loaded,
             rejected = sum.rejected,
             corrupt = sum.corrupt_removed,
             tmp = sum.tmp_removed,
+            dir_errors = sum.dir_errors,
             "jetcache: warm scan complete"
         );
         sum
@@ -3556,6 +3576,18 @@ impl PageStore {
                 let buf = self.scan_purge.lock();
                 if let Some(buf) = buf.as_ref() {
                     if buf.purged_all || tags.iter().any(|t| buf.tags.contains(t)) {
+                        return false;
+                    }
+                    // A tag purge that tore this key's entry down also unlinks the key's
+                    // older files by version alone, so an inherited one must not be installed
+                    // whatever tags it carries. A runtime adoption is exempt: it publishes
+                    // under `page_commit`, after any purge recorded here has finished.
+                    if runtime_purge_epoch.is_none()
+                        && buf
+                            .swept
+                            .get(&id)
+                            .is_some_and(|&through| new_version_seq <= through)
+                    {
                         return false;
                     }
                 }
@@ -3855,6 +3887,10 @@ impl PageStore {
                         .and_then(CacheEntry::as_page)
                         .and_then(|node| file_body_version_seq(&node.body))
                 });
+                #[cfg(test)]
+                if let Some(hook) = self.purge_sweep_probe.lock().take() {
+                    hook(self);
+                }
                 disk.remove_key_versions_through_except(&key, max_version_seq, live_version);
             }
         }
@@ -3864,9 +3900,11 @@ impl PageStore {
         let mut sweeps: Vec<(PageCacheKey, u64)> = Vec::new();
         let wall_ms = wall_now_ms();
         let epoch = self.purge_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut scan_pending = false;
         if self.disk.is_some() {
             let mut buf = self.scan_purge.lock();
             if let Some(buf) = buf.as_mut() {
+                scan_pending = true;
                 for tag in tags {
                     buf.tags.insert(Arc::from(*tag));
                 }
@@ -3899,6 +3937,15 @@ impl PageStore {
                 self.inner.with_shard_groups(&mut ids, |acc, group| {
                     for id in group {
                         if let Some(sweep) = self.purge_tagged_id_locked(&ta, *id, epoch, acc) {
+                            // Still under the shard lock that tore the entry down, so a
+                            // boot-scan install of this key either ran before the teardown
+                            // or sees this record. Lock order: shard, then `scan_purge`.
+                            if scan_pending {
+                                if let Some(buf) = self.scan_purge.lock().as_mut() {
+                                    let through = buf.swept.entry(*id).or_insert(sweep.1);
+                                    *through = (*through).max(sweep.1);
+                                }
+                            }
                             sweeps.push(sweep);
                         }
                     }
@@ -4090,6 +4137,7 @@ impl PageStore {
             disk_write_errors: self.disk_write_errors.load(Ordering::Relaxed),
             disk_full_errors: self.disk_full_errors.load(Ordering::Relaxed),
             fanout_recreations: self.disk.as_ref().map_or(0, |d| d.fanout_recreations()),
+            scan_dir_errors: self.scan_dir_errors.load(Ordering::Relaxed),
             poisoned_locks: 0,
             meta_compressed_bytes,
             meta_raw_bytes,
@@ -5558,6 +5606,21 @@ mod tests {
         );
     }
 
+    /// (#1227) Both boot-scan walks report a fan-out directory they cannot open.
+    #[test]
+    fn scan_dir_errors_reach_the_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        let leaf = dir.path().join("0").join("0").join("0");
+        std::fs::remove_dir(&leaf).unwrap();
+        std::fs::write(&leaf, b"").unwrap();
+
+        assert_eq!(store.stats().scan_dir_errors, 0);
+        let sum = store.load_from_disk(|_| {});
+        assert_eq!(sum.dir_errors, 2, "the page walk and the static walk");
+        assert_eq!(store.stats().scan_dir_errors, 2);
+    }
+
     #[test]
     fn path_presence_tracks_resident_entries() {
         let mut c = cfg();
@@ -6899,5 +6962,99 @@ mod tests {
             "an entry inserted mid-scan after purge_all must not survive"
         );
         assert_eq!(store.entry_count(), 0, "purge_all must win the race");
+    }
+
+    // ---- boot-scan install vs a tag purge's older-version sweep (#1227) ----
+    // A tag purge that tears down a key's live entry also unlinks every older file of that
+    // key. An inherited older version carrying OTHER tags passes the tag checks, so the scan
+    // must not install it once that purge has covered the key: the index would hold an
+    // entry whose file is gone.
+
+    /// One key with an inherited file tagged `old` on disk and, before the boot scan has
+    /// reached that file, a newer live entry tagged `live`.
+    fn live_entry_over_an_unscanned_older_version() -> (tempfile::TempDir, PageStore, PageCacheKey)
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let key = PageCacheKey::public(1, true, "forum.example", "/thread/", "");
+        let inherited = {
+            let ds = DiskStore::open(dir.path()).unwrap();
+            let e = entry(b"inherited", &["old"], Duration::from_secs(3600));
+            let stored_ms = wall_now_ms().saturating_sub(1_000);
+            ds.write_entry(&key, &e, 0, b"inherited", stored_ms)
+                .unwrap()
+                .0
+        };
+        let store = PageStore::new(disk_cfg(dir.path(), 64 * 1024 * 1024));
+        assert!(store.store(
+            key.clone(),
+            entry(b"live", &["live"], Duration::from_secs(3600))
+        ));
+        let live = store
+            .lookup(&key, "id", Instant::now())
+            .expect("live entry");
+        assert!(
+            file_body_version_seq(&live.body) > crate::diskstore::page_file_seq(&inherited),
+            "the live version must sort after the inherited one for the purge to sweep it"
+        );
+        assert_eq!(pc_files(dir.path()), 2);
+        (dir, store, key)
+    }
+
+    fn assert_no_entry_outlived_its_file(dir: &Path, store: &PageStore, key: &PageCacheKey) {
+        assert_eq!(
+            store.scan_loaded(),
+            0,
+            "the swept older version must not be installed"
+        );
+        assert_eq!(store.entry_count(), 0, "no entry may outlive its file");
+        assert_eq!(pc_files(dir), 0, "every version of the key is unlinked");
+        assert!(
+            store.lookup(key, "id", Instant::now()).is_none(),
+            "a hit here would point at an unlinked file"
+        );
+    }
+
+    /// The whole purge (teardown and sweep) lands after the scan read the older file's
+    /// metadata and before it installs the entry.
+    #[test]
+    fn boot_scan_install_loses_to_a_tag_purge_that_swept_its_key() {
+        let (dir, store, key) = live_entry_over_an_unscanned_older_version();
+        *store.scan_insert_probe.lock() = Some(Box::new(|s: &PageStore| {
+            s.purge_tags(&["live"]);
+        }));
+        store.load_from_disk(|_| {});
+        assert_no_entry_outlived_its_file(dir.path(), &store, &key);
+    }
+
+    /// The scan installs the older file between the purge's teardown of the live entry
+    /// and its sweep of the key's older files.
+    #[test]
+    fn boot_scan_install_between_a_tag_purge_teardown_and_its_sweep_is_rejected() {
+        let (dir, store, key) = live_entry_over_an_unscanned_older_version();
+        *store.purge_sweep_probe.lock() = Some(Box::new(|s: &PageStore| {
+            s.load_from_disk(|_| {});
+        }));
+        store.purge_tags(&["live"]);
+        assert_no_entry_outlived_its_file(dir.path(), &store, &key);
+    }
+
+    /// The sweep spares a version newer than the one the purge tore down, so the scan
+    /// still installs it.
+    #[test]
+    fn boot_scan_installs_a_version_newer_than_the_one_a_tag_purge_swept() {
+        let (dir, store, key) = live_entry_over_an_unscanned_older_version();
+        let newer = DiskStore::open(dir.path()).unwrap();
+        let e = entry(b"newer", &["other"], Duration::from_secs(3600));
+        newer
+            .write_entry(&key, &e, 0, b"newer", wall_now_ms())
+            .unwrap();
+        store.purge_tags(&["live"]);
+        assert_eq!(pc_files(dir.path()), 1, "only the newer version is spared");
+        store.load_from_disk(|_| {});
+        assert_eq!(store.scan_loaded(), 1);
+        let hit = store
+            .lookup(&key, "id", Instant::now())
+            .expect("the newer version is restored");
+        assert_eq!(&store.body_bytes(&hit).unwrap()[..], b"newer");
     }
 }

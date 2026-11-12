@@ -235,6 +235,156 @@ fn multi_range_count_cap_falls_back_to_ignore() {
     assert_eq!(multi(parse_ranges(spec(8).as_bytes(), 1000)).len(), 8);
 }
 
+/// splitmix64 with a fixed seed: the sweep below generates the same headers on every run.
+struct RangeGen(u64);
+
+impl RangeGen {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+        items[self.below(items.len() as u64) as usize]
+    }
+
+    fn entity_len(&mut self) -> u64 {
+        match self.below(12) {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 10,
+            4 => 1000,
+            5 => u64::MAX,
+            6 => u64::MAX - 1,
+            7 => 1 << 32,
+            _ => 1 + self.below(5000),
+        }
+    }
+
+    /// A byte position: mostly inside the entity, often on or just past its edges.
+    fn position(&mut self, len: u64) -> u64 {
+        match self.below(12) {
+            0 => 0,
+            1 => len.wrapping_sub(1),
+            2 => len,
+            3 => len.saturating_add(1),
+            4 => u64::MAX,
+            5 => self.next(),
+            _ => self.below(len.max(1)),
+        }
+    }
+
+    /// One range-spec. A `clean` one is syntactically valid; otherwise it may be anything.
+    fn component(&mut self, len: u64, clean: bool) -> String {
+        if !clean && self.below(3) == 0 {
+            return self
+                .pick(&[
+                    "",
+                    "x",
+                    "5",
+                    "1-2-3",
+                    "-",
+                    "--1",
+                    "1e3-2",
+                    "-0",
+                    "9-1",
+                    "+1-+2",
+                    "007-0010",
+                    "18446744073709551616-",
+                ])
+                .to_owned();
+        }
+        let pad = self.pick(&["", "", "", " ", "\t"]);
+        match self.below(6) {
+            0 => format!("{pad}{}-", self.position(len)),
+            1 => format!("-{}{pad}", self.position(len).max(1)),
+            _ => {
+                let start = self.position(len);
+                let end = match self.below(4) {
+                    0 => self.position(len).max(start),
+                    _ => start.saturating_add(self.below(40)),
+                };
+                format!("{start}{pad}-{pad}{end}")
+            }
+        }
+    }
+
+    fn header(&mut self, len: u64) -> Vec<u8> {
+        let unit = match self.below(24) {
+            0 => return (0..self.below(24)).map(|_| self.next() as u8).collect(),
+            1 => self.pick(&["items=", "", "Bytes=", "bytes =", "bytes"]),
+            2 => " bytes= ",
+            _ => "bytes=",
+        };
+        let clean = self.below(5) != 0;
+        let parts: Vec<String> = (0..1 + self.below(10))
+            .map(|_| self.component(len, clean))
+            .collect();
+        let mut value = format!("{unit}{}", parts.join(self.pick(&[",", ",", ", ", " ,"])));
+        if !clean && self.below(8) == 0 {
+            value.push(',');
+        }
+        value.into_bytes()
+    }
+}
+
+/// What `RangeOutcome` documents, for any header: a single range lies inside the entity;
+/// a multi-range set has 2..=MAX_RANGES in-bounds ranges, ascending, with a gap of at
+/// least one byte between neighbours (overlapping and adjacent ranges are coalesced).
+#[test]
+fn generated_range_headers_only_yield_in_bounds_coalesced_ranges() {
+    let mut generator = RangeGen(0x6a09_e667_f3bc_c908);
+    let (mut singles, mut multis, mut unsatisfiable, mut ignored) = (0u32, 0u32, 0u32, 0u32);
+    for _ in 0..20_000 {
+        let len = generator.entity_len();
+        let value = generator.header(len);
+        let shown = String::from_utf8_lossy(&value).into_owned();
+        let in_bounds = |&(start, end): &(u64, u64)| start <= end && end < len;
+        match parse_ranges(&value, len) {
+            RangeOutcome::Single(start, end) => {
+                singles += 1;
+                assert!(
+                    in_bounds(&(start, end)),
+                    "{shown:?} on {len} bytes gave {start}-{end}"
+                );
+            }
+            RangeOutcome::Multi(ranges) => {
+                multis += 1;
+                assert!(
+                    (2..=MAX_RANGES).contains(&ranges.len()),
+                    "{shown:?} on {len} bytes gave {} ranges",
+                    ranges.len()
+                );
+                assert!(
+                    ranges.iter().all(in_bounds),
+                    "{shown:?} on {len} bytes gave {ranges:?}"
+                );
+                assert!(
+                    ranges
+                        .windows(2)
+                        .all(|pair| pair[0].1 < pair[1].0 && pair[1].0 - pair[0].1 > 1),
+                    "{shown:?} on {len} bytes gave uncoalesced {ranges:?}"
+                );
+            }
+            RangeOutcome::Unsatisfiable => unsatisfiable += 1,
+            RangeOutcome::Ignore => ignored += 1,
+        }
+    }
+    // The seed is fixed, so these only fail if the generator stops reaching an outcome.
+    assert!(
+        singles > 1000 && multis > 1000 && unsatisfiable > 500 && ignored > 1000,
+        "outcomes: {singles} single, {multis} multi, {unsatisfiable} unsatisfiable, {ignored} ignored"
+    );
+}
+
 #[tokio::test]
 async fn multipart_body_framing_is_byte_exact() {
     let root = temp_root("multipart-framing");

@@ -480,3 +480,15 @@ fn authenticates_non_good_outcomes_and_enforces_two_clocks() {
             .is_none()
     );
 }
+
+/// (#1239) The prototypes in `ffi.rs` are written by hand and were compared with the
+/// OpenSSL 3.x and 4.0 headers only. A build against another major fails here instead of
+/// calling through declarations nobody compared.
+#[test]
+fn linked_openssl_is_a_major_the_prototypes_were_checked_against() {
+    assert!(
+        crate::ffi::VERIFIED_OPENSSL.contains(&openssl::version::number()),
+        "linked {}: compare crates/hj-ocsp/src/ffi.rs with its headers, then widen VERIFIED_OPENSSL",
+        openssl::version::version()
+    );
+}

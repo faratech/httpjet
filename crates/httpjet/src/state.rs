@@ -409,6 +409,117 @@ impl PaddedAtomic {
     }
 }
 
+/// Requests inside `pipeline::handle`, counted on one cache line per worker so the ±1 of
+/// every bridged request does not bounce a line all workers share. A request can leave
+/// on another worker than it entered on, so one shard may sit below zero; only the sum
+/// means anything.
+#[derive(Default)]
+pub struct ActiveRequests(PaddedAtomic);
+
+impl ActiveRequests {
+    #[inline]
+    pub fn enter(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn leave(&self) {
+        self.0.fetch_add(u64::MAX, Ordering::Relaxed);
+    }
+
+    /// A read racing a request can see its leave without its enter; that is zero, not 2^64-1.
+    pub fn load(&self) -> u64 {
+        (self.0.load(Ordering::Relaxed) as i64).max(0) as u64
+    }
+}
+
+/// Why an HTTP/1 connection ended. One connection records exactly one cause, so the
+/// counts add up to the connections that ended (the h2 taxonomy is `hj_h2::server`'s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum H1ConnEnd {
+    /// Our keep-alive idle timer expired.
+    Idle,
+    /// The peer closed cleanly between requests.
+    PeerEof,
+    /// The peer closed before it sent a request.
+    NoRequest,
+    /// A read or write failed (reset, TLS closed without close_notify, send stall).
+    IoError,
+    /// The request asked for the connection to close (`Connection: close`, HTTP/1.0).
+    ClientClose,
+    /// The keep-alive request cap was reached.
+    KeepaliveCap,
+    /// The response had to end with a close.
+    ResponseClose,
+    /// A request we refused with a 4xx and closed.
+    Refused,
+    /// The request head did not arrive in time.
+    RequestTimeout,
+    /// A 503 for an exhausted body-buffer budget.
+    Overload,
+    /// The connection was handed to an upgraded protocol.
+    Upgrade,
+    /// Server shutdown or drain.
+    Shutdown,
+    /// Any other end.
+    Other,
+}
+
+impl H1ConnEnd {
+    pub const ALL: [H1ConnEnd; 13] = [
+        H1ConnEnd::Idle,
+        H1ConnEnd::PeerEof,
+        H1ConnEnd::NoRequest,
+        H1ConnEnd::IoError,
+        H1ConnEnd::ClientClose,
+        H1ConnEnd::KeepaliveCap,
+        H1ConnEnd::ResponseClose,
+        H1ConnEnd::Refused,
+        H1ConnEnd::RequestTimeout,
+        H1ConnEnd::Overload,
+        H1ConnEnd::Upgrade,
+        H1ConnEnd::Shutdown,
+        H1ConnEnd::Other,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            H1ConnEnd::Idle => "idle",
+            H1ConnEnd::PeerEof => "peer_eof",
+            H1ConnEnd::NoRequest => "no_request",
+            H1ConnEnd::IoError => "io_error",
+            H1ConnEnd::ClientClose => "client_close",
+            H1ConnEnd::KeepaliveCap => "keepalive_cap",
+            H1ConnEnd::ResponseClose => "response_close",
+            H1ConnEnd::Refused => "refused",
+            H1ConnEnd::RequestTimeout => "request_timeout",
+            H1ConnEnd::Overload => "overload",
+            H1ConnEnd::Upgrade => "upgrade",
+            H1ConnEnd::Shutdown => "shutdown",
+            H1ConnEnd::Other => "other",
+        }
+    }
+}
+
+/// Connection-end counts, indexed by [`H1ConnEnd`]. Written once per connection.
+#[derive(Default)]
+pub struct H1ConnEnds([AtomicU64; H1ConnEnd::ALL.len()]);
+
+impl H1ConnEnds {
+    pub fn record(&self, end: H1ConnEnd) {
+        if let Some(count) = self.0.get(end as usize) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn snapshot(&self) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        H1ConnEnd::ALL
+            .iter()
+            .zip(&self.0)
+            .map(|(end, count)| (end.label(), count.load(Ordering::Relaxed)))
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
     /// (OPS1) Total requests served, incremented at the access-log point.
@@ -421,7 +532,7 @@ pub struct Metrics {
     /// (OPS2 / observability) Requests currently executing inside `pipeline::handle` (a
     /// guard ±1) — producing the response head, NOT spanning the streamed body — so it is
     /// a handler-concurrency gauge, not the drain signal.
-    pub active_requests: Arc<AtomicU64>,
+    pub active_requests: Arc<ActiveRequests>,
     /// (OPS3) Local loopback purges received on /__hj_cache_purge and applied.
     pub purges_received: Arc<AtomicU64>,
     /// (#349) Finished-response memo hits served on the on-core fast path.
@@ -457,6 +568,8 @@ pub struct Metrics {
     /// in `hj_h2::server::connection_close_counts`).
     pub h1_idle_closes: Arc<AtomicU64>,
     pub h1_peer_closes: Arc<AtomicU64>,
+    /// Every HTTP/1 connection end, by cause.
+    pub h1_conn_ends: Arc<H1ConnEnds>,
     /// Last accepted `/cache-entries` debug render, in unix milliseconds.
     pub cache_entries_last_ms: Arc<AtomicU64>,
     /// Accepted `/cache-entries` renders.
@@ -1410,6 +1523,32 @@ mod tests {
     use hj_core::config::{Context, ContextKind, ExtAddress, VHostConfig, VHostDecl};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// (#1240) A request may leave on another worker than it entered on. The gauge is
+    /// the sum over the workers' lines, and a read that catches only the leave is zero.
+    #[test]
+    fn in_flight_requests_balance_across_threads() {
+        let active = Arc::new(ActiveRequests::default());
+        for _ in 0..3 {
+            active.enter();
+        }
+        assert_eq!(active.load(), 3);
+        let elsewhere = active.clone();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                elsewhere.leave();
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(active.load(), 0);
+        active.leave();
+        assert_eq!(active.load(), 0, "an unmatched leave reads as zero");
+        active.enter();
+        assert_eq!(active.load(), 0);
+        active.enter();
+        assert_eq!(active.load(), 1);
+    }
 
     /// #807/#808 prod-safety: the live LiteSpeed config (when present on this
     /// host) keeps its ACL verdicts: allow ALL plus trusted Cloudflare ranges.

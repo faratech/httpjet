@@ -9,6 +9,10 @@ exclude = [
     "vendor/quinn-udp",
 ]
 
+[workspace.lints.rust]
+# cargo-fuzz compiles every crate with `--cfg fuzzing`; the fuzzing seams are gated on it.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
 [workspace.lints.clippy]
 # panic = "abort" in release: a reachable panic restarts the whole server. These stay
 # warnings (the build never fails on them); scripts/clippy-panic-ratchet.sh fails CI
@@ -20,7 +24,7 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 publish = false
 rust-version = "1.99.1"

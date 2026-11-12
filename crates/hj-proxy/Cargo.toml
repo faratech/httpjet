@@ -37,3 +37,6 @@ hyper = { workspace = true, features = ["server"] }
 tokio = { workspace = true, features = ["test-util"] }
 http-body-util = { workspace = true }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+
+[lints]
+workspace = true

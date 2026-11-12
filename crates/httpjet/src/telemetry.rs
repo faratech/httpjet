@@ -1223,7 +1223,7 @@ impl TelemetrySampler {
             conn_idle_closes_h2: h2_idle,
             conn_peer_closes_h2: h2_peer,
             active_connections: m.active_conns.load(Relaxed),
-            active_requests: m.active_requests.load(Relaxed),
+            active_requests: m.active_requests.load(),
             rss_anon_bytes: crate::metrics::proc_mem().map_or(0, |p| p.rss_anon_bytes),
             pagecache_memory_bytes: page.index_ram_bytes,
             pagecache_hot_bytes: page.hot_bytes,
@@ -1843,7 +1843,9 @@ mod tests {
         )
         .unwrap();
         state.metrics.active_conns.store(7, Relaxed);
-        state.metrics.active_requests.store(3, Relaxed);
+        for _ in 0..3 {
+            state.metrics.active_requests.enter();
+        }
         state.metrics.tls_handshakes_full.store(11, Relaxed);
         state.metrics.tls_handshakes_resumed.store(2, Relaxed);
         state.metrics.h1_idle_closes.store(5, Relaxed);

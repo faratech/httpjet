@@ -2,8 +2,10 @@
 # clippy-panic-ratchet.sh — keep panic-capable code in the request-serving crates from
 # growing. Release builds use panic = "abort", so a reachable unwrap/expect/index/panic
 # restarts the server. Counts clippy's unwrap_used / expect_used / indexing_slicing /
-# panic / unreachable warnings per (file, lint) in non-test code of httpjet, hj-h2 and
-# hj-lsapi, and fails when any count exceeds scripts/clippy-panic-baseline.txt.
+# panic / unreachable warnings per (file, lint) in non-test code of the request-path
+# crates (PACKAGES below) and fails when any count exceeds
+# scripts/clippy-panic-baseline.txt. It does not see integer wraps: release builds have
+# overflow checks off.
 #
 # Usage: bash scripts/clippy-panic-ratchet.sh [--update]
 #   --update rewrites the baseline (commit it with the change that justified it).
@@ -14,7 +16,9 @@ BASELINE=scripts/clippy-panic-baseline.txt
 
 current="$(mktemp)"
 trap 'rm -f "$current"' EXIT
-cargo clippy --locked -p httpjet -p hj-h2 -p hj-lsapi --message-format=json 2>/dev/null \
+PACKAGES=(httpjet hj-h2 hj-lsapi hj-fastcgi hj-proxy hj-static hj-compress hj-pagecache
+  hj-rewrite hj-acl hj-core)
+cargo clippy --locked "${PACKAGES[@]/#/--package=}" --message-format=json 2>/dev/null \
   | python3 -I -c '
 import json, sys, collections
 lints = {"clippy::unwrap_used", "clippy::expect_used", "clippy::indexing_slicing",

@@ -12,6 +12,12 @@ use openssl::{
 use openssl_sys::{ASN1_GENERALIZEDTIME, OCSP_BASICRESP, X509_ALGOR};
 use std::ffi::{c_int, c_void};
 
+/// OpenSSL versions whose headers these prototypes were compared with: 3.x and 4.0
+/// (`openssl/ocsp.h`, `openssl/x509v3.h`). openssl-sys does not export the functions, so
+/// nothing checks the signatures at build time; [`crate::Identity::new`] refuses any other
+/// major instead of calling through a declaration nobody compared.
+pub(crate) const VERIFIED_OPENSSL: std::ops::Range<i64> = 0x3000_0000..0x5000_0000;
+
 unsafe extern "C" {
     fn X509_check_ca(cert: *mut openssl_sys::X509) -> c_int;
     fn OCSP_resp_get0_signer(

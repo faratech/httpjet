@@ -692,7 +692,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -988,7 +988,7 @@ checksum = "e17592d60ebacc7d5e169f4663c5f84f9161cc90328abcfe8456f41e4dfcb284"
 
 [[package]]
 name = "hj-acl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "globset",
  "hj-core",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "hj-acme"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "hj-cache"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hj-config",
  "parking_lot",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "hj-compress"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "brotli",
@@ -1049,7 +1049,7 @@ dependencies = [
 
 [[package]]
 name = "hj-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ipnet",
  "quick-xml",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "hj-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1076,7 +1076,7 @@ dependencies = [
 
 [[package]]
 name = "hj-extension"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "hj-core",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "hj-fastcgi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1101,14 +1101,14 @@ dependencies = [
 
 [[package]]
 name = "hj-geo"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ipnet",
 ]
 
 [[package]]
 name = "hj-h2"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1126,14 +1126,14 @@ dependencies = [
 
 [[package]]
 name = "hj-http"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hj-core",
 ]
 
 [[package]]
 name = "hj-log"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flate2",
  "libc",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "hj-lsapi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "hj-ocsp"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "foreign-types",
@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "hj-pagecache"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "hj-proxy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -1222,7 +1222,7 @@ dependencies = [
 
 [[package]]
 name = "hj-rewrite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "bcrypt",
@@ -1242,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "hj-static"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "hj-tls"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1331,7 +1331,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "httpjet"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2472,7 +2472,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2483,7 +2483,7 @@ dependencies = [
  "libc",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2715,15 +2715,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2781,7 +2781,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3133,7 +3133,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3648,7 +3648,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

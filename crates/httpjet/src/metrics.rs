@@ -413,7 +413,7 @@ fn render(state: &ServerState) -> String {
     let mut body = render_metrics(
         state.metrics.requests_total.load(Ordering::Relaxed),
         state.metrics.active_conns.load(Ordering::Relaxed),
-        state.metrics.active_requests.load(Ordering::Relaxed),
+        state.metrics.active_requests.load(),
         PeerPurgeCounters {
             received: state.metrics.purges_received.load(Ordering::Relaxed),
         },
@@ -538,6 +538,25 @@ fn render(state: &ServerState) -> String {
         body.push_str(&format!(
             "httpjet_pagecache_integrity_active {}\n",
             u8::from(hj_pagecache::diskstore::integrity_key_active())
+        ));
+        let admission = &state.page_cache_admission;
+        body.push_str(&format!(
+            "# HELP httpjet_pagecache_admission_counters Counters in the store-admission frequency table (one byte each).\n\
+             # TYPE httpjet_pagecache_admission_counters gauge\n\
+             httpjet_pagecache_admission_counters {}\n\
+             # HELP httpjet_pagecache_admission_period_records Cacheable lookups between two agings of the admission table.\n\
+             # TYPE httpjet_pagecache_admission_period_records gauge\n\
+             httpjet_pagecache_admission_period_records {}\n\
+             # HELP httpjet_pagecache_admission_occupancy Share of admission counters that are non-zero (sampled). A never-requested URL is taken for a repeat with about this share to the 4th power; healthy is below 0.3.\n\
+             # TYPE httpjet_pagecache_admission_occupancy gauge\n\
+             httpjet_pagecache_admission_occupancy {:.4}\n\
+             # HELP httpjet_pagecache_admission_agings_total Aging passes of the admission table since start.\n\
+             # TYPE httpjet_pagecache_admission_agings_total counter\n\
+             httpjet_pagecache_admission_agings_total {}\n",
+            admission.counters(),
+            admission.period_records(),
+            admission.occupancy(),
+            admission.aging_passes(),
         ));
     }
     append_runtime_diagnostics(
@@ -745,6 +764,15 @@ fn append_connection_metrics(out: &mut String, metrics: &crate::state::Metrics) 
     for (reason, count) in hj_h2::server::connection_end_counts() {
         out.push_str(&format!(
             "httpjet_h2_conn_ends_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP httpjet_h1_conn_ends_total HTTP/1 connections that ended, by cause (plain and TLS).\n\
+         # TYPE httpjet_h1_conn_ends_total counter\n",
+    );
+    for (reason, count) in metrics.h1_conn_ends.snapshot() {
+        out.push_str(&format!(
+            "httpjet_h1_conn_ends_total{{reason=\"{reason}\"}} {count}\n"
         ));
     }
     let (send_blocked_conn, send_blocked_stream) = hj_h2::server::send_blocked_counts();
@@ -1880,6 +1908,12 @@ fn render_metrics(
             s.fanout_recreations.to_string(),
         );
         metric(
+            "httpjet_pagecache_scan_dir_errors_total",
+            "counter",
+            "File-tier fanout directories the boot scan could not open or list; their files stay unindexed and uncharged until a restart.",
+            s.scan_dir_errors.to_string(),
+        );
+        metric(
             "httpjet_pagecache_meta_decode_errors_total",
             "counter",
             "Resident metadata blobs that failed to decode and were invalidated.",
@@ -2047,6 +2081,7 @@ mod tests {
             store_purge_rejections: 3,
             entries: 12,
             poisoned_locks: 2,
+            scan_dir_errors: 4,
             ..CacheStats::default()
         };
         let body = render_metrics(
@@ -2077,6 +2112,10 @@ mod tests {
         );
         assert!(
             body.contains("httpjet_pagecache_poisoned_locks_total 2\n"),
+            "got:\n{body}"
+        );
+        assert!(
+            body.contains("httpjet_pagecache_scan_dir_errors_total 4\n"),
             "got:\n{body}"
         );
     }

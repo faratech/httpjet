@@ -34,7 +34,7 @@ class PublicChecks(unittest.TestCase):
 
     def response(self, request, timeout):
         self.assertEqual(timeout, 30)
-        self.assertEqual(request.get_header('User-agent'), 'httpjet-release/0.2.0')
+        self.assertEqual(request.get_header('User-agent'), 'httpjet-release/0.2.1')
         return Response(request.full_url, self.payloads[request.full_url])
 
     def test_optional_website_skip_keeps_package_and_release_checks(self):

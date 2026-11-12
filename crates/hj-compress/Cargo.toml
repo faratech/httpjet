@@ -23,3 +23,6 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
+
+[lints]
+workspace = true

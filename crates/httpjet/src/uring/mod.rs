@@ -15,6 +15,7 @@ pub(crate) mod directio;
 mod generation_test;
 mod h1_write_buffers;
 pub(crate) mod h3;
+mod h3_wire;
 #[cfg(feature = "ktls")]
 pub(crate) mod ktls;
 pub(crate) mod ktls_policy;
@@ -38,7 +39,7 @@ use monoio::net::{TcpListener, TcpStream};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::serving_generation::{RequestGeneration, ServingView};
-use crate::state::ServerState;
+use crate::state::{H1ConnEnd, ServerState};
 use bridge::{Bridge, BridgeCtx};
 use codec::{
     BodyFraming, ChunkStep, ChunkedDecoder, MAX_REQUEST_HEADERS, RequestHeadProgress,
@@ -2020,6 +2021,32 @@ fn keepalive_exhausted(served: u32, max: u32) -> bool {
     served >= max.max(1)
 }
 
+/// Records why an HTTP/1 connection ended, once, when its serve loop returns. A path
+/// that sets no cause counts as `other`, so the causes always add up to the connections.
+struct H1EndGuard {
+    ends: Arc<crate::state::H1ConnEnds>,
+    cause: std::cell::Cell<H1ConnEnd>,
+}
+
+impl H1EndGuard {
+    fn new(core: &CoreHandler) -> Self {
+        Self {
+            ends: core.holder.load().metrics.h1_conn_ends.clone(),
+            cause: std::cell::Cell::new(H1ConnEnd::Other),
+        }
+    }
+
+    fn set(&self, cause: H1ConnEnd) {
+        self.cause.set(cause);
+    }
+}
+
+impl Drop for H1EndGuard {
+    fn drop(&mut self) {
+        self.ends.record(self.cause.get());
+    }
+}
+
 /// Real HTTP/1.1 over io_uring (plaintext or TLS stream) dispatched to the pipeline
 /// via the bridge: parse the full request (method/uri/headers/body),
 /// `bridge.dispatch`, then write the real response. Keep-alive loop; pipelining via
@@ -2039,6 +2066,7 @@ async fn handle_h1_bridged<S>(
 {
     // Requests served on this keep-alive connection (LiteSpeed maxKeepAliveReq enforcement).
     let mut served: u32 = 0;
+    let end = H1EndGuard::new(&core);
     let mut read_scratch: Vec<u8> = Vec::new();
     let mut response_buffers = h1_write_buffers::ResponseBuffers::default();
     // (Tier 2) One bucket per CONNECTION — pacing must not reset per response. Rebuilt
@@ -2071,17 +2099,27 @@ async fn handle_h1_bridged<S>(
                         Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
                         Ok(_) => {
                             core.holder.load().metrics.h1_peer_closes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            end.set(if served == 0 {
+                                H1ConnEnd::NoRequest
+                            } else {
+                                H1ConnEnd::PeerEof
+                            });
                             return;
                         }
                         Err(e) if e.kind() == io::ErrorKind::TimedOut => {
                             core.holder.load().metrics.h1_idle_closes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            end.set(H1ConnEnd::Idle);
                             return;
                         }
-                        Err(_) => return,
+                        Err(_) => {
+                            end.set(H1ConnEnd::IoError);
+                            return;
+                        }
                     }
                 }
                 _ = shutdown.cancelled() => {
                     let _ = stream.shutdown().await;
+                    end.set(H1ConnEnd::Shutdown);
                     return;
                 }
             }
@@ -2144,10 +2182,12 @@ async fn handle_h1_bridged<S>(
                     // reply", Cloudflare retries against the peer, and nothing reaches the
                     // access log because the funnel is never entered. Answer 400 + close
                     // like every sibling refusal path (and hyper/LiteSpeed) instead.
+                    end.set(H1ConnEnd::Refused);
                     write_status_close(&mut stream, 400, "Bad Request", &shutdown).await;
                     return;
                 }
                 ParsedReq::HeadersTooLarge => {
+                    end.set(H1ConnEnd::Refused);
                     write_status_close(
                         &mut stream,
                         431,
@@ -2158,11 +2198,13 @@ async fn handle_h1_bridged<S>(
                     return;
                 }
                 ParsedReq::MethodNotAllowed => {
+                    end.set(H1ConnEnd::Refused);
                     write_status_close(&mut stream, 405, "Method Not Allowed", &shutdown).await;
                     return;
                 }
                 ParsedReq::Partial => {
                     if acc.len() > max_head {
+                        end.set(H1ConnEnd::Refused);
                         write_status_close(
                             &mut stream,
                             431,
@@ -2177,6 +2219,7 @@ async fn handle_h1_bridged<S>(
                     if let Some(r) = remaining {
                         if r.is_zero() {
                             tracing::debug!(%ctx.peer, "uring h1: header read timed out");
+                            end.set(H1ConnEnd::RequestTimeout);
                             return;
                         }
                     }
@@ -2184,11 +2227,21 @@ async fn handle_h1_bridged<S>(
                     // been processed; closing it lets the drain finish promptly.
                     let read = monoio::select! {
                         read = read_timeout(&mut stream, remaining, &mut read_scratch) => read,
-                        _ = shutdown.cancelled() => return,
+                        _ = shutdown.cancelled() => {
+                            end.set(H1ConnEnd::Shutdown);
+                            return;
+                        }
                     };
                     match read {
                         Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
-                        _ => return,
+                        Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                            end.set(H1ConnEnd::RequestTimeout);
+                            return;
+                        }
+                        _ => {
+                            end.set(H1ConnEnd::IoError);
+                            return;
+                        }
                     }
                 }
             }
@@ -2214,8 +2267,10 @@ async fn handle_h1_bridged<S>(
         );
         // maxKeepAliveReq: once this connection has served the configured number of requests,
         // signal close on this (final) response so the client opens a fresh connection.
+        let client_close = !keep_alive;
         served = served.saturating_add(1);
-        if keepalive_exhausted(served, max_keepalive) {
+        let keepalive_cap = keepalive_exhausted(served, max_keepalive);
+        if keepalive_cap {
             keep_alive = false;
         }
         // A plaintext request the mTLS gate will refuse is answered from its head:
@@ -2265,6 +2320,7 @@ async fn handle_h1_bridged<S>(
                 if !outcome.failed {
                     lingering_close(&mut stream, &shutdown).await;
                 }
+                end.set(H1ConnEnd::Refused);
                 return;
             }
         }
@@ -2273,6 +2329,7 @@ async fn handle_h1_bridged<S>(
         let mut body_lease: Option<hj_core::budget::BodyBufferLease> = None;
         let body_bytes: Vec<u8> = match framing {
             BodyFraming::Reject => {
+                end.set(H1ConnEnd::Refused);
                 write_status_close(&mut stream, 400, "Bad Request", &shutdown).await;
                 return;
             }
@@ -2280,6 +2337,7 @@ async fn handle_h1_bridged<S>(
                 // Bound buffered request-body memory: reject an oversized declared length
                 // up front (413) instead of reading gigabytes into `acc`.
                 if content_length > max_body {
+                    end.set(H1ConnEnd::Refused);
                     write_status_close(&mut stream, 413, "Payload Too Large", &shutdown).await;
                     return;
                 }
@@ -2310,6 +2368,7 @@ async fn handle_h1_bridged<S>(
                         // Server capacity, not client error — same status collect_to_cap uses.
                         tracing::debug!(%ctx.peer, "uring h1: body buffer budget exhausted");
                         release_refused_body(&mut body_lease, &mut acc);
+                        end.set(H1ConnEnd::Overload);
                         write_status_close(&mut stream, 503, "Service Unavailable", &shutdown)
                             .await;
                         return;
@@ -2320,6 +2379,7 @@ async fn handle_h1_bridged<S>(
                 // client that already streamed the body doesn't need it).
                 if expect_continue && content_length > 0 && acc.len() < total {
                     if write_continue(&mut stream).await.is_err() {
+                        end.set(H1ConnEnd::IoError);
                         return;
                     }
                 }
@@ -2345,6 +2405,7 @@ async fn handle_h1_bridged<S>(
                                     "uring h1: body buffer budget exhausted mid-body"
                                 );
                                 release_refused_body(&mut body_lease, &mut acc);
+                                end.set(H1ConnEnd::Overload);
                                 write_status_close(
                                     &mut stream,
                                     503,
@@ -2355,7 +2416,10 @@ async fn handle_h1_bridged<S>(
                                 return;
                             }
                         }
-                        _ => return,
+                        _ => {
+                            end.set(H1ConnEnd::IoError);
+                            return;
+                        }
                     }
                 }
                 take_fixed_body(&mut acc, head_len, content_length)
@@ -2370,6 +2434,7 @@ async fn handle_h1_bridged<S>(
                 // A chunked request always carries a body; honor Expect before draining it.
                 if expect_continue {
                     if write_continue(&mut stream).await.is_err() {
+                        end.set(H1ConnEnd::IoError);
                         return;
                     }
                 }
@@ -2392,6 +2457,7 @@ async fn handle_h1_bridged<S>(
                             tracing::debug!(%ctx.peer, "uring h1: body buffer budget exhausted");
                             release_refused_body(&mut body_lease, &mut acc);
                             dec.body = Vec::new();
+                            end.set(H1ConnEnd::Overload);
                             write_status_close(&mut stream, 503, "Service Unavailable", &shutdown)
                                 .await;
                             return;
@@ -2403,6 +2469,7 @@ async fn handle_h1_bridged<S>(
                         ChunkStep::Bad if dec.too_large => {
                             release_refused_body(&mut body_lease, &mut acc);
                             dec.body = Vec::new();
+                            end.set(H1ConnEnd::Refused);
                             write_status_close(&mut stream, 413, "Payload Too Large", &shutdown)
                                 .await;
                             return;
@@ -2410,6 +2477,7 @@ async fn handle_h1_bridged<S>(
                         ChunkStep::Bad => {
                             release_refused_body(&mut body_lease, &mut acc);
                             dec.body = Vec::new();
+                            end.set(H1ConnEnd::Refused);
                             write_status_close(&mut stream, 400, "Bad Request", &shutdown).await;
                             return;
                         }
@@ -2427,7 +2495,10 @@ async fn handle_h1_bridged<S>(
                                         deadline.received(acc.len());
                                     }
                                 }
-                                _ => return,
+                                _ => {
+                                    end.set(H1ConnEnd::IoError);
+                                    return;
+                                }
                             }
                         }
                     }
@@ -2468,6 +2539,7 @@ async fn handle_h1_bridged<S>(
         {
             Ok(bytes) => bytes,
             Err(status) => {
+                end.set(H1ConnEnd::Refused);
                 write_status_close(
                     &mut stream,
                     status.as_u16(),
@@ -2531,22 +2603,26 @@ async fn handle_h1_bridged<S>(
         }
         if resp.status == http::StatusCode::SWITCHING_PROTOCOLS {
             let Some(mut ready) = upgrade_ready else {
+                end.set(H1ConnEnd::Other);
                 write_status_close(&mut stream, 502, "Bad Gateway", &shutdown).await;
                 return;
             };
             let Some(upgrade) = ready.recv().await else {
+                end.set(H1ConnEnd::Other);
                 write_status_close(&mut stream, 502, "Bad Gateway", &shutdown).await;
                 return;
             };
             let head = serialize_h1_upgrade_response(resp.status, &resp.headers);
             let (written, _) = stream.write_all(head).await;
             if written.is_err() {
+                end.set(H1ConnEnd::IoError);
                 return;
             }
             #[cfg(feature = "otel")]
             if let Some(trace) = trace.take() {
                 trace.finish("upgraded");
             }
+            end.set(H1ConnEnd::Upgrade);
             relay_h1_upgrade(stream, std::mem::take(&mut acc), upgrade, &shutdown).await;
             return;
         }
@@ -2583,6 +2659,17 @@ async fn handle_h1_bridged<S>(
             trace.finish(if outcome.failed { "error" } else { "complete" });
         }
         if outcome.close {
+            end.set(if outcome.failed {
+                H1ConnEnd::IoError
+            } else if client_close {
+                H1ConnEnd::ClientClose
+            } else if keepalive_cap {
+                H1ConnEnd::KeepaliveCap
+            } else if shutdown.is_cancelled() {
+                H1ConnEnd::Shutdown
+            } else {
+                H1ConnEnd::ResponseClose
+            });
             // Bytes already pipelined behind this request say more are in flight (#1036).
             if !outcome.failed && !acc.is_empty() {
                 lingering_close(&mut stream, &shutdown).await;
@@ -7420,6 +7507,108 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             .await;
         });
         client.join().unwrap()
+    }
+
+    /// Serve one plaintext H1 connection driven by `client` and return the cause the
+    /// connection end was recorded under.
+    fn h1_end_cause(
+        max_keep_alive_req: u32,
+        client: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> Vec<&'static str> {
+        let (_tokio_runtime, core) = websocket_test_core_with(max_keep_alive_req);
+        let ends = core.holder.load().metrics.h1_conn_ends.clone();
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = std_listener.local_addr().unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let client = std::thread::spawn(move || {
+            let stream = std::net::TcpStream::connect(local).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            client(stream);
+        });
+        let mut runtime = build_core_runtime().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(std_listener).unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
+            handle_h1_bridged(
+                stream,
+                Vec::new(),
+                BridgeCtx::plain(peer, local, Proto::Http1),
+                core,
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        });
+        client.join().unwrap();
+        ends.snapshot()
+            .filter(|(_, count)| *count > 0)
+            .flat_map(|(cause, count)| std::iter::repeat_n(cause, count as usize))
+            .collect()
+    }
+
+    /// (#1237) Every H1 connection end is recorded under exactly one cause.
+    #[test]
+    fn h1_connection_ends_are_counted_by_cause() {
+        use std::io::{Read, Write};
+        let read_response = |stream: &mut std::net::TcpStream| {
+            let mut wire = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !wire.ends_with(b"hinted") {
+                match stream.read(&mut chunk) {
+                    Ok(n) if n > 0 => wire.extend_from_slice(&chunk[..n]),
+                    _ => break,
+                }
+            }
+        };
+
+        // The peer connects and leaves without a request.
+        assert_eq!(h1_end_cause(100, drop), ["no_request"]);
+
+        // A keep-alive request, then the peer closes between requests.
+        assert_eq!(
+            h1_end_cause(100, move |mut stream| {
+                stream
+                    .write_all(b"GET /hint HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .unwrap();
+                read_response(&mut stream);
+            }),
+            ["peer_eof"]
+        );
+
+        // The same request on a connection that has reached its request cap.
+        assert_eq!(
+            h1_end_cause(1, move |mut stream| {
+                stream
+                    .write_all(b"GET /hint HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .unwrap();
+                let _ = stream.read_to_end(&mut Vec::new());
+            }),
+            ["keepalive_cap"]
+        );
+
+        // The request asks for the close.
+        assert_eq!(
+            h1_end_cause(100, move |mut stream| {
+                stream
+                    .write_all(b"GET /hint HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let _ = stream.read_to_end(&mut Vec::new());
+            }),
+            ["client_close"]
+        );
+
+        // A request we refuse and close on.
+        assert_eq!(
+            h1_end_cause(100, move |mut stream| {
+                stream
+                    .write_all(b"GET /hint HTTP/1.1\nHost: x\n\n")
+                    .unwrap();
+                let _ = stream.read_to_end(&mut Vec::new());
+            }),
+            ["refused"]
+        );
     }
 
     /// Regression (#608): 103 Early Hints go to HTTP/1.1 clients only; an HTTP/1.0

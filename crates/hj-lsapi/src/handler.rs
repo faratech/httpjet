@@ -2843,6 +2843,42 @@ impl Drop for PacketReader {
     }
 }
 
+/// Fuzzing seam (cargo-fuzz compiles with `--cfg fuzzing`): run the production packet
+/// reader over `chunks`, each delivered as one socket read, and return every packet it
+/// yields as `(type, flag, body)` with whether the stream ended in an error.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub async fn fuzz_read_packets(chunks: Vec<Vec<u8>>) -> (Vec<(u8, u8, Vec<u8>)>, bool) {
+    struct Chunks(std::collections::VecDeque<Vec<u8>>);
+    impl tokio::io::AsyncRead for Chunks {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(mut chunk) = self.0.pop_front() {
+                let taken = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..taken]);
+                if taken < chunk.len() {
+                    chunk.drain(..taken);
+                    self.0.push_front(chunk);
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    let mut source = Chunks(chunks.into_iter().filter(|c| !c.is_empty()).collect());
+    let mut reader = PacketReader::with_deadline(Duration::from_secs(5), None);
+    let mut packets = Vec::new();
+    loop {
+        match reader.next(&mut source).await {
+            Ok(Some(frame)) => packets.push((frame.ptype as u8, frame.flag, frame.body.to_vec())),
+            Ok(None) => return (packets, false),
+            Err(_) => return (packets, true),
+        }
+    }
+}
+
 #[cfg(test)]
 mod inline_body_tests {
     use std::time::Duration;

@@ -1394,7 +1394,18 @@ pub(super) struct OutQueue {
     inline: Vec<u8>,
     segs: Vec<Seg>,
     completions: Vec<hj_core::ResponseCompletion>,
+    #[cfg(feature = "monoio")]
+    write_backings: Vec<Bytes>,
+    #[cfg(feature = "monoio")]
+    write_spans: Vec<crate::owned_iovec::IoVecSpan>,
+    #[cfg(feature = "monoio")]
+    write_storage: crate::owned_iovec::IoVecStorage,
 }
+
+// Flush metadata kept between writes. One large response must not grow the scratch
+// of every idle connection for its lifetime.
+#[cfg(feature = "monoio")]
+const RETAINED_FLUSH_METADATA: usize = 64;
 #[cfg(test)]
 mod completion_tests;
 
@@ -1435,6 +1446,12 @@ impl OutQueue {
         f(&mut self.inline);
         let len = self.inline.len() - start;
         if len > 0 {
+            if let Some(Seg::Inline(offset, previous)) = self.segs.last_mut()
+                && *offset + *previous == start
+            {
+                *previous += len;
+                return;
+            }
             self.segs.push(Seg::Inline(start, len));
         }
     }
@@ -1563,6 +1580,9 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
             for seg in &q.segs {
                 let (ptr, len) = match seg {
                     Seg::Inline(off, l) => (
+                        // SAFETY: an inline segment is an `(offset, len)` range the queue
+                        // recorded when it appended those bytes to `q.inline`, which only
+                        // grows until the queue is cleared, so `off` is inside the Vec.
                         unsafe { q.inline.as_ptr().add(*off) } as *mut libc::c_void,
                         *l,
                     ),
@@ -1613,11 +1633,12 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
         use crate::owned_iovec::{IoVecSpan, OwnedIoVec, write_all_owned};
 
         let inline = Bytes::from(std::mem::take(&mut q.inline));
-        let segments = std::mem::take(&mut q.segs);
-        let mut backings = Vec::with_capacity(segments.len() + 1);
-        let mut spans = Vec::with_capacity(segments.len());
+        let mut backings = std::mem::take(&mut q.write_backings);
+        let mut spans = std::mem::take(&mut q.write_spans);
+        backings.reserve(q.segs.len() + 1);
+        spans.reserve(q.segs.len());
         backings.push(inline);
-        for segment in segments {
+        for segment in q.segs.drain(..) {
             match segment {
                 Seg::Inline(offset, len) => spans.push(IoVecSpan::new(0, offset, len)),
                 Seg::Body(body) => {
@@ -1628,15 +1649,30 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
                 }
             }
         }
-        let buffer = OwnedIoVec::from_backings(backings, spans)?;
+        let buffer =
+            OwnedIoVec::with_storage(backings, &spans, std::mem::take(&mut q.write_storage))?;
         let buffer = write_all_owned(stream, buffer).await?;
-        q.inline = buffer
-            .into_backings()
-            .into_iter()
-            .next()
+        let (mut backings, mut storage) = buffer.into_reusable_parts();
+        q.inline = backings
+            .first_mut()
+            .map(std::mem::take)
             .map(Vec::from)
             .unwrap_or_default();
         q.inline.clear();
+        // Only metadata capacity survives a completed write: clearing releases every body.
+        backings.clear();
+        spans.clear();
+        if backings.capacity() <= RETAINED_FLUSH_METADATA {
+            q.write_backings = backings;
+        }
+        if spans.capacity() <= RETAINED_FLUSH_METADATA {
+            q.write_spans = spans;
+        }
+        storage.trim(RETAINED_FLUSH_METADATA);
+        q.write_storage = storage;
+        if q.segs.capacity() > RETAINED_FLUSH_METADATA {
+            q.segs = Vec::new();
+        }
         return Ok(());
     }
     // COALESCE fallback: reached on the non-monoio (tokio) build, or when there are >IOV_MAX
@@ -1672,6 +1708,9 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
         res?;
     }
     q.clear();
+    if q.segs.capacity() > RETAINED_FLUSH_METADATA {
+        q.segs = Vec::new();
+    }
     Ok(())
 }
 

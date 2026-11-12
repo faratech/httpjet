@@ -46,7 +46,7 @@ mod waf;
 /// `RESULTS.md` named (futex ≈75% of syscall time). Applies to every crate.
 /// Under `--features allocount` it is wrapped to count allocations (the h2
 /// alloc-campaign measurement harness); a normal/PGO build uses plain mimalloc.
-#[cfg(not(feature = "allocount"))]
+#[cfg(not(any(feature = "allocount", miri)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

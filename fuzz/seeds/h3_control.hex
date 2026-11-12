@@ -1,0 +1,36 @@
+# First byte selects the read split; with its top bit set the rest is a bare SETTINGS
+# payload, otherwise a client control stream after its stream type.
+# an empty SETTINGS frame
+000400
+# table capacity, field section size and extended CONNECT
+0204070100067ffc0801
+# SETTINGS, then GOAWAY and a grease frame
+0004070100067ffc08010701002103010203
+# SETTINGS, then MAX_PUSH_ID and CANCEL_PUSH
+0404000d0105030100
+# SETTINGS sent twice
+0004000400
+# a repeated identifier
+01040406010602
+# a SETTINGS frame over the payload bound
+000480010001
+# a stream that does not start with SETTINGS
+00070100
+# DATA on the control stream
+000400000161
+# a reserved HTTP/2 identifier
+0004020200
+# extended CONNECT set to 2
+0004020802
+# a setting cut off by the end of its frame
+00040106
+# a frame that promises more than arrives
+0204080100
+# a grease setting with long varints
+030416407ec00001000000000080000006c000000000001000
+# a bare SETTINGS payload
+800100067ffc08013301
+# a bare payload with the datagram setting out of range
+833302
+# a bare payload ending inside a varint
+81068000

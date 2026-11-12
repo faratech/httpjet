@@ -27,7 +27,7 @@ CHECKS = ('install', 'rerun', 'http', 'scripts-denied', 'bridged-transfer', 'res
           'config-preserved', 'upgrade', 'downgrade', 'remove', 'purge', 'occupied-port',
           'no-php-no-cache', 'io-uring-denied', 'reinstall', 'reboot')
 REPO_URL = 'https://httpjet-packages.pages.dev/apt'
-USER_AGENT = 'httpjet-release/0.2.0'
+USER_AGENT = 'httpjet-release/0.2.1'
 
 def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, stdout=subprocess.PIPE,

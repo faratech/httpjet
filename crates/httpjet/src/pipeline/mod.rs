@@ -120,18 +120,18 @@ fn effective_index_files<'a>(
 /// (OPS2) RAII ±1 around the lifetime of one `handle()` call so graceful shutdown
 /// can wait for in-flight requests to finish. Decrements on every exit path
 /// (early returns, the cache-hit short-circuit, panics) via `Drop`.
-struct RequestGuard<'a>(&'a std::sync::atomic::AtomicU64);
+struct RequestGuard<'a>(&'a crate::state::ActiveRequests);
 
 impl<'a> RequestGuard<'a> {
-    fn new(counter: &'a std::sync::atomic::AtomicU64) -> Self {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    fn new(counter: &'a crate::state::ActiveRequests) -> Self {
+        counter.enter();
         RequestGuard(counter)
     }
 }
 
 impl Drop for RequestGuard<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.leave();
     }
 }
 
@@ -5726,7 +5726,11 @@ pub(super) fn resolve_vhost_jail(state: &ServerState, ctx: &ReqCtx) -> std::io::
         .get(&ctx.vhost_name)
         .map(|d| d.vh_root.clone())
         .unwrap_or_else(|| ctx.vhost.doc_root.clone());
-    let is_root = rustix::process::getuid().is_root();
+    // The process's uid does not change after start; asking the kernel per PHP request
+    // was one syscall each, behind the unit's seccomp filters.
+    static IS_ROOT: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| rustix::process::getuid().is_root());
+    let is_root = *IS_ROOT;
     JailConfig::resolve(
         ctx.vhost.isolation.as_ref(),
         &ctx.vhost.doc_root,
@@ -7908,16 +7912,15 @@ mod tests {
 
     #[test]
     fn request_guard_tracks_inflight_and_decrements_on_drop() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let c = AtomicU64::new(0);
+        let c = crate::state::ActiveRequests::default();
         {
             let _g = RequestGuard::new(&c);
-            assert_eq!(c.load(Ordering::Relaxed), 1);
+            assert_eq!(c.load(), 1);
             let _g2 = RequestGuard::new(&c);
-            assert_eq!(c.load(Ordering::Relaxed), 2);
+            assert_eq!(c.load(), 2);
         }
         // Both guards dropped (every handle() exit path) → back to zero.
-        assert_eq!(c.load(Ordering::Relaxed), 0);
+        assert_eq!(c.load(), 0);
     }
 
     #[test]
