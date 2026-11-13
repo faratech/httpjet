@@ -1,0 +1,19 @@
+{
+  "stage": "gen",
+  "target": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/target-gen",
+  "rustflags": "-Ctarget-cpu=native -Cforce-frame-pointers=yes -Cprofile-generate=/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-raw",
+  "exit": 0,
+  "jobs": 2,
+  "profile": "release/opt3/thinLTO/codegen1/panic-abort/strip-debuginfo",
+  "features": [
+    "httpjet/beeper-h2-serve",
+    "httpjet/beeper-observer",
+    "httpjet/quic-bpf"
+  ],
+  "prebuilt_bpf": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/objects",
+  "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/logs/build-gen.log",
+  "log_sha256": "ea77d4aef07f366b9ae6f3e8ef898e914adbd48ca8241a111666ce144ff1ce59",
+  "source_manifest_sha256": "7c66ac12e6e7f0861596ae5aba040a1e3c57e8866493a4873c78847363c31a71",
+  "cflags_cxxflags": "unset, unchanged from non-PGO recipe",
+  "scope": "build only; no performance result"
+}

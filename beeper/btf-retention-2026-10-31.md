@@ -1,0 +1,28 @@
+# BTF retention: helper memory falls, first candidate rejected
+
+The first scoped-BTF helper candidate `8f230a14…` is **rejected and not promoted**. It consistently saves about 6.48 MiB of helper private memory, roughly 64%, but the longer H2c static confirmation raises scheduled p99 **6.91%**, server/helper CPU **8.75%** and whole-VM busy CPU **19.91%**. Scheduled p99 is worse in all three confirmation cycles. This is a stable research record, not a source, binary or deployment promotion.
+
+The experiment scopes startup BTF loading metadata instead of retaining it globally. Both helpers serve the same frozen ABF application and the same four BPF objects. The primary comparison is fresh non-PGO native/frame-pointer helpers: retained-BTF control `3b673b25…` versus scoped candidate `8f230a14…`. The operational PGO helper `0e7be72d…` is a separate third control in the first study. Runtime parser-table bytes were not pinned in these older runs, so source matching alone does not isolate BTF lifetime. [Exact artifacts and source provenance](../docs/evidence/btf-retention-20261031/provenance.json).
+
+The initial study has 72 valid arms across plaintext H1/H2c static and page-cache fixtures, with three balanced six-position cycles per cell. Each arm has 60,000 measured plus 5,000 warmup responses at 15,000 offered requests/s. The predeclared confirmation adds 24 matched-control/candidate ABBA arms for H1 page cache and H2c static, with 200,000 measured plus 5,000 warmups per arm. The independent seals verify 4.68 million and 4.92 million raw latency rows respectively; both datasets remain separate and all measured arms are retained. [Initial seal](../docs/evidence/btf-retention-20261031/initial72/receipt.json), [confirmation seal](../docs/evidence/btf-retention-20261031/confirmation24/receipt.json).
+
+| Study / warm 1 KiB cell | Helper private MiB, control → candidate | Server/helper CPU | Scheduled p99 | Whole-VM CPU |
+|---|---:|---:|---:|---:|
+| Initial / h1 static | 10.143 → 3.662 | -7.32% | -3.36% | -18.23% |
+| Initial / h1 page cache | 10.143 → 3.660 | -2.50% | -0.19% | -14.48% |
+| Initial / h2c static | 10.145 → 3.668 | -2.30% | -0.30% | +4.49% |
+| Initial / h2c page cache | 10.146 → 3.656 | -3.16% | -0.63% | -17.63% |
+| Confirmation / h1 page cache | 10.154 → 3.629 | -0.93% | +0.45% | -1.85% |
+| Confirmation / h2c static | 10.146 → 3.646 | +8.75% | +6.91% | +19.91% |
+
+Helper private memory falls in every paired cycle in both studies. In the initial study, helper PSS falls 62.67–63.12% against matched control; combined web/helper PSS falls 10.97–13.76%. These are sequential, post-client `smaps_rollup` samples for one worker and 32 connections. They exclude unmapped kernel/BPF/socket allocations and do not measure cold-start peak memory. The 64% figure applies to the helper’s private resident pages, not total engine or deployment RAM. [Memory samples](../docs/evidence/btf-retention-20261031/initial72/memory-processes.csv).
+
+The initial aggregate p99 improvements conceal reversals: H1 page-cache cycle 3 is 4.45% worse, and H2c static whole-VM CPU is worse in all three cycles. The longer confirmation makes the rejection clear: H2c static p99 changes are +6.71%, +349.93% and +1.31%; CPU and VM busy also worsen in every cycle. Two candidate arms reach 11.959 and 31.101 ms p99; one control reaches 7.567 ms. Their admission waits remain included. H1 page-cache confirmation is mixed, including a 14.59% p99 increase in cycle 3. [Initial cycles](../docs/evidence/btf-retention-20261031/initial72/cycles-percent.csv), [confirmation cycles](../docs/evidence/btf-retention-20261031/confirmation24/cycles-percent.csv).
+
+The original qualification remains failed at expiry’s required warm-hit check, with duplicate-cookie EEXIST refusals observed. All three predeclared expiry controls—frozen, matched control and candidate—and the candidate lifecycle follow-up pass with unchanged inputs. Those passes do not erase the failure or identify its cause. The 72 timing arms contain no EEXIST lines; confirmation records two in control and none in candidate. Successful body/status, offload, PMU, headroom, exit and input-integrity audits establish dataset validity, not regression-free behavior or complete functional qualification.
+
+A subsequent source audit found nondeterministic DFA action-ID assignment from `RandomState` iteration. Canonical serialization sorts transitions before assigning action IDs. Tests-only RED produced two failures; canonical GREEN passed 17/17 tests, followed by all seven wire gates for the new `d381…` control / `64126…` scoped pair. Their timing run was active when this record was prepared; no result from it is asserted here. Certified fast-path hits bypass the DFA, so this demonstrated confound is **not a proven cause** of the earlier CPU or latency regression. Matching actual installed table bytes removes one confound, not every possible CPU cause.
+
+Figures are ratios of six-arm medians, not pooled request p99. CPU/PMU/VM counts divide by 65,000 responses initially and 205,000 in confirmation; latency covers 60,000 and 200,000 measured requests. Server CPU includes web plus helper. VM busy includes clients and unrelated Linux work; Windows-host work is unobserved. This capped-rate fixture does not establish capacity. Raw TSVs, fixture TLS material and archives stay private. The experimental source remains uncommitted and unpromoted at preparation; only these reviewed research artifacts are proposed for publication.
+
+Credit to [Laurin Brandner (@lerboe)](https://github.com/lerboe), [Beeper](https://github.com/lerboe/beeper) and [hyper-fast-path](https://github.com/lerboe/hyper-fast-path) for the parsing work informing this experiment.

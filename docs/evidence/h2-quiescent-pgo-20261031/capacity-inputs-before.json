@@ -1,0 +1,73 @@
+{
+  "pins": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+    "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet": "e9be9eca3c2fa6ad0f01e493696e1d3f74899345b81e705423e6c3a799112676",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1": "b9b924c3eb6c59b688ccb857fd804d88b72b4a2e569485e2240f17af7d3a73b9",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-observe": "68f1f01362b3d1dd584b61376412f457c330f67b3d869a35f17375870fd75254",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-quic-steer": "7a96a79c5e5b807e9d21460e208bcdfad7cc9fb0c534ab4e32b663fc8b5a8587",
+    "/var/tmp/hjc/httpjet-http-load-bind": "e5c21fa94ea72c965cd4cfea950977c2bb771a4a5842a58499a5b1355c758b8f"
+  },
+  "inputs": {
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/qualification.json": "8d5e527b99e4136e82748b047b687b88a22b70b01301f38e015a3bab3de66b1b",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/inputs-before.json": "1e73e352a01bdcb41d0acd781a8c601d6489e6d8ef07b1fa0f6c0cd7cf358d55",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h1-late-readiness.json": "659ceda705f7cf6734f1a9f203a6fcd01117b4c3784dddf25b549e82e49e46b1",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h1-h2-ua.json": "861de96d4f7da7c08c60bc4a87299ae4e814e28764f8d1385d535f28842000c0",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-oversize.json": "8e5affa4d6a2d8153828eb4a0b465f0c3693d5c78ab71488ff47a57055d03427",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-expiry.json": "c3ccb7eb79e317696a26a6cc1d16d9a2379e50a1f02b4c5f63600fd28df95a31",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-lifecycle.json": "64cc6cc9d65e4c8b5ea5fea9b653a7f7dd94e763b8628d8b1f44df882ca4e743",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/tls-smoke.json": "ae896e0602f3813a9604d290024cbcb0535dddaaaa31e24b5d297c9c3f5c6180",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h3-shutdown.json": "83814bfe0489d5c66a90426dffcc3693a94eaab212fe8ddfa96edf092da12db1",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/cache-required.json": "b4bb499addf2b4de785ac42fb62c21d03e4a8ec8b2589de0ffb687e2338526d8",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h3-gso20-batch1.json": "2dfa3316c520b69a5508107036e77f5a32ae50ed141c74659b6efc4d729f8866",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet.json": "9836d08bf595f6681d80585ed307ba0f0f91f1faf714ff54625e9fc4a6b3c9ca",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet-beeper-h1.json": "5f843328236272f33ad470206889fe14b47fa3235165fde22c063b3da01c5dbe",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet-beeper-observe.json": "93812326f0506a7328a2f15ba6ea650bf26cbd46b98fbc4fbba537a3db9ba1d7",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprints/httpjet-quic-steer.json": "9357c8e5c6160c556c760a21881c63d37129be1a06db45feba3259856d256469",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-artifacts.json": "d2b3f65e597e237005e10a0e9fb4ec7448c25eda57ee14878735cbe9f9206eef",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-use.json": "0428f4f98cb49e67832deed91c8192daa1266efbf850d333ff861e74ef0db58c",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/profile-use-warnings.json": "10d8507e2c47dd19a150f1b8ea393ff917a05b6a22e1fbebfcdfac57dfeeee14",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-fingerprint-audit.json": "836d0c8754b07469f231d9083e72a260ddfe1c79ff867478e4fc3365d21e09e5",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use.rustc_info.json": "b3e6d8c43eb15ed16fad2958055cacc1b38da9bcfa8b8d61e5d788f63b561910",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/pgo-inputs.json": "1c81b39262cb21f750c4c9f0b3786e807cf80399853956f095b57963bc7a3e39",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-source-manifest.json": "7c66ac12e6e7f0861596ae5aba040a1e3c57e8866493a4873c78847363c31a71",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualified-inputs.json": "b10a7db343830a1c1b5667502ea5b3e7afd36dcc72cdea9608d044d41a2d10b8",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bpf-objects.json": "99e7ecf1de175d307f73f42920ba0cdef9954c2f6537a40fa6d9a8228db71cc5",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bpf-source-identity": "16fccd5aefc0808b60c61cec006fc9560ee2c2fc88107ad9606208f359602d20",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/merge-receipt.json": "8b04ce52411d9a348c92bbbc93e7356e7a49b913f01bf3d89fb04ba47ce14d2d",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/profile-inputs.json": "2299f4acf214de52f1b5214eed861bf74d8e78f3db7e02f373605b805d105d49",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/coverage-review.json": "920f9c197a49d9b20ef3687bf0f593b46a0181624d0d779df1ceb6b6624d7f06",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/runtime.profdata": "0ade3a4f73f5c085826de497088987d8d06b6617edda2fae28baf59a1269ede3",
+    "/var/tmp/h2q-pgo-common.sh": "05939c965ecbc4f7ca965885fc579b0472e1edfae9c8210badd00986b1d1425b",
+    "/var/tmp/h2q-final-run.sh": "b49c9292b6cc3c7f387fc4fd58cdec84a70b7154b2dc002ecb6f689469a035d1",
+    "/var/tmp/h2q-final-run.py": "1076e6aba54488b1b3ede822462437da8b37c6cd15bbfa6b4972febb36c6a518",
+    "/var/tmp/h2q-final-summarize.py": "d9830cfa1c487ff1a05fe4e286f929d9ab3c8a83c5f2c2bf22878d9f4129b138",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/h2-final-capacity-v1/plan.json": "8a867ea747e8872da4f5e0713621166d6d7b8181f139397d76bd4f50585dac11",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/h2-final-capacity-v1/arms.json": "621f1b9ea6688065b36096f7b646a5c8da10f50a3c659588c2944a5c55ecfbd1"
+  },
+  "harness": {
+    "scripts/http_engine_check.py": "6b7b239d1dfc07c2ae81efcf5ea597e2f402cff35a27b145fe70d36fd5004655",
+    "scripts/h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "scripts/bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "scripts/bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "scripts/bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "scripts/bench_environment_run.py": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+    "scripts/bench_kernel_samples.py": "61bc86d0dfbaa4cdb64a776f07840ea37438c03de0343cf4e13f2261e69f5edb",
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe"
+  },
+  "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda",
+  "uname": [
+    "Linux",
+    "SINGULARITY",
+    "7.3.1-microsoft-standard-WSL2-dirty",
+    "#1 SMP PREEMPT_DYNAMIC Fri Oct 30 14:09:11 EDT 2026",
+    "x86_64"
+  ],
+  "network": {
+    "server": "127.0.0.2",
+    "client_bind": "127.0.0.2"
+  },
+  "selected_artifact_processes": []
+}

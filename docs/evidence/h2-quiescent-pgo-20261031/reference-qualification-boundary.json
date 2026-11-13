@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "kind": "qualification scope clarification",
+  "qualified_inputs_sha256": "b10a7db343830a1c1b5667502ea5b3e7afd36dcc72cdea9608d044d41a2d10b8",
+  "owner_v2": {
+    "server_sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb",
+    "helper_sha256": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d",
+    "passed": [
+      "H2 corpus",
+      "expiry recovery",
+      "four lifecycle cases"
+    ]
+  },
+  "combined_v2_wide": {
+    "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+    "passed": [
+      "16-case H2 corpus",
+      "H1/H2 UA corpus rerun ua-v2"
+    ],
+    "not_yet_run_for_this_combination": [
+      "expiry recovery",
+      "four lifecycle cases"
+    ]
+  },
+  "scope": "Initial reference passed flag authorizes isolated PGO experiment preparation only; it is not final combined artifact qualification. Full final exact PGO server/helper qualification is mandatory before timing. Original frozen receipt is preserved."
+}

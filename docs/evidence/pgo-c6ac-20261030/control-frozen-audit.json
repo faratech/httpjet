@@ -1,0 +1,89 @@
+{
+  "stage_exit": 0,
+  "pgo": false,
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-control/httpjet": {
+      "bytes": 23160960,
+      "sha256": "f9b441d1810afc842e096222fd279323b174076410c923d713e533b11a79c7e2"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-control/httpjet-beeper-h1": {
+      "bytes": 2474144,
+      "sha256": "6208c5cc8402468481aeba015e6b0bafed961c078e34cef6eba9320c6ad5180a"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-control/httpjet-beeper-observe": {
+      "bytes": 1965208,
+      "sha256": "7ed0c27011e4625a37960e4d55c931617b18ccef315993de4b116a1c2f350c87"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-control/httpjet-quic-steer": {
+      "bytes": 1325080,
+      "sha256": "0c5f0d36e997337530892dfd3b724198502a868d7a9759224e04f742579c1378"
+    }
+  },
+  "build": {
+    "stage": "control",
+    "target": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-control",
+    "rustflags": "-Ctarget-cpu=native -Cforce-frame-pointers=yes",
+    "exit": 0,
+    "jobs": 2,
+    "profile": "release/opt3/thinLTO/codegen1/panic-abort/strip-debuginfo",
+    "features": [
+      "httpjet/beeper-h2-serve",
+      "httpjet/beeper-observer",
+      "httpjet/quic-bpf"
+    ],
+    "prebuilt_bpf": "/var/tmp/httpjet-continuation/integrated-f7555d80/objects",
+    "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/logs/build-control.log",
+    "log_sha256": "01acdc7e1886f89df1f8641b359f9220b01370047c28c6d03e8ab885d39c8917",
+    "scope": "build receipt only; no performance result"
+  },
+  "fingerprints": {
+    "httpjet": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/control-fingerprints/httpjet.json",
+      "sha256": "03e3bfcb07decf9eb3d70f81b1e95ee9617b804977f141bac0a4d1e90a77800f",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]",
+      "config": 9396254390672932401
+    },
+    "httpjet-beeper-h1": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/control-fingerprints/httpjet-beeper-h1.json",
+      "sha256": "81fd5539088f34edaaeb1ff189b7d3dd0dbc0e36bd3b8fd3b6aaf7f5a048a23c",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-observer\"]",
+      "config": 9396254390672932401
+    },
+    "httpjet-beeper-observe": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/control-fingerprints/httpjet-beeper-observe.json",
+      "sha256": "e2afa6488d2c5ae940a5ae28fa3de7c7856ff03f558c27d2f5715a34f68cbb50",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-observer\"]",
+      "config": 9396254390672932401
+    },
+    "httpjet-quic-steer": {
+      "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/control-fingerprints/httpjet-quic-steer.json",
+      "sha256": "f1fec317631da6d819bf1774377ac5cd4cc9b23f1a589bc2a1b180aae0c69eed",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"default\", \"loader\"]",
+      "config": 9396254390672932401
+    }
+  },
+  "rustc_info": {
+    "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/control.rustc_info.json",
+    "sha256": "3bd7bfc381829e83d2c08d67ea44740255dddfae8e3c7977049a13aee244ef57"
+  }
+}

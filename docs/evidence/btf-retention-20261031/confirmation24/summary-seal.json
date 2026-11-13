@@ -1,0 +1,11 @@
+{
+  "passed": true,
+  "independent_receipt_sha256": "f591d74bac1fe86cf1aba49fee2a5043f7e0d64e8652b659590db2fd4c8a3fc8",
+  "recompute_sha256": "1f251b0ac1f94aa8f76ee16ab9c9607915141951e65fdbe249d9e2eeb74b688c",
+  "outputs_sha256": {
+    "TABLE.md": "ea8a06109fe302218fb42b1e7195e8b61765c981225ec314e0086b2054a9b775",
+    "pmu-cpu-arm-split.csv": "7dc33a899c753c858a2389e2121078bc3ebec28a22056b0a4b6f53e3cd19d54d",
+    "pmu-cpu-process-split.csv": "83cbc2ad2d16a74d4b01c78f22e115e3c43a9c9f9269a5f19ab646844f4090da",
+    "pmu-cpu-process-groups.csv": "c587213851ba556dce27eb05d15a7419f499cffc3ee164d6884a9e2a769655ee"
+  }
+}

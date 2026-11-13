@@ -1,0 +1,61 @@
+{
+  "verified": true,
+  "fingerprints": {
+    "httpjet": {
+      "source": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/target-gen/release/.fingerprint/httpjet-af6a46fa2ca310e2/bin-httpjet.json",
+      "copy": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/gen-fingerprints/httpjet.json",
+      "sha256": "cbf941144fd7ef178e6a1c387ca732e5e09adf80f6de393fa16f61e9fdbddc88",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]"
+    },
+    "httpjet-beeper-h1": {
+      "source": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/target-gen/release/.fingerprint/hj-kernel-fastpath-31232f3b1298e72d/bin-httpjet-beeper-h1.json",
+      "copy": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/gen-fingerprints/httpjet-beeper-h1.json",
+      "sha256": "a721512a00c2a2ff7bb02a5f9c5c77e2b47ce9b8baaa61916de110974cefa4ad",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-observer\"]"
+    },
+    "httpjet-beeper-observe": {
+      "source": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/target-gen/release/.fingerprint/hj-kernel-fastpath-845080ee24193e18/bin-httpjet-beeper-observe.json",
+      "copy": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/gen-fingerprints/httpjet-beeper-observe.json",
+      "sha256": "d5871099f81d8d5e1c57af3e7827623b9c68f2cff6d29170873a333831d4be7a",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-observer\"]"
+    },
+    "httpjet-quic-steer": {
+      "source": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/target-gen/release/.fingerprint/hj-quic-steering-507947fddc27deec/bin-httpjet-quic-steer.json",
+      "copy": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/gen-fingerprints/httpjet-quic-steer.json",
+      "sha256": "4932ce26f8183c675219b1a5bea9b277cfbf2f272982db8967e021a466bfc12d",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"default\", \"loader\"]"
+    }
+  },
+  "helper_bpf_binding": {
+    "helper_sha256": "e46b62d672da56da7cd34932a9bb32b980cb4cbe5338714f7e4ac637546e3f71",
+    "h1_serve_sha256": "353abef987650e609aad33aebf09eb92570be477377b272886f861cebf029b16",
+    "object_offset": 855107,
+    "method": "raw include_bytes object containment"
+  },
+  "rustc_info_sha256": "f18444bd3822b9db8469a484071dc02dda0cf40067e8e1d257cdfb89fa20e859",
+  "scope": "frozen binaries/fingerprints; no runtime or performance qualification"
+}

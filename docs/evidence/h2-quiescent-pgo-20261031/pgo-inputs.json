@@ -1,0 +1,75 @@
+{
+  "source_manifest_sha256": "7c66ac12e6e7f0861596ae5aba040a1e3c57e8866493a4873c78847363c31a71",
+  "qualified_inputs_sha256": "b10a7db343830a1c1b5667502ea5b3e7afd36dcc72cdea9608d044d41a2d10b8",
+  "qualified_reference": {
+    "server": {
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/bin/httpjet",
+      "sha256": "1c21f69cd63afe0704f9be78ea01ef4d2ef5f04676adf2f00b99dfe7f3eb3feb"
+    },
+    "helper": {
+      "path": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/bin/httpjet-beeper-h1",
+      "sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89"
+    }
+  },
+  "bpf_reference": {
+    "root": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1",
+    "manifest_sha256": "99e7ecf1de175d307f73f42920ba0cdef9954c2f6537a40fa6d9a8228db71cc5",
+    "hashes": {
+      "cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f",
+      "h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+      "h1_serve": "353abef987650e609aad33aebf09eb92570be477377b272886f861cebf029b16",
+      "observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a"
+    },
+    "source": {
+      "path": "/var/tmp/httpjet-continuation/h2-gate-pins-wide-v1/source-inputs.json",
+      "sha256": "16fccd5aefc0808b60c61cec006fc9560ee2c2fc88107ad9606208f359602d20"
+    },
+    "serving_abi": 5,
+    "helper_rpc_abi": 2
+  },
+  "qualified_helper_binding": {
+    "helper_sha256": "f1e69cbb1230e4ee804a9ca4e58c104fdd7a4b946c8546aaf18d1b72933ede89",
+    "h1_serve_sha256": "353abef987650e609aad33aebf09eb92570be477377b272886f861cebf029b16",
+    "object_offset": 103080,
+    "method": "raw include_bytes object containment"
+  },
+  "bpf_manifest_sha256": "99e7ecf1de175d307f73f42920ba0cdef9954c2f6537a40fa6d9a8228db71cc5",
+  "tool_versions": {
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.1\nLLVM version: 23.1.1\n",
+    "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)\n",
+    "llvm_profdata": "LLVM (http://llvm.org/):\n  LLVM version 23.1.1-rust-1.99.1-stable\n  Optimized build.\n"
+  },
+  "tool_sha256": {
+    "/var/tmp/httpjet-h3-tools/rust/bin/rustc": "b53b780f77f952062f8ca8a3b70aef2390b1e45ad91939be94afdc9543026853",
+    "/var/tmp/httpjet-h3-tools/rust/bin/cargo": "a670e02cfa39ac2e53f77a2d911ca1fc9e2c479b0603ec956625be1daf24e3af",
+    "/var/tmp/httpjet-h3-tools/rust/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-profdata": "a5a595c1a396827579c7e15ae74feddd22cabad6d0392b2ef44d8797e61efbb9"
+  },
+  "harness_source_root": "/var/tmp/httpjet-continuation/h2-quiescent-v2/harness-current",
+  "harness_source_sha256": {
+    "scripts/http_engine_check.py": "6b7b239d1dfc07c2ae81efcf5ea597e2f402cff35a27b145fe70d36fd5004655",
+    "scripts/h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "scripts/bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "scripts/bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "scripts/bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "scripts/bench_environment_run.py": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+    "scripts/bench_kernel_samples.py": "61bc86d0dfbaa4cdb64a776f07840ea37438c03de0343cf4e13f2261e69f5edb",
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe"
+  },
+  "harness_sha256": {
+    "http_engine_check.py": "6b7b239d1dfc07c2ae81efcf5ea597e2f402cff35a27b145fe70d36fd5004655",
+    "h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "bench_environment_run.py": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+    "bench_kernel_samples.py": "61bc86d0dfbaa4cdb64a776f07840ea37438c03de0343cf4e13f2261e69f5edb"
+  },
+  "fixture_sha256": {
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe"
+  },
+  "scope": "fresh V2 source/profile namespace; no old Rust profiles copied; training is not performance evidence"
+}

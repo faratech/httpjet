@@ -1,0 +1,10 @@
+{
+  "scope": "Post-run background-service context; not part of measured TLS experiment",
+  "tls_final_monitor_unix_ns": 1793472665018705912,
+  "forum_test_stop_started_unix_ns": 1793473096669166063,
+  "forum_test_stop_finished_unix_ns": 1793473105205952768,
+  "verified_containers_stopped": 9,
+  "stop_exit": 0,
+  "stop_receipt_sha256": "57fa121e56db41044d173ded35dc6c7d9d8f1bcedc509c5289a51d38ac038f58",
+  "claim": "The 48 TLS arms completed before the forum preview/test containers were closed; future measurements require fresh controls for the new context."
+}

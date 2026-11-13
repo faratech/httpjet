@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "base_commit": "c122c44f7e21781e0b2abe5108cb37b5ca61edea",
+  "recorded_at_utc": "2026-10-30T12:54:37.997330+00:00",
+  "host": "SINGULARITY",
+  "kernel": "Linux 7.3.0-microsoft-standard-WSL2 x86_64 GNU/Linux",
+  "runtime_source_file": "crates/httpjet/src/uring/h3.rs",
+  "runtime_source_sha256": "682bd0de593328b9d660c4884bbb0518b4ab61c48e397af9dca4c3b1842aba89",
+  "source_manifest": {
+    "path": "/var/tmp/httpjet-continuation/h3-due-fairness-c122/final-source-manifest.json",
+    "sha256": "2f01961fcd0a6c70fbf2a8b25c2266cd358179eb4fb9dcb3bd1ae1073feda223",
+    "file_count": 1302
+  },
+  "toolchain": {
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "cargo": "cargo 1.99.1 (5f94df478 2026-08-27)"
+  },
+  "cargo": {
+    "offline": true,
+    "locked": true,
+    "jobs": 2,
+    "features": [
+      "beeper-h2-serve",
+      "beeper-observer",
+      "quic-bpf"
+    ],
+    "fingerprint_sha256": "9c8daeebb7ec4afab9489f003e537b80819cec2de7437782d821600002993362",
+    "actual_rustflags": [
+      "-Ctarget-cpu=native",
+      "-Cforce-frame-pointers=yes"
+    ],
+    "actual_features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]",
+    "profile": 3998859906364395787
+  },
+  "bpf": {
+    "verified_source_inputs_match_f755": 32,
+    "serving_abi": 5,
+    "helper_rpc": 2,
+    "objects": {
+      "cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f",
+      "h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+      "h1_serve": "3c4768271e6c394adb183a04a1fc9e2f4e2324c6b95220024d715c423ba33263",
+      "observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a"
+    }
+  },
+  "stages": [
+    {
+      "name": "red",
+      "exit_code": 101,
+      "summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1074 filtered out; finished in 0.05s",
+      "log": "/var/tmp/httpjet-continuation/h3-due-fairness-c122/red-test.log",
+      "log_sha256": "8cb42c66355f3951a34dd825c9411aecd41bcfa344ddefc6ed6c56e00c0b9c4d"
+    },
+    {
+      "name": "self-wake",
+      "exit_code": 101,
+      "summary": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1074 filtered out; finished in 0.05s",
+      "log": "/var/tmp/httpjet-continuation/h3-due-fairness-c122/green-test.log",
+      "log_sha256": "e189abce2e8267c34619a5d83c7882b6cfdb11835e2cba974ad061c7ccfdfbd1"
+    },
+    {
+      "name": "notifier",
+      "exit_code": 0,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1074 filtered out; finished in 0.05s",
+      "log": "/var/tmp/httpjet-continuation/h3-due-fairness-c122/green2-test.log",
+      "log_sha256": "cf1a9047f2a8cbdba25c77241c551cfade601071e154d353d7b7da2aa479feca"
+    },
+    {
+      "name": "final-full-h3",
+      "exit_code": 0,
+      "summary": "test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 948 filtered out; finished in 0.91s",
+      "log": "/var/tmp/httpjet-continuation/h3-due-fairness-c122/full-h3-test.log",
+      "log_sha256": "c5ca08429d8bf2fdb020daf4c866a810365777941c4ba77905b35e8e932087d1"
+    },
+    {
+      "name": "final-full-server",
+      "exit_code": 0,
+      "summary": "1075 passed; 0 failed; 1 ignored",
+      "log": "/var/tmp/httpjet-continuation/h3-due-fairness-c122/full-main-test.log",
+      "log_sha256": "159276aaa3d6dc52c0717cfe53a57edd0a42adab9af0dbe83696af9fdcac3181",
+      "runtime_inputs_verified_against_main": 679
+    }
+  ],
+  "final_test_binary": {
+    "path": "/var/tmp/httpjet-continuation/h3-due-fairness-c122/final-httpjet-tests",
+    "sha256": "6f62fbcb297ddf9a32ce49604b2e9c3cac903b9a51215c8b9acd42a33fca48ae",
+    "bytes": 470368288
+  },
+  "performance_tested": false,
+  "historical_timeout_causality": "not established; regression proves a conditional H3 scheduler fairness gap"
+}

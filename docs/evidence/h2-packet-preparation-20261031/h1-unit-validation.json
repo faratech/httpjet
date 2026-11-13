@@ -1,0 +1,167 @@
+{
+  "schema": 1,
+  "passed": true,
+  "recorded_utc": "2026-10-31T16:14:32.589715+00:00",
+  "scope": "Targeted correctness-only RED/GREEN validation, not performance or full corpus qualification",
+  "host": "SINGULARITY",
+  "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda",
+  "parent_commit": "b8362e6f36bf57d75d53f5ca6a831062eb9c32a6",
+  "source_before_after_verified": true,
+  "sources": {
+    "green": {
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/green-source-v2-manifest.json",
+      "sha256": "b428a17eb1385870e09247f40ebed9fa80b9273989d3b26fec441165175d0e49",
+      "loader_sha256": "5cf900daf7472a5f8e30fcdb9b2c8eac4603157e90f37c8e3c159dc51d28b9f5",
+      "input_count": 1436,
+      "test_module_sha256": "a9a9f06fe0e9aa5c205f58b5523b699062ed3104163abf320cd6a0bc7d661024"
+    },
+    "red": {
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/red-source-v2-manifest.json",
+      "sha256": "d422a8451dce09b44b76e21e5e27b1e84d46c684654e0a5cbe5464909e05a079",
+      "loader_sha256": "067231160f2e079698251e8897b780f9b8456a680dadc34e38c7e6a4777a4c1a",
+      "input_count": 1436,
+      "test_module_sha256": "a9a9f06fe0e9aa5c205f58b5523b699062ed3104163abf320cd6a0bc7d661024"
+    }
+  },
+  "prebuilt_objects": {
+    "observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a",
+    "h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+    "h1_serve": "4bdf891e8a249de182c68714a48ae29ed1c6dbb1e43d90a063dfd8421932677b",
+    "cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f"
+  },
+  "rust": "1.99.1/LLVM23.1.1",
+  "rustflags": "-Ctarget-cpu=native -Cforce-frame-pointers=yes",
+  "features": [
+    "beeper-h1-serve"
+  ],
+  "cargo_target": "/var/tmp/httpjet-continuation/target",
+  "cargo_jobs": 2,
+  "offline_locked": true,
+  "green_unique_tests": 4,
+  "green_passing_invocations": 5,
+  "red_expected_failure": "H1 native write BrokenPipe32 with original H2-only timeout guard",
+  "same_test_module": true,
+  "logs": [
+    {
+      "name": "green-transport-feature",
+      "exit": 0,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/green-transport-feature.log",
+      "sha256": "9097a8e576cd1b4ab35113bb138d064e765afd1b91bfbc5f5c273bafe9f986b0",
+      "accepted": true,
+      "classification": "passing targeted test"
+    },
+    {
+      "name": "green-timeout",
+      "exit": 0,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/green-timeout.log",
+      "sha256": "bbde542447b6036f146801cf10a81acc99df9dccaed86027e7697837c77573d6",
+      "accepted": true,
+      "classification": "passing targeted test"
+    },
+    {
+      "name": "green-unexpected-reply",
+      "exit": 0,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/green-unexpected-reply.log",
+      "sha256": "1927d8a2b28c4bab192823ba2911531c8148811384ec521a912f4d2f506b13fd",
+      "accepted": true,
+      "classification": "passing targeted test"
+    },
+    {
+      "name": "green-real-bpf-native",
+      "exit": 0,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/green-real-bpf-native.log",
+      "sha256": "b8b841bdf5b992215125074b037a12cb49b40f775b327f0079f00cd80fd0d1ec",
+      "accepted": true,
+      "classification": "passing targeted test"
+    },
+    {
+      "name": "green-timeout-fresh-after-red",
+      "exit": 0,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/green-timeout-fresh-after-red.log",
+      "sha256": "8250754dcacfe9434176aa1c2c161453ff7ddc97351d0c878c04ea87b5d3d555",
+      "accepted": true,
+      "classification": "passing targeted test"
+    },
+    {
+      "name": "red-timeout-fresh",
+      "exit": 101,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/red-timeout-fresh.log",
+      "sha256": "897250c85567ad2c0fe00754873e1da2dae9ddeec139434ae97ded89aa93fc1a",
+      "accepted": true,
+      "classification": "expected negative control"
+    },
+    {
+      "name": "green-transport",
+      "exit": 0,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/green-transport.log",
+      "sha256": "24aaa28c77f22ba547d9deaf0aab6d51b5f33686c3dde697c54d0b4732feebb1",
+      "accepted": false,
+      "classification": "excluded: omitted h1 feature,0 selected"
+    },
+    {
+      "name": "red-timeout",
+      "exit": 0,
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/logs/red-timeout.log",
+      "sha256": "17af3b419ff0d3d5366b3ff9fe6601e11e9c8cc4e2d8b3bfcdc5aad1f25c73a5",
+      "accepted": false,
+      "classification": "excluded: Cargo reused stale GREEN artifact"
+    }
+  ],
+  "test_artifacts": {
+    "green-tests": {
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/test-artifacts/green-tests",
+      "sha256": "59b3a10136c4578e5cec0df0479875a849c9a5344661ae108951b685475253de",
+      "bytes": 38930992
+    },
+    "red-tests": {
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/test-artifacts/red-tests",
+      "sha256": "9981e0ac523933d188747db1e6ff4bd19e238bc897e4ffff422ea3bd000c36f4",
+      "bytes": 38931224
+    },
+    "green-tests-after-red": {
+      "path": "/var/tmp/httpjet-continuation/h1-register-timeout-v1/test-artifacts/green-tests-after-red",
+      "sha256": "59b3a10136c4578e5cec0df0479875a849c9a5344661ae108951b685475253de",
+      "bytes": 38930992
+    }
+  },
+  "compiler_overlap": {
+    "foreign_docker_forum_build_observed": true,
+    "initial_pids": [
+      335342,
+      355298
+    ],
+    "initial_cgroup": "docker:j2xr50lgwpa0a02ik1snw7jd6",
+    "authorized_correctness_only_overlap": true,
+    "remaining_compilers": [
+      {
+        "pid": 335342,
+        "ppid": 335122,
+        "status": "Sl",
+        "elapsed_seconds": 1017,
+        "comm": "cargo",
+        "evidence_path": "logs/processes-after.txt",
+        "evidence_sha256": "f69e0e16d40a238acedaa4871403eff80370273e6259748822d9569064096868"
+      },
+      {
+        "pid": 364238,
+        "ppid": 335342,
+        "status": "Sl",
+        "elapsed_seconds": 310,
+        "comm": "rustc",
+        "evidence_path": "logs/processes-after.txt",
+        "evidence_sha256": "f69e0e16d40a238acedaa4871403eff80370273e6259748822d9569064096868"
+      }
+    ],
+    "unrelated_processes_signaled": false,
+    "remaining_compilers_scope": "Saved post-test ps snapshot, not a new live observation after slot return",
+    "metadata_correction": "Original strict /proc/PID/cwd resolution skipped container processes with inaccessible /work targets; saved ps snapshot is authoritative for this field."
+  },
+  "limitations": [
+    "No HTTPJet release/PGO app build, no full H1 corpus rerun or performance evidence.",
+    "RED/GREEN validates the shutdown mechanism; saved incident timing remains inferred.",
+    "Initial unselected and stale-target invocations are preserved and excluded."
+  ],
+  "remaining_work": "Root review, full owned corpus validation, and fresh PGO after any accepted Rust source change.",
+  "receipt_revision": 2,
+  "supersedes_receipt_sha256": "568d96a8875a27fce3fcaeccc1e58860e6173e5c8f6bc86f38e04c2f772aec4a"
+}

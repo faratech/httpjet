@@ -1,0 +1,15 @@
+{
+  "scope": "Local evidence/source/recipe investigation only",
+  "passed_saved_CPU_recompute": true,
+  "baseline_TLS_seal_sha256": "a0472ef64ad8d943718a67e0c2a2a546464da6254b6305ad69f90b07e990231c",
+  "files_sha256": {
+    "FINDINGS.md": "42e313d31707913da06080da7305784ec3fc4efe178ef37877a9f88072c0dd92",
+    "arms.csv": "6a3b20688d0e81db82df900d86f5c218854b7ac0c9e8433a00955b2ef2efa0b8",
+    "changes-percent.csv": "a287bdc447a35b550275d1951cdd8334b2e0bba56c353c9ce0b8b1c5dfd079f5",
+    "groups.csv": "a5b5285350e318503c9d5e58d9481696b49fca788c8da9315de5ece05e68a41e",
+    "source-comparison.json": "6d879a719d45124d8e17a20255fdb768b30d8df10473064f8219f2502b835024",
+    "split_cpu.py": "778e4d4e405f854c25b2ae1c0c2cf4a74992e1753ee33ee3f4a2d3a9337769ed"
+  },
+  "cause_validated": false,
+  "runtime_or_build_executed": false
+}
