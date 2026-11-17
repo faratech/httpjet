@@ -1,3 +1,25 @@
+httpjet (0.2.3-1) stable; urgency=medium
+
+  * Page cache: a no-Content-Length public miss on a stream-fill vhost goes to
+    the client while the backend is still writing it; a backend-paced task
+    stores it at the end, so a slow reader no longer holds the single-flight
+    leader and a departed client no longer discards the render.
+  * Compression: a streamed zstd miss is encoded once and the sent bytes are
+    stored; progressive streams use page-sized zstd parameters.
+  * Page cache: a cancelled file fill keeps its body-budget reservation until
+    the blocking read ends.
+  * Static: the on-core fast path serves from a borrowed request head.
+  * PHP slow log: build the record identity only for slow or sampled requests.
+  * Proxy: expire idle connections from an ordered queue prefix; sweep the
+    dynamic upstream registry at most once a second.
+  * --buffered-work-min-bytes: encode a buffered body of at least that size in
+    64 KiB slices that yield to other requests (off by default).
+  * Dependencies: refresh to the latest releases (aws-lc-rs 1.19, rustls-webpki
+    0.103.17, brotli 9.1.3, zstd-safe 8.3, io-uring 0.7.16, openssl 0.10.82,
+    nix 0.32).
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Mon, 16 Nov 2026 00:00:00 +0000
+
 httpjet (0.2.2-1) stable; urgency=medium
 
   * HTTP/3: keep the handshake slot of a connection lost before its handshake

@@ -666,6 +666,48 @@ pub fn context_relative_path<'a>(rel: &'a Path, context_uri: &str) -> &'a Path {
 #[derive(Clone)]
 pub struct IndexFilesOverride(pub Vec<String>);
 
+/// Borrowed HTTP fields used by static serving without owning a request body.
+#[derive(Clone, Copy)]
+pub struct StaticRequestHead<'a> {
+    method: &'a Method,
+    uri: &'a http::Uri,
+    headers: &'a http::HeaderMap,
+}
+
+impl<'a> StaticRequestHead<'a> {
+    pub fn new(method: &'a Method, uri: &'a http::Uri, headers: &'a http::HeaderMap) -> Self {
+        Self {
+            method,
+            uri,
+            headers,
+        }
+    }
+
+    fn method(&self) -> &Method {
+        self.method
+    }
+
+    fn uri(&self) -> &http::Uri {
+        self.uri
+    }
+
+    fn headers(&self) -> &http::HeaderMap {
+        self.headers
+    }
+}
+
+/// Trusted pipeline overrides kept separate from the borrowed wire head. A body
+/// filter can suppress ranges without cloning and editing the inbound headers.
+#[derive(Clone, Copy, Default)]
+pub struct StaticRequestOverrides<'a> {
+    pub doc_root: Option<(&'a Path, &'a str)>,
+    pub index_files: Option<&'a [String]>,
+    pub default_charset: Option<&'a str>,
+    pub content_type: Option<&'a ContentTypeOverride>,
+    pub no_precompressed_sibling: bool,
+    pub ignore_range: bool,
+}
+
 impl StaticFiles {
     /// Serve a request while leaving its head available to the caller after
     /// dispatch.  The main pipeline uses this for post-dispatch authorization
@@ -675,6 +717,40 @@ impl StaticFiles {
         &self,
         ctx: &mut ReqCtx,
         req: &mut Request<hj_core::IncomingBody>,
+    ) -> Result<Response<Body>, HandlerError> {
+        self.handle_head(
+            ctx,
+            StaticRequestHead::new(req.method(), req.uri(), req.headers()),
+            StaticRequestOverrides {
+                doc_root: req
+                    .extensions()
+                    .get::<DocRootOverride>()
+                    .map(|o| (o.0.as_path(), o.1.as_str())),
+                index_files: req
+                    .extensions()
+                    .get::<IndexFilesOverride>()
+                    .map(|o| o.0.as_slice()),
+                default_charset: req
+                    .extensions()
+                    .get::<DefaultCharsetOverride>()
+                    .map(|o| o.0.as_str()),
+                content_type: req.extensions().get::<ContentTypeOverride>(),
+                no_precompressed_sibling: req
+                    .extensions()
+                    .get::<NoPrecompressedSibling>()
+                    .is_some(),
+                ignore_range: false,
+            },
+        )
+        .await
+    }
+
+    /// Serve an immutable request head with explicit trusted pipeline overrides.
+    pub async fn handle_head(
+        &self,
+        ctx: &ReqCtx,
+        req: StaticRequestHead<'_>,
+        overrides: StaticRequestOverrides<'_>,
     ) -> Result<Response<Body>, HandlerError> {
         // Only GET/HEAD are servable as static content. Anything else is the
         // pipeline's concern (e.g. POST to a script handler); we 405 here so a
@@ -688,25 +764,25 @@ impl StaticFiles {
         // A static <context> with a `location` differing from the vhost docroot
         // pins it here via the DocRootOverride extension (set by the pipeline);
         // otherwise resolve against the vhost docroot.
-        let doc_root_override = req.extensions().get::<DocRootOverride>();
+        let doc_root_override = overrides.doc_root;
         let doc_root = match doc_root_override {
-            Some(o) => o.0.clone(),
+            Some((root, _)) => root.to_path_buf(),
             None => ctx.vhost.doc_root.clone(),
         };
         let allow_symlink = ctx.vhost.allow_symbol_link;
 
         // Decode and clean the request path into doc_root-relative components.
         let mut rel = clean_request_path(req.uri().path()).ok_or(HandlerError::Forbidden)?;
-        if let Some(o) = doc_root_override {
-            rel = context_relative_path(&rel, &o.1).to_path_buf();
+        if let Some((_, uri)) = doc_root_override {
+            rel = context_relative_path(&rel, uri).to_path_buf();
         }
         let wants_dir = path_names_directory(req.uri().path());
 
         // Resolve to a concrete regular file (handling directory -> index).
         // Borrow the index list (lives as long as `ctx`) instead of cloning the Vec<String>
         // on every static request — resolve_cached takes a slice.
-        let index_files: &[String] = match req.extensions().get::<IndexFilesOverride>() {
-            Some(o) => &o.0,
+        let index_files: &[String] = match overrides.index_files {
+            Some(index) => index,
             None if ctx.vhost.index_files.is_empty() => &ctx.server.index_files,
             None => &ctx.vhost.index_files,
         };
@@ -757,11 +833,8 @@ impl StaticFiles {
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("");
-        let default_charset = req
-            .extensions()
-            .get::<DefaultCharsetOverride>()
-            .map(|c| c.0.as_str());
-        let mime_override = match req.extensions().get::<ContentTypeOverride>() {
+        let default_charset = overrides.default_charset;
+        let mime_override = match overrides.content_type {
             None => None,
             Some(ContentTypeOverride::Fixed(mime)) => Some(mime.clone()),
             Some(ContentTypeOverride::ByName(map)) => resolved
@@ -786,8 +859,8 @@ impl StaticFiles {
         // operate on the primary's bytes).
         let mut content_encoding: Option<Encoding> = None;
         // HEAD ignores Range (RFC 9110 §14.2), so it describes the GET's sibling (#789).
-        if (is_head || !req.headers().contains_key(RANGE))
-            && req.extensions().get::<NoPrecompressedSibling>().is_none()
+        if (is_head || overrides.ignore_range || !req.headers().contains_key(RANGE))
+            && !overrides.no_precompressed_sibling
         {
             let accepts = req
                 .headers()
@@ -949,10 +1022,11 @@ impl StaticFiles {
         // ---- Range handling (RFC 7233) -----------------------------------
         // If-Range: only honor Range if the validator still matches. A bare
         // date If-Range can still match even without an ETag.
-        let honor_range = match req.headers().get(IF_RANGE) {
-            None => true,
-            Some(ir) => if_range_matches(ir, etag_str, resolved.mtime, now),
-        };
+        let honor_range = !overrides.ignore_range
+            && match req.headers().get(IF_RANGE) {
+                None => true,
+                Some(ir) => if_range_matches(ir, etag_str, resolved.mtime, now),
+            };
 
         let range = if !is_head && honor_range {
             req.headers().get(RANGE)

@@ -263,6 +263,25 @@ impl Compress {
         encode_bytes_transient(enc, input, &self.levels())
     }
 
+    /// Encode a streamed `resp` as `want` now, exactly as the transform would later, when
+    /// that is the coding `accept_encoding` negotiates. The caller reads the encoded frames
+    /// itself (the page cache keeps a streamed fill's egress bytes), and the transform then
+    /// leaves the already encoded response alone. False leaves `resp` untouched.
+    pub fn encode_stream_now(
+        &self,
+        resp: &mut Response,
+        accept_encoding: &str,
+        want: Encoding,
+    ) -> bool {
+        if !matches!(resp.body(), Body::Stream(_))
+            || self.should_compress(resp, accept_encoding) != Some(want)
+        {
+            return false;
+        }
+        self.apply(resp, want);
+        true
+    }
+
     /// (CF_SEND_ZSTD) Enable forcing zstd egress to trusted-proxy (Cloudflare) peers.
     pub fn with_cf_send_zstd(mut self, on: bool) -> Self {
         self.cf_send_zstd = on;
@@ -592,6 +611,39 @@ impl Compress {
             .or_else(|| ctx.get_env("accept-encoding"))
             .or_else(|| ctx.get_env(ACCEPT_ENCODING.as_str()))
             .unwrap_or("")
+    }
+}
+
+impl Compress {
+    /// [`ResponseTransform::transform`] for a large buffered body on a shared runtime
+    /// worker: the same response, with the encode run in slices that yield between
+    /// them (see `stream::encode_in_slices`).
+    pub async fn transform_in_slices(&self, ctx: &ReqCtx, resp: &mut Response) {
+        let accept = if self.cf_send_zstd && ctx.trusted_proxy {
+            "zstd"
+        } else {
+            self.accept_encoding(ctx)
+        };
+        let identity = match resp.body() {
+            Body::Full(bytes) => Some(bytes.clone()),
+            Body::File(file) => file.cached.clone(),
+            _ => None,
+        };
+        if resp.status() != StatusCode::NOT_MODIFIED
+            && let Some(identity) = identity
+            && let Some(enc) = self.should_compress(resp, accept)
+            && !no_gzip(ctx)
+            && resp
+                .extensions()
+                .get::<PreEncoded>()
+                .is_none_or(|pre| pre.for_body(enc, &identity).is_none())
+            && let Some(encoded) = stream::encode_in_slices(enc, &identity, &self.levels()).await
+        {
+            *resp.body_mut() = Body::Full(identity.clone());
+            resp.extensions_mut()
+                .insert(PreEncoded::new(enc, identity, Bytes::from(encoded)));
+        }
+        self.transform(ctx, resp).await;
     }
 }
 

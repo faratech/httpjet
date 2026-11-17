@@ -13,6 +13,173 @@ use hj_core::config::{MimeMap, ServerConfig, Tuning, VHostConfig};
 use hj_core::{Body, HandlerError, Proto, ReqCtx};
 use http::{Method, StatusCode};
 
+async fn head_snapshot(
+    result: Result<Response<Body>, HandlerError>,
+) -> Result<(StatusCode, http::HeaderMap, Vec<u8>, Option<PathBuf>, bool), StatusCode> {
+    use http_body_util::BodyExt;
+    let response = result.map_err(|error| error.status())?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let target = response
+        .extensions()
+        .get::<ResolvedTargetPath>()
+        .map(|p| p.0.clone());
+    let sibling = response
+        .extensions()
+        .get::<PrecompressedSiblingSelected>()
+        .is_some();
+    let bytes = match response.into_body() {
+        Body::Empty => Vec::new(),
+        Body::Full(bytes) => bytes.to_vec(),
+        body @ Body::File(_) => read_file_body(&body),
+        Body::Stream(body) => body.collect().await.unwrap().to_bytes().to_vec(),
+    };
+    Ok((status, headers, bytes, target, sibling))
+}
+
+#[tokio::test]
+async fn borrowed_static_head_matches_request_wrapper_without_mutating_headers() {
+    let root = temp_root("borrowed-head");
+    fs::write(root.join("file.txt"), b"0123456789abcdef").unwrap();
+    fs::write(root.join("file.txt.br"), b"BR-FIXTURE").unwrap();
+    fs::write(root.join("file.txt.gz"), b"GZIP-FIXTURE").unwrap();
+    let mut ctx = make_ctx(
+        Arc::new(make_server()),
+        Arc::new(VHostConfig {
+            doc_root: root.clone(),
+            allow_symbol_link: false,
+            ..Default::default()
+        }),
+    );
+    let handler = StaticFiles::new();
+    let cases = [
+        (Method::GET, Vec::new(), false),
+        (Method::GET, vec![("accept-encoding", "br, gzip")], false),
+        (
+            Method::HEAD,
+            vec![("accept-encoding", "br"), ("range", "bytes=1-3")],
+            false,
+        ),
+        (
+            Method::GET,
+            vec![("accept-encoding", "br"), ("range", "bytes=1-3")],
+            false,
+        ),
+        (
+            Method::GET,
+            vec![("accept-encoding", "gzip"), ("if-none-match", "*")],
+            false,
+        ),
+        (Method::GET, vec![("if-match", "\"wrong\"")], false),
+        (
+            Method::GET,
+            vec![("range", "bytes=1-3"), ("if-range", "\"wrong\"")],
+            false,
+        ),
+        (
+            Method::GET,
+            vec![("accept-encoding", "br"), ("range", "bytes=1-3")],
+            true,
+        ),
+    ];
+    for (method, headers, filtered) in cases {
+        let mut original = req(method.clone(), "/file.txt?q=original");
+        for (name, value) in headers {
+            original.headers_mut().insert(
+                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static(value),
+            );
+        }
+        for index in 0..256 {
+            original.headers_mut().insert(
+                http::header::HeaderName::from_bytes(format!("x-view-{index}").as_bytes()).unwrap(),
+                HeaderValue::from_static("retained-header"),
+            );
+        }
+        let saved = original.headers().clone();
+        let mut legacy = req(method, "/file.txt?q=original");
+        *legacy.headers_mut() = saved.clone();
+        if filtered {
+            legacy.headers_mut().remove(RANGE);
+            legacy.headers_mut().remove(IF_RANGE);
+            legacy.extensions_mut().insert(NoPrecompressedSibling);
+        }
+        let expected = head_snapshot(handler.handle_borrowed(&mut ctx, &mut legacy).await).await;
+        let actual = head_snapshot(
+            handler
+                .handle_head(
+                    &ctx,
+                    StaticRequestHead::new(original.method(), original.uri(), original.headers()),
+                    StaticRequestOverrides {
+                        no_precompressed_sibling: filtered,
+                        ignore_range: filtered,
+                        ..Default::default()
+                    },
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(actual, expected);
+        assert_eq!(original.headers(), &saved);
+        assert_eq!(original.uri(), "/file.txt?q=original");
+    }
+    println!("static_head_probe cases=8 retained_extra_headers=256 inbound_header_mutations=0");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn borrowed_static_overrides_preserve_context_index_charset_and_mime() {
+    let root = temp_root("borrowed-alias");
+    let alias = root.join("alias");
+    fs::create_dir(&alias).unwrap();
+    fs::write(alias.join("landing.custom"), b"alias bytes").unwrap();
+    let mut ctx = make_ctx(
+        Arc::new(make_server()),
+        Arc::new(VHostConfig {
+            doc_root: root.clone(),
+            ..Default::default()
+        }),
+    );
+    let handler = StaticFiles::new();
+    let index = vec!["landing.custom".to_owned()];
+    let mime = ContentTypeOverride::ByName(Arc::new(|name| {
+        (name == "landing.custom").then(|| "application/json".to_owned())
+    }));
+    let mut original = req(Method::GET, "/mount/?q=retained");
+    original
+        .extensions_mut()
+        .insert(DocRootOverride(alias.clone(), "/mount/".into()));
+    original
+        .extensions_mut()
+        .insert(IndexFilesOverride(index.clone()));
+    original
+        .extensions_mut()
+        .insert(DefaultCharsetOverride("UTF-8".into()));
+    original.extensions_mut().insert(mime.clone());
+    let expected = head_snapshot(handler.handle_borrowed(&mut ctx, &mut original).await).await;
+    let actual = head_snapshot(
+        handler
+            .handle_head(
+                &ctx,
+                StaticRequestHead::new(original.method(), original.uri(), original.headers()),
+                StaticRequestOverrides {
+                    doc_root: Some((alias.as_path(), "/mount/")),
+                    index_files: Some(&index),
+                    default_charset: Some("UTF-8"),
+                    content_type: Some(&mime),
+                    ..Default::default()
+                },
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(actual, expected);
+    let (_, headers, body, _, _) = actual.unwrap();
+    assert_eq!(headers[CONTENT_TYPE], "application/json; charset=UTF-8");
+    assert_eq!(body, b"alias bytes");
+    fs::remove_dir_all(root).unwrap();
+}
+
 // ----------------------------------------------------------------------------
 // Pure-function tests: path cleaning / traversal
 // ----------------------------------------------------------------------------

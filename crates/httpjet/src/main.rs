@@ -15,6 +15,7 @@ mod admin_resources;
 mod admin_submission;
 mod admin_write;
 mod allocount;
+mod buffered_work;
 mod config_root;
 mod config_transaction;
 mod extensions;
@@ -376,6 +377,10 @@ struct ServeArgs {
     /// response to the server-side logs. Off by default.
     #[arg(long, default_value_t = false)]
     request_id_header: bool,
+    /// Encode a buffered response body of at least this many bytes in 64 KiB
+    /// slices, yielding to other requests between them. Zero disables it.
+    #[arg(long, default_value_t = 0)]
+    buffered_work_min_bytes: u64,
     /// (mem) Interval (seconds) for the background mimalloc OS-trim that calls
     /// mi_collect(force) to hand retained/cold arena pages back to the OS (counters
     /// the swap retention seen in prod after a burst). 0 = disable.
@@ -1661,6 +1666,7 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
             );
         }
         let state = ServerState::new(server, php_registry.clone(), alt_svc, page_cache, page_cache_dicts, args.page_cache.admit_threshold, xf_capsule, peer_purge, cf_send_zstd, php_slow, args.request_id_header, rewrite_tuning).map_err(anyhow::Error::msg)?;
+        state.buffered_work.set_threshold(args.buffered_work_min_bytes);
         let state = {
             let mut state = state;
             Arc::get_mut(&mut state)

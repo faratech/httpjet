@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+#[cfg(test)]
 use hj_core::Request;
 
 /// 1-in-N population sample rate. Power of two — the decision is a mask, and the
@@ -50,11 +51,9 @@ pub struct PhpSlowLog {
     tick: AtomicU64,
 }
 
-/// Request identity captured BEFORE dispatch consumes the `Request`. Whether the
-/// line is written is only known after the render (the decision needs the TTFB),
-/// so the identity must be owned up front. Cost: two small String allocations per
-/// PHP request when the log is enabled — the dispatch path already clones the
-/// full header map for the GET/HEAD self-redirect retry, so this is noise.
+/// Owned identity for a selected log line. The pipeline retains the original
+/// request head during LSAPI dispatch, so ordinary unsampled requests need not
+/// materialize it.
 pub struct PreCapture {
     method: http::Method,
     host: String,
@@ -67,24 +66,27 @@ impl PreCapture {
     /// `host` is the already-resolved request host (the caller has it on hand
     /// for the page-cache key; don't recompute). `request_id` is the `ReqCtx`
     /// correlation id so a slow render is joinable with the access/error logs.
+    #[cfg(test)]
     pub fn from_request(req: &Request, host: String, request_id: String) -> Self {
-        let uri = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let mut uri = uri.to_string();
-        if uri.len() > MAX_URI_BYTES {
-            let mut cut = MAX_URI_BYTES;
-            while !uri.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            uri.truncate(cut);
-        }
+        Self::from_head(req.method(), req.uri(), req.headers(), host, request_id)
+    }
+
+    pub fn from_parts(parts: &http::request::Parts, host: String, request_id: String) -> Self {
+        Self::from_head(&parts.method, &parts.uri, &parts.headers, host, request_id)
+    }
+
+    fn from_head(
+        method: &http::Method,
+        uri: &http::Uri,
+        headers: &http::HeaderMap,
+        host: String,
+        request_id: String,
+    ) -> Self {
+        let uri = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        let uri = bounded_uri(uri).to_owned();
         // Presence-only scan: a logged-in visitor carries xf_user (remember-me)
         // and/or xf_session. Values are never extracted.
-        let auth = req
-            .headers()
+        let auth = headers
             .get(http::header::COOKIE)
             .map(|v| {
                 let b = v.as_bytes();
@@ -92,7 +94,7 @@ impl PreCapture {
             })
             .unwrap_or(false);
         PreCapture {
-            method: req.method().clone(),
+            method: method.clone(),
             host,
             uri,
             auth,
@@ -126,7 +128,7 @@ impl PhpSlowLog {
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
-        pre: PreCapture,
+        pre: impl FnOnce() -> PreCapture,
         timing: Option<(Duration, Duration)>,
         dispatch: Duration,
         status: u16,
@@ -152,6 +154,7 @@ impl PhpSlowLog {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
+        let pre = pre();
         let line = format!(
             "{ts_ms}\t{kind}\t{lb}\t{user}\t{method}\t{status}\t{ttfb_us}\t{acquire_us}\t{dispatch_us}\t{bytes}\t{retry}\t{host}\t{uri}\t{reqid}\t{xfcache}",
             kind = if slow { "slow" } else { "samp" },
@@ -171,6 +174,14 @@ impl PhpSlowLog {
     pub fn reopen(&self) {
         self.logger.reopen();
     }
+}
+
+fn bounded_uri(uri: &str) -> &str {
+    let mut end = uri.len().min(MAX_URI_BYTES);
+    while !uri.is_char_boundary(end) {
+        end -= 1;
+    }
+    &uri[..end]
 }
 
 /// Keep every line one-per-event: control bytes (incl. tab) in wire-derived
@@ -200,6 +211,155 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(uri: &str) -> Request {
+        http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(http::header::COOKIE, "other=value; xf_session=synthetic")
+            .body(hj_core::empty_incoming())
+            .unwrap()
+    }
+
+    #[test]
+    fn retained_head_matches_original_log_identity() {
+        let req = request("http://example.test/original?q=retained");
+        let before =
+            PreCapture::from_request(&req, "example.test".into(), "0123456789abcdef".into());
+        let (parts, _) = req.into_parts();
+        let after =
+            PreCapture::from_parts(&parts, "example.test".into(), "0123456789abcdef".into());
+        assert_eq!(before.method, after.method);
+        assert_eq!(before.host, after.host);
+        assert_eq!(before.uri, after.uri);
+        assert_eq!(before.auth, after.auth);
+        assert_eq!(before.request_id, after.request_id);
+    }
+
+    #[test]
+    fn long_uri_is_bounded_before_owning_its_storage() {
+        let req = request(&format!("/original?q={}", "x".repeat(20_000)));
+        let (parts, _) = req.into_parts();
+        let pre = PreCapture::from_parts(&parts, "example.test".into(), "0123456789abcdef".into());
+        assert_eq!(pre.uri.len(), MAX_URI_BYTES);
+        assert!(pre.uri.capacity() <= MAX_URI_BYTES);
+        let utf8 = format!("{}é", "x".repeat(MAX_URI_BYTES - 1));
+        assert_eq!(bounded_uri(&utf8).len(), MAX_URI_BYTES - 1);
+    }
+
+    #[tokio::test]
+    async fn only_selected_or_slow_records_materialize_identity() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hj-php-log-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fixture = Fixture(dir);
+        let path = fixture.0.join("php.tsv");
+        let log = PhpSlowLog::spawn(&path, 250);
+        let req = request("/original?q=retained");
+        let (parts, _) = req.into_parts();
+        let identities = std::cell::Cell::new(0_u32);
+        let identity = || {
+            identities.set(identities.get() + 1);
+            PreCapture::from_parts(&parts, "example.test".into(), "0123456789abcdef".into())
+        };
+        for _ in 0..256 {
+            log.record(
+                identity,
+                Some((Duration::from_micros(2), Duration::from_micros(200))),
+                Duration::from_micros(300),
+                200,
+                64,
+                true,
+                "-",
+                Some("PREBHIT"),
+            );
+        }
+        assert_eq!(identities.get(), 2);
+        for (timing, dispatch) in [
+            (
+                Some((Duration::from_micros(2), Duration::from_millis(300))),
+                Duration::from_millis(400),
+            ),
+            (None, Duration::from_millis(300)),
+            (
+                Some((Duration::from_micros(2), Duration::from_millis(250))),
+                Duration::from_millis(300),
+            ),
+        ] {
+            log.record(
+                identity,
+                timing,
+                dispatch,
+                502,
+                0,
+                false,
+                "idempotent_reset",
+                None,
+            );
+        }
+        assert_eq!(identities.get(), 5);
+        let contents = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&path)
+                    && contents.lines().count() == 5
+                {
+                    break contents;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the isolated log writer must flush every selected record");
+        let lines: Vec<Vec<&str>> = contents
+            .lines()
+            .map(|line| line.split('\t').collect())
+            .collect();
+        assert_eq!(
+            lines.iter().map(|line| line[1]).collect::<Vec<_>>(),
+            ["samp", "samp", "slow", "slow", "slow"]
+        );
+        for line in &lines {
+            assert_eq!(line.len(), 15);
+            assert_eq!(line[3], "auth");
+            assert_eq!(line[4], "POST");
+            assert_eq!(line[11], "example.test");
+            assert_eq!(line[12], "/original?q=retained");
+            assert_eq!(line[13], "0123456789abcdef");
+        }
+        assert_eq!(
+            &lines[0][2..],
+            [
+                "1",
+                "auth",
+                "POST",
+                "200",
+                "200",
+                "2",
+                "300",
+                "64",
+                "-",
+                "example.test",
+                "/original?q=retained",
+                "0123456789abcdef",
+                "PREBHIT"
+            ]
+        );
+        assert_eq!(lines[3][6], "300000");
+        assert_eq!(lines[3][7], "0");
+        println!(
+            "php_log_identity_probe fast_requests=256 fast_identities=2 slow_requests=3 slow_identities=3 uri_cap_bytes={MAX_URI_BYTES}"
+        );
+        drop(log);
+    }
 
     #[test]
     fn cookie_scan_matches_presence_only() {

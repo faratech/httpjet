@@ -241,7 +241,7 @@ version = "0.7"
 optional = true
 
 [target."cfg(unix)".dependencies.nix]
-version = "0.31.3"
+version = "0.32.0"
 features = [
     "process",
     "sched",

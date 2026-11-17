@@ -4,8 +4,8 @@
 //! `release` pushes fresh connections to the back, so the oldest live entries sit
 //! at the front. The previous expiry loop popped only the back, leaving expired
 //! front entries to linger (inflating idle_count + causing is_ready()-false
-//! rejects and extra dials under a burst). The fix prunes the whole Vec in one
-//! `retain` pass.
+//! rejects and extra dials under a burst). Releases are ordered by idle time,
+//! so expiry removes the stale prefix while reuse still selects the newest.
 //!
 //! The deterministic front-vs-back unit test lives inline in `pool.rs`
 //! (`checkout_prunes_expired_from_front_not_just_back`, which sets `idle_since`

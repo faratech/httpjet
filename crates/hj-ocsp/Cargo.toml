@@ -9,8 +9,8 @@ repository.workspace = true
 
 [dependencies]
 base64 = "0.23"
-openssl = "=0.10.81"
-openssl-sys = "=0.9.117"
+openssl = "=0.10.82"
+openssl-sys = "=0.9.118"
 foreign-types = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 tokio = { workspace = true }

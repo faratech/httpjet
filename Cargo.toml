@@ -24,7 +24,7 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 publish = false
 rust-version = "1.99.1"
@@ -112,7 +112,7 @@ memmap2 = "0.9"
 flate2 = "1"
 # No `legacy` (pre-v0.8 frame decoders) or `zdict_builder`: httpjet decodes only its own
 # frames and modern request bodies, and dictionaries are trained with the zstd CLI.
-zstd = { version = "0.14", default-features = false, features = ["arrays"] }
+zstd = { version = "0.14", default-features = false, features = ["arrays", "experimental"] }
 brotli = "9"
 
 # utility

@@ -434,6 +434,7 @@ fn render(state: &ServerState) -> String {
         state.page_cache.as_ref().map(|pc| pc.stats()),
     );
     append_body_budget_metrics(&mut body, &state.body_budget);
+    append_buffered_work_metrics(&mut body, &state.buffered_work);
     append_fast_bridge_metrics(&mut body, &state.metrics.fast_bridge);
     append_pagecache_lookup_metrics(&mut body, &state.metrics.pagecache_lookup);
     append_early_bridge_metrics(
@@ -1296,6 +1297,25 @@ fn append_proxy_peer_metrics(out: &mut String, peers: &[hj_proxy::PeerSnapshot])
                 p.peer
             );
         }
+    }
+}
+
+fn append_buffered_work_metrics(out: &mut String, work: &crate::buffered_work::BufferedWork) {
+    use std::fmt::Write;
+    for (name, kind, value) in [
+        ("httpjet_buffered_work_min_bytes", "gauge", work.threshold()),
+        (
+            "httpjet_buffered_work_sliced_encodes_total",
+            "counter",
+            work.encodes(),
+        ),
+        (
+            "httpjet_buffered_work_sliced_input_bytes_total",
+            "counter",
+            work.encoded_input_bytes(),
+        ),
+    ] {
+        let _ = writeln!(out, "# TYPE {name} {kind}\n{name} {value}");
     }
 }
 

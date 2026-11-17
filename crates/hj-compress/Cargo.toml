@@ -18,9 +18,9 @@ zstd = { workspace = true }
 brotli = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 

@@ -258,6 +258,7 @@ pub struct ServerState {
     pub geo: Arc<hj_acl::GeoRules>,
     /// gzip response compression (type-gated).
     pub compress: Arc<Compress>,
+    pub buffered_work: Arc<crate::buffered_work::BufferedWork>,
     /// The post-handler response-transform pipeline, applied in order by
     /// `pipeline::handle` (cache-small-static → expires → compress → deny-CDN-cache
     /// → advertise-h3). A new transform plugs in here; built once per generation
@@ -1325,6 +1326,7 @@ impl ServerState {
             auth_limiter: Arc::default(),
             geo,
             compress: cd.compress,
+            buffered_work: Arc::default(),
             transforms,
             access_log,
             vhost_access_logs,
@@ -1474,6 +1476,7 @@ impl ServerState {
             },
             geo,
             compress: cd.compress,
+            buffered_work: old.buffered_work.clone(),
             transforms,
             mtls_required_vhosts: cd.mtls_required_vhosts,
             // ---- runtime half: carried forward (proxy filtered to new config) ----

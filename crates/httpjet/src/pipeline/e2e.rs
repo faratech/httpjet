@@ -41,6 +41,49 @@ const LISTENER: &str = "http";
 const VHOST: &str = "testvh";
 const CANON_HOST: &str = "canon.test";
 
+#[cfg(feature = "allocount")]
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "manual allocation probe; run this exact test alone with allocount"]
+async fn static_head_allocation_probe() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let args = std::env::args().collect::<Vec<_>>();
+    assert!(args.iter().any(|arg| arg == "--exact"));
+    assert!(args.iter().any(|arg| arg == "--test-threads=1"));
+    struct MemoGuard(bool);
+    impl Drop for MemoGuard {
+        fn drop(&mut self) {
+            super::fast_memo::ENABLED.store(self.0, Relaxed);
+        }
+    }
+    let _memo = MemoGuard(super::fast_memo::ENABLED.swap(false, Relaxed));
+    let root = temp_root("static-head-allocation-probe");
+    std::fs::write(root.join("asset.txt"), b"static allocation fixture").unwrap();
+    let state = build_state(root.clone());
+    let mut request = get(CANON_HOST, "/asset.txt", None);
+    for index in 0..256 {
+        request.headers_mut().insert(
+            http::header::HeaderName::from_bytes(format!("x-count-{index}").as_bytes()).unwrap(),
+            http::HeaderValue::from_static("fixed-input-header"),
+        );
+    }
+    for _ in 0..32 {
+        let response = fast_serve_req(&state, &request).await.unwrap();
+        assert_eq!(identity_bytes(response), b"static allocation fixture");
+    }
+    let before = crate::allocount::ALLOC_COUNT.load(Relaxed);
+    for _ in 0..256 {
+        let response = fast_serve_req(&state, &request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(identity_bytes(response), b"static allocation fixture");
+    }
+    let allocations = crate::allocount::ALLOC_COUNT.load(Relaxed) - before;
+    assert_eq!(state.metrics.fast_memo_hits.load(Relaxed), 0);
+    println!(
+        "static_head_allocation_probe requests=256 headers=256 allocations={allocations} memo_hits=0 scope=fast_static_with_body_validation"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Test temp roots live in `$TMPDIR`, often a RAM-backed tmpfs, and many tests
 /// (every `build_state` server root) never remove theirs. Once per test process,
 /// delete this suite's leftovers older than an hour: any concurrent run's are newer.

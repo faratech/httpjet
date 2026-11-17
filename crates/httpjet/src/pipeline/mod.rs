@@ -64,8 +64,8 @@ use proxy_glue::{ProxyHandler, matching_proxy_context, proxy_websocket, resolve_
 use response_util::{
     apply_error_document, apply_static_context_headers, apply_static_context_request,
     cache_identity_for, context_refusal, context_slash_redirect, error_doc_or_page,
-    matching_static_context, matching_static_context_vhost, redirect, static_context_extra_headers,
-    static_location_override, status_response,
+    matching_static_context, matching_static_context_vhost, redirect, static_context_charset,
+    static_context_extra_headers, static_location_override, status_response,
 };
 use rewrite_glue::{
     RewriteTrace, RwResult, build_uri, decode_request_path, normalized_request_path,
@@ -837,7 +837,7 @@ pub(crate) async fn fast_serve(
                 &ctx,
                 &mut resp,
             );
-            apply_response_transforms(state, &ctx, &mut resp).await;
+            apply_response_transforms(state, &ctx, &mut resp, false).await;
             if !state
                 .client_throttle
                 .allow_deferring_rejection(ctx.client_ip)
@@ -930,32 +930,30 @@ pub(crate) async fn fast_serve(
     let static_extra_headers: Option<Vec<(String, String)>> =
         matching_static_context(&ctx, &orig_path)
             .map(|_| static_context_extra_headers(&ctx, &orig_path));
-    // Static. Serve via the shared static handler on a bodyless GET/HEAD clone (the
-    // caller keeps the original request to bridge if we decline).
-    let build_sreq = |ctx: &ReqCtx, identity: bool| {
-        let mut sreq: Request = http::Request::new(hj_core::empty_incoming());
-        *sreq.method_mut() = method.clone();
-        *sreq.uri_mut() = req.uri().clone();
-        *sreq.headers_mut() = req.headers().clone();
-        if let Some(idx) = htaccess_index_files(&chain) {
-            sreq.extensions_mut()
-                .insert(hj_static::IndexFilesOverride(idx.to_vec()));
-        }
-        apply_static_context_request(ctx, &orig_path, &mut sreq);
-        apply_content_type_override(&chain, &orig_path, &mut sreq);
-        if sub_filter_matches(ctx, &orig_path) {
-            strip_sub_filter_request(&mut sreq);
-        }
-        if identity {
-            sreq.extensions_mut()
-                .insert(hj_static::NoPrecompressedSibling);
-        }
-        sreq
+    let static_charset = static_context_charset(&ctx, &orig_path);
+    let static_type = static_content_type_override(&chain, &orig_path);
+    let static_filter = sub_filter_matches(&ctx, &orig_path);
+    let static_overrides = hj_static::StaticRequestOverrides {
+        doc_root: static_location_override(&ctx, &orig_path)
+            .map(|(root, uri)| (root.as_path(), uri)),
+        index_files: htaccess_index_files(&chain),
+        default_charset: static_charset.as_deref(),
+        content_type: static_type.as_ref(),
+        no_precompressed_sibling: static_filter,
+        ignore_range: static_filter,
     };
     let mut identity = false;
     let mut resp = loop {
-        let sreq = build_sreq(&ctx, identity);
-        let resp = run_handler(&state.static_handler, &mut ctx, sreq).await;
+        let resp = run_static_head(
+            &state.static_handler,
+            &ctx,
+            req,
+            hj_static::StaticRequestOverrides {
+                no_precompressed_sibling: identity || static_filter,
+                ..static_overrides
+            },
+        )
+        .await;
         let sibling = resp
             .extensions()
             .get::<hj_static::PrecompressedSiblingSelected>()
@@ -1048,7 +1046,7 @@ pub(crate) async fn fast_serve(
     );
     // Header transforms (expires / Alt-Svc / compress) — they see an in-memory body now,
     // so CacheStaticTransform is a no-op (no block_in_place) and Compress negotiates per AE.
-    apply_response_transforms(state, &ctx, &mut resp).await;
+    apply_response_transforms(state, &ctx, &mut resp, false).await;
     if resp.status() == StatusCode::OK && !resp.headers().contains_key(http::header::SET_COOKIE) {
         if memo_store_ok {
             if let Some(vary) = memo_vary_set(state, &ctx, req, memo_inline, &chain_with_dirs)
@@ -1712,14 +1710,50 @@ fn strip_empty_query(uri: &http::Uri) -> Option<http::Uri> {
 /// This ordering gives extensions the terminal/cache response before compression,
 /// while keeping cache-safety, compression and transport headers under httpjet's
 /// final control. Every full and on-core response funnel calls this helper.
-async fn apply_response_transforms(state: &ServerState, ctx: &ReqCtx, resp: &mut Response) {
+async fn apply_response_transforms(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    resp: &mut Response,
+    bridged: bool,
+) {
     // The distributed binary ships an empty compile-time registry. Avoid
     // constructing and polling its no-op async dispatcher on every response.
     if !state.extensions.is_empty() {
         state.extensions.run_response_transforms(ctx, resp).await;
     }
+    let threshold = if bridged {
+        state.buffered_work.threshold()
+    } else {
+        0
+    };
     for transform in &state.transforms {
-        transform.transform(ctx, resp).await;
+        if threshold == 0
+            || Arc::as_ptr(transform).cast::<()>() != Arc::as_ptr(&state.compress).cast::<()>()
+        {
+            transform.transform(ctx, resp).await;
+            continue;
+        }
+        let bytes = match resp.body() {
+            Body::Full(bytes) => bytes.len() as u64,
+            Body::File(file) => file.cached.as_ref().map_or(0, |bytes| bytes.len() as u64),
+            _ => 0,
+        };
+        let accept = if state.compress.cf_send_zstd() && ctx.trusted_proxy {
+            "zstd"
+        } else {
+            ctx.get_env(hj_compress::ACCEPT_ENCODING_ENV)
+                .or_else(|| ctx.get_env("accept-encoding"))
+                .unwrap_or("")
+        };
+        if bytes >= threshold
+            && !hj_compress::no_gzip(ctx)
+            && state.compress.should_compress(resp, accept).is_some()
+        {
+            state.buffered_work.record_encode(bytes);
+            state.compress.transform_in_slices(ctx, resp).await;
+        } else {
+            transform.transform(ctx, resp).await;
+        }
     }
 }
 
@@ -2145,7 +2179,7 @@ async fn handle_inner(
         .telemetry
         .sample_phase(crate::telemetry::PHASE_SAMPLE_RATE)
         .then(std::time::Instant::now);
-    apply_response_transforms(&state, &ctx, &mut resp).await;
+    apply_response_transforms(&state, &ctx, &mut resp, true).await;
     if let Some(t) = _ct {
         state.telemetry.shard().phase_compress.record(t.elapsed());
     }
@@ -5045,24 +5079,9 @@ async fn dispatch(
                 ctx.set_env("QUERY_STRING", cur_query.clone());
                 ctx.set_env("REDIRECT_URL", orig_path.clone());
             }
-            // (attribution) Pre-capture the request identity for the PHP slow/sample
-            // log before dispatch consumes `req` — whether the line is written is
-            // only known after the render (the decision needs the TTFB).
-            let slow_pre = state.php_slow.as_ref().map(|sl| {
-                let host = if cache_host.is_empty() {
-                    lscache::request_host(&req, ctx)
-                } else {
-                    cache_host.clone()
-                };
-                (
-                    sl.clone(),
-                    crate::phpslow::PreCapture::from_request(
-                        &req,
-                        host,
-                        ctx.request_id.to_string(),
-                    ),
-                )
-            });
+            // LSAPI returns the original request head. Only the copyable id must
+            // be captured before dispatch; identity strings wait for log selection.
+            let slow_log = state.php_slow.as_ref().map(|sl| (sl, ctx.request_id));
             // (telemetry) The PHP/LSAPI backend call — served counter + dispatch
             // latency (always-on on this minority cache-miss path; the histogram
             // that fingers the spawn/channel overhead the optimization targets).
@@ -5148,7 +5167,7 @@ async fn dispatch(
             }
             // (attribution) Emit the slow/sample line now that the final status is
             // known. First-attempt timing — same numbers the histograms recorded.
-            if let Some((sl, pre)) = slow_pre {
+            if let Some((sl, request_id)) = slow_log {
                 let bytes = resp
                     .headers()
                     .get(http::header::CONTENT_LENGTH)
@@ -5164,7 +5183,18 @@ async fn dispatch(
                     .get("x-xf-cache-status")
                     .and_then(|v| v.to_str().ok());
                 sl.record(
-                    pre,
+                    || {
+                        let host = if cache_host.is_empty() {
+                            lscache::request_host_from_head(&req_head.headers, &req_head.uri, ctx)
+                        } else {
+                            cache_host.clone()
+                        };
+                        crate::phpslow::PreCapture::from_parts(
+                            &req_head,
+                            host,
+                            request_id.to_string(),
+                        )
+                    },
                     lsapi_timing,
                     lsapi_elapsed,
                     resp.status().as_u16(),
@@ -5616,8 +5646,17 @@ fn set_env_scope_basename(
 /// static file `request_path` names (or, for a directory, the index file the
 /// resolver will select). Inert unless some chain file maps a MIME type.
 fn apply_content_type_override(chain: &[Arc<Htaccess>], request_path: &str, req: &mut Request) {
+    if let Some(mapping) = static_content_type_override(chain, request_path) {
+        req.extensions_mut().insert(mapping);
+    }
+}
+
+fn static_content_type_override(
+    chain: &[Arc<Htaccess>],
+    request_path: &str,
+) -> Option<hj_static::ContentTypeOverride> {
     if !chain.iter().any(|ht| ht.has_type_override) {
-        return;
+        return None;
     }
     let rel = resolved_rel_path(request_path);
     let mapping = if suffix_routing::directory_like(request_path) {
@@ -5634,10 +5673,10 @@ fn apply_content_type_override(chain: &[Arc<Htaccess>], request_path: &str, req:
         let basename = rel.rsplit('/').next().unwrap_or("");
         match hj_rewrite::content_type_override(chain.iter().map(AsRef::as_ref), &rel, basename) {
             Some(mime) => hj_static::ContentTypeOverride::Fixed(mime),
-            None => return,
+            None => return None,
         }
     };
-    req.extensions_mut().insert(mapping);
+    Some(mapping)
 }
 
 /// (#9a/#505) Build the effective executable-suffix set for a vhost. Per-suffix
@@ -5909,6 +5948,35 @@ pub(super) async fn run_handler<H: TelemetryHandler>(
         }
     };
     finish_handler_result(ctx, &method, &path, result)
+}
+
+async fn run_static_head(
+    handler: &hj_static::StaticFiles,
+    ctx: &ReqCtx,
+    request: &Request,
+    overrides: hj_static::StaticRequestOverrides<'_>,
+) -> Response {
+    let head =
+        hj_static::StaticRequestHead::new(request.method(), request.uri(), request.headers());
+    let result = {
+        #[cfg(feature = "otel")]
+        {
+            if crate::otel::enabled() {
+                crate::otel::backend(
+                    crate::otel::BackendKind::Static,
+                    handler.handle_head(ctx, head, overrides),
+                )
+                .await
+            } else {
+                handler.handle_head(ctx, head, overrides).await
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            handler.handle_head(ctx, head, overrides).await
+        }
+    };
+    finish_handler_result(ctx, request.method(), request.uri().path(), result)
 }
 
 /// Borrowing counterpart to [`run_handler`] for terminal paths that need the
@@ -7157,6 +7225,74 @@ fn error_page(status: StatusCode) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn buffered_handoff_respects_core_funnel_and_compression_guards() {
+        let root =
+            std::env::temp_dir().join(format!("hj-buffered-transform-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("public")).unwrap();
+        let state = e2e::build_state(root.join("public"));
+        state.buffered_work.set_threshold(1024);
+        let cases = [
+            (false, "normal", false),
+            (true, "normal", true),
+            (true, "no-gzip", false),
+            (true, "no-transform", false),
+            (true, "range", false),
+            (true, "head", false),
+        ];
+        for (bridged, kind, enters) in cases {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut ctx = bare_ctx_for_headers();
+                ctx.env
+                    .push((hj_compress::ACCEPT_ENCODING_ENV.into(), "gzip".into()));
+                if kind == "no-gzip" {
+                    ctx.env.push(("no-gzip".into(), "1".into()));
+                }
+                let payload = bytes::Bytes::from(vec![b'x'; 4096]);
+                let mut response = Response::new(Body::Full(payload.clone()));
+                response
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                if kind == "no-transform" {
+                    response.headers_mut().insert(
+                        http::header::CACHE_CONTROL,
+                        HeaderValue::from_static("no-transform"),
+                    );
+                }
+                if kind == "range" {
+                    *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+                }
+                if kind == "head" {
+                    response.extensions_mut().insert(hj_compress::HeadResponse);
+                }
+                let before = state.buffered_work.encodes();
+                apply_response_transforms(&state, &ctx, &mut response, bridged).await;
+                let after = state.buffered_work.encodes();
+                assert_eq!(after - before, u64::from(enters), "{kind}/{bridged}");
+                let Body::Full(body) = response.into_body() else {
+                    panic!("full body")
+                };
+                if kind == "normal" {
+                    assert_eq!(
+                        hj_compress::decode_bytes(hj_compress::Encoding::Gzip, &body).unwrap(),
+                        payload
+                    );
+                } else {
+                    assert_eq!(body, payload, "{kind}");
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let reloaded = ServerState::reload(&state, state.server.clone()).unwrap();
+        assert!(Arc::ptr_eq(&state.buffered_work, &reloaded.buffered_work));
+        assert_eq!(reloaded.buffered_work.threshold(), 1024);
+        drop(reloaded);
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     /// The thread keeps one full reservation across flushes (regrowing from empty
     /// re-faulted pages per chunk), and ships each chunk at its exact size.

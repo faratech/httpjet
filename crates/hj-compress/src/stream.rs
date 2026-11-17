@@ -41,6 +41,12 @@ use crate::encoding::{Encoding, Levels, zstd_window_log};
 /// (ratio) and the worst-case latency added while a slow upstream fills the
 /// buffer; the terminal `finish()` always flushes whatever remains.
 const FLUSH_THRESHOLD: usize = 32 * 1024;
+/// Size zstd is told to expect of a progressive body (an HTML page). A stream has no
+/// length, so zstd sizes its match tables for a large input: at level 3 twice the tables
+/// it uses for the same page encoded whole, and its match search took 37% more cycles on
+/// progressive template pages (115 KiB, aarch64). A larger body is still encoded correctly, with
+/// the smaller window.
+const PROGRESSIVE_SIZE_HINT: u32 = 128 * 1024;
 
 thread_local! {
     static STREAM_OUT_LOCAL: std::cell::RefCell<Vec<Vec<u8>>> =
@@ -79,6 +85,18 @@ const READY_EMPTY_YIELD_INTERVAL: usize = 64;
 pub(crate) trait BlockEncoder: Send + Sync {
     /// Compress `buf`, flush, and return any bytes the encoder produced.
     fn write_block(&mut self, buf: &[u8]) -> io::Result<Vec<u8>>;
+    /// Compress `buf` without closing a block; returns what the encoder chose to emit.
+    fn write(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
+        self.write_block(buf)
+    }
+    /// Compress `buf` and leave every flush decision to the codec, so a body fed in
+    /// slices encodes as it would in one call.
+    fn write_unflushed(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
+        self.write(buf)
+    }
+    /// The body is expected to be about one page ([`PROGRESSIVE_SIZE_HINT`]). Called
+    /// before the first write.
+    fn expect_page(&mut self) {}
     /// Finalize the stream, returning the trailing bytes.
     fn finish(self: Box<Self>) -> io::Result<Vec<u8>>;
 }
@@ -88,6 +106,13 @@ impl BlockEncoder for GzipEnc {
     fn write_block(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
         self.0.write_all(buf)?;
         self.0.flush()?;
+        Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
+    }
+    fn write_unflushed(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
+        self.0.write_all(buf)?;
+        if self.0.get_ref().is_empty() {
+            return Ok(Vec::new());
+        }
         Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
     }
     fn finish(self: Box<Self>) -> io::Result<Vec<u8>> {
@@ -141,27 +166,52 @@ fn return_zstd_stream_encoder(level: i32, mut enc: RawZstdEncoder<'static>) {
 /// `zio::Writer` over a pooled raw encoder: the same pairing `zstd::stream::write::Encoder`
 /// wraps, so the frames are identical, but `into_inner` hands the context back at the end.
 struct ZstdEnc {
-    writer: Option<ZioWriter<Vec<u8>, RawZstdEncoder<'static>>>,
+    writer: ZioWriter<Vec<u8>, RawZstdEncoder<'static>>,
     level: i32,
+    /// The context carries [`PROGRESSIVE_SIZE_HINT`], to be cleared before it is pooled.
+    hinted: bool,
 }
 impl BlockEncoder for ZstdEnc {
     fn write_block(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
-        let w = self
-            .writer
-            .as_mut()
-            .expect("zstd stream writer is present until finish");
+        let w = &mut self.writer;
         w.write_all(buf)?;
         w.flush()?;
         Ok(std::mem::replace(w.writer_mut(), next_sink(buf.len())))
     }
-    fn finish(mut self: Box<Self>) -> io::Result<Vec<u8>> {
-        let mut w = self
-            .writer
-            .take()
-            .expect("zstd stream writer is present until finish");
+    fn write(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
+        let w = &mut self.writer;
+        w.write_all(buf)?;
+        if w.writer().is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(std::mem::replace(w.writer_mut(), next_sink(buf.len())))
+    }
+    fn expect_page(&mut self) {
+        let w = &mut self.writer;
+        self.hinted = w
+            .operation_mut()
+            .set_parameter(zstd::zstd_safe::CParameter::SrcSizeHint(
+                PROGRESSIVE_SIZE_HINT,
+            ))
+            .is_ok();
+    }
+    fn finish(self: Box<Self>) -> io::Result<Vec<u8>> {
+        let ZstdEnc {
+            writer: mut w,
+            level,
+            hinted,
+        } = *self;
         w.finish()?;
-        let (sink, enc) = w.into_inner();
-        return_zstd_stream_encoder(self.level, enc);
+        let (sink, mut enc) = w.into_inner();
+        // A pooled context serves any stream next: one still hinted is dropped.
+        if !hinted
+            || (enc.reinit().is_ok()
+                && enc
+                    .set_parameter(zstd::zstd_safe::CParameter::SrcSizeHint(0))
+                    .is_ok())
+        {
+            return_zstd_stream_encoder(level, enc);
+        }
         Ok(sink)
     }
 }
@@ -173,11 +223,70 @@ impl BlockEncoder for BrotliEnc {
         self.0.flush()?;
         Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
     }
+    fn write_unflushed(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
+        self.0.write_all(buf)?;
+        if self.0.get_ref().is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
+    }
     fn finish(self: Box<Self>) -> io::Result<Vec<u8>> {
         // `into_inner` performs the brotli FINISH operation before returning.
         let BrotliEnc(w) = *self;
         Ok(w.into_inner())
     }
+}
+
+/// Input given to the codec between two yields of [`encode_in_slices`].
+const ENCODE_SLICE: usize = 64 * 1024;
+
+fn block_encoder(enc: Encoding, levels: &Levels) -> Box<dyn BlockEncoder> {
+    match enc {
+        Encoding::Gzip => Box::new(GzipEnc(GzEncoder::new(
+            next_sink(SINK_ROOM),
+            Compression::new(levels.gzip),
+        ))),
+        Encoding::Zstd => Box::new(ZstdEnc {
+            writer: ZioWriter::new(
+                next_sink(SINK_ROOM),
+                take_zstd_stream_encoder(levels.zstd)
+                    .expect("zstd encoder init is infallible for a valid level"),
+            ),
+            level: levels.zstd,
+            hinted: false,
+        }),
+        Encoding::Brotli => Box::new(BrotliEnc(BrotliCompressor::new(
+            next_sink(SINK_ROOM),
+            4096,
+            levels.brotli_q,
+            levels.brotli_lgwin,
+        ))),
+    }
+}
+
+/// Encode a whole body `ENCODE_SLICE` bytes at a time, giving the runtime worker back
+/// between slices. A multi-megabyte one-shot encode holds its worker for the whole
+/// encode and stalls every request queued behind it; this keeps the work on the same
+/// task and thread, so no allocator heap or codec context is created for it.
+pub(crate) async fn encode_in_slices(
+    enc: Encoding,
+    input: &[u8],
+    levels: &Levels,
+) -> Option<Vec<u8>> {
+    let mut encoder = block_encoder(enc, levels);
+    let mut out = Vec::with_capacity(input.len() / 4 + 64);
+    let mut slices = input.chunks(ENCODE_SLICE).peekable();
+    while let Some(slice) = slices.next() {
+        out.extend_from_slice(&encoder.write_unflushed(slice).ok()?);
+        if slices.peek().is_some() {
+            // Not a bare self-wake: that re-queues this task on its own worker ahead of
+            // requests arriving from other threads, which the worker then reaches only
+            // every 61 polls. The runtime's yield runs those first.
+            tokio::task::yield_now().await;
+        }
+    }
+    out.extend_from_slice(&encoder.finish().ok()?);
+    Some(out)
 }
 
 /// State of the encoder driving an upstream body.
@@ -207,6 +316,9 @@ pub struct CompressStream {
     /// Emit the pending block every time the upstream stalls (see
     /// [`CompressStream::flush_when_idle`]).
     flush_when_idle: bool,
+    /// After the first block, hand upstream frames straight to the encoder and let it
+    /// close blocks itself (see [`CompressStream::flush_first_when_idle`]).
+    unbatched_rest: bool,
     /// Consecutive always-ready empty DATA frames skipped since real payload.
     skipped_empty_frames: usize,
 }
@@ -214,41 +326,31 @@ pub struct CompressStream {
 impl CompressStream {
     /// Wrap `inner` with an incremental encoder for `enc` at the given `levels`.
     pub fn new(inner: StreamBody, enc: Encoding, levels: &Levels) -> Self {
-        let encoder: Box<dyn BlockEncoder> = match enc {
-            Encoding::Gzip => Box::new(GzipEnc(GzEncoder::new(
-                next_sink(SINK_ROOM),
-                Compression::new(levels.gzip),
-            ))),
-            Encoding::Zstd => Box::new(ZstdEnc {
-                writer: Some(ZioWriter::new(
-                    next_sink(SINK_ROOM),
-                    take_zstd_stream_encoder(levels.zstd)
-                        .expect("zstd encoder init is infallible for a valid level"),
-                )),
-                level: levels.zstd,
-            }),
-            Encoding::Brotli => Box::new(BrotliEnc(BrotliCompressor::new(
-                next_sink(SINK_ROOM),
-                4096,
-                levels.brotli_q,
-                levels.brotli_lgwin,
-            ))),
-        };
+        let encoder = block_encoder(enc, levels);
         CompressStream {
             inner,
             state: EncState::Active(encoder),
             pending_in: STREAM_OUT.take_buf(FLUSH_THRESHOLD, FLUSH_THRESHOLD),
             flush_first_when_idle: false,
             flush_when_idle: false,
+            unbatched_rest: false,
             skipped_empty_frames: 0,
         }
     }
 
     /// For a body the backend is still producing (`crate::ProgressiveBody`): its first
     /// bytes usually carry the page head, which a browser acts on before the rest arrives,
-    /// so they go out when the upstream first stalls. Later blocks keep the batching.
+    /// so they go out when the upstream first stalls. The rest is not flushed early: its
+    /// reader gains nothing from the middle of the page arriving in pieces, and on
+    /// progressive template pages (115 KiB, aarch64) batching it here in 32 KiB blocks cost a
+    /// fifth more CPU than the buffered miss, in cache misses on a second copy of the
+    /// body. The encoder takes each frame as it arrives and closes its own blocks.
     pub fn flush_first_when_idle(mut self) -> Self {
+        if let EncState::Active(enc) = &mut self.state {
+            enc.expect_page();
+        }
         self.flush_first_when_idle = true;
+        self.unbatched_rest = true;
         self
     }
 
@@ -319,7 +421,7 @@ impl Body for CompressStream {
                                     let EncState::Active(mut enc) =
                                         std::mem::replace(&mut self.state, EncState::Done)
                                     else {
-                                        unreachable!("state is Active in this arm");
+                                        return Poll::Ready(None);
                                     };
                                     // (#326) Drain any buffered input into the encoder, then
                                     // finish; concatenate both outputs into the single terminal
@@ -368,6 +470,22 @@ impl Body for CompressStream {
                             // (#326) Accumulate upstream frames; only compress + flush a block
                             // once FLUSH_THRESHOLD is reached, the upstream stalls on a
                             // `flush_when_idle` feed, or at EOF/trailers. SSE is never routed here.
+                            if self.unbatched_rest && !self.flush_first_when_idle {
+                                let EncState::Active(enc) = &mut self.state else {
+                                    unreachable!("state is Active in this arm");
+                                };
+                                match enc.write(&data) {
+                                    Ok(buf) if buf.is_empty() => continue,
+                                    Ok(buf) => {
+                                        return Poll::Ready(Some(Ok(Frame::data(block_bytes(
+                                            buf,
+                                        )))));
+                                    }
+                                    Err(e) => {
+                                        return Poll::Ready(Some(Err(Box::new(e) as BoxError)));
+                                    }
+                                }
+                            }
                             self.pending_in.extend_from_slice(&data);
                             if self.pending_in.len() < FLUSH_THRESHOLD {
                                 continue;
@@ -454,6 +572,41 @@ impl Body for CompressStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sliced_encode_yields_between_slices_and_matches_one_shot_size() {
+        use std::task::Waker;
+
+        let mut input = Vec::new();
+        for i in 0..(5 * ENCODE_SLICE / 16 + 3) {
+            input.extend_from_slice(format!("<li>row {i:08}</li>").as_bytes());
+        }
+        let levels = Levels::default();
+        for enc in [Encoding::Gzip, Encoding::Zstd, Encoding::Brotli] {
+            let mut fut = std::pin::pin!(encode_in_slices(enc, &input, &levels));
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut yields = 0;
+            let out = loop {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(out) => break out.expect("encode"),
+                    Poll::Pending => yields += 1,
+                }
+            };
+            assert_eq!(yields, input.len().div_ceil(ENCODE_SLICE) - 1, "{enc:?}");
+            assert_eq!(
+                crate::encoding::decode_bytes(enc, &out).as_deref(),
+                Some(&input[..]),
+                "{enc:?}"
+            );
+            let one_shot = crate::encoding::encode_bytes(enc, &input, &levels).expect("one shot");
+            assert!(
+                out.len() <= one_shot.len() + one_shot.len() / 20,
+                "{enc:?}: sliced {} vs one-shot {}",
+                out.len(),
+                one_shot.len()
+            );
+        }
+    }
     use flate2::read::GzDecoder;
     use http_body_util::{BodyExt, Full};
     use std::io::Read;
@@ -491,6 +644,52 @@ mod tests {
         B::Error: std::error::Error + Send + Sync + 'static,
     {
         b.map_err(|e| Box::new(e) as BoxError).boxed()
+    }
+
+    /// A progressive body is encoded with the match tables zstd picks for a page-sized
+    /// input, as the buffered encode of the same page is: its output is the size of that
+    /// encode, not of an unhinted stream's.
+    #[tokio::test]
+    async fn progressive_zstd_stream_is_sized_like_a_page() {
+        let mut page = Vec::new();
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        while page.len() < 115 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            page.extend_from_slice(
+                format!(
+                    "<li class=\"row r{}\"><a href=\"/moon/{}\">{}</a></li>\n",
+                    x % 7,
+                    x % 9973,
+                    x % 100_003
+                )
+                .as_bytes(),
+            );
+        }
+        let levels = Levels::default();
+        let collect = |stream: CompressStream| async move {
+            let mut out = Vec::new();
+            let mut body = stream.boxed_stream();
+            while let Some(frame) = body.frame().await {
+                if let Ok(data) = frame.unwrap().into_data() {
+                    out.extend_from_slice(&data);
+                }
+            }
+            out
+        };
+        let source = || into_stream_body(Full::new(Bytes::from(page.clone())));
+        let plain = collect(CompressStream::new(source(), Encoding::Zstd, &levels)).await;
+        let hinted =
+            collect(CompressStream::new(source(), Encoding::Zstd, &levels).flush_first_when_idle())
+                .await;
+        let whole = crate::encoding::zstd_bytes_level(&page, levels.zstd).unwrap();
+        assert_eq!(zstd::decode_all(hinted.as_slice()).unwrap(), page);
+        assert_eq!(hinted.len(), whole.len(), "the page-sized parameters");
+        assert_ne!(plain.len(), hinted.len(), "an unhinted stream differs");
+        // A later stream from the pool is unhinted again.
+        let again = collect(CompressStream::new(source(), Encoding::Zstd, &levels)).await;
+        assert_eq!(again.len(), plain.len());
     }
 
     async fn compress(enc: Encoding, inner: StreamBody) -> Vec<u8> {
@@ -681,8 +880,9 @@ mod tests {
                     Box::new(GzipEnc(GzEncoder::new(Vec::new(), Compression::new(6))))
                 }
                 Encoding::Zstd => Box::new(ZstdEnc {
-                    writer: Some(ZioWriter::new(Vec::new(), RawZstdEncoder::new(3).unwrap())),
+                    writer: ZioWriter::new(Vec::new(), RawZstdEncoder::new(3).unwrap()),
                     level: 3,
+                    hinted: false,
                 }),
                 Encoding::Brotli => {
                     Box::new(BrotliEnc(BrotliCompressor::new(Vec::new(), 4096, 5, 19)))

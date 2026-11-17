@@ -105,7 +105,7 @@ version = "0.5.5"
 optional = true
 
 [dependencies.nix]
-version = "0.31.3"
+version = "0.32.0"
 features = [
     "signal",
     "fs",

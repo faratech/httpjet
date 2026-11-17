@@ -11,7 +11,7 @@
 //! response straight through with no read-idle timeout — essential for SSE and
 //! long-lived proxied streams.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -208,7 +208,7 @@ pub struct Upstream {
     connect_timeout: Duration,
     /// Max time to wait for upstream response *headers* (not the body).
     response_timeout: Duration,
-    idle: Mutex<Vec<PooledConn>>,
+    idle: Mutex<VecDeque<PooledConn>>,
     /// Consecutive connect-failure count feeding the circuit breaker.
     fail_count: AtomicU32,
     /// When the breaker opened (`None` = closed). While open, checkout fast-fails
@@ -275,7 +275,7 @@ impl Upstream {
                 connect_timeout
             },
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
-            idle: Mutex::new(Vec::new()),
+            idle: Mutex::new(VecDeque::new()),
             fail_count: AtomicU32::new(0),
             tripped_at: Mutex::new(None),
             tls_config,
@@ -399,14 +399,16 @@ impl Upstream {
         loop {
             let candidate = {
                 let mut idle = self.idle.lock();
-                // (#27) Prune expired connections from ALL positions, not just the back.
-                // `release` pushes fresh entries to the back, so the OLDEST live entries sit
-                // at the front; popping only the back leaves stale front entries to linger,
-                // inflating idle_count() and causing a cluster of is_ready()-false rejects +
-                // extra dials under a burst. A single retain drops every expired entry in one
-                // pass regardless of position; we then reuse the freshest (back).
-                idle.retain(|c| c.idle_since.elapsed() <= self.keep_alive);
-                idle.pop()
+                // Releases append under this same lock, so expiry is ordered even
+                // when responses finish concurrently. Only the expired prefix needs work.
+                let now = Instant::now();
+                while idle
+                    .front()
+                    .is_some_and(|c| now.duration_since(c.idle_since) > self.keep_alive)
+                {
+                    idle.pop_front();
+                }
+                idle.pop_back()
             };
             match candidate {
                 Some(c) => {
@@ -621,7 +623,7 @@ impl Upstream {
         if idle.len() >= self.max_conns as usize {
             return; // pool full: let this connection drop & close
         }
-        idle.push(PooledConn {
+        idle.push_back(PooledConn {
             sender,
             idle_since: Instant::now(),
         });
@@ -633,7 +635,7 @@ impl Upstream {
 /// rewrite targets.
 #[derive(Default)]
 pub struct UpstreamPool {
-    dynamic: Arc<Mutex<HashMap<PoolKey, DynamicPool>>>,
+    dynamic: Arc<Mutex<DynamicRegistry>>,
     identity_epoch: u64,
     health_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     published_groups: Arc<Mutex<Option<Vec<Arc<balance::Group>>>>>,
@@ -649,6 +651,7 @@ pub struct UpstreamPool {
 
 const MAX_DYNAMIC_POOLS: usize = 256;
 const DYNAMIC_POOL_TTL: Duration = Duration::from_secs(60);
+const DYNAMIC_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 static NEXT_IDENTITY_EPOCH: AtomicU64 = AtomicU64::new(1);
 static GLOBAL_DIALS: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(64)));
@@ -668,6 +671,26 @@ pub(crate) fn dial_permit() -> Result<tokio::sync::OwnedSemaphorePermit, ProxyEr
 struct DynamicPool {
     upstream: Arc<Upstream>,
     last_used: Instant,
+}
+
+#[derive(Default)]
+struct DynamicRegistry {
+    pools: HashMap<PoolKey, DynamicPool>,
+    last_prune: Option<Instant>,
+}
+
+impl DynamicRegistry {
+    fn prune(&mut self, now: Instant) {
+        if self
+            .last_prune
+            .is_none_or(|at| now.duration_since(at) >= DYNAMIC_PRUNE_INTERVAL)
+        {
+            self.pools.retain(|_, pool| {
+                now.duration_since(pool.last_used) < DYNAMIC_POOL_TTL || pool.upstream_in_use()
+            });
+            self.last_prune = Some(now);
+        }
+    }
 }
 
 impl DynamicPool {
@@ -734,7 +757,7 @@ impl PoolKey {
 impl UpstreamPool {
     pub fn new() -> Self {
         UpstreamPool {
-            dynamic: Arc::new(Mutex::new(HashMap::new())),
+            dynamic: Arc::new(Mutex::new(DynamicRegistry::default())),
             identity_epoch: NEXT_IDENTITY_EPOCH.fetch_add(1, Ordering::Relaxed),
             health_tasks: Mutex::new(Vec::new()),
             published_groups: Arc::new(Mutex::new(None)),
@@ -824,9 +847,8 @@ impl UpstreamPool {
         let now = Instant::now();
         let mut registry = self.dynamic.lock();
         // Failure/backoff state lives in the same entry as the semaphore.
-        registry.retain(|_, pool| {
-            now.duration_since(pool.last_used) < DYNAMIC_POOL_TTL || pool.upstream_in_use()
-        });
+        registry.prune(now);
+        let registry = &mut registry.pools;
         let peers = target.peers();
         let now_ms = now_epoch_ms();
         let key_for = |peer: &ProxyTarget| {
@@ -841,13 +863,20 @@ impl UpstreamPool {
             .enumerate()
             .find(|(_, peer)| {
                 let key = key_for(peer);
-                registry.get(&key).is_none_or(|p| {
-                    p.upstream
-                        .bad_until
-                        .lock()
-                        .as_ref()
-                        .is_none_or(|b| b.load(Ordering::Relaxed) <= now_ms)
-                })
+                let Some(pool) = registry.get(&key) else {
+                    return true;
+                };
+                if now.duration_since(pool.last_used) >= DYNAMIC_POOL_TTL && !pool.upstream_in_use()
+                {
+                    // The selected key still observes its exact TTL between broad sweeps.
+                    registry.remove(&key);
+                    return true;
+                }
+                pool.upstream
+                    .bad_until
+                    .lock()
+                    .as_ref()
+                    .is_none_or(|b| b.load(Ordering::Relaxed) <= now_ms)
             })
             .unwrap_or((0, &peers[0]));
         if index > 0 {
@@ -889,11 +918,11 @@ impl UpstreamPool {
 
     /// Number of distinct upstream pools (for tests/metrics).
     pub fn len(&self) -> usize {
-        self.pools.lock().len() + self.dynamic.lock().len()
+        self.pools.lock().len() + self.dynamic.lock().pools.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.lock().is_empty() && self.dynamic.lock().is_empty()
+        self.pools.lock().is_empty() && self.dynamic.lock().pools.is_empty()
     }
 
     pub(crate) fn retained_generation(
@@ -1002,8 +1031,12 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(pool.len(), MAX_DYNAMIC_POOLS);
-        for value in pool.dynamic.lock().values_mut() {
-            value.last_used -= DYNAMIC_POOL_TTL;
+        {
+            let mut registry = pool.dynamic.lock();
+            for value in registry.pools.values_mut() {
+                value.last_used -= DYNAMIC_POOL_TTL;
+            }
+            registry.last_prune = Some(Instant::now() - DYNAMIC_PRUNE_INTERVAL);
         }
         assert!(
             pool.get_or_create(&extra, 1, Duration::from_secs(1), Duration::from_secs(1))
@@ -1022,8 +1055,12 @@ mod tests {
             .unwrap();
         let permit = first.acquire().await.expect("free slot");
         drop(first);
-        for value in pool.dynamic.lock().values_mut() {
-            value.last_used -= DYNAMIC_POOL_TTL;
+        {
+            let mut registry = pool.dynamic.lock();
+            for value in registry.pools.values_mut() {
+                value.last_used -= DYNAMIC_POOL_TTL;
+            }
+            registry.last_prune = Some(Instant::now() - DYNAMIC_PRUNE_INTERVAL);
         }
         pool.get_or_create(&other, 1, Duration::from_secs(1), Duration::from_secs(1))
             .unwrap();
@@ -1037,6 +1074,57 @@ mod tests {
         );
         drop(permit);
         assert_eq!(again.sem.available_permits(), 1);
+    }
+
+    #[test]
+    fn selected_dynamic_pool_expires_between_registry_sweeps() {
+        let pool = UpstreamPool::new();
+        let target = ProxyTarget::parse_url("http://192.0.2.9:80/").unwrap();
+        let first = pool
+            .get_or_create(&target, 4, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        let old = Arc::downgrade(&first);
+        drop(first);
+        {
+            let mut registry = pool.dynamic.lock();
+            for entry in registry.pools.values_mut() {
+                entry.last_used -= DYNAMIC_POOL_TTL;
+            }
+            registry.last_prune = Some(Instant::now());
+        }
+        let replacement = pool
+            .get_or_create(&target, 4, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        assert!(old.upgrade().is_none());
+        assert_eq!(replacement.sem.available_permits(), 4);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn expired_unselected_dynamic_pool_is_reaped_on_bounded_sweep() {
+        let pool = UpstreamPool::new();
+        let stale = ProxyTarget::parse_url("http://192.0.2.10:80/").unwrap();
+        let fresh = ProxyTarget::parse_url("http://192.0.2.11:80/").unwrap();
+        let first = pool
+            .get_or_create(&stale, 4, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        let old = Arc::downgrade(&first);
+        drop(first);
+        {
+            let mut registry = pool.dynamic.lock();
+            for entry in registry.pools.values_mut() {
+                entry.last_used -= DYNAMIC_POOL_TTL;
+            }
+            registry.last_prune = Some(Instant::now());
+        }
+        pool.get_or_create(&fresh, 4, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        assert!(old.upgrade().is_some());
+        pool.dynamic.lock().last_prune = Some(Instant::now() - DYNAMIC_PRUNE_INTERVAL);
+        pool.get_or_create(&fresh, 4, Duration::from_secs(5), Duration::from_secs(1))
+            .unwrap();
+        assert!(old.upgrade().is_none());
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]
@@ -1404,22 +1492,22 @@ mod tests {
         {
             let mut idle = u.idle.lock();
             // Front: expired (idle longer than keep_alive). Back: two fresh entries.
-            idle.push(PooledConn {
+            idle.push_back(PooledConn {
                 sender: AnySender::H1(s_old),
                 idle_since: Instant::now() - Duration::from_secs(120),
             });
-            idle.push(PooledConn {
+            idle.push_back(PooledConn {
                 sender: AnySender::H1(s_fresh1),
                 idle_since: Instant::now(),
             });
-            idle.push(PooledConn {
+            idle.push_back(PooledConn {
                 sender: AnySender::H1(s_fresh2),
                 idle_since: Instant::now(),
             });
         }
         assert_eq!(u.idle_count(), 3);
 
-        // checkout() prunes the expired front entry (retain), then reuses a fresh one (pop).
+        // The expired prefix is removed before selecting the newest live entry.
         let reused = u
             .checkout()
             .await
@@ -1432,6 +1520,38 @@ mod tests {
             1,
             "expired front entry pruned; one fresh consumed, one fresh left"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_expiry_preserves_fresh_entries_across_pool_sizes() {
+        for count in [1, 16, 256, 1024] {
+            let target = ProxyTarget::parse_url("http://127.0.0.1:8002/").unwrap();
+            let upstream = Upstream::new(
+                &target,
+                count as u32,
+                Duration::from_secs(300),
+                Duration::from_secs(5),
+            );
+            let mut peers = Vec::new();
+            for index in 0..count {
+                let (sender, peer) = live_sender().await;
+                peers.push(peer);
+                upstream.idle.lock().push_back(PooledConn {
+                    sender: AnySender::H1(sender),
+                    idle_since: if index < count / 2 {
+                        Instant::now() - Duration::from_secs(600)
+                    } else {
+                        Instant::now()
+                    },
+                });
+            }
+            let fresh = count - count / 2;
+            for remaining in (0..fresh).rev() {
+                let sender = upstream.checkout().await.unwrap();
+                assert!(sender.is_ready());
+                assert_eq!(upstream.idle_count(), remaining);
+            }
+        }
     }
 
     #[test]

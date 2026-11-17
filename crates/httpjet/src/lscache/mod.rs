@@ -74,17 +74,24 @@ const HDR_XF_SHELL_AGE: HeaderName = HeaderName::from_static("x-wf-shell-age");
 /// mangle a `[::1]:443` Host header to `[` (or empty) and feed that to the
 /// self-redirect cache guard.
 pub fn request_host(req: &Request, ctx: &ReqCtx) -> String {
+    request_host_from_head(req.headers(), req.uri(), ctx)
+}
+
+pub(super) fn request_host_from_head(
+    headers: &http::HeaderMap,
+    uri: &http::Uri,
+    ctx: &ReqCtx,
+) -> String {
     // SAME precedence as pipeline::dispatch's `route_key` (Host header first, then the URI
     // authority): the two MUST agree, else a request whose Host and absolute-form authority
     // disagree (h2 `:authority` vs an absolute-form `:path`, or h1 absolute-form) routes by one
     // host but computes `host_foreign` by the other — skipping the foreign-host CDN-cache
     // protection. Keying by the routed Host also keeps the identity guard consistent with
     // routing. (RFC 9110 §7.4: the Host/authority is authoritative for the target.)
-    let raw: &str = req
-        .headers()
+    let raw: &str = headers
         .get(http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .or_else(|| req.uri().host())
+        .or_else(|| uri.host())
         .unwrap_or(&ctx.vhost_name);
     let h = hj_core::host_without_port(raw);
     // A port-only or empty authority (e.g. a bare ":443" Host) normalizes to "" — fall back
@@ -4028,14 +4035,50 @@ pub async fn cache_store_leading(
             .metrics
             .pagecache_stream_fills
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let body = StreamFill {
-            inner,
+        let copy = Arc::new(std::sync::Mutex::new(FillCopy {
             buf: hj_core::BODY_BUFS.take_buf(COLLECT_DEFAULT_CAPACITY, hj_core::BODY_BUF_CAP),
+            encoded_len: 0,
             lease: Some(lease),
             max_bytes: cfg.max_obj_bytes,
-            commit: Some(commit),
+            dead: false,
+        }));
+        let tap = FillTap {
+            inner,
+            copy: copy.clone(),
         };
-        return Response::from_parts(parts, Body::Stream(body.boxed()));
+        let mut resp = Response::from_parts(parts, Body::Stream(tap.boxed()));
+        // Where the store keeps the egress zstd encode, the fill makes that encode itself
+        // and stores the bytes it sent, instead of an identity copy encoded a second time.
+        // A registered response transform expects the identity body, so it keeps the
+        // later encode.
+        let encodes = cfg.stores_egress_at_rest(&ctx.vhost_name)
+            && state.extensions.is_empty()
+            && state
+                .compress
+                .encode_stream_now(&mut resp, egress_ae(state, ctx), Encoding::Zstd);
+        let (parts, body) = resp.into_parts();
+        let source = match body {
+            Body::Stream(source) => source,
+            other => return Response::from_parts(parts, other),
+        };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let queue = Arc::new(FillQueue {
+            bytes: std::sync::atomic::AtomicU64::new(0),
+            lease: std::sync::Mutex::new(BodyBufferLease::new(state.body_budget.clone())),
+            drained: tokio::sync::Notify::new(),
+        });
+        tokio::spawn(
+            FillPump {
+                source,
+                copy,
+                encoded: encodes.then(Vec::new),
+                commit: Some(commit),
+                tx,
+                queue: queue.clone(),
+            }
+            .run(),
+        );
+        return Response::from_parts(parts, Body::Stream(FillReader { rx, queue }.boxed()));
     }
 
     // A static file public admission would reject is served zero-copy: reading it into RAM
@@ -4327,7 +4370,7 @@ pub async fn cache_store_leading(
                         headers
                     })
                 },
-                inline_at_rest,
+                inline_at_rest.map_or(AtRest::Background, AtRest::Inline),
                 &mut pre_encoded,
             ));
         }
@@ -4421,6 +4464,17 @@ struct PendingEntry {
     render_epoch: u64,
 }
 
+/// Where an admitted body's at-rest zstd form comes from
+/// (`--page-cache-egress-at-rest-vhosts`).
+enum AtRest<'a> {
+    /// None here: the body is stored as identity and the background pool encodes it.
+    Background,
+    /// Encoded now, the way the egress would encode it.
+    Inline(&'a hj_compress::Compress),
+    /// The egress encode a streamed fill already made and sent.
+    Streamed(Bytes),
+}
+
 /// Admit and store `entry` with `bytes` as its body and `headers()` as its stored headers
 /// (built only once the entry is admitted); the finalize target when it was stored.
 fn store_admitted(
@@ -4429,7 +4483,7 @@ fn store_admitted(
     entry: PendingEntry,
     bytes: &Bytes,
     headers: impl FnOnce() -> Vec<(HeaderName, HeaderValue)>,
-    egress: Option<&hj_compress::Compress>,
+    at_rest: AtRest<'_>,
     pre_encoded: &mut Option<Bytes>,
 ) -> Option<FinalizeTarget> {
     // (W-TinyLFU admission) Spend RAM (store) + CPU (precompress) only on keys that show
@@ -4461,7 +4515,12 @@ fn store_admitted(
     // (--page-cache-egress-at-rest-vhosts) The zstd encode this response would get on egress
     // is the stored body too, under the dictionary-less generation, with the same savings
     // gate as the dictionary re-encode. It is handed back so the serve reuses it.
-    let (body, dict_gen) = match egress.and_then(|c| c.encode_full(Encoding::Zstd, bytes)) {
+    let encoded = match at_rest {
+        AtRest::Background => None,
+        AtRest::Inline(compress) => compress.encode_full(Encoding::Zstd, bytes),
+        AtRest::Streamed(encoded) => Some(encoded),
+    };
+    let (body, dict_gen) = match encoded {
         Some(c) if c.len() <= bytes.len().saturating_sub(bytes.len() / 8) => {
             *pre_encoded = Some(c.clone());
             (PageBody::InMem(c), hj_compress::PLAIN_GENERATION)
@@ -4552,21 +4611,8 @@ struct FillCommit {
 }
 
 impl FillCommit {
-    /// Store off the response's task: the client's end-of-stream never waits for the
-    /// tmpfs write.
-    fn finish(self, bytes: Bytes, lease: Option<BodyBufferLease>) {
-        match tokio::runtime::Handle::try_current() {
-            Ok(rt) => {
-                rt.spawn(async move {
-                    self.store(bytes);
-                    drop(lease);
-                });
-            }
-            Err(_) => self.store(bytes),
-        }
-    }
-
-    fn store(self, bytes: Bytes) {
+    /// `encoded` is the zstd stream the fill sent, when it made the egress encode itself.
+    fn store(self, bytes: Bytes, encoded: Option<Bytes>) {
         let FillCommit {
             state,
             entry,
@@ -4587,8 +4633,10 @@ impl FillCommit {
                 );
             } else {
                 let status = entry.status;
-                // The frames already went out encoded per frame, so there is no single
-                // egress encode to keep: the identity is stored and re-encoded as before.
+                // Frames that went out as identity were encoded per frame downstream, so
+                // there is no single egress encode to keep: the identity is stored and the
+                // background pool encodes it.
+                let background = encoded.is_none();
                 let stored = store_admitted(
                     &state,
                     store,
@@ -4599,7 +4647,7 @@ impl FillCommit {
                         ensure_stored_etag(status, &mut headers, &bytes);
                         headers
                     },
-                    None,
+                    encoded.map_or(AtRest::Background, AtRest::Streamed),
                     &mut None,
                 );
                 if let Some(target) = stored {
@@ -4607,7 +4655,15 @@ impl FillCommit {
                         .metrics
                         .pagecache_stream_fill_stores
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    spawn_store_finalize(&state, &vhost_name, vec![target], &bytes, &content_type);
+                    if background {
+                        spawn_store_finalize(
+                            &state,
+                            &vhost_name,
+                            vec![target],
+                            &bytes,
+                            &content_type,
+                        );
+                    }
                 }
             }
         }
@@ -4615,28 +4671,69 @@ impl FillCommit {
     }
 }
 
-/// A page-cache miss served while the backend is still writing it. Each frame is forwarded
-/// as it arrives and copied aside; the copy is stored once the backend finishes cleanly. A
-/// backend error, an early drop (client gone) or a body past the object cap stores nothing,
-/// so a partial body can never become an entry.
-struct StreamFill {
-    inner: hj_core::StreamBody,
+/// Bytes of a streamed fill that may wait for a slow client. Past this the fill gives up
+/// its store and follows the client's pace, so a stalled reader pins a bounded amount.
+const FILL_QUEUE_MAX: u64 = 4 * 1024 * 1024;
+
+/// The identity copy of a streamed fill, taken by [`FillTap`] as the backend's frames pass.
+struct FillCopy {
     buf: Vec<u8>,
-    /// The fill budget charged for `buf`, held until the store is done.
+    /// Bytes of the encoded copy [`FillPump`] keeps, charged to the same lease.
+    encoded_len: u64,
+    /// The fill budget charged for both copies, held until the store is done.
     lease: Option<BodyBufferLease>,
     max_bytes: u64,
-    commit: Option<FillCommit>,
+    /// The body outgrew the object cap or the fill budget: nothing will be stored.
+    dead: bool,
 }
 
-impl StreamFill {
+impl FillCopy {
     fn abandon(&mut self) {
-        self.commit = None;
+        self.dead = true;
+        self.encoded_len = 0;
         hj_core::BODY_BUFS.give_buf(std::mem::take(&mut self.buf), hj_core::BODY_BUF_CAP);
         self.lease = None;
     }
+
+    /// Charge `more` bytes to the lease; false abandons the copy.
+    fn charge(&mut self, more: u64) -> bool {
+        if self.dead {
+            return false;
+        }
+        let need = self.buf.len() as u64 + self.encoded_len + more;
+        let fits = self.lease.as_mut().is_some_and(|lease| {
+            let held = lease.held();
+            need <= held || lease.reserve(need - held)
+        });
+        if !fits {
+            self.abandon();
+        }
+        fits
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        if (self.buf.len() + data.len()) as u64 > self.max_bytes {
+            if !self.dead {
+                self.abandon();
+            }
+        } else if self.charge(data.len() as u64) {
+            self.buf.extend_from_slice(data);
+        }
+    }
 }
 
-impl http_body::Body for StreamFill {
+fn fill_copy(copy: &std::sync::Mutex<FillCopy>) -> std::sync::MutexGuard<'_, FillCopy> {
+    copy.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The backend body of a streamed fill: each data frame is copied aside as it passes.
+struct FillTap {
+    inner: hj_core::StreamBody,
+    copy: Arc<std::sync::Mutex<FillCopy>>,
+}
+
+impl http_body::Body for FillTap {
     type Data = Bytes;
     type Error = hj_core::BoxError;
 
@@ -4644,48 +4741,197 @@ impl http_body::Body for StreamFill {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
-        use std::task::Poll;
         let this = self.get_mut();
         let polled = std::pin::Pin::new(&mut this.inner).poll_frame(cx);
-        match &polled {
-            Poll::Ready(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref()
-                    && this.commit.is_some()
-                {
-                    let need = (this.buf.len() + data.len()) as u64;
-                    let fits = this.lease.as_mut().is_some_and(|lease| {
-                        let held = lease.held();
-                        need <= held || lease.reserve(need - held)
-                    });
-                    if need > this.max_bytes || !fits {
-                        this.abandon();
-                    } else {
-                        this.buf.extend_from_slice(data);
-                    }
-                }
-            }
-            Poll::Ready(Some(Err(_))) => this.abandon(),
-            Poll::Ready(None) => {
-                if let Some(commit) = this.commit.take() {
-                    commit.finish(
-                        hj_core::BODY_BUFS
-                            .freeze(std::mem::take(&mut this.buf), hj_core::BODY_BUF_CAP),
-                        this.lease.take(),
-                    );
-                }
-            }
-            Poll::Pending => {}
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled
+            && let Some(data) = frame.data_ref()
+        {
+            fill_copy(&this.copy).push(data);
         }
         polled
     }
 
     fn is_end_stream(&self) -> bool {
-        // Not before the end-of-stream poll that commits the store.
-        self.commit.is_none() && self.inner.is_end_stream()
+        self.inner.is_end_stream()
     }
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// What a streamed fill has sent that its client has not read yet.
+struct FillQueue {
+    bytes: std::sync::atomic::AtomicU64,
+    lease: std::sync::Mutex<BodyBufferLease>,
+    drained: tokio::sync::Notify,
+}
+
+impl FillQueue {
+    fn lease(&self) -> std::sync::MutexGuard<'_, BodyBufferLease> {
+        self.lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn try_add(&self, n: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.bytes.load(Relaxed) + n > FILL_QUEUE_MAX || !self.lease().reserve(n) {
+            return false;
+        }
+        self.bytes.fetch_add(n, Relaxed);
+        true
+    }
+
+    fn took(&self, n: u64) {
+        self.lease().release(n);
+        self.bytes
+            .fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        self.drained.notify_one();
+    }
+}
+
+/// A frame for the client and the bytes it holds in the [`FillQueue`]: none for a frame
+/// sent past the queue's bound, to a client that had nothing else waiting.
+type FillFrame = (Result<http_body::Frame<Bytes>, hj_core::BoxError>, u64);
+
+/// A page-cache miss served while the backend is still writing it. The pump reads the
+/// backend at the backend's pace on its own task, queues each frame for the client and
+/// stores the body when the backend finishes, so a slow or departed client neither holds
+/// the single-flight leader nor keeps the backend waiting. A backend error or a
+/// body past the object cap stores nothing, so a partial body can never become an entry.
+struct FillPump {
+    /// [`FillTap`] over the backend, behind the egress encoder when `encoded` is kept.
+    source: hj_core::StreamBody,
+    copy: Arc<std::sync::Mutex<FillCopy>>,
+    /// The frames as sent, when the fill makes the egress encode itself.
+    encoded: Option<Vec<u8>>,
+    commit: Option<FillCommit>,
+    tx: tokio::sync::mpsc::UnboundedSender<FillFrame>,
+    queue: Arc<FillQueue>,
+}
+
+impl FillPump {
+    fn abandon(&mut self) {
+        self.commit = None;
+        self.encoded = None;
+        fill_copy(&self.copy).abandon();
+    }
+
+    async fn run(mut self) {
+        loop {
+            let frame = match self.source.frame().await {
+                Some(Ok(frame)) => frame,
+                Some(Err(e)) => {
+                    self.abandon();
+                    let _ = self.tx.send((Err(e), 0));
+                    return;
+                }
+                None => break,
+            };
+            if self.commit.is_some() {
+                let kept = match (&mut self.encoded, frame.data_ref()) {
+                    (Some(encoded), Some(data)) => {
+                        let mut copy = fill_copy(&self.copy);
+                        let kept = copy.charge(data.len() as u64);
+                        if kept {
+                            copy.encoded_len += data.len() as u64;
+                            encoded.extend_from_slice(data);
+                        }
+                        kept
+                    }
+                    _ => !fill_copy(&self.copy).dead,
+                };
+                if !kept {
+                    self.abandon();
+                }
+            }
+            if !self.forward(frame).await {
+                return;
+            }
+        }
+        let FillPump {
+            copy,
+            encoded,
+            commit,
+            tx,
+            ..
+        } = self;
+        // The client's end-of-stream does not wait for the tmpfs write.
+        drop(tx);
+        let Some(commit) = commit else { return };
+        let (bytes, lease) = {
+            let mut copy = fill_copy(&copy);
+            if copy.dead {
+                return;
+            }
+            (
+                hj_core::BODY_BUFS.freeze(std::mem::take(&mut copy.buf), hj_core::BODY_BUF_CAP),
+                copy.lease.take(),
+            )
+        };
+        commit.store(bytes, encoded.map(Bytes::from));
+        drop(lease);
+    }
+
+    /// Queue `frame` for the client; false once there is neither a client nor a store
+    /// left to read the backend for.
+    async fn forward(&mut self, frame: http_body::Frame<Bytes>) -> bool {
+        let len = frame.data_ref().map_or(0, |data| data.len() as u64);
+        let mut queued = 0;
+        if !self.tx.is_closed() {
+            if self.queue.try_add(len) {
+                queued = len;
+            } else {
+                // The client is behind by the whole queue: stop holding the leader for it
+                // and follow its pace, as an unstored stream does.
+                self.abandon();
+                loop {
+                    let drained = self.queue.drained.notified();
+                    if self.queue.try_add(len) {
+                        queued = len;
+                        break;
+                    }
+                    if self.queue.bytes.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = drained => {}
+                        _ = self.tx.closed() => break,
+                    }
+                }
+            }
+        }
+        if let Err(unsent) = self.tx.send((Ok(frame), queued)) {
+            self.queue.took(unsent.0.1);
+            // The client left. The render still completes for the store.
+            return self.commit.is_some();
+        }
+        true
+    }
+}
+
+/// The client's side of a streamed fill: the frames [`FillPump`] queued.
+struct FillReader {
+    rx: tokio::sync::mpsc::UnboundedReceiver<FillFrame>,
+    queue: Arc<FillQueue>,
+}
+
+impl http_body::Body for FillReader {
+    type Data = Bytes;
+    type Error = hj_core::BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        this.rx.poll_recv(cx).map(|item| {
+            item.map(|(frame, queued)| {
+                this.queue.took(queued);
+                frame
+            })
+        })
     }
 }
 
@@ -4811,6 +5057,24 @@ const COLLECT_PRESIZE_CAP: u64 = 1 << 20;
 /// Starting capacity when no length is declared.
 const COLLECT_DEFAULT_CAPACITY: usize = 64 * 1024;
 
+async fn blocking_file_fill(
+    lease: BodyBufferLease,
+    read: impl FnOnce() -> (Option<Bytes>, hj_core::FileBody) + Send + 'static,
+) -> Collected {
+    match tokio::task::spawn_blocking(move || {
+        let (bytes, file) = read();
+        // Keep the reservation coupled to the worker and then its output even
+        // if the awaiting request disappears before the read finishes.
+        (bytes, file, lease)
+    })
+    .await
+    {
+        Ok((Some(bytes), _, lease)) => Collected::Buffered(bytes, Some(lease)),
+        Ok((None, file, _)) => Collected::Passthrough(Body::File(file)),
+        Err(_) => Collected::Error,
+    }
+}
+
 /// Every byte a fill allocates is reserved from the server-wide body budget first
 /// (`budget`), so concurrent misses cannot materialize unbounded memory before the
 /// admission check; without room the body is served through uncached.
@@ -4841,7 +5105,7 @@ async fn collect_body(
             if !lease.reserve(len) {
                 return Collected::Passthrough(Body::File(f));
             }
-            match tokio::task::spawn_blocking(move || {
+            blocking_file_fill(lease, move || {
                 if f.file.is_none() {
                     match std::fs::File::open(&f.path) {
                         Ok(file) => f.file = Some(file),
@@ -4857,11 +5121,6 @@ async fn collect_body(
                 (bytes, f)
             })
             .await
-            {
-                Ok((Some(bytes), _)) => Collected::Buffered(bytes, Some(lease)),
-                Ok((None, f)) => Collected::Passthrough(Body::File(f)),
-                Err(_) => Collected::Error,
-            }
         }
         Body::Stream(mut s) => {
             let mut lease = BodyBufferLease::new(budget.clone());
@@ -4921,6 +5180,52 @@ fn error_502() -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_file_fill_keeps_its_budget_until_the_worker_finishes() {
+        use super::*;
+        let budget = Arc::new(BodyBufferBudget::new(256));
+        let mut lease = BodyBufferLease::new(budget.clone());
+        assert!(lease.reserve(128));
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let file = hj_core::FileBody {
+            path: std::path::PathBuf::from("unused-fixture"),
+            file: None,
+            len: 128,
+            range: None,
+            cached: None,
+        };
+        let task = tokio::spawn(blocking_file_fill(lease, move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            (Some(Bytes::from(vec![7u8; 128])), file)
+        }));
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.is_err());
+        assert_eq!(
+            budget.in_flight(),
+            128,
+            "the detached read still owns its reservation"
+        );
+        release_tx.send(()).unwrap();
+        for _ in 0..500 {
+            if budget.in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            budget.in_flight(),
+            0,
+            "the abandoned worker output releases once"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -6692,13 +6997,13 @@ mod tests {
         ));
     }
 
-    /// A streamed miss that errors, is dropped by the client, or outgrows the object cap is
-    /// never stored, and its leader is released so followers render for themselves.
+    /// A streamed miss that errors or outgrows the object cap is never stored, and its
+    /// leader is released so followers render for themselves.
     #[tokio::test]
     async fn cut_short_or_oversized_streamed_miss_stores_nothing() {
         let (state, ctx, store) = stream_fill_ctx();
         let method = Method::GET;
-        for (path, case) in [("/err", 0), ("/drop", 1), ("/big", 2)] {
+        for (path, case) in [("/err", 0), ("/big", 2)] {
             let identity = format!("https\nforum.example\n{path}");
             let cc = page_cc(&method, path, &identity, store.purge_epoch());
             let CacheOutcome::Miss(key_hash) = cache_lookup(&state, &ctx, &cc, None, false, None)
@@ -6720,7 +7025,6 @@ mod tests {
                     feed.send(Err("backend died".into())).unwrap();
                     assert!(matches!(body.frame().await, Some(Err(_))));
                 }
-                1 => drop(body),
                 _ => {
                     let big = Bytes::from(vec![b'x'; 100]);
                     feed.send(Ok(big.clone())).unwrap();
@@ -6799,6 +7103,236 @@ mod tests {
             ),
             "a body rendered before the purge must not be stored"
         );
+    }
+
+    /// The leading streamed miss of `path`: its key hash, the backend feed and the response.
+    async fn leading_stream(
+        state: &Arc<ServerState>,
+        ctx: &ReqCtx,
+        cc: &CacheCtx<'_>,
+    ) -> (u64, Feed, Response) {
+        let CacheOutcome::Miss(key_hash) = cache_lookup(state, ctx, cc, None, false, None) else {
+            panic!("first request misses");
+        };
+        let Enter::Leader(guard) = state.page_cache_inflight.enter(key_hash, 0) else {
+            panic!("first misser leads");
+        };
+        let (feed, resp) = fed_page(None);
+        let resp = cache_store_leading(state, ctx, cc, resp, &mut Some(guard)).await;
+        (key_hash, feed, resp)
+    }
+
+    /// Regression: the fill follows the backend, not the client. A client that has
+    /// read nothing neither delays the store nor keeps followers waiting, and it still gets
+    /// the whole body afterwards.
+    #[tokio::test]
+    async fn stalled_reader_does_not_hold_the_streamed_store() {
+        let (state, ctx, store) = stream_fill_ctx();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/stalled".to_string();
+        let cc = page_cc(&method, "/stalled", &identity, store.purge_epoch());
+        let (key_hash, feed, resp) = leading_stream(&state, &ctx, &cc).await;
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a no-Content-Length miss streams");
+        };
+        let Enter::Follower(follower) = state.page_cache_inflight.enter(key_hash, 0) else {
+            panic!("the render is in flight");
+        };
+        feed.send(Ok(Bytes::from_static(b"<head>"))).unwrap();
+        feed.send(Ok(Bytes::from_static(b"<body>"))).unwrap();
+        drop(feed);
+
+        tokio::time::timeout(Duration::from_secs(5), follower.wait())
+            .await
+            .expect("the store does not wait for the client");
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("stored while the client had read nothing");
+        };
+        assert!(matches!(hit.into_body(), Body::Full(b) if &b[..] == b"<head><body>"));
+
+        assert_eq!(next_data(&mut body).await.unwrap(), "<head>");
+        assert_eq!(next_data(&mut body).await.unwrap(), "<body>");
+        assert!(next_data(&mut body).await.is_none());
+        assert_eq!(state.body_budget.in_flight(), 0, "every lease is returned");
+    }
+
+    /// A client that leaves mid-body does not waste the render: the backend is read to its
+    /// end and the page is stored for the next request.
+    #[tokio::test]
+    async fn streamed_miss_is_stored_after_its_client_left() {
+        let (state, ctx, store) = stream_fill_ctx();
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/left".to_string();
+        let cc = page_cc(&method, "/left", &identity, store.purge_epoch());
+        let (key_hash, feed, resp) = leading_stream(&state, &ctx, &cc).await;
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a no-Content-Length miss streams");
+        };
+        feed.send(Ok(Bytes::from_static(b"<head>"))).unwrap();
+        assert_eq!(next_data(&mut body).await.unwrap(), "<head>");
+        drop(body);
+        let Enter::Follower(follower) = state.page_cache_inflight.enter(key_hash, 0) else {
+            panic!("the render is still in flight");
+        };
+        feed.send(Ok(Bytes::from_static(b"<body>"))).unwrap();
+        drop(feed);
+        tokio::time::timeout(Duration::from_secs(5), follower.wait())
+            .await
+            .expect("the backend's end releases the leader");
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("the finished render is stored");
+        };
+        assert!(matches!(hit.into_body(), Body::Full(b) if &b[..] == b"<head><body>"));
+        assert_eq!(state.body_budget.in_flight(), 0, "every lease is returned");
+    }
+
+    /// A client further behind than the queue bound costs the fill its store, not memory:
+    /// the leader is released, the backend is then read at the client's pace, and the
+    /// client still gets every byte.
+    #[tokio::test]
+    async fn reader_behind_by_the_whole_queue_ends_the_store_and_is_paced() {
+        let (state, ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                cfg.stream_fill_vhosts = vec!["forum.example".into()];
+            });
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/behind".to_string();
+        let cc = page_cc(&method, "/behind", &identity, store.purge_epoch());
+        let (key_hash, feed, resp) = leading_stream(&state, &ctx, &cc).await;
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a no-Content-Length miss streams");
+        };
+        let frame = Bytes::from(vec![b'q'; 1024 * 1024]);
+        let frames = FILL_QUEUE_MAX as usize / frame.len() + 3;
+        for _ in 0..frames {
+            feed.send(Ok(frame.clone())).unwrap();
+        }
+        drop(feed);
+
+        let mut released = false;
+        for _ in 0..200 {
+            if let Enter::Leader(_) = state.page_cache_inflight.enter(key_hash, 0) {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(released, "the stalled client no longer holds the leader");
+        assert!(
+            state.body_budget.in_flight() <= FILL_QUEUE_MAX,
+            "only the bounded queue is held: {}",
+            state.body_budget.in_flight()
+        );
+
+        for _ in 0..frames {
+            assert_eq!(next_data(&mut body).await.unwrap().len(), frame.len());
+        }
+        assert!(next_data(&mut body).await.is_none());
+        assert!(matches!(
+            cache_lookup(&state, &ctx, &cc, None, false, None),
+            CacheOutcome::Miss(_)
+        ));
+        assert_eq!(state.body_budget.in_flight(), 0, "every lease is returned");
+    }
+
+    /// On an egress-at-rest vhost a streamed miss served as zstd is encoded once: the
+    /// frames the client got are the stored body, a zstd hit replays them, and any other
+    /// client gets the identity back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_fill_stores_the_zstd_stream_it_sent() {
+        let (base, mut ctx, store) =
+            cache_test_ctx_with(crate::state::XfCapsuleConfig::disabled(), |cfg| {
+                cfg.stream_fill_vhosts = vec!["forum.example".into()];
+                cfg.egress_at_rest_vhosts = vec!["forum.example".into()];
+            });
+        let registry = hj_compress::PageDictRegistry::new(std::collections::HashMap::new(), None)
+            .with_plain(3);
+        let state = ServerState::new(
+            base.server.clone(),
+            None,
+            None,
+            Some(store.clone()),
+            Arc::new(registry),
+            1,
+            crate::state::XfCapsuleConfig::disabled(),
+            None,
+            false,
+            None,
+            false,
+            crate::state::RewriteTuning::default(),
+        )
+        .unwrap();
+        let plain_ctx = ctx.clone();
+        ctx.env
+            .push((hj_compress::ACCEPT_ENCODING_ENV.into(), "zstd".into()));
+        let method = Method::GET;
+        let identity = "https\nforum.example\n/moon-zstd".to_string();
+        let cc = page_cc(&method, "/moon-zstd", &identity, store.purge_epoch());
+        let (key_hash, feed, resp) = leading_stream(&state, &ctx, &cc).await;
+        assert_eq!(resp.headers()[CONTENT_ENCODING], "zstd");
+        assert!(resp.headers().get(CONTENT_LENGTH).is_none());
+        assert!(
+            state.compress.should_compress(&resp, "zstd").is_none(),
+            "the transform leaves the encoded stream alone"
+        );
+        let Body::Stream(mut body) = resp.into_body() else {
+            panic!("a no-Content-Length miss streams");
+        };
+        let Enter::Follower(follower) = state.page_cache_inflight.enter(key_hash, 0) else {
+            panic!("the render is in flight");
+        };
+
+        let head = DICT_CORPUS.repeat(2);
+        let rest = DICT_CORPUS.repeat(6);
+        let page = [head.as_slice(), rest.as_slice()].concat();
+        feed.send(Ok(Bytes::from(head.clone()))).unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(5), next_data(&mut body))
+            .await
+            .expect("the head goes out while the backend is still writing")
+            .unwrap();
+        let mut sent = first.to_vec();
+        feed.send(Ok(Bytes::from(rest))).unwrap();
+        drop(feed);
+        while let Some(data) = next_data(&mut body).await {
+            sent.extend_from_slice(&data);
+        }
+        assert_eq!(zstd::decode_all(sent.as_slice()).unwrap(), page);
+
+        tokio::time::timeout(Duration::from_secs(5), follower.wait())
+            .await
+            .expect("the leader is released after the store");
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &ctx, &cc, None, false, None) else {
+            panic!("the streamed page is stored");
+        };
+        assert_eq!(hit.headers()[CONTENT_ENCODING], "zstd");
+        let replay = crate::uring::bridge::buffer_body(hit.into_body()).await.0;
+        assert_eq!(
+            replay.as_ref(),
+            sent.as_slice(),
+            "the stored body is what went out"
+        );
+
+        let CacheOutcome::Hit(hit) = cache_lookup(&state, &plain_ctx, &cc, None, false, None)
+        else {
+            panic!("the entry serves every client");
+        };
+        assert!(!hit.headers().contains_key(CONTENT_ENCODING));
+        assert_eq!(
+            hit.headers().get(ETAG).unwrap(),
+            hit::weak_etag(&page).as_str(),
+            "the validator is the identity body's"
+        );
+        let got = crate::uring::bridge::buffer_body(hit.into_body()).await.0;
+        assert_eq!(got.as_ref(), page.as_slice(), "an identity hit decodes it");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let queued = state
+            .page_cache_dict_metrics
+            .get("forum.example")
+            .map(|m| m.queued.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(0);
+        assert_eq!(queued, 0, "no second encode in the background");
+        assert_eq!(state.body_budget.in_flight(), 0, "every lease is returned");
     }
 
     /// Framed (Content-Length) bodies and vhosts without the opt-in keep the buffered miss.
