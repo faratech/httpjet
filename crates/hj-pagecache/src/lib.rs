@@ -34,11 +34,11 @@ pub mod urlvary;
 
 pub use admission::AdmissionFilter;
 pub use classify::{Disposition, classify_response};
-pub use diskstore::key_hash;
+pub use diskstore::{key_hash, key_hash_ref};
 pub use key::{
-    PageCacheKey, PhpCookieName, QsStrip, compute_vary_value, compute_vary_value_with_defaults,
-    normalize_query, php_cookie_lookup, php_cookie_name, php_cookie_name_eq, php_trim,
-    public_with_vary, vary_value_from_request,
+    PageCacheKey, PageCacheKeyRef, PhpCookieName, QsStrip, compute_vary_value,
+    compute_vary_value_with_defaults, normalize_query, php_cookie_lookup, php_cookie_name,
+    php_cookie_name_eq, php_trim, public_with_vary, vary_value_from_request,
 };
 pub use proto::{
     LsCacheControl, Purge, StdCacheControl, parse_lscache_control, parse_purge,

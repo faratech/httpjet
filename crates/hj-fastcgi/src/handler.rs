@@ -375,12 +375,15 @@ async fn write_head(
     params: &[Bytes],
     timeout: Duration,
 ) -> Result<(), HandlerError> {
+    let begin = begin_request(REQUEST_ID, false).expect("constant request id");
+    let total = begin.len() + params.iter().map(Bytes::len).sum::<usize>();
+    let mut buf = BytesMut::with_capacity(total);
+    buf.extend_from_slice(&begin);
+    for record in params {
+        buf.extend_from_slice(record);
+    }
     let operation = async {
-        conn.write_all(&begin_request(REQUEST_ID, false).expect("constant request id"))
-            .await?;
-        for record in params {
-            conn.write_all(record).await?;
-        }
+        conn.write_all(&buf).await?;
         conn.flush().await
     };
     tokio::time::timeout(timeout, operation)
@@ -396,19 +399,25 @@ async fn write_request(
     keep_conn: bool,
     timeout: Duration,
 ) -> Result<(), HandlerError> {
+    let begin = begin_request(REQUEST_ID, keep_conn).expect("constant request id");
+    let stdin_recs =
+        encode_stream(RecordType::Stdin, REQUEST_ID, body).expect("bounded request id and chunks");
+    let end = end_stream(RecordType::Stdin, REQUEST_ID).expect("constant request id");
+    let total = begin.len()
+        + params.iter().map(Bytes::len).sum::<usize>()
+        + stdin_recs.iter().map(Bytes::len).sum::<usize>()
+        + end.len();
+    let mut buf = BytesMut::with_capacity(total);
+    buf.extend_from_slice(&begin);
+    for record in params {
+        buf.extend_from_slice(record);
+    }
+    for record in &stdin_recs {
+        buf.extend_from_slice(record);
+    }
+    buf.extend_from_slice(&end);
     let operation = async {
-        conn.write_all(&begin_request(REQUEST_ID, keep_conn).expect("constant request id"))
-            .await?;
-        for record in params {
-            conn.write_all(record).await?;
-        }
-        for record in encode_stream(RecordType::Stdin, REQUEST_ID, body)
-            .expect("bounded request id and chunks")
-        {
-            conn.write_all(&record).await?;
-        }
-        conn.write_all(&end_stream(RecordType::Stdin, REQUEST_ID).expect("constant request id"))
-            .await?;
+        conn.write_all(&buf).await?;
         conn.flush().await
     };
     tokio::time::timeout(timeout, operation)
@@ -654,7 +663,11 @@ async fn pump_response(
                         if app_status != 0 {
                             tracing::warn!(target: "hj_fastcgi", app_status, "FastCGI application returned nonzero status");
                         }
-                        conn.finish_clean().await;
+                        // Only return the socket to the pool when no unread trailing
+                        // bytes remain buffered after END_REQUEST.
+                        if wire.is_empty() {
+                            conn.finish_clean().await;
+                        }
                         clean = true;
                     }
                     _ => clean = false,

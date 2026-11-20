@@ -135,16 +135,17 @@ impl CoreHandler {
     async fn dispatch_h1(
         &self,
         state: Arc<ServerState>,
-        mut ctx: BridgeCtx,
+        ctx: &BridgeCtx,
         req: hj_core::Request,
         upgrade: bool,
     ) -> Option<bridge::BridgeResp> {
-        if !upgrade && let Some(response) = self.fast(&state, &ctx, &req).await {
+        if !upgrade && let Some(response) = self.fast(&state, ctx, &req).await {
             return Some(bridge::fast_response(response, ctx.direct_file_egress).await);
         }
         // Only a request that crosses to the Tokio runtime carries its selected
         // generation. Keep it in the bridge sideband so ordinary misses do not
         // allocate and hash an `http::Extensions` map.
+        let mut ctx = ctx.clone();
         ctx.request_generation = Some(RequestGeneration(state));
         #[cfg(feature = "otel")]
         crate::otel::execution_path(false);
@@ -201,7 +202,7 @@ impl CoreHandler {
         // Stamp Date here (insert-if-absent): the page cache strips the stored Date
         // expecting the serve boundary to re-add one, and the uring writers never do — the
         // tokio path stamps at server::stamp_date, this is its on-core fast-path twin.
-        crate::pipeline::fast_serve(
+        crate::pipeline::fast_serve_uring(
             st,
             listener_name,
             ctx.peer.ip(),
@@ -211,7 +212,7 @@ impl CoreHandler {
             ctx.client_auth_requested,
             ctx.peer_unix,
             ctx.proto,
-            ctx.tls.clone(),
+            ctx.tls.as_ref(),
             req,
         )
         .await
@@ -407,6 +408,16 @@ async fn accept_drain_loop<F, Fut>(
             crate::pipeline::flush_access_chunks();
         });
     }
+    // Configure TCP_NODELAY, SO_KEEPALIVE (+ idle/interval), and TCP_USER_TIMEOUT
+    // once on the listening socket so the Linux kernel copies them into every
+    // accepted socket via `sk_clone_lock` (5 fewer setsockopt syscalls per conn).
+    // Falls back to per-connection setup if any setsockopt fails, and re-applies
+    // TCP_USER_TIMEOUT per connection only when SIGHUP changes it.
+    let initial_user_timeout = tcp_user_timeout(&core.holder.load());
+    let listener_opts_ok = configure_listener_tcp_options(
+        std::os::fd::AsRawFd::as_raw_fd(&listener),
+        initial_user_timeout,
+    );
     // (#334) One armed multishot SQE yields every inbound connection (no accept
     // submission per conn; peer addr via getpeername since multishot CQEs carry
     // no sockaddr). A terminal CQE re-arms once; if arming fails the loop falls
@@ -485,26 +496,27 @@ async fn accept_drain_loop<F, Fut>(
                             tracing::debug!(core = core_idx, secure, limit = cap, "uring connection cap reached; rejecting");
                             continue;
                         };
-                        // Disable Nagle, mirroring the tokio accept path (server.rs). monoio
-                        // leaves TCP_NODELAY OFF by default, which stalls h1 request/response on
-                        // mid-size bodies behind the peer's ~40 ms delayed ACK. The option is
-                        // TCP-level and persists across the kTLS TCP_ULP upgrade on this fd.
-                        let _ = stream.set_nodelay(true);
-                        // Keepalive persists across an h1->WebSocket upgrade (same fd), so a
-                        // relay whose client peer silently vanishes is reaped instead of parking
-                        // its read forever. The tokio accept path armed this until server.rs was
-                        // removed; the systemd listener sets KeepAlive=no, so nothing is
-                        // inherited. Probe count stays at the OS default.
-                        let _ = stream.set_tcp_keepalive(
-                            Some(hj_proxy::PROXY_KEEPALIVE_IDLE),
-                            Some(hj_proxy::PROXY_KEEPALIVE_INTERVAL),
-                            None,
-                        );
-                        // Keepalive only covers an idle peer. A peer that stops reading
-                        // while we have data in flight (zero-window probes forever) would
-                        // otherwise park a write — and every response it pins — with no
-                        // timer able to fire; the kernel aborts it after this bound.
-                        let _ = stream.set_tcp_user_timeout(Some(tcp_user_timeout(&state)));
+                        if !listener_opts_ok {
+                            // Disable Nagle, mirroring the tokio accept path (server.rs). monoio
+                            // leaves TCP_NODELAY OFF by default, which stalls h1 request/response on
+                            // mid-size bodies behind the peer's ~40 ms delayed ACK. The option is
+                            // TCP-level and persists across the kTLS TCP_ULP upgrade on this fd.
+                            let _ = stream.set_nodelay(true);
+                            // Keepalive persists across an h1->WebSocket upgrade (same fd), so a
+                            // relay whose client peer silently vanishes is reaped instead of parking
+                            // its read forever.
+                            let _ = stream.set_tcp_keepalive(
+                                Some(hj_proxy::PROXY_KEEPALIVE_IDLE),
+                                Some(hj_proxy::PROXY_KEEPALIVE_INTERVAL),
+                                None,
+                            );
+                            let _ = stream.set_tcp_user_timeout(Some(tcp_user_timeout(&state)));
+                        } else {
+                            let want_timeout = tcp_user_timeout(&state);
+                            if want_timeout != initial_user_timeout {
+                                let _ = stream.set_tcp_user_timeout(Some(want_timeout));
+                            }
+                        }
                         let fut = on_accept(stream, peer);
                         let cnt = inflight.clone();
                         cnt.set(cnt.get() + 1);
@@ -2096,7 +2108,10 @@ async fn handle_h1_bridged<S>(
                 biased;
                 res = read_timeout(&mut stream, keep_alive_timeout, &mut read_scratch) => {
                     match res {
-                        Ok(n) if n > 0 => acc.extend_from_slice(&read_scratch[..n]),
+                        Ok(n) if n > 0 => {
+                            read_scratch.truncate(n);
+                            std::mem::swap(&mut acc, &mut read_scratch);
+                        }
                         Ok(_) => {
                             core.holder.load().metrics.h1_peer_closes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             end.set(if served == 0 {
@@ -2135,8 +2150,10 @@ async fn handle_h1_bridged<S>(
         let max_body = state.serve_config.max_req_body_size;
         // maxKeepAliveReq: close the connection after N requests (0 and 1 disable keep-alive).
         let max_keepalive = state.serve_config.max_keepalive_requests;
+        let default_bw_rate = state.serve_config.bandwidth_limit;
+        let request_body_ceiling = state.serve_config.request_body_ceiling;
         // Parse a complete request head (drops the borrow before mutating `acc`).
-        let request_start = std::time::Instant::now();
+        let mut request_start: Option<std::time::Instant> = None;
         let header_read_timeout = state.serve_config.header_read_timeout;
         let parsed = loop {
             let step: ParsedReq = {
@@ -2164,6 +2181,7 @@ async fn handle_h1_bridged<S>(
                     keep_alive,
                     expect_continue,
                     http10,
+                    has_upgrade,
                 } => {
                     break (
                         method,
@@ -2174,6 +2192,7 @@ async fn handle_h1_bridged<S>(
                         keep_alive,
                         expect_continue,
                         http10,
+                        has_upgrade,
                     );
                 }
                 ParsedReq::Bad => {
@@ -2214,7 +2233,8 @@ async fn handle_h1_bridged<S>(
                         .await;
                         return;
                     }
-                    let elapsed = request_start.elapsed();
+                    let started = *request_start.get_or_insert_with(std::time::Instant::now);
+                    let elapsed = started.elapsed();
                     let remaining = header_read_timeout.map(|d| d.saturating_sub(elapsed));
                     if let Some(r) = remaining {
                         if r.is_zero() {
@@ -2259,16 +2279,11 @@ async fn handle_h1_bridged<S>(
             mut keep_alive,
             expect_continue,
             http10,
+            has_upgrade,
         ) = parsed;
-        // The body gets `connTimeout` from here. Restarting it on every read would let a
-        // slow client retain a connection and body-budget lease indefinitely by trickling
-        // data, so only BODY_MIN_PROGRESS per window extends it, up to the ceiling (#509,
-        // #1035).
-        let mut body_deadline = H1BodyDeadline::start(
-            header_read_timeout,
-            state.serve_config.request_body_ceiling,
-            acc.len(),
-        );
+        // Lazily initialized only when a body actually requires another socket read
+        // (avoids an Instant::now() vDSO call on every bodiless GET/HEAD request).
+        let mut body_deadline: Option<Option<H1BodyDeadline>> = None;
         // maxKeepAliveReq: once this connection has served the configured number of requests,
         // signal close on this (final) response so the client opens a fresh connection.
         let client_close = !keep_alive;
@@ -2392,16 +2407,19 @@ async fn handle_h1_bridged<S>(
                     }
                 }
                 while acc.len() < total {
+                    let dl = body_deadline.get_or_insert_with(|| {
+                        H1BodyDeadline::start(header_read_timeout, request_body_ceiling, acc.len())
+                    });
                     match read_before_deadline(
                         &mut stream,
-                        body_deadline.as_ref().map(|d| d.deadline),
+                        dl.as_ref().map(|d| d.deadline),
                         &mut read_scratch,
                     )
                     .await
                     {
                         Ok(n) if n > 0 => {
                             acc.extend_from_slice(&read_scratch[..n]);
-                            if let Some(deadline) = body_deadline.as_mut() {
+                            if let Some(deadline) = dl.as_mut() {
                                 deadline.received(acc.len());
                             }
                             // Top the reservation up to the bytes actually buffered.
@@ -2498,16 +2516,23 @@ async fn handle_h1_bridged<S>(
                             return;
                         }
                         ChunkStep::NeedMore => {
+                            let dl = body_deadline.get_or_insert_with(|| {
+                                H1BodyDeadline::start(
+                                    header_read_timeout,
+                                    request_body_ceiling,
+                                    acc.len(),
+                                )
+                            });
                             match read_before_deadline(
                                 &mut stream,
-                                body_deadline.as_ref().map(|d| d.deadline),
+                                dl.as_ref().map(|d| d.deadline),
                                 &mut read_scratch,
                             )
                             .await
                             {
                                 Ok(n) if n > 0 => {
                                     acc.extend_from_slice(&read_scratch[..n]);
-                                    if let Some(deadline) = body_deadline.as_mut() {
+                                    if let Some(deadline) = dl.as_mut() {
                                         deadline.received(acc.len());
                                     }
                                 }
@@ -2603,14 +2628,14 @@ async fn handle_h1_bridged<S>(
             req.headers_mut().remove(http::header::UPGRADE);
         }
         let mut upgrade_ready = None;
-        if !http10 && hj_proxy::is_websocket_upgrade(req.headers()) {
+        if !http10 && has_upgrade && hj_proxy::is_websocket_upgrade(req.headers()) {
             let (upgrade, ready) = bridge::UringUpgradeRequest::channel();
             req.extensions_mut().insert(upgrade);
             upgrade_ready = Some(ready);
         }
         #[cfg(feature = "otel")]
         let mut trace = core.trace_request(&state, &ctx, &mut req);
-        let dispatch = core.dispatch_h1(state, ctx.clone(), req, upgrade_ready.is_some());
+        let dispatch = core.dispatch_h1(state, &ctx, req, upgrade_ready.is_some());
         #[cfg(feature = "otel")]
         let response = match &trace {
             Some(trace) => crate::otel::in_context(trace.context(), dispatch).await,
@@ -2656,9 +2681,7 @@ async fn handle_h1_bridged<S>(
         // Full → paced 64 KiB slices when a rate is configured, else one vectored
         // head/body write; Stream → head then drained (paced) chunks. A context
         // bandwidthLimit wins over the connection-wide tuning rate.
-        let want_rate = resp
-            .bw_rate
-            .unwrap_or_else(|| core.holder.load().serve_config.bandwidth_limit);
+        let want_rate = resp.bw_rate.unwrap_or(default_bw_rate);
         if throttle.as_ref().is_none_or(|t| t.rate_bps() != want_rate) {
             throttle = hj_http::BandwidthThrottle::new(want_rate);
         }
@@ -2719,6 +2742,8 @@ enum ParsedReq {
         /// The request line said HTTP/1.0: no 1xx interim responses and no
         /// Transfer-Encoding may be sent back (RFC 9110 §15.2, RFC 9112 §6.1).
         http10: bool,
+        /// Request carried an `Upgrade` header (gates `is_websocket_upgrade`).
+        has_upgrade: bool,
     },
     Partial,
     Bad,
@@ -2760,10 +2785,13 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
     };
     let mut host_value: Option<&[u8]> = None;
     let mut hdr_map = http::HeaderMap::with_capacity(req.headers.len());
-    let mut cl_values: Vec<&[u8]> = Vec::new();
+    let mut cl_inline: [&[u8]; 2] = [&[], &[]];
+    let mut cl_inline_len = 0usize;
+    let mut cl_overflow: Vec<&[u8]> = Vec::new();
     let mut chunked = false;
     let mut te_other = false;
     let mut host_count = 0usize;
+    let mut cookie_count = 0usize;
     let mut conn_close = req.version == Some(0);
     // RFC 9112 §9.6: once any `close` option is present the connection closes, whatever
     // else the Connection field(s) carry.
@@ -2772,27 +2800,37 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
     // sending an interim 100 before reading the body, so a client that
     // withholds the body pending it isn't stalled to the header timeout.
     let mut expect_continue = false;
+    let mut has_upgrade = false;
     for h in req.headers.iter() {
-        if h.name.eq_ignore_ascii_case("expect") {
+        let Ok(n) = http::HeaderName::from_bytes(h.name.as_bytes()) else {
+            continue;
+        };
+        if n == http::header::EXPECT {
             expect_continue = req.version == Some(1) && expect_is_100_continue(h.value);
-        }
-        if h.name.eq_ignore_ascii_case("content-length") {
-            cl_values.push(h.value);
-        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+        } else if n == http::header::UPGRADE {
+            has_upgrade = true;
+        } else if n == http::header::CONTENT_LENGTH {
+            if let Some(slot) = cl_inline.get_mut(cl_inline_len) {
+                *slot = h.value;
+                cl_inline_len += 1;
+            } else {
+                cl_overflow.push(h.value);
+            }
+        } else if n == http::header::TRANSFER_ENCODING {
             // We frame the body ourselves; Transfer-Encoding is hop-by-hop and
             // is never forwarded downstream. Only a lone `chunked` is framable
             // here — any other coding (or a non-final/compound TE) we cannot
             // length-frame, so flag it for rejection rather than guess.
-            if te_is_chunked(h.value) {
+            if te_is_chunked(h.value) && !chunked {
                 chunked = true;
             } else {
                 te_other = true;
             }
             continue;
-        } else if h.name.eq_ignore_ascii_case("host") {
+        } else if n == http::header::HOST {
             host_count += 1;
             host_value.get_or_insert(h.value);
-        } else if h.name.eq_ignore_ascii_case("connection") {
+        } else if n == http::header::CONNECTION {
             // RFC 7230 §6.1: Connection is a comma-separated token list
             // (e.g. `close, Upgrade`). Match each token, not the whole
             // value — a whole-value compare misses `close` in a multi-token
@@ -2807,10 +2845,7 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
                 }
             }
         }
-        if let (Ok(n), Ok(v)) = (
-            http::HeaderName::from_bytes(h.name.as_bytes()),
-            http::HeaderValue::from_bytes(h.value),
-        ) {
+        if let Ok(v) = http::HeaderValue::from_bytes(h.value) {
             // Identical duplicate CL lines (the only duplicates the framing
             // check accepts) are forwarded as ONE so a lenient upstream cannot
             // re-parse two lines differently; conflicting duplicates are
@@ -2820,12 +2855,17 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
             {
                 continue;
             }
+            if n == http::header::COOKIE {
+                cookie_count += 1;
+            }
             hdr_map.append(n, v);
         }
     }
     // One Cookie view for every consumer, as on H2/H3: lsphp builds `$_COOKIE` from a
     // last-wins header slot, while the cache key would parse a joined view (#671).
-    hj_core::coalesce_cookie_crumbs(&mut hdr_map);
+    if cookie_count > 1 {
+        hj_core::coalesce_cookie_crumbs(&mut hdr_map);
+    }
     // RFC 7230 §3.3.3: reject smuggling-prone framing — both TE and CL present,
     // a non-chunked/compound TE, a non-numeric/overflowing CL, or conflicting
     // duplicate CL values. (A malformed/duplicate CL silently coerced to a length
@@ -2863,7 +2903,13 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
         // (a 1.0 intermediary would not have decoded it), so never decode-and-reuse (#669).
         BodyFraming::Reject
     } else {
-        classify_framing(cl_values.iter().copied(), chunked, te_other)
+        let cl_iter = cl_inline
+            .get(..cl_inline_len)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .chain(cl_overflow.iter().copied());
+        classify_framing(cl_iter, chunked, te_other)
     };
     ParsedReq::Done {
         method,
@@ -2874,6 +2920,7 @@ fn materialize_head(req: &httparse::Request<'_, '_>, head_len: usize) -> ParsedR
         keep_alive: !conn_close,
         expect_continue,
         http10: req.version == Some(0),
+        has_upgrade,
     }
 }
 
@@ -3061,6 +3108,18 @@ fn push_u64_hex(out: &mut Vec<u8>, v: u64) {
 /// Status line bytes ("HTTP/1.1 <code> <reason>\r\n") appended without format! temporaries.
 #[inline]
 fn push_h1_status_line(out: &mut Vec<u8>, status: http::StatusCode, reason: &str) {
+    if status == http::StatusCode::OK {
+        out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        return;
+    }
+    if status == http::StatusCode::NOT_MODIFIED {
+        out.extend_from_slice(b"HTTP/1.1 304 Not Modified\r\n");
+        return;
+    }
+    if status == http::StatusCode::NOT_FOUND {
+        out.extend_from_slice(b"HTTP/1.1 404 Not Found\r\n");
+        return;
+    }
     out.extend_from_slice(b"HTTP/1.1 ");
     push_u64_decimal(out, status.as_u16() as u64);
     out.push(b' ');
@@ -3104,7 +3163,21 @@ fn serialize_h1_response_head_into(
     keep_alive: bool,
 ) {
     out.clear();
-    out.reserve(h1_head_capacity(headers));
+    append_h1_response_head_into(out, status, headers, body_len, is_head, keep_alive);
+}
+
+fn append_h1_response_head_into(
+    out: &mut Vec<u8>,
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    body_len: usize,
+    is_head: bool,
+    keep_alive: bool,
+) {
+    let heuristic = H1_HEAD_FIXED_BYTES + headers.len() * 64;
+    if out.capacity() - out.len() < heuristic {
+        out.reserve(h1_head_capacity(headers));
+    }
     let reason = status.canonical_reason().unwrap_or("");
     push_h1_status_line(out, status, reason);
     for (n, v) in headers.iter() {
@@ -3255,26 +3328,39 @@ async fn relay_h1_upgrade<S>(
 /// `Stream` writes the head then drains chunks. Returns true if the connection must close
 /// (write error, no keep-alive, or a mid-stream abort that desynced framing).
 
+/// Append an interim `103 Early Hints` response carrying the backend's
+/// preload/preconnect `Link` headers directly into `out`. Returns `true` if
+/// any hints were written.
+fn append_103_early_hints(out: &mut Vec<u8>, headers: &http::HeaderMap) -> bool {
+    let mut wrote_header = false;
+    for v in headers.get_all(http::header::LINK).iter() {
+        if !hj_h2::server::is_early_hint_link(v) {
+            continue;
+        }
+        if !wrote_header {
+            out.extend_from_slice(b"HTTP/1.1 103 Early Hints\r\n");
+            wrote_header = true;
+        }
+        out.extend_from_slice(b"Link: ");
+        out.extend_from_slice(v.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if wrote_header {
+        out.extend_from_slice(b"\r\n");
+    }
+    wrote_header
+}
+
 /// Serialize an interim `103 Early Hints` response carrying the backend's
 /// preload/preconnect `Link` headers, or `None` when there are none. HTTP/1.1
 /// parity with hj-h2's h2 emitter.
 fn build_103_early_hints(headers: &http::HeaderMap) -> Option<Vec<u8>> {
-    let links: Vec<&http::HeaderValue> = headers
-        .get_all(http::header::LINK)
-        .iter()
-        .filter(|v| hj_h2::server::is_early_hint_link(v))
-        .collect();
-    if links.is_empty() {
-        return None;
+    let mut interim = Vec::new();
+    if append_103_early_hints(&mut interim, headers) {
+        Some(interim)
+    } else {
+        None
     }
-    let mut interim = String::from("HTTP/1.1 103 Early Hints\r\n");
-    for v in links {
-        interim.push_str("Link: ");
-        interim.push_str(&String::from_utf8_lossy(v.as_bytes()));
-        interim.push_str("\r\n");
-    }
-    interim.push_str("\r\n");
-    Some(interim.into_bytes())
 }
 
 /// The final response head, preceded by its interim 103 when there is one.
@@ -3498,6 +3584,7 @@ mod early_hints_tests {
             completion: None,
             status: http::StatusCode::OK,
             headers: hinted_headers(),
+            shared_headers: None,
             body,
             bw_rate: None,
         };
@@ -3668,16 +3755,26 @@ impl SendProgress {
         let Some(budget) = self.budget(len) else {
             return Ok((write.await, std::time::Duration::ZERO));
         };
-        let started = std::time::Instant::now();
         let mut write = std::pin::pin!(write);
-        let mut deadline = write_watch::Deadline::new(started + budget);
+        let mut state: Option<(std::time::Instant, write_watch::Deadline)> = None;
         std::future::poll_fn(|cx| {
-            if deadline.expired() {
+            if let Some((_, ref deadline)) = state
+                && deadline.expired()
+            {
                 return std::task::Poll::Ready(Err(send_progress_timeout()));
             }
             match write.as_mut().poll(cx) {
-                std::task::Poll::Ready(out) => std::task::Poll::Ready(Ok((out, started.elapsed()))),
+                std::task::Poll::Ready(out) => {
+                    let elapsed = state
+                        .as_ref()
+                        .map_or(std::time::Duration::ZERO, |(started, _)| started.elapsed());
+                    std::task::Poll::Ready(Ok((out, elapsed)))
+                }
                 std::task::Poll::Pending => {
+                    let (_, deadline) = state.get_or_insert_with(|| {
+                        let started = std::time::Instant::now();
+                        (started, write_watch::Deadline::new(started + budget))
+                    });
                     deadline.arm(cx.waker());
                     std::task::Poll::Pending
                 }
@@ -3838,25 +3935,41 @@ where
     // preload/preconnect Link headers go out as an interim response ahead of the final
     // head, in the same write (the final response is already complete). Upgrades (101)
     // never reach here, and an HTTP/1.0 client must never see a 1xx (RFC 9110 §15.2; #608).
-    let interim = if http10 {
-        None
-    } else {
-        build_103_early_hints(&resp.headers)
-    };
+    let emit_103 = !http10 && resp.status.is_success();
     let outcome = match resp.body {
         bridge::BridgeBody::Full(body) => {
             let body_forbidden = hj_core::response_body_forbidden(is_head, resp.status);
-            let result = if interim.is_none() && throttle.is_none() {
+            let result = if throttle.is_none() {
+                let hdrs = resp.shared_headers.as_deref().unwrap_or(&resp.headers);
                 let mut head = buffers.take_head();
-                serialize_h1_response_head_into(
+                head.clear();
+                let est = 512 + hdrs.len() * 64;
+                if head.capacity() < est {
+                    head.reserve(est);
+                }
+                if emit_103 {
+                    append_103_early_hints(&mut head, hdrs);
+                }
+                append_h1_response_head_into(
                     &mut head,
                     resp.status,
-                    &resp.headers,
+                    hdrs,
                     body.len(),
                     is_head,
                     keep_alive,
                 );
                 if body_forbidden || body.is_empty() {
+                    match progress.write_all(stream, head).await {
+                        Ok(head) => {
+                            buffers.recycle_head(head);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else if head.len() + body.len() <= 4096 {
+                    // Small-body coalescing: append into the reused head buffer and
+                    // submit a single IORING_OP_WRITE instead of Box<[iovec; 2]> + WRITEV.
+                    head.extend_from_slice(&body);
                     match progress.write_all(stream, head).await {
                         Ok(head) => {
                             buffers.recycle_head(head);
@@ -3877,15 +3990,11 @@ where
                     }
                 }
             } else {
+                let hdrs = resp.shared_headers.as_deref().unwrap_or(&resp.headers);
+                let interim = emit_103.then(|| build_103_early_hints(hdrs)).flatten();
                 let head = with_interim(
                     interim,
-                    serialize_h1_response_head(
-                        resp.status,
-                        &resp.headers,
-                        body.len(),
-                        is_head,
-                        keep_alive,
-                    ),
+                    serialize_h1_response_head(resp.status, hdrs, body.len(), is_head, keep_alive),
                 );
                 if body_forbidden || body.is_empty() {
                     progress.write_all(stream, head).await.map(drop)
@@ -3900,6 +4009,9 @@ where
             WriteOutcome::new(result.is_err(), keep_alive)
         }
         bridge::BridgeBody::File(file) => {
+            let interim = emit_103
+                .then(|| build_103_early_hints(&resp.headers))
+                .flatten();
             let result = write_h1_file(
                 stream,
                 interim,
@@ -3916,6 +4028,9 @@ where
             WriteOutcome::new(result.is_err(), keep_alive)
         }
         bridge::BridgeBody::Stream { rx, len } => {
+            let interim = emit_103
+                .then(|| build_103_early_hints(&resp.headers))
+                .flatten();
             write_h1_stream(
                 stream,
                 interim,
@@ -4240,6 +4355,7 @@ mod send_progress_tests {
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body,
             bw_rate: None,
         };
@@ -4403,6 +4519,7 @@ mod send_progress_tests {
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::Full(bytes::Bytes::from(vec![b'x'; len])),
             bw_rate: None,
         };
@@ -4467,6 +4584,7 @@ mod send_progress_tests {
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::File(hj_core::FileBody {
                 path: path.clone(),
                 file: Some(std::fs::File::open(&path).unwrap()),
@@ -4745,6 +4863,62 @@ fn tcp_user_timeout(state: &crate::state::ServerState) -> std::time::Duration {
         .serve_config
         .header_read_timeout
         .unwrap_or(std::time::Duration::from_secs(60))
+}
+
+/// Set TCP_NODELAY, SO_KEEPALIVE (+ idle/interval), and TCP_USER_TIMEOUT on the
+/// listening socket once so Linux inherits them into every accepted child socket
+/// via `sk_clone_lock`, avoiding 5 setsockopt syscalls per accepted connection.
+/// Returns `true` only if every setsockopt succeeded.
+fn configure_listener_tcp_options(fd: i32, user_timeout: std::time::Duration) -> bool {
+    let one: libc::c_int = 1;
+    let idle: libc::c_int = hj_proxy::PROXY_KEEPALIVE_IDLE
+        .as_secs()
+        .clamp(1, i32::MAX as u64) as libc::c_int;
+    let intvl: libc::c_int = hj_proxy::PROXY_KEEPALIVE_INTERVAL
+        .as_secs()
+        .clamp(1, i32::MAX as u64) as libc::c_int;
+    let utimeout: libc::c_uint = user_timeout.as_millis().min(u32::MAX as u128) as libc::c_uint;
+
+    // SAFETY: `fd` is a live listening TCP socket owned by the caller; each
+    // `val` pointer points to a properly sized, initialized C integer.
+    unsafe {
+        let ok_nodelay = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            (&raw const one).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        ) == 0;
+        let ok_ka = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            (&raw const one).cast(),
+            std::mem::size_of_val(&one) as libc::socklen_t,
+        ) == 0;
+        let ok_idle = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            (&raw const idle).cast(),
+            std::mem::size_of_val(&idle) as libc::socklen_t,
+        ) == 0;
+        let ok_intvl = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            (&raw const intvl).cast(),
+            std::mem::size_of_val(&intvl) as libc::socklen_t,
+        ) == 0;
+        let ok_ut = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            (&raw const utimeout).cast(),
+            std::mem::size_of_val(&utimeout) as libc::socklen_t,
+        ) == 0;
+        ok_nodelay && ok_ka && ok_idle && ok_intvl && ok_ut
+    }
 }
 
 /// Build a `SO_REUSEPORT` TCP listener (std) for a monoio runtime to adopt via
@@ -6272,6 +6446,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::PARTIAL_CONTENT,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::File(hj_core::FileBody {
                 path: path.clone(),
                 file: Some(std::fs::File::open(&path).unwrap()),
@@ -6307,6 +6482,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::File(hj_core::FileBody {
                 path: path.clone(),
                 file: Some(std::fs::File::open(&path).unwrap()),
@@ -6335,6 +6511,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::File(hj_core::FileBody {
                 path: path.clone(),
                 file: Some(std::fs::File::open(&path).unwrap()),
@@ -6396,6 +6573,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::File(hj_core::FileBody {
                 path: path.clone(),
                 file: Some(std::fs::File::open(&path).unwrap()),
@@ -6423,6 +6601,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::Full(body),
             bw_rate: Some(300_000),
         };
@@ -6451,6 +6630,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::Full(body),
             bw_rate: None,
         };
@@ -6469,6 +6649,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::NO_CONTENT,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::Full(bytes::Bytes::from_static(b"full-sentinel")),
             bw_rate: None,
         });
@@ -6480,6 +6661,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::NO_CONTENT,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::Stream { rx, len: Some(15) },
             bw_rate: None,
         });
@@ -6505,6 +6687,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             completion: None,
             status: http::StatusCode::OK,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: bridge::BridgeBody::Stream { rx, len: None },
             bw_rate: None,
         });
@@ -6532,6 +6715,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 completion: None,
                 status: http::StatusCode::OK,
                 headers: http::HeaderMap::new(),
+                shared_headers: None,
                 body: bridge::BridgeBody::Stream { rx, len: None },
                 bw_rate: None,
             },
@@ -6563,6 +6747,7 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
                 completion: None,
                 status: http::StatusCode::OK,
                 headers: http::HeaderMap::new(),
+                shared_headers: None,
                 body: bridge::BridgeBody::Stream { rx, len: Some(3) },
                 bw_rate: None,
             },

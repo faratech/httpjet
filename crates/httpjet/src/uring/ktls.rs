@@ -339,7 +339,6 @@ async fn retry_record_send(
     expected: usize,
     mut send: impl FnMut() -> io::Result<usize>,
 ) -> io::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         match send() {
             Ok(n) if n == expected => return Ok(()),
@@ -352,19 +351,21 @@ async fn retry_record_send(
                 ));
             }
             Err(error) => {
-                if !matches!(error.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
-                    return Err(error);
+                if error.raw_os_error() == Some(libc::EINTR) {
+                    continue;
                 }
-                if std::time::Instant::now() >= deadline {
+                if error.raw_os_error() == Some(libc::EAGAIN) {
+                    // Never sleep across `.await` while holding the per-connection
+                    // `rekey` mutex: on a split single-task HTTP/2 connection,
+                    // `KtlsWriteHalf` awaits `rekey` outside `select!` while
+                    // `KtlsReadHalf` is suspended, which would permanently deadlock
+                    // the connection. Close cleanly on TX backpressure instead.
                     return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "timed out waiting to send kTLS KeyUpdate",
+                        io::ErrorKind::WouldBlock,
+                        "kTLS KeyUpdate blocked by TX backpressure",
                     ));
                 }
-                // This runs on a monoio core while holding the rekey gate.
-                // Yield under backpressure so other connections can progress;
-                // application writes remain excluded until TX is rekeyed.
-                monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+                return Err(error);
             }
         }
     }
@@ -458,9 +459,18 @@ async fn handle_rx_control(state: &mut RekeyState) -> io::Result<RxControl> {
     let mut data = [0u8; 64]; // KeyUpdate is 5 bytes decrypted; alerts 2
     let mut iov = [IoSliceMut::new(&mut data)];
     let mut cmsg_space = nix::cmsg_space!(u8);
-    let msg =
-        recvmsg::<SockaddrStorage>(state.fd, &mut iov, Some(&mut cmsg_space), MsgFlags::empty())
-            .map_err(io::Error::from)?;
+    let msg = loop {
+        match recvmsg::<SockaddrStorage>(
+            state.fd,
+            &mut iov,
+            Some(&mut cmsg_space),
+            MsgFlags::empty(),
+        ) {
+            Ok(msg) => break msg,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(err) => return Err(io::Error::from(err)),
+        }
+    };
     let n = msg.bytes;
     let record_type = msg.cmsgs().ok().and_then(|mut c| {
         c.find_map(|m| match m {
@@ -622,7 +632,7 @@ impl<S: AsyncWriteRent> AsyncWriteRent for KtlsStream<S> {
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
                 // On Linux EAGAIN == EWOULDBLOCK (same errno), so one arm covers both.
-                Some(libc::EAGAIN) => self.inner.write(buf).await,
+                Some(libc::EAGAIN) | Some(libc::EINTR) => self.inner.write(buf).await,
                 _ => (Err(err), buf),
             }
         }
@@ -631,7 +641,24 @@ impl<S: AsyncWriteRent> AsyncWriteRent for KtlsStream<S> {
         &mut self,
         buf_vec: T,
     ) -> impl std::future::Future<Output = BufResult<usize, T>> {
-        self.inner.writev(buf_vec)
+        async move {
+            let fd = self.rekey.fd;
+            let iov_len = buf_vec.read_iovec_len();
+            if iov_len == 0 {
+                return (Ok(0), buf_vec);
+            }
+            let count = iov_len.min(1024) as libc::c_int;
+            // SAFETY: `buf_vec` owns `iov_len` valid `libc::iovec` descriptors for this call.
+            let n = unsafe { libc::writev(fd, buf_vec.read_iovec_ptr(), count) };
+            if n >= 0 {
+                return (Ok(n as usize), buf_vec);
+            }
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => self.inner.writev(buf_vec).await,
+                _ => (Err(err), buf_vec),
+            }
+        }
     }
     fn flush(&mut self) -> impl std::future::Future<Output = io::Result<()>> {
         self.inner.flush()
@@ -738,7 +765,7 @@ impl<W: AsyncWriteRent> AsyncWriteRent for KtlsWriteHalf<W> {
                 return (Ok(n as usize), buf);
             }
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EAGAIN) {
+            if !matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
                 drop(rekey);
                 return (Err(error), buf);
             }
@@ -754,6 +781,23 @@ impl<W: AsyncWriteRent> AsyncWriteRent for KtlsWriteHalf<W> {
     ) -> impl std::future::Future<Output = BufResult<usize, T>> {
         async move {
             let rekey = self.rekey.lock().await;
+            let iov_len = buf.read_iovec_len();
+            if iov_len == 0 {
+                drop(rekey);
+                return (Ok(0), buf);
+            }
+            let count = iov_len.min(1024) as libc::c_int;
+            // SAFETY: `buf` owns `iov_len` valid `libc::iovec` descriptors for this call.
+            let n = unsafe { libc::writev(rekey.fd, buf.read_iovec_ptr(), count) };
+            if n >= 0 {
+                drop(rekey);
+                return (Ok(n as usize), buf);
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
+                drop(rekey);
+                return (Err(error), buf);
+            }
             let result = self.inner.writev(buf).await;
             drop(rekey);
             result
@@ -798,31 +842,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_record_retries_transient_errors_without_blocking_the_core() {
+    fn control_record_retries_eintr_and_fails_fast_on_eagain() {
         let mut runtime = crate::uring::build_core_runtime().unwrap();
         runtime.block_on(async {
-            let progressed = Rc::new(std::cell::Cell::new(false));
-            monoio::spawn({
-                let progressed = progressed.clone();
-                async move {
-                    progressed.set(true);
-                }
-            });
             let mut attempts = 0;
             retry_record_send(5, || {
                 attempts += 1;
                 match attempts {
                     1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
-                    2 => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
-                    _ => {
-                        assert!(progressed.get(), "other connections must progress");
-                        Ok(5)
-                    }
+                    _ => Ok(5),
                 }
             })
             .await
             .unwrap();
-            assert_eq!(attempts, 3);
+            assert_eq!(attempts, 2);
+            assert_eq!(
+                retry_record_send(5, || Err(io::Error::from_raw_os_error(libc::EAGAIN)))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
             assert_eq!(
                 retry_record_send(5, || Ok(2)).await.unwrap_err().kind(),
                 io::ErrorKind::WriteZero

@@ -224,7 +224,12 @@ impl Htaccess {
                         msg: "legacy access directive inside an authorization container".into(),
                     });
                 }
-                if section_stack.iter().any(PendingSection::is_unmodelled) {
+                if section_stack.iter().any(|s| {
+                    s.is_unmodelled()
+                        || s.scope
+                            .as_ref()
+                            .is_some_and(|sc| sc.kind == ScopeKind::If && sc.uri_expr.is_none())
+                }) {
                     // Its Allow could only widen to the whole directory.
                     return Err(RewriteError::Malformed {
                         line: lineno,

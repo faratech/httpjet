@@ -53,7 +53,6 @@ use http_body_util::combinators::BoxBody;
 use hyper::body::Incoming;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
 
 pub use headers::is_websocket_upgrade;
 pub use pool::{PeerSnapshot, RequestReservation, Upstream, UpstreamPool};
@@ -391,46 +390,18 @@ impl Proxy {
         // in-flight REQUEST limit, so the h2 drain task must also wait for the downstream
         // body to reach EOF/error or be dropped. For h1, sender.ready() already tracks the
         // single in-flight response and preserves the existing disconnect/drain behavior.
-        let (response_done_tx, response_done_rx) = if sender.is_h2() {
-            let (tx, rx) = oneshot::channel();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
         if let Some(r) = &mut reservation {
             r.response_received();
         }
-        let downstream_response = into_streaming_response(upstream_resp, response_done_tx);
-
-        // Return the sender according to its protocol. An h2 sender can open another
-        // stream as soon as the response head arrives, while an h1 connection becomes
-        // reusable only after its response body drains. We never block this request on
-        // the h1 drain (that would defeat streaming); its detached task waits for
-        // `sender.ready()` and then returns it to the pool. A genuinely busy stream
-        // keeps its request slot for its real lifetime; TCP keepalive eventually reaps
-        // a silently dead peer.
-        //
-        // (#28) The maxConns permit is MOVED INTO this drain task. On a mid-stream
-        // client disconnect, the h1 sender reports its final readiness/error; the h2
-        // response wrapper signals its drop. The slot is released only once this task
-        // sees the protocol-specific completion. That way the semaphore counts
-        // running + draining connections, so a fresh request can't acquire a permit,
-        // find the idle pool empty, and dial a second connection while the old one is
-        // still being drained — which would let the upstream transiently see up to
-        // 2× max_conns sockets.
-        if let Some(response_done) = response_done_rx {
+        let downstream_response = if sender.is_h2() {
             // H2 can reuse the multiplexed connection while the prior response stream is
-            // open. Hyper's h2 sender is ready whenever the connection is not closed, so
-            // return it synchronously: deferring this to a spawned task leaves the pool
-            // briefly empty and a back-to-back request can commit to an unnecessary dial.
-            // The semaphore permit remains tied to the response body's real lifetime below.
+            // open. Return the sender synchronously and hold `permit` + `reservation`
+            // directly inside `ResponseCompletionBody` (no per-request `oneshot` or
+            // `tokio::spawn` needed).
             upstream.release(sender);
-            tokio::spawn(async move {
-                let _permit = permit;
-                let _reservation = reservation;
-                let _ = response_done.await;
-            });
+            into_streaming_response(upstream_resp, Some((permit, reservation)))
         } else {
+            let resp = into_streaming_response(upstream_resp, None);
             let up = upstream.clone();
             tokio::spawn(async move {
                 let _permit = permit;
@@ -445,7 +416,8 @@ impl Proxy {
                 }
                 // _permit drops here: the slot frees only after the connection is truly free.
             });
-        }
+            resp
+        };
 
         Ok(downstream_response)
     }
@@ -479,6 +451,8 @@ impl Proxy {
                 .unwrap_or(self.default_connect_timeout),
         )?;
         let mut selected_target = target.clone();
+        selected_target.authority = selected.authority.clone();
+        selected_target.transport = selected.transport().clone();
         if let Some(r) = &mut reservation {
             r.permit = Some(
                 selected
@@ -486,8 +460,6 @@ impl Proxy {
                     .await
                     .ok_or(HandlerError::ServiceUnavailable)?,
             );
-            selected_target.authority = selected.authority.clone();
-            selected_target.transport = selected.transport().clone();
         }
         // (#583) Default (non-load-balanced) targets return no reservation,
         // but maxConns must still bound the long-lived relay: acquire a plain
@@ -516,25 +488,25 @@ impl Proxy {
             ));
         }
 
-        let connect_timeout = target
-            .connect_timeout
-            .unwrap_or(self.default_connect_timeout);
+        if selected.breaker_open() {
+            return Err(HandlerError::ServiceUnavailable);
+        }
+        let dial_timeout = selected.dial_timeout();
         let dial_admission = pool::dial_permit().map_err(|_| HandlerError::ServiceUnavailable)?;
-        let stream =
-            match tokio::time::timeout(connect_timeout, TcpStream::connect(&hostport)).await {
-                Ok(Ok(stream)) => {
-                    selected.note_dial_success();
-                    stream
-                }
-                Ok(Err(e)) => {
-                    selected.note_dial_failure();
-                    return Err(HandlerError::BadGateway(format!("ws connect: {e}")));
-                }
-                Err(_) => {
-                    selected.note_dial_failure();
-                    return Err(HandlerError::GatewayTimeout);
-                }
-            };
+        let stream = match tokio::time::timeout(dial_timeout, TcpStream::connect(&hostport)).await {
+            Ok(Ok(stream)) => {
+                selected.note_dial_success();
+                stream
+            }
+            Ok(Err(e)) => {
+                selected.note_dial_failure();
+                return Err(HandlerError::BadGateway(format!("ws connect: {e}")));
+            }
+            Err(_) => {
+                selected.note_dial_failure();
+                return Err(HandlerError::GatewayTimeout);
+            }
+        };
         drop(dial_admission);
         let _ = stream.set_nodelay(true);
         set_tcp_keepalive(&stream);
@@ -565,7 +537,9 @@ impl Proxy {
         // connection + handshake but never replies pins this request task and the
         // upstream socket forever (a slow FD/task leak under repeated hits).
         let upstream_resp =
-            match tokio::time::timeout(connect_timeout, sender.send_request(out_req)).await {
+            match tokio::time::timeout(selected.response_timeout(), sender.send_request(out_req))
+                .await
+            {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => return Err(HandlerError::BadGateway(format!("ws request: {e}"))),
                 Err(_) => return Err(HandlerError::GatewayTimeout),
@@ -814,6 +788,13 @@ fn is_websocket_handshake_response(
 /// the connection dials is independent (it lives in [`ProxyTarget::transport`]);
 /// the URI we send upstream over HTTP/1.1 is origin-form (path only).
 fn upstream_uri(inbound: &Uri, target: &ProxyTarget) -> Result<Uri, HandlerError> {
+    if target.path_and_query.is_empty()
+        && inbound.scheme().is_none()
+        && inbound.authority().is_none()
+        && inbound.path_and_query().is_some()
+    {
+        return Ok(inbound.clone());
+    }
     let pq = if target.path_and_query.is_empty() {
         inbound
             .path_and_query()
@@ -961,11 +942,16 @@ fn empty_stream_body() -> StreamBody {
         .boxed()
 }
 
+type H2PermitHold = (
+    tokio::sync::OwnedSemaphorePermit,
+    Option<pool::RequestReservation>,
+);
+
 /// Convert a hyper upstream response into an [`hj_core::Response`] whose body is
 /// a pass-through [`Body::Stream`]. Hop-by-hop headers are stripped.
 fn into_streaming_response(
     resp: hyper::Response<Incoming>,
-    completion: Option<oneshot::Sender<()>>,
+    hold: Option<H2PermitHold>,
 ) -> Response {
     let (mut parts, incoming) = resp.into_parts();
     // Run BEFORE sanitize (which strips TE), while we can still see that the upstream framed by
@@ -983,7 +969,7 @@ fn into_streaming_response(
         parts.extensions.insert(hj_core::ProxiedBody);
     }
     headers::sanitize_response_headers(&mut parts.headers, false);
-    let stream: StreamBody = box_incoming(incoming, completion);
+    let stream: StreamBody = box_incoming(incoming, hold);
     http::Response::from_parts(parts, Body::Stream(stream))
 }
 
@@ -1001,14 +987,11 @@ fn drop_stale_content_length_on_te(headers: &mut http::HeaderMap) {
 
 /// Box a hyper `Incoming` body into the workspace `StreamBody`
 /// (`BoxBody<Bytes, BoxError>`), mapping hyper's error into [`BoxError`].
-fn box_incoming(
-    incoming: Incoming,
-    completion: Option<oneshot::Sender<()>>,
-) -> BoxBody<Bytes, BoxError> {
-    if let Some(completion) = completion {
+fn box_incoming(incoming: Incoming, hold: Option<H2PermitHold>) -> BoxBody<Bytes, BoxError> {
+    if let Some(hold) = hold {
         ResponseCompletionBody {
             incoming,
-            completion: Some(completion),
+            hold: Some(hold),
         }
         .boxed()
     } else {
@@ -1016,19 +999,20 @@ fn box_incoming(
     }
 }
 
-/// Signals when an h2 response stops being in flight from the downstream's point of view.
-/// Hyper exposes h2 connection capacity independently from individual response bodies, so
-/// `SendRequest::ready()` alone cannot define the `maxConns` permit lifetime.
+/// Holds an h2 response's `maxConns` permit and load-balancer reservation directly
+/// inside the streaming body until EOF, error, or drop (eliminating a per-request
+/// `oneshot` channel and `tokio::spawn` task).
 struct ResponseCompletionBody {
     incoming: Incoming,
-    completion: Option<oneshot::Sender<()>>,
+    hold: Option<(
+        tokio::sync::OwnedSemaphorePermit,
+        Option<pool::RequestReservation>,
+    )>,
 }
 
 impl ResponseCompletionBody {
     fn complete(&mut self) {
-        if let Some(completion) = self.completion.take() {
-            let _ = completion.send(());
-        }
+        self.hold.take();
     }
 }
 

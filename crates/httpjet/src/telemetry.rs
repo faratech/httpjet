@@ -144,7 +144,6 @@ impl HistogramSnapshot {
 /// in traffic.
 #[derive(Default)]
 pub struct VhostMetrics {
-    requests: AtomicU64,
     status_2xx: AtomicU64,
     status_3xx: AtomicU64,
     status_4xx: AtomicU64,
@@ -302,11 +301,15 @@ impl TelemetryShard {
         dur: Duration,
         vhost_idx: usize,
     ) {
-        self.request_duration.record(dur);
+        // Record duration and status class ONLY into the per-vhost bucket (5 atomic
+        // RMWs instead of 10). Global `request_duration` and `status_{2..5}xx` are
+        // summed across `per_vhost` at scrape/flush time, and `vh.duration.count`
+        // doubles as `vh.requests`.
         let vh = &self.per_vhost[vhost_idx.min(VHOST_OVERFLOW)];
-        vh.requests.fetch_add(1, Relaxed);
         vh.duration.record(dur);
-        if let Some(i) = STATUS_CODES.iter().position(|c| *c == status) {
+        if status >= 400
+            && let Some(i) = STATUS_CODES.iter().position(|c| *c == status)
+        {
             self.status_code[i].fetch_add(1, Relaxed);
         }
         match proto {
@@ -315,17 +318,16 @@ impl TelemetryShard {
             hj_core::Proto::Http3 => &self.proto_h3,
         }
         .fetch_add(1, Relaxed);
-        let (global, per_vh) = match status / 100 {
+        let per_vh = match status / 100 {
             // 1xx (e.g. a successful WebSocket `101 Switching Protocols`) is informational,
             // not a final 2xx/5xx outcome — do NOT fold it into status_5xx (which would make
             // every WS upgrade read as a server error and inflate the 5xx alerting signal).
             1 => return,
-            2 => (&self.status_2xx, &vh.status_2xx),
-            3 => (&self.status_3xx, &vh.status_3xx),
-            4 => (&self.status_4xx, &vh.status_4xx),
-            _ => (&self.status_5xx, &vh.status_5xx),
+            2 => &vh.status_2xx,
+            3 => &vh.status_3xx,
+            4 => &vh.status_4xx,
+            _ => &vh.status_5xx,
         };
-        global.fetch_add(1, Relaxed);
         per_vh.fetch_add(1, Relaxed);
     }
 
@@ -432,9 +434,25 @@ impl TelemetryShard {
     }
 
     fn counter_values(&self) -> [u64; COUNTER_NAMES.len()] {
-        [
+        let (mut ch, mut cm, mut s2, mut s3, mut s4, mut s5) = (
             self.cache_hits.load(Relaxed),
             self.cache_misses.load(Relaxed),
+            self.status_2xx.load(Relaxed),
+            self.status_3xx.load(Relaxed),
+            self.status_4xx.load(Relaxed),
+            self.status_5xx.load(Relaxed),
+        );
+        for vh in &self.per_vhost {
+            ch += vh.cache_hits.load(Relaxed);
+            cm += vh.cache_misses.load(Relaxed);
+            s2 += vh.status_2xx.load(Relaxed);
+            s3 += vh.status_3xx.load(Relaxed);
+            s4 += vh.status_4xx.load(Relaxed);
+            s5 += vh.status_5xx.load(Relaxed);
+        }
+        [
+            ch,
+            cm,
             self.cache_bypass.load(Relaxed),
             self.cache_stale_serves.load(Relaxed),
             self.disp_store_public.load(Relaxed),
@@ -449,10 +467,10 @@ impl TelemetryShard {
             self.proto_h1.load(Relaxed),
             self.proto_h2.load(Relaxed),
             self.proto_h3.load(Relaxed),
-            self.status_2xx.load(Relaxed),
-            self.status_3xx.load(Relaxed),
-            self.status_4xx.load(Relaxed),
-            self.status_5xx.load(Relaxed),
+            s2,
+            s3,
+            s4,
+            s5,
             self.cache_hits_loopback.load(Relaxed),
             self.cache_misses_loopback.load(Relaxed),
             self.cache_bypass_loopback.load(Relaxed),
@@ -593,7 +611,6 @@ impl Telemetry {
     #[inline]
     pub fn record_cache_hit_idx(&self, loopback: bool, vhost_idx: usize) {
         let s = self.shard();
-        s.cache_hits.fetch_add(1, Relaxed);
         s.per_vhost[vhost_idx.min(VHOST_OVERFLOW)]
             .cache_hits
             .fetch_add(1, Relaxed);
@@ -605,7 +622,6 @@ impl Telemetry {
     /// Record a cache MISS (+ loopback subset, + vhost series). See [`Self::record_cache_hit`].
     pub fn record_cache_miss(&self, loopback: bool, vhost: &str) {
         let s = self.shard();
-        s.cache_misses.fetch_add(1, Relaxed);
         s.per_vhost[self.vhost_idx(vhost)]
             .cache_misses
             .fetch_add(1, Relaxed);
@@ -668,6 +684,12 @@ impl Telemetry {
         let mut agg = HistogramSnapshot::default();
         for s in &self.shards {
             agg.merge(&s.0.histograms()[idx].3.snapshot());
+            if idx == 0 {
+                // Global `request_duration` is derived by summing `per_vhost` durations.
+                for vh in &s.0.per_vhost {
+                    agg.merge(&vh.duration.snapshot());
+                }
+            }
         }
         agg
     }
@@ -677,7 +699,7 @@ impl Telemetry {
         let mut acc = [0u64; 5];
         for s in &self.shards {
             let v = &s.0.per_vhost[i];
-            acc[0] += v.requests.load(Relaxed);
+            acc[0] += v.duration.count.load(Relaxed);
             acc[1] += v.status_2xx.load(Relaxed);
             acc[2] += v.status_3xx.load(Relaxed);
             acc[3] += v.status_4xx.load(Relaxed);
@@ -1284,7 +1306,12 @@ pub async fn run_flush(
 async fn rotate_stale_schema(path: &std::path::Path) {
     use tokio::io::AsyncBufReadExt;
     let expected = format!("ts\t{}", Telemetry::tsv_header());
-    if let Ok(f) = tokio::fs::File::open(path).await {
+    if let Ok(f) = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .await
+    {
         let mut first = String::new();
         let mut r = tokio::io::BufReader::new(f);
         if r.read_line(&mut first).await.is_ok()
@@ -1304,16 +1331,23 @@ pub async fn flush_once(sampler: &std::sync::Arc<TelemetrySampler>, path: &std::
 
 async fn append_snapshot(t: &Telemetry, extra: &ExtraSample, path: &std::path::Path) {
     use tokio::io::AsyncWriteExt;
-    // Size-based rotation: keep exactly one backup (`<path>.1`).
-    if let Ok(md) = tokio::fs::metadata(path).await {
+    // Size-based rotation: keep exactly one backup (`<path>.1`). Use
+    // `symlink_metadata` + `O_NOFOLLOW` so a symlink planted in a writable
+    // log directory is never followed.
+    if let Ok(md) = tokio::fs::symlink_metadata(path).await {
+        if md.file_type().is_symlink() {
+            tracing::warn!(path = %path.display(), "telemetry: refusing to follow symlink snapshot path");
+            return;
+        }
         if md.len() > 32 * 1024 * 1024 {
             let _ = tokio::fs::rename(path, path.with_extension("tsv.1")).await;
         }
     }
-    let fresh = tokio::fs::metadata(path).await.is_err();
+    let fresh = tokio::fs::symlink_metadata(path).await.is_err();
     let mut f = match tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .await
     {

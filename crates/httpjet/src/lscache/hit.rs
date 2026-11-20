@@ -104,7 +104,10 @@ pub(super) fn build_hit_response(
     // transport can stream the immutable HJPC payload range from tmpfs without
     // allocating the body on the heap; dict/derived/fallback paths use `stored`
     // bytes and still fail closed on a missing/corrupt file.
-    let encodable = compress.stored_encodable(&entry.headers);
+    let encodable = match &entry.prebuilt_headers {
+        Some(pb) => pb.stored_encodable_or(|| compress.stored_encodable(&entry.headers)),
+        None => compress.stored_encodable(&entry.headers),
+    };
     // A body stored as plain zstd (`--page-cache-egress-at-rest-vhosts`) is served as it is to
     // a client that would get zstd and has no zstd variant (a cold entry), with no decode.
     let picked = pick_variant(entry, accept_encoding, compress, encodable);
@@ -167,10 +170,14 @@ pub(super) fn build_hit_response(
             .insert(hj_compress::StaticIdentityLength(content_len as u64));
     }
     let h = resp.headers_mut();
-    // entry.headers + CONTENT_LENGTH/HDR_CACHE_STATUS/AGE (+ optional CONTENT_ENCODING/VARY).
-    h.reserve(entry.headers.len() + 5);
-    for (k, v) in &entry.headers {
-        h.append(k.clone(), v.clone());
+    if let Some(prebuilt) = &entry.prebuilt_headers {
+        *h = prebuilt.map.clone();
+    } else {
+        // entry.headers + CONTENT_LENGTH/HDR_CACHE_STATUS/AGE (+ optional CONTENT_ENCODING/VARY).
+        h.reserve(entry.headers.len() + 5);
+        for (k, v) in &entry.headers {
+            h.append(k.clone(), v.clone());
+        }
     }
     h.insert(CONTENT_LENGTH, HeaderValue::from(content_len));
     h.insert(HDR_CACHE_STATUS, HeaderValue::from_static("hit"));
@@ -331,13 +338,31 @@ fn merge_vary_accept_encoding(headers: &mut HeaderMap) {
     // are valid and combine per RFC 9110), since `insert` would drop the others.
     if count == 1 {
         if let Some(existing) = headers.get(VARY).and_then(|v| v.to_str().ok()) {
-            const SUFFIX: &str = ", Accept-Encoding";
-            let mut merged = String::with_capacity(existing.len() + SUFFIX.len());
-            merged.push_str(existing);
-            merged.push_str(SUFFIX);
-            if let Ok(hv) = HeaderValue::from_str(&merged) {
-                headers.insert(VARY, hv);
-                return;
+            const SUFFIX: &[u8] = b", Accept-Encoding";
+            let eb = existing.as_bytes();
+            let merged_len = eb.len().saturating_add(SUFFIX.len());
+            if merged_len <= 256 {
+                let mut buf = [0u8; 256];
+                if let Some((head, rest)) = buf.split_at_mut_checked(eb.len())
+                    && let Some(tail) = rest.get_mut(..SUFFIX.len())
+                {
+                    head.copy_from_slice(eb);
+                    tail.copy_from_slice(SUFFIX);
+                    if let Some(slice) = buf.get(..merged_len)
+                        && let Ok(hv) = HeaderValue::from_bytes(slice)
+                    {
+                        headers.insert(VARY, hv);
+                        return;
+                    }
+                }
+            } else {
+                let mut merged = Vec::with_capacity(merged_len);
+                merged.extend_from_slice(eb);
+                merged.extend_from_slice(SUFFIX);
+                if let Ok(hv) = HeaderValue::from_bytes(&merged) {
+                    headers.insert(VARY, hv);
+                    return;
+                }
             }
         }
     }
@@ -346,6 +371,9 @@ fn merge_vary_accept_encoding(headers: &mut HeaderMap) {
 
 /// The stored validator (ETag) for a cached entry, if any.
 pub(super) fn entry_etag(entry: &CachedResponse) -> Option<&str> {
+    if let Some(prebuilt) = &entry.prebuilt_headers {
+        return prebuilt.get(ETAG).and_then(|v| v.to_str().ok());
+    }
     entry
         .headers
         .iter()
@@ -368,7 +396,11 @@ fn hit_would_encode(
     accept_encoding: AcceptEncoding,
     compress: &Compress,
 ) -> bool {
-    if !compress.stored_encodable(&entry.headers) {
+    let encodable = match &entry.prebuilt_headers {
+        Some(pb) => pb.stored_encodable_or(|| compress.stored_encodable(&entry.headers)),
+        None => compress.stored_encodable(&entry.headers),
+    };
+    if !encodable {
         return false;
     }
     if pick_variant(entry, accept_encoding, compress, true).is_some() {
@@ -667,6 +699,7 @@ mod tests {
             status: 200,
             identity: "id".into(),
             headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+            prebuilt_headers: None,
             body: PageBody::InMem(Bytes::copy_from_slice(body)),
             variants: variants
                 .iter()

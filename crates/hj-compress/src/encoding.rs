@@ -33,11 +33,15 @@ impl Encoding {
     /// Returns `None` for `identity`, an empty/unknown token, or a multi-value
     /// list (which the caller should treat as "can't canonicalize").
     pub fn from_token(token: &str) -> Option<Encoding> {
-        match token.trim().to_ascii_lowercase().as_str() {
-            "gzip" | "x-gzip" => Some(Encoding::Gzip),
-            "br" => Some(Encoding::Brotli),
-            "zstd" => Some(Encoding::Zstd),
-            _ => None,
+        let t = token.trim();
+        if t.eq_ignore_ascii_case("gzip") || t.eq_ignore_ascii_case("x-gzip") {
+            Some(Encoding::Gzip)
+        } else if t.eq_ignore_ascii_case("br") {
+            Some(Encoding::Brotli)
+        } else if t.eq_ignore_ascii_case("zstd") {
+            Some(Encoding::Zstd)
+        } else {
+            None
         }
     }
 }
@@ -123,6 +127,66 @@ impl AcceptEncoding {
                 gzip: false,
                 empty: true,
             };
+        }
+        // O(1) fast path for canonical edge (`CF_SEND_ZSTD=1` -> "zstd") and browser strings.
+        match trimmed {
+            "zstd" => {
+                return AcceptEncoding {
+                    zstd: true,
+                    brotli: false,
+                    gzip: false,
+                    empty: false,
+                };
+            }
+            "gzip" => {
+                return AcceptEncoding {
+                    zstd: false,
+                    brotli: false,
+                    gzip: true,
+                    empty: false,
+                };
+            }
+            "br" => {
+                return AcceptEncoding {
+                    zstd: false,
+                    brotli: true,
+                    gzip: false,
+                    empty: false,
+                };
+            }
+            "gzip, deflate, br, zstd" | "gzip, br, zstd" | "zstd, br, gzip" => {
+                return AcceptEncoding {
+                    zstd: true,
+                    brotli: true,
+                    gzip: true,
+                    empty: false,
+                };
+            }
+            "gzip, deflate, br" | "br, gzip" | "gzip, br" => {
+                return AcceptEncoding {
+                    zstd: false,
+                    brotli: true,
+                    gzip: true,
+                    empty: false,
+                };
+            }
+            "gzip, deflate" => {
+                return AcceptEncoding {
+                    zstd: false,
+                    brotli: false,
+                    gzip: true,
+                    empty: false,
+                };
+            }
+            "identity" => {
+                return AcceptEncoding {
+                    zstd: false,
+                    brotli: false,
+                    gzip: false,
+                    empty: false,
+                };
+            }
+            _ => {}
         }
 
         // q for each coding if named explicitly; q for "*" if a wildcard appears.
@@ -300,8 +364,14 @@ pub fn decode_bytes_sized(
         }
         Encoding::Brotli => brotli_decode_exact(input, cap, out),
         Encoding::Zstd => {
-            // zstd::stream::read::Decoder implements Read; wrap with take() so
-            // the decompressor never writes more than MAX_DECODE bytes.
+            // Fast path: framed zstd with a known content size <= cap reuses the
+            // thread-local DCtx (avoiding a ~100 KiB context alloc + page-fault per call).
+            match crate::dict::decompress_plain_tls(input, cap, expected) {
+                Ok(Some(decoded)) => return Some(decoded),
+                Err(()) => return None,
+                Ok(None) => {}
+            }
+            // Streaming fallback for frames without a declared size (or > cap).
             let mut reader = zstd::stream::read::Decoder::new(input).ok()?;
             // (L5) Cap the back-reference window the decoder will pre-allocate at 16 MiB
             // (2^24). Every caller feeds httpjet's OWN encoder output (trusted) and zstd's

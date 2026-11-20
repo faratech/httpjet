@@ -1043,6 +1043,19 @@ fn parse_rule(rest: &str, conds: Vec<Cond>, line: usize) -> Result<Rule, Rewrite
             .iter()
             .any(|(k, v)| uses_dollar_backref(k) || uses_dollar_backref(v))
         || conds_need_rule_caps;
+    let needs_cond_caps = uses_percent_backref(&subst)
+        || flags
+            .env_sets
+            .iter()
+            .any(|(k, v)| uses_percent_backref(k) || uses_percent_backref(v))
+        || conds.iter().any(|c| {
+            uses_percent_backref(&c.test_string)
+                || matches!(
+                    &c.pattern,
+                    CondPattern::Lexical(_, rhs) | CondPattern::Numeric(_, rhs)
+                        if uses_percent_backref(rhs)
+                )
+        });
     let literal_prefix = extract_literal_prefix(&pattern_src, negate, flags.nocase);
     let match_total = recognize_total_match(&pattern_src, negate, flags.nocase);
     Ok(Rule {
@@ -1055,6 +1068,7 @@ fn parse_rule(rest: &str, conds: Vec<Cond>, line: usize) -> Result<Rule, Rewrite
         flags,
         prefilter_idx: None, // assigned by RuleSet::parse after all rules are parsed
         needs_rule_caps,
+        needs_cond_caps,
         conds_need_rule_caps,
         literal_prefix,
     })

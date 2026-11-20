@@ -60,7 +60,10 @@ fn total_match_shortcut_respects_newlines() {
 }
 
 fn ua_env(ht: &Htaccess, ua: &str) -> Vec<(String, String)> {
-    let header = |n: &str| n.eq_ignore_ascii_case("user-agent").then(|| ua.to_string());
+    let header = hj_rewrite::header_fn(|n: &str| {
+        n.eq_ignore_ascii_case("user-agent")
+            .then_some(std::borrow::Cow::Borrowed(ua))
+    });
     let attrs = ReqAttrs {
         request_uri: "/x",
         method: "GET",

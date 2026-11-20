@@ -36,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use dashmap::DashMap;
 use hashbrown::{HashMap as HbHashMap, HashSet as HbHashSet};
-use http::{HeaderName, HeaderValue};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use parking_lot::Mutex;
 
 use hj_cache::sharded::{
@@ -361,6 +361,46 @@ impl PageBody {
     }
 }
 
+/// Pre-built `HeaderMap` + cached `stored_encodable` verdict shared across every hit of a
+/// [`CachedResponse`] snapshot (0 header hashing and 0 linear header/type scans after hit #1).
+#[derive(Debug)]
+pub struct PrebuiltHeaders {
+    pub map: HeaderMap,
+    encodable: std::sync::atomic::AtomicU8,
+}
+
+impl PrebuiltHeaders {
+    pub fn new(map: HeaderMap) -> Self {
+        Self {
+            map,
+            encodable: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// Return the cached `stored_encodable` verdict, computing it once on first hit.
+    #[inline]
+    pub fn stored_encodable_or(&self, compute: impl FnOnce() -> bool) -> bool {
+        match self.encodable.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let v = compute();
+                self.encodable
+                    .store(if v { 2 } else { 1 }, Ordering::Relaxed);
+                v
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for PrebuiltHeaders {
+    type Target = HeaderMap;
+    #[inline]
+    fn deref(&self) -> &HeaderMap {
+        &self.map
+    }
+}
+
 /// A cached full-page response.
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
@@ -374,6 +414,10 @@ pub struct CachedResponse {
     /// Response headers to replay on a hit (the `X-LiteSpeed-*` control headers
     /// are already stripped before storing).
     pub headers: Vec<(HeaderName, HeaderValue)>,
+    /// Pre-built `HeaderMap` + cached `stored_encodable` materialized once when building
+    /// the shared serve snapshot from `MetaBlob`, so cache hits clone the contiguous
+    /// bucket table instead of re-hashing ~40 headers on every hit. `None` on freshly-constructed store inputs.
+    pub prebuilt_headers: Option<Arc<PrebuiltHeaders>>,
     pub body: PageBody,
     /// (PC1/PC2-lazy) Precompressed body variants by Content-Encoding token (e.g. "br",
     /// "gzip"). Filled LAZILY on the first cache HIT (not at store time) so compression
@@ -522,23 +566,14 @@ fn tag_vec_ram_bytes(tags: &Vec<Arc<str>>) -> u64 {
     vec_heap_bytes(tags) + tags.iter().map(|t| t.len() as u64).sum::<u64>()
 }
 
-fn decoded_meta_heap_bytes(decoded: &DecodedMeta) -> u64 {
-    page_key_heap_bytes(&decoded.key)
-        + string_heap_bytes(&decoded.identity)
-        + vec_heap_bytes(&decoded.headers)
-        + decoded
-            .headers
-            .iter()
-            .map(|(name, value)| name.as_str().len() as u64 + value.as_bytes().len() as u64)
-            .sum::<u64>()
-        + tag_vec_ram_bytes(&decoded.tags)
-        + string_heap_bytes(&decoded.vary_cookie_name)
-        + string_heap_bytes(&decoded.vary_value)
-}
-
 /// Resident heap of the shared serve snapshot (body/variants are accounted by their own
-/// `body_ram_bytes`/`variants_ram_bytes` terms; this covers only the rebuilt response shell).
+/// `body_ram_bytes`/`variants_ram_bytes` terms; this covers only the rebuilt response shell
+/// and its pre-built `HeaderMap` table).
 fn snapshot_heap_bytes(r: &CachedResponse) -> u64 {
+    let prebuilt = r
+        .prebuilt_headers
+        .as_ref()
+        .map_or(0, |_| size_of::<HeaderMap>() as u64);
     size_of::<CachedResponse>() as u64
         + string_heap_bytes(&r.identity)
         + vec_heap_bytes(&r.headers)
@@ -546,6 +581,7 @@ fn snapshot_heap_bytes(r: &CachedResponse) -> u64 {
             .iter()
             .map(|(name, value)| name.as_str().len() as u64 + value.as_bytes().len() as u64)
             .sum::<u64>()
+        + prebuilt
         + tag_vec_ram_bytes(&r.tags)
         + string_heap_bytes(&r.vary_cookie_name)
         + string_heap_bytes(&r.vary_value)
@@ -642,22 +678,19 @@ impl Drop for SnapshotLeaseOwner {
 struct Node {
     // ---- payload (UNCHANGED from the old ResidentEntry) ----
     meta: MetaBlob,
-    /// Lazily-memoized decode of `meta`, populated on the FIRST hit and reused for every
-    /// subsequent one. Cold / rarely-served entries never populate it, so the compressed-only
-    /// resident footprint is preserved for the long tail; only entries proven hot by being
-    /// served pay the (one-time) decode + hold the decoded form. The `Node` is owned by its
-    /// shard and only ever touched under the shard lock, so the `OnceLock` need not be behind
-    /// an `Arc`.
-    decoded: OnceLock<DecodedMeta>,
+    /// Lazily-memoized key decoded from `meta` on the FIRST hit (headers, identity,
+    /// tags, and vary strings move directly into `resp_snapshot` with zero cloning
+    /// and zero duplicate RAM residency).
+    decoded_key: OnceLock<PageCacheKey>,
     /// Per-node SERVE SNAPSHOT: the fully built `CachedResponse` shared by every hit of
-    /// this node version. Built eagerly at store time and after any invalidation; a hit
+    /// this node version. Built lazily on first hit and after any invalidation; a hit
     /// costs an Arc refcount bump instead of rebuilding + cloning headers/identity/tags/
     /// vary strings under the shard lock. INVARIANT: any post-install mutation of
     /// `body`/`variants`/`variants_filled`/`dict_gen` MUST call `invalidate_snapshot`
     /// (the next hit rebuilds from the mutated fields); missing it serves stale bytes.
     resp_snapshot: OnceLock<Arc<CachedResponse>>,
     // Allocated only when an external finalized-response memo requests a lease.
-    snapshot_lease: Option<SnapshotLeaseOwner>,
+    snapshot_lease: OnceLock<SnapshotLeaseOwner>,
     /// Plaintext copy of the purge tags, denormalized off the encoded `meta` so [`StoreEvict`]
     /// can drop this key from the tag index WITHOUT decoding `meta` (a decode failure on a corrupt
     /// blob would otherwise strand the key in its tag sets forever).
@@ -683,7 +716,7 @@ impl CacheValue for Node {
     /// payloads/capacities visible from the current fields. Hidden allocator and
     /// hash-table bucket overhead is reported separately as process/RSS gap metrics.
     fn ram_weight(&self) -> u64 {
-        let decoded = self.decoded.get().map(decoded_meta_heap_bytes).unwrap_or(0);
+        let decoded = self.decoded_key.get().map(page_key_heap_bytes).unwrap_or(0);
         let snap = self
             .resp_snapshot
             .get()
@@ -696,7 +729,11 @@ impl CacheValue for Node {
             + variants_ram_bytes(&self.variants)
             + decoded
             + snap
-            + if self.snapshot_lease.is_some() { 24 } else { 0 }
+            + if self.snapshot_lease.get().is_some() {
+                24
+            } else {
+                0
+            }
     }
 
     /// Disk (tmpfs) bytes: the charged file-tier footprint of a File body, else 0.
@@ -733,9 +770,9 @@ impl Node {
         let meta = MetaBlob::encode(key, &entry)?;
         let node = Node {
             meta,
-            decoded: OnceLock::new(),
+            decoded_key: OnceLock::new(),
             resp_snapshot: OnceLock::new(),
-            snapshot_lease: None,
+            snapshot_lease: OnceLock::new(),
             tags: entry.tags.clone(),
             body: entry.body,
             variants: entry.variants,
@@ -757,15 +794,8 @@ impl Node {
     /// Build (and install) the shared serve snapshot from current fields. Caller holds the
     /// shard lock. Returns a clone for immediate use.
     fn build_snapshot(&self) -> Result<Arc<CachedResponse>, MetaError> {
-        let decoded = match self.decoded.get() {
-            Some(d) => d,
-            None => {
-                let d = self.meta.decode()?;
-                let _ = self.decoded.set(d);
-                self.decoded.get().expect("OnceLock populated after set")
-            }
-        };
-        let resp = Arc::new(decoded.to_cached_response(
+        let decoded = self.meta.decode()?;
+        let (key, cached) = decoded.into_cached_response(
             self.body.clone(),
             self.variants.clone(),
             self.variants_filled,
@@ -774,7 +804,9 @@ impl Node {
             self.ttl,
             self.swr,
             self.sie,
-        ));
+        );
+        let _ = self.decoded_key.set(key);
+        let resp = Arc::new(cached);
         let _ = self.resp_snapshot.set(Arc::clone(&resp));
         Ok(resp)
     }
@@ -783,7 +815,7 @@ impl Node {
     /// the next hit rebuilds it from the mutated fields (one rebuild per mutation —
     /// mutations are rare relative to hits).
     fn invalidate_snapshot(&mut self) {
-        self.snapshot_lease = None;
+        self.snapshot_lease = OnceLock::new();
         self.resp_snapshot = OnceLock::new();
     }
 
@@ -809,10 +841,7 @@ impl Node {
     /// ([`Self::build_snapshot`]) does — or every stored entry carries it (and its RAM charge)
     /// for its whole life, although most entries are never served.
     fn with_decoded<R>(&self, inspect: impl FnOnce(&DecodedMeta) -> R) -> Result<R, MetaError> {
-        match self.decoded.get() {
-            Some(decoded) => Ok(inspect(decoded)),
-            None => self.meta.decode().map(|decoded| inspect(&decoded)),
-        }
+        self.meta.decode().map(|decoded| inspect(&decoded))
     }
 }
 
@@ -835,54 +864,63 @@ fn ms_saturating(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Cache-line-padded wrapper to prevent false sharing across `HotTier` shards
+/// and its shared byte counter.
+#[repr(align(128))]
+struct PaddedHot<T>(T);
+
 /// A small standalone sharded LRU of `body_id -> Bytes` in front of the file store.
 /// Pure derived cache (losing one costs a tmpfs re-read, never correctness), with NO
 /// teardown coupling to files — so it is the simplest possible thing. `time_to_idle`
 /// is enforced lazily on the maintenance tick (`evict_idle`).
 struct HotTier {
-    shards: Box<[Mutex<HotShard>]>,
+    shards: Box<[PaddedHot<Mutex<HotShard>>]>,
     max_bytes: u64,
-    used_bytes: AtomicU64,
+    used_bytes: PaddedHot<AtomicU64>,
     tti: Duration,
 }
 
 struct HotShard {
-    /// FxHash: keys are process-local body ids, never client input, and a hit pays
-    /// several probes (the #273 reasoning for the main cache's shards).
-    map: HashMap<u64, HotNode, rustc_hash::FxBuildHasher>,
-    head: u64,
-    tail: u64,
+    /// FxHash: keys are process-local body ids, never client input. Maps body_id -> slab idx
+    /// so LRU touches pay 0 extra HashMap probes (8 -> 1 per hit).
+    map: HashMap<u64, u32, rustc_hash::FxBuildHasher>,
+    slots: Vec<Option<HotNode>>,
+    free: Vec<u32>,
+    head: u32,
+    tail: u32,
     bytes: u64,
 }
 
 struct HotNode {
+    body_id: u64,
     body: Bytes,
     last: Instant,
-    prev: u64,
-    next: u64,
+    prev: u32,
+    next: u32,
 }
 
-/// `u64::MAX` is the hot-LRU NIL terminator. `body_id` is allocated from a counter
-/// starting at 1, so it never reaches this.
-const HOT_NIL: u64 = u64::MAX;
+/// `u32::MAX` is the hot-LRU NIL slab terminator.
+const HOT_NIL: u32 = u32::MAX;
 
 impl HotTier {
     fn new(max_bytes: u64, tti: Duration) -> Self {
         let shards = (0..SHARDS)
             .map(|_| {
-                Mutex::new(HotShard {
+                PaddedHot(Mutex::new(HotShard {
                     map: HashMap::default(),
+                    slots: Vec::new(),
+                    free: Vec::new(),
                     head: HOT_NIL,
                     tail: HOT_NIL,
                     bytes: 0,
-                })
+                }))
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         HotTier {
             shards,
             max_bytes,
-            used_bytes: AtomicU64::new(0),
+            used_bytes: PaddedHot(AtomicU64::new(0)),
             tti,
         }
     }
@@ -902,18 +940,29 @@ impl HotTier {
     }
 
     fn get(&self, body_id: u64, now: Instant) -> Option<Bytes> {
-        let mut s = self.shards[Self::shard_idx(body_id)].lock();
-        let body = s.map.get(&body_id)?.body.clone();
-        s.touch(body_id, now);
+        let mut s = self.shards[Self::shard_idx(body_id)].0.lock();
+        let idx = *s.map.get(&body_id)?;
+        let (body, stale_touch) = {
+            let n = s.node(idx)?;
+            (
+                n.body.clone(),
+                now.saturating_duration_since(n.last) >= Duration::from_secs(1),
+            )
+        };
+        if stale_touch {
+            s.touch_idx(idx, now);
+        }
         Some(body)
     }
 
     fn insert(&self, body_id: u64, body: Bytes, now: Instant) {
         let budget = self.budget_per_shard();
-        let mut s = self.shards[Self::shard_idx(body_id)].lock();
+        let mut s = self.shards[Self::shard_idx(body_id)].0.lock();
         let old_weight = s
             .map
             .get(&body_id)
+            .copied()
+            .and_then(|idx| s.node(idx))
             .map(|node| Self::weight(body_id, &node.body))
             .unwrap_or(0);
         let new_weight = Self::weight(body_id, &body);
@@ -925,13 +974,13 @@ impl HotTier {
                 return;
             }
             let mut victim = s.tail;
-            if victim == body_id {
-                victim = s.map.get(&victim).map(|node| node.prev).unwrap_or(HOT_NIL);
+            if victim != HOT_NIL && s.node(victim).is_some_and(|n| n.body_id == body_id) {
+                victim = s.node(victim).map(|node| node.prev).unwrap_or(HOT_NIL);
             }
             if victim == HOT_NIL {
                 return;
             }
-            let removed = s.remove(victim);
+            let removed = s.remove_idx(victim);
             self.release_weight(removed);
         }
         s.insert(body_id, body, now);
@@ -940,33 +989,37 @@ impl HotTier {
     }
 
     fn invalidate(&self, body_id: u64) {
-        let mut s = self.shards[Self::shard_idx(body_id)].lock();
+        let mut s = self.shards[Self::shard_idx(body_id)].0.lock();
         let removed = s.remove(body_id);
         self.release_weight(removed);
     }
 
     fn evict_idle(&self, now: Instant) {
         for sh in self.shards.iter() {
-            let mut s = sh.lock();
-            let stale: Vec<u64> = s
+            let mut s = sh.0.lock();
+            let stale: Vec<u32> = s
                 .map
-                .iter()
-                .filter(|(_, n)| now.duration_since(n.last) >= self.tti)
-                .map(|(k, _)| *k)
+                .values()
+                .copied()
+                .filter(|&idx| {
+                    s.node(idx)
+                        .is_some_and(|n| now.duration_since(n.last) >= self.tti)
+                })
                 .collect();
-            for id in stale {
-                let removed = s.remove(id);
+            for idx in stale {
+                let removed = s.remove_idx(idx);
                 self.release_weight(removed);
             }
         }
     }
 
     fn bytes(&self) -> u64 {
-        self.used_bytes.load(Ordering::Relaxed)
+        self.used_bytes.0.load(Ordering::Relaxed)
     }
 
     fn try_replace_weight(&self, old_weight: u64, new_weight: u64) -> bool {
         self.used_bytes
+            .0
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 used.saturating_sub(old_weight)
                     .checked_add(new_weight)
@@ -981,6 +1034,7 @@ impl HotTier {
         }
         let _ = self
             .used_bytes
+            .0
             .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(weight))
             });
@@ -988,97 +1042,128 @@ impl HotTier {
 }
 
 impl HotShard {
-    fn push_front(&mut self, id: u64) {
+    #[inline]
+    fn node(&self, idx: u32) -> Option<&HotNode> {
+        self.slots.get(idx as usize).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    fn node_mut(&mut self, idx: u32) -> Option<&mut HotNode> {
+        self.slots.get_mut(idx as usize).and_then(Option::as_mut)
+    }
+
+    fn alloc_slot(&mut self, node: HotNode) -> Option<u32> {
+        if let Some(idx) = self.free.pop() {
+            if let Some(slot) = self.slots.get_mut(idx as usize) {
+                *slot = Some(node);
+                return Some(idx);
+            }
+        }
+        let idx = u32::try_from(self.slots.len()).ok()?;
+        if idx == HOT_NIL {
+            return None;
+        }
+        self.slots.push(Some(node));
+        Some(idx)
+    }
+
+    fn push_front_idx(&mut self, idx: u32) {
         let old = self.head;
-        if let Some(n) = self.map.get_mut(&id) {
+        if let Some(n) = self.node_mut(idx) {
             n.prev = HOT_NIL;
             n.next = old;
         }
         if old != HOT_NIL {
-            if let Some(o) = self.map.get_mut(&old) {
-                o.prev = id;
+            if let Some(o) = self.node_mut(old) {
+                o.prev = idx;
             }
         } else {
-            self.tail = id;
+            self.tail = idx;
         }
-        self.head = id;
+        self.head = idx;
     }
 
-    fn unlink(&mut self, id: u64) {
-        let (prev, next) = match self.map.get(&id) {
-            Some(n) => (n.prev, n.next),
-            None => return,
+    fn unlink_idx(&mut self, idx: u32) {
+        let Some((prev, next)) = self.node(idx).map(|n| (n.prev, n.next)) else {
+            return;
         };
         if prev != HOT_NIL {
-            if let Some(p) = self.map.get_mut(&prev) {
+            if let Some(p) = self.node_mut(prev) {
                 p.next = next;
             }
         } else {
             self.head = next;
         }
         if next != HOT_NIL {
-            if let Some(nx) = self.map.get_mut(&next) {
+            if let Some(nx) = self.node_mut(next) {
                 nx.prev = prev;
             }
         } else {
             self.tail = prev;
         }
-        if let Some(n) = self.map.get_mut(&id) {
+        if let Some(n) = self.node_mut(idx) {
             n.prev = HOT_NIL;
             n.next = HOT_NIL;
         }
     }
 
-    fn touch(&mut self, id: u64, now: Instant) {
-        if let Some(n) = self.map.get_mut(&id) {
+    fn touch_idx(&mut self, idx: u32, now: Instant) {
+        if let Some(n) = self.node_mut(idx) {
             n.last = now;
         }
-        if self.head == id {
+        if self.head == idx {
             return;
         }
-        self.unlink(id);
-        self.push_front(id);
+        self.unlink_idx(idx);
+        self.push_front_idx(idx);
     }
 
     fn insert(&mut self, id: u64, body: Bytes, now: Instant) {
-        if self.map.contains_key(&id) {
-            self.remove(id);
+        if let Some(&old_idx) = self.map.get(&id) {
+            self.remove_idx(old_idx);
         }
         let w = HotTier::weight(id, &body);
-        self.map.insert(
-            id,
-            HotNode {
-                body,
-                last: now,
-                prev: HOT_NIL,
-                next: HOT_NIL,
-            },
-        );
+        let Some(idx) = self.alloc_slot(HotNode {
+            body_id: id,
+            body,
+            last: now,
+            prev: HOT_NIL,
+            next: HOT_NIL,
+        }) else {
+            return;
+        };
+        self.map.insert(id, idx);
         self.bytes += w;
-        self.push_front(id);
+        self.push_front_idx(idx);
     }
 
     fn remove(&mut self, id: u64) -> u64 {
-        if !self.map.contains_key(&id) {
+        let Some(&idx) = self.map.get(&id) else {
             return 0;
-        }
-        self.unlink(id);
-        if let Some(n) = self.map.remove(&id) {
-            let weight = HotTier::weight(id, &n.body);
-            self.bytes -= weight;
-            return weight;
-        }
-        0
+        };
+        self.remove_idx(idx)
+    }
+
+    fn remove_idx(&mut self, idx: u32) -> u64 {
+        self.unlink_idx(idx);
+        let Some(n) = self.slots.get_mut(idx as usize).and_then(Option::take) else {
+            return 0;
+        };
+        self.free.push(idx);
+        self.map.remove(&n.body_id);
+        let weight = HotTier::weight(n.body_id, &n.body);
+        self.bytes = self.bytes.saturating_sub(weight);
+        weight
     }
 
     fn enforce(&mut self, budget: u64, protect: u64) -> u64 {
         let mut removed = 0;
         while self.bytes > budget {
             let t = self.tail;
-            if t == HOT_NIL || t == protect {
+            if t == HOT_NIL || self.node(t).is_some_and(|n| n.body_id == protect) {
                 break;
             }
-            removed += self.remove(t);
+            removed += self.remove_idx(t);
         }
         removed
     }
@@ -1641,7 +1726,7 @@ impl OnEvict<CacheKeyId, CacheEntry> for StoreEvict {
     fn on_evict(&self, id: &CacheKeyId, entry: &CacheEntry, cause: EvictCause) {
         match entry {
             CacheEntry::Page(node) => {
-                if let Some(lease) = node.snapshot_lease.as_ref() {
+                if let Some(lease) = node.snapshot_lease.get() {
                     lease.0.revoke();
                 }
                 if cause == EvictCause::Disk {
@@ -2378,7 +2463,23 @@ impl PageStore {
         key: &PageCacheKey,
         expected: &Arc<CachedResponse>,
     ) -> Option<SnapshotLease> {
-        let id = CacheKeyId::new(key);
+        self.lease_snapshot_by_id(CacheKeyId::new(key), expected)
+    }
+
+    /// [`lease_snapshot`](Self::lease_snapshot) with a precomputed `key_hash`.
+    pub fn lease_snapshot_hashed(
+        &self,
+        key_hash: u64,
+        expected: &Arc<CachedResponse>,
+    ) -> Option<SnapshotLease> {
+        self.lease_snapshot_by_id(CacheKeyId::from_raw_page_hash(key_hash), expected)
+    }
+
+    fn lease_snapshot_by_id(
+        &self,
+        id: CacheKeyId,
+        expected: &Arc<CachedResponse>,
+    ) -> Option<SnapshotLease> {
         let mut result = None;
         self.inner.with_shard(&id, |access| {
             let Some(node) = access.get(&id).and_then(CacheEntry::as_page) else {
@@ -2391,19 +2492,16 @@ impl PageStore {
             {
                 return;
             }
-            if let Some(lease) = node.snapshot_lease.as_ref() {
+            if let Some(lease) = node.snapshot_lease.get() {
                 result = Some(lease.0.clone());
                 return;
             }
-            access.mutate(&id, |entry| {
-                let CacheEntry::Page(node) = entry else {
-                    return false;
-                };
-                let lease = SnapshotLease(Arc::new(AtomicBool::new(true)));
-                result = Some(lease.clone());
-                node.snapshot_lease = Some(SnapshotLeaseOwner(lease));
-                true
-            });
+            let lease = SnapshotLease(Arc::new(AtomicBool::new(true)));
+            let _ = node.snapshot_lease.set(SnapshotLeaseOwner(lease.clone()));
+            result = Some(lease);
+            // Reweigh via `reconcile_weights` instead of `mutate` so no duplicate
+            // deadline-heap entry is pushed.
+            let _ = access.reconcile_weights(&id, &id);
         });
         result.filter(SnapshotLease::is_current)
     }
@@ -2532,7 +2630,7 @@ impl PageStore {
     /// for the exact URL it was built for. A key collision degrades to a miss,
     /// never the wrong page. A fully-gone entry is invalidated lazily.
     pub fn get_entry(&self, key: &PageCacheKey, identity: &str, now: Instant) -> EntryState {
-        self.get_entry_inner(key, CacheKeyId::new(key), identity, now, true)
+        self.get_entry_inner(&key.as_ref(), CacheKeyId::new(key), identity, now, true)
     }
 
     /// [`get_entry`](Self::get_entry) with a caller-supplied raw page hash (`crate::key_hash`)
@@ -2543,6 +2641,23 @@ impl PageStore {
         &self,
         key_hash: u64,
         key: &PageCacheKey,
+        identity: &str,
+        now: Instant,
+    ) -> EntryState {
+        self.get_entry_inner(
+            &key.as_ref(),
+            CacheKeyId::from_raw_page_hash(key_hash),
+            identity,
+            now,
+            true,
+        )
+    }
+
+    /// Borrowed-key equivalent of [`get_entry_hashed`](Self::get_entry_hashed).
+    pub fn get_entry_hashed_ref(
+        &self,
+        key_hash: u64,
+        key: &crate::key::PageCacheKeyRef<'_>,
         identity: &str,
         now: Instant,
     ) -> EntryState {
@@ -2563,6 +2678,23 @@ impl PageStore {
         &self,
         key_hash: u64,
         key: &PageCacheKey,
+        identity: &str,
+        now: Instant,
+    ) -> EntryState {
+        self.get_entry_inner(
+            &key.as_ref(),
+            CacheKeyId::from_raw_page_hash(key_hash),
+            identity,
+            now,
+            false,
+        )
+    }
+
+    /// Borrowed-key equivalent of [`get_entry_hashed_uncounted`](Self::get_entry_hashed_uncounted).
+    pub fn get_entry_hashed_uncounted_ref(
+        &self,
+        key_hash: u64,
+        key: &crate::key::PageCacheKeyRef<'_>,
         identity: &str,
         now: Instant,
     ) -> EntryState {
@@ -2589,12 +2721,12 @@ impl PageStore {
         identity: &str,
         now: Instant,
     ) -> EntryState {
-        self.get_entry_inner(key, CacheKeyId::new(key), identity, now, false)
+        self.get_entry_inner(&key.as_ref(), CacheKeyId::new(key), identity, now, false)
     }
 
     fn get_entry_inner(
         &self,
-        key: &PageCacheKey,
+        key: &crate::key::PageCacheKeyRef<'_>,
         id: CacheKeyId,
         identity: &str,
         now: Instant,
@@ -2633,7 +2765,10 @@ impl PageStore {
                     let snap = node.resp_snapshot.get().expect("snapshot built above");
                     (
                         Arc::clone(snap),
-                        &node.decoded.get().expect("decoded during build").key == key,
+                        node.decoded_key
+                            .get()
+                            .expect("decoded during build")
+                            .eq_ref(key),
                         snap.identity == identity,
                         matches!(snap.body, PageBody::File { .. }),
                     )
@@ -2661,8 +2796,10 @@ impl PageStore {
                     );
                     return None;
                 }
-                acc.touch_ram(&id);
-                if body_is_file && matches!(fresh, Freshness::Fresh | Freshness::Stale) { acc.touch_disk(&id); }
+                acc.touch_ram_and_disk(
+                    &id,
+                    body_is_file && matches!(fresh, Freshness::Fresh | Freshness::Stale),
+                );
                 Some((fresh, snap))
             });
         match outcome {
@@ -2814,6 +2951,7 @@ impl PageStore {
             status: se.status,
             identity: se.identity.clone(),
             headers: se.headers.clone(),
+            prebuilt_headers: None,
             body: PageBody::File {
                 path: Arc::from(se.path.as_path()),
                 len: se.body_len,
@@ -2958,7 +3096,8 @@ impl PageStore {
                     }
                 }
             }
-            if !acc.contains(&id) {
+            let had_predecessor = acc.contains(&id);
+            if !had_predecessor {
                 previous_tags.clear();
             }
 
@@ -2972,6 +3111,7 @@ impl PageStore {
                     provisional_tags.push(tag.clone());
                 }
             }
+            #[cfg(test)]
             if self.purged_after(&tags, render_epoch) {
                 self.store_purge_rejections.fetch_add(1, Ordering::Relaxed);
                 for tag in &provisional_tags {
@@ -3013,6 +3153,7 @@ impl PageStore {
                     }
                 }
             }
+            #[cfg(test)]
             if self.purged_after(&tags, render_epoch) {
                 self.store_purge_rejections.fetch_add(1, Ordering::Relaxed);
                 for tag in &provisional_tags {
@@ -3020,8 +3161,9 @@ impl PageStore {
                 }
                 return false;
             }
-            // Install (tears down any same-key predecessor first), then register THIS node's tags
-            // (after the predecessor's GC), then enforce budgets with the just-inserted key
+            // Install (tears down any same-key predecessor first), then re-register THIS node's
+            // tags when a predecessor was torn down (fresh stores already registered all tags in
+            // the provisional loop above), then enforce budgets with the just-inserted key
             // protected.
             if !acc.insert_replacing(&id, CacheEntry::Page(node)) {
                 for tag in &provisional_tags {
@@ -3029,13 +3171,16 @@ impl PageStore {
                 }
                 return false;
             }
-            for tag in &tags {
-                self.tag_index.insert(tag.clone(), id);
+            if had_predecessor {
+                for tag in &tags {
+                    self.tag_index.insert(tag.clone(), id);
+                }
             }
             acc.enforce_budgets(&id);
             if !acc.contains(&id) {
                 return false;
             }
+            #[cfg(test)]
             if self.purged_after(&tags, render_epoch) {
                 self.store_purge_rejections.fetch_add(1, Ordering::Relaxed);
                 acc.teardown(&id, EvictCause::Explicit);
@@ -3242,10 +3387,10 @@ impl PageStore {
                     // The container rebuild needs the full response, so decode transiently:
                     // this is a background re-encode, not a hit, and must not pin the decode.
                     let is_file = matches!(node.body, PageBody::File { .. });
-                    let view = node.with_decoded(|d| {
+                    let view = node.meta.decode().map(|d| {
                         (d.key == *key && d.identity == identity).then(|| {
                             is_file.then(|| {
-                                d.to_cached_response(
+                                d.into_cached_response(
                                     node.body.clone(),
                                     node.variants.clone(),
                                     node.variants_filled,
@@ -3255,6 +3400,7 @@ impl PageStore {
                                     node.swr,
                                     node.sie,
                                 )
+                                .1
                             })
                         })
                     });
@@ -3421,6 +3567,7 @@ impl PageStore {
                 status: se.status,
                 identity: se.identity.clone(),
                 headers: se.headers.clone(),
+                prebuilt_headers: None,
                 body: PageBody::File {
                     path: Arc::from(se.path.as_path()),
                     len: se.body_len,
@@ -4117,7 +4264,7 @@ impl PageStore {
             };
             meta_compressed_bytes += e.meta.compressed_len() as u64;
             meta_raw_bytes += e.meta.raw_len() as u64;
-            if e.decoded.get().is_some() {
+            if e.decoded_key.get().is_some() {
                 decoded_entries += 1;
             }
         });
@@ -4566,6 +4713,7 @@ mod tests {
                 http::header::CONTENT_TYPE,
                 HeaderValue::from_static("text/html"),
             )],
+            prebuilt_headers: None,
             body: PageBody::InMem(Bytes::copy_from_slice(body)),
             variants: Vec::new(),
             variants_filled: false,
@@ -4703,7 +4851,7 @@ mod tests {
         let probe = Node::from_cached(&key, cached.clone(), 0).unwrap();
         let compressed_only_weight = probe.ram_weight();
         probe.build_snapshot().unwrap();
-        assert!(probe.decoded.get().is_some());
+        assert!(probe.decoded_key.get().is_some());
         assert!(
             probe.ram_weight() > compressed_only_weight,
             "decoded metadata must add a resident RAM charge"
@@ -4938,7 +5086,7 @@ mod tests {
         let mut n = 0;
         s.inner.for_each(|_, e| {
             if let Some(e) = e.as_page() {
-                if e.decoded.get().is_some() {
+                if e.decoded_key.get().is_some() {
                     n += 1;
                 }
             }
@@ -5172,7 +5320,10 @@ mod tests {
         );
         assert_eq!(hot.bytes(), 4 * 1024);
         assert_eq!(
-            hot.shards.iter().map(|s| s.lock().map.len()).sum::<usize>(),
+            hot.shards
+                .iter()
+                .map(|s| s.0.lock().map.len())
+                .sum::<usize>(),
             4
         );
         hot.insert(100, Bytes::from(vec![0; 960]), now);

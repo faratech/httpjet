@@ -18,15 +18,15 @@ use http::header::{CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue};
 /// Hop-by-hop headers that must never be forwarded across a proxy hop
 /// (RFC 7230 §6.1). `Upgrade` is handled specially: it is stripped for ordinary
 /// requests but preserved for WebSocket upgrades (see [`is_websocket_upgrade`]).
-pub(crate) const HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
+pub(crate) const HOP_BY_HOP: [HeaderName; 8] = [
+    CONNECTION,
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-authenticate"),
+    HeaderName::from_static("proxy-authorization"),
+    HeaderName::from_static("te"),
+    HeaderName::from_static("trailer"),
+    HeaderName::from_static("transfer-encoding"),
+    http::header::UPGRADE,
 ];
 
 /// Remove all hop-by-hop headers from `headers`.
@@ -66,14 +66,14 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
         headers.remove(&name);
     }
 
-    for h in HOP_BY_HOP {
-        if keep_upgrade && (*h == "upgrade" || *h == "connection") {
+    for h in &HOP_BY_HOP {
+        if keep_upgrade && *h == http::header::UPGRADE {
             continue;
         }
-        // remove() with a &str target requires a HeaderName; build once.
-        if let Ok(name) = HeaderName::from_bytes(h.as_bytes()) {
-            headers.remove(&name);
-        }
+        headers.remove(h);
+    }
+    if keep_upgrade {
+        headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
     }
 
     // Strip any Proxy-* headers (Proxy-Connection and friends are non-standard
@@ -94,22 +94,21 @@ pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap, keep_upgrade: bool) {
 /// True if these request headers represent a WebSocket upgrade
 /// (`Upgrade: websocket` + a `Connection` token containing `upgrade`).
 pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
-    let upgrade_ws = headers
-        .get(http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false);
+    let upgrade_ws = headers.get_all(http::header::UPGRADE).iter().any(|v| {
+        v.to_str().ok().is_some_and(|s| {
+            s.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+        })
+    });
     if !upgrade_ws {
         return false;
     }
-    headers
-        .get(CONNECTION)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
+    headers.get_all(CONNECTION).iter().any(|v| {
+        v.to_str().ok().is_some_and(|s| {
+            s.split(',')
                 .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
         })
-        .unwrap_or(false)
+    })
 }
 
 /// Remove every client-controlled spelling commonly interpreted as forwarding
@@ -117,9 +116,8 @@ pub fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
 /// proxy and resolved `ReqCtx::client_ip`; downstream applications must see
 /// only that canonical result, never an attacker-chosen alias.
 fn strip_forwarding_authority(headers: &mut HeaderMap) {
-    for name in hj_core::FORWARDING_AUTHORITY_HEADERS {
-        headers.remove(*name);
-    }
+    // Single pass over present keys (eliminates ~10 blind remove probes + a second key scan;
+    // `is_forwarding_authority_header` already covers `FORWARDING_AUTHORITY_HEADERS`).
     let synonyms: Vec<HeaderName> = headers
         .keys()
         .filter(|name| hj_core::is_forwarding_authority_header(name.as_str()))
@@ -141,30 +139,39 @@ fn strip_forwarding_authority(headers: &mut HeaderMap) {
 /// - set `X-Real-IP` to `ctx.client_ip`,
 /// - leave the original `Host` header untouched.
 pub(crate) fn rewrite_request_headers(headers: &mut HeaderMap, ctx: &ReqCtx, keep_upgrade: bool) {
-    // Capture the inbound Host before we touch anything, for X-Forwarded-Host.
-    let inbound_host = headers
-        .get(HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
+    // Capture the inbound Host before we touch anything, for X-Forwarded-Host
+    // (shallow HeaderValue clone avoids String alloc + HeaderValue re-validation).
+    let inbound_host = headers.get(HOST).filter(|v| v.to_str().is_ok()).cloned();
 
     strip_hop_by_hop(headers, keep_upgrade);
     strip_forwarding_authority(headers);
 
-    if let Ok(val) = HeaderValue::from_str(&ctx.client_ip.to_string()) {
+    // Format IP into a stack buffer (IPv6 max length is 45 bytes) to avoid a heap String.
+    let mut ip_buf = [0u8; 48];
+    let ip_len = {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(&mut ip_buf[..]);
+        if write!(cursor, "{}", ctx.client_ip).is_ok() {
+            cursor.position() as usize
+        } else {
+            0
+        }
+    };
+    if let Some(ip_bytes) = ip_buf.get(..ip_len)
+        && !ip_bytes.is_empty()
+        && let Ok(val) = HeaderValue::from_bytes(ip_bytes)
+    {
         headers.insert(HeaderName::from_static("x-forwarded-for"), val.clone());
         headers.insert(HeaderName::from_static("x-real-ip"), val);
     }
 
-    let proto = if ctx.is_tls { "https" } else { "http" };
     headers.insert(
         HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_static(if proto == "https" { "https" } else { "http" }),
+        HeaderValue::from_static(if ctx.is_tls { "https" } else { "http" }),
     );
 
-    if let Some(host) = inbound_host {
-        if let Ok(val) = HeaderValue::from_str(&host) {
-            headers.insert(HeaderName::from_static("x-forwarded-host"), val);
-        }
+    if let Some(val) = inbound_host {
+        headers.insert(HeaderName::from_static("x-forwarded-host"), val);
     }
 }
 
@@ -441,5 +448,27 @@ mod tests {
         strip_hop_by_hop(&mut h, false);
         assert!(!h.contains_key(http::header::UPGRADE));
         assert!(!h.contains_key(CONNECTION));
+    }
+
+    #[test]
+    fn websocket_upgrade_normalizes_connection_and_handles_split_headers() {
+        let mut h = HeaderMap::new();
+        h.append(CONNECTION, HeaderValue::from_static("keep-alive"));
+        h.append(
+            CONNECTION,
+            HeaderValue::from_static("Upgrade, X-Forwarded-For, X-Real-IP"),
+        );
+        h.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        assert!(is_websocket_upgrade(&h));
+        let ctx = dummy_ctx("10.0.0.1".parse().unwrap(), false);
+        rewrite_request_headers(&mut h, &ctx, true);
+        let conn_vals: Vec<_> = h
+            .get_all(CONNECTION)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(conn_vals, vec!["upgrade"]);
+        assert!(h.contains_key("x-forwarded-for"));
+        assert!(h.contains_key("x-real-ip"));
     }
 }

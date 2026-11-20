@@ -328,7 +328,8 @@ impl HtaccessCache {
         request_path: &str,
         access_file_name: &str,
     ) -> (Vec<(PathBuf, Arc<Htaccess>)>, Instant) {
-        let mut deadline = Instant::now() + self.revalidate_ttl;
+        let now = Instant::now();
+        let mut deadline = now + self.revalidate_ttl;
         let mut chain = Vec::new();
 
         // The directories to check, in order: docroot, docroot/seg1, ... up to the directory
@@ -347,23 +348,31 @@ impl HtaccessCache {
             seg_count.saturating_sub(1)
         };
         if dir_count >= MAX_CHAIN_DEPTH {
-            return (
-                vec![(docroot.to_path_buf(), deny_all_sentinel())],
-                Instant::now(),
-            );
+            return (vec![(docroot.to_path_buf(), deny_all_sentinel())], now);
         }
 
         // A directory that does not exist ends the walk: nothing beneath it can hold an
         // access file. Front-controller URLs (`/threads/slug.123/`) name directories that
         // never exist, and walking (and memoizing) every such level used to fill the
         // cache with one entry per URL.
-        let mut cur = docroot.to_path_buf();
+        thread_local! {
+            static WALK_SCRATCH: std::cell::RefCell<PathBuf> =
+                const { std::cell::RefCell::new(PathBuf::new()) };
+        }
+        let mut cur = WALK_SCRATCH.with(|cell| {
+            cell.try_borrow_mut()
+                .map(|mut b| std::mem::take(&mut *b))
+                .unwrap_or_default()
+        });
+        cur.clear();
+        cur.push(docroot);
         let segs = rel.split('/').filter(|s| !s.is_empty()).take(dir_count);
         for seg in std::iter::once(None).chain(segs.map(Some)) {
             if let Some(seg) = seg {
                 cur.push(seg);
             }
-            let (parsed, dir_missing, checked_until) = self.load(&cur, access_file_name);
+            let (parsed, dir_missing, checked_until) =
+                self.load_at(&mut cur, access_file_name, now);
             deadline = deadline.min(checked_until);
             if let Some(h) = parsed {
                 chain.push((cur.clone(), h));
@@ -371,6 +380,13 @@ impl HtaccessCache {
             if dir_missing {
                 break;
             }
+        }
+        if cur.capacity() <= 4096 {
+            WALK_SCRATCH.with(|cell| {
+                if let Ok(mut b) = cell.try_borrow_mut() {
+                    *b = cur;
+                }
+            });
         }
         (chain, deadline)
     }
@@ -389,6 +405,34 @@ impl HtaccessCache {
     /// do not collide.
     pub fn get_or_load_named(&self, dir: &Path, access_file_name: &str) -> Option<Arc<Htaccess>> {
         self.load(dir, access_file_name).0
+    }
+
+    /// Zero-allocation fast path for chain walks: temporarily pushes
+    /// `access_file_name` onto `cur` to probe `self.inner` by `&Path` before
+    /// popping it back, avoiding a fresh `PathBuf` allocation per directory level.
+    fn load_at(
+        &self,
+        cur: &mut PathBuf,
+        access_file_name: &str,
+        now: Instant,
+    ) -> (Option<Arc<Htaccess>>, bool, Instant) {
+        cur.push(access_file_name);
+        if let Some(entry) = self.inner.get(cur.as_path()) {
+            if !self.revalidate_ttl.is_zero()
+                && now.saturating_duration_since(entry.checked_at) < self.revalidate_ttl
+            {
+                let res = (
+                    entry.parsed.clone(),
+                    entry.dir_missing,
+                    entry.checked_at + self.revalidate_ttl,
+                );
+                drop(entry);
+                cur.pop();
+                return res;
+            }
+        }
+        cur.pop();
+        self.load(cur, access_file_name)
     }
 
     /// [`get_or_load_named`](Self::get_or_load_named) plus whether `dir` itself is

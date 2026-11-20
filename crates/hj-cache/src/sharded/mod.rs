@@ -201,31 +201,52 @@ impl<K> Ord for DeadlineEntry<K> {
     }
 }
 
-/// One node: the value plus its intrusive LRU links and cached weights/deadline.
+/// Sentinel slab index for intrusive LRU list ends.
+const NIL: u32 = u32::MAX;
+
+/// Cache-line-aligned mutex wrapper so adjacent shards and the global budget
+/// never share a 128-byte cache line (x86_64 spatial prefetcher + ARM64).
+#[repr(align(128))]
+struct PaddedMutex<T>(Mutex<T>);
+
+impl<T> PaddedMutex<T> {
+    fn new(value: T) -> Self {
+        Self(Mutex::new(value))
+    }
+
+    #[inline]
+    fn lock(&self) -> parking_lot::MutexGuard<'_, T> {
+        self.0.lock()
+    }
+}
+
+/// One node: the key, value, intrusive slab-index LRU links, and cached weights/generation.
 struct Node<K, V> {
+    key: K,
     value: V,
-    ram_prev: K,
-    ram_next: K,
-    disk_prev: K,
-    disk_next: K,
+    ram_prev: u32,
+    ram_next: u32,
+    disk_prev: u32,
+    disk_next: u32,
     ram_weight: u64,
     disk_weight: u64,
     generation: u32,
 }
 
-/// One shard: a key→node map threaded by two intrusive LRU lists (RAM + disk weight),
-/// two byte accumulators, and a deadline min-heap with per-node generation guards (a
-/// re-insert or mutation bumps `next_gen`, orphaning old heap entries so a stale heap
-/// pop can never tear down a fresh node).
+/// One shard: a key→slab-index map threaded by two intrusive slab-index LRU lists
+/// (RAM + disk weight), two byte accumulators, and a deadline min-heap with per-node
+/// generation guards. Using slab indices turns every LRU splice from 6–7 HashMap
+/// probes into O(1) slice lookups (15 probes → 1 per file-backed hit).
 struct Shard<K, V> {
     // FxBuildHasher: K is an internal u64-ish key derived from our own hashing, never
-    // raw client input (the ShardKey contract) — a multiply-xor hash beats SipHash for
-    // the 5-7 probes a hit pays across probe + LRU touches.
-    map: HashMap<K, Box<Node<K, V>>, FxBuildHasher>,
-    ram_head: K,
-    ram_tail: K,
-    disk_head: K,
-    disk_tail: K,
+    // raw client input (the ShardKey contract).
+    map: HashMap<K, u32, FxBuildHasher>,
+    slots: Vec<Option<Node<K, V>>>,
+    free: Vec<u32>,
+    ram_head: u32,
+    ram_tail: u32,
+    disk_head: u32,
+    disk_tail: u32,
     ram_used: u64,
     disk_used: u64,
     expiry: BinaryHeap<Reverse<DeadlineEntry<K>>>,
@@ -236,10 +257,12 @@ impl<K: ShardKey, V: CacheValue> Shard<K, V> {
     fn new() -> Self {
         Shard {
             map: HashMap::with_hasher(FxBuildHasher),
-            ram_head: K::nil(),
-            ram_tail: K::nil(),
-            disk_head: K::nil(),
-            disk_tail: K::nil(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            ram_head: NIL,
+            ram_tail: NIL,
+            disk_head: NIL,
+            disk_tail: NIL,
             ram_used: 0,
             disk_used: 0,
             expiry: BinaryHeap::new(),
@@ -247,111 +270,136 @@ impl<K: ShardKey, V: CacheValue> Shard<K, V> {
         }
     }
 
-    fn is_nil(k: &K) -> bool {
-        *k == K::nil()
+    #[inline]
+    fn node(&self, idx: u32) -> Option<&Node<K, V>> {
+        self.slots.get(idx as usize).and_then(Option::as_ref)
+    }
+
+    #[inline]
+    fn node_mut(&mut self, idx: u32) -> Option<&mut Node<K, V>> {
+        self.slots.get_mut(idx as usize).and_then(Option::as_mut)
+    }
+
+    fn alloc_slot(&mut self, node: Node<K, V>) -> Option<u32> {
+        if let Some(idx) = self.free.pop() {
+            if let Some(slot) = self.slots.get_mut(idx as usize) {
+                *slot = Some(node);
+                return Some(idx);
+            }
+        }
+        let idx = u32::try_from(self.slots.len()).ok()?;
+        if idx == NIL {
+            return None;
+        }
+        self.slots.push(Some(node));
+        Some(idx)
+    }
+
+    fn free_slot(&mut self, idx: u32) -> Option<Node<K, V>> {
+        let node = self.slots.get_mut(idx as usize)?.take()?;
+        self.free.push(idx);
+        Some(node)
     }
 
     // ---- RAM LRU list (every node is on it) ----
 
-    fn ram_push_front(&mut self, id: &K) {
-        let old_head = self.ram_head.clone();
-        {
-            let n = self.map.get_mut(id).expect("ram_push_front: id present");
-            n.ram_prev = K::nil();
-            n.ram_next = old_head.clone();
+    fn ram_push_front(&mut self, idx: u32) {
+        let old_head = self.ram_head;
+        if let Some(n) = self.node_mut(idx) {
+            n.ram_prev = NIL;
+            n.ram_next = old_head;
         }
-        if !Self::is_nil(&old_head) {
-            self.map
-                .get_mut(&old_head)
-                .expect("ram head present")
-                .ram_prev = id.clone();
+        if old_head != NIL {
+            if let Some(h) = self.node_mut(old_head) {
+                h.ram_prev = idx;
+            }
         } else {
-            self.ram_tail = id.clone();
+            self.ram_tail = idx;
         }
-        self.ram_head = id.clone();
+        self.ram_head = idx;
     }
 
-    fn ram_unlink(&mut self, id: &K) {
-        let (prev, next) = {
-            let n = self.map.get(id).expect("ram_unlink: id present");
-            (n.ram_prev.clone(), n.ram_next.clone())
+    fn ram_unlink(&mut self, idx: u32) {
+        let Some((prev, next)) = self.node(idx).map(|n| (n.ram_prev, n.ram_next)) else {
+            return;
         };
-        if !Self::is_nil(&prev) {
-            self.map.get_mut(&prev).expect("ram prev present").ram_next = next.clone();
+        if prev != NIL {
+            if let Some(p) = self.node_mut(prev) {
+                p.ram_next = next;
+            }
         } else {
-            self.ram_head = next.clone();
+            self.ram_head = next;
         }
-        if !Self::is_nil(&next) {
-            self.map.get_mut(&next).expect("ram next present").ram_prev = prev.clone();
+        if next != NIL {
+            if let Some(nx) = self.node_mut(next) {
+                nx.ram_prev = prev;
+            }
         } else {
-            self.ram_tail = prev.clone();
+            self.ram_tail = prev;
         }
-        let n = self.map.get_mut(id).expect("ram_unlink: id present");
-        n.ram_prev = K::nil();
-        n.ram_next = K::nil();
+        if let Some(n) = self.node_mut(idx) {
+            n.ram_prev = NIL;
+            n.ram_next = NIL;
+        }
     }
 
-    /// Splice `id` to the MRU end of the RAM list (recency bump on a hit). O(1).
-    fn ram_touch(&mut self, id: &K) {
-        if self.ram_head == *id {
+    /// Splice `idx` to the MRU end of the RAM list (recency bump on a hit). O(1), 0 map probes.
+    fn ram_touch(&mut self, idx: u32) {
+        if self.ram_head == idx {
             return;
         }
-        self.ram_unlink(id);
-        self.ram_push_front(id);
+        self.ram_unlink(idx);
+        self.ram_push_front(idx);
     }
 
     // ---- disk LRU list (disk-weighted nodes only) ----
 
-    fn disk_push_front(&mut self, id: &K) {
-        let old_head = self.disk_head.clone();
-        {
-            let n = self.map.get_mut(id).expect("disk_push_front: id present");
-            n.disk_prev = K::nil();
-            n.disk_next = old_head.clone();
+    fn disk_push_front(&mut self, idx: u32) {
+        let old_head = self.disk_head;
+        if let Some(n) = self.node_mut(idx) {
+            n.disk_prev = NIL;
+            n.disk_next = old_head;
         }
-        if !Self::is_nil(&old_head) {
-            self.map
-                .get_mut(&old_head)
-                .expect("disk head present")
-                .disk_prev = id.clone();
+        if old_head != NIL {
+            if let Some(h) = self.node_mut(old_head) {
+                h.disk_prev = idx;
+            }
         } else {
-            self.disk_tail = id.clone();
+            self.disk_tail = idx;
         }
-        self.disk_head = id.clone();
+        self.disk_head = idx;
     }
 
-    fn disk_unlink(&mut self, id: &K) {
-        let (prev, next) = {
-            let n = self.map.get(id).expect("disk_unlink: id present");
-            (n.disk_prev.clone(), n.disk_next.clone())
+    fn disk_unlink(&mut self, idx: u32) {
+        let Some((prev, next)) = self.node(idx).map(|n| (n.disk_prev, n.disk_next)) else {
+            return;
         };
-        if !Self::is_nil(&prev) {
-            self.map
-                .get_mut(&prev)
-                .expect("disk prev present")
-                .disk_next = next.clone();
+        if prev != NIL {
+            if let Some(p) = self.node_mut(prev) {
+                p.disk_next = next;
+            }
         } else {
-            self.disk_head = next.clone();
+            self.disk_head = next;
         }
-        if !Self::is_nil(&next) {
-            self.map
-                .get_mut(&next)
-                .expect("disk next present")
-                .disk_prev = prev.clone();
+        if next != NIL {
+            if let Some(nx) = self.node_mut(next) {
+                nx.disk_prev = prev;
+            }
         } else {
-            self.disk_tail = prev.clone();
+            self.disk_tail = prev;
         }
-        let n = self.map.get_mut(id).expect("disk_unlink: id present");
-        n.disk_prev = K::nil();
-        n.disk_next = K::nil();
+        if let Some(n) = self.node_mut(idx) {
+            n.disk_prev = NIL;
+            n.disk_next = NIL;
+        }
     }
 
-    fn disk_touch(&mut self, id: &K) {
-        if self.disk_head == *id {
+    fn disk_touch(&mut self, idx: u32) {
+        if self.disk_head == idx {
             return;
         }
-        self.disk_unlink(id);
-        self.disk_push_front(id);
+        self.disk_unlink(idx);
+        self.disk_push_front(idx);
     }
 
     /// Push a deadline-heap entry for `id` under generation `g` if `deadline` is set.
@@ -375,11 +423,11 @@ impl<K: ShardKey, V: CacheValue> Shard<K, V> {
 /// The generic sharded byte-weighted LRU. Construct one with [`ShardedCache::new`]
 /// and share it via `Arc`. All methods take `&self`.
 pub struct ShardedCache<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> {
-    shards: Box<[Mutex<Shard<K, V>>]>,
+    shards: Box<[PaddedMutex<Shard<K, V>>]>,
     on_evict: E,
     ram_budget_per_shard: u64,
     disk_budget_per_shard: u64,
-    global_budget: Mutex<GlobalBudget>,
+    global_budget: PaddedMutex<GlobalBudget>,
 }
 
 struct GlobalBudget {
@@ -457,7 +505,7 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
         let ram_budget_per_shard = (config.max_ram_bytes / SHARDS as u64).max(1);
         let disk_budget_per_shard = (disk_total / SHARDS as u64).max(1);
         let shards = (0..SHARDS)
-            .map(|_| Mutex::new(Shard::new()))
+            .map(|_| PaddedMutex::new(Shard::new()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         ShardedCache {
@@ -465,7 +513,7 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
             on_evict,
             ram_budget_per_shard,
             disk_budget_per_shard,
-            global_budget: Mutex::new(GlobalBudget {
+            global_budget: PaddedMutex::new(GlobalBudget {
                 ram_used: 0,
                 disk_used: 0,
                 ram_max: config.max_ram_bytes,
@@ -481,7 +529,7 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
     }
 
     #[inline]
-    fn shard_for(&self, id: &K) -> &Mutex<Shard<K, V>> {
+    fn shard_for(&self, id: &K) -> &PaddedMutex<Shard<K, V>> {
         &self.shards[id.shard_index(SHARDS)]
     }
 
@@ -556,21 +604,22 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
     {
         let now = Instant::now();
         self.with_shard(id, |acc| {
-            let (fresh, value, disk) = match acc.shard.map.get(id) {
-                None => return None,
-                Some(node) => (
+            let idx = *acc.shard.map.get(id)?;
+            let (fresh, value, disk) = {
+                let node = acc.shard.node(idx)?;
+                (
                     node.value.is_fresh(now),
                     node.value.clone(),
                     node.disk_weight > 0,
-                ),
+                )
             };
             if !fresh {
-                acc.teardown(id, EvictCause::Expired);
+                acc.teardown_idx(idx, EvictCause::Expired, true);
                 return None;
             }
-            acc.shard.ram_touch(id);
+            acc.shard.ram_touch(idx);
             if disk {
-                acc.shard.disk_touch(id);
+                acc.shard.disk_touch(idx);
             }
             Some(value)
         })
@@ -621,9 +670,12 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
                         .shard
                         .map
                         .get(&id)
-                        .is_some_and(|n| n.generation == g && !n.value.is_fresh(now));
-                    if due {
-                        acc.teardown(&id, EvictCause::Expired);
+                        .copied()
+                        .and_then(|idx| acc.shard.node(idx).map(|n| (idx, n)))
+                        .filter(|(_, n)| n.generation == g && !n.value.is_fresh(now))
+                        .map(|(idx, _)| idx);
+                    if let Some(idx) = due {
+                        acc.teardown_idx(idx, EvictCause::Expired, true);
                         swept += 1;
                     }
                 }
@@ -667,8 +719,8 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
     pub fn for_each(&self, mut f: impl FnMut(&K, &V)) {
         for sh in self.shards.iter() {
             let s = sh.lock();
-            for (k, n) in s.map.iter() {
-                f(k, &n.value);
+            for n in s.slots.iter().flatten() {
+                f(&n.key, &n.value);
             }
         }
     }
@@ -685,8 +737,8 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
             let batch = {
                 let s = sh.lock();
                 let mut batch = Vec::with_capacity(s.map.len());
-                for (key, node) in s.map.iter() {
-                    if let Some(item) = snapshot(key, &node.value) {
+                for node in s.slots.iter().flatten() {
+                    if let Some(item) = snapshot(&node.key, &node.value) {
                         batch.push(item);
                     }
                 }
@@ -706,11 +758,14 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
         for sh in self.shards.iter() {
             let evicted = {
                 let mut s = sh.lock();
-                let to_remove: Vec<K> = s
+                let to_remove: Vec<u32> = s
                     .map
-                    .iter()
-                    .filter(|(key, node)| predicate(key, &node.value))
-                    .map(|(key, _)| key.clone())
+                    .values()
+                    .copied()
+                    .filter(|&idx| {
+                        s.node(idx)
+                            .is_some_and(|node| predicate(&node.key, &node.value))
+                    })
                     .collect();
                 let mut acc = ShardAccess {
                     shard: &mut s,
@@ -720,8 +775,8 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
                     global_budget: &self.global_budget,
                     evicted: false,
                 };
-                for id in to_remove {
-                    acc.teardown(&id, EvictCause::Explicit);
+                for idx in to_remove {
+                    acc.teardown_idx(idx, EvictCause::Explicit, true);
                 }
                 acc.evicted
             };
@@ -737,21 +792,24 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardedCache<K, V, E> {
         for sh in self.shards.iter() {
             let evicted = {
                 let mut s = sh.lock();
-                // Drain the map first so a node is gone from the index before its hook
+                // Drain the map/slots first so a node is gone from the index before its hook
                 // runs (the hook never re-enters this shard).
-                let drained: Vec<(K, Box<Node<K, V>>)> = s.map.drain().collect();
-                for (k, n) in &drained {
-                    self.on_evict.on_evict(k, &n.value, EvictCause::Explicit);
+                s.map.clear();
+                let drained: Vec<Node<K, V>> = s.slots.drain(..).flatten().collect();
+                s.free.clear();
+                for n in &drained {
+                    self.on_evict
+                        .on_evict(&n.key, &n.value, EvictCause::Explicit);
                 }
                 let ram = s.ram_used;
                 let disk = s.disk_used;
                 s.ram_used = 0;
                 s.disk_used = 0;
                 s.expiry.clear();
-                s.ram_head = K::nil();
-                s.ram_tail = K::nil();
-                s.disk_head = K::nil();
-                s.disk_tail = K::nil();
+                s.ram_head = NIL;
+                s.ram_tail = NIL;
+                s.disk_head = NIL;
+                s.disk_tail = NIL;
                 self.global_budget.lock().release(ram, disk);
                 !drained.is_empty()
             };
@@ -772,7 +830,7 @@ pub struct ShardAccess<'a, K: ShardKey, V: CacheValue, E: OnEvict<K, V>> {
     on_evict: &'a E,
     ram_budget_per_shard: u64,
     disk_budget_per_shard: u64,
-    global_budget: &'a Mutex<GlobalBudget>,
+    global_budget: &'a PaddedMutex<GlobalBudget>,
     /// True once any teardown fired [`OnEvict::on_evict`] in this critical
     /// section; the owning entry point calls [`OnEvict::after_unlock`] after
     /// releasing the shard mutex iff set (#293).
@@ -782,7 +840,8 @@ pub struct ShardAccess<'a, K: ShardKey, V: CacheValue, E: OnEvict<K, V>> {
 impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
     /// Borrow the value for `id` if present.
     pub fn get(&self, id: &K) -> Option<&V> {
-        self.shard.map.get(id).map(|n| &n.value)
+        let idx = *self.shard.map.get(id)?;
+        self.shard.node(idx).map(|n| &n.value)
     }
 
     /// Is `id` present in this shard?
@@ -792,18 +851,26 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
 
     /// Splice `id` to the MRU end of the RAM (and, if disk-weighted, disk) recency list.
     pub fn touch(&mut self, id: &K) {
-        if !self.shard.map.contains_key(id) {
+        let Some(&idx) = self.shard.map.get(id) else {
             return;
-        }
-        self.shard.ram_touch(id);
-        let disk = self
-            .shard
-            .map
-            .get(id)
-            .map(|n| n.disk_weight > 0)
-            .unwrap_or(false);
+        };
+        let disk = self.shard.node(idx).is_some_and(|n| n.disk_weight > 0);
+        self.shard.ram_touch(idx);
         if disk {
-            self.shard.disk_touch(id);
+            self.shard.disk_touch(idx);
+        }
+    }
+
+    /// Splice `id` to the MRU end of the RAM recency list, and optionally the disk
+    /// recency list, in a single HashMap lookup.
+    pub fn touch_ram_and_disk(&mut self, id: &K, bump_disk: bool) {
+        let Some(&idx) = self.shard.map.get(id) else {
+            return;
+        };
+        let disk = bump_disk && self.shard.node(idx).is_some_and(|n| n.disk_weight > 0);
+        self.shard.ram_touch(idx);
+        if disk {
+            self.shard.disk_touch(idx);
         }
     }
 
@@ -812,23 +879,20 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
     /// disk-recency bump separately (e.g. an error-only File hit bumps RAM recency but
     /// must NOT bump disk recency). No-op if `id` is absent.
     pub fn touch_ram(&mut self, id: &K) {
-        if !self.shard.map.contains_key(id) {
+        let Some(&idx) = self.shard.map.get(id) else {
             return;
-        }
-        self.shard.ram_touch(id);
+        };
+        self.shard.ram_touch(idx);
     }
 
     /// Splice `id` to the MRU end of the disk recency list only (the page cache's
     /// "a served File hit bumps disk-LRU recency" step). No-op if not disk-weighted.
     pub fn touch_disk(&mut self, id: &K) {
-        let disk = self
-            .shard
-            .map
-            .get(id)
-            .map(|n| n.disk_weight > 0)
-            .unwrap_or(false);
-        if disk {
-            self.shard.disk_touch(id);
+        let Some(&idx) = self.shard.map.get(id) else {
+            return;
+        };
+        if self.shard.node(idx).is_some_and(|n| n.disk_weight > 0) {
+            self.shard.disk_touch(idx);
         }
     }
 
@@ -836,29 +900,31 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
     /// lists + budgets, fire [`OnEvict`], then drop the node.
     /// No-op if `id` is absent.
     pub fn teardown(&mut self, id: &K, cause: EvictCause) {
-        self.teardown_inner(id, cause, true);
+        if let Some(&idx) = self.shard.map.get(id) {
+            self.teardown_idx(idx, cause, true);
+        }
     }
 
-    fn teardown_inner(&mut self, id: &K, cause: EvictCause, release_global: bool) {
-        if !self.shard.map.contains_key(id) {
+    fn teardown_idx(&mut self, idx: u32, cause: EvictCause, release_global: bool) {
+        let Some((ram_w, disk_w)) = self.shard.node(idx).map(|n| (n.ram_weight, n.disk_weight))
+        else {
             return;
-        }
-        let (ram_w, disk_w) = {
-            let n = self.shard.map.get(id).expect("teardown: id present");
-            (n.ram_weight, n.disk_weight)
         };
-        self.shard.ram_unlink(id);
+        self.shard.ram_unlink(idx);
         if disk_w > 0 {
-            self.shard.disk_unlink(id);
+            self.shard.disk_unlink(idx);
         }
         self.shard.ram_used = self.shard.ram_used.saturating_sub(ram_w);
         self.shard.disk_used = self.shard.disk_used.saturating_sub(disk_w);
-        let node = self.shard.map.remove(id).expect("teardown: id present");
+        let Some(node) = self.shard.free_slot(idx) else {
+            return;
+        };
+        self.shard.map.remove(&node.key);
         if release_global {
             self.global_budget.lock().release(ram_w, disk_w);
         }
         self.evicted = true;
-        self.on_evict.on_evict(id, &node.value, cause);
+        self.on_evict.on_evict(&node.key, &node.value, cause);
     }
 
     fn reserve_replacing(
@@ -869,6 +935,9 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
         new_ram: u64,
         new_disk: u64,
     ) -> bool {
+        if old_ram == new_ram && old_disk == new_disk {
+            return true;
+        }
         loop {
             let (ram_over, disk_over, impossible) = {
                 let mut global = self.global_budget.lock();
@@ -885,30 +954,29 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
             }
 
             let (mut victim, cause) = if disk_over {
-                (self.shard.disk_tail.clone(), EvictCause::Disk)
+                (self.shard.disk_tail, EvictCause::Disk)
             } else if ram_over {
-                (self.shard.ram_tail.clone(), EvictCause::Size)
+                (self.shard.ram_tail, EvictCause::Size)
             } else {
                 return false;
             };
-            if victim == *id {
+            if victim != NIL && self.shard.node(victim).is_some_and(|n| n.key == *id) {
                 victim = self
                     .shard
-                    .map
-                    .get(&victim)
+                    .node(victim)
                     .map(|node| {
                         if disk_over {
-                            node.disk_prev.clone()
+                            node.disk_prev
                         } else {
-                            node.ram_prev.clone()
+                            node.ram_prev
                         }
                     })
-                    .unwrap_or_else(K::nil);
+                    .unwrap_or(NIL);
             }
-            if Shard::<K, V>::is_nil(&victim) {
+            if victim == NIL {
                 return false;
             }
-            self.teardown(&victim, cause);
+            self.teardown_idx(victim, cause, true);
         }
     }
 
@@ -920,43 +988,41 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
     pub fn insert_replacing(&mut self, id: &K, value: V) -> bool {
         let ram_w = value.ram_weight();
         let disk_w = value.disk_weight();
-        let (old_ram, old_disk) = self
-            .shard
-            .map
-            .get(id)
+        let deadline = value.deadline();
+        let old_idx = self.shard.map.get(id).copied();
+        let (old_ram, old_disk) = old_idx
+            .and_then(|idx| self.shard.node(idx))
             .map(|n| (n.ram_weight, n.disk_weight))
             .unwrap_or((0, 0));
         if !self.reserve_replacing(id, old_ram, old_disk, ram_w, disk_w) {
             return false;
         }
-        if self.shard.map.contains_key(id) {
-            self.teardown_inner(id, EvictCause::Explicit, false);
+        if let Some(&idx) = self.shard.map.get(id) {
+            self.teardown_idx(idx, EvictCause::Explicit, false);
         }
         let g = self.shard.bump_gen();
-        let node = Box::new(Node {
+        let node = Node {
+            key: id.clone(),
             value,
-            ram_prev: K::nil(),
-            ram_next: K::nil(),
-            disk_prev: K::nil(),
-            disk_next: K::nil(),
+            ram_prev: NIL,
+            ram_next: NIL,
+            disk_prev: NIL,
+            disk_next: NIL,
             ram_weight: ram_w,
             disk_weight: disk_w,
             generation: g,
-        });
-        self.shard.map.insert(id.clone(), node);
-        self.shard.ram_push_front(id);
+        };
+        let Some(idx) = self.shard.alloc_slot(node) else {
+            self.global_budget.lock().release(ram_w, disk_w);
+            return false;
+        };
+        self.shard.map.insert(id.clone(), idx);
+        self.shard.ram_push_front(idx);
         if disk_w > 0 {
-            self.shard.disk_push_front(id);
+            self.shard.disk_push_front(idx);
         }
         self.shard.ram_used += ram_w;
         self.shard.disk_used += disk_w;
-        let deadline = self
-            .shard
-            .map
-            .get(id)
-            .expect("just inserted")
-            .value
-            .deadline();
         self.shard.push_deadline(id, deadline, g);
         true
     }
@@ -968,49 +1034,49 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
     /// a global-reservation failure evicts the already-mutated value and returns false.
     /// No-op (returns `false`) if `id` is absent.
     pub fn mutate(&mut self, id: &K, f: impl FnOnce(&mut V) -> bool) -> bool {
-        if !self.shard.map.contains_key(id) {
+        let Some(&idx) = self.shard.map.get(id) else {
             return false;
-        }
-        let (old_ram, old_disk) = {
-            let n = self.shard.map.get(id).expect("present");
-            (n.ram_weight, n.disk_weight)
         };
-        let committed = {
-            let n = self.shard.map.get_mut(id).expect("present");
-            f(&mut n.value)
+        let Some((old_ram, old_disk)) = self.shard.node(idx).map(|n| (n.ram_weight, n.disk_weight))
+        else {
+            return false;
+        };
+        let committed = match self.shard.node_mut(idx) {
+            Some(n) => f(&mut n.value),
+            None => return false,
         };
         if !committed {
             return false;
         }
-        let (new_ram, new_disk, deadline) = {
-            let n = self.shard.map.get(id).expect("present");
+        let Some((new_ram, new_disk, deadline)) = self.shard.node(idx).map(|n| {
             (
                 n.value.ram_weight(),
                 n.value.disk_weight(),
                 n.value.deadline(),
             )
+        }) else {
+            return false;
         };
         if !self.reserve_replacing(id, old_ram, old_disk, new_ram, new_disk) {
             // `f` already committed an in-place change and cannot be rolled back. Evict the
             // mutated value while its cached weights still carry the old global reservation;
             // report false because no committed value remains resident.
-            self.teardown(id, EvictCause::Size);
+            self.teardown_idx(idx, EvictCause::Size, true);
             return false;
         }
-        {
-            let n = self.shard.map.get_mut(id).expect("present");
+        if let Some(n) = self.shard.node_mut(idx) {
             n.ram_weight = new_ram;
             n.disk_weight = new_disk;
         }
         if old_disk > 0 && new_disk == 0 {
-            self.shard.disk_unlink(id);
+            self.shard.disk_unlink(idx);
         } else if old_disk == 0 && new_disk > 0 {
-            self.shard.disk_push_front(id);
+            self.shard.disk_push_front(idx);
         }
         self.shard.ram_used = self.shard.ram_used.saturating_sub(old_ram) + new_ram;
         self.shard.disk_used = self.shard.disk_used.saturating_sub(old_disk) + new_disk;
         let g = self.shard.bump_gen();
-        if let Some(n) = self.shard.map.get_mut(id) {
+        if let Some(n) = self.shard.node_mut(idx) {
             n.generation = g;
         }
         self.shard.push_deadline(id, deadline, g);
@@ -1022,30 +1088,34 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
     /// mutation, then enforce budgets. This is for values with internal one-time
     /// initialization such as `OnceLock`-backed decoded metadata.
     pub fn reconcile_weights(&mut self, id: &K, protect: &K) -> bool {
-        if !self.shard.map.contains_key(id) {
+        let Some(&idx) = self.shard.map.get(id) else {
             return false;
+        };
+        let Some((old_ram, old_disk, new_ram, new_disk)) = self.shard.node(idx).map(|n| {
+            (
+                n.ram_weight,
+                n.disk_weight,
+                n.value.ram_weight(),
+                n.value.disk_weight(),
+            )
+        }) else {
+            return false;
+        };
+        if old_ram == new_ram && old_disk == new_disk {
+            return true;
         }
-        let (old_ram, old_disk) = {
-            let n = self.shard.map.get(id).expect("present");
-            (n.ram_weight, n.disk_weight)
-        };
-        let (new_ram, new_disk) = {
-            let n = self.shard.map.get(id).expect("present");
-            (n.value.ram_weight(), n.value.disk_weight())
-        };
         if !self.reserve_replacing(id, old_ram, old_disk, new_ram, new_disk) {
-            self.teardown(id, EvictCause::Size);
+            self.teardown_idx(idx, EvictCause::Size, true);
             return false;
         }
-        {
-            let n = self.shard.map.get_mut(id).expect("present");
+        if let Some(n) = self.shard.node_mut(idx) {
             n.ram_weight = new_ram;
             n.disk_weight = new_disk;
         }
         if old_disk > 0 && new_disk == 0 {
-            self.shard.disk_unlink(id);
+            self.shard.disk_unlink(idx);
         } else if old_disk == 0 && new_disk > 0 {
-            self.shard.disk_push_front(id);
+            self.shard.disk_push_front(idx);
         }
         self.shard.ram_used = self.shard.ram_used.saturating_sub(old_ram) + new_ram;
         self.shard.disk_used = self.shard.disk_used.saturating_sub(old_disk) + new_disk;
@@ -1058,38 +1128,28 @@ impl<K: ShardKey, V: CacheValue, E: OnEvict<K, V>> ShardAccess<'_, K, V, E> {
     /// while allowing one valid object to exceed its shard's soft target.
     pub fn enforce_budgets(&mut self, protect: &K) {
         while self.shard.ram_used > self.ram_budget_per_shard {
-            let mut t = self.shard.ram_tail.clone();
+            let mut t = self.shard.ram_tail;
             // `protect` (the just-touched key) is never self-evicted. If it happens to be
             // the LRU tail, step toward the head to its predecessor and evict THAT instead
             // of breaking — otherwise a `reconcile_weights(&id,&id)` charge on the tail
             // would leave the shard transiently over budget until the next insert.
-            if t == *protect {
-                t = self
-                    .shard
-                    .map
-                    .get(&t)
-                    .map(|n| n.ram_prev.clone())
-                    .unwrap_or_else(K::nil);
+            if t != NIL && self.shard.node(t).is_some_and(|n| n.key == *protect) {
+                t = self.shard.node(t).map(|n| n.ram_prev).unwrap_or(NIL);
             }
-            if Shard::<K, V>::is_nil(&t) {
+            if t == NIL {
                 break;
             }
-            self.teardown(&t, EvictCause::Size);
+            self.teardown_idx(t, EvictCause::Size, true);
         }
         while self.shard.disk_used > self.disk_budget_per_shard {
-            let mut t = self.shard.disk_tail.clone();
-            if t == *protect {
-                t = self
-                    .shard
-                    .map
-                    .get(&t)
-                    .map(|n| n.disk_prev.clone())
-                    .unwrap_or_else(K::nil);
+            let mut t = self.shard.disk_tail;
+            if t != NIL && self.shard.node(t).is_some_and(|n| n.key == *protect) {
+                t = self.shard.node(t).map(|n| n.disk_prev).unwrap_or(NIL);
             }
-            if Shard::<K, V>::is_nil(&t) {
+            if t == NIL {
                 break;
             }
-            self.teardown(&t, EvictCause::Disk);
+            self.teardown_idx(t, EvictCause::Disk, true);
         }
     }
 }

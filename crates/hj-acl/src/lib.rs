@@ -97,17 +97,37 @@ impl Rule {
 }
 
 /// Access-control evaluator built from a server's [`Security`] block.
+#[derive(Debug, Clone, Copy)]
+struct V4Rule {
+    network: u32,
+    mask: u32,
+    allow: bool,
+    trusted: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct V6Rule {
+    network: u128,
+    mask: u128,
+    allow: bool,
+    trusted: bool,
+}
+
+/// Access-control list + trusted-proxy table + `accessDenyDir` globs.
 ///
 /// Cheap to clone-via-`Arc`; build once and share. All query methods are
 /// read-only and `Sync`.
 #[derive(Debug, Clone)]
 pub struct AccessControl {
+    /// Unique instance id so thread-local peer classification caches stay
+    /// isolated across instances and invalidate immediately on SIGHUP reload.
+    id: u64,
     /// Allow/deny rules, **sorted most-specific-first** (longest prefix first;
-    /// `ALL` last). This lets [`check_peer`](Self::check_peer) take the first
-    /// matching rule as authoritative. An `ALL` rule is always included when
-    /// configured, so the loop always finds a match; no separate fallback is
-    /// needed.
+    /// `ALL` last). Kept for inspection/tests; hot-path matching uses the compact
+    /// `v4_rules` / `v6_rules` tables below.
     rules: Vec<Rule>,
+    v4_rules: Vec<V4Rule>,
+    v6_rules: Vec<V6Rule>,
     /// Every peer is trusted: an `ALL` rule exists (so every address matches some
     /// rule) and every rule is a trusted allow. Lets the XFF walk skip trust scans.
     all_trusted: bool,
@@ -165,8 +185,52 @@ impl AccessControl {
 
         let deny_globs = build_deny_globs(&security.access_deny_dir)?;
 
+        let mut v4_rules = Vec::new();
+        let mut v6_rules = Vec::new();
+        for r in &rules {
+            match r.net {
+                None => {
+                    v4_rules.push(V4Rule {
+                        network: 0,
+                        mask: 0,
+                        allow: r.allow,
+                        trusted: r.trusted,
+                    });
+                    v6_rules.push(V6Rule {
+                        network: 0,
+                        mask: 0,
+                        allow: r.allow,
+                        trusted: r.trusted,
+                    });
+                }
+                Some(IpNet::V4(n)) => {
+                    let mask = u32::from(n.netmask());
+                    v4_rules.push(V4Rule {
+                        network: u32::from(n.network()) & mask,
+                        mask,
+                        allow: r.allow,
+                        trusted: r.trusted,
+                    });
+                }
+                Some(IpNet::V6(n)) => {
+                    let mask = u128::from(n.netmask());
+                    v6_rules.push(V6Rule {
+                        network: u128::from(n.network()) & mask,
+                        mask,
+                        allow: r.allow,
+                        trusted: r.trusted,
+                    });
+                }
+            }
+        }
+        static NEXT_ACL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ACL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         Ok(AccessControl {
+            id,
             rules,
+            v4_rules,
+            v6_rules,
             all_trusted,
             deny_globs,
         })
@@ -192,22 +256,100 @@ impl AccessControl {
     /// a network), and a base `deny ALL` with specific `allow <cidr>` entries
     /// permits only those networks.
     pub fn check_peer(&self, ip: IpAddr) -> AclDecision {
-        // Canonicalize an IPv4-mapped IPv6 peer (`::ffff:a.b.c.d`) to its IPv4 form before
-        // matching: configured CIDRs are address-family-strict, so on a dual-stack `[::]` listener
-        // a `deny 1.2.3.0/24` would otherwise NOT match a v4 client arriving mapped — falling
-        // through to the open default (fail-OPEN). Mirrors peer_purge.rs's canonicalization.
+        self.classify_peer(ip).0
+    }
+
+    /// Classify `ip` in a single pass over compact family-specific CIDR tables,
+    /// fronted by a 16-slot thread-local cache keyed by `(self.id, canonical_ip)`
+    /// so keep-alive / Cloudflare edge peers pay O(1) instead of scanning ~25 CIDRs
+    /// on every request.
+    pub fn classify_peer(&self, ip: IpAddr) -> (AclDecision, bool) {
         let ip = ip.to_canonical();
-        for rule in &self.rules {
-            if rule.matches(ip) {
-                return if rule.allow {
-                    AclDecision::Allow
-                } else {
-                    AclDecision::Deny
+        const CACHE_SLOTS: usize = 16;
+        thread_local! {
+            static PEER_CACHE: std::cell::RefCell<[(u64, IpAddr, AclDecision, bool); CACHE_SLOTS]> =
+                const {
+                    std::cell::RefCell::new(
+                        [(0, IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), AclDecision::Allow, false); CACHE_SLOTS]
+                    )
                 };
-            }
         }
-        // No rule matched (no access-control configured): LiteSpeed's open default.
-        AclDecision::Allow
+        let slot_idx = match ip {
+            IpAddr::V4(v4) => (u32::from(v4).wrapping_mul(0x9e37_79b1) >> 28) as usize,
+            IpAddr::V6(v6) => {
+                let bits = u128::from(v6);
+                let mixed =
+                    ((bits as u64) ^ ((bits >> 64) as u64)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                (mixed >> 60) as usize
+            }
+        } & (CACHE_SLOTS - 1);
+        if let Some(hit) = PEER_CACHE.with(|cell| {
+            let Ok(table) = cell.try_borrow() else {
+                return None;
+            };
+            let entry = table.get(slot_idx)?;
+            (entry.0 == self.id && entry.1 == ip).then_some((entry.2, entry.3))
+        }) {
+            return hit;
+        }
+        let res = match ip {
+            IpAddr::V4(v4) => {
+                let bits = u32::from(v4);
+                let mut found = (AclDecision::Allow, self.all_trusted);
+                for r in &self.v4_rules {
+                    if (bits & r.mask) == r.network {
+                        let decision = if r.allow {
+                            AclDecision::Allow
+                        } else {
+                            AclDecision::Deny
+                        };
+                        found = (decision, self.all_trusted || r.trusted);
+                        break;
+                    }
+                }
+                found
+            }
+            IpAddr::V6(v6) => {
+                let bits = u128::from(v6);
+                let mut found = (AclDecision::Allow, self.all_trusted);
+                for r in &self.v6_rules {
+                    if (bits & r.mask) == r.network {
+                        let decision = if r.allow {
+                            AclDecision::Allow
+                        } else {
+                            AclDecision::Deny
+                        };
+                        found = (decision, self.all_trusted || r.trusted);
+                        break;
+                    }
+                }
+                found
+            }
+        };
+        PEER_CACHE.with(|cell| {
+            if let Ok(mut table) = cell.try_borrow_mut()
+                && let Some(slot) = table.get_mut(slot_idx)
+            {
+                *slot = (self.id, ip, res.0, res.1);
+            }
+        });
+        res
+    }
+
+    /// Verdict for a request whose peer was already checked via [`classify_peer`].
+    pub fn check_client_after_peer(
+        &self,
+        peer: IpAddr,
+        peer_allowed: bool,
+        client: IpAddr,
+    ) -> AclDecision {
+        if !peer_allowed {
+            return AclDecision::Deny;
+        }
+        if client.to_canonical() == peer.to_canonical() {
+            return AclDecision::Allow;
+        }
+        self.check_peer(client)
     }
 
     /// Verdict for a request whose resolved client IP may differ from the TCP peer.
@@ -285,6 +427,30 @@ impl AccessControl {
         use_ip_in_proxy_header: u8,
         is_tls_mtls_ok: bool,
     ) -> IpAddr {
+        let peer_trusted = use_ip_in_proxy_header != 0
+            && use_ip_in_proxy_header != 1
+            && use_ip_in_proxy_header != 4
+            && is_tls_mtls_ok
+            && self.is_trusted(peer);
+        self.resolve_client_ip_with_trust(
+            peer,
+            peer_trusted,
+            headers,
+            use_ip_in_proxy_header,
+            is_tls_mtls_ok,
+        )
+    }
+
+    /// Like [`Self::resolve_client_ip`], reusing a precomputed `peer_trusted`
+    /// verdict from [`Self::classify_peer`] so `self.rules` is not scanned twice.
+    pub fn resolve_client_ip_with_trust(
+        &self,
+        peer: IpAddr,
+        peer_trusted: bool,
+        headers: &HeaderMap,
+        use_ip_in_proxy_header: u8,
+        is_tls_mtls_ok: bool,
+    ) -> IpAddr {
         // Canonicalize a v4-mapped v6 peer up front so the trust gate (`is_trusted(peer)`) and the
         // returned client IP are consistent with the family-strict CIDR matching (dual-stack
         // listener) — mirrors peer_purge.rs.
@@ -310,7 +476,7 @@ impl AccessControl {
         // Mode 2 (and any unknown value, fail-safe): trusted peer + mTLS required.
         let honor = match use_ip_in_proxy_header {
             0 => false,
-            _ => self.is_trusted(peer) && is_tls_mtls_ok,
+            _ => peer_trusted && is_tls_mtls_ok,
         };
 
         if !honor {
@@ -401,14 +567,18 @@ impl AccessControl {
     /// with `None` (the peer): skipping it would land on an address farther left,
     /// which the client wrote.
     fn rightmost_untrusted_xff(&self, headers: &HeaderMap) -> Option<IpAddr> {
-        let entries = xff_entries(headers);
-        for entry in entries.iter().rev() {
-            let ip = (*entry)?;
-            if !self.is_trusted(ip) {
-                return Some(ip);
+        let mut leftmost: Option<IpAddr> = None;
+        for val in headers.get_all("x-forwarded-for").iter().rev() {
+            let s = val.to_str().ok()?;
+            for raw in s.rsplit(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let ip = parse_ip(raw)?;
+                if !self.is_trusted(ip) {
+                    return Some(ip);
+                }
+                leftmost = Some(ip);
             }
         }
-        entries.first().copied().flatten()
+        leftmost
     }
 
     /// `true` if `resolved_path` matches any `accessDenyDir` glob and must not

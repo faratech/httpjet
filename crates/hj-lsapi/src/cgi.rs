@@ -60,7 +60,7 @@ pub struct CgiEnvBuilder<'a> {
     /// per request instead of cloned. Applied before `extra` (both upsert; `extra`
     /// still wins last). Empty by default.
     extra_ref: &'a [(String, String)],
-    server_software: String,
+    server_software: Cow<'a, str>,
     /// The request also travels as an LSAPI header block, so header copies that
     /// lsphp already registers from that block are left out of the env table.
     header_block: bool,
@@ -75,7 +75,7 @@ impl<'a> CgiEnvBuilder<'a> {
             document_root: None,
             extra: Vec::new(),
             extra_ref: &[],
-            server_software: "LiteSpeed".to_string(),
+            server_software: Cow::Borrowed("LiteSpeed"),
             header_block: false,
         }
     }
@@ -110,7 +110,7 @@ impl<'a> CgiEnvBuilder<'a> {
     }
 
     /// Set SERVER_SOFTWARE.
-    pub fn server_software(mut self, s: impl Into<String>) -> Self {
+    pub fn server_software(mut self, s: impl Into<Cow<'a, str>>) -> Self {
         self.server_software = s.into();
         self
     }
@@ -175,19 +175,20 @@ impl<'a> CgiEnvBuilder<'a> {
         let path = uri.path();
         let query = uri.query().unwrap_or("");
         push_borrow!("REQUEST_METHOD", req.method().as_str());
-        // Builder-owned fields are cloned (build consumes `self`, so they cannot
-        // borrow out of it); everything sourced from `req`/`ctx` borrows.
-        push!(
-            "SCRIPT_FILENAME",
-            self.script_filename
-                .to_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| self.script_filename.to_string_lossy().into_owned())
-        );
-        push!(
-            "SCRIPT_NAME",
-            self.script_name.clone().unwrap_or_else(|| path.to_string())
-        );
+        // `self.script_filename` has lifetime `'a: 'r`, so borrow directly when UTF-8;
+        // owned fields (`script_name`, `path_info`, `document_root`) are moved out of
+        // `self` instead of cloned, and fall back to borrowing `path` / `ctx.vhost.doc_root`.
+        match self.script_filename.to_str() {
+            Some(s) => push_borrow!("SCRIPT_FILENAME", s),
+            None => push!(
+                "SCRIPT_FILENAME",
+                self.script_filename.to_string_lossy().into_owned()
+            ),
+        }
+        match self.script_name {
+            Some(s) => push!("SCRIPT_NAME", s),
+            None => push_borrow!("SCRIPT_NAME", path),
+        }
         push_borrow!("QUERY_STRING", query);
         if let Some(q) = uri.query() {
             env.push((
@@ -197,26 +198,21 @@ impl<'a> CgiEnvBuilder<'a> {
         } else {
             push_borrow!("REQUEST_URI", path);
         }
-        let has_path_info = self.path_info.as_deref().is_some_and(|pi| !pi.is_empty());
-        if has_path_info {
-            push!("PATH_INFO", self.path_info.clone().unwrap_or_default());
-        }
-
-        let doc_root = self
-            .document_root
-            .clone()
-            .unwrap_or_else(|| ctx.vhost.doc_root.to_string_lossy().into_owned());
-        push!("DOCUMENT_ROOT", doc_root.clone());
-
-        // PATH_TRANSLATED = doc root + PATH_INFO (only when PATH_INFO is set).
-        if has_path_info {
-            env.push((
-                Cow::Borrowed("PATH_TRANSLATED"),
-                Cow::Owned(format!(
-                    "{doc_root}{}",
-                    self.path_info.as_deref().unwrap_or_default()
-                )),
-            ));
+        let path_info = self.path_info.filter(|pi| !pi.is_empty());
+        let doc_root: Cow<'r, str> = match self.document_root {
+            Some(d) => Cow::Owned(d),
+            None => match ctx.vhost.doc_root.to_str() {
+                Some(s) => Cow::Borrowed(s),
+                None => Cow::Owned(ctx.vhost.doc_root.to_string_lossy().into_owned()),
+            },
+        };
+        if let Some(pi) = path_info {
+            let translated = format!("{doc_root}{pi}");
+            push!("PATH_INFO", pi);
+            env.push((Cow::Borrowed("DOCUMENT_ROOT"), doc_root));
+            env.push((Cow::Borrowed("PATH_TRANSLATED"), Cow::Owned(translated)));
+        } else {
+            env.push((Cow::Borrowed("DOCUMENT_ROOT"), doc_root));
         }
 
         // Client / remote. REMOTE_ADDR is the proxy-resolved client IP;
@@ -230,7 +226,7 @@ impl<'a> CgiEnvBuilder<'a> {
             None => ctx.vhost_name.as_str(),
         };
         env.push((Cow::Borrowed("SERVER_NAME"), Cow::Borrowed(server_name)));
-        push!("SERVER_SOFTWARE", self.server_software.clone());
+        env.push((Cow::Borrowed("SERVER_SOFTWARE"), self.server_software));
         push!("SERVER_ADDR", ctx.local_addr.ip().to_string());
 
         // The listener's port, never the client's Host header: SERVER_PORT is
@@ -373,7 +369,7 @@ impl<'a> CgiEnvBuilder<'a> {
                 }
             };
             have_host |= is_host;
-            env.push((Cow::Owned(http_var_name(nm)), value));
+            env.push((http_var_name(nm), value));
         }
         if let Some(cl) = content_length {
             env.push((Cow::Borrowed("HTTP_CONTENT_LENGTH"), Cow::Borrowed(cl)));
@@ -385,12 +381,11 @@ impl<'a> CgiEnvBuilder<'a> {
         // $_SERVER['HTTP_HOST'] is always present (LiteSpeed maps :authority -> Host).
         // Only when absent, so the HTTP/1.x case (real Host header) is untouched.
         if !have_host {
-            let host = req
-                .uri()
-                .authority()
-                .map(|a| host_without_default_port(a.as_str(), ctx.is_tls).to_string())
-                .unwrap_or_else(|| ctx.vhost_name.clone());
-            env.push((Cow::Borrowed("HTTP_HOST"), Cow::Owned(host)));
+            let host = match req.uri().authority() {
+                Some(a) => Cow::Borrowed(host_without_default_port(a.as_str(), ctx.is_tls)),
+                None => Cow::Borrowed(ctx.vhost_name.as_str()),
+            };
+            env.push((Cow::Borrowed("HTTP_HOST"), host));
         }
 
         // Speculation Rules fetches (prefetch/prerender) carry only
@@ -402,20 +397,21 @@ impl<'a> CgiEnvBuilder<'a> {
         // Normalize here instead: surface a synthetic HTTP_X_PURPOSE=prefetch
         // so a prerendered page has no side effects until the user actually
         // activates it (the activation navigation carries no Sec-Purpose).
-        if !req.headers().contains_key("x-purpose")
+        // Check `sec-purpose` first (absent on 99% of requests -> 1 HeaderMap probe
+        // instead of 4) and match "prefetch" ASCII case-insensitively without allocating.
+        if let Some(sp) = req
+            .headers()
+            .get("sec-purpose")
+            .and_then(|v| v.to_str().ok())
+            && !req.headers().contains_key("x-purpose")
             && !req.headers().contains_key("purpose")
             && !req.headers().contains_key("x-moz")
+            && sp
+                .as_bytes()
+                .windows(8)
+                .any(|w| w.eq_ignore_ascii_case(b"prefetch"))
         {
-            if let Some(sp) = req
-                .headers()
-                .get("sec-purpose")
-                .and_then(|v| v.to_str().ok())
-            {
-                // `prefetch;prerender` for prerenders; plain `prefetch` otherwise.
-                if sp.to_ascii_lowercase().contains("prefetch") {
-                    env.push((Cow::Borrowed("HTTP_X_PURPOSE"), Cow::Borrowed("prefetch")));
-                }
-            }
+            env.push((Cow::Borrowed("HTTP_X_PURPOSE"), Cow::Borrowed("prefetch")));
         }
 
         // Env set by rewrite [E=...] flags (exposed as $_SERVER in PHP too).
@@ -657,7 +653,48 @@ fn header_block_registers_copy(header: &str) -> bool {
 }
 
 /// `Content-Type` -> `HTTP_CONTENT_TYPE`, `X-Forwarded-For` -> `HTTP_X_FORWARDED_FOR`.
-fn http_var_name(header: &str) -> String {
+fn http_var_name(header: &str) -> Cow<'static, str> {
+    // Fast static table for common lowercase HTTP header names (zero allocations).
+    let known = match header {
+        "host" => Some("HTTP_HOST"),
+        "user-agent" => Some("HTTP_USER_AGENT"),
+        "accept" => Some("HTTP_ACCEPT"),
+        "accept-encoding" => Some("HTTP_ACCEPT_ENCODING"),
+        "accept-language" => Some("HTTP_ACCEPT_LANGUAGE"),
+        "cookie" => Some("HTTP_COOKIE"),
+        "referer" => Some("HTTP_REFERER"),
+        "origin" => Some("HTTP_ORIGIN"),
+        "authorization" => Some("HTTP_AUTHORIZATION"),
+        "cache-control" => Some("HTTP_CACHE_CONTROL"),
+        "pragma" => Some("HTTP_PRAGMA"),
+        "connection" => Some("HTTP_CONNECTION"),
+        "if-none-match" => Some("HTTP_IF_NONE_MATCH"),
+        "if-modified-since" => Some("HTTP_IF_MODIFIED_SINCE"),
+        "range" => Some("HTTP_RANGE"),
+        "x-requested-with" => Some("HTTP_X_REQUESTED_WITH"),
+        "x-forwarded-for" => Some("HTTP_X_FORWARDED_FOR"),
+        "x-forwarded-proto" => Some("HTTP_X_FORWARDED_PROTO"),
+        "x-forwarded-host" => Some("HTTP_X_FORWARDED_HOST"),
+        "x-real-ip" => Some("HTTP_X_REAL_IP"),
+        "cf-connecting-ip" => Some("HTTP_CF_CONNECTING_IP"),
+        "cf-ray" => Some("HTTP_CF_RAY"),
+        "cf-ipcountry" => Some("HTTP_CF_IPCOUNTRY"),
+        "cf-visitor" => Some("HTTP_CF_VISITOR"),
+        "sec-fetch-mode" => Some("HTTP_SEC_FETCH_MODE"),
+        "sec-fetch-site" => Some("HTTP_SEC_FETCH_SITE"),
+        "sec-fetch-dest" => Some("HTTP_SEC_FETCH_DEST"),
+        "sec-fetch-user" => Some("HTTP_SEC_FETCH_USER"),
+        "sec-ch-ua" => Some("HTTP_SEC_CH_UA"),
+        "sec-ch-ua-mobile" => Some("HTTP_SEC_CH_UA_MOBILE"),
+        "sec-ch-ua-platform" => Some("HTTP_SEC_CH_UA_PLATFORM"),
+        "upgrade-insecure-requests" => Some("HTTP_UPGRADE_INSECURE_REQUESTS"),
+        "priority" => Some("HTTP_PRIORITY"),
+        "dnt" => Some("HTTP_DNT"),
+        _ => None,
+    };
+    if let Some(s) = known {
+        return Cow::Borrowed(s);
+    }
     let mut s = String::with_capacity(header.len() + 5);
     s.push_str("HTTP_");
     for c in header.chars() {
@@ -667,7 +704,7 @@ fn http_var_name(header: &str) -> String {
             s.push(c.to_ascii_uppercase());
         }
     }
-    s
+    Cow::Owned(s)
 }
 
 fn host_header<'r>(req: &'r Request) -> Option<&'r str> {

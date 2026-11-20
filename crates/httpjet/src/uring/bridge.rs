@@ -125,6 +125,9 @@ pub(crate) struct BridgeResp {
     pub completion: Option<hj_core::ResponseCompletion>,
     pub status: http::StatusCode,
     pub headers: http::HeaderMap,
+    /// Shared immutable response headers from `fast_memo` hits (avoids cloning
+    /// `HeaderMap` on every H1/H3 fast-memo hit).
+    pub shared_headers: Option<Arc<http::HeaderMap>>,
     pub body: BridgeBody,
     /// (Tier 2) Per-connection egress rate (bytes/sec) the H1 writer should pace this
     /// response with; None ⇒ the connection-wide ServeConfig default. Popped from the
@@ -220,6 +223,7 @@ type LimitProvider = dyn Fn() -> usize + Send + Sync;
 
 struct AdmissionGate {
     active: AtomicUsize,
+    waiters: AtomicUsize,
     limit: Arc<LimitProvider>,
     generation: AtomicU64,
     changed: Notify,
@@ -229,6 +233,7 @@ impl AdmissionGate {
     fn new(limit: Arc<LimitProvider>) -> Arc<Self> {
         Arc::new(Self {
             active: AtomicUsize::new(0),
+            waiters: AtomicUsize::new(0),
             limit,
             generation: AtomicU64::new(0),
             changed: Notify::new(),
@@ -242,14 +247,14 @@ impl AdmissionGate {
     fn try_acquire(self: &Arc<Self>) -> Option<AdmissionPermit> {
         loop {
             let limit = self.current_limit();
-            let active = self.active.load(Ordering::Acquire);
+            let active = self.active.load(Ordering::SeqCst);
             if active >= limit {
                 return None;
             }
             let next = active + 1;
             if self
                 .active
-                .compare_exchange_weak(active, next, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange_weak(active, next, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
                 continue;
@@ -266,8 +271,22 @@ impl AdmissionGate {
     }
 
     async fn acquire(self: &Arc<Self>) -> AdmissionPermit {
+        // Uncontended fast path: skip Notify waiter registration when capacity is open.
+        if let Some(permit) = self.try_acquire() {
+            return permit;
+        }
+        struct WaiterGuard<'a>(&'a AtomicUsize);
+        impl Drop for WaiterGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
         loop {
             let generation = self.generation.load(Ordering::Acquire);
+            // SeqCst pairs with `AdmissionPermit::drop`'s SeqCst fetch_sub + waiters load
+            // (Dekker's pattern) so a waiter on ARM64 can never miss `notify_one()`.
+            self.waiters.fetch_add(1, Ordering::SeqCst);
+            let _guard = WaiterGuard(&self.waiters);
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -295,9 +314,11 @@ struct AdmissionPermit {
 
 impl Drop for AdmissionPermit {
     fn drop(&mut self) {
-        let previous = self.gate.active.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.gate.active.fetch_sub(1, Ordering::SeqCst);
         debug_assert!(previous > 0, "bridge admission count underflow");
-        self.gate.changed.notify_one();
+        if self.gate.waiters.load(Ordering::SeqCst) > 0 {
+            self.gate.changed.notify_one();
+        }
     }
 }
 
@@ -351,13 +372,17 @@ impl Drop for CancelOnDrop {
     }
 }
 
+type SpawnFn = dyn Fn(BridgeReq, &tokio::runtime::Handle) + Send + Sync;
+
 /// Clonable handle the monoio cores use to dispatch a request to the side-runtime.
 #[derive(Clone)]
 pub(crate) struct Bridge {
-    tx: mpsc::Sender<BridgeReq>,
+    spawn_req: Arc<SpawnFn>,
     admission: Arc<AdmissionGate>,
     timer: tokio::runtime::Handle,
     body_budget: Arc<hj_core::budget::BodyBufferBudget>,
+    #[cfg(test)]
+    _keepalive: Option<Arc<mpsc::Sender<()>>>,
 }
 
 impl Bridge {
@@ -432,17 +457,17 @@ impl Bridge {
         let (rtx, rrx) = oneshot::channel();
         let cancel = CancellationToken::new();
         let mut cancel_on_drop = CancelOnDrop::new(cancel.clone());
-        self.tx
-            .send(BridgeReq {
+        (self.spawn_req)(
+            BridgeReq {
                 req,
                 ctx,
                 resp: rtx,
                 cancel,
                 permit,
                 body_budget: self.body_budget.clone(),
-            })
-            .await
-            .ok()?;
+            },
+            &self.timer,
+        );
         match rrx.await {
             Ok(resp) => {
                 cancel_on_drop.disarm();
@@ -553,62 +578,47 @@ impl http_body::Body for ChannelBody {
     }
 }
 
-/// Spawn the tokio side-runtime (its own threads) running `handler` per bridged
-/// request and buffering each response body to `Bytes`. The returned [`Bridge`] is
-/// cloned to every monoio core. `handler` is typically a closure capturing
-/// `Arc<ServerState>` and calling `pipeline::handle`.
-/// The receiver loop: spawn `handler` per bridged request, buffer the response.
-async fn run_receiver<F, Fut>(mut rx: mpsc::Receiver<BridgeReq>, handler: Arc<F>)
+/// Build the direct tokio-runtime spawner for `handler`: each bridged request spawns
+/// its `hj_core::Recycled` future directly onto the tokio runtime handle from
+/// `Bridge::dispatch`, avoiding a single-task `mpsc` + `JoinSet` funnel.
+fn make_spawner<F, Fut>(handler: F) -> Arc<SpawnFn>
 where
     F: Fn(Request, BridgeCtx) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response> + Send + 'static,
 {
-    let mut tasks = tokio::task::JoinSet::new();
-    loop {
-        tokio::select! {
-            biased;
-            joined = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(Err(error)) = joined {
-                    tracing::error!(%error, "bridge request task failed");
-                }
-            }
-            request = rx.recv() => {
-                let Some(BridgeReq {
-                    req,
-                    ctx,
-                    resp,
-                    cancel,
-                    permit,
-                    body_budget,
-                }) = request else {
-                    break;
-                };
-                if resp.is_closed() {
-                    continue;
-                }
-                let handler = handler.clone();
-                // The request future is ~15 KiB; a recycled slot keeps the tokio task
-                // small and the future's memory resident across requests on this worker.
-                tasks.spawn(hj_core::Recycled::new(async move {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {}
-                        _ = async move {
-                            let direct_file = ctx.direct_file_egress;
-                            let budget = ResponseBudget {
-                                global: body_budget,
-                                connection: ctx.response_budget.clone(),
-                            };
-                            let response = handler(req, ctx).await;
-                            forward_response_with_budget(response, resp, direct_file, &budget).await;
-                        } => {}
-                    }
-                    drop(permit);
-                }));
-            }
+    let handler = Arc::new(handler);
+    Arc::new(move |req: BridgeReq, rt: &tokio::runtime::Handle| {
+        if req.resp.is_closed() {
+            return;
         }
-    }
-    tasks.shutdown().await;
+        let handler = Arc::clone(&handler);
+        // The request future is ~15 KiB; a recycled slot keeps the tokio task
+        // small and the future's memory resident across requests on this worker.
+        rt.spawn(hj_core::Recycled::new(async move {
+            let BridgeReq {
+                req,
+                ctx,
+                resp,
+                cancel,
+                permit,
+                body_budget,
+            } = req;
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {}
+                _ = async move {
+                    let direct_file = ctx.direct_file_egress;
+                    let budget = ResponseBudget {
+                        global: body_budget,
+                        connection: ctx.response_budget.clone(),
+                    };
+                    let response = handler(req, ctx).await;
+                    forward_response_with_budget(response, resp, direct_file, &budget).await;
+                } => {}
+            }
+            drop(permit);
+        }));
+    })
 }
 
 /// A clean 502 substituted when an upstream body errors BEFORE any byte has crossed to the
@@ -620,6 +630,7 @@ pub(crate) fn bad_gateway() -> BridgeResp {
         completion: None,
         status: http::StatusCode::BAD_GATEWAY,
         headers: http::HeaderMap::new(),
+        shared_headers: None,
         body: BridgeBody::Full(Bytes::from_static(b"upstream body truncated\n")),
         bw_rate: None,
     }
@@ -632,6 +643,7 @@ pub(crate) fn service_unavailable_resp() -> BridgeResp {
         completion: None,
         status: http::StatusCode::SERVICE_UNAVAILABLE,
         headers: http::HeaderMap::new(),
+        shared_headers: None,
         body: BridgeBody::Full(Bytes::from_static(b"server busy\n")),
         bw_rate: None,
     }
@@ -651,12 +663,21 @@ fn take_response_completion(
 fn full_resp(mut parts: http::response::Parts, body: Bytes, bw_rate: Option<u64>) -> BridgeResp {
     let status = parts.status;
     observe_response_head(&mut parts, status);
+    let shared_headers = if parts.extensions.is_empty() {
+        None
+    } else {
+        parts
+            .extensions
+            .remove::<hj_core::SharedHeaders>()
+            .map(|s| s.0)
+    };
     // The Full arms own `parts` outright — move the header map instead of cloning it per
     // bridged response.
     BridgeResp {
         completion: take_response_completion(&mut parts.extensions),
         status: parts.status,
         headers: parts.headers,
+        shared_headers,
         body: BridgeBody::Full(body),
         bw_rate,
     }
@@ -684,6 +705,7 @@ pub(crate) async fn fast_response(r: Response, direct_file: bool) -> BridgeResp 
                 completion: take_response_completion(&mut parts.extensions),
                 status: parts.status,
                 headers: strip_framing(parts.headers),
+                shared_headers: None,
                 body: BridgeBody::File(file),
                 bw_rate,
             }
@@ -793,6 +815,7 @@ async fn forward_response_with_budget(
                 completion: take_response_completion(&mut parts.extensions),
                 status: parts.status,
                 headers: strip_framing(parts.headers),
+                shared_headers: None,
                 body: BridgeBody::File(f),
                 bw_rate,
             });
@@ -1026,6 +1049,7 @@ async fn forward_file(
         completion: take_response_completion(&mut parts.extensions),
         status: parts.status,
         headers,
+        shared_headers: None,
         body: BridgeBody::Stream {
             rx: rrx,
             len: Some(len),
@@ -1135,6 +1159,7 @@ async fn forward_stream(
             completion: take_response_completion(&mut parts.extensions),
             status: parts.status,
             headers,
+            shared_headers: None,
             body: BridgeBody::Stream { rx: rrx, len: None },
             bw_rate,
         });
@@ -1191,6 +1216,7 @@ async fn forward_stream(
                             completion: take_response_completion(&mut parts.extensions),
                             status: parts.status,
                             headers,
+                            shared_headers: None,
                             body: BridgeBody::Stream { rx: rrx, len: None },
                             bw_rate,
                         });
@@ -1301,19 +1327,23 @@ where
         .thread_stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
         .enable_all()
         .build()?;
-    let (bridge, rx) = bridge_channel(
-        BridgeAdmission::fixed(max_in_flight),
-        rt.handle().clone(),
-        Arc::new(hj_core::budget::BodyBufferBudget::new(
+    let (keepalive_tx, mut keepalive_rx) = mpsc::channel::<()>(1);
+    let bridge = Bridge {
+        spawn_req: make_spawner(handler),
+        admission: BridgeAdmission::fixed(max_in_flight).gate,
+        timer: rt.handle().clone(),
+        body_budget: Arc::new(hj_core::budget::BodyBufferBudget::new(
             hj_core::budget::DEFAULT_BODY_BUFFER_MEM,
         )),
-    );
-    let handler = Arc::new(handler);
+        _keepalive: Some(Arc::new(keepalive_tx)),
+    };
     std::thread::Builder::new()
         .name("hj-uring-bridge".into())
         .stack_size(crate::RUNTIME_THREAD_STACK_BYTES)
         .spawn(move || {
-            rt.block_on(run_receiver(rx, handler));
+            rt.block_on(async move {
+                let _ = keepalive_rx.recv().await;
+            });
         })?;
     Ok(bridge)
 }
@@ -1357,26 +1387,14 @@ where
     F: Fn(Request, BridgeCtx) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Response> + Send + 'static,
 {
-    let (bridge, rx) = bridge_channel(admission, tokio::runtime::Handle::current(), body_budget);
-    tokio::spawn(run_receiver(rx, Arc::new(handler)));
-    bridge
-}
-
-fn bridge_channel(
-    admission: BridgeAdmission,
-    timer: tokio::runtime::Handle,
-    body_budget: Arc<hj_core::budget::BodyBufferBudget>,
-) -> (Bridge, mpsc::Receiver<BridgeReq>) {
-    let (tx, rx) = mpsc::channel(MAX_IN_FLIGHT_REQUESTS);
-    (
-        Bridge {
-            tx,
-            admission: admission.gate,
-            timer,
-            body_budget,
-        },
-        rx,
-    )
+    Bridge {
+        spawn_req: make_spawner(handler),
+        admission: admission.gate,
+        timer: tokio::runtime::Handle::current(),
+        body_budget,
+        #[cfg(test)]
+        _keepalive: None,
+    }
 }
 
 /// Buffer a response body to `Bytes`. The bridge returns a complete response; a
@@ -3275,6 +3293,7 @@ mod tests {
             completion: None,
             status,
             headers: http::HeaderMap::new(),
+            shared_headers: None,
             body: BridgeBody::Full(Bytes::new()),
             bw_rate: None,
         };

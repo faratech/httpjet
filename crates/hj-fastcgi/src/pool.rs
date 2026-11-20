@@ -181,7 +181,13 @@ impl FastCgiPool {
                     state.idle.pop_front();
                     state.open -= 1;
                 }
-                while reuse_idle && let Some(idle) = state.idle.pop_back() {
+                let candidate = if reuse_idle {
+                    state.idle.pop_back()
+                } else {
+                    None
+                };
+                if let Some(idle) = candidate {
+                    drop(state);
                     if idle.stream.is_healthy() {
                         return Ok(PooledConnection {
                             inner: self.0.clone(),
@@ -190,9 +196,11 @@ impl FastCgiPool {
                             reused: true,
                         });
                     }
-                    // #629: peer closed while idle — discard and keep looking
-                    // (falls through to a fresh dial when no idle survives).
+                    // #629: peer closed while idle — drop lock-free, decrement open, retry loop.
+                    drop(idle);
+                    let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
                     state.open -= 1;
+                    continue;
                 }
                 // A fresh dial at the cap gives up the oldest idle connection for its slot.
                 if !reuse_idle && state.open >= self.0.max_open && state.idle.pop_front().is_some()

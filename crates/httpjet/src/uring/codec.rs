@@ -309,6 +309,9 @@ impl ChunkedDecoder {
                     Ok(line_end) => line_end,
                     Err(line_len) => return self.unterminated(buf, line_len),
                 };
+                if line_end.saturating_sub(self.pos) > MAX_CHUNK_LINE {
+                    return ChunkStep::Bad;
+                }
                 let next = line_end + 2;
                 if next.saturating_sub(self.start) > self.max_raw {
                     return ChunkStep::Bad;
@@ -326,6 +329,9 @@ impl ChunkedDecoder {
                 Ok(line_end) => line_end,
                 Err(line_len) => return self.unterminated(buf, line_len),
             };
+            if line_end.saturating_sub(self.pos) > MAX_CHUNK_LINE {
+                return ChunkStep::Bad;
+            }
             let data_start = line_end + 2;
             if data_start.saturating_sub(self.start) > self.max_raw {
                 return ChunkStep::Bad;
@@ -355,9 +361,7 @@ impl ChunkedDecoder {
 /// decoder and the h2/h3 parsers do not; a head one parser frames differently from
 /// another is a desync seam against lenient upstreams, so such a head is refused.
 pub fn head_has_bare_lf(head: &[u8]) -> bool {
-    head.iter()
-        .enumerate()
-        .any(|(i, &b)| b == b'\n' && (i == 0 || head[i - 1] != b'\r'))
+    memchr::memchr_iter(b'\n', head).any(|i| i == 0 || head.get(i - 1) != Some(&b'\r'))
 }
 
 #[cfg(test)]

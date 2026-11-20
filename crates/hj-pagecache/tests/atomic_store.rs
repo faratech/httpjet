@@ -40,6 +40,7 @@ fn entry(i: usize, body: &[u8], tags: &[&str], ttl: Duration) -> CachedResponse 
             http::header::CONTENT_TYPE,
             HeaderValue::from_static("text/html"),
         )],
+        prebuilt_headers: None,
         body: PageBody::InMem(Bytes::copy_from_slice(body)),
         variants: Vec::new(),
         variants_filled: false,

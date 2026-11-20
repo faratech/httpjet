@@ -1974,14 +1974,14 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
 
         tracing::info!(workers, vhosts = state.server.vhosts.len(), "httpjet serving. Ctrl-C to stop.");
         #[cfg(feature = "acme")]
-        if let Some(acme) = acme {
+        let acme_handle = acme.map(|acme| {
             let shutdown = state.shutdown.clone();
-            handles.push(tokio::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(error) = acme.run(shutdown).await {
                     tracing::error!(%error, "ACME manager stopped; operator reconciliation required");
                 }
-            }));
-        }
+            })
+        });
         // Serve until SIGINT/SIGTERM (systemctl stop / kill). SIGUSR1 reopens the
         // logs (logrotate); SIGUSR2 toggles the log level at runtime — neither
         // exits, so the wait is a loop.
@@ -2194,6 +2194,18 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         );
         if !args.telemetry_file.trim().is_empty() && args.telemetry_flush_secs > 0 {
             telemetry::flush_once(&telemetry_sampler, &telemetry_file).await;
+        }
+        #[cfg(feature = "acme")]
+        if let Some(mut handle) = acme_handle {
+            // Give the ACME task a bounded window to complete cooperative DNS-01 TXT
+            // cleanup after `state.shutdown.cancel()` before aborting it.
+            if tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!("ACME shutdown cleanup timed out after 5s; aborting task");
+                handle.abort();
+            }
         }
         for h in handles {
             h.abort();

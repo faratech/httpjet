@@ -142,36 +142,40 @@ fn qpack_read_int(buf: &[u8], pos: &mut usize, prefix_bits: u32) -> Option<u64> 
     Some(val)
 }
 
-/// Read a QPACK string literal: an `H` (Huffman) bit at bit position `prefix_bits`, a
-/// `prefix_bits`-prefixed length, then the bytes (Huffman-decoded when H=1).
-fn qpack_read_str_limited(
-    buf: &[u8],
+/// Read a QPACK string literal into a borrowed slice (direct slice into `buf` when H=0,
+/// or decoded into `scratch` when H=1), enforcing `max_output`.
+fn qpack_read_str_ref<'a>(
+    buf: &'a [u8],
     pos: &mut usize,
     prefix_bits: u32,
     max_output: usize,
-) -> Option<Vec<u8>> {
+    scratch: &'a mut Vec<u8>,
+) -> Option<&'a [u8]> {
     let huff = (*buf.get(*pos)? >> prefix_bits) & 1 == 1;
     let len = qpack_read_int(buf, pos, prefix_bits)? as usize;
     let raw = buf.get(*pos..(*pos).checked_add(len)?)?;
     *pos += len;
     if huff {
-        hj_h2::hpack::huffman::decode_limited(raw, max_output)
+        hj_h2::hpack::huffman::decode_into_limited(scratch, raw, max_output)?;
+        Some(scratch.as_slice())
     } else {
-        (raw.len() <= max_output).then(|| raw.to_vec())
+        (raw.len() <= max_output).then_some(raw)
     }
 }
 
-/// Decode a QPACK encoded field section (RFC 9204 §4.5) into (name, value) pairs. Supports
-/// the static table + literals + Huffman; rejects any dynamic/post-base reference (unused).
-#[cfg(test)]
-pub(crate) fn qpack_decode(buf: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    qpack_decode_limited(buf, usize::MAX).map(|(headers, _)| headers)
-}
-
-pub(crate) fn qpack_decode_limited(
+/// Decode a QPACK encoded field section (RFC 9204 §4.5), invoking `emit(name, value)` for
+/// each decoded field without allocating per-header `Vec<u8>`s. Returning `false` from
+/// `emit` aborts decoding and returns `None`. On success returns the RFC 9204 decoded
+/// field-section size.
+pub(crate) fn qpack_decode_into(
     buf: &[u8],
     max_field_section_size: usize,
-) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, usize)> {
+    mut emit: impl FnMut(&[u8], &[u8]) -> bool,
+) -> Option<usize> {
+    use std::cell::RefCell;
+    thread_local! {
+        static SCRATCH: RefCell<(Vec<u8>, Vec<u8>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    }
     let mut pos = 0usize;
     // Required Insert Count must be 0: the dynamic table is never used
     // (SETTINGS advertise capacity 0), so a nonzero count references state
@@ -185,59 +189,114 @@ pub(crate) fn qpack_decode_limited(
     if qpack_read_int(buf, &mut pos, 7)? != 0 || delta_sign_negative {
         return None;
     }
-    let mut out = Vec::new();
     let mut decoded_size = 0usize;
-    while pos < buf.len() {
-        let first = buf[pos];
-        if first & 0x80 != 0 {
-            // Indexed Field Line; T (bit6): 1=static.
-            let is_static = (first >> 6) & 1 == 1;
-            let idx = qpack_read_int(buf, &mut pos, 6)? as usize;
-            if !is_static {
-                return None;
+    SCRATCH.with(|cell| {
+        let mut fallback = (Vec::new(), Vec::new());
+        let mut guard = cell.try_borrow_mut().ok();
+        let (name_scratch, val_scratch) = match guard.as_deref_mut() {
+            Some(pair) => pair,
+            None => &mut fallback,
+        };
+        while pos < buf.len() {
+            let first = *buf.get(pos)?;
+            if first & 0x80 != 0 {
+                // Indexed Field Line; T (bit6): 1=static.
+                let is_static = (first >> 6) & 1 == 1;
+                let idx = qpack_read_int(buf, &mut pos, 6)? as usize;
+                if !is_static {
+                    return None;
+                }
+                let (n, v) = QPACK_STATIC.get(idx)?;
+                decoded_size = decoded_size
+                    .checked_add(n.len())?
+                    .checked_add(v.len())?
+                    .checked_add(32)?;
+                if decoded_size > max_field_section_size {
+                    return None;
+                }
+                if !emit(n.as_bytes(), v.as_bytes()) {
+                    return None;
+                }
+            } else if first & 0x40 != 0 {
+                // Literal Field Line with Name Reference; T (bit4): 1=static.
+                let is_static = (first >> 4) & 1 == 1;
+                let idx = qpack_read_int(buf, &mut pos, 4)? as usize;
+                if !is_static {
+                    return None;
+                }
+                let name_bytes = QPACK_STATIC.get(idx)?.0.as_bytes();
+                let base = decoded_size
+                    .checked_add(name_bytes.len())?
+                    .checked_add(32)?;
+                if base > max_field_section_size {
+                    return None;
+                }
+                let value = qpack_read_str_ref(
+                    buf,
+                    &mut pos,
+                    7,
+                    max_field_section_size - base,
+                    val_scratch,
+                )?;
+                decoded_size = base.checked_add(value.len())?;
+                if !emit(name_bytes, value) {
+                    return None;
+                }
+            } else if first & 0x20 != 0 {
+                // Literal Field Line with Literal Name (001 N H + 3-bit name length).
+                let base = decoded_size.checked_add(32)?;
+                if base > max_field_section_size {
+                    return None;
+                }
+                let name = qpack_read_str_ref(
+                    buf,
+                    &mut pos,
+                    3,
+                    max_field_section_size - base,
+                    name_scratch,
+                )?;
+                let with_name = base.checked_add(name.len())?;
+                let value = qpack_read_str_ref(
+                    buf,
+                    &mut pos,
+                    7,
+                    max_field_section_size - with_name,
+                    val_scratch,
+                )?;
+                decoded_size = with_name.checked_add(value.len())?;
+                if !emit(name, value) {
+                    return None;
+                }
+            } else {
+                return None; // post-base / dynamic — unsupported (table capacity 0)
             }
-            let (n, v) = QPACK_STATIC.get(idx)?;
-            decoded_size = decoded_size
-                .checked_add(n.len())?
-                .checked_add(v.len())?
-                .checked_add(32)?;
-            if decoded_size > max_field_section_size {
-                return None;
-            }
-            out.push((n.as_bytes().to_vec(), v.as_bytes().to_vec()));
-        } else if first & 0x40 != 0 {
-            // Literal Field Line with Name Reference; T (bit4): 1=static.
-            let is_static = (first >> 4) & 1 == 1;
-            let idx = qpack_read_int(buf, &mut pos, 4)? as usize;
-            if !is_static {
-                return None;
-            }
-            let name_bytes = QPACK_STATIC.get(idx)?.0.as_bytes();
-            let base = decoded_size
-                .checked_add(name_bytes.len())?
-                .checked_add(32)?;
-            if base > max_field_section_size {
-                return None;
-            }
-            let value = qpack_read_str_limited(buf, &mut pos, 7, max_field_section_size - base)?;
-            decoded_size = base.checked_add(value.len())?;
-            let name = name_bytes.to_vec();
-            out.push((name, value));
-        } else if first & 0x20 != 0 {
-            // Literal Field Line with Literal Name (001 N H + 3-bit name length).
-            let base = decoded_size.checked_add(32)?;
-            if base > max_field_section_size {
-                return None;
-            }
-            let name = qpack_read_str_limited(buf, &mut pos, 3, max_field_section_size - base)?;
-            let with_name = base.checked_add(name.len())?;
-            let value =
-                qpack_read_str_limited(buf, &mut pos, 7, max_field_section_size - with_name)?;
-            decoded_size = with_name.checked_add(value.len())?;
-            out.push((name, value));
-        } else {
-            return None; // post-base / dynamic — unsupported (table capacity 0)
         }
-    }
+        // Cap retained scratch capacity so one huge header doesn't pin memory.
+        if name_scratch.capacity() > 4096 {
+            *name_scratch = Vec::new();
+        }
+        if val_scratch.capacity() > 16384 {
+            *val_scratch = Vec::new();
+        }
+        Some(decoded_size)
+    })
+}
+
+/// Decode a QPACK encoded field section (RFC 9204 §4.5) into (name, value) pairs. Supports
+/// the static table + literals + Huffman; rejects any dynamic/post-base reference (unused).
+#[cfg(test)]
+pub(crate) fn qpack_decode(buf: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    qpack_decode_limited(buf, usize::MAX).map(|(headers, _)| headers)
+}
+
+pub(crate) fn qpack_decode_limited(
+    buf: &[u8],
+    max_field_section_size: usize,
+) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, usize)> {
+    let mut out = Vec::new();
+    let decoded_size = qpack_decode_into(buf, max_field_section_size, |name, value| {
+        out.push((name.to_vec(), value.to_vec()));
+        true
+    })?;
     Some((out, decoded_size))
 }

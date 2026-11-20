@@ -239,7 +239,7 @@ impl ExpiresRules {
     /// ignored): OLS `setExpiresByType` applies entries in order, each overwriting
     /// the matching MIME types, so a later entry wins. `None` if no rule applies.
     pub fn lookup(&self, content_type: &str) -> Option<ExpiresRule> {
-        let base = ct_base(content_type).to_ascii_lowercase();
+        let base = ct_base(content_type);
         if base.is_empty() {
             // OLS still matches a bare `*` rule even with no subtype context,
             // but in practice an empty content-type yields no MIME setting.
@@ -253,7 +253,7 @@ impl ExpiresRules {
         self.entries
             .iter()
             .rev()
-            .find(|(g, _)| g.matches(&base))
+            .find(|(g, _)| g.matches(base))
             .map(|(_, r)| *r)
     }
 
@@ -291,11 +291,14 @@ impl TypeGlob {
         matches!(self, TypeGlob::Any)
     }
 
-    fn matches(&self, base_lower: &str) -> bool {
+    fn matches(&self, base: &str) -> bool {
         match self {
             TypeGlob::Any => true,
-            TypeGlob::Prefix(p) => base_lower.starts_with(p.as_str()),
-            TypeGlob::Exact(e) => e == base_lower,
+            TypeGlob::Prefix(p) => base
+                .as_bytes()
+                .get(..p.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes())),
+            TypeGlob::Exact(e) => base.eq_ignore_ascii_case(e),
         }
     }
 }

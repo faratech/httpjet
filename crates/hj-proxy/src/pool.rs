@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hyper::client::conn::http1::SendRequest;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -211,6 +211,8 @@ pub struct Upstream {
     idle: Mutex<VecDeque<PooledConn>>,
     /// Consecutive connect-failure count feeding the circuit breaker.
     fail_count: AtomicU32,
+    /// Lock-free fast-path hint mirroring `tripped_at.is_some()`.
+    breaker_tripped: std::sync::atomic::AtomicBool,
     /// When the breaker opened (`None` = closed). While open, checkout fast-fails
     /// without dialing, avoiding a connect-timeout storm against a dead upstream.
     tripped_at: Mutex<Option<Instant>>,
@@ -277,6 +279,7 @@ impl Upstream {
             response_timeout: DEFAULT_RESPONSE_TIMEOUT,
             idle: Mutex::new(VecDeque::new()),
             fail_count: AtomicU32::new(0),
+            breaker_tripped: std::sync::atomic::AtomicBool::new(false),
             tripped_at: Mutex::new(None),
             tls_config,
             bad_until: Mutex::new(None),
@@ -300,7 +303,7 @@ impl Upstream {
     const MAX_QUEUE_WAIT: Duration = Duration::from_secs(10);
 
     /// The bound on each phase of a dial (see [`Self::MAX_QUEUE_WAIT`]).
-    fn dial_timeout(&self) -> Duration {
+    pub(crate) fn dial_timeout(&self) -> Duration {
         self.connect_timeout.min(Self::MAX_QUEUE_WAIT)
     }
 
@@ -325,11 +328,14 @@ impl Upstream {
     /// Side effect: once the open window has elapsed it admits ONE half-open trial
     /// dial and re-arms the window, so concurrent checkouts stay fast-failed until
     /// that trial resolves.
-    fn breaker_open(&self) -> bool {
+    pub(crate) fn breaker_open(&self) -> bool {
         matches!(self.breaker_gate(), BreakerGate::Open)
     }
 
     fn breaker_gate(&self) -> BreakerGate {
+        if !self.breaker_tripped.load(Ordering::Acquire) {
+            return BreakerGate::Closed;
+        }
         let mut tripped = self.tripped_at.lock();
         match *tripped {
             Some(at) if at.elapsed() < CB_HALF_OPEN_AFTER => BreakerGate::Open,
@@ -352,7 +358,11 @@ impl Upstream {
     /// (and clear the pool-level failover mark).
     pub(crate) fn note_dial_success(&self) {
         self.fail_count.store(0, Ordering::Relaxed);
-        *self.tripped_at.lock() = None;
+        if self.breaker_tripped.load(Ordering::Acquire) {
+            let mut tripped = self.tripped_at.lock();
+            *tripped = None;
+            self.breaker_tripped.store(false, Ordering::Release);
+        }
         if let Some(b) = self.bad_until.lock().as_ref() {
             b.store(0, Ordering::Relaxed);
         }
@@ -364,7 +374,11 @@ impl Upstream {
     pub(crate) fn note_dial_failure(&self) {
         let n = self.fail_count.fetch_add(1, Ordering::Relaxed) + 1;
         if n >= CB_THRESHOLD {
-            *self.tripped_at.lock() = Some(Instant::now());
+            {
+                let mut tripped = self.tripped_at.lock();
+                *tripped = Some(Instant::now());
+                self.breaker_tripped.store(true, Ordering::Release);
+            }
             if let Some(b) = self.bad_until.lock().as_ref() {
                 let until = now_epoch_ms() + CB_HALF_OPEN_AFTER.as_millis() as u64;
                 b.store(until, Ordering::Relaxed);
@@ -630,6 +644,15 @@ impl Upstream {
     }
 }
 
+#[derive(Clone)]
+struct PoolEntry {
+    upstream: Arc<Upstream>,
+    /// Per-peer failover mark: epoch-ms until which the peer is skipped for NEW
+    /// requests (set when the peer's breaker trips, cleared on a successful dial).
+    /// Bound into `upstream` once at creation and carried across reloads together.
+    bad_until: Arc<AtomicU64>,
+}
+
 /// A registry of upstreams keyed by [`ProxyTarget::pool_key`]. Lets the proxy
 /// reuse pools across requests for both configured ext-processors and ad-hoc
 /// rewrite targets.
@@ -640,11 +663,9 @@ pub struct UpstreamPool {
     health_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     published_groups: Arc<Mutex<Option<Vec<Arc<balance::Group>>>>>,
     groups: Mutex<HashMap<balance::GroupKey, Arc<balance::Group>>>,
-    pools: Mutex<HashMap<PoolKey, Arc<Upstream>>>,
-    /// (Tier 1.2) Per-peer failover marks: epoch-ms until which the peer is skipped
-    /// for NEW requests (set when the peer's breaker trips, cleared on a successful
-    /// dial). Keyed by the same PoolKey as `pools`.
-    bad_until: Mutex<HashMap<PoolKey, Arc<AtomicU64>>>,
+    /// Named-peer pools + failover cooldowns under a single `RwLock`, bucketed by
+    /// 64-bit `PoolKeyRef` hash so the hot read path takes 1 read lock and 0 allocs.
+    pools: RwLock<HashMap<u64, Vec<(PoolKey, PoolEntry)>>>,
     /// (Tier 1.2) Requests served by a failover peer because the primary was marked.
     failovers: AtomicU64,
 }
@@ -723,7 +744,95 @@ struct PoolKey {
     connect_timeout: Duration,
 }
 
+/// Borrowed lookup key matching [`PoolKey`] without allocating any Strings or PathBufs.
+struct PoolKeyRef<'a> {
+    scope: Option<&'a str>,
+    name: Option<&'a str>,
+    scheme: &'a str,
+    authority: &'a str,
+    transport: &'a TargetTransport,
+    client_cert_file: Option<&'a std::path::Path>,
+    client_key_file: Option<&'a std::path::Path>,
+    max_conns: u32,
+    keep_alive: Duration,
+    connect_timeout: Duration,
+}
+
+impl<'a> PoolKeyRef<'a> {
+    fn from_target(
+        target: &'a ProxyTarget,
+        max_conns: u32,
+        keep_alive: Duration,
+        connect_timeout: Duration,
+    ) -> Self {
+        PoolKeyRef {
+            scope: target.scope.as_deref(),
+            name: target.name.as_deref(),
+            scheme: &target.scheme,
+            authority: &target.authority,
+            transport: &target.transport,
+            client_cert_file: target.client_cert_file.as_deref(),
+            client_key_file: target.client_key_file.as_deref(),
+            max_conns: max_conns.max(1),
+            keep_alive,
+            connect_timeout: if connect_timeout.is_zero() {
+                Duration::from_secs(10)
+            } else {
+                connect_timeout
+            },
+        }
+    }
+
+    fn hash64(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.scope.hash(&mut h);
+        self.name.hash(&mut h);
+        for b in self.scheme.bytes() {
+            b.to_ascii_lowercase().hash(&mut h);
+        }
+        self.authority.hash(&mut h);
+        self.transport.hash(&mut h);
+        self.client_cert_file.hash(&mut h);
+        self.client_key_file.hash(&mut h);
+        self.max_conns.hash(&mut h);
+        self.keep_alive.hash(&mut h);
+        self.connect_timeout.hash(&mut h);
+        h.finish()
+    }
+}
+
 impl PoolKey {
+    fn eq_ref(&self, r: &PoolKeyRef<'_>) -> bool {
+        self.identity_epoch == 0
+            && self.scope.as_deref() == r.scope
+            && self.name.as_deref() == r.name
+            && self.scheme.eq_ignore_ascii_case(r.scheme)
+            && self.authority == r.authority
+            && &self.transport == r.transport
+            && self.client_cert_file.as_deref() == r.client_cert_file
+            && self.client_key_file.as_deref() == r.client_key_file
+            && self.max_conns == r.max_conns
+            && self.keep_alive == r.keep_alive
+            && self.connect_timeout == r.connect_timeout
+    }
+
+    fn hash64(&self) -> u64 {
+        PoolKeyRef {
+            scope: self.scope.as_deref(),
+            name: self.name.as_deref(),
+            scheme: &self.scheme,
+            authority: &self.authority,
+            transport: &self.transport,
+            client_cert_file: self.client_cert_file.as_deref(),
+            client_key_file: self.client_key_file.as_deref(),
+            max_conns: self.max_conns,
+            keep_alive: self.keep_alive,
+            connect_timeout: self.connect_timeout,
+        }
+        .hash64()
+    }
+
     fn new(
         target: &ProxyTarget,
         max_conns: u32,
@@ -762,8 +871,7 @@ impl UpstreamPool {
             health_tasks: Mutex::new(Vec::new()),
             published_groups: Arc::new(Mutex::new(None)),
             groups: Mutex::new(HashMap::new()),
-            pools: Mutex::new(HashMap::new()),
-            bad_until: Mutex::new(HashMap::new()),
+            pools: RwLock::new(HashMap::new()),
             failovers: AtomicU64::new(0),
         }
     }
@@ -787,40 +895,55 @@ impl UpstreamPool {
         }
         let peers = target.peers();
         let now_ms = now_epoch_ms();
-        for (idx, peer) in peers.iter().enumerate() {
-            let key = PoolKey::new(peer, max_conns, keep_alive, connect_timeout);
-            let bad = {
-                let bad = self.bad_until.lock();
-                bad.get(&key)
-                    .map(|a| a.load(Ordering::Relaxed))
-                    .unwrap_or(0)
-            };
-            if bad > now_ms {
-                continue; // peer in its failover cooldown — try the next
+        // Hot read path: single shared RwLock read, zero allocations.
+        {
+            let pools = self.pools.read();
+            for (idx, peer) in peers.iter().enumerate() {
+                let kref = PoolKeyRef::from_target(peer, max_conns, keep_alive, connect_timeout);
+                let h = kref.hash64();
+                let Some(entry) = pools
+                    .get(&h)
+                    .and_then(|bucket| bucket.iter().find(|(k, _)| k.eq_ref(&kref)))
+                    .map(|(_, e)| e)
+                else {
+                    // First time seeing this peer — fall through to write path.
+                    break;
+                };
+                if entry.bad_until.load(Ordering::Relaxed) > now_ms {
+                    continue;
+                }
+                if idx > 0 {
+                    self.failovers.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Arc::clone(&entry.upstream));
             }
-            let handle = {
-                let mut bad = self.bad_until.lock();
-                Arc::clone(
-                    bad.entry(key.clone())
-                        .or_insert_with(|| Arc::new(AtomicU64::new(0))),
-                )
-            };
-            let upstream = {
-                let mut pools = self.pools.lock();
-                pools
-                    .entry(key)
-                    .or_insert_with(|| {
-                        let up = Upstream::new(peer, max_conns, keep_alive, connect_timeout);
-                        up.set_bad_until_handle(handle.clone());
-                        up
-                    })
-                    .clone()
-            };
-            // (#584) A retained upstream (config reload) still points at the
-            // PREVIOUS generation's bad_until handle, so its dial failures
-            // never reach this pool's failover check. Rebind on every
-            // selection; same-Arc when nothing changed.
-            upstream.set_bad_until_handle(handle);
+        }
+        // Cold write path (first creation of a named peer, or all peers marked bad).
+        let mut pools = self.pools.write();
+        for (idx, peer) in peers.iter().enumerate() {
+            let kref = PoolKeyRef::from_target(peer, max_conns, keep_alive, connect_timeout);
+            let h = kref.hash64();
+            let bucket = pools.entry(h).or_default();
+            if let Some((_, entry)) = bucket.iter().find(|(k, _)| k.eq_ref(&kref)) {
+                if entry.bad_until.load(Ordering::Relaxed) > now_ms {
+                    continue;
+                }
+                if idx > 0 {
+                    self.failovers.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(Arc::clone(&entry.upstream));
+            }
+            let key = PoolKey::new(peer, max_conns, keep_alive, connect_timeout);
+            let bad_until = Arc::new(AtomicU64::new(0));
+            let upstream = Upstream::new(peer, max_conns, keep_alive, connect_timeout);
+            upstream.set_bad_until_handle(Arc::clone(&bad_until));
+            bucket.push((
+                key,
+                PoolEntry {
+                    upstream: Arc::clone(&upstream),
+                    bad_until,
+                },
+            ));
             if idx > 0 {
                 self.failovers.fetch_add(1, Ordering::Relaxed);
             }
@@ -828,13 +951,29 @@ impl UpstreamPool {
         }
         // Every peer marked bad: serve from the primary (its breaker half-open
         // window decides fast-fail vs trial dial) rather than refusing outright.
-        let primary = &peers[0];
+        let Some(primary) = peers.first() else {
+            return Err(hj_core::HandlerError::BadGateway(
+                "proxy target has no peers".into(),
+            ));
+        };
+        let kref = PoolKeyRef::from_target(primary, max_conns, keep_alive, connect_timeout);
+        let h = kref.hash64();
+        let bucket = pools.entry(h).or_default();
+        if let Some((_, entry)) = bucket.iter().find(|(k, _)| k.eq_ref(&kref)) {
+            return Ok(Arc::clone(&entry.upstream));
+        }
         let key = PoolKey::new(primary, max_conns, keep_alive, connect_timeout);
-        let mut pools = self.pools.lock();
-        Ok(pools
-            .entry(key)
-            .or_insert_with(|| Upstream::new(primary, max_conns, keep_alive, connect_timeout))
-            .clone())
+        let bad_until = Arc::new(AtomicU64::new(0));
+        let upstream = Upstream::new(primary, max_conns, keep_alive, connect_timeout);
+        upstream.set_bad_until_handle(Arc::clone(&bad_until));
+        bucket.push((
+            key,
+            PoolEntry {
+                upstream: Arc::clone(&upstream),
+                bad_until,
+            },
+        ));
+        Ok(upstream)
     }
 
     fn dynamic_pool(
@@ -918,11 +1057,11 @@ impl UpstreamPool {
 
     /// Number of distinct upstream pools (for tests/metrics).
     pub fn len(&self) -> usize {
-        self.pools.lock().len() + self.dynamic.lock().pools.len()
+        self.pools.read().values().map(Vec::len).sum::<usize>() + self.dynamic.lock().pools.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pools.lock().is_empty() && self.dynamic.lock().pools.is_empty()
+        self.pools.read().is_empty() && self.dynamic.lock().pools.is_empty()
     }
 
     pub(crate) fn retained_generation(
@@ -964,39 +1103,37 @@ impl UpstreamPool {
                 )
             })
             .collect();
-        // (#584) Carry failover cooldowns for retained keys into the new
-        // generation; a fresh empty map would forget a dead primary.
-        let retained_bad: HashMap<PoolKey, Arc<AtomicU64>> = {
-            let pools_keys: std::collections::HashSet<PoolKey> =
-                self.pools.lock().keys().cloned().collect();
-            self.bad_until
-                .lock()
-                .iter()
-                .filter(|(k, _)| pools_keys.contains(*k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
-        };
-        let pools = self.pools.lock();
-        let retained = pools
-            .iter()
-            // Credential files can rotate in place without changing their paths. Rebuild any
-            // explicitly authenticated TLS upstream for the new generation so it re-reads the
-            // identity (or retains a new load error) while the old generation's in-flight handles
-            // drain naturally. Anonymous pools still retain their live connections.
-            .filter(|(key, _)| {
-                !key.has_configured_tls_identity()
-                    && (key.name.is_none() || retained_named.contains(*key))
-            })
-            .map(|(key, upstream)| (key.clone(), upstream.clone()))
-            .collect();
+        let pools = self.pools.read();
+        let mut retained: HashMap<u64, Vec<(PoolKey, PoolEntry)>> = HashMap::new();
+        for bucket in pools.values() {
+            for (key, entry) in bucket {
+                // Credential files can rotate in place without changing their paths. Rebuild any
+                // explicitly authenticated TLS upstream for the new generation so it re-reads the
+                // identity (or retains a new load error) while the old generation's in-flight handles
+                // drain naturally. Anonymous pools still retain their live connections.
+                if !key.has_configured_tls_identity()
+                    && (key.name.is_none() || retained_named.contains(key))
+                {
+                    // (#584) Carry failover cooldowns together with retained upstreams.
+                    let cloned = entry.clone();
+                    cloned
+                        .upstream
+                        .set_bad_until_handle(Arc::clone(&cloned.bad_until));
+                    retained
+                        .entry(key.hash64())
+                        .or_default()
+                        .push((key.clone(), cloned));
+                }
+            }
+        }
+        drop(pools);
         UpstreamPool {
             dynamic: self.dynamic.clone(),
             identity_epoch: NEXT_IDENTITY_EPOCH.fetch_add(1, Ordering::Relaxed),
-            pools: Mutex::new(retained),
+            pools: RwLock::new(retained),
             health_tasks: Mutex::new(Vec::new()),
             published_groups: self.published_groups.clone(),
             groups: Mutex::new(groups),
-            bad_until: Mutex::new(retained_bad),
             failovers: AtomicU64::new(0),
         }
     }
@@ -1024,7 +1161,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(pool.len(), MAX_DYNAMIC_POOLS);
-        assert!(pool.bad_until.lock().is_empty());
+        assert!(pool.pools.read().is_empty());
         drop(held);
         assert!(
             pool.get_or_create(&extra, 1, Duration::from_secs(1), Duration::from_secs(1))

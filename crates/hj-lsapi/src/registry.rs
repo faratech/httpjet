@@ -726,14 +726,27 @@ impl LsapiRegistry {
         let mut supervisor = LsphpSupervisor::new(sup_cfg);
         supervisor.set_cancel(cancel.clone());
         // Adopt the systemd socket-activated listen fd for the DEFAULT pool, if one was
-        // installed (standalone `httpjet lsphp`). The supervisor then holds it across
-        // restarts and never binds/unlinks the socket path. Jailed/non-default keys always
-        // self-bind their own generated sockets.
-        if key.is_default() {
-            if let Some(fd) = self.listen_fd.lock().take() {
+        // installed (standalone `httpjet lsphp`). Duplicate the fd before `start()` so a
+        // transient startup failure does not permanently lose socket activation on retry;
+        // once started, drop the registry's copy. Jailed/non-default keys always self-bind
+        // their own generated sockets.
+        let adopted_listen_fd = if key.is_default() {
+            let dup = self
+                .listen_fd
+                .lock()
+                .as_ref()
+                .map(|fd| fd.try_clone())
+                .transpose()
+                .map_err(|e| std::io::Error::new(e.kind(), format!("dup lsapi listen fd: {e}")))?;
+            if let Some(fd) = dup {
                 supervisor = supervisor.with_listen_fd(fd);
+                true
+            } else {
+                false
             }
-        }
+        } else {
+            false
+        };
         let pool = Arc::new(
             LsapiPool::from_uds(socket_path, self.params.max_conns, self.params.init_timeout)
                 .idle_ttl(self.params.idle_ttl)
@@ -754,6 +767,9 @@ impl LsapiRegistry {
         );
         let supervisor = Arc::new(supervisor);
         supervisor.start().await?;
+        if adopted_listen_fd {
+            let _ = self.listen_fd.lock().take();
+        }
 
         // Monitor: the single restart authority for THIS pool.
         let mut mon_cfg = MonitorConfig::new(supervisor.clone(), pool.clone());

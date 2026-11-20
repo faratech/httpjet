@@ -874,7 +874,7 @@ fn apply_rule(
         // an unset slot expands empty (not a stale prior-rule value).
         state.last_cond_caps = empty_caps();
         state.last_cond_escaped = None;
-        if !eval_conditions(&rule.conds, input, state, &[]) {
+        if !eval_conditions(&rule.conds, input, state, &[], rule.needs_cond_caps) {
             if state.regex_failed {
                 return Some(RuleApply::Terminal(RewriteOutcome::Failed {
                     env: state.env_vec(),
@@ -905,6 +905,21 @@ fn apply_rule(
                 empty_caps()
             }
         }
+        None if !rule.needs_rule_caps => {
+            let hit = match rule.pattern.is_match_checked(match_target.as_ref()) {
+                Ok(hit) => hit,
+                Err(()) => {
+                    return Some(RuleApply::Terminal(RewriteOutcome::Failed {
+                        env: state.env_vec(),
+                        reason: "rewrite rule regex failed at match time",
+                    }));
+                }
+            };
+            if !(hit ^ rule.negate) {
+                return None;
+            }
+            empty_caps()
+        }
         None => {
             let caps = match rule.pattern.captures_checked(match_target.as_ref()) {
                 Ok(caps) => caps,
@@ -919,11 +934,7 @@ fn apply_rule(
             if !matched {
                 return None;
             }
-            if rule.needs_rule_caps {
-                capture_vec(match_target.as_ref(), rule, caps)
-            } else {
-                empty_caps()
-            }
+            capture_vec(match_target.as_ref(), rule, caps)
         }
     };
 
@@ -935,7 +946,7 @@ fn apply_rule(
     if !prescreened {
         state.last_cond_caps = empty_caps();
         state.last_cond_escaped = None;
-        if !eval_conditions(&rule.conds, input, state, &rule_caps) {
+        if !eval_conditions(&rule.conds, input, state, &rule_caps, rule.needs_cond_caps) {
             if state.regex_failed {
                 return Some(RuleApply::Terminal(RewriteOutcome::Failed {
                     env: state.env_vec(),
@@ -1208,6 +1219,7 @@ fn eval_conditions(
     input: &RewriteInput,
     state: &mut EvalState,
     rule_caps: &[Option<String>],
+    needs_cond_caps: bool,
 ) -> bool {
     if conds.is_empty() {
         return true;
@@ -1229,7 +1241,7 @@ fn eval_conditions(
     let mut i = 0;
     while i < conds.len() {
         let cond = &conds[i];
-        let passed = eval_one_cond(cond, input, state, rule_caps);
+        let passed = eval_one_cond(cond, input, state, rule_caps, needs_cond_caps);
         // An unevaluable cond must fail the rule (the caller turns it into a
         // fail-closed outcome) before negation or an `[OR]` sibling can pass it.
         if state.regex_failed {
@@ -1269,12 +1281,22 @@ fn eval_one_cond(
     input: &RewriteInput,
     state: &mut EvalState,
     rule_caps: &[Option<String>],
+    needs_cond_caps: bool,
 ) -> bool {
     COND_SCRATCH.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut guard) => eval_one_cond_in(cond, input, state, rule_caps, &mut guard),
+        Ok(mut guard) => {
+            eval_one_cond_in(cond, input, state, rule_caps, needs_cond_caps, &mut guard)
+        }
         // A stat or header callback re-entered `evaluate` while this thread's scratch
         // is in use: the nested condition gets its own buffers instead of a panic.
-        Err(_) => eval_one_cond_in(cond, input, state, rule_caps, &mut Default::default()),
+        Err(_) => eval_one_cond_in(
+            cond,
+            input,
+            state,
+            rule_caps,
+            needs_cond_caps,
+            &mut Default::default(),
+        ),
     })
 }
 
@@ -1283,6 +1305,7 @@ fn eval_one_cond_in(
     input: &RewriteInput,
     state: &mut EvalState,
     rule_caps: &[Option<String>],
+    needs_cond_caps: bool,
     scratch: &mut (String, String),
 ) -> bool {
     let (test, rhs_buf) = scratch;
@@ -1314,6 +1337,15 @@ fn eval_one_cond_in(
     let mut pending_caps = None;
     let mut pending_escaped = None;
     let result = match &cond.pattern {
+        CondPattern::Regex(re, _) if !needs_cond_caps || cond.negate => {
+            match re.is_match_checked(test.as_str()) {
+                Ok(hit) => hit,
+                Err(()) => {
+                    state.regex_failed = true;
+                    false
+                }
+            }
+        }
         CondPattern::Regex(re, _) => match re.captures_checked(test.as_str()) {
             Ok(Some(c)) => {
                 let mut caps = empty_caps();
@@ -1346,10 +1378,11 @@ fn eval_one_cond_in(
                 rule_caps,
                 &state.last_cond_caps,
             );
-            // OLS compares with strcmp/strcasecmp (NC). Replicate the case folding so `[NC]`
-            // lexical comparisons match; the non-NC path compares the buffers directly (no copy).
+            // OLS compares with strcmp/strcasecmp (NC). Zero-alloc ASCII case fold.
             let c = if cond.nocase {
-                test.to_ascii_lowercase().cmp(&rhs_buf.to_ascii_lowercase())
+                test.bytes()
+                    .map(|b| b.to_ascii_lowercase())
+                    .cmp(rhs_buf.bytes().map(|b| b.to_ascii_lowercase()))
             } else {
                 test.as_str().cmp(rhs_buf.as_str())
             };

@@ -155,21 +155,27 @@ struct CachedMeta {
     content_length: HeaderValue,
 }
 
-#[derive(Default)]
 struct HdrCache {
     /// File-version -> (ETag, Last-Modified, Content-Length).
-    meta: DashMap<MetaKey, Arc<CachedMeta>>,
+    meta: DashMap<MetaKey, Arc<CachedMeta>, rustc_hash::FxBuildHasher>,
     /// Extension -> Content-Type (only used on the charset-off path, where the
     /// value depends solely on the extension; `mime` is server-global).
-    ct: DashMap<Box<str>, HeaderValue>,
+    ct: DashMap<Box<str>, HeaderValue, rustc_hash::FxBuildHasher>,
     /// (doc_root, rel, wants_dir) hash -> the resolved file, TTL-coalesced.
     /// Keyed by a hash with the originating (root, rel, wants_dir) stored in the
     /// entry for a collision guard (a hash clash degrades to a re-resolve, never
     /// wrong content). See [`RESOLVE_TTL`].
-    resolve: DashMap<u64, Arc<ResolveEntry>>,
+    resolve: DashMap<u64, Arc<ResolveEntry>, rustc_hash::FxBuildHasher>,
     /// Docroot -> deadline of its "a symlink is on the path" verdict. See
     /// [`StaticFiles::open_root`].
-    symlinked_roots: DashMap<PathBuf, Instant>,
+    symlinked_roots: DashMap<PathBuf, Instant, rustc_hash::FxBuildHasher>,
+    /// (doc_root, primary_path, allow_symlink) hash -> ((doc_root, path, allow_symlink), bitmask, expires).
+    /// Avoids 1-2 ENOENT `openat2` syscalls per unmemoized static request when no
+    /// precompressed sibling exists, with zero PathBuf allocation on hit.
+    siblings: DashMap<u64, (PathBuf, PathBuf, bool, u8, Instant), rustc_hash::FxBuildHasher>,
+    /// Docroot -> (opened `RootDir` fd, expires). Avoids `openat2` + `close` (2 syscalls)
+    /// on every unmemoized static request; capped and refreshed on `RESOLVE_TTL` (1 s).
+    root_dirs: DashMap<PathBuf, (Arc<RootDir>, Instant), rustc_hash::FxBuildHasher>,
     /// Approximate entry counts for the cap gates — `DashMap::len()` sweeps every
     /// shard, and a full map paid that sweep on every uncached request. Bumped on
     /// new-key insert and reset when a full map is cleared, so they are exact up
@@ -178,12 +184,44 @@ struct HdrCache {
     ct_count: AtomicUsize,
     resolve_count: AtomicUsize,
     symlinked_roots_count: AtomicUsize,
+    siblings_count: AtomicUsize,
+    root_dirs_count: AtomicUsize,
 }
+
+impl Default for HdrCache {
+    fn default() -> Self {
+        Self {
+            meta: DashMap::with_hasher(rustc_hash::FxBuildHasher),
+            ct: DashMap::with_hasher(rustc_hash::FxBuildHasher),
+            resolve: DashMap::with_hasher(rustc_hash::FxBuildHasher),
+            symlinked_roots: DashMap::with_hasher(rustc_hash::FxBuildHasher),
+            siblings: DashMap::with_hasher(rustc_hash::FxBuildHasher),
+            root_dirs: DashMap::with_hasher(rustc_hash::FxBuildHasher),
+            meta_count: AtomicUsize::new(0),
+            ct_count: AtomicUsize::new(0),
+            resolve_count: AtomicUsize::new(0),
+            symlinked_roots_count: AtomicUsize::new(0),
+            siblings_count: AtomicUsize::new(0),
+            root_dirs_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+const SIBLING_BR_PROBED: u8 = 1 << 0;
+const SIBLING_BR_PRESENT: u8 = 1 << 1;
+const SIBLING_GZ_PROBED: u8 = 1 << 2;
+const SIBLING_GZ_PRESENT: u8 = 1 << 3;
 
 /// Insert into a capped cache, clearing it first when it is full: a cache that
 /// stopped admitting at its cap left every later key uncached for the rest of
 /// the config generation.
-fn admit<K: Eq + Hash, V>(map: &DashMap<K, V>, count: &AtomicUsize, cap: usize, key: K, value: V) {
+fn admit<K: Eq + Hash, V, S: std::hash::BuildHasher + Clone>(
+    map: &DashMap<K, V, S>,
+    count: &AtomicUsize,
+    cap: usize,
+    key: K,
+    value: V,
+) {
     if count.load(Ordering::Relaxed) >= cap {
         map.clear();
         count.store(0, Ordering::Relaxed);
@@ -312,7 +350,7 @@ impl StaticFiles {
         allow_symlink: bool,
         want_resolved: bool,
     ) -> Result<Resolved, HandlerError> {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut h = rustc_hash::FxHasher::default();
         doc_root.hash(&mut h);
         rel.hash(&mut h);
         wants_dir.hash(&mut h);
@@ -396,13 +434,19 @@ impl StaticFiles {
     /// `openat2`) falls back to the plain open every request used before, and is
     /// remembered for [`SYMLINKED_ROOT_TTL`] so it does not also pay a failing
     /// `openat2` each time.
-    fn open_root(&self, doc_root: &Path) -> io::Result<RootDir> {
+    fn open_root(&self, doc_root: &Path) -> io::Result<Arc<RootDir>> {
+        let now = Instant::now();
+        if let Some(entry) = self.hdr.root_dirs.get(doc_root)
+            && now < entry.1
+        {
+            return Ok(Arc::clone(&entry.0));
+        }
         let symlinked = self.hdr.symlinked_roots_count.load(Ordering::Relaxed) != 0
             && self
                 .hdr
                 .symlinked_roots
                 .get(doc_root)
-                .is_some_and(|until| *until > Instant::now());
+                .is_some_and(|until| *until > now);
         if !symlinked && !openat2_unavailable() {
             use rustix::io::Errno;
             match rustix::fs::openat2(
@@ -413,10 +457,18 @@ impl StaticFiles {
                 ResolveFlags::NO_SYMLINKS,
             ) {
                 Ok(fd) => {
-                    return Ok(RootDir {
+                    let rd = Arc::new(RootDir {
                         fd,
                         symlink_free: true,
                     });
+                    admit(
+                        &self.hdr.root_dirs,
+                        &self.hdr.root_dirs_count,
+                        SYMLINKED_ROOT_CAP,
+                        doc_root.to_path_buf(),
+                        (Arc::clone(&rd), now + RESOLVE_TTL),
+                    );
+                    return Ok(rd);
                 }
                 // The walk stopped at a missing name or a non-directory, every
                 // earlier component a real directory: a following open fails alike.
@@ -441,10 +493,18 @@ impl StaticFiles {
                 Err(_) => {}
             }
         }
-        Ok(RootDir {
+        let rd = Arc::new(RootDir {
             fd: open_dir(doc_root)?,
             symlink_free: false,
-        })
+        });
+        admit(
+            &self.hdr.root_dirs,
+            &self.hdr.root_dirs_count,
+            SYMLINKED_ROOT_CAP,
+            doc_root.to_path_buf(),
+            (Arc::clone(&rd), now + RESOLVE_TTL),
+        );
+        Ok(rd)
     }
 }
 
@@ -765,9 +825,9 @@ impl StaticFiles {
         // pins it here via the DocRootOverride extension (set by the pipeline);
         // otherwise resolve against the vhost docroot.
         let doc_root_override = overrides.doc_root;
-        let doc_root = match doc_root_override {
-            Some((root, _)) => root.to_path_buf(),
-            None => ctx.vhost.doc_root.clone(),
+        let doc_root: &Path = match doc_root_override {
+            Some((root, _)) => root,
+            None => &ctx.vhost.doc_root,
         };
         let allow_symlink = ctx.vhost.allow_symbol_link;
 
@@ -868,25 +928,75 @@ impl StaticFiles {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let accepted = AcceptEncoding::parse(accepts);
-            for (enc, ext_suffix) in [(Encoding::Brotli, ".br"), (Encoding::Gzip, ".gz")] {
-                if !accepted.accepts(enc) {
-                    continue;
-                }
-                if let Some(sibling) = resolve_precompressed_sibling(
-                    &root,
-                    &doc_root,
-                    &resolved.path,
-                    ext_suffix,
-                    allow_symlink,
-                    want_resolved,
-                ) {
-                    // Judged only once a sibling exists: a `no-gzip` request gets identity.
-                    if hj_compress::no_gzip(ctx) {
-                        break;
+            if accepted.accepts(Encoding::Brotli) || accepted.accepts(Encoding::Gzip) {
+                let now = Instant::now();
+                let mut sib_h = rustc_hash::FxHasher::default();
+                doc_root.hash(&mut sib_h);
+                resolved.path.hash(&mut sib_h);
+                allow_symlink.hash(&mut sib_h);
+                let sib_key = sib_h.finish();
+                let cached_mask = self.hdr.siblings.get(&sib_key).and_then(|e| {
+                    (now < e.4 && e.0 == doc_root && e.1 == resolved.path && e.2 == allow_symlink)
+                        .then_some(e.3)
+                });
+                let mut mask = cached_mask.unwrap_or(0);
+                let mut mask_dirty = false;
+                let mut primary_path: Option<PathBuf> = None;
+                for (enc, ext_suffix, probed_bit, present_bit) in [
+                    (
+                        Encoding::Brotli,
+                        ".br",
+                        SIBLING_BR_PROBED,
+                        SIBLING_BR_PRESENT,
+                    ),
+                    (Encoding::Gzip, ".gz", SIBLING_GZ_PROBED, SIBLING_GZ_PRESENT),
+                ] {
+                    if !accepted.accepts(enc) {
+                        continue;
                     }
-                    content_encoding = Some(enc);
-                    resolved = sibling;
-                    break;
+                    if (mask & probed_bit) != 0 && (mask & present_bit) == 0 {
+                        continue;
+                    }
+                    if let Some(sibling) = resolve_precompressed_sibling(
+                        &root,
+                        &doc_root,
+                        &resolved.path,
+                        ext_suffix,
+                        allow_symlink,
+                        want_resolved,
+                    ) {
+                        if (mask & (probed_bit | present_bit)) != (probed_bit | present_bit) {
+                            mask |= probed_bit | present_bit;
+                            mask_dirty = true;
+                            primary_path.get_or_insert_with(|| resolved.path.clone());
+                        }
+                        // Judged only once a sibling exists: a `no-gzip` request gets identity.
+                        if hj_compress::no_gzip(ctx) {
+                            break;
+                        }
+                        content_encoding = Some(enc);
+                        resolved = sibling;
+                        break;
+                    } else if (mask & probed_bit) == 0 || (mask & present_bit) != 0 {
+                        mask = (mask | probed_bit) & !present_bit;
+                        mask_dirty = true;
+                    }
+                }
+                if mask_dirty {
+                    let stored_path = primary_path.unwrap_or_else(|| resolved.path.clone());
+                    admit(
+                        &self.hdr.siblings,
+                        &self.hdr.siblings_count,
+                        RESOLVE_CACHE_CAP,
+                        sib_key,
+                        (
+                            doc_root.to_path_buf(),
+                            stored_path,
+                            allow_symlink,
+                            mask,
+                            now + RESOLVE_TTL,
+                        ),
+                    );
                 }
             }
         }
@@ -1242,14 +1352,25 @@ fn path_names_directory(uri_path: &str) -> bool {
 }
 
 fn clean_request_path(uri_path: &str) -> Option<PathBuf> {
-    let decoded = hj_core::percent_decode(uri_path)?;
+    let decoded = hj_core::percent_decode_cow(uri_path)?;
     // Reject embedded NULs outright.
-    if decoded.contains(&0) {
+    if decoded.as_bytes().contains(&0) {
         return None;
     }
-    let s = String::from_utf8(decoded).ok()?;
+    let s: &str = decoded.as_ref();
 
-    let mut out: Vec<String> = Vec::new();
+    // Fast path: clean relative path with no `.`, `..`, or repeated/trailing `/`
+    // (the overwhelming majority of static URLs) needs a single PathBuf allocation.
+    let trimmed = s.trim_start_matches('/');
+    if !trimmed.is_empty()
+        && !trimmed.ends_with('/')
+        && !trimmed.contains("//")
+        && trimmed.split('/').all(|seg| seg != "." && seg != "..")
+    {
+        return Some(PathBuf::from(trimmed));
+    }
+
+    let mut out: Vec<&str> = Vec::new();
     for seg in s.split('/') {
         match seg {
             "" | "." => continue,
@@ -1258,14 +1379,12 @@ fn clean_request_path(uri_path: &str) -> Option<PathBuf> {
                 out.pop()?;
             }
             other => {
-                // Backslashes are not path separators on Linux, but reject any
-                // segment that is purely a Windows-style traversal just in case.
-                out.push(other.to_string());
+                out.push(other);
             }
         }
     }
 
-    let mut pb = PathBuf::new();
+    let mut pb = PathBuf::with_capacity(trimmed.len());
     for seg in out {
         pb.push(seg);
     }
@@ -1863,11 +1982,8 @@ fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
         let Ok(start) = start_s.parse::<u64>() else {
             return RangeOutcome::Ignore;
         };
-        if start >= len {
-            continue; // valid but unsatisfiable: dropped
-        }
-        let end: u64 = if end_s.is_empty() {
-            len - 1
+        let parsed_end = if end_s.is_empty() {
+            None
         } else {
             let Ok(n) = end_s.parse::<u64>() else {
                 return RangeOutcome::Ignore;
@@ -1876,8 +1992,12 @@ fn parse_ranges(value: &[u8], len: u64) -> RangeOutcome {
                 // last-byte-pos < first-byte-pos is INVALID (not unsatisfiable).
                 return RangeOutcome::Ignore;
             }
-            n.min(len - 1)
+            Some(n)
         };
+        if start >= len {
+            continue; // valid but unsatisfiable: dropped
+        }
+        let end = parsed_end.map_or(len - 1, |n| n.min(len - 1));
         ranges.push((start, end));
     }
 
@@ -2039,24 +2159,25 @@ fn parse_range(value: &[u8], len: u64) -> RangeOutcome {
         Err(_) => return RangeOutcome::Ignore,
     };
 
+    let parsed_end = if end_s.is_empty() {
+        None
+    } else {
+        let Ok(n) = end_s.parse::<u64>() else {
+            return RangeOutcome::Ignore;
+        };
+        if n < start {
+            // RFC 9110 §14.1.1: last-byte-pos < first-byte-pos is invalid — ignore.
+            return RangeOutcome::Ignore;
+        }
+        Some(n)
+    };
+
     if start >= len {
         // First-byte-pos beyond the entity → unsatisfiable.
         return RangeOutcome::Unsatisfiable;
     }
 
-    let end: u64 = if end_s.is_empty() {
-        len - 1
-    } else {
-        match end_s.parse::<u64>() {
-            Ok(n) => n.min(len - 1),
-            Err(_) => return RangeOutcome::Ignore,
-        }
-    };
-
-    if end < start {
-        // RFC 9110 §14.1.1: last-byte-pos < first-byte-pos is invalid — ignore.
-        return RangeOutcome::Ignore;
-    }
+    let end = parsed_end.map_or(len - 1, |n| n.min(len - 1));
     RangeOutcome::Single(start, end)
 }
 

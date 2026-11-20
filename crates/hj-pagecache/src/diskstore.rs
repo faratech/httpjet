@@ -23,7 +23,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(test)]
+use std::io::{Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -284,12 +286,14 @@ fn validate_owned_dir(file: &fs::File, display: &Path) -> io::Result<fs::Metadat
     Ok(metadata)
 }
 
+fn current_euid() -> u32 {
+    static EUID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *EUID.get_or_init(|| rustix::process::geteuid().as_raw())
+}
+
 fn validate_owned_file(file: &fs::File, display: &Path, harden: bool) -> io::Result<fs::Metadata> {
     let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.nlink() != 1
-    {
+    if !metadata.is_file() || metadata.uid() != current_euid() || metadata.nlink() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
@@ -971,6 +975,35 @@ impl DiskStore {
     pub fn read_body(&self, path: &Path, expected_len: u32) -> Result<Bytes, ReadError> {
         let (mut f, metadata) = self.open_path_with_metadata(path, false)?;
         let file_len = metadata.len();
+        const SMALL_SINGLE_READ_MAX: u64 = 24 * 1024;
+        if (expected_len as u64) < MMAP_BODY_MIN
+            && file_len >= HEADER_LEN
+            && file_len <= SMALL_SINGLE_READ_MAX
+        {
+            // Single read(2) syscall for small containers: validates header in memory
+            // and slices the body out with zero `lseek` or second `read`.
+            let total = file_len as usize;
+            let mut buf = Vec::with_capacity(total);
+            let read = f.take(file_len).read_to_end(&mut buf)?;
+            if read != total {
+                return Err(ReadError::Corrupt(
+                    "container shorter than metadata declared",
+                ));
+            }
+            let Some(header) = buf.get(..HEADER_LEN as usize) else {
+                return Err(ReadError::Corrupt("container header truncated"));
+            };
+            let (meta_len, body_len) = validate_header(header, HEADER_LEN, file_len)?;
+            if body_len != expected_len {
+                return Err(ReadError::Corrupt("body length disagrees with index"));
+            }
+            let start = (HEADER_LEN + meta_len as u64) as usize;
+            let end = start.saturating_add(body_len as usize);
+            if end > buf.len() {
+                return Err(ReadError::Corrupt("body shorter than header declared"));
+            }
+            return Ok(Bytes::from(buf).slice(start..end));
+        }
         let mut header = [0u8; HEADER_LEN as usize];
         f.read_exact(&mut header)?;
         let (meta_len, body_len) = validate_header(&header, HEADER_LEN, file_len)?;
@@ -997,12 +1030,8 @@ impl DiskStore {
             let start = body_start as usize;
             return Ok(Bytes::from_owner(map).slice(start..start + body_len as usize));
         }
-        f.seek(SeekFrom::Start(body_start))?;
-        let mut body = Vec::with_capacity(body_len as usize);
-        let read = f.take(body_len as u64).read_to_end(&mut body)?;
-        if read != body_len as usize {
-            return Err(ReadError::Corrupt("body shorter than header declared"));
-        }
+        let mut body = vec![0u8; body_len as usize];
+        std::os::unix::fs::FileExt::read_exact_at(&f, &mut body, body_start)?;
         Ok(Bytes::from(body))
     }
 
@@ -1667,6 +1696,7 @@ impl DecodedContainer {
             status: self.status,
             identity: self.identity.clone(),
             headers: self.headers.clone(),
+            prebuilt_headers: None,
             body: crate::store::PageBody::InMem(Bytes::new()),
             variants: Vec::new(),
             variants_filled: false,
@@ -1798,6 +1828,11 @@ fn read_static_meta_file_with_metadata(
 /// `vhost_id_hash` and the private-owner hashes). Only a storage locator; the
 /// exact key in the meta block is what the index trusts.
 pub fn key_hash(key: &PageCacheKey) -> u64 {
+    key_hash_ref(&key.as_ref())
+}
+
+/// Borrowed-key equivalent of [`key_hash`], guaranteed to produce identical output.
+pub fn key_hash_ref(key: &crate::key::PageCacheKeyRef<'_>) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut eat = |bytes: &[u8]| {
         for &b in bytes {
@@ -2117,6 +2152,7 @@ mod tests {
                     HeaderValue::from_static("SAMEORIGIN"),
                 ),
             ],
+            prebuilt_headers: None,
             body: crate::store::PageBody::InMem(Bytes::new()),
             variants: vec![("br".into(), Bytes::from_static(b"ignored-not-persisted"))],
             variants_filled: true,

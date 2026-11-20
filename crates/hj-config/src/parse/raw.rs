@@ -255,9 +255,13 @@ pub(super) struct RawAccessDenyDir {
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct RawAccessControl {
     #[serde(default)]
-    pub(super) allow: Option<String>,
+    pub(super) allow: Vec<String>,
+    #[serde(rename = "allowList", default)]
+    pub(super) allow_list: Vec<String>,
     #[serde(default)]
-    pub(super) deny: Option<String>,
+    pub(super) deny: Vec<String>,
+    #[serde(rename = "denyList", default)]
+    pub(super) deny_list: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]

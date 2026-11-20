@@ -233,6 +233,73 @@ std::thread_local! {
 const ENTRY_OVERHEAD: usize = 32; // RFC 7541 §4.1
 const STATIC_LEN: usize = 61; // static_table::TABLE.len()
 
+/// Inline 1-element list for `Encoder::name_index` so unique header names never
+/// heap-allocate a `Vec<u64>` when inserted into the HPACK dynamic table.
+enum SeqList {
+    One(u64),
+    Many(Vec<u64>),
+}
+
+impl SeqList {
+    #[inline]
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            SeqList::One(s) => std::slice::from_ref(s),
+            SeqList::Many(v) => v.as_slice(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    #[inline]
+    fn newest(&self) -> Option<u64> {
+        match self {
+            SeqList::One(s) => Some(*s),
+            SeqList::Many(v) => v.last().copied(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, seqno: u64) {
+        match self {
+            SeqList::One(first) => {
+                *self = SeqList::Many(vec![*first, seqno]);
+            }
+            SeqList::Many(v) => v.push(seqno),
+        }
+    }
+
+    /// Remove `seqno` from the list. Returns `true` if the list is now empty.
+    #[inline]
+    fn remove(&mut self, seqno: u64) -> bool {
+        match self {
+            SeqList::One(s) => *s == seqno,
+            SeqList::Many(v) => {
+                if let Some(pos) = v.iter().position(|s| *s == seqno) {
+                    v.remove(pos);
+                }
+                if v.len() == 1
+                    && let Some(&only) = v.first()
+                {
+                    *self = SeqList::One(only);
+                    false
+                } else {
+                    v.is_empty()
+                }
+            }
+        }
+    }
+}
+
+enum DynMatch {
+    Exact(usize),
+    NameOnly(usize),
+    None,
+}
+
 /// HPACK encoder with a connection-scoped dynamic table (incremental indexing), like
 /// lshpack's history mode: headers that repeat across requests on a connection collapse
 /// to a single index byte after their first appearance. Per-message-varying headers
@@ -261,7 +328,7 @@ pub struct Encoder {
     /// corruption). `find_dynamic`/`find_dynamic_name` are proven equal to the retained
     /// linear oracle by a property test. FxHash: the table holds ~100 entries whose names
     /// come from our own responses, so there is no flooding to defend against.
-    name_index: FxHashMap<Box<str>, Vec<u64>>,
+    name_index: FxHashMap<Box<str>, SeqList>,
     size: usize,
     /// The dynamic-table size currently in effect — kept in lock-step with the peer's
     /// decoder (it only changes when a size-update instruction is actually emitted).
@@ -342,23 +409,45 @@ impl Encoder {
         STATIC_LEN + 1 + (self.ins_count - 1 - seqno) as usize
     }
 
-    /// 1-based HPACK index of an exact dynamic-table `(name, value)` match — the
-    /// front-most (newest) such entry, matching the old front-to-back `position()`.
-    /// O(1) name lookup + a scan of the (usually 1-element) per-name list, newest-first.
-    fn find_dynamic(&self, name: &str, value: &[u8]) -> Option<usize> {
-        let list = self.name_index.get(name)?;
-        // Ascending seqno order, so reverse = newest-first = front-most.
-        list.iter().rev().find_map(|&seqno| {
-            let pos = (self.ins_count - 1 - seqno) as usize;
-            let (_, v) = self.dynamic.get(pos)?;
-            (v.as_ref() == value).then(|| self.hpack_index(seqno))
-        })
+    /// Single-probe dynamic-table lookup: finds an exact `(name, value)` match when
+    /// `check_value` is true, and otherwise returns the newest matching `name` entry
+    /// from the SAME `name_index` lookup.
+    #[inline]
+    fn lookup_dynamic(&self, name: &str, value: &[u8], check_value: bool) -> DynMatch {
+        let Some(list) = self.name_index.get(name) else {
+            return DynMatch::None;
+        };
+        if check_value {
+            // Ascending seqno order, so reverse = newest-first = front-most.
+            for &seqno in list.as_slice().iter().rev() {
+                let pos = (self.ins_count - 1 - seqno) as usize;
+                if let Some((_, v)) = self.dynamic.get(pos)
+                    && v.as_ref() == value
+                {
+                    return DynMatch::Exact(self.hpack_index(seqno));
+                }
+            }
+        }
+        match list.newest() {
+            Some(seqno) => DynMatch::NameOnly(self.hpack_index(seqno)),
+            None => DynMatch::None,
+        }
     }
 
-    /// 1-based HPACK index of the front-most (newest) dynamic-table entry with `name`.
+    #[cfg(test)]
+    fn find_dynamic(&self, name: &str, value: &[u8]) -> Option<usize> {
+        match self.lookup_dynamic(name, value, true) {
+            DynMatch::Exact(idx) => Some(idx),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     fn find_dynamic_name(&self, name: &str) -> Option<usize> {
-        let seqno = self.name_index.get(name)?.last()?;
-        Some(self.hpack_index(*seqno))
+        match self.lookup_dynamic(name, &[], false) {
+            DynMatch::Exact(idx) | DynMatch::NameOnly(idx) => Some(idx),
+            DynMatch::None => None,
+        }
     }
 
     /// Evict the oldest (back) dynamic entry, keeping `seqnos` and `name_index` in
@@ -371,13 +460,12 @@ impl Encoder {
             return false;
         };
         self.size -= n.len() + v.len() + ENTRY_OVERHEAD;
-        if let Some(list) = self.name_index.get_mut(&n) {
-            if let Some(pos) = list.iter().position(|s| *s == seqno) {
-                list.remove(pos);
-            }
-            if list.is_empty() {
-                self.name_index.remove(&n);
-            }
+        let remove_key = self
+            .name_index
+            .get_mut(&n)
+            .is_some_and(|list| list.remove(seqno));
+        if remove_key {
+            self.name_index.remove(&n);
         }
         true
     }
@@ -401,7 +489,7 @@ impl Encoder {
             match self.name_index.get_mut(name) {
                 Some(list) => list.push(seqno),
                 None => {
-                    self.name_index.insert(name.into(), vec![seqno]);
+                    self.name_index.insert(name.into(), SeqList::One(seqno));
                 }
             }
         }
@@ -413,8 +501,9 @@ impl Encoder {
     /// security/CORS/Link headers that would otherwise repeat as one-byte indexes.
     /// A resource's length, validators and redirect target stay indexed: they repeat
     /// whenever that resource is served again on the connection.
-    fn indexable(name: &str, value: &[u8]) -> bool {
+    fn indexable(&self, name: &str, value: &[u8]) -> bool {
         value.len() <= 256
+            && name.len() + value.len() + ENTRY_OVERHEAD <= self.max_size
             && !matches!(
                 name,
                 ":path"
@@ -474,20 +563,36 @@ impl Encoder {
         } else {
             self.pending_min_size = None; // no pending change, discard any stale min
         }
-        // 1. Exact (name,value) already in the static or dynamic table -> 1 indexed ref.
-        //    Only an indexable pair can ever have been inserted, so the dynamic probe is
-        //    skipped for the rest.
-        let indexable = Self::indexable(name, value);
-        if let Some(idx) = static_table::find_name_value(name, value)
-            .or_else(|| indexable.then(|| self.find_dynamic(name, value)).flatten())
-        {
+        // 1. Single-pass static lookup + at most one dynamic lookup.
+        //    Only an indexable pair can ever have been inserted, so when `!indexable`
+        //    and the static table already gave us a name index, we skip `name_index`
+        //    entirely.
+        let static_match = static_table::lookup(name, value);
+        if let static_table::StaticMatch::Exact(idx) = static_match {
             integer::encode(out, idx as u64, 7, 0x80);
             return;
         }
+        let indexable = self.indexable(name, value);
+        let dyn_match = if !self.dynamic.is_empty()
+            && (indexable || matches!(static_match, static_table::StaticMatch::None))
+        {
+            self.lookup_dynamic(name, value, indexable)
+        } else {
+            DynMatch::None
+        };
+        if let DynMatch::Exact(idx) = dyn_match {
+            integer::encode(out, idx as u64, 7, 0x80);
+            return;
+        }
+        let name_idx = match (static_match, dyn_match) {
+            (static_table::StaticMatch::NameOnly(i), _) => Some(i),
+            (_, DynMatch::NameOnly(i)) => Some(i),
+            _ => None,
+        };
         // 2. Indexable -> literal WITH incremental indexing (6-bit name prefix), then add
         //    it so the next occurrence on this connection is a single index byte.
         if indexable {
-            match static_table::find_name(name).or_else(|| self.find_dynamic_name(name)) {
+            match name_idx {
                 Some(i) => integer::encode(out, i as u64, 6, 0x40),
                 None => {
                     out.push(0x40);
@@ -499,7 +604,7 @@ impl Encoder {
             return;
         }
         // 3. Not worth indexing -> literal WITHOUT indexing (indexed name if known).
-        match static_table::find_name(name).or_else(|| self.find_dynamic_name(name)) {
+        match name_idx {
             Some(i) => integer::encode(out, i as u64, 4, 0x00),
             None => {
                 out.push(0x00);
@@ -537,9 +642,51 @@ pub fn validate_request_header_name(name: &[u8]) -> Option<http::HeaderName> {
     http::HeaderName::from_bytes(name).ok()
 }
 
+/// Stored dynamic-table value: pre-validated [`http::HeaderValue`] when the
+/// bytes satisfy RFC 9113 §8.2.1 (no NUL/CR/LF and no leading/trailing SP/HTAB),
+/// or raw bytes otherwise so malformed entries still keep the table in sync and
+/// trigger rejection when emitted.
+enum DynValue {
+    Valid(http::HeaderValue),
+    Raw(Box<[u8]>),
+}
+
+impl DynValue {
+    fn from_bytes(bytes: Box<[u8]>) -> Self {
+        let edge_ws = matches!(bytes.first(), Some(b' ' | b'\t'))
+            || matches!(bytes.last(), Some(b' ' | b'\t'));
+        if !edge_ws && let Ok(v) = http::HeaderValue::from_bytes(&bytes) {
+            DynValue::Valid(v)
+        } else {
+            DynValue::Raw(bytes)
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            DynValue::Valid(v) => v.as_bytes(),
+            DynValue::Raw(b) => b,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.as_bytes().len()
+    }
+
+    #[inline]
+    fn header_value(&self) -> Option<http::HeaderValue> {
+        match self {
+            DynValue::Valid(v) => Some(v.clone()),
+            DynValue::Raw(_) => None,
+        }
+    }
+}
+
 /// HPACK decoder maintaining the dynamic table per RFC 7541 §2.3.2 / §4.
 pub struct Decoder {
-    dynamic: VecDeque<(Box<[u8]>, Box<[u8]>, Option<http::HeaderName>)>,
+    dynamic: VecDeque<(Box<[u8]>, DynValue, Option<http::HeaderName>)>,
     size: usize,
     /// Current dynamic-table size limit (mutated by §6.3 size updates).
     max_size: usize,
@@ -566,31 +713,50 @@ impl Decoder {
         }
     }
 
-    /// Borrow a table entry's `(name, pre_validated_header_name, value)` — static (`'static`)
-    /// or dynamic (borrowing `self.dynamic`). Returning refs lets the decode loop emit
-    /// indexed/named headers with ZERO per-header `String` allocation and skip redundant
-    /// UTF-8/lowercase/connection-specific/HeaderName validation on every indexed hit.
+    /// Borrow a table entry's `(name, pre_validated_header_name, value, pre_validated_header_value)`
+    /// — static (`'static`) or dynamic (borrowing `self.dynamic`). Returning pre-validated
+    /// `HeaderName` + `HeaderValue` lets indexed hits skip redundant byte validation and heap
+    /// allocation on every request.
     #[inline]
-    fn entry_ref(&self, index: usize) -> Option<(&[u8], Option<http::HeaderName>, &[u8])> {
+    fn entry_ref(
+        &self,
+        index: usize,
+    ) -> Option<(
+        &[u8],
+        Option<http::HeaderName>,
+        &[u8],
+        Option<http::HeaderValue>,
+    )> {
         if let Some((n, v)) = static_table::get(index) {
+            let hv = if v.is_empty() {
+                None
+            } else {
+                Some(http::HeaderValue::from_static(v))
+            };
             return Some((
                 n.as_bytes(),
                 static_table::request_header_name(index),
                 v.as_bytes(),
+                hv,
             ));
         }
         let dyn_idx = index.checked_sub(static_table::TABLE.len() + 1)?;
         self.dynamic
             .get(dyn_idx)
-            .map(|(n, v, hdr)| (&**n, hdr.clone(), &**v))
+            .map(|(n, v, hdr)| (&**n, hdr.clone(), v.as_bytes(), v.header_value()))
     }
 
-    fn insert(&mut self, name: Box<[u8]>, value: Box<[u8]>, hdr_name: Option<http::HeaderName>) {
-        let entry_size = name.len() + value.len() + ENTRY_OVERHEAD;
+    fn insert_dyn(
+        &mut self,
+        name: Box<[u8]>,
+        dyn_val: DynValue,
+        hdr_name: Option<http::HeaderName>,
+    ) {
+        let entry_size = name.len() + dyn_val.len() + ENTRY_OVERHEAD;
         self.evict_to(self.max_size.saturating_sub(entry_size));
         if entry_size <= self.max_size {
             self.size += entry_size;
-            self.dynamic.push_front((name, value, hdr_name));
+            self.dynamic.push_front((name, dyn_val, hdr_name));
         }
         // If a single entry exceeds max_size, the table ends up empty (RFC §4.4).
     }
@@ -641,19 +807,19 @@ impl Decoder {
     where
         F: FnMut(&[u8], &[u8]),
     {
-        self.decode_octets_with_header_name(buf, |n, _, v| emit(n, v))
+        self.decode_octets_with_header_name(buf, |n, _, v, _| emit(n, v))
     }
 
     /// Decode a complete header block, passing any pre-validated request [`http::HeaderName`]
-    /// from the static or dynamic table alongside `(name, value)` so the HTTP/2 request
-    /// builder can skip redundant name validation on indexed hits.
+    /// and [`http::HeaderValue`] from the static or dynamic table alongside `(name, value)` so
+    /// the HTTP/2 request builder can skip redundant validation and allocation on indexed hits.
     pub fn decode_octets_with_header_name<F>(
         &mut self,
         buf: &[u8],
         mut emit: F,
     ) -> Result<(), Error>
     where
-        F: FnMut(&[u8], Option<http::HeaderName>, &[u8]),
+        F: FnMut(&[u8], Option<http::HeaderName>, &[u8], Option<http::HeaderValue>),
     {
         let mut pos = 0;
         // §4.2: a dynamic table size update MUST occur at the beginning of a header block,
@@ -669,36 +835,39 @@ impl Decoder {
         // whole block is consumed. The wire block itself is bounded by the caller.
         let list_limit = self.max_list_size;
         let listed = std::cell::Cell::new(0usize);
-        let mut emit_checked =
-            |n: &[u8], hdr: Option<http::HeaderName>, v: &[u8]| -> Result<(), Error> {
-                let total = listed
-                    .get()
-                    .saturating_add(n.len() + v.len() + ENTRY_OVERHEAD);
-                listed.set(total);
-                if total <= list_limit {
-                    emit(n, hdr, v);
-                }
-                Ok(())
-            };
+        let mut emit_checked = |n: &[u8],
+                                hdr: Option<http::HeaderName>,
+                                v: &[u8],
+                                hv: Option<http::HeaderValue>|
+         -> Result<(), Error> {
+            let total = listed
+                .get()
+                .saturating_add(n.len() + v.len() + ENTRY_OVERHEAD);
+            listed.set(total);
+            if total <= list_limit {
+                emit(n, hdr, v, hv);
+            }
+            Ok(())
+        };
         while pos < buf.len() {
             let b = buf[pos];
             if b & 0x80 != 0 {
                 // §6.1 Indexed Header Field.
                 let idx = integer::decode(buf, &mut pos, 7).ok_or(Error::Truncated)? as usize;
-                let (n, hdr, v) = self.entry_ref(idx).ok_or(Error::BadIndex)?;
+                let (n, hdr, v, hv) = self.entry_ref(idx).ok_or(Error::BadIndex)?;
                 seen_field = true;
-                emit_checked(n, hdr, v)?;
+                emit_checked(n, hdr, v, hv)?;
             } else if b & 0x40 != 0 {
                 // §6.2.1 Literal with incremental indexing (6-bit name index prefix).
                 let (n, hdr, v) = self.read_literal(buf, &mut pos, 6)?;
                 seen_field = true;
-                emit_checked(&n, hdr.clone(), &v)?;
-                // Own the entry before inserting: the table must outlive the block, AND owning in a
-                // separate statement first releases the shared `self`/`buf` borrow the `Cow` held,
-                // so the insert can reborrow `&mut self`. (The non-indexing arm below never owns —
-                // that is the allocation the `Cow` return type saves.)
-                let (n, v) = (n.into_owned().into(), v.into_owned().into());
-                self.insert(n, v, hdr);
+                // Own once and pre-validate `HeaderValue` before emitting so both the
+                // emitted request header and the dynamic table share one refcounted Bytes
+                // allocation with a single validation pass.
+                let n: Box<[u8]> = n.into_owned().into();
+                let dyn_val = DynValue::from_bytes(v.into_owned().into());
+                emit_checked(&n, hdr.clone(), dyn_val.as_bytes(), dyn_val.header_value())?;
+                self.insert_dyn(n, dyn_val, hdr);
             } else if b & 0x20 != 0 {
                 // §6.3 Dynamic table size update (5-bit prefix).
                 if seen_field {
@@ -720,11 +889,11 @@ impl Decoder {
                     let (name, hdr): (&[u8], Option<http::HeaderName>) = if name_idx == 0 {
                         (decode_string_into(buf, &mut pos, nb)?, None)
                     } else {
-                        let (n, hdr, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
+                        let (n, hdr, _, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
                         (n, hdr)
                     };
                     let value: &[u8] = decode_string_into(buf, &mut pos, vb)?;
-                    emit_checked(name, hdr, value)
+                    emit_checked(name, hdr, value, None)
                 })?;
             }
         }
@@ -753,7 +922,7 @@ impl Decoder {
             let hdr = validate_request_header_name(&n);
             (n, hdr)
         } else {
-            let (n, hdr, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
+            let (n, hdr, _, _) = self.entry_ref(name_idx).ok_or(Error::BadIndex)?;
             (Cow::Borrowed(n), hdr)
         };
         let value = decode_string(buf, pos)?;
@@ -1563,5 +1732,39 @@ mod tests {
         let buf = [0x00, 0x01, b'x', 0x84, 0xff, 0xff, 0xff, 0xff];
         let mut dec = Decoder::new(4096, 1 << 20);
         assert_eq!(dec.decode_octets(&buf, |_, _| {}), Err(Error::BadString));
+    }
+
+    #[test]
+    fn encoder_does_not_wipe_small_dynamic_table_on_oversize_header() {
+        // Table fits a small entry ("x-a: 1" = 36 B) but not a 100-byte entry.
+        let mut enc = Encoder::new();
+        enc.set_peer_max_size(64);
+        let mut dec = Decoder::new(4096, 1 << 20);
+        let mut blk1 = Vec::new();
+        enc.encode_header(&mut blk1, "x-a", b"1");
+        enc.encode_header(&mut blk1, "x-big", &[b'b'; 80]);
+        assert_eq!(
+            enc.dynamic.len(),
+            1,
+            "oversize header must use literal-without-indexing and preserve existing dynamic entries"
+        );
+        let mut got = Vec::new();
+        dec.decode_octets(&blk1, |n, v| got.push((n.to_vec(), v.to_vec())))
+            .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(dec.dynamic.len(), 1);
+
+        // Zero-sized table never emits incremental indexing or inserts.
+        let mut enc0 = Encoder::new();
+        enc0.set_peer_max_size(0);
+        let mut blk0 = Vec::new();
+        enc0.encode_header(&mut blk0, "x-a", b"1");
+        assert!(enc0.dynamic.is_empty());
+        assert_eq!(blk0[0], 0x20);
+        assert_eq!(
+            blk0[1] & 0x40,
+            0,
+            "max_size=0 must emit literal without indexing"
+        );
     }
 }

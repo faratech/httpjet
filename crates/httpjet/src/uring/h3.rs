@@ -14,7 +14,13 @@ pub(crate) use request_engine::{H3EngineMode, configure_engine_mode, engine_coun
 pub(crate) use scheduling::counts as scheduling_counts;
 use scheduling::{InlineBudget, dispatch_work, sleep_until_opt};
 
-use std::collections::{BTreeSet, HashMap};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeSet;
+#[cfg(test)]
+use std::collections::HashMap;
+
+type FxConnMap<V> = FxHashMap<ConnectionHandle, V>;
+type FxConnSet = FxHashSet<ConnectionHandle>;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -703,6 +709,18 @@ fn server_config(rustls_cfg: Arc<rustls::ServerConfig>) -> io::Result<ServerConf
     Ok(cfg)
 }
 
+/// Per-stream receive state for an unfinished client request bidi stream.
+/// Consolidates the former 5 per-stream maps (`requests`, `request_snapshots`,
+/// `req_buf`, `req_frames`, `body_leases`) into a single `FxHashMap` entry so
+/// accept, receive, and dispatch each pay ONE hash probe instead of 3–5.
+#[derive(Default)]
+struct InflightRequest {
+    snapshot: Option<H3RequestSnapshot>,
+    buf: Vec<u8>,
+    frames: H3FrameCounter,
+    lease: Option<hj_core::budget::BodyBufferLease>,
+}
+
 /// Per-connection HTTP/3 state.
 #[derive(Default)]
 struct H3State {
@@ -734,39 +752,30 @@ struct H3State {
     /// TLS SNI from the QUIC handshake: the routing fallback, like H2's
     /// `server_name()`, never derived from `:authority`.
     server_name: Option<Arc<str>>,
-    /// In-flight client request bidi streams (removed once served), so we never
-    /// re-scan already-served streams — bounded by concurrent requests, not total.
-    requests: std::collections::HashSet<StreamId>,
+    /// In-flight unfinished client request bidi streams (removed once dispatched
+    /// or reclaimed) — single map holding snapshot, frame buffer, counters, and
+    /// body-buffer lease so accept/receive/dispatch each do ONE hash lookup.
+    inflight_requests: FxHashMap<StreamId, InflightRequest>,
     /// Receive deadlines for unfinished request streams. The same key is held
-    /// in `request_snapshots`, so completion removes it directly in O(log N).
-    /// Equal batch deadlines never trigger a scan of the remaining streams.
+    /// in `inflight_requests[id].snapshot`, so completion removes it directly in
+    /// O(log N). Equal batch deadlines never trigger a scan of remaining streams.
     request_deadlines: BTreeSet<H3RequestDeadlineKey>,
     next_request_deadline_sequence: u64,
-    /// Limits and dispatch generation captured once when each stream is accepted.
-    /// This travels with the buffered request until dispatch or reclamation.
-    request_snapshots: std::collections::HashMap<StreamId, H3RequestSnapshot>,
     /// Unfinished request streams with data, FIN or a reset to read: each newly
     /// accepted stream and each `StreamEvent::Readable`, at most once per stream
     /// (`H3RequestSnapshot::read_queued`). A drive reads only these.
     readable_requests: Vec<StreamId>,
-    /// Accumulated request bytes per in-flight bidi stream (a request's HEADERS+DATA
-    /// frames may arrive across several datagrams); drained + handled on stream fin.
-    req_buf: std::collections::HashMap<StreamId, Vec<u8>>,
-    req_frames: std::collections::HashMap<StreamId, H3FrameCounter>,
     /// (security #263) Server-wide buffered-body budget shared with H1/H2/LSAPI,
     /// installed by the connection driver. Accumulated request bytes reserve
     /// against it so pre-dispatch buffering stays server-bounded.
     body_budget: Option<std::sync::Arc<hj_core::budget::BodyBufferBudget>>,
-    /// Owned reservations follow request buffers into dispatch or release on every
-    /// state teardown, including a connection lost before a request finishes.
-    body_leases: std::collections::HashMap<StreamId, hj_core::budget::BodyBufferLease>,
     /// Byte-weighted response retention guard. A lease follows every encoded
     /// response part until quinn accepts it or the stream/connection is reset.
     egress_budget: Option<H3EgressBudget>,
     /// Every accepted peer unidirectional stream remains here until FIN/reset. HTTP/3
     /// control and QPACK streams are critical and must be continuously drained; accepting
     /// and reading them once loses split stream-type/SETTINGS delivery and hides closure.
-    peer_uni: std::collections::HashMap<StreamId, PeerUniStream>,
+    peer_uni: rustc_hash::FxHashMap<StreamId, PeerUniStream>,
     peer_control: Option<StreamId>,
     peer_qpack_encoder: Option<StreamId>,
     peer_qpack_decoder: Option<StreamId>,
@@ -792,13 +801,13 @@ struct H3State {
     /// window, e.g. a multi-MB file) is written incrementally: the remainder is pumped
     /// as the peer grants more window (`StreamEvent::Writable`). Without this, a large
     /// response is silently truncated to the first window.
-    pending: std::collections::HashMap<StreamId, PendingSend>,
+    pending: rustc_hash::FxHashMap<StreamId, PendingSend>,
     /// Response FINs accepted by QUIC but not yet fully acknowledged. An empty
     /// application queue does not mean QUIC sent every byte: congestion/pacing
     /// can leave a whole buffered response queued inside the transport. Only
     /// client-initiated bidi streams belong here, never permanent H3 control or
     /// QPACK streams. The peer's MAX_STREAMS bound also bounds these live sends.
-    response_fins: std::collections::HashSet<StreamId>,
+    response_fins: rustc_hash::FxHashSet<StreamId>,
     /// Live `header_read_timeout`, refreshed per drive: how long a response may wait
     /// on the peer's flow-control credit without [`SEND_STALL_MIN_PROGRESS`] progress.
     send_stall_timeout: Option<Duration>,
@@ -854,8 +863,7 @@ impl H3State {
         // accept(Dir::Bi) yields each stream once. Keeping the insertion guard
         // makes a re-accept unable to restart the deadline even if that assumption
         // ever changes in quinn-proto.
-        if self.requests.insert(id) {
-            self.req_buf.entry(id).or_default();
+        if let std::collections::hash_map::Entry::Vacant(slot) = self.inflight_requests.entry(id) {
             if let Some(timeout) = snapshot.config.timeout {
                 let deadline = accepted_at + timeout;
                 let key = H3RequestDeadlineKey {
@@ -877,26 +885,31 @@ impl H3State {
             // reports as `Opened`, never as `Readable`.
             snapshot.read_queued = true;
             self.readable_requests.push(id);
-            self.request_snapshots.insert(id, snapshot);
+            slot.insert(InflightRequest {
+                snapshot: Some(snapshot),
+                ..InflightRequest::default()
+            });
         }
     }
 
     /// Queue request stream `id` for the next receive pass after a
     /// `StreamEvent::Readable`; false if it is not an unfinished request stream.
     fn queue_readable_request(&mut self, id: StreamId) -> bool {
-        match self.request_snapshots.get_mut(&id) {
+        let Some(req) = self.inflight_requests.get_mut(&id) else {
+            return false;
+        };
+        match req.snapshot.as_mut() {
             Some(snapshot) => {
                 if !std::mem::replace(&mut snapshot.read_queued, true) {
                     self.readable_requests.push(id);
                 }
                 true
             }
-            None if self.requests.contains(&id) => {
+            None => {
                 // A tracked stream without a snapshot is reclaimed by the receive pass.
                 self.readable_requests.push(id);
                 true
             }
-            None => false,
         }
     }
 
@@ -908,7 +921,11 @@ impl H3State {
     /// `BODY_MIN_PROGRESS` past its last extension, move its deadline (re-keyed in the
     /// ordered set) to `now + timeout`, capped at its ceiling.
     fn extend_request_deadline(&mut self, id: StreamId, buffered: usize, now: Instant) {
-        let Some(snapshot) = self.request_snapshots.get_mut(&id) else {
+        let Some(snapshot) = self
+            .inflight_requests
+            .get_mut(&id)
+            .and_then(|req| req.snapshot.as_mut())
+        else {
             return;
         };
         let (Some(timeout), Some(key), Some(progress)) = (
@@ -1010,7 +1027,7 @@ impl Ord for ConnectionDeadlineKey {
 #[derive(Default)]
 struct ConnectionDeadlineIndex {
     ordered: BTreeSet<ConnectionDeadlineKey>,
-    by_connection: HashMap<ConnectionHandle, ConnectionDeadlineKey>,
+    by_connection: FxConnMap<ConnectionDeadlineKey>,
     next_sequence: u64,
 }
 
@@ -1053,11 +1070,7 @@ impl ConnectionDeadlineIndex {
         self.ordered.first().map(|key| key.when)
     }
 
-    fn extend_due(
-        &mut self,
-        affected: &mut std::collections::HashSet<ConnectionHandle>,
-        now: Instant,
-    ) {
+    fn extend_due(&mut self, affected: &mut FxConnSet, now: Instant) {
         while let Some(key) = self.ordered.first().copied() {
             if key.when > now {
                 break;
@@ -1072,8 +1085,8 @@ impl ConnectionDeadlineIndex {
 /// When the driver must next revisit `hd` on its own: the earlier of its QUIC timer
 /// (which only quinn calls on the connection can move) and its HTTP/3 deadlines.
 fn connection_deadline(
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &HashMap<ConnectionHandle, H3State>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    h3: &FxConnMap<H3State>,
     hd: ConnectionHandle,
 ) -> Option<Instant> {
     let quic = conns
@@ -1087,10 +1100,10 @@ fn connection_deadline(
 }
 
 #[derive(Default)]
-struct RequestCancellations(std::collections::HashMap<StreamId, CancellationToken>);
+struct RequestCancellations(rustc_hash::FxHashMap<StreamId, CancellationToken>);
 
 impl std::ops::Deref for RequestCancellations {
-    type Target = std::collections::HashMap<StreamId, CancellationToken>;
+    type Target = rustc_hash::FxHashMap<StreamId, CancellationToken>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -1204,6 +1217,7 @@ fn advance_send_stall(
     }
 }
 impl PendingSend {
+    #[cfg(test)]
     fn buffered(
         head: Vec<u8>,
         body: Bytes,
@@ -1530,40 +1544,354 @@ fn qpack_int(out: &mut Vec<u8>, flags: u8, prefix_bits: u32, mut val: u64) {
     out.push(val as u8);
 }
 
-/// QPACK "Literal Field Line with Literal Name" (RFC 9204 §4.5.6), no Huffman, not
-/// never-indexed. Always valid regardless of the peer's dynamic-table capacity, so
-/// the response needs no QPACK static table / dynamic table / Huffman machinery.
+/// Emit a QPACK string literal (H bit at `prefix_bits`, length, octets), using HPACK
+/// Huffman coding when it produces fewer bytes than the raw octets.
+#[inline]
+fn qpack_write_str(out: &mut Vec<u8>, flags: u8, prefix_bits: u32, data: &[u8]) {
+    let hlen = hj_h2::hpack::huffman::encoded_len(data);
+    if hlen < data.len() {
+        qpack_int(out, flags | (1u8 << prefix_bits), prefix_bits, hlen as u64);
+        hj_h2::hpack::huffman::encode_sized(out, data, hlen);
+    } else {
+        qpack_int(out, flags, prefix_bits, data.len() as u64);
+        out.extend_from_slice(data);
+    }
+}
+
+/// Memoized QPACK 7-bit-prefixed string literal for `Date` (29 bytes, changes once/sec)
+/// and repeated long non-secret response values (>= 128 B, e.g. preload `Link` / CSP),
+/// mirroring `hj_h2::hpack`'s `DATE_LITERAL` and `LONG_LITERALS`.
+fn qpack_write_value(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    const LONG_MIN: usize = 128;
+    const LONG_MAX: usize = 16 * 1024;
+    const LONG_SLOTS: usize = 16;
+
+    if name == "date" && !value.is_empty() && value.len() <= 64 {
+        thread_local! {
+            static QPACK_DATE: std::cell::RefCell<(Vec<u8>, Vec<u8>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+        }
+        let hit = QPACK_DATE.with(|cell| {
+            let Ok(mut slot) = cell.try_borrow_mut() else {
+                return false;
+            };
+            if slot.1.is_empty() || slot.0.as_slice() != value {
+                slot.0.clear();
+                slot.0.extend_from_slice(value);
+                slot.1.clear();
+                qpack_write_str(&mut slot.1, 0x00, 7, value);
+            }
+            out.extend_from_slice(&slot.1);
+            true
+        });
+        if hit {
+            return;
+        }
+    } else if value.len() >= LONG_MIN
+        && value.len() <= LONG_MAX
+        && !matches!(name, "set-cookie" | "authorization" | "cookie")
+    {
+        thread_local! {
+            static QPACK_LONG: std::cell::RefCell<[(u64, Vec<u8>, Vec<u8>); LONG_SLOTS]> =
+                std::cell::RefCell::new(std::array::from_fn(|_| (0, Vec::new(), Vec::new())));
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in value {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        let idx = (h as usize) & (LONG_SLOTS - 1);
+        let hit = QPACK_LONG.with(|cell| {
+            let Ok(mut table) = cell.try_borrow_mut() else {
+                return false;
+            };
+            let Some(slot) = table.get_mut(idx) else {
+                return false;
+            };
+            if slot.0 != h || slot.1.as_slice() != value {
+                slot.0 = h;
+                slot.1.clear();
+                slot.1.extend_from_slice(value);
+                slot.2.clear();
+                qpack_write_str(&mut slot.2, 0x00, 7, value);
+            }
+            out.extend_from_slice(&slot.2);
+            true
+        });
+        if hit {
+            return;
+        }
+    }
+    qpack_write_str(out, 0x00, 7, value);
+}
+
+/// QPACK "Literal Field Line with Literal Name" (RFC 9204 §4.5.6), Huffman-coded when
+/// shorter, not never-indexed. Always valid regardless of the peer's dynamic-table capacity.
 fn qpack_literal(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
-    qpack_int(out, 0b0010_0000, 3, name.len() as u64); // 001 N=0 H=0 + 3-bit name len
-    out.extend_from_slice(name);
-    qpack_int(out, 0x00, 7, value.len() as u64); // H=0 + 7-bit value len
-    out.extend_from_slice(value);
+    qpack_write_str(out, 0b0010_0000, 3, name); // 001 N=0 H + 3-bit name len
+    qpack_write_value(out, std::str::from_utf8(name).unwrap_or(""), value); // H + 7-bit value len
 }
 
-/// (#287) Encode-side view of [`QPACK_STATIC`]: header name → (lowest static
-/// index carrying that name, the table's non-empty (value, index) pairs for
-/// it). Derived once from the decode table so the two can never diverge.
-struct QpackNameEntry {
-    name_idx: u8,
-    values: Vec<(&'static str, u8)>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QpackStaticMatch {
+    Exact(u8),
+    NameOnly(u8),
+    None,
 }
 
-fn qpack_encode_map() -> &'static std::collections::HashMap<&'static str, QpackNameEntry> {
-    static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, QpackNameEntry>> =
-        std::sync::OnceLock::new();
-    MAP.get_or_init(|| {
-        let mut by_name = std::collections::HashMap::new();
-        for (i, (name, value)) in QPACK_STATIC.iter().enumerate() {
-            let entry = by_name.entry(*name).or_insert(QpackNameEntry {
-                name_idx: i as u8,
-                values: Vec::new(),
-            });
-            if !value.is_empty() {
-                entry.values.push((*value, i as u8));
+/// (#287 / P36) Compile-time `match` over RFC 9204 Appendix A (`QPACK_STATIC`):
+/// returns `Exact(idx)` for an exact non-empty `(name, value)` match, `NameOnly(idx)`
+/// for the lowest static index carrying `name`, or `None`. Zero `OnceLock`, zero hash,
+/// zero `Vec` scan; proven 100% identical to `QPACK_STATIC` by unit test.
+#[inline]
+fn qpack_static_lookup(name: &str, value: &[u8]) -> QpackStaticMatch {
+    use QpackStaticMatch::{Exact, NameOnly, None};
+    match name {
+        ":authority" => NameOnly(0),
+        ":path" => {
+            if value == b"/" {
+                Exact(1)
+            } else {
+                NameOnly(1)
             }
         }
-        by_name
-    })
+        "age" => {
+            if value == b"0" {
+                Exact(2)
+            } else {
+                NameOnly(2)
+            }
+        }
+        "content-disposition" => NameOnly(3),
+        "content-length" => {
+            if value == b"0" {
+                Exact(4)
+            } else {
+                NameOnly(4)
+            }
+        }
+        "cookie" => NameOnly(5),
+        "date" => NameOnly(6),
+        "etag" => NameOnly(7),
+        "if-modified-since" => NameOnly(8),
+        "if-none-match" => NameOnly(9),
+        "last-modified" => NameOnly(10),
+        "link" => NameOnly(11),
+        "location" => NameOnly(12),
+        "referer" => NameOnly(13),
+        "set-cookie" => NameOnly(14),
+        ":method" => match value {
+            b"CONNECT" => Exact(15),
+            b"DELETE" => Exact(16),
+            b"GET" => Exact(17),
+            b"HEAD" => Exact(18),
+            b"OPTIONS" => Exact(19),
+            b"POST" => Exact(20),
+            b"PUT" => Exact(21),
+            _ => NameOnly(15),
+        },
+        ":scheme" => match value {
+            b"http" => Exact(22),
+            b"https" => Exact(23),
+            _ => NameOnly(22),
+        },
+        ":status" => match value {
+            b"103" => Exact(24),
+            b"200" => Exact(25),
+            b"304" => Exact(26),
+            b"404" => Exact(27),
+            b"503" => Exact(28),
+            b"100" => Exact(63),
+            b"204" => Exact(64),
+            b"206" => Exact(65),
+            b"302" => Exact(66),
+            b"400" => Exact(67),
+            b"403" => Exact(68),
+            b"421" => Exact(69),
+            b"425" => Exact(70),
+            b"500" => Exact(71),
+            _ => NameOnly(24),
+        },
+        "accept" => match value {
+            b"*/*" => Exact(29),
+            b"application/dns-message" => Exact(30),
+            _ => NameOnly(29),
+        },
+        "accept-encoding" => {
+            if value == b"gzip, deflate, br" {
+                Exact(31)
+            } else {
+                NameOnly(31)
+            }
+        }
+        "accept-ranges" => {
+            if value == b"bytes" {
+                Exact(32)
+            } else {
+                NameOnly(32)
+            }
+        }
+        "access-control-allow-headers" => match value {
+            b"cache-control" => Exact(33),
+            b"content-type" => Exact(34),
+            b"*" => Exact(75),
+            _ => NameOnly(33),
+        },
+        "access-control-allow-origin" => {
+            if value == b"*" {
+                Exact(35)
+            } else {
+                NameOnly(35)
+            }
+        }
+        "cache-control" => match value {
+            b"max-age=0" => Exact(36),
+            b"max-age=2592000" => Exact(37),
+            b"max-age=604800" => Exact(38),
+            b"no-cache" => Exact(39),
+            b"no-store" => Exact(40),
+            b"public, max-age=31536000" => Exact(41),
+            _ => NameOnly(36),
+        },
+        "content-encoding" => match value {
+            b"br" => Exact(42),
+            b"gzip" => Exact(43),
+            _ => NameOnly(42),
+        },
+        "content-type" => match value {
+            b"application/dns-message" => Exact(44),
+            b"application/javascript" => Exact(45),
+            b"application/json" => Exact(46),
+            b"application/x-www-form-urlencoded" => Exact(47),
+            b"image/gif" => Exact(48),
+            b"image/jpeg" => Exact(49),
+            b"image/png" => Exact(50),
+            b"text/css" => Exact(51),
+            b"text/html; charset=utf-8" => Exact(52),
+            b"text/plain" => Exact(53),
+            b"text/plain;charset=utf-8" => Exact(54),
+            _ => NameOnly(44),
+        },
+        "range" => {
+            if value == b"bytes=0-" {
+                Exact(55)
+            } else {
+                NameOnly(55)
+            }
+        }
+        "strict-transport-security" => match value {
+            b"max-age=31536000" => Exact(56),
+            b"max-age=31536000; includesubdomains" => Exact(57),
+            b"max-age=31536000; includesubdomains; preload" => Exact(58),
+            _ => NameOnly(56),
+        },
+        "vary" => match value {
+            b"accept-encoding" => Exact(59),
+            b"origin" => Exact(60),
+            _ => NameOnly(59),
+        },
+        "x-content-type-options" => {
+            if value == b"nosniff" {
+                Exact(61)
+            } else {
+                NameOnly(61)
+            }
+        }
+        "x-xss-protection" => {
+            if value == b"1; mode=block" {
+                Exact(62)
+            } else {
+                NameOnly(62)
+            }
+        }
+        "accept-language" => NameOnly(72),
+        "access-control-allow-credentials" => match value {
+            b"FALSE" => Exact(73),
+            b"TRUE" => Exact(74),
+            _ => NameOnly(73),
+        },
+        "access-control-allow-methods" => match value {
+            b"get" => Exact(76),
+            b"get, post, options" => Exact(77),
+            b"options" => Exact(78),
+            _ => NameOnly(76),
+        },
+        "access-control-expose-headers" => {
+            if value == b"content-length" {
+                Exact(79)
+            } else {
+                NameOnly(79)
+            }
+        }
+        "access-control-request-headers" => {
+            if value == b"content-type" {
+                Exact(80)
+            } else {
+                NameOnly(80)
+            }
+        }
+        "access-control-request-method" => match value {
+            b"get" => Exact(81),
+            b"post" => Exact(82),
+            _ => NameOnly(81),
+        },
+        "alt-svc" => {
+            if value == b"clear" {
+                Exact(83)
+            } else {
+                NameOnly(83)
+            }
+        }
+        "authorization" => NameOnly(84),
+        "content-security-policy" => {
+            if value == b"script-src 'none'; object-src 'none'; base-uri 'none'" {
+                Exact(85)
+            } else {
+                NameOnly(85)
+            }
+        }
+        "early-data" => {
+            if value == b"1" {
+                Exact(86)
+            } else {
+                NameOnly(86)
+            }
+        }
+        "expect-ct" => NameOnly(87),
+        "forwarded" => NameOnly(88),
+        "if-range" => NameOnly(89),
+        "origin" => NameOnly(90),
+        "purpose" => {
+            if value == b"prefetch" {
+                Exact(91)
+            } else {
+                NameOnly(91)
+            }
+        }
+        "server" => NameOnly(92),
+        "timing-allow-origin" => {
+            if value == b"*" {
+                Exact(93)
+            } else {
+                NameOnly(93)
+            }
+        }
+        "upgrade-insecure-requests" => {
+            if value == b"1" {
+                Exact(94)
+            } else {
+                NameOnly(94)
+            }
+        }
+        "user-agent" => NameOnly(95),
+        "x-forwarded-for" => NameOnly(96),
+        "x-frame-options" => match value {
+            b"deny" => Exact(97),
+            b"sameorigin" => Exact(98),
+            _ => NameOnly(97),
+        },
+        _ => None,
+    }
 }
 
 /// (#287) Emit one response field line using the static table where it helps:
@@ -1571,19 +1899,20 @@ fn qpack_encode_map() -> &'static std::collections::HashMap<&'static str, QpackN
 /// §4.5.2, 1-2 bytes); a known name becomes a Literal Field Line With Name
 /// Reference (§4.5.4); anything else keeps the always-valid
 /// literal-with-literal-name form. Static references only — no dynamic table,
-/// no Huffman, no encoder state.
+/// no encoder state.
 fn qpack_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
-    if let Some(entry) = qpack_encode_map().get(name) {
-        if let Some((_, idx)) = entry.values.iter().find(|(v, _)| v.as_bytes() == value) {
-            qpack_int(out, 0b1100_0000, 6, *idx as u64); // 1 T=1 + 6-bit index
-            return;
+    match qpack_static_lookup(name, value) {
+        QpackStaticMatch::Exact(idx) => {
+            qpack_int(out, 0b1100_0000, 6, idx as u64); // 1 T=1 + 6-bit index
         }
-        qpack_int(out, 0b0101_0000, 4, entry.name_idx as u64); // 01 N=0 T=1 + 4-bit name index
-        qpack_int(out, 0x00, 7, value.len() as u64); // H=0 + 7-bit value len
-        out.extend_from_slice(value);
-        return;
+        QpackStaticMatch::NameOnly(name_idx) => {
+            qpack_int(out, 0b0101_0000, 4, name_idx as u64); // 01 N=0 T=1 + 4-bit name index
+            qpack_write_value(out, name, value); // H + 7-bit value len
+        }
+        QpackStaticMatch::None => {
+            qpack_literal(out, name.as_bytes(), value);
+        }
     }
-    qpack_literal(out, name.as_bytes(), value);
 }
 
 /// How a `read_stream` pass ended.
@@ -1662,30 +1991,36 @@ struct TakenRequest {
 }
 
 fn take_request_for_dispatch(st: &mut H3State, id: StreamId) -> TakenRequest {
-    st.requests.remove(&id);
-    let snapshot = st.request_snapshots.remove(&id);
-    if let Some(deadline) = snapshot.as_ref().and_then(|snapshot| snapshot.deadline) {
+    let Some(req) = st.inflight_requests.remove(&id) else {
+        return TakenRequest {
+            body: Vec::new(),
+            frames: H3FrameCounter::default(),
+            lease: None,
+            snapshot: None,
+        };
+    };
+    if let Some(deadline) = req.snapshot.as_ref().and_then(|snapshot| snapshot.deadline) {
         st.request_deadlines.remove(&deadline);
     }
     TakenRequest {
-        body: st.req_buf.remove(&id).unwrap_or_default(),
-        frames: st.req_frames.remove(&id).unwrap_or_default(),
-        lease: st.body_leases.remove(&id),
-        snapshot,
+        body: req.buf,
+        frames: req.frames,
+        lease: req.lease,
+        snapshot: req.snapshot,
     }
 }
 
 /// Release unfinished request allocations as soon as the connection is lost.
 /// Dispatched requests own separate leases and keep their remaining charge.
 fn reclaim_buffered_requests(st: &mut H3State) {
-    let bytes: usize = st.req_frames.values().map(|frames| frames.charged).sum();
-    st.requests.clear();
+    let bytes: usize = st
+        .inflight_requests
+        .values()
+        .map(|req| req.frames.charged)
+        .sum();
+    st.inflight_requests.clear();
     st.readable_requests.clear();
     st.request_deadlines.clear();
-    st.request_snapshots.clear();
-    st.req_frames.clear();
-    st.req_buf.clear();
-    st.body_leases.clear();
     release_request_charge(st, bytes);
 }
 
@@ -1719,11 +2054,11 @@ fn append_request_bytes(
     if total > limits.max_connection_bytes {
         return Err(RequestFrameError::Limit);
     }
-    let frames = st.req_frames.entry(id).or_default();
-    let decoded_before = frames.head_footprint;
-    frames.consume(bytes, st.req_buf.entry(id).or_default(), limits)?;
+    let req = st.inflight_requests.entry(id).or_default();
+    let decoded_before = req.frames.head_footprint;
+    req.frames.consume(bytes, &mut req.buf, limits)?;
     // The head decodes at most once, at the first DATA frame header.
-    let charge = bytes.len() + (frames.head_footprint - decoded_before);
+    let charge = bytes.len() + (req.frames.head_footprint - decoded_before);
     let Some(total) = total.checked_add(charge - bytes.len()) else {
         return Err(RequestFrameError::Limit);
     };
@@ -1733,22 +2068,21 @@ fn append_request_bytes(
     // (security #263) Reserve against the server-wide budget before accounting, so
     // pre-dispatch accumulation is bounded by the same cap as H1/H2/LSAPI. The
     // owned reservation follows the body through dispatch and every drop path.
-    if let Some(budget) = st.body_budget.clone() {
-        let lease = st
-            .body_leases
-            .entry(id)
-            .or_insert_with(|| hj_core::budget::BodyBufferLease::new(budget));
+    if let Some(ref budget) = st.body_budget {
+        let lease = req
+            .lease
+            .get_or_insert_with(|| hj_core::budget::BodyBufferLease::new(Arc::clone(budget)));
         if !lease.reserve(charge as u64) {
             return Err(RequestFrameError::Limit);
         }
     }
-    frames.charged += charge;
-    frames.wire_bytes += bytes.len();
+    req.frames.charged += charge;
+    req.frames.wire_bytes += bytes.len();
     st.total_req_bytes.set(total);
-    if frames.wire_bytes > limits.max_request_wire_bytes {
+    if req.frames.wire_bytes > limits.max_request_wire_bytes {
         Err(RequestFrameError::Limit)
     } else {
-        Ok(frames.wire_bytes)
+        Ok(req.frames.wire_bytes)
     }
 }
 
@@ -1972,8 +2306,8 @@ fn pump_local_h3_setup<I: LocalUniIo>(io: &mut I, st: &mut H3State) -> Result<()
 /// serving + datagram flush are the caller's job (they differ between drivers).
 fn service_conn(
     endpoint: &mut Endpoint,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &mut HashMap<ConnectionHandle, H3State>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    h3: &mut FxConnMap<H3State>,
     hd: ConnectionHandle,
     now: Instant,
     accepting_requests: bool,
@@ -2137,7 +2471,7 @@ fn service_conn(
                     .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             }
             if let Some(error) = charge_request_cancel(st, now) {
-                close_h3_connection(conns, hd, now, error);
+                close_h3_connection(conns, st, hd, now, error);
                 return;
             }
         }
@@ -2230,10 +2564,10 @@ fn service_conn(
     // stream tracked, or the stream would later be dispatched with no cancellation token.
     for id in stopped {
         if let Some(error) = reject_stopped_local_critical_stream(st, id) {
-            close_h3_connection(conns, hd, now, error);
+            close_h3_connection(conns, st, hd, now, error);
             return;
         }
-        let receiving = st.requests.contains(&id);
+        let receiving = st.inflight_requests.contains_key(&id);
         let unanswered = receiving || st.request_cancellations.contains_key(&id);
         if receiving {
             reclaim_request(st, id);
@@ -2250,18 +2584,21 @@ fn service_conn(
             }
         }
         if unanswered && let Some(error) = charge_request_cancel(st, now) {
-            close_h3_connection(conns, hd, now, error);
+            close_h3_connection(conns, st, hd, now, error);
             return;
         }
     }
 }
 
 fn close_h3_connection(
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    st: &mut H3State,
     hd: ConnectionHandle,
     now: Instant,
     error: H3ConnectionError,
 ) {
+    st.rejected = true;
+    cancel_all_dispatched_requests(st);
     if let Some(conn) = conns.get_mut(&hd) {
         conn.close(
             now,
@@ -2281,7 +2618,7 @@ fn admit_request_stream(
 ) -> Result<(), H3ConnectionError> {
     *accepted_this_drive += 1;
     if *accepted_this_drive > MAX_CONCURRENT_BIDI_STREAMS
-        || st.requests.len() >= 2 * MAX_CONCURRENT_BIDI_STREAMS as usize
+        || st.inflight_requests.len() >= 2 * MAX_CONCURRENT_BIDI_STREAMS as usize
     {
         return Err(H3ConnectionError::new(
             H3_EXCESSIVE_LOAD,
@@ -2345,13 +2682,24 @@ const MAX_TX_DATAGRAMS: usize = 20;
 
 async fn flush_conn(
     udp: &IoUringDatagram,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
     hd: ConnectionHandle,
     now: Instant,
     tbuf: &mut Vec<u8>,
 ) -> bool {
+    flush_conn_with_tail(udp, conns, hd, now, tbuf, true).await
+}
+
+async fn flush_conn_with_tail(
+    udp: &IoUringDatagram,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    hd: ConnectionHandle,
+    now: Instant,
+    tbuf: &mut Vec<u8>,
+    flush_tail: bool,
+) -> bool {
     if udp.batch_enabled() {
-        return flush_conn_batched(udp, conns, hd, now, tbuf);
+        return flush_conn_batched(udp, conns, hd, now, tbuf, flush_tail);
     }
     let mut datagrams = 0usize;
     loop {
@@ -2393,13 +2741,14 @@ async fn flush_conn(
 /// it never asks Quinn to regenerate packets already removed by poll_transmit.
 fn flush_conn_batched(
     udp: &IoUringDatagram,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
     hd: ConnectionHandle,
     now: Instant,
     tbuf: &mut Vec<u8>,
+    flush_tail: bool,
 ) -> bool {
-    if udp.has_pending_sends() {
-        // Completing the previous flush consumes this turn's send budget.
+    if udp.send_blocked() || (flush_tail && udp.has_pending_sends()) {
+        // Completing a previously-blocked flush consumes this turn's send budget.
         udp.flush_pending();
         return true;
     }
@@ -2414,9 +2763,12 @@ fn flush_conn_batched(
             conn.poll_transmit(now, cap.max(1), tbuf)
         });
         let Some(transmit) = transmit else {
-            // Flush a short batch promptly: no deadline or another connection
-            // is needed to release the final packet.
-            return !udp.flush_pending();
+            if flush_tail {
+                // Flush a short batch promptly when called outside a multi-connection
+                // pump round.
+                return !udp.flush_pending();
+            }
+            return false;
         };
         datagrams += transmit
             .segment_size
@@ -2436,11 +2788,8 @@ fn flush_conn_batched(
 /// A spawned request's response may write back only if its connection still exists, remains
 /// protocol-eligible, and its epoch is unchanged (the `ConnectionHandle` was not reused by a
 /// newer connection while the request was in flight). Pure so it can be unit-tested.
-fn completion_is_live(
-    h3: &HashMap<ConnectionHandle, H3State>,
-    conn: ConnectionHandle,
-    epoch: u64,
-) -> bool {
+#[cfg(test)]
+fn completion_is_live(h3: &FxConnMap<H3State>, conn: ConnectionHandle, epoch: u64) -> bool {
     h3.get(&conn)
         .is_some_and(|state| state.epoch == epoch && !state.rejected)
 }
@@ -2512,42 +2861,121 @@ fn reclaim_stalled_sends(st: &mut H3State, now: Instant) -> Vec<StreamId> {
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Queue a finished request's response on its stream. The caller then drives the
-/// connection, whose flush sends every completion of the batch together.
-fn write_completion(
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &mut HashMap<ConnectionHandle, H3State>,
-    c: Completion,
+/// Direct-write helper for complete single-response completions (`Full` / `Buffered`):
+/// writes parts straight into `conn.send_stream(stream)` without allocating a `VecDeque`
+/// or inserting/removing an entry in `st.pending` when the entire response fits in the
+/// initial QUIC stream window (the common case for HTML/JSON/CSS/JS/cached pages).
+/// Falls back to `st.pending.insert(...)` only if QUIC blocks mid-response.
+fn write_direct_or_queue(
+    conn: &mut quinn_proto::Connection,
+    st: &mut H3State,
+    stream: StreamId,
+    mut first: PendingPart,
+    mut second: Option<PendingPart>,
+    completion: Option<hj_core::ResponseCompletion>,
 ) {
-    if !completion_is_live(h3, c.conn, c.epoch)
-        || !h3
-            .get(&c.conn)
-            .is_some_and(|state| state.request_cancellations.contains_key(&c.stream))
-    {
-        return; // connection/stream gone, or handle reused by a different connection
-    }
-    let Completion {
-        conn: ch,
-        stream,
-        kind,
-        ..
-    } = c;
-    let (Some(conn), Some(st)) = (conns.get_mut(&ch), h3.get_mut(&ch)) else {
-        return;
-    };
-    match kind {
-        // A whole buffered response: send and finish when drained.
-        CompletionKind::Full(resp, completion, lease) => {
-            st.request_cancellations.remove(&stream);
+    let mut ss = conn.send_stream(stream);
+    let mut sent = 0u64;
+    match first.write(&mut ss, &mut sent) {
+        Ok(true) => {
+            first.acknowledge();
+        }
+        Ok(false) | Err(WriteError::Blocked) => {
+            let mut parts =
+                std::collections::VecDeque::with_capacity(if second.is_some() { 2 } else { 1 });
+            parts.push_back(first);
+            if let Some(p2) = second {
+                parts.push_back(p2);
+            }
             st.pending.insert(
                 stream,
                 PendingSend {
                     completion,
-                    parts: std::iter::once(PendingPart::contiguous(resp, lease)).collect(),
+                    parts,
                     fin: true,
-                    stall: None,
+                    stall: advance_send_stall(None, sent, true, Instant::now()),
                 },
             );
+            return;
+        }
+        Err(WriteError::Stopped(_)) => return,
+        Err(_) => {
+            cancel_dispatched_request(st, stream);
+            return;
+        }
+    }
+    if let Some(mut p2) = second.take() {
+        match p2.write(&mut ss, &mut sent) {
+            Ok(true) => {
+                p2.acknowledge();
+            }
+            Ok(false) | Err(WriteError::Blocked) => {
+                let mut parts = std::collections::VecDeque::with_capacity(1);
+                parts.push_back(p2);
+                st.pending.insert(
+                    stream,
+                    PendingSend {
+                        completion,
+                        parts,
+                        fin: true,
+                        stall: advance_send_stall(None, sent, true, Instant::now()),
+                    },
+                );
+                return;
+            }
+            Err(WriteError::Stopped(_)) => return,
+            Err(_) => {
+                cancel_dispatched_request(st, stream);
+                return;
+            }
+        }
+    }
+    let fin_accepted = ss.finish().is_ok();
+    if let Some(completion) = completion {
+        completion.finish(if fin_accepted {
+            hj_core::ResponseEnd::Complete
+        } else {
+            hj_core::ResponseEnd::Cancelled
+        });
+    }
+    if fin_accepted && stream.dir() == Dir::Bi && stream.initiator() == quinn_proto::Side::Client {
+        st.response_fins.insert(stream);
+    }
+}
+
+/// Queue a finished request's response on its stream. The caller then drives the
+/// connection, whose flush sends every completion of the batch together.
+fn write_completion(
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    h3: &mut FxConnMap<H3State>,
+    c: Completion,
+) {
+    let Completion {
+        conn: ch,
+        stream,
+        epoch,
+        kind,
+    } = c;
+    let (Some(conn), Some(st)) = (conns.get_mut(&ch), h3.get_mut(&ch)) else {
+        return;
+    };
+    if st.epoch != epoch || st.rejected || !st.request_cancellations.contains_key(&stream) {
+        return; // connection/stream gone, rejected, or handle reused by a different connection
+    }
+    match kind {
+        // A whole buffered response: write directly into QUIC; only allocate/queue
+        // a PendingSend if stream flow control blocks before FIN.
+        CompletionKind::Full(resp, completion, lease) => {
+            st.request_cancellations.remove(&stream);
+            write_direct_or_queue(
+                conn,
+                st,
+                stream,
+                PendingPart::contiguous(resp, lease),
+                None,
+                completion,
+            );
+            return;
         }
         CompletionKind::Buffered {
             head,
@@ -2556,8 +2984,39 @@ fn write_completion(
             lease,
         } => {
             st.request_cancellations.remove(&stream);
-            st.pending
-                .insert(stream, PendingSend::buffered(head, body, completion, lease));
+            if body.is_empty() {
+                write_direct_or_queue(
+                    conn,
+                    st,
+                    stream,
+                    PendingPart::contiguous(head, lease),
+                    None,
+                    completion,
+                );
+            } else {
+                let (head, body) = match lease {
+                    Some(lease) => {
+                        let lease = Arc::new(lease);
+                        (
+                            h3_bytes_with_lease(Bytes::from(head), lease.clone()),
+                            h3_bytes_with_lease(body, lease),
+                        )
+                    }
+                    None => (Bytes::from(head), body),
+                };
+                write_direct_or_queue(
+                    conn,
+                    st,
+                    stream,
+                    PendingPart::Contiguous {
+                        data: head,
+                        ack: None,
+                    },
+                    Some(PendingPart::data_frame(body, None, None)),
+                    completion,
+                );
+            }
+            return;
         }
         // HEADERS of a streamed response: DATA chunks follow, so don't finish yet.
         CompletionKind::Head(head, completion, lease) => {
@@ -2622,17 +3081,18 @@ fn receive_request_streams(
     let mut req_ids = std::mem::take(&mut st.readable_requests);
     let mut finished = Vec::new();
     for &id in &req_ids {
-        let Some((request_limits, progress)) = st.request_snapshots.get_mut(&id).map(|snapshot| {
+        let Some(req) = st.inflight_requests.get_mut(&id) else {
+            // Reclaimed (stopped, expired or refused) since it was queued.
+            continue;
+        };
+        let Some((request_limits, progress)) = req.snapshot.as_mut().map(|snapshot| {
             snapshot.read_queued = false;
             (snapshot.config.limits, snapshot.progress)
         }) else {
-            if st.requests.contains(&id) {
-                // Internal invariant failure: never receive under a live-reloaded
-                // policy chosen after this stream began. Reclaim and fail closed.
-                reclaim_request(st, id);
-                refuse_request_stream(c, st, id, RequestFrameError::Limit);
-            }
-            // Otherwise reclaimed (stopped, expired or refused) since it was queued.
+            // Internal invariant failure: never receive under a live-reloaded
+            // policy chosen after this stream began. Reclaim and fail closed.
+            reclaim_request(st, id);
+            refuse_request_stream(c, st, id, RequestFrameError::Limit);
             continue;
         };
         let mut buffered = None;
@@ -2655,6 +3115,7 @@ fn receive_request_streams(
                 .send_stream(id)
                 .reset(quinn_proto::VarInt::from_u32(H3_REQUEST_CANCELLED));
             if let Some(error) = charge_request_cancel(st, now) {
+                st.rejected = true;
                 c.close(
                     now,
                     quinn_proto::VarInt::from_u32(error.code),
@@ -2751,8 +3212,8 @@ fn refuse_request_stream(
 async fn drive_one_conn(
     udp: &IoUringDatagram,
     endpoint: &mut Endpoint,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &mut HashMap<ConnectionHandle, H3State>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    h3: &mut FxConnMap<H3State>,
     hd: ConnectionHandle,
     now: Instant,
     local: SocketAddr,
@@ -2760,7 +3221,7 @@ async fn drive_one_conn(
     inflight: &std::rc::Rc<std::cell::Cell<usize>>,
     comp_tx: &flume::Sender<Completion>,
     comp_rx: &flume::Receiver<Completion>,
-    other_work: &mut std::collections::HashSet<ConnectionHandle>,
+    other_work: &mut FxConnSet,
     fallback_request_config: H3RequestConfig,
     accepting_requests: bool,
     tx_scratch: &mut Vec<u8>,
@@ -3025,7 +3486,7 @@ async fn drive_one_conn(
             other_work.insert(owner);
         }
     }
-    flush_conn(udp, conns, hd, now, tx_scratch).await
+    flush_conn_with_tail(udp, conns, hd, now, tx_scratch, false).await
 }
 
 /// recvmmsg slots: fixed, initialized storage the kernel writes into on every pass.
@@ -3061,8 +3522,8 @@ async fn recv_drain(
     recv_metas: &mut [quinn_udp::RecvMeta; GRO_BATCH],
     scratch: &mut Vec<u8>,
     endpoint: &mut Endpoint,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &mut HashMap<ConnectionHandle, H3State>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    h3: &mut FxConnMap<H3State>,
     deadlines: &mut ConnectionDeadlineIndex,
     epoch_ctr: &mut u64,
     handshakes: &Arc<AtomicU64>,
@@ -3070,7 +3531,7 @@ async fn recv_drain(
     policy: &QuicServerPolicy,
     accepting_connections: bool,
     now: Instant,
-    affected: &mut std::collections::HashSet<ConnectionHandle>,
+    affected: &mut FxConnSet,
 ) {
     let mut completed_batches = 0;
     loop {
@@ -3170,8 +3631,8 @@ async fn pump<const ROUND_LIMIT: usize>(
     scratch: &mut Vec<u8>,
     tx_scratch: &mut Vec<u8>,
     endpoint: &mut Endpoint,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &mut HashMap<ConnectionHandle, H3State>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    h3: &mut FxConnMap<H3State>,
     deadlines: &mut ConnectionDeadlineIndex,
     epoch_ctr: &mut u64,
     handshakes: &Arc<AtomicU64>,
@@ -3183,11 +3644,24 @@ async fn pump<const ROUND_LIMIT: usize>(
     runtime: &H3RuntimeConfig,
     policy: &QuicServerPolicy,
     accepting: bool,
-    to_drive: &mut std::collections::HashSet<ConnectionHandle>,
+    to_drive: &mut FxConnSet,
 ) {
+    thread_local! {
+        static PUMP_SCRATCH: std::cell::RefCell<(Vec<ConnectionHandle>, FxConnSet)> =
+            std::cell::RefCell::new((Vec::new(), FxConnSet::default()));
+    }
+    let (mut touched, mut next) = PUMP_SCRATCH.with(|cell| {
+        if let Ok(mut guard) = cell.try_borrow_mut() {
+            let t = std::mem::take(&mut guard.0);
+            let n = std::mem::take(&mut guard.1);
+            (t, n)
+        } else {
+            (Vec::new(), FxConnSet::default())
+        }
+    });
+    touched.clear();
+    next.clear();
     let mut rounds = 0;
-    let mut touched: Vec<ConnectionHandle> = Vec::new();
-    let mut next = std::collections::HashSet::new();
     while !to_drive.is_empty() && rounds < ROUND_LIMIT {
         rounds += 1;
         next.clear();
@@ -3220,6 +3694,11 @@ async fn pump<const ROUND_LIMIT: usize>(
                 next.insert(hd); // hit the per-flush datagram cap → more to send
             }
         }
+        // Flush any coalesced cross-connection sendmmsg tail once per pump round
+        // before draining incoming ACKs.
+        if udp.batch_enabled() && udp.has_pending_sends() {
+            udp.flush_pending();
+        }
         // Process ACKs our sends elicited so cwnd/loss-detection stay current.
         let now = Instant::now();
         recv_drain(
@@ -3245,14 +3724,24 @@ async fn pump<const ROUND_LIMIT: usize>(
         deadlines.sync(*hd, connection_deadline(conns, h3, *hd));
     }
     touched.extend(to_drive.iter().copied());
-    reap_connections(endpoint, conns, h3, deadlines, to_drive, touched);
+    let mut touched = reap_connections(endpoint, conns, h3, deadlines, to_drive, touched);
+    touched.clear();
+    next.clear();
+    if touched.capacity() <= 1024 && next.capacity() <= 1024 {
+        PUMP_SCRATCH.with(|cell| {
+            if let Ok(mut guard) = cell.try_borrow_mut() {
+                guard.0 = touched;
+                guard.1 = next;
+            }
+        });
+    }
 }
 
 /// Whether `hd` is finished: quinn drained it, or it was lost before its handshake
 /// completed (see [`H3State::discard`]).
 fn connection_finished(
-    conns: &HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &HashMap<ConnectionHandle, H3State>,
+    conns: &FxConnMap<quinn_proto::Connection>,
+    h3: &FxConnMap<H3State>,
     hd: &ConnectionHandle,
 ) -> bool {
     conns.get(hd).is_some_and(|c| c.is_drained()) || h3.get(hd).is_some_and(|st| st.discard)
@@ -3264,12 +3753,12 @@ fn connection_finished(
 /// O(connections). A full scan still runs at most once a second.
 fn reap_connections(
     endpoint: &mut Endpoint,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-    h3: &mut HashMap<ConnectionHandle, H3State>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
+    h3: &mut FxConnMap<H3State>,
     deadlines: &mut ConnectionDeadlineIndex,
-    to_drive: &mut std::collections::HashSet<ConnectionHandle>,
+    to_drive: &mut FxConnSet,
     mut touched: Vec<ConnectionHandle>,
-) {
+) -> Vec<ConnectionHandle> {
     let now = Instant::now();
     let full = LAST_FULL_REAP.with(|last| {
         let due = now.duration_since(last.get()) >= FULL_REAP_EVERY;
@@ -3278,19 +3767,22 @@ fn reap_connections(
         }
         due
     });
-    let finished: Vec<ConnectionHandle> = if full {
-        conns
-            .keys()
-            .filter(|hd| connection_finished(conns, h3, hd))
-            .copied()
-            .collect()
+    let mut finished: Vec<ConnectionHandle> = if full {
+        touched.clear();
+        touched.extend(
+            conns
+                .keys()
+                .filter(|hd| connection_finished(conns, h3, hd))
+                .copied(),
+        );
+        touched
     } else {
         touched.retain(|hd| connection_finished(conns, h3, hd));
         touched.sort_unstable_by_key(|hd| hd.0);
         touched.dedup();
         touched
     };
-    for hd in finished {
+    for hd in finished.drain(..) {
         let Some(mut conn) = conns.remove(&hd) else {
             continue;
         };
@@ -3321,6 +3813,7 @@ fn reap_connections(
         deadlines.remove(hd);
         to_drive.remove(&hd);
     }
+    finished
 }
 
 /// A capped pump retains runnable work. Yield once before resuming it so request
@@ -3356,14 +3849,14 @@ thread_local! {
 }
 
 fn h3_drain_complete(
-    h3: &HashMap<ConnectionHandle, H3State>,
+    h3: &FxConnMap<H3State>,
     inflight: usize,
     completion_queue_empty: bool,
 ) -> bool {
     inflight == 0
         && completion_queue_empty
         && h3.values().all(|state| {
-            state.requests.is_empty()
+            state.inflight_requests.is_empty()
                 && state.pending.is_empty()
                 && state.response_fins.is_empty()
                 && state.total_req_bytes.get() == 0
@@ -3372,7 +3865,7 @@ fn h3_drain_complete(
 
 async fn close_h3_connections(
     udp: &IoUringDatagram,
-    conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+    conns: &mut FxConnMap<quinn_proto::Connection>,
     reason: &'static [u8],
     tx_scratch: &mut Vec<u8>,
 ) {
@@ -3407,8 +3900,8 @@ async fn endpoint_loop_concurrent(
     activation: super::worker_group::ActivationGate,
 ) -> io::Result<()> {
     let runtime = runtime.with_shutdown(shutdown.clone());
-    let mut conns: HashMap<ConnectionHandle, quinn_proto::Connection> = HashMap::new();
-    let mut h3: HashMap<ConnectionHandle, H3State> = HashMap::new();
+    let mut conns: FxConnMap<quinn_proto::Connection> = FxConnMap::default();
+    let mut h3: FxConnMap<H3State> = FxConnMap::default();
     let mut scratch: Vec<u8> = Vec::with_capacity(MAX_DATAGRAM);
     let mut tx_scratch: Vec<u8> = Vec::with_capacity(MAX_DATAGRAM);
     let (comp_tx, comp_rx) = flume::bounded::<Completion>(MAX_INFLIGHT_PER_CORE * 2);
@@ -3429,7 +3922,7 @@ async fn endpoint_loop_concurrent(
     let mut recv_bufs = recv_slots();
     let mut recv_metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
     let mut deadlines = ConnectionDeadlineIndex::default();
-    let mut pending_work = std::collections::HashSet::new();
+    let mut pending_work = FxConnSet::default();
     let mut draining = false;
     let mut drain_deadline: Option<Instant> = None;
     // Socket capability probing and driver allocations belong to preparation,
@@ -3575,8 +4068,12 @@ async fn endpoint_loop_concurrent(
 // tokio/quinn transport adapter no longer exists.
 
 #[cfg(test)]
+use super::qpack::QPACK_STATIC;
+#[cfg(test)]
 use super::qpack::qpack_decode;
-use super::qpack::{QPACK_STATIC, qpack_decode_limited};
+use super::qpack::qpack_decode_into;
+#[cfg(test)]
+use super::qpack::qpack_decode_limited;
 use crate::uring::bridge::{Bridge, BridgeCtx};
 use hj_core::Proto;
 use tokio_util::sync::CancellationToken;
@@ -3661,33 +4158,45 @@ fn h3_field_section_size(status: http::StatusCode, headers: &http::HeaderMap) ->
 }
 
 fn encode_h3_headers_frame(status: http::StatusCode, headers: &http::HeaderMap) -> Vec<u8> {
-    // (#288) The field section goes into a REUSED per-thread scratch (cleared per
-    // call, capacity retained) so a response allocates only its final wire buffer;
-    // QUIC/H3 varints must be minimally encoded, so the HEADERS length cannot be
-    // backfilled into a fixed-size slot.
-    FIELD_SCRATCH.with(|cell| {
-        let mut scratch = cell.borrow_mut();
-        let field: &mut Vec<u8> = scratch.get_or_insert_with(Vec::new);
-        field.clear();
-        let cap = 2 + 16 + headers.len() * 24;
-        if field.capacity() < cap {
-            field.reserve(cap);
-        }
-        field.extend_from_slice(&[0x00, 0x00]); // RIC=0, Base=0
-        qpack_field(field, ":status", status.as_str().as_bytes());
-        for (name, value) in headers {
-            qpack_field(field, name.as_str(), value.as_bytes());
-        }
-        let mut out = Vec::with_capacity(field.len() + 12);
-        write_varint(&mut out, 0x01); // HEADERS
-        write_varint(&mut out, field.len() as u64);
-        out.extend_from_slice(field);
-        out
-    })
+    encode_h3_headers_frame_with_extra(status, headers, 0)
 }
 
-thread_local! {
-    static FIELD_SCRATCH: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+/// Encode an HTTP/3 HEADERS frame directly into its final wire buffer (plus `extra_cap`
+/// headroom for coalescing a small DATA frame) with zero intermediate scratch copy:
+/// reserves a 3-byte prefix `[0x01, len_hi, len_lo]` which covers the common
+/// `64..16384`-byte field-section length in place, shifts `< 64` bytes by 1 byte for
+/// minimal 1-byte varints, and splices only for rare `>= 16384`-byte blocks.
+fn encode_h3_headers_frame_with_extra(
+    status: http::StatusCode,
+    headers: &http::HeaderMap,
+    extra_cap: usize,
+) -> Vec<u8> {
+    let cap = 3 + 2 + 16 + headers.len() * 24 + extra_cap;
+    let mut out = Vec::with_capacity(cap);
+    out.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00]); // 3-byte frame hdr placeholder + RIC=0, Base=0
+    qpack_field(&mut out, ":status", status.as_str().as_bytes());
+    for (name, value) in headers {
+        qpack_field(&mut out, name.as_str(), value.as_bytes());
+    }
+    let field_len = out.len() - 3;
+    if (64..16384).contains(&field_len) {
+        if let Some([h1, h2]) = out.get_mut(1..3) {
+            *h1 = 0x40 | ((field_len >> 8) as u8);
+            *h2 = (field_len & 0xff) as u8;
+        }
+    } else if field_len < 64 {
+        if let Some(slot) = out.get_mut(1) {
+            *slot = field_len as u8;
+        }
+        out.copy_within(3.., 2);
+        out.pop();
+    } else {
+        let mut hdr = Vec::with_capacity(9);
+        write_varint(&mut hdr, 0x01);
+        write_varint(&mut hdr, field_len as u64);
+        out.splice(0..3, hdr);
+    }
+    out
 }
 /// Frame one DATA chunk (`0x00` type + length + payload). Concatenated DATA frames
 /// reassemble byte-identically to one big DATA frame, so the streaming path is wire-equal
@@ -3827,24 +4336,188 @@ fn split_h3_request_headers(headers: Vec<(Vec<u8>, Vec<u8>)>) -> Option<H3Reques
 }
 
 fn valid_h3_trailers(field: &[u8], max_field_section_size: usize) -> bool {
-    qpack_decode_limited(field, max_field_section_size).is_some_and(|(headers, _)| {
-        headers.into_iter().all(|(name, value)| {
-            if name.first() == Some(&b':') || name.iter().any(|b| b.is_ascii_uppercase()) {
+    qpack_decode_into(field, max_field_section_size, |name, value| {
+        if name.first() == Some(&b':') || name.iter().any(|b| b.is_ascii_uppercase()) {
+            return false;
+        }
+        let (Ok(name), Ok(value)) = (
+            http::HeaderName::from_bytes(name),
+            http::HeaderValue::from_bytes(value),
+        ) else {
+            return false;
+        };
+        !hj_core::is_connection_specific_request_header(name.as_str())
+            && !(name == http::header::TE && !value.as_bytes().eq_ignore_ascii_case(b"trailers"))
+            && !matches!(value.as_bytes().first(), Some(b' ' | b'\t'))
+            && !matches!(value.as_bytes().last(), Some(b' ' | b'\t'))
+    })
+    .is_some()
+}
+
+/// Single-pass zero-intermediate-Vec QPACK request head decoder and validator for the
+/// common bodiless-request path (`decoded_head.is_none()`). Enforces the exact same
+/// RFC 9114 rules as `split_h3_request_headers` + `resolve_content_length` +
+/// `build_h3_request_head`.
+fn decode_h3_request_direct(
+    field: &[u8],
+    max_header_bytes: usize,
+    body_len: usize,
+    inbody: hj_core::IncomingBody,
+) -> Option<(hj_core::Request, usize)> {
+    let mut method: Option<http::Method> = None;
+    let mut scheme_ok = false;
+    let mut seen_scheme = false;
+    let mut uri: Option<http::Uri> = None;
+    let mut is_star_path = false;
+    let mut authority: Option<http::HeaderValue> = None;
+    let mut regular_host: Option<http::HeaderValue> = None;
+    let mut seen_regular = false;
+    let mut headers = http::HeaderMap::with_capacity(16);
+    let mut cookie_count = 0usize;
+    let mut declared_cl: Option<usize> = None;
+
+    let decoded_size = qpack_decode_into(field, max_header_bytes, |name, value| {
+        if name.first() == Some(&b':') {
+            if seen_regular {
                 return false;
             }
-            let (Ok(name), Ok(value)) = (
-                http::HeaderName::from_bytes(&name),
-                http::HeaderValue::from_bytes(&value),
-            ) else {
+            match name {
+                b":method" => {
+                    if method.is_some() || value == b"CONNECT" {
+                        return false;
+                    }
+                    let Ok(m) = http::Method::from_bytes(value) else {
+                        return false;
+                    };
+                    method = Some(m);
+                }
+                b":scheme" => {
+                    if seen_scheme {
+                        return false;
+                    }
+                    seen_scheme = true;
+                    scheme_ok = value == b"https";
+                }
+                b":path" => {
+                    if uri.is_some() {
+                        return false;
+                    }
+                    let Ok(path_str) = std::str::from_utf8(value) else {
+                        return false;
+                    };
+                    if value.contains(&b'#')
+                        || !(value.starts_with(b"/") || value == b"*")
+                        || value.starts_with(b"//")
+                    {
+                        return false;
+                    }
+                    is_star_path = value == b"*";
+                    let Ok(u) = path_str.parse::<http::Uri>() else {
+                        return false;
+                    };
+                    uri = Some(u);
+                }
+                b":authority" => {
+                    if authority.is_some() {
+                        return false;
+                    }
+                    let Ok(text) = std::str::from_utf8(value) else {
+                        return false;
+                    };
+                    if !hj_core::valid_http_authority(text) {
+                        return false;
+                    }
+                    let Ok(hv) = http::HeaderValue::from_bytes(value) else {
+                        return false;
+                    };
+                    authority = Some(hv);
+                }
+                _ => return false,
+            }
+            return true;
+        }
+        seen_regular = true;
+        if name.iter().any(|b| b.is_ascii_uppercase()) {
+            return false;
+        }
+        let (Ok(hname), Ok(hval)) = (
+            http::HeaderName::from_bytes(name),
+            http::HeaderValue::from_bytes(value),
+        ) else {
+            return false;
+        };
+        if hj_core::is_connection_specific_request_header(hname.as_str()) {
+            return false;
+        }
+        if hname == http::header::TE && !hval.as_bytes().eq_ignore_ascii_case(b"trailers") {
+            return false;
+        }
+        if matches!(hval.as_bytes().first(), Some(b' ' | b'\t'))
+            || matches!(hval.as_bytes().last(), Some(b' ' | b'\t'))
+        {
+            return false;
+        }
+        if hname == http::header::CONTENT_LENGTH {
+            let Ok(Some(parsed_cl)) = super::codec::resolve_content_length(std::iter::once(value))
+            else {
                 return false;
             };
-            !hj_core::is_connection_specific_request_header(name.as_str())
-                && !(name == http::header::TE
-                    && !value.as_bytes().eq_ignore_ascii_case(b"trailers"))
-                && !matches!(value.as_bytes().first(), Some(b' ' | b'\t'))
-                && !matches!(value.as_bytes().last(), Some(b' ' | b'\t'))
-        })
-    })
+            if let Some(prev) = declared_cl
+                && prev != parsed_cl
+            {
+                return false;
+            }
+            declared_cl = Some(parsed_cl);
+        }
+        if hname == http::header::HOST {
+            let Ok(text) = hval.to_str() else {
+                return false;
+            };
+            if !hj_core::valid_http_authority(text) {
+                return false;
+            }
+            if regular_host.replace(hval).is_some() {
+                return false;
+            }
+        } else {
+            if hname == http::header::COOKIE {
+                cookie_count += 1;
+            }
+            headers.append(hname, hval);
+        }
+        true
+    })?;
+
+    if !scheme_ok {
+        return None;
+    }
+    let method = method?;
+    let uri = uri?;
+    if is_star_path && method != http::Method::OPTIONS {
+        return None;
+    }
+    if declared_cl.is_some_and(|cl| cl != body_len) {
+        return None;
+    }
+    match (authority, regular_host) {
+        (Some(auth), Some(host)) if auth.as_bytes() != host.as_bytes() => return None,
+        (Some(auth), _) => {
+            headers.append(http::header::HOST, auth);
+        }
+        (None, Some(host)) => {
+            headers.append(http::header::HOST, host);
+        }
+        (None, None) => return None,
+    }
+    if cookie_count > 1 {
+        hj_core::coalesce_cookie_crumbs(&mut headers);
+    }
+    let mut req = http::Request::new(inbody);
+    *req.version_mut() = http::Version::HTTP_3;
+    *req.method_mut() = method;
+    *req.uri_mut() = uri;
+    *req.headers_mut() = headers;
+    Some((req, decoded_size))
 }
 
 /// Validate the decoded H3 request head and construct the HTTP request builder.
@@ -3957,12 +4630,55 @@ async fn handle_h3_request(
     if parsed.body.len() > request_limits.max_body_bytes {
         return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     }
-    // The receive path decodes the head of a request with a body; it is the same
-    // field section under the same limit.
-    let decoded = decoded_head
-        .or_else(|| qpack_decode_limited(&parsed.field, request_limits.max_header_bytes));
-    let Some((headers, initial_field_size)) = decoded else {
-        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
+    let body_b = parsed.body;
+    let body_len = body_b.len();
+    let inbody: hj_core::IncomingBody = if body_b.is_empty() {
+        hj_core::empty_incoming()
+    } else {
+        use http_body_util::BodyExt;
+        http_body_util::Full::new(body_b)
+            .map_err(|n| match n {})
+            .boxed()
+    };
+    let (req, initial_field_size) = if let Some((headers, initial_field_size)) = decoded_head {
+        let head = match split_h3_request_headers(headers) {
+            Some(h) => h,
+            None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
+        };
+        let declared_cl = {
+            let values = head
+                .regular
+                .iter()
+                .filter(|(n, _)| n.as_slice() == b"content-length")
+                .map(|(_, v)| v.as_slice());
+            match super::codec::resolve_content_length(values) {
+                Ok(cl) => cl,
+                Err(()) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
+            }
+        };
+        if declared_cl.is_some_and(|cl| cl != body_len) {
+            return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
+        }
+        let builder = match build_h3_request_head(head) {
+            Some(head) => head,
+            None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
+        };
+        let mut req = match builder.body(inbody) {
+            Ok(r) => r,
+            Err(_) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
+        };
+        hj_core::coalesce_cookie_crumbs(req.headers_mut());
+        (req, initial_field_size)
+    } else {
+        match decode_h3_request_direct(
+            &parsed.field,
+            request_limits.max_header_bytes,
+            body_len,
+            inbody,
+        ) {
+            Some(pair) => pair,
+            None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
+        }
     };
     if parsed.trailers.as_deref().is_some_and(|field| {
         !valid_h3_trailers(
@@ -3974,46 +4690,6 @@ async fn handle_h3_request(
     }) {
         return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
     }
-    let head = match split_h3_request_headers(headers) {
-        Some(h) => h,
-        None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
-    };
-    // (N2) §4.1.2: a Content-Length that disagrees with the DATA length is malformed.
-    // Parsed with the SAME strict resolver as H1 (#232 residual): ASCII-OWS trim,
-    // digit-only — the old `trim().parse()` accepted "+5" (unsigned FromStr sign) and
-    // obs-text-padded values that every conformant stack rejects.
-    let declared_cl = {
-        let values = head
-            .regular
-            .iter()
-            .filter(|(n, _)| n.as_slice() == b"content-length")
-            .map(|(_, v)| v.as_slice());
-        match super::codec::resolve_content_length(values) {
-            Ok(cl) => cl,
-            Err(()) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
-        }
-    };
-    if declared_cl.is_some_and(|cl| cl != parsed.body.len()) {
-        return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST));
-    }
-    let builder = match build_h3_request_head(head) {
-        Some(head) => head,
-        None => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
-    };
-    let body_b = parsed.body;
-    let inbody: hj_core::IncomingBody = if body_b.is_empty() {
-        hj_core::empty_incoming()
-    } else {
-        use http_body_util::BodyExt;
-        http_body_util::Full::new(body_b)
-            .map_err(|n| match n {})
-            .boxed()
-    };
-    let mut req = match builder.body(inbody) {
-        Ok(r) => r,
-        Err(_) => return H3Outcome::full(h3_error(http::StatusCode::BAD_REQUEST)),
-    };
-    hj_core::coalesce_cookie_crumbs(req.headers_mut());
     let ctx = BridgeCtx {
         peer,
         local,
@@ -4042,6 +4718,7 @@ async fn handle_h3_request(
         Some(mut r) => {
             let mut completion = r.completion;
             let status = r.status;
+            let shared_headers = r.shared_headers;
             let mut headers = r.headers;
             let streaming_unknown_len = match &r.body {
                 crate::uring::bridge::BridgeBody::Stream { len: Some(n), .. } => {
@@ -4052,15 +4729,36 @@ async fn handle_h3_request(
                 crate::uring::bridge::BridgeBody::Stream { len: None, .. } => true,
                 _ => false,
             };
-            let body_forbidden =
-                prepare_h3_response_headers(&mut headers, is_head, status, streaming_unknown_len);
+            // Fast-memo hits carry pre-sanitized status-200 GET headers in `shared_headers`
+            // so we encode straight from `&Arc<HeaderMap>` without cloning `HeaderMap`.
+            let (body_forbidden, headers_ref): (bool, &http::HeaderMap) = if let Some(ref shared) =
+                shared_headers
+                && !is_head
+                && status == http::StatusCode::OK
+                && !streaming_unknown_len
+            {
+                (false, shared.as_ref())
+            } else {
+                if let Some(shared) = shared_headers
+                    && headers.is_empty()
+                {
+                    headers = (*shared).clone();
+                }
+                let forbidden = prepare_h3_response_headers(
+                    &mut headers,
+                    is_head,
+                    status,
+                    streaming_unknown_len,
+                );
+                (forbidden, &headers)
+            };
             // #626 (RFC 9114 §7.2.4.1): never emit a field section larger than
             // the peer's SETTINGS_MAX_FIELD_SECTION_SIZE — a conforming client
             // would abort the stream with H3_MESSAGE_ERROR. Fall back to a
             // minimal 500 head (status only, the smallest legal section).
             if max_field_section_size
                 .get()
-                .is_some_and(|limit| h3_field_section_size(status, &headers) > limit)
+                .is_some_and(|limit| h3_field_section_size(status, headers_ref) > limit)
             {
                 if let crate::uring::bridge::BridgeBody::Stream { rx, .. } = &mut r.body {
                     rx.close();
@@ -4074,45 +4772,70 @@ async fn handle_h3_request(
                 // Small / HIT / sub-threshold dynamic bodies: buffered + sent whole — byte-identical
                 // to the previous path.
                 crate::uring::bridge::BridgeBody::Full(b) => {
+                    const H3_COALESCE_BODY_MAX: usize = 4096;
                     let body = buffered_h3_body(status, body_forbidden, b);
-                    let head = encode_h3_headers_frame(status, &headers);
-                    let framed_body = if body.is_empty() {
-                        0
-                    } else {
-                        body.len().saturating_add(16)
-                    };
-                    // A body with another owner (page cache, static cache, memo, or a
-                    // buffer the bridge already leased) adds no memory of its own.
-                    let (owned, shared) = if body.is_unique() {
-                        (head.len().saturating_add(framed_body), 0)
-                    } else {
-                        (head.len(), framed_body)
-                    };
-                    let reserved = match egress_budget.as_ref() {
-                        Some(budget) => budget
-                            .reserve_with_shared(owned, shared)
-                            .map(Some)
-                            .ok_or(()),
-                        None => Ok(None),
-                    };
-                    let lease = match reserved {
-                        Ok(lease) => lease,
-                        Err(()) => {
-                            if let Some(completion) = completion.take() {
-                                completion.finish(hj_core::ResponseEnd::Cancelled);
+                    if !body.is_empty() && body.len() <= H3_COALESCE_BODY_MAX {
+                        // Small-body coalescing: append DATA frame directly onto `head`
+                        // and emit `H3Body::Full` — eliminates Arc<H3EgressLease>, a
+                        // second `Bytes::from_owner`, and 2 extra quinn SendStream writes.
+                        let mut data =
+                            encode_h3_headers_frame_with_extra(status, headers_ref, body.len() + 4);
+                        encode_h3_data_frame(&mut data, &body);
+                        let lease = match reserve_h3_egress(egress_budget.as_ref(), data.len()) {
+                            Ok(lease) => lease,
+                            Err(()) => {
+                                if let Some(completion) = completion.take() {
+                                    completion.finish(hj_core::ResponseEnd::Cancelled);
+                                }
+                                return H3Outcome::full(h3_error(
+                                    http::StatusCode::SERVICE_UNAVAILABLE,
+                                ));
                             }
-                            return H3Outcome::full(h3_error(
-                                http::StatusCode::SERVICE_UNAVAILABLE,
-                            ));
+                        };
+                        H3Outcome {
+                            body: H3Body::Full { data, lease },
+                            completion,
                         }
-                    };
-                    H3Outcome {
-                        body: if body.is_empty() {
-                            H3Body::Full { data: head, lease }
+                    } else {
+                        let head = encode_h3_headers_frame(status, headers_ref);
+                        let framed_body = if body.is_empty() {
+                            0
                         } else {
-                            H3Body::Buffered { head, body, lease }
-                        },
-                        completion,
+                            body.len().saturating_add(16)
+                        };
+                        // A body with another owner (page cache, static cache, memo, or a
+                        // buffer the bridge already leased) adds no memory of its own.
+                        let (owned, shared) = if body.is_unique() {
+                            (head.len().saturating_add(framed_body), 0)
+                        } else {
+                            (head.len(), framed_body)
+                        };
+                        let reserved = match egress_budget.as_ref() {
+                            Some(budget) => budget
+                                .reserve_with_shared(owned, shared)
+                                .map(Some)
+                                .ok_or(()),
+                            None => Ok(None),
+                        };
+                        let lease = match reserved {
+                            Ok(lease) => lease,
+                            Err(()) => {
+                                if let Some(completion) = completion.take() {
+                                    completion.finish(hj_core::ResponseEnd::Cancelled);
+                                }
+                                return H3Outcome::full(h3_error(
+                                    http::StatusCode::SERVICE_UNAVAILABLE,
+                                ));
+                            }
+                        };
+                        H3Outcome {
+                            body: if body.is_empty() {
+                                H3Body::Full { data: head, lease }
+                            } else {
+                                H3Body::Buffered { head, body, lease }
+                            },
+                            completion,
+                        }
                     }
                 }
                 crate::uring::bridge::BridgeBody::File(_) => {
@@ -4121,7 +4844,7 @@ async fn handle_h3_request(
                 // Large / SSE / proxy bodies: stream the HEADERS now and forward DATA chunks as the
                 // backend produces them, instead of buffering the whole body first.
                 crate::uring::bridge::BridgeBody::Stream { mut rx, .. } => {
-                    let head = encode_h3_headers_frame(status, &headers);
+                    let head = encode_h3_headers_frame(status, headers_ref);
                     let head_lease = match reserve_h3_egress(egress_budget.as_ref(), head.len()) {
                         Ok(lease) => lease,
                         Err(()) => {
@@ -4755,7 +5478,7 @@ mod h3_codec_tests {
     // connection gone) must be dropped — never cross-written to the wrong connection.
     #[test]
     fn completion_epoch_guard_drops_stale() {
-        let mut h3: HashMap<ConnectionHandle, H3State> = HashMap::new();
+        let mut h3: FxConnMap<H3State> = FxConnMap::default();
         let hd = ConnectionHandle(7);
         h3.insert(
             hd,
@@ -4916,7 +5639,11 @@ mod h3_codec_tests {
         ));
         let second_stream = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
         early.track_request_stream(second_stream, accepted_at, request_snapshot.clone());
-        let retained = early.request_snapshots.get(&first_stream).unwrap();
+        let retained = early
+            .inflight_requests
+            .get(&first_stream)
+            .and_then(|r| r.snapshot.as_ref())
+            .unwrap();
         assert_eq!(
             retained.config.limits.max_body_bytes,
             initial.serve_config.max_req_body_size
@@ -4931,8 +5658,9 @@ mod h3_codec_tests {
         ));
         assert!(Arc::ptr_eq(
             &early
-                .request_snapshots
+                .inflight_requests
                 .get(&second_stream)
+                .and_then(|r| r.snapshot.as_ref())
                 .unwrap()
                 .generation
                 .as_ref()
@@ -4951,7 +5679,7 @@ mod h3_codec_tests {
             &dispatched_snapshot.generation.unwrap().0,
             &initial
         ));
-        assert!(!early.request_snapshots.contains_key(&first_stream));
+        assert!(!early.inflight_requests.contains_key(&first_stream));
         let later = runtime.accepted_state(permit(), 2);
         let mut replacement =
             crate::state::ServerState::reload(&application, application.server.clone()).unwrap();
@@ -5028,7 +5756,7 @@ mod h3_codec_tests {
         .await;
         assert_eq!(seen.load(Ordering::SeqCst), application.generation);
         reclaim_buffered_requests(&mut early);
-        assert!(early.request_snapshots.is_empty());
+        assert!(early.inflight_requests.is_empty());
         assert!(early.request_deadlines.is_empty());
         drop(early);
         drop(later);
@@ -5243,13 +5971,13 @@ mod h3_codec_tests {
             _connection_permit: Some(permit),
             ..Default::default()
         };
-        state.requests.insert(request);
-        let mut states = HashMap::new();
+        state.inflight_requests.entry(request).or_default();
+        let mut states = FxConnMap::default();
         states.insert(handle, state);
 
         assert!(!h3_drain_complete(&states, 1, true));
         assert_eq!(active.load(Ordering::Relaxed), 1);
-        states.get_mut(&handle).unwrap().requests.clear();
+        states.get_mut(&handle).unwrap().inflight_requests.clear();
         assert!(h3_drain_complete(&states, 0, true));
         assert_eq!(
             active.load(Ordering::Relaxed),
@@ -5641,7 +6369,9 @@ mod h3_codec_tests {
         let first = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
         let second = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
         let mut st = H3State::default();
-        st.requests.extend([first, second]);
+        for id in [first, second] {
+            st.inflight_requests.entry(id).or_default();
+        }
         assert!(append_request_bytes(&mut st, first, &[0x00, 4, 1, 2, 3, 4], limits).is_ok());
         assert_eq!(st.total_req_bytes.get(), 6);
         assert!(append_request_bytes(&mut st, second, &[0x00, 4, 5, 6, 7, 8], limits).is_err());
@@ -5692,12 +6422,12 @@ mod h3_codec_tests {
             };
             for index in 0..256 {
                 let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, index);
-                st.requests.insert(id);
+                st.inflight_requests.entry(id).or_default();
                 if append_request_bytes(&mut st, id, &wire, limits).is_err() {
                     connections.push(st);
                     break 'probe;
                 }
-                let frames = &st.req_frames[&id];
+                let frames = &st.inflight_requests[&id].frames;
                 assert!(frames.head_footprint >= REFS * 80);
                 assert_eq!(frames.charged, wire.len() + frames.head_footprint);
                 decoded += decoded_heap(frames);
@@ -5727,10 +6457,10 @@ mod h3_codec_tests {
             body_budget: Some(budget.clone()),
             ..Default::default()
         };
-        st.requests.insert(id);
+        st.inflight_requests.entry(id).or_default();
         let wire = static_ref_request(100, b"body");
         append_request_bytes(&mut st, id, &wire, H3RequestLimits::new(16_380, 1024)).unwrap();
-        let footprint = st.req_frames[&id].head_footprint;
+        let footprint = st.inflight_requests[&id].frames.head_footprint;
         assert_eq!(budget.in_flight(), (wire.len() + footprint) as u64);
         let taken = take_request_for_dispatch(&mut st, id);
         let charge = RequestChargeGuard {
@@ -5762,7 +6492,9 @@ mod h3_codec_tests {
         let first = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
         let second = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
         let mut st = H3State::default();
-        st.requests.extend([first, second]);
+        for id in [first, second] {
+            st.inflight_requests.entry(id).or_default();
+        }
         assert!(append_request_bytes(&mut st, first, &[0x00, 4, 1, 2, 3, 4], limits).is_ok());
         let dispatched = take_request_for_dispatch(&mut st, first);
         assert_eq!(dispatched.frames.charged, 6);
@@ -5792,7 +6524,7 @@ mod h3_codec_tests {
                 body_budget: Some(budget.clone()),
                 ..Default::default()
             };
-            st.requests.insert(id);
+            st.inflight_requests.entry(id).or_default();
             append_request_bytes(&mut st, id, &[0x00, 4, 1, 2, 3, 4], limits).unwrap();
             assert_eq!(budget.in_flight(), 6);
             if explicit_loss {
@@ -5800,11 +6532,11 @@ mod h3_codec_tests {
                 reclaim_buffered_requests(&mut st);
                 assert_eq!(budget.in_flight(), 0);
                 assert_eq!(st.total_req_bytes.get(), 0);
-                assert!(st.requests.is_empty());
+                assert!(st.inflight_requests.is_empty());
             }
             // Covers direct cancellation/error/drop as well as the drained map's
             // removal; explicit-loss followed by drop must not double-release.
-            let mut states = HashMap::new();
+            let mut states = FxConnMap::default();
             states.insert(ConnectionHandle(1), st);
             states.remove(&ConnectionHandle(1));
             assert_eq!(budget.in_flight(), 0);
@@ -5821,7 +6553,7 @@ mod h3_codec_tests {
             body_budget: Some(budget.clone()),
             ..Default::default()
         };
-        st.requests.insert(id);
+        st.inflight_requests.entry(id).or_default();
         append_request_bytes(
             &mut st,
             id,
@@ -5850,10 +6582,10 @@ mod h3_codec_tests {
             body_budget: Some(budget.clone()),
             ..Default::default()
         };
-        st.requests.insert(id);
+        st.inflight_requests.entry(id).or_default();
         let wire = [0x01, 2, 0, 0, 0x00, 4, 1, 2, 3, 4];
         append_request_bytes(&mut st, id, &wire, H3RequestLimits::new(16, 16)).unwrap();
-        let allocation = st.req_buf[&id].as_ptr();
+        let allocation = st.inflight_requests[&id].buf.as_ptr();
         let taken = take_request_for_dispatch(&mut st, id);
         assert_eq!(
             budget.in_flight(),
@@ -6499,49 +7231,62 @@ mod h3_codec_tests {
     fn reclaim_request_clears_slot_and_buffer() {
         let mut st = H3State::default();
         let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0); // first client bidi stream
-        st.requests.insert(id);
-        st.req_buf.insert(id, b"partial body".to_vec());
-        st.req_frames.insert(
+        st.inflight_requests.insert(
             id,
-            H3FrameCounter {
-                charged: b"partial body".len(),
-                ..Default::default()
+            InflightRequest {
+                buf: b"partial body".to_vec(),
+                frames: H3FrameCounter {
+                    charged: b"partial body".len(),
+                    ..Default::default()
+                },
+                snapshot: Some(H3RequestSnapshot::unscoped(H3RequestConfig::new(
+                    H3RequestLimits::new(16, 16),
+                    None,
+                ))),
+                lease: None,
             },
-        );
-        st.request_snapshots.insert(
-            id,
-            H3RequestSnapshot::unscoped(H3RequestConfig::new(H3RequestLimits::new(16, 16), None)),
         );
         // A second, still-open stream must be untouched.
         let other = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 1);
-        st.requests.insert(other);
-        st.req_buf.insert(other, b"keep".to_vec());
-        st.req_frames.insert(
+        st.inflight_requests.insert(
             other,
-            H3FrameCounter {
-                charged: b"keep".len(),
-                ..Default::default()
+            InflightRequest {
+                buf: b"keep".to_vec(),
+                frames: H3FrameCounter {
+                    charged: b"keep".len(),
+                    ..Default::default()
+                },
+                snapshot: Some(H3RequestSnapshot::unscoped(H3RequestConfig::new(
+                    H3RequestLimits::new(16, 16),
+                    None,
+                ))),
+                lease: None,
             },
-        );
-        st.request_snapshots.insert(
-            other,
-            H3RequestSnapshot::unscoped(H3RequestConfig::new(H3RequestLimits::new(16, 16), None)),
         );
         st.total_req_bytes
             .set(b"partial body".len() + b"keep".len());
 
         let drained = reclaim_request(&mut st, id);
         assert_eq!(drained.as_ref(), b"partial body");
-        assert!(!st.requests.contains(&id), "slot must be removed");
-        assert!(!st.req_buf.contains_key(&id), "buffer must be removed");
-        assert!(!st.request_snapshots.contains_key(&id));
+        assert!(
+            !st.inflight_requests.contains_key(&id),
+            "slot must be removed"
+        );
+        assert!(
+            !st.inflight_requests.contains_key(&id),
+            "buffer must be removed"
+        );
+        assert!(!st.inflight_requests.contains_key(&id));
         // The unrelated open stream is retained.
-        assert!(st.requests.contains(&other));
+        assert!(st.inflight_requests.contains_key(&other));
         assert_eq!(
-            st.req_buf.get(&other).map(|b| b.as_slice()),
+            st.inflight_requests
+                .get(&other)
+                .map(|r| &r.buf)
+                .map(|b| b.as_slice()),
             Some(&b"keep"[..])
         );
-        assert!(st.request_snapshots.contains_key(&other));
+        assert!(st.inflight_requests.contains_key(&other));
         assert_eq!(st.total_req_bytes.get(), b"keep".len());
 
         // Reclaiming an unknown stream is a harmless no-op returning empty.
@@ -6570,7 +7315,12 @@ mod h3_codec_tests {
         let deadline = accepted + Duration::from_secs(10);
         assert_eq!(st.next_request_deadline(), Some(deadline));
         assert_eq!(
-            st.request_snapshots[&id].deadline.map(|key| key.when),
+            st.inflight_requests[&id]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .deadline
+                .map(|key| key.when),
             Some(deadline)
         );
 
@@ -6583,17 +7333,22 @@ mod h3_codec_tests {
         .unwrap();
         // Receiving progress does not slide the acceptance-time deadline.
         assert_eq!(
-            st.request_snapshots[&id].deadline.map(|key| key.when),
+            st.inflight_requests[&id]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .deadline
+                .map(|key| key.when),
             Some(deadline)
         );
         assert!(reclaim_expired_requests(&mut st, deadline - Duration::from_nanos(1)).is_empty());
 
         assert_eq!(reclaim_expired_requests(&mut st, deadline), vec![id]);
-        assert!(!st.requests.contains(&id));
-        assert!(!st.req_buf.contains_key(&id));
-        assert!(!st.req_frames.contains_key(&id));
-        assert!(!st.body_leases.contains_key(&id));
-        assert!(!st.request_snapshots.contains_key(&id));
+        assert!(!st.inflight_requests.contains_key(&id));
+        assert!(!st.inflight_requests.contains_key(&id));
+        assert!(!st.inflight_requests.contains_key(&id));
+        assert!(!st.inflight_requests.contains_key(&id));
+        assert!(!st.inflight_requests.contains_key(&id));
         assert!(st.request_deadlines.is_empty());
         assert_eq!(st.next_request_deadline(), None);
         assert_eq!(st.total_req_bytes.get(), 0);
@@ -6618,13 +7373,23 @@ mod h3_codec_tests {
 
         st.extend_request_deadline(id, floor - 1, accepted + Duration::from_secs(5));
         assert_eq!(
-            st.request_snapshots[&id].deadline.map(|key| key.when),
+            st.inflight_requests[&id]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .deadline
+                .map(|key| key.when),
             Some(accepted + timeout)
         );
         let at = accepted + Duration::from_secs(8);
         st.extend_request_deadline(id, floor, at);
         assert_eq!(
-            st.request_snapshots[&id].deadline.map(|key| key.when),
+            st.inflight_requests[&id]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .deadline
+                .map(|key| key.when),
             Some(at + timeout)
         );
         assert_eq!(st.request_deadlines.len(), 2, "the old node is replaced");
@@ -6666,7 +7431,14 @@ mod h3_codec_tests {
             st.next_request_deadline(),
             Some(now + Duration::from_secs(5))
         );
-        assert_eq!(st.request_snapshots[&disabled].deadline, None);
+        assert_eq!(
+            st.inflight_requests[&disabled]
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .deadline,
+            None
+        );
 
         let _ = take_request_for_dispatch(&mut st, first);
         assert_eq!(
@@ -6675,13 +7447,13 @@ mod h3_codec_tests {
         );
         let _ = take_request_for_dispatch(&mut st, second);
         assert_eq!(st.next_request_deadline(), None);
-        assert!(st.requests.contains(&disabled));
-        assert!(st.request_snapshots.contains_key(&disabled));
+        assert!(st.inflight_requests.contains_key(&disabled));
+        assert!(st.inflight_requests.contains_key(&disabled));
 
         reclaim_buffered_requests(&mut st);
-        assert!(st.requests.is_empty());
+        assert!(st.inflight_requests.is_empty());
         assert!(st.request_deadlines.is_empty());
-        assert!(st.request_snapshots.is_empty());
+        assert!(st.inflight_requests.is_empty());
         assert_eq!(st.next_request_deadline(), None);
     }
 
@@ -6711,7 +7483,7 @@ mod h3_codec_tests {
             assert_eq!(st.next_request_deadline(), expected);
         }
         assert!(st.request_deadlines.is_empty());
-        assert!(st.request_snapshots.is_empty());
+        assert!(st.inflight_requests.is_empty());
     }
 
     #[test]
@@ -6746,7 +7518,7 @@ mod h3_codec_tests {
         assert_eq!(deadlines.ordered.len(), 2, "same deadline is a no-op");
         assert_eq!(deadlines.next(), Some(now));
 
-        let mut affected = std::collections::HashSet::from([packet_affected]);
+        let mut affected = FxConnSet::from_iter([packet_affected]);
         deadlines.extend_due(&mut affected, now);
 
         assert!(affected.contains(&packet_affected));
@@ -6760,9 +7532,9 @@ mod h3_codec_tests {
         // pump returns; the outer loop can therefore select it again.
         deadlines.sync(deadline_due, Some(now));
         assert_eq!(deadlines.next(), Some(now));
-        let mut requeued = std::collections::HashSet::new();
+        let mut requeued = FxConnSet::default();
         deadlines.extend_due(&mut requeued, now);
-        assert_eq!(requeued, std::collections::HashSet::from([deadline_due]));
+        assert_eq!(requeued, FxConnSet::from_iter([deadline_due]));
 
         deadlines.sync(deadline_future, Some(now + Duration::from_secs(2)));
         assert_eq!(deadlines.ordered.len(), 1, "reschedule replaces its node");
@@ -6854,12 +7626,15 @@ mod h3_codec_tests {
         let id = StreamId::new(quinn_proto::Side::Client, Dir::Bi, 0);
         for chunk in [1, 4, usize::MAX] {
             let mut st = H3State::default();
-            st.requests.insert(id);
+            st.inflight_requests.entry(id).or_default();
             for piece in stream.chunks(chunk) {
                 append_request_bytes(&mut st, id, piece, H3RequestLimits::new(64, 64)).unwrap();
             }
-            assert_eq!(st.req_buf[&id], b"first-second", "chunk={chunk}");
-            let allocation = st.req_buf[&id].as_ptr();
+            assert_eq!(
+                st.inflight_requests[&id].buf, b"first-second",
+                "chunk={chunk}"
+            );
+            let allocation = st.inflight_requests[&id].buf.as_ptr();
             let taken = take_request_for_dispatch(&mut st, id);
             assert_eq!(taken.frames.charged, stream.len(), "chunk={chunk}");
             let (parsed, _) = taken.frames.finish(taken.body, None).unwrap();
@@ -7328,8 +8103,8 @@ mod admission_tests {
         /// Exchange datagrams until the server reports the handshake outcome.
         fn drive_handshake(
             &mut self,
-            conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
-            h3: &mut HashMap<ConnectionHandle, H3State>,
+            conns: &mut FxConnMap<quinn_proto::Connection>,
+            h3: &mut FxConnMap<H3State>,
             hd: ConnectionHandle,
             client_handle: ConnectionHandle,
             client: &mut quinn_proto::Connection,
@@ -7386,7 +8161,7 @@ mod admission_tests {
         /// Deliver every datagram the client has queued to the server.
         fn to_server(
             &mut self,
-            conns: &mut HashMap<ConnectionHandle, quinn_proto::Connection>,
+            conns: &mut FxConnMap<quinn_proto::Connection>,
             client: &mut quinn_proto::Connection,
             client_addr: SocketAddr,
             now: Instant,
@@ -7421,8 +8196,8 @@ mod admission_tests {
             let Admission::Accepted(hd, conn, slot) = self.admit(incoming, now) else {
                 panic!("an idle server accepts the connection");
             };
-            let mut conns = HashMap::from([(hd, conn)]);
-            let mut h3 = HashMap::from([(
+            let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
+            let mut h3: FxConnMap<_> = FxHashMap::from_iter([(
                 hd,
                 self.runtime
                     .accepted_state_with_policy(slot, now, 1, &policy),
@@ -7448,8 +8223,8 @@ mod admission_tests {
     }
 
     struct Established {
-        conns: HashMap<ConnectionHandle, quinn_proto::Connection>,
-        h3: HashMap<ConnectionHandle, H3State>,
+        conns: FxConnMap<quinn_proto::Connection>,
+        h3: FxConnMap<H3State>,
         hd: ConnectionHandle,
         client_handle: ConnectionHandle,
         client: quinn_proto::Connection,
@@ -7469,8 +8244,8 @@ mod admission_tests {
         let datagram = Harness::first_datagram(&mut client, now);
 
         let (hd, conn, state) = h.accepted(spoofed(1), &datagram, now);
-        let mut conns = HashMap::from([(hd, conn)]);
-        let mut h3 = HashMap::from([(hd, state)]);
+        let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
+        let mut h3: FxConnMap<_> = [(hd, state)].into_iter().collect();
         service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
         assert!(
             !conns[&hd].is_drained(),
@@ -7484,7 +8259,7 @@ mod admission_tests {
         );
 
         let mut deadlines = ConnectionDeadlineIndex::default();
-        let mut to_drive = std::collections::HashSet::from([hd]);
+        let mut to_drive: FxConnSet = [hd].into_iter().collect();
         reap_connections(
             &mut h.server,
             &mut conns,
@@ -7518,8 +8293,8 @@ mod admission_tests {
         let datagram = Harness::first_datagram(&mut client, now);
 
         let (hd, conn, state) = h.accepted(spoofed(1), &datagram, now);
-        let mut conns = HashMap::from([(hd, conn)]);
-        let mut h3 = HashMap::from([(hd, state)]);
+        let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
+        let mut h3: FxConnMap<_> = [(hd, state)].into_iter().collect();
         service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
         assert!(h3[&hd].discard);
         service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
@@ -7530,7 +8305,7 @@ mod admission_tests {
         );
 
         let mut deadlines = ConnectionDeadlineIndex::default();
-        let mut to_drive = std::collections::HashSet::from([hd]);
+        let mut to_drive: FxConnSet = [hd].into_iter().collect();
         reap_connections(
             &mut h.server,
             &mut conns,
@@ -7556,8 +8331,8 @@ mod admission_tests {
         let (_, mut client) = h.connect(now);
         let datagram = Harness::first_datagram(&mut client, now);
         let (hd, conn, state) = h.accepted(spoofed(2), &datagram, now);
-        let mut conns = HashMap::from([(hd, conn)]);
-        let mut h3 = HashMap::from([(hd, state)]);
+        let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
+        let mut h3: FxConnMap<_> = [(hd, state)].into_iter().collect();
         service_conn(&mut h.server, &mut conns, &mut h3, hd, now, true, config);
         assert_eq!(h.server.open_connections(), 1);
 
@@ -7572,7 +8347,7 @@ mod admission_tests {
             &mut conns,
             &mut h3,
             &mut ConnectionDeadlineIndex::default(),
-            &mut std::collections::HashSet::new(),
+            &mut FxConnSet::default(),
             vec![hd],
         );
         assert!(conns.is_empty());
@@ -7586,10 +8361,10 @@ mod admission_tests {
         let mut h = Harness::new(0);
         let now = Instant::now();
         let config = H3RequestConfig::new(H3RequestLimits::new(1024, 1024), None);
-        let mut conns = HashMap::new();
-        let mut h3 = HashMap::new();
+        let mut conns = FxConnMap::default();
+        let mut h3 = FxConnMap::default();
         let mut deadlines = ConnectionDeadlineIndex::default();
-        let mut to_drive = std::collections::HashSet::new();
+        let mut to_drive = FxConnSet::default();
         let (mut accepted, mut retried) = (0u64, 0u64);
         for i in 0..200u16 {
             let (_, mut client) = h.connect(now);
@@ -7788,14 +8563,14 @@ mod admission_tests {
         let mut metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
         let mut scratch = Vec::new();
         let mut tx_scratch = Vec::new();
-        let mut conns = HashMap::new();
-        let mut states = HashMap::new();
+        let mut conns = FxConnMap::default();
+        let mut states = FxConnMap::default();
         let mut deadlines = ConnectionDeadlineIndex::default();
         let mut epoch = 1;
         let inflight = std::rc::Rc::new(std::cell::Cell::new(1));
         let resumed = std::rc::Rc::new(std::cell::Cell::new(false));
         let (tx, rx) = flume::bounded(1);
-        let mut work = std::collections::HashSet::new();
+        let mut work = FxConnSet::default();
         let mut runtime = crate::uring::build_core_runtime().unwrap();
         runtime.block_on(async {
             let udp = IoUringDatagram::new(UdpSocket::from_std(socket).unwrap()).unwrap();
@@ -7953,7 +8728,7 @@ mod admission_tests {
         let mut epoch = 1;
         let inflight = std::rc::Rc::new(std::cell::Cell::new(0));
         let (tx, rx) = flume::bounded(1);
-        let mut work = std::collections::HashSet::from([e.hd]);
+        let mut work = FxConnSet::from_iter([e.hd]);
         let mut runtime = crate::uring::build_core_runtime().unwrap();
         runtime.block_on(async {
             let udp = IoUringDatagram::new(UdpSocket::from_std(socket).unwrap()).unwrap();
@@ -7982,7 +8757,7 @@ mod admission_tests {
                 &mut work,
             )
             .await;
-            assert_eq!(work, std::collections::HashSet::from([e.hd]));
+            assert_eq!(work, FxConnSet::from_iter([e.hd]));
             assert!(deadlines.next().is_none_or(|deadline| deadline > near));
             pending_work_wait(!work.is_empty()).await;
             pump::<1>(
@@ -8040,11 +8815,11 @@ mod admission_tests {
         let bases: Vec<*const u8> = slots.iter().map(|slot| slot.as_ptr()).collect();
         let mut metas = [quinn_udp::RecvMeta::default(); GRO_BATCH];
         let mut scratch = Vec::new();
-        let mut conns = HashMap::new();
-        let mut h3 = HashMap::new();
+        let mut conns = FxConnMap::default();
+        let mut h3 = FxConnMap::default();
         let mut deadlines = ConnectionDeadlineIndex::default();
         let mut epoch = 0;
-        let mut affected = std::collections::HashSet::new();
+        let mut affected = FxConnSet::default();
         let pending_send = ConnectionHandle(usize::MAX);
         affected.insert(pending_send);
         let mut rt = crate::uring::build_core_runtime().unwrap();
@@ -8437,14 +9212,16 @@ mod admission_tests {
         let conn = e.conns.get_mut(&e.hd).unwrap();
         assert_eq!(receive_request_streams(conn, st, now), vec![ids[3]]);
         assert!(
-            st.req_frames
+            st.inflight_requests
                 .get(&ids[3])
-                .and_then(H3FrameCounter::decoded_head)
+                .and_then(|r| r.frames.decoded_head())
                 .is_some(),
             "the accepted upload carries its decoded head to dispatch"
         );
         for id in &ids[..3] {
-            assert!(!st.requests.contains(id) && !st.req_buf.contains_key(id));
+            assert!(
+                !st.inflight_requests.contains_key(id) && !st.inflight_requests.contains_key(id)
+            );
         }
         assert!(st.pending.is_empty(), "each 413 was written whole");
         h.to_client(conn, e.client_handle, &mut e.client, now);
@@ -8605,7 +9382,7 @@ mod admission_tests {
         assert!(e.h3[&e.hd].pending.is_empty());
         assert_eq!(
             e.h3[&e.hd].response_fins,
-            std::collections::HashSet::from([id])
+            rustc_hash::FxHashSet::from_iter([id])
         );
         (e, id, wire, global)
     }
@@ -8761,7 +9538,7 @@ mod admission_tests {
                 "round {rounds}: a stopped stream was dispatched without a cancellation token"
             );
             let st = &e.h3[&e.hd];
-            assert!(!st.requests.contains(&id) && st.request_cancellations.is_empty());
+            assert!(!st.inflight_requests.contains_key(&id) && st.request_cancellations.is_empty());
             h.to_client(
                 e.conns.get_mut(&e.hd).unwrap(),
                 e.client_handle,
@@ -8884,7 +9661,7 @@ mod admission_tests {
         }
         assert_eq!(close_code, Some(u64::from(H3_EXCESSIVE_LOAD)));
         let st = &e.h3[&e.hd];
-        assert!(st.rejected && st.requests.is_empty() && st.total_req_bytes.get() == 0);
+        assert!(st.rejected && st.inflight_requests.is_empty() && st.total_req_bytes.get() == 0);
     }
 
     #[test]
@@ -8916,7 +9693,7 @@ mod admission_tests {
                 config,
             );
             let st = e.h3.get_mut(&e.hd).unwrap();
-            accepted = st.requests.len();
+            accepted = st.inflight_requests.len();
             let conn = e.conns.get_mut(&e.hd).unwrap();
             assert!(receive_request_streams(conn, st, now).is_empty());
             assert!(st.readable_requests.is_empty());
@@ -8951,9 +9728,13 @@ mod admission_tests {
         assert_eq!(st.readable_requests, vec![target]);
         let conn = e.conns.get_mut(&e.hd).unwrap();
         assert_eq!(receive_request_streams(conn, st, now), vec![target]);
-        assert_eq!(st.req_buf[&target], b"ok");
+        assert_eq!(st.inflight_requests[&target].buf, b"ok");
         assert!(st.readable_requests.is_empty());
-        assert!(st.request_snapshots.values().all(|s| !s.read_queued));
+        assert!(
+            st.inflight_requests
+                .values()
+                .all(|r| r.snapshot.as_ref().is_none_or(|s| !s.read_queued))
+        );
     }
 
     #[test]
@@ -8989,9 +9770,9 @@ mod admission_tests {
         reclaim_request(e.h3.get_mut(&e.hd).unwrap(), request);
         deadlines.sync(e.hd, connection_deadline(&mut e.conns, &e.h3, e.hd));
         assert_eq!(deadlines.next(), quic);
-        let mut due = std::collections::HashSet::new();
+        let mut due = FxConnSet::default();
         deadlines.extend_due(&mut due, quic.unwrap());
-        assert_eq!(due, std::collections::HashSet::from([e.hd]));
+        assert_eq!(due, FxConnSet::from_iter([e.hd]));
 
         e.conns.clear();
         e.h3.clear();
@@ -9070,7 +9851,10 @@ mod admission_tests {
             // stream's initial deadline.
             if accepted.is_none()
                 && let (Some(key), Some(timeout)) = (
-                    st.request_snapshots.get(&id).and_then(|s| s.deadline),
+                    st.inflight_requests
+                        .get(&id)
+                        .and_then(|r| r.snapshot.as_ref())
+                        .and_then(|s| s.deadline),
                     config.timeout,
                 )
             {
@@ -9082,7 +9866,7 @@ mod admission_tests {
             }
             let conn = e.conns.get_mut(&e.hd).unwrap();
             if receive_request_streams(conn, st, now).contains(&id) {
-                let body = st.req_buf.get(&id).map_or(0, Vec::len);
+                let body = st.inflight_requests.get(&id).map_or(0, |r| r.buf.len());
                 return PacedUpload::Finished(since_accept, body);
             }
             h.to_client(conn, e.client_handle, &mut e.client, now);
@@ -9233,8 +10017,8 @@ mod admission_tests {
         let mut h = Harness::new(cap);
         let now = Instant::now();
         let policy = h.policy();
-        let mut conns = HashMap::new();
-        let mut h3 = HashMap::new();
+        let mut conns = FxConnMap::default();
+        let mut h3 = FxConnMap::default();
         let mut clients = Vec::new();
         for i in 0..20u16 {
             let (client_handle, mut client) = h.connect(now);
@@ -9317,8 +10101,8 @@ mod admission_tests {
         let Admission::Accepted(hd, conn, slot) = h.admit(incoming, now) else {
             panic!("accepted");
         };
-        let mut conns = HashMap::from([(hd, conn)]);
-        let mut h3 = HashMap::from([(
+        let mut conns: FxConnMap<_> = [(hd, conn)].into_iter().collect();
+        let mut h3: FxConnMap<_> = FxHashMap::from_iter([(
             hd,
             h.runtime.accepted_state_with_policy(slot, now, 1, &policy),
         )]);
@@ -9413,20 +10197,67 @@ mod admission_tests {
     fn request_stream_admission_caps_live_requests() {
         let mut st = H3State::default();
         for index in 0..u64::from(2 * MAX_CONCURRENT_BIDI_STREAMS - 1) {
-            st.requests
-                .insert(StreamId::new(quinn_proto::Side::Client, Dir::Bi, index));
+            st.inflight_requests
+                .entry(StreamId::new(quinn_proto::Side::Client, Dir::Bi, index))
+                .or_default();
         }
         let mut accepted = 0;
         assert!(admit_request_stream(&st, &mut accepted).is_ok());
-        st.requests.insert(StreamId::new(
-            quinn_proto::Side::Client,
-            Dir::Bi,
-            u64::from(2 * MAX_CONCURRENT_BIDI_STREAMS),
-        ));
+        st.inflight_requests
+            .entry(StreamId::new(
+                quinn_proto::Side::Client,
+                Dir::Bi,
+                u64::from(2 * MAX_CONCURRENT_BIDI_STREAMS),
+            ))
+            .or_default();
         let mut accepted = 0;
         assert_eq!(
             admit_request_stream(&st, &mut accepted).unwrap_err().code,
             H3_EXCESSIVE_LOAD
+        );
+    }
+
+    #[test]
+    fn qpack_static_lookup_matches_table() {
+        // Build the oracle map from QPACK_STATIC and verify every (name, value)
+        // pair (including empty values and non-matching values) matches qpack_static_lookup.
+        let mut oracle: rustc_hash::FxHashMap<&'static str, (u8, Vec<(&'static str, u8)>)> =
+            rustc_hash::FxHashMap::default();
+        for (i, (name, value)) in QPACK_STATIC.iter().enumerate() {
+            let entry = oracle.entry(*name).or_insert((i as u8, Vec::new()));
+            if !value.is_empty() {
+                entry.1.push((*value, i as u8));
+            }
+        }
+        for (name, (name_idx, values)) in &oracle {
+            // Empty value must resolve to NameOnly(name_idx) (never Exact)
+            assert_eq!(
+                qpack_static_lookup(name, b""),
+                QpackStaticMatch::NameOnly(*name_idx),
+                "empty value for {name}"
+            );
+            // Non-matching value must resolve to NameOnly(name_idx)
+            assert_eq!(
+                qpack_static_lookup(name, b"__non_matching__"),
+                QpackStaticMatch::NameOnly(*name_idx),
+                "non-matching value for {name}"
+            );
+            // Every non-empty table value must resolve to Exact(idx)
+            for (val, idx) in values {
+                assert_eq!(
+                    qpack_static_lookup(name, val.as_bytes()),
+                    QpackStaticMatch::Exact(*idx),
+                    "exact ({name}, {val})"
+                );
+            }
+        }
+        assert_eq!(
+            qpack_static_lookup("x-unknown", b"1"),
+            QpackStaticMatch::None
+        );
+        assert_eq!(
+            qpack_static_lookup("x-unknown", b""),
+            QpackStaticMatch::None
         );
     }
 }

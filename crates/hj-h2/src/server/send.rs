@@ -168,6 +168,7 @@ pub(super) fn begin_response(
     outstreams: &mut FxHashMap<u32, OutStream>,
     send_schedule: &mut VecDeque<u32>,
     pending_window: &mut FxHashMap<u32, i64>,
+    send_conn: &mut i64,
     peer: &PeerSettings,
     block_scratch: &mut Vec<u8>,
 ) {
@@ -175,15 +176,14 @@ pub(super) fn begin_response(
     // ResponseCompletion is opt-in (currently OpenTelemetry). The normal
     // production response has no extensions, so avoid a TypeId/hash-table
     // lookup on every H2 response.
-    let mut completion = if head.extensions.is_empty() {
-        None
+    let (mut completion, shared_headers) = if head.extensions.is_empty() {
+        (None, None)
     } else {
-        head.extensions.remove::<hj_core::ResponseCompletion>()
+        (
+            head.extensions.remove::<hj_core::ResponseCompletion>(),
+            head.extensions.remove::<hj_core::SharedHeaders>(),
+        )
     };
-    // §8.2.2: connection-specific ("hop-by-hop") fields are illegal on an h2 response — strip
-    // them before encoding so a backend that emits e.g. `Connection`/`Transfer-Encoding`
-    // (PHP over LSAPI, a proxied upstream) can't produce a malformed frame stream.
-    hj_core::strip_hop_by_hop_response(&mut head.headers);
     let streaming_unknown_len = match &body {
         // A stream keeps its Content-Length only when the body's exact size
         // hint confirms it (a bridged file of known length).
@@ -200,12 +200,32 @@ pub(super) fn begin_response(
         _ => false,
     };
     let body_forbidden = hj_core::response_body_forbidden(is_head, head.status);
-    hj_core::sanitize_h2_h3_body_headers(
-        &mut head.headers,
-        is_head,
-        head.status,
-        streaming_unknown_len,
-    );
+    // Fast-memo hits carry pre-sanitized status-200 GET headers in `SharedHeaders`
+    // so we encode straight from `&Arc<HeaderMap>` without cloning `HeaderMap`.
+    let headers_ref: &http::HeaderMap = if let Some(ref shared) = shared_headers
+        && !body_forbidden
+        && !streaming_unknown_len
+        && head.status == http::StatusCode::OK
+    {
+        &shared.0
+    } else {
+        if let Some(shared) = shared_headers
+            && head.headers.is_empty()
+        {
+            head.headers = (*shared.0).clone();
+        }
+        // §8.2.2: connection-specific ("hop-by-hop") fields are illegal on an h2 response — strip
+        // them before encoding so a backend that emits e.g. `Connection`/`Transfer-Encoding`
+        // (PHP over LSAPI, a proxied upstream) can't produce a malformed frame stream.
+        hj_core::strip_hop_by_hop_response(&mut head.headers);
+        hj_core::sanitize_h2_h3_body_headers(
+            &mut head.headers,
+            is_head,
+            head.status,
+            streaming_unknown_len,
+        );
+        &head.headers
+    };
     // §4.2: every frame we emit for this response (HEADERS/CONTINUATION/DATA) is bounded by the
     // peer's advertised max frame size.
     let mf = (peer.max_frame_size as usize).max(1);
@@ -219,32 +239,23 @@ pub(super) fn begin_response(
     if head.status.is_success() {
         // One scan decides hint-ness per Link value (bit i ⇒ value i is a hint), so the
         // emit loop below doesn't re-scan ~2.5 KB of Link values a second time per
-        // response. >64 Link values (never seen in practice) fall back to a re-check.
+        // response. Single pass avoids a duplicate `get_all(LINK)` probe when absent.
         let mut hints: u64 = 0;
-        for (i, v) in head
-            .headers
-            .get_all(http::header::LINK)
-            .iter()
-            .take(64)
-            .enumerate()
-        {
+        let mut any_hint = false;
+        for (i, v) in headers_ref.get_all(http::header::LINK).iter().enumerate() {
             if is_early_hint_link(v) {
-                hints |= 1 << i;
+                any_hint = true;
+                if i < 64 {
+                    hints |= 1 << i;
+                }
             }
         }
-        let any_hint = hints != 0
-            || head
-                .headers
-                .get_all(http::header::LINK)
-                .iter()
-                .skip(64)
-                .any(is_early_hint_link);
         if any_hint {
             // Encode the interim 103 block into the per-connection scratch (reused; write_field_block
             // copies it into OutQueue.inline before we touch the scratch again for the final block).
             block_scratch.clear();
             enc.encode_header(block_scratch, ":status", "103");
-            for (i, v) in head.headers.get_all(http::header::LINK).iter().enumerate() {
+            for (i, v) in headers_ref.get_all(http::header::LINK).iter().enumerate() {
                 if (i < 64 && hints & (1 << i) != 0) || (i >= 64 && is_early_hint_link(v)) {
                     enc.encode_header(block_scratch, "link", v.as_bytes());
                 }
@@ -253,35 +264,57 @@ pub(super) fn begin_response(
         }
     }
 
-    // Encode the HPACK header block into the per-connection scratch buffer (reused
-    // across responses — capacity stays warm) rather than a fresh Vec per response.
-    // It is fully copied into OutQueue.inline by write_field_block before the next
-    // response touches the scratch, so reuse is safe.
-    block_scratch.clear();
-    enc.encode_header(block_scratch, ":status", head.status.as_str());
-    for (name, value) in head.headers.iter() {
-        // Raw octets, no `to_str`: HPACK strings are byte strings and `HeaderValue`
-        // already forbids NUL/CR/LF (the only octets illegal in an h2 field value), so
-        // the per-byte text validation was pure overhead — the hottest single loop in
-        // the HIT-path CPU profile. Side effect: obs-text (0x80–0xFF) values are now
-        // forwarded instead of silently dropped, matching LSWS/nginx behavior.
-        enc.encode_header(block_scratch, name.as_str(), value.as_bytes());
-    }
-    let block: &[u8] = block_scratch;
+    // Encode the HPACK header block directly into `out.inline` (reserving a 9-byte
+    // FrameHeader prefix and backfilling it in place when the block fits in one frame,
+    // which is 99.99% of responses — zero `block_scratch` memcpy). Oversized blocks
+    // (> peer.max_frame_size) copy out to `block_scratch` and split into CONTINUATIONs.
+    let mut emit_headers = |out: &mut OutQueue, lead_flags: u8| {
+        out.frames(|b| {
+            let hdr_pos = b.len();
+            b.resize(hdr_pos + 9, 0);
+            enc.encode_header(b, ":status", head.status.as_str());
+            for (name, value) in headers_ref.iter() {
+                enc.encode_header(b, name.as_str(), value.as_bytes());
+            }
+            let block_len = b.len() - (hdr_pos + 9);
+            if block_len <= mf {
+                let mut hdr_bytes = [0u8; 9];
+                let len = block_len as u32;
+                hdr_bytes[0] = (len >> 16) as u8;
+                hdr_bytes[1] = (len >> 8) as u8;
+                hdr_bytes[2] = len as u8;
+                hdr_bytes[3] = kind::HEADERS;
+                hdr_bytes[4] = lead_flags | flags::END_HEADERS;
+                let sid_bytes = (stream_id & 0x7fff_ffff).to_be_bytes();
+                hdr_bytes[5..9].copy_from_slice(&sid_bytes);
+                if let Some(slot) = b.get_mut(hdr_pos..hdr_pos + 9) {
+                    slot.copy_from_slice(&hdr_bytes);
+                }
+            } else {
+                block_scratch.clear();
+                if let Some(encoded) = b.get(hdr_pos + 9..) {
+                    block_scratch.extend_from_slice(encoded);
+                }
+                b.truncate(hdr_pos);
+                write_field_block(b, stream_id, lead_flags, block_scratch, mf);
+            }
+        });
+    };
     // Initial send window = the peer's INITIAL_WINDOW_SIZE plus any WINDOW_UPDATE credit
     // that arrived for this stream before we got here (always consume it, even for bodies
     // that need no stream, so the map stays bounded to in-flight streams).
-    let credit = pending_window.remove(&stream_id).unwrap_or(0);
+    let credit = if pending_window.is_empty() {
+        0
+    } else {
+        pending_window.remove(&stream_id).unwrap_or(0)
+    };
     let window = (peer.initial_window + credit).min(i32::MAX as i64);
 
-    let headers_only = |out: &mut OutQueue, completion: Option<hj_core::ResponseCompletion>| {
-        out.frames(|b| write_field_block(b, stream_id, flags::END_STREAM, block, mf));
+    let mut headers_only = |out: &mut OutQueue, completion: Option<hj_core::ResponseCompletion>| {
+        emit_headers(out, flags::END_STREAM);
         if let Some(completion) = completion {
             out.completions.push(completion);
         }
-    };
-    let headers_open = |out: &mut OutQueue| {
-        out.frames(|b| write_field_block(b, stream_id, 0, block, mf));
     };
     let register = |outstreams: &mut FxHashMap<u32, OutStream>,
                     send_schedule: &mut VecDeque<u32>,
@@ -317,7 +350,7 @@ pub(super) fn begin_response(
     match body {
         Body::Empty => headers_only(out, completion.take()),
         Body::Stream(s) => {
-            headers_open(out);
+            emit_headers(out, 0);
             register(
                 outstreams,
                 send_schedule,
@@ -333,7 +366,7 @@ pub(super) fn begin_response(
             if f.len == 0 {
                 headers_only(out, completion.take());
             } else {
-                headers_open(out);
+                emit_headers(out, 0);
                 register(
                     outstreams,
                     send_schedule,
@@ -348,8 +381,32 @@ pub(super) fn begin_response(
             let bytes = body_to_bytes(other); // Body::Full or a cached file — already in memory
             if bytes.is_empty() {
                 headers_only(out, completion.take());
+            } else if outstreams.is_empty()
+                && bytes.len() <= mf
+                && (bytes.len() as i64) <= (*send_conn).min(window)
+            {
+                // Single-frame direct-emit fast path: when no other stream is queued
+                // for round-robin fairness and the entire body fits in one DATA frame
+                // under both connection and stream windows, emit HEADERS + DATA(END_STREAM)
+                // directly without inserting/removing an OutStream or slicing Bytes.
+                let n = bytes.len();
+                emit_headers(out, 0);
+                out.frames(|b| {
+                    FrameHeader {
+                        length: n as u32,
+                        kind: kind::DATA,
+                        flags: flags::END_STREAM,
+                        stream_id,
+                    }
+                    .write(b)
+                });
+                out.body(bytes);
+                *send_conn -= n as i64;
+                if let Some(completion) = completion.take() {
+                    out.completions.push(completion);
+                }
             } else {
-                headers_open(out);
+                emit_headers(out, 0);
                 register(
                     outstreams,
                     send_schedule,
@@ -531,8 +588,11 @@ fn pump_one_frame(
         }
         st.send_blocked = false;
         let n = (allow as usize).min(st.pending.len());
-        let chunk = st.pending.slice(..n);
-        st.pending = st.pending.slice(n..);
+        let chunk = if n == st.pending.len() {
+            std::mem::take(&mut st.pending)
+        } else {
+            st.pending.split_to(n)
+        };
         let last = st.eof && st.pending.is_empty();
         let dflags = if last { flags::END_STREAM } else { 0 };
         out.frames(|b| {
@@ -1022,17 +1082,25 @@ mod tests {
             }
         }
         fn data_stream_ids(out: &OutQueue) -> Vec<u32> {
-            out.segs
-                .iter()
-                .filter_map(|seg| match seg {
-                    super::super::Seg::Inline(offset, len) if *len == FrameHeader::LEN => {
-                        FrameHeader::parse(&out.inline[*offset..*offset + *len])
-                            .filter(|header| header.kind == kind::DATA)
-                            .map(|header| header.stream_id)
+            let mut wire = Vec::new();
+            for seg in &out.segs {
+                match seg {
+                    super::super::Seg::Inline(offset, len) => {
+                        wire.extend_from_slice(&out.inline[*offset..*offset + *len]);
                     }
-                    _ => None,
-                })
-                .collect()
+                    super::super::Seg::Body(b) => wire.extend_from_slice(b),
+                }
+            }
+            let mut ids = Vec::new();
+            let mut pos = 0;
+            while pos + FrameHeader::LEN <= wire.len() {
+                let header = FrameHeader::parse(&wire[pos..pos + FrameHeader::LEN]).unwrap();
+                if header.kind == kind::DATA {
+                    ids.push(header.stream_id);
+                }
+                pos += FrameHeader::LEN + header.length as usize;
+            }
+            ids
         }
 
         let mut streams = FxHashMap::default();

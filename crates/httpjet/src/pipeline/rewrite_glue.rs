@@ -3,6 +3,7 @@
 //! decode/normalize/encode helpers every downstream consumer agrees on.
 
 use std::borrow::Cow;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -139,7 +140,7 @@ pub(crate) struct RewriteOutcomeCache {
     /// lookup never builds the 7-String OutcomeKey; the stored full key verifies
     /// equality on hit (a rare hash collision degrades to a miss / replaces on
     /// insert — an efficiency loss, never wrong content).
-    map: DashMap<u64, OutcomeSlot>,
+    map: DashMap<u64, OutcomeSlot, rustc_hash::FxBuildHasher>,
     ttl: Duration,
     cap: usize,
     /// Approximate entry count for the cap gate — `DashMap::len()` sweeps every
@@ -167,7 +168,7 @@ impl RewriteOutcomeCache {
 
     pub(crate) fn new(ttl: Duration) -> Self {
         RewriteOutcomeCache {
-            map: DashMap::new(),
+            map: DashMap::with_hasher(rustc_hash::FxBuildHasher),
             ttl,
             cap: 65_536,
             count: AtomicUsize::new(0),
@@ -179,7 +180,7 @@ impl RewriteOutcomeCache {
     #[cfg(test)]
     fn with_cap(ttl: Duration, cap: usize) -> Self {
         RewriteOutcomeCache {
-            map: DashMap::new(),
+            map: DashMap::with_hasher(rustc_hash::FxBuildHasher),
             ttl,
             cap,
             count: AtomicUsize::new(0),
@@ -379,40 +380,86 @@ impl dashmap::Equivalent<(u64, String)> for UaKeyRef<'_> {
 }
 
 pub(crate) struct UaClassifyCache {
-    map: DashMap<(u64, String), u64>,
+    map: DashMap<(u64, String), u64, rustc_hash::FxBuildHasher>,
     cap: usize,
     count: AtomicUsize,
+    /// Instance-unique epoch bumped on every `clear()`, keeping the thread-local
+    /// `UA_L1` isolated across cache instances and invalidated on flush.
+    l1_epoch: std::sync::atomic::AtomicU64,
     /// Last cap-triggered wholesale flush — see [`Self::maybe_flush_full`].
     last_flush: std::sync::Mutex<Instant>,
 }
 
 impl UaClassifyCache {
     pub(crate) fn new() -> Self {
+        static NEXT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let base_epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed) << 32;
         UaClassifyCache {
-            map: DashMap::new(),
+            map: DashMap::with_hasher(rustc_hash::FxBuildHasher),
             cap: 65_536,
             count: AtomicUsize::new(0),
+            l1_epoch: std::sync::atomic::AtomicU64::new(base_epoch),
             last_flush: std::sync::Mutex::new(Instant::now()),
         }
     }
 
     /// The memoized bitmap for (`rs`, `ua`), computing + (cap-gated) inserting on miss.
-    /// A hit allocates nothing: the probe borrows the UA.
+    /// A hit allocates nothing: the thread-local L1 cache avoids cross-core `DashMap`
+    /// RwLock ping-pong for repeated UAs on the `fast_memo` hot path.
     pub(crate) fn get_or_compute(&self, rs: &RuleSet, ua: &str) -> u64 {
         if ua.len() > MAX_MEMO_UA_BYTES {
             return rs.ua_cond_signature(ua);
         }
-        if let Some(sig) = self.map.get(&UaKeyRef(rs.id(), ua)) {
-            return *sig;
+        const L1_SLOTS: usize = 256;
+        thread_local! {
+            static UA_L1: std::cell::RefCell<[(u64, u64, String, u64); L1_SLOTS]> =
+                std::cell::RefCell::new(std::array::from_fn(|_| (0, 0, String::new(), 0)));
         }
-        let sig = rs.ua_cond_signature(ua);
-        if self.count.load(Ordering::Relaxed) >= self.cap {
-            self.maybe_flush_full();
+        let rs_id = rs.id();
+        let epoch = self.l1_epoch.load(Ordering::Relaxed);
+        let mut h = rustc_hash::FxHasher::default();
+        rs_id.hash(&mut h);
+        ua.hash(&mut h);
+        let slot_idx = (h.finish() as usize) & (L1_SLOTS - 1);
+        if let Some(sig) = UA_L1.with(|cell| {
+            let Ok(table) = cell.try_borrow() else {
+                return None;
+            };
+            let slot = table.get(slot_idx)?;
+            (slot.0 == epoch && slot.1 == rs_id && slot.2 == ua).then_some(slot.3)
+        }) {
+            return sig;
         }
-        if self.count.load(Ordering::Relaxed) < self.cap
-            && self.map.insert((rs.id(), ua.to_string()), sig).is_none()
-        {
-            self.count.fetch_add(1, Ordering::Relaxed);
+        let (sig, admitted) = if let Some(sig) = self.map.get(&UaKeyRef(rs_id, ua)) {
+            (*sig, true)
+        } else {
+            let sig = rs.ua_cond_signature(ua);
+            if self.count.load(Ordering::Relaxed) >= self.cap {
+                self.maybe_flush_full();
+            }
+            let admitted = if self.count.load(Ordering::Relaxed) < self.cap {
+                if self.map.insert((rs_id, ua.to_string()), sig).is_none() {
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            } else {
+                false
+            };
+            (sig, admitted)
+        };
+        if admitted {
+            let epoch = self.l1_epoch.load(Ordering::Relaxed);
+            UA_L1.with(|cell| {
+                if let Ok(mut table) = cell.try_borrow_mut()
+                    && let Some(slot) = table.get_mut(slot_idx)
+                {
+                    slot.0 = epoch;
+                    slot.1 = rs_id;
+                    slot.2.clear();
+                    slot.2.push_str(ua);
+                    slot.3 = sig;
+                }
+            });
         }
         sig
     }
@@ -439,6 +486,7 @@ impl UaClassifyCache {
     pub(crate) fn clear(&self) {
         self.map.clear();
         self.count.store(0, Ordering::Relaxed);
+        self.l1_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Approximate entry count (metrics gauge).
@@ -649,7 +697,31 @@ pub(super) fn run_rewrite_with_headers(
                 .iter()
                 .any(|(_, ht)| ht.rules.cache_key_vars.contains(&v))
     };
-    let mut key_vars = String::new();
+    thread_local! {
+        static KEY_VARS_SCRATCH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    }
+    let mut key_vars_owned = String::new();
+    KEY_VARS_SCRATCH.with(|cell| {
+        if let Ok(mut s) = cell.try_borrow_mut() {
+            s.clear();
+            std::mem::swap(&mut *s, &mut key_vars_owned);
+        }
+    });
+    struct ReturnKeyVars(String);
+    impl Drop for ReturnKeyVars {
+        fn drop(&mut self) {
+            if self.0.capacity() <= 4096 {
+                let s = std::mem::take(&mut self.0);
+                KEY_VARS_SCRATCH.with(|cell| {
+                    if let Ok(mut slot) = cell.try_borrow_mut() {
+                        *slot = s;
+                    }
+                });
+            }
+        }
+    }
+    let mut key_vars_guard = ReturnKeyVars(key_vars_owned);
+    let key_vars = &mut key_vars_guard.0;
     if uses(CacheKeyVar::UserAgent) {
         // Same extraction the engine's lazy header_lookup performs (get_all +
         // first decodable value), so key and evaluation always agree; the engine
@@ -713,19 +785,41 @@ pub(super) fn run_rewrite_with_headers(
     // Pin the outcome to the rule sets that produced it. A re-parse mints new ids, so
     // an edited access file is seen at once instead of when the entry expires.
     {
-        use std::fmt::Write;
+        #[inline]
+        fn push_hex_u64(out: &mut String, mut v: u64) {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut buf = [0u8; 16];
+            let mut i = 16usize;
+            loop {
+                i -= 1;
+                if let (Some(slot), Some(&ch)) = (buf.get_mut(i), HEX.get((v & 0xf) as usize)) {
+                    *slot = ch;
+                }
+                v >>= 4;
+                if v == 0 {
+                    break;
+                }
+            }
+            if let Some(slice) = buf.get(i..)
+                && let Ok(s) = std::str::from_utf8(slice)
+            {
+                out.push_str(s);
+            }
+        }
         key_vars.push_str("\nr=");
         if let Some(rs) = inline {
-            let _ = write!(key_vars, "{:x};", rs.id());
+            push_hex_u64(key_vars, rs.id());
+            key_vars.push(';');
         }
         for (_, ht) in chain {
-            let _ = write!(key_vars, "{:x};", ht.rules.id());
+            push_hex_u64(key_vars, ht.rules.id());
+            key_vars.push(';');
         }
     }
     // The self-redirect guard reads the Host header's port (#703).
     if let Some(p) = host_header_port(headers) {
-        key_vars.push_str("\nhp=");
-        key_vars.push_str(&p.to_string());
+        use std::fmt::Write;
+        let _ = write!(key_vars, "\nhp={p}");
     }
     // (#313) Borrow every key part for the size guard and the hash-first probe;
     // the owned OutcomeKey is built only on the miss path that inserts.
@@ -768,7 +862,7 @@ pub(super) fn run_rewrite_with_headers(
             && k.host == host_s
             && k.path == path
             && k.query == query
-            && k.key_vars == key_vars
+            && k.key_vars == *key_vars
     }) {
         state
             .metrics
@@ -805,7 +899,7 @@ pub(super) fn run_rewrite_with_headers(
         host: host_s.to_string(),
         path: path.to_string(),
         query: query.to_string(),
-        key_vars,
+        key_vars: key_vars.clone(),
     };
     state
         .rewrite_outcomes
@@ -904,9 +998,34 @@ pub(crate) fn page_cache_header_vary(
     use std::collections::BTreeSet;
     #[cfg(test)]
     HEADER_VARY_CALLS.with(|n| n.set(n.get() + 1));
+    // Zero-alloc pre-check: if neither inline rules nor any `.htaccess` in `chain`
+    // reads any header (or Origin/Accept cache_key_var), return `None` immediately
+    // without allocating `BTreeSet` or `Vec`.
+    let inline = state.inline_rules.get(&ctx.vhost_name);
+    let has_any_header_read = inline.is_some_and(|rs| {
+        !rs.header_reads.is_empty()
+            || rs.cache_key_vars.iter().any(|v| {
+                matches!(
+                    v,
+                    hj_rewrite::CacheKeyVar::Origin | hj_rewrite::CacheKeyVar::Accept
+                )
+            })
+    }) || chain.iter().any(|(_, ht)| {
+        !ht.memo.vary_headers.is_empty()
+            || !ht.rules.header_reads.is_empty()
+            || ht.rules.cache_key_vars.iter().any(|v| {
+                matches!(
+                    v,
+                    hj_rewrite::CacheKeyVar::Origin | hj_rewrite::CacheKeyVar::Accept
+                )
+            })
+    });
+    if !has_any_header_read {
+        return None;
+    }
     let mut names: BTreeSet<&str> = BTreeSet::new();
-    let mut rulesets: Vec<&hj_rewrite::RuleSet> = Vec::new();
-    if let Some(rs) = state.inline_rules.get(&ctx.vhost_name) {
+    let mut rulesets: Vec<&hj_rewrite::RuleSet> = Vec::with_capacity(chain.len() + 1);
+    if let Some(rs) = inline {
         rulesets.push(rs);
     }
     let mut setenv_reads_user_agent = false;
@@ -1016,7 +1135,7 @@ fn rewrite_host<'a>(ctx: &'a ReqCtx, headers: &'a http::HeaderMap) -> Cow<'a, st
     headers
         .get(http::header::HOST)
         .and_then(|h| h.to_str().ok())
-        .map(|h| Cow::Owned(hj_core::host_without_port(h)))
+        .map(hj_core::host_without_port_cow)
         .unwrap_or_else(|| Cow::Borrowed(ctx.vhost_name.as_str()))
 }
 
@@ -1127,13 +1246,13 @@ fn run_rewrite_inner(
     // be evaded by sending two values of the keyed header (the stages would evaluate against
     // different values). (Was `.next_back()` = last value.) A non-ASCII value is decoded
     // lossily (the view lsphp gets), never skipped (#360).
-    let header_lookup = |name: &str| -> Option<String> {
+    let header_lookup = hj_rewrite::header_fn(|name: &str| -> Option<Cow<'_, str>> {
         headers
             .get_all(name)
             .iter()
             .next()
-            .map(|v| hj_core::header_value_lossy(v).into_owned())
-    };
+            .map(hj_core::header_value_lossy)
+    });
     // (#3 / A) Populate the expanded %{} variables from ctx. Only the formatted IPs must
     // own; `method`/`host`/`uri`/`query`/`server_name`/`protocol` are borrowed into the
     // `RewriteInput` (Cow), so the uncacheable hot path builds no per-request Strings for them.
@@ -1610,7 +1729,34 @@ fn is_canonical_abs(path: &str) -> bool {
 /// static handler. The leading slash is always present; the result equals
 /// `resolved_rel_path` for any path that does not end in `/`, and root `/` is
 /// preserved.
+/// Zero-alloc fast path for `normalized_request_path`: returns `Cow::Borrowed` when
+/// `path` is already `"/"` or canonical (with or without a single trailing `'/'`).
+pub(super) fn normalized_request_path_cow(path: &str) -> Cow<'_, str> {
+    if path == "/" || is_canonical_abs(path) {
+        return Cow::Borrowed(path);
+    }
+    if let Some(stem) = path.strip_suffix('/')
+        && is_canonical_abs(stem)
+    {
+        return Cow::Borrowed(path);
+    }
+    Cow::Owned(normalized_request_path_slow(path))
+}
+
+/// Derive `resolved_rel_path` from an ALREADY-normalized request path with zero allocations.
+#[inline]
+pub(super) fn rel_from_normalized(norm: &str) -> &str {
+    match norm.strip_suffix('/') {
+        Some("") | None => norm,
+        Some(stem) => stem,
+    }
+}
+
 pub(super) fn normalized_request_path(path: &str) -> String {
+    normalized_request_path_cow(path).into_owned()
+}
+
+fn normalized_request_path_slow(path: &str) -> String {
     let mut norm = resolved_rel_path(path);
     // Re-attach the trailing slash the collapse dropped, but never produce `//`
     // (root, or a path that already normalized to `/`, stays `/`).

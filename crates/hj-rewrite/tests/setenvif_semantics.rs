@@ -1,6 +1,8 @@
 //! `SetEnvIf` attribute resolution, assignment lists, `!VAR` unsets, the
 //! `BrowserMatch` aliases and enclosing-section scopes (#779 #780 #781).
 
+use std::borrow::Cow;
+
 use hj_rewrite::{
     AccessDecision, AccessSubject, EnvAssignment, HeaderLookup, Htaccess, ReqAttrs, RewriteError,
     RewriteInput, RuleSet, evaluate,
@@ -11,13 +13,14 @@ fn env_for(
     uri: &str,
     header: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
+    let header_cow = hj_rewrite::header_fn(|name: &str| header(name).map(Cow::Owned));
     let attrs = ReqAttrs {
         request_uri: uri,
         method: "GET",
         protocol: "HTTP/1.1",
         remote_addr: "203.0.113.9",
         host: "example.com",
-        header_lookup: Some(HeaderLookup(header)),
+        header_lookup: Some(HeaderLookup(&header_cow)),
         ..Default::default()
     };
     ht.eval_set_env(&attrs).unwrap()
@@ -257,15 +260,16 @@ fn env_with_base(
     header: &dyn Fn(&str) -> Option<String>,
     base: &[(&str, &str)],
 ) -> Vec<(String, String)> {
-    let env = |name: &str| {
+    let header_cow = hj_rewrite::header_fn(|name: &str| header(name).map(Cow::Owned));
+    let env = hj_rewrite::header_fn(|name: &str| {
         base.iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.to_string())
-    };
+            .map(|(_, v)| Cow::Borrowed(*v))
+    });
     let attrs = ReqAttrs {
         request_uri: "/x",
         method: "GET",
-        header_lookup: Some(HeaderLookup(header)),
+        header_lookup: Some(HeaderLookup(&header_cow)),
         env_lookup: Some(HeaderLookup(&env)),
         ..Default::default()
     };

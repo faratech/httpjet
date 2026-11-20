@@ -381,10 +381,26 @@ fn chain_qs_strip(chain: &[Arc<Htaccess>]) -> Vec<QsStrip> {
 /// query), so we skip building it — the common forum hit allocates nothing for the cache key here.
 fn normalized_query_for<'q>(chain: &[Arc<Htaccess>], req_query: &'q str) -> Cow<'q, str> {
     if req_query.is_empty() {
-        Cow::Borrowed("")
-    } else {
-        normalize_query(req_query, &chain_qs_strip(chain))
+        return Cow::Borrowed("");
     }
+    let has_modifiers = chain.iter().any(|h| !h.cache_key_modifiers.is_empty());
+    if !has_modifiers {
+        return Cow::Borrowed(req_query);
+    }
+    // Fast path: check against the chain's borrowed modifiers before allocating `Vec<QsStrip>`.
+    let any_stripped = req_query.split('&').any(|kv| {
+        let name = kv.split_once('=').map_or(kv, |(n, _)| n);
+        chain.iter().any(|h| {
+            h.cache_key_modifiers.iter().any(|m| match m {
+                CacheKeyModifier::StripQs(n) => name == n,
+                CacheKeyModifier::StripQsPrefix(p) => name.starts_with(p.as_str()),
+            })
+        })
+    });
+    if !any_stripped {
+        return Cow::Borrowed(req_query);
+    }
+    normalize_query(req_query, &chain_qs_strip(chain))
 }
 
 fn is_control_header(name: &HeaderName) -> bool {
@@ -858,18 +874,71 @@ fn lookup(
         return CacheOutcome::Bypass;
     }
 
-    // The historic key path; only a URL that may vary (lock-free pre-filter) is extended.
-    let key = configuration_key(state, build_cache_key(ctx, cc, store, &route));
-    let key_hash = hash_key(&key);
-    let resolved_identity: Cow<'_, str>;
-    let (key, key_hash, identity, varied_base) = if !url_vary_may_apply(cc, store, key_hash) {
-        (key, key_hash, cc.identity, None)
+    // The historic key path; build borrowed key components with zero String allocations
+    // on the common warm-hit path, materializing an owned `PageCacheKey` only when
+    // url-vary or a cold background task (variant fill / finalize / retry) needs one.
+    let nq_cow = normalized_query_for(cc.chain, cc.req_query);
+    let base_vary_cow: Cow<'_, str> = match &route {
+        PrivateRoute::Private { owner2, .. } => Cow::Borrowed(owner2.as_str()),
+        _ => match cc.vary_value {
+            Some(v) => Cow::Borrowed(v),
+            None => {
+                let cfg = store.config();
+                Cow::Owned(compute_vary_value_with_defaults(
+                    cc.cookie,
+                    &cfg.vary_cookies,
+                    &cfg.vary_defaults,
+                ))
+            }
+        },
+    };
+    let vary_suffix = request_vary_suffix(cc);
+    let full_vary_cow: Cow<'_, str> = if let Some(epoch) = &state.response_cache_epoch {
+        Cow::Owned(format!(
+            "\0httpjet-config:{epoch}:{}\0{}{}",
+            state.generation, base_vary_cow, vary_suffix
+        ))
+    } else if vary_suffix.is_empty() {
+        base_vary_cow
+    } else if base_vary_cow.is_empty() {
+        Cow::Owned(vary_suffix)
     } else {
-        let Some(r) = resolve_url_vary(ctx, cc, store, &route, key, key_hash) else {
+        let mut s = base_vary_cow.into_owned();
+        s.push_str(&vary_suffix);
+        Cow::Owned(s)
+    };
+    let private_owner = match &route {
+        PrivateRoute::Private { owner, .. } => *owner,
+        _ => 0,
+    };
+    let host_cow = key_host_cow(ctx, cc);
+    let base_key_ref = hj_pagecache::PageCacheKeyRef {
+        vhost_id: vhost_id_hash(&ctx.vhost_name),
+        secure: ctx.is_tls,
+        host: &host_cow,
+        path: cc.req_path,
+        normalized_query: &nq_cow,
+        vary_value: &full_vary_cow,
+        private_owner,
+    };
+    let key_hash = hj_pagecache::key_hash_ref(&base_key_ref);
+    let varied_owned_key: hj_pagecache::PageCacheKey;
+    let resolved_identity: Cow<'_, str>;
+    let (key_ref, key_hash, identity, varied_base) = if !url_vary_may_apply(cc, store, key_hash) {
+        (base_key_ref, key_hash, cc.identity, None)
+    } else {
+        let Some(r) = resolve_url_vary(ctx, cc, store, &route, base_key_ref.to_owned(), key_hash)
+        else {
             return CacheOutcome::Bypass;
         };
         resolved_identity = r.identity;
-        (r.key, r.key_hash, &*resolved_identity, r.varied_base)
+        varied_owned_key = r.key;
+        (
+            varied_owned_key.as_ref(),
+            r.key_hash,
+            &*resolved_identity,
+            r.varied_base,
+        )
     };
     // (W-TinyLFU) Record this cacheable lookup in the admission sketch — true access frequency
     // (hit OR miss), so the store-admission gate can reject one-hit-wonders. Cheap atomic bumps.
@@ -888,8 +957,10 @@ fn lookup(
             .then(|| store.purge_epoch());
     let now = Instant::now();
     let probed = match mode {
-        LookupMode::Full => store.get_entry_hashed(key_hash, &key, identity, now),
-        LookupMode::FastPath => store.get_entry_hashed_uncounted(key_hash, &key, identity, now),
+        LookupMode::Full => store.get_entry_hashed_ref(key_hash, &key_ref, identity, now),
+        LookupMode::FastPath => {
+            store.get_entry_hashed_uncounted_ref(key_hash, &key_ref, identity, now)
+        }
     };
     if let (
         Some(base_hash),
@@ -927,7 +998,7 @@ fn lookup(
             let Some(mut resp) = build_hit_response_with_successor_retry(
                 state,
                 store,
-                &key,
+                &key_ref,
                 identity,
                 &mut e,
                 now,
@@ -1002,7 +1073,7 @@ fn lookup(
                 force_cache_control(resp.headers_mut(), "private, no-store");
                 strip_shared_cdn_cache_directives(resp.headers_mut());
             }
-            maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
+            maybe_spawn_finalize(state, ctx, &key_ref, key_hash, &entry);
             record_fast_path_hit(state, store, mode, key_hash);
             return CacheOutcome::Hit(resp);
         }
@@ -1028,7 +1099,7 @@ fn lookup(
     {
         spawn_variant_fill(
             state,
-            key.clone(),
+            key_ref.to_owned(),
             key_hash,
             entry.clone(),
             accept_encoding,
@@ -1038,7 +1109,7 @@ fn lookup(
     match build_hit_response_with_successor_retry(
         state,
         store,
-        &key,
+        &key_ref,
         identity,
         &mut entry,
         now,
@@ -1072,7 +1143,7 @@ fn lookup(
             }
             // Pin/open the selected stored body before a background recompress can
             // replace and unlink its pathname. The response keeps that inode alive.
-            maybe_spawn_finalize(state, ctx, &key, key_hash, &entry);
+            maybe_spawn_finalize(state, ctx, &key_ref, key_hash, &entry);
             record_fast_path_hit(state, store, mode, key_hash);
             if let Some(purge_epoch) = memo_epoch
                 && method == Method::GET
@@ -1083,7 +1154,7 @@ fn lookup(
                 && matches!(resp.body(), Body::Full(body)
                     if body.len() <= crate::pipeline::fast_memo::MAX_BODY)
                 && let Some(deadline) = response_memo_deadline(entry.stored_at, entry.ttl, now)
-                && let Some(lease) = store.lease_snapshot(&key, &entry)
+                && let Some(lease) = store.lease_snapshot_hashed(key_hash, &entry)
             {
                 resp.extensions_mut().insert(PublicResponseMemo {
                     key_hash,
@@ -1157,10 +1228,28 @@ fn stored_file_body(
 /// then serves the successor without turning a valid cache hit into a backend miss.
 /// Callers validate the lookup snapshot before entering; `valid` applies only to
 /// a successor fetched after the first body-resolution attempt fails.
+trait AsKeyRef {
+    fn as_key_ref(&self) -> hj_pagecache::PageCacheKeyRef<'_>;
+}
+
+impl AsKeyRef for hj_pagecache::PageCacheKey {
+    #[inline]
+    fn as_key_ref(&self) -> hj_pagecache::PageCacheKeyRef<'_> {
+        self.as_ref()
+    }
+}
+
+impl AsKeyRef for hj_pagecache::PageCacheKeyRef<'_> {
+    #[inline]
+    fn as_key_ref(&self) -> hj_pagecache::PageCacheKeyRef<'_> {
+        *self
+    }
+}
+
 fn build_hit_response_with_successor_retry(
     state: &ServerState,
     store: &hj_pagecache::PageStore,
-    key: &hj_pagecache::PageCacheKey,
+    key: &impl AsKeyRef,
     identity: &str,
     entry: &mut Arc<CachedResponse>,
     now: Instant,
@@ -1191,6 +1280,8 @@ fn build_hit_response_with_successor_retry(
 
     // Remove a genuinely broken current version, but never a replacement
     // published after this request obtained its snapshot.
+    let owned_key = key.as_key_ref().to_owned();
+    let key = &owned_key;
     if store.invalidate_entry_if_current(key, entry) {
         store.settle_body_read_failures(snapshot_failures, false);
         return None;
@@ -1322,79 +1413,68 @@ fn spawn_variant_fill(
     let registry = state.page_cache_variant_fill.clone();
     let state = state.clone();
     spawn_guarded(&registry, key_hash, async move {
-        let Some(store) = state.page_cache.as_ref() else {
+        let Some(store) = state.page_cache.clone() else {
             return;
         };
-        // (dedup) Recover the IDENTITY to compress the variant from: resolve the stored-form
-        // body without promoting it into the hot heap tier. This is a background compression
-        // job, not a serve, so populating hot memory here pins bodies that may never be served
-        // in identity form. A dead file just skips the fill.
-        let Some(stored) = store.body_bytes_cold(&entry) else {
-            return;
-        };
-        let body = if entry.dict_gen == 0 {
-            stored
-        } else {
-            let max = usize::try_from(store.config().max_obj_bytes).unwrap_or(usize::MAX);
-            match matching_dict(&state, entry.dict_gen).and_then(|d| d.decode(stored.as_ref(), max))
-            {
-                Some(v) => Bytes::from(v),
-                None => return,
-            }
-        };
-        // The same single-variant precompression the store path used to do eagerly, now deferred
-        // to a proven hit. It runs on the blocking pool; the variant-fill registry already caps
-        // how many run at once. `block_in_place` instead handed this worker's core to another
-        // thread on every fill, so the runtime kept bringing in fresh threads, each starting
-        // with a cold allocator heap and empty per-thread pools.
-        let variants = {
-            let (state, entry, body) = (state.clone(), entry.clone(), body.clone());
+        // Run blocking tmpfs reads (`body_bytes_cold`), full-page zstd dict decode,
+        // variant precompression, and `InMem` round-trip verification together on
+        // the blocking pool so async tokio worker threads never stall on disk/CPU.
+        let (variants, derive_len) = {
+            let (state, store, entry) = (state.clone(), store.clone(), entry.clone());
             match tokio::task::spawn_blocking(move || {
-                hit::precompress_variants(
+                // (dedup) Recover the IDENTITY to compress the variant from: resolve the
+                // stored-form body without promoting it into the hot heap tier.
+                let stored = store.body_bytes_cold(&entry)?;
+                let body = if entry.dict_gen == 0 {
+                    stored
+                } else {
+                    let max = usize::try_from(store.config().max_obj_bytes).unwrap_or(usize::MAX);
+                    let decoded = matching_dict(&state, entry.dict_gen)
+                        .and_then(|d| d.decode(stored.as_ref(), max))?;
+                    Bytes::from(decoded)
+                };
+                let variants = hit::precompress_variants(
                     &state,
                     &entry.headers,
                     &body,
                     accept_encoding,
                     capsule_shell,
                     at_rest_zstd,
-                )
+                );
+                // The store only uses `derive_len` for an InMem body (a file-tier body
+                // keeps its tmpfs identity), so skip the verify decode everywhere else.
+                let derive_len = matches!(entry.body, hj_pagecache::PageBody::InMem(_))
+                    .then(|| {
+                        variants
+                            .iter()
+                            .find_map(|(tok, b)| {
+                                Encoding::from_token(tok).and_then(|e| {
+                                    decode_bytes_sized(
+                                        e,
+                                        b,
+                                        store.config().max_obj_bytes,
+                                        body.len(),
+                                    )
+                                })
+                            })
+                            .filter(|id| id.as_slice() == body.as_ref())
+                            .and(u32::try_from(body.len()).ok())
+                    })
+                    .flatten();
+                Some((variants, derive_len))
             })
             .await
             {
-                Ok(variants) => variants,
-                Err(_) => return,
+                Ok(Some(pair)) => pair,
+                _ => return,
             }
         };
-        // Enrich IN PLACE only if K still holds this exact entry (identity + stored_at). If a
-        // purge or an SWR refresh landed during the compression window, the fill is a NO-OP — so
-        // it can never resurrect a purged entry nor clobber a fresher one. `variants_filled` is
-        // set even when `variants` is empty, so the fill is attempted at most once per entry.
-        // VARIANT-PRIMARY: authorize dropping the redundant identity body iff a stored
-        // variant losslessly round-trips back to it. Verify the EXACT variant
-        // resolve_identity would pick (the first decodable one) reproduces the identity
-        // byte-for-byte — defense against any codec edge case before discarding the only
-        // other copy. `derive_len` carries the identity length for the store's accounting.
         for (token, _) in &variants {
             if let Some(index) = variant_codec_index(token) {
                 state.metrics.pagecache_variant_fills[index]
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        // The store only uses this for an InMem body (a file-tier body keeps its tmpfs
-        // identity), so skip the verify decode everywhere else.
-        let derive_len = matches!(entry.body, hj_pagecache::PageBody::InMem(_))
-            .then(|| {
-                variants
-                    .iter()
-                    .find_map(|(tok, b)| {
-                        Encoding::from_token(tok).and_then(|e| {
-                            decode_bytes_sized(e, b, store.config().max_obj_bytes, body.len())
-                        })
-                    })
-                    .filter(|id| id.as_slice() == body.as_ref())
-                    .and(u32::try_from(body.len()).ok())
-            })
-            .flatten();
         store.fill_variants(&key, &entry.identity, entry.stored_at, variants, derive_len);
     });
 }
@@ -1503,30 +1583,35 @@ fn spawn_finalize(
         task_metrics
             .attempts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let bytes = match body {
-            FinalizeBody::Ready(bytes) => Some(bytes),
-            FinalizeBody::Resident(entry) => store.body_bytes_cold(&entry),
-        };
-        let Some(bytes) = bytes else {
-            task_metrics.skip(DictSkip::BodyMissing, targets.len() as u64);
-            return;
-        };
-        task_metrics
-            .input_bytes
-            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        // On the blocking pool, like the variant fill; the dict-fill registry caps concurrency.
+        // On the blocking pool (including any cold tmpfs read), like the variant fill.
         // Savings gate: a dict-stored body costs a decode on every AE-mismatch hit and on
         // every variant fill, so the swap must buy real RAM. An incompressible body (already-
         // minified JSON blobs, binary-ish payloads) that shrinks <12.5% stays the identity file.
-        let encoded = {
-            let (dict, input) = (dict.clone(), bytes.clone());
-            tokio::task::spawn_blocking(move || dict.encode(&input))
-                .await
-                .ok()
-                .flatten()
+        let (input_len, encoded) = {
+            let (store_bg, dict_bg) = (store.clone(), dict.clone());
+            match tokio::task::spawn_blocking(move || {
+                let bytes = match body {
+                    FinalizeBody::Ready(bytes) => Some(bytes),
+                    FinalizeBody::Resident(entry) => store_bg.body_bytes_cold(&entry),
+                }?;
+                let len = bytes.len();
+                let enc = dict_bg.encode(&bytes);
+                Some((len, enc))
+            })
+            .await
+            {
+                Ok(Some(pair)) => pair,
+                _ => {
+                    task_metrics.skip(DictSkip::BodyMissing, targets.len() as u64);
+                    return;
+                }
+            }
         };
+        task_metrics
+            .input_bytes
+            .fetch_add(input_len as u64, std::sync::atomic::Ordering::Relaxed);
         let compressed = match encoded {
-            Some(c) if c.len() <= bytes.len().saturating_sub(bytes.len() / 8) => Bytes::from(c),
+            Some(c) if c.len() <= input_len.saturating_sub(input_len / 8) => Bytes::from(c),
             _ => {
                 task_metrics.skip(DictSkip::Savings, targets.len() as u64);
                 return;
@@ -1548,7 +1633,7 @@ fn spawn_finalize(
                     .output_bytes
                     .fetch_add(compressed_len, std::sync::atomic::Ordering::Relaxed);
                 task_metrics.saved_bytes.fetch_add(
-                    (bytes.len() as u64).saturating_sub(compressed_len),
+                    (input_len as u64).saturating_sub(compressed_len),
                     std::sync::atomic::Ordering::Relaxed,
                 );
             } else {
@@ -1606,7 +1691,7 @@ fn rate_limit_dict_saturation_warning(last: &std::sync::atomic::AtomicU64, now: 
 fn maybe_spawn_finalize(
     state: &Arc<ServerState>,
     ctx: &ReqCtx,
-    key: &hj_pagecache::PageCacheKey,
+    key: &impl AsKeyRef,
     key_hash: u64,
     entry: &Arc<CachedResponse>,
 ) {
@@ -1620,7 +1705,7 @@ fn maybe_spawn_finalize(
     spawn_finalize(
         state,
         vec![FinalizeTarget {
-            key: key.clone(),
+            key: key.as_key_ref().to_owned(),
             key_hash,
             identity: entry.identity.clone(),
             stored_at: entry.stored_at,
@@ -1837,10 +1922,18 @@ pub(crate) fn cache_alias_host<'a>(
     (!host_foreign && !host.is_empty() && !host.eq_ignore_ascii_case(vhost_name)).then_some(host)
 }
 
+fn key_host_cow<'a>(ctx: &'a ReqCtx, cc: &'a CacheCtx<'_>) -> Cow<'a, str> {
+    let raw =
+        cache_alias_host(&ctx.vhost_name, cc.host, cc.host_foreign).unwrap_or(&ctx.vhost_name);
+    if raw.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(raw.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(raw)
+    }
+}
+
 fn key_host(ctx: &ReqCtx, cc: &CacheCtx<'_>) -> String {
-    cache_alias_host(&ctx.vhost_name, cc.host, cc.host_foreign)
-        .unwrap_or(&ctx.vhost_name)
-        .to_ascii_lowercase()
+    key_host_cow(ctx, cc).into_owned()
 }
 
 pub(crate) fn build_cache_key(
@@ -4289,6 +4382,7 @@ pub async fn cache_store_leading(
                     status,
                     identity: stored_identity.clone(),
                     headers: stored_headers.clone(),
+                    prebuilt_headers: None,
                     body: PageBody::InMem(bytes.clone()),
                     variants: Vec::new(),
                     variants_filled: false,
@@ -4540,6 +4634,7 @@ fn store_admitted(
             status: entry.status,
             identity: entry.identity.clone(),
             headers,
+            prebuilt_headers: None,
             body,
             variants: Vec::new(),
             // Private entries never get the lazy variant fill: per-session
@@ -4932,6 +5027,17 @@ impl http_body::Body for FillReader {
                 frame
             })
         })
+    }
+}
+
+impl Drop for FillReader {
+    fn drop(&mut self) {
+        self.rx.close();
+        while let Ok((_, queued)) = self.rx.try_recv() {
+            if queued > 0 {
+                self.queue.took(queued);
+            }
+        }
     }
 }
 
@@ -6084,6 +6190,7 @@ mod tests {
             status: 200,
             identity: "id".into(),
             headers: Vec::new(),
+            prebuilt_headers: None,
             body: PageBody::InMem(Bytes::from_static(b"tiny")),
             variants: Vec::new(),
             variants_filled: false,
@@ -8285,6 +8392,7 @@ mod tests {
             status: 200,
             identity: "id".into(),
             headers: Vec::new(),
+            prebuilt_headers: None,
             body: PageBody::InMem(Bytes::from_static(b"x")),
             variants: Vec::new(),
             variants_filled: false,
@@ -8829,6 +8937,7 @@ mod tests {
                     CONTENT_TYPE,
                     HeaderValue::from_static("text/html; charset=utf-8")
                 )],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from_static(b"<html>public shell</html>")),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -8907,6 +9016,7 @@ mod tests {
                     CONTENT_TYPE,
                     HeaderValue::from_static("text/html; charset=utf-8")
                 )],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from_static(b"<html>stale public shell</html>")),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -8986,6 +9096,7 @@ mod tests {
                     CONTENT_TYPE,
                     HeaderValue::from_static("text/html; charset=utf-8")
                 )],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from_static(b"<html>ordinary public</html>")),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -9121,6 +9232,7 @@ mod tests {
                     CONTENT_TYPE,
                     HeaderValue::from_static("text/html; charset=utf-8")
                 )],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from_static(b"<html>PRIVATE leak</html>")),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -9353,6 +9465,7 @@ mod tests {
                 status: 200,
                 identity: cc.identity.to_string(),
                 headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from_static(b"stale-body")),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -9413,6 +9526,7 @@ mod tests {
                 status: 404,
                 identity: cc.identity.to_string(),
                 headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/plain"))],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from_static(b"not found")),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -9438,6 +9552,7 @@ mod tests {
             status: 200,
             identity: identity.to_string(),
             headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+            prebuilt_headers: None,
             body: PageBody::InMem(Bytes::from_static(b"stale-body")),
             variants: Vec::new(),
             variants_filled: false,
@@ -9700,6 +9815,7 @@ mod tests {
                 status: 200,
                 identity: identity.to_owned(),
                 headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                prebuilt_headers: None,
                 body: PageBody::InMem(body.clone()),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -9790,6 +9906,7 @@ mod tests {
                 status: 200,
                 identity: identity.to_owned(),
                 headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                prebuilt_headers: None,
                 body: PageBody::InMem(body.clone()),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -9929,6 +10046,7 @@ mod tests {
                 status: 200,
                 identity: identity.to_owned(),
                 headers: vec![(CONTENT_TYPE, HeaderValue::from_static("text/html"))],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from(DICT_CORPUS.repeat(4))),
                 variants: Vec::new(),
                 variants_filled: false,

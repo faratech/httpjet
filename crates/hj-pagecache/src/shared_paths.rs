@@ -62,13 +62,22 @@ pub fn path_has_segment_prefix(path: &str, prefix: &str) -> bool {
 /// parameter name at the start of the query or right after `&`. Name match is exact
 /// and case-sensitive; `paramx=…`, a bare `param` and an empty `param=` do not count:
 /// an empty value selects nothing, so the endpoint answers for its other parameters
-/// (`proxy.php?image=&link=…` is the link proxy, not an image).
+/// (`proxy.php?image=&link=…` is the link proxy, not an image). Uses PHP's last-wins
+/// semantics when `param` appears multiple times (`image=1&image=&link=…` resolves to
+/// empty in PHP `$_GET` and therefore must not match).
 fn query_has_param(query: &str, param: &str) -> bool {
-    query.split('&').any(|kv| {
-        kv.strip_prefix(param)
+    let mut last_value: Option<&str> = None;
+    for kv in query.split('&') {
+        if kv == param {
+            last_value = Some("");
+        } else if let Some(value) = kv
+            .strip_prefix(param)
             .and_then(|rest| rest.strip_prefix('='))
-            .is_some_and(|value| !value.is_empty())
-    })
+        {
+            last_value = Some(value);
+        }
+    }
+    last_value.is_some_and(|value| !value.is_empty())
 }
 
 /// Strictly parse a `--page-cache-shared-paths` spec. Empty/whitespace-only ⇒
@@ -226,6 +235,10 @@ mod tests {
         // So does the link proxy reached with an empty image value.
         assert!(!m.matches("/proxy.php", "image=&link=https%3A%2F%2Fx&hash=abc"));
         assert!(!m.matches("/proxy.php", "image="));
+        // PHP last-wins semantics: a trailing empty or bare `image` overrides an earlier value.
+        assert!(!m.matches("/proxy.php", "image=1&image=&link=https%3A%2F%2Fx"));
+        assert!(!m.matches("/proxy.php", "image=1&image&link=https%3A%2F%2Fx"));
+        assert!(m.matches("/proxy.php", "image=&image=1"));
     }
 
     #[test]

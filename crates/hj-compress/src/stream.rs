@@ -20,8 +20,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use flate2::Compression;
-use flate2::write::GzEncoder;
+use flate2::{Compress as FlateCompress, Compression, Crc, FlushCompress, Status as FlateStatus};
 use hj_core::{BoxError, StreamBody};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
@@ -101,23 +100,135 @@ pub(crate) trait BlockEncoder: Send + Sync {
     fn finish(self: Box<Self>) -> io::Result<Vec<u8>>;
 }
 
-struct GzipEnc(GzEncoder<Vec<u8>>);
+/// Pooled `flate2::Compress` deflate states reused across streamed gzip responses
+/// (avoids allocating + zeroing ~256 KiB of miniz_oxide hash tables per stream).
+static GZIP_STREAM_POOL: Mutex<Vec<(u32, FlateCompress)>> = Mutex::new(Vec::new());
+const GZIP_STREAM_POOL_CAP: usize = 8;
+
+/// Standard 10-byte RFC 1952 gzip header (deflate, no flags, mtime=0, OS=unknown).
+const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+
+fn take_gzip_compress(level: u32) -> FlateCompress {
+    let pooled = {
+        let mut pool = GZIP_STREAM_POOL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        pool.iter()
+            .position(|(l, _)| *l == level)
+            .map(|i| pool.swap_remove(i).1)
+    };
+    if let Some(mut comp) = pooled {
+        comp.reset();
+        return comp;
+    }
+    FlateCompress::new(Compression::new(level), false)
+}
+
+fn return_gzip_compress(level: u32, comp: FlateCompress) {
+    let mut pool = GZIP_STREAM_POOL
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if pool.len() < GZIP_STREAM_POOL_CAP {
+        pool.push((level, comp));
+    }
+}
+
+struct GzipEnc {
+    level: u32,
+    compress: Option<FlateCompress>,
+    crc: Crc,
+    sink: Vec<u8>,
+}
+
+impl GzipEnc {
+    fn new(level: u32) -> Self {
+        let mut sink = Vec::with_capacity(4096);
+        sink.extend_from_slice(&GZIP_HEADER);
+        Self {
+            level,
+            compress: Some(take_gzip_compress(level)),
+            crc: Crc::new(),
+            sink,
+        }
+    }
+
+    fn pump(&mut self, mut input: &[u8], flush: FlushCompress) -> io::Result<()> {
+        let Some(comp) = self.compress.as_mut() else {
+            return Err(io::Error::other("gzip compressor missing"));
+        };
+        loop {
+            let before_in = comp.total_in();
+            let before_out = comp.total_out();
+            // Ensure room for compressed output so compress_vec can make progress.
+            if self.sink.capacity() - self.sink.len() < 1024 {
+                self.sink.reserve(input.len().max(4096));
+            }
+            let status = comp
+                .compress_vec(input, &mut self.sink, flush)
+                .map_err(io::Error::other)?;
+            let consumed = (comp.total_in() - before_in) as usize;
+            let produced = (comp.total_out() - before_out) as usize;
+            input = input.get(consumed..).unwrap_or(&[]);
+            match flush {
+                FlushCompress::None => {
+                    if input.is_empty() && produced == 0 {
+                        break;
+                    }
+                    if input.is_empty() && self.sink.capacity() - self.sink.len() >= 1024 {
+                        break;
+                    }
+                }
+                FlushCompress::Sync => {
+                    if input.is_empty()
+                        && status == FlateStatus::Ok
+                        && self.sink.capacity() - self.sink.len() >= 1024
+                    {
+                        break;
+                    }
+                    if status == FlateStatus::StreamEnd {
+                        break;
+                    }
+                }
+                FlushCompress::Finish => {
+                    if status == FlateStatus::StreamEnd {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GzipEnc {
+    fn drop(&mut self) {
+        if let Some(comp) = self.compress.take() {
+            return_gzip_compress(self.level, comp);
+        }
+    }
+}
+
 impl BlockEncoder for GzipEnc {
     fn write_block(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
-        self.0.write_all(buf)?;
-        self.0.flush()?;
-        Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
+        self.crc.update(buf);
+        self.pump(buf, FlushCompress::Sync)?;
+        Ok(std::mem::replace(&mut self.sink, next_sink(buf.len())))
     }
     fn write_unflushed(&mut self, buf: &[u8]) -> io::Result<Vec<u8>> {
-        self.0.write_all(buf)?;
-        if self.0.get_ref().is_empty() {
+        self.crc.update(buf);
+        self.pump(buf, FlushCompress::None)?;
+        if self.sink.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(std::mem::replace(self.0.get_mut(), next_sink(buf.len())))
+        Ok(std::mem::replace(&mut self.sink, next_sink(buf.len())))
     }
-    fn finish(self: Box<Self>) -> io::Result<Vec<u8>> {
-        let GzipEnc(enc) = *self;
-        enc.finish()
+    fn finish(mut self: Box<Self>) -> io::Result<Vec<u8>> {
+        self.pump(&[], FlushCompress::Finish)?;
+        self.sink.extend_from_slice(&self.crc.sum().to_le_bytes());
+        self.sink
+            .extend_from_slice(&self.crc.amount().to_le_bytes());
+        Ok(std::mem::take(&mut self.sink))
     }
 }
 
@@ -242,10 +353,7 @@ const ENCODE_SLICE: usize = 64 * 1024;
 
 fn block_encoder(enc: Encoding, levels: &Levels) -> Box<dyn BlockEncoder> {
     match enc {
-        Encoding::Gzip => Box::new(GzipEnc(GzEncoder::new(
-            next_sink(SINK_ROOM),
-            Compression::new(levels.gzip),
-        ))),
+        Encoding::Gzip => Box::new(GzipEnc::new(levels.gzip)),
         Encoding::Zstd => Box::new(ZstdEnc {
             writer: ZioWriter::new(
                 next_sink(SINK_ROOM),
@@ -876,9 +984,7 @@ mod tests {
 
             // Reference: the pre-#326 per-frame-flush encoding of the same frames.
             let mut per_frame: Box<dyn BlockEncoder> = match enc {
-                Encoding::Gzip => {
-                    Box::new(GzipEnc(GzEncoder::new(Vec::new(), Compression::new(6))))
-                }
+                Encoding::Gzip => Box::new(GzipEnc::new(6)),
                 Encoding::Zstd => Box::new(ZstdEnc {
                     writer: ZioWriter::new(Vec::new(), RawZstdEncoder::new(3).unwrap()),
                     level: 3,

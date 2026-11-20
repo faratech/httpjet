@@ -76,7 +76,7 @@ impl Reference {
         } else if eq("host") || eq("server_name") {
             Some(Cow::Borrowed(attrs.host))
         } else {
-            attrs.lookup_header(attribute).map(Cow::Owned)
+            attrs.lookup_header(attribute)
         }
     }
 
@@ -257,13 +257,13 @@ fn random_cookie(rng: &mut Rng) -> Option<String> {
     Some(s)
 }
 
-fn lookup_in<'a>(headers: &'a [(&'static str, String)]) -> impl Fn(&str) -> Option<String> + 'a {
-    move |n: &str| {
+fn lookup_in<'a>(headers: &'a [(&'static str, String)]) -> impl crate::HeaderLookupFn + 'a {
+    crate::header_fn(move |n: &str| {
         headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(n))
-            .map(|(_, v)| v.clone())
-    }
+            .map(|(_, v)| Cow::Borrowed(v.as_str()))
+    })
 }
 
 /// Compare new and reference evaluation over `cases` random requests.
@@ -319,11 +319,11 @@ fn differential(text: &str, header_names: &[&'static str], values: &[&str], case
             }
         }
         let base = ENVS[rng.below(ENVS.len())];
-        let env = |name: &str| {
+        let env = crate::header_fn(|name: &str| {
             base.iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.to_string())
-        };
+                .map(|(_, v)| Cow::Borrowed(*v))
+        });
         let lookup = lookup_in(&headers);
         let uri = rng.pick(URIS);
         let attrs = ReqAttrs {
@@ -411,14 +411,15 @@ fn adjacent_identical_rules_share_one_evaluation() {
     assert!(h.set_env_if[1].reuse_prev);
     let header_calls = Cell::new(0);
     let env_calls = Cell::new(0);
-    let header = |_: &str| {
+    let header = crate::header_fn(|_: &str| -> Option<Cow<'_, str>> {
         header_calls.set(header_calls.get() + 1);
         None
-    };
-    let env = |n: &str| {
+    });
+    let env = crate::header_fn(|n: &str| {
         env_calls.set(env_calls.get() + 1);
-        n.eq_ignore_ascii_case("x-foo").then(|| "bar".to_string())
-    };
+        n.eq_ignore_ascii_case("x-foo")
+            .then_some(Cow::Borrowed("bar"))
+    });
     let attrs = ReqAttrs {
         header_lookup: Some(HeaderLookup(&header)),
         env_lookup: Some(HeaderLookup(&env)),
@@ -437,11 +438,12 @@ fn adjacent_identical_rules_share_one_evaluation() {
     // The forum's four Cookie directives copy the Cookie header once.
     let forum = Htaccess::parse(FORUM).unwrap();
     let reads = std::cell::RefCell::new(Vec::new());
-    let cookie = |n: &str| {
+    let cookie = crate::header_fn(|n: &str| {
         reads.borrow_mut().push(n.to_string());
-        n.eq_ignore_ascii_case("cookie")
-            .then(|| "xf_user=1; xf_style_id=51; xf_session_admin=1".to_string())
-    };
+        n.eq_ignore_ascii_case("cookie").then_some(Cow::Borrowed(
+            "xf_user=1; xf_style_id=51; xf_session_admin=1",
+        ))
+    });
     let attrs = ReqAttrs {
         request_uri: "/",
         header_lookup: Some(HeaderLookup(&cookie)),

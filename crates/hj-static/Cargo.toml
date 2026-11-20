@@ -16,6 +16,7 @@ httpdate = { workspace = true }
 async-trait = { workspace = true }
 rustix = { workspace = true }
 dashmap = { workspace = true }
+rustc-hash = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 

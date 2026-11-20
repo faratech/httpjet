@@ -2,6 +2,7 @@
 //! `ctx.env` before the rewrite, evaluate the access decision across the chain,
 //! and fold the chain's `Header` directives into a finished response.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -140,13 +141,13 @@ where
     // find-first) and a non-ASCII value is decoded lossily, never skipped, so SetEnvIf judges
     // the same string lsphp receives (#360); `_`/`-` folding is applied by
     // ReqAttrs::lookup_header before this is called.
-    let header_lookup = |name: &str| -> Option<String> {
+    let header_lookup = hj_rewrite::header_fn(|name: &str| -> Option<Cow<'_, str>> {
         headers
             .get_all(name)
             .iter()
             .next()
-            .map(|v| hj_core::header_value_lossy(v).into_owned())
-    };
+            .map(hj_core::header_value_lossy)
+    });
     // `as_str()` already yields a borrow good for the rest of this fn (method borrows `req`,
     // protocol is `&'static`), so feed ReqAttrs the borrows directly — no per-request String.
     let protocol = ctx.protocol.as_str();
@@ -198,7 +199,7 @@ where
         // assignments of the files before it (#794).
         let assignments = {
             let env = &ctx.env;
-            let env_lookup = |name: &str| setenvif_env_value(env, name);
+            let env_lookup = hj_rewrite::header_fn(|name: &str| setenvif_env_value(env, name));
             let attrs = ReqAttrs {
                 env_lookup: Some(HeaderLookup(&env_lookup)),
                 ..attrs
@@ -238,7 +239,7 @@ fn if_scope_path<'r>(path: &str, rel: &'r str) -> std::borrow::Cow<'r, str> {
 /// pre-seeded for the compression transform (Apache adds `HTTP_*` vars at
 /// handler time, after mod_setenvif), so a rule could otherwise read the raw
 /// Accept-Encoding, which no cache key carries.
-fn setenvif_env_value(env: &[(String, String)], name: &str) -> Option<String> {
+fn setenvif_env_value<'e>(env: &'e [(String, String)], name: &str) -> Option<Cow<'e, str>> {
     let hidden = |k: &str| {
         k.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("HJ_"))
             || k.eq_ignore_ascii_case("HTTP_ACCEPT_ENCODING")
@@ -249,7 +250,7 @@ fn setenvif_env_value(env: &[(String, String)], name: &str) -> Option<String> {
     env.iter()
         .find(|(k, _)| k == name)
         .or_else(|| env.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
-        .map(|(_, v)| v.clone())
+        .map(|(_, v)| Cow::Borrowed(v.as_str()))
 }
 
 /// Whether an `Allow/Deny from env=NAME` variable is set: ASCII-case-insensitive
@@ -321,8 +322,26 @@ pub(super) fn access_denied_for(
 /// normalized (see [`resolved_rel_path`](super::rewrite_glue::resolved_rel_path));
 /// its leading `/` is stripped before joining so the result stays inside `docroot`.
 pub(super) fn access_deny_dir(acl: &hj_acl::AccessControl, docroot: &Path, rel_path: &str) -> bool {
-    let abs = docroot.join(rel_path.trim_start_matches('/'));
-    acl.deny_dir_match(&abs)
+    thread_local! {
+        static DENY_SCRATCH: std::cell::RefCell<std::path::PathBuf> =
+            const { std::cell::RefCell::new(std::path::PathBuf::new()) };
+    }
+    let rel = rel_path.trim_start_matches('/');
+    DENY_SCRATCH.with(|cell| {
+        let Ok(mut buf) = cell.try_borrow_mut() else {
+            return acl.deny_dir_match(&docroot.join(rel));
+        };
+        buf.clear();
+        buf.push(docroot);
+        if !rel.is_empty() {
+            buf.push(rel);
+        }
+        let hit = acl.deny_dir_match(&buf);
+        if buf.capacity() > 4096 {
+            *buf = std::path::PathBuf::new();
+        }
+        hit
+    })
 }
 
 /// (#2/#7) Apply the chain's `Header` directives to a finished response: set /
@@ -358,17 +377,17 @@ pub(super) fn apply_response_headers_for_target(
     }
     if has_headers {
         let status = resp.status().as_u16();
-        let ops = hj_rewrite::chain_prepared_headers(
+        hj_rewrite::for_each_prepared_header(
             chain.iter().map(AsRef::as_ref),
             rel_path,
             target_basename,
             request_path,
             status,
             &ctx.env,
+            |op| {
+                apply_header(resp, op.kind, op.name, &op.value, op.field_value);
+            },
         );
-        for op in &ops {
-            apply_header(resp, op.kind, op.name, &op.value, op.field_value);
-        }
     }
     if has_charset {
         let basename = target_basename.unwrap_or_else(|| rel_path.rsplit('/').next().unwrap_or(""));

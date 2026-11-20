@@ -14,7 +14,6 @@
 //! marker always splits a key unambiguously, and a key that never declared a per-URL vary
 //! carries no marker at all — its bytes are exactly the historic key.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -258,7 +257,7 @@ struct Spec {
     /// [`path_filter_hash`] of the base key (to rebuild the path pre-filter).
     path_hash: u64,
     /// Variant key hash → last use (ms on the map's clock).
-    variants: HashMap<u64, AtomicU64>,
+    variants: hashbrown::HashMap<u64, AtomicU64>,
     /// Newest variant stored under this spec (the boot scan's newest-wins tie-break).
     newest: Instant,
     /// Last store or served hit (ms on the map's clock).
@@ -538,7 +537,7 @@ impl UrlVarySpecs {
                 true
             }
             Entry::Vacant(slot) => {
-                let mut variants = HashMap::new();
+                let mut variants = hashbrown::HashMap::new();
                 variants.insert(variant_hash, AtomicU64::new(now_ms));
                 let mut spec = Spec {
                     names: names.into(),
@@ -654,7 +653,7 @@ impl UrlVarySpecs {
                     return ScanVerdict::Drop;
                 }
                 invalidate(base_hash);
-                let mut variants = HashMap::new();
+                let mut variants = hashbrown::HashMap::new();
                 variants.insert(key_hash, AtomicU64::new(now_ms));
                 let mut spec = Spec {
                     names: names.into(),

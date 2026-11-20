@@ -373,9 +373,11 @@ impl<T> std::ops::Deref for Recycled<T> {
     }
 }
 
-impl<T> std::ops::DerefMut for Recycled<T> {
+impl<T: Unpin> std::ops::DerefMut for Recycled<T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as in `deref`, and `&mut self` makes the access unique.
+        // Requiring `T: Unpin` prevents safe code from moving a pinned `!Unpin`
+        // future out of `Recycled<F>` after `Future::poll`.
         unsafe { self.ptr.as_mut() }
     }
 }

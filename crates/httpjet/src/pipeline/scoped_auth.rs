@@ -442,10 +442,15 @@ fn static_candidates(
         None => (&ctx.vhost.doc_root, rel),
     };
     let lexical = root.join(rel);
-    if path.ends_with('/') && lexical.is_dir() {
+    if path.ends_with('/') && state.stat_cache.tests(&lexical).is_some_and(|t| t.is_dir) {
         for index in effective_index_files(state, ctx, chain) {
             let candidate = lexical.join(index);
-            if hj_static::safe_index_name(index) && candidate.is_file() {
+            if hj_static::safe_index_name(index)
+                && state
+                    .stat_cache
+                    .tests(&candidate)
+                    .is_some_and(|t| t.is_file)
+            {
                 return vec![(format!("{path}{index}"), candidate)];
             }
         }
@@ -489,18 +494,34 @@ pub(super) fn target_has_auth(
     path: &str,
     chain: &[Arc<Htaccess>],
 ) -> (bool, Option<std::time::Instant>) {
-    let policy = target_policy(state, ctx, request, path, chain);
+    // Called on rewritten `cur_path`, whose `<Files>`/`<FilesMatch>` scopes were NOT
+    // evaluated by `access_policy(orig_path)`, so never skip `opened_target_policy`.
+    let policy = target_policy_inner(state, ctx, request, path, chain, false);
     (policy.protected, policy.deadline)
 }
 
 /// [`target_has_auth`] with the memo verdict and the resolved targets. The access
 /// part reads `ctx.client_ip` and `ctx.env`, so call it after both are final.
+/// `orig_env_unchanged` may only be `true` when `path` is `orig_path` AND rewrite
+/// rules did not add/change any `[E=...]` env vars since `access_denied` ran.
 pub(super) fn target_policy(
     state: &ServerState,
     ctx: &ReqCtx,
     request: ResourceRequest<'_>,
     path: &str,
     chain: &[Arc<Htaccess>],
+    orig_env_unchanged: bool,
+) -> TargetPolicy {
+    target_policy_inner(state, ctx, request, path, chain, orig_env_unchanged)
+}
+
+fn target_policy_inner(
+    state: &ServerState,
+    ctx: &ReqCtx,
+    request: ResourceRequest<'_>,
+    path: &str,
+    chain: &[Arc<Htaccess>],
+    orig_already_checked: bool,
 ) -> TargetPolicy {
     let mut policy = TargetPolicy {
         memo_ok: true,
@@ -521,8 +542,16 @@ pub(super) fn target_policy(
     } else {
         static_candidates(state, ctx, path, chain)
     };
+    let req_lexical = orig_already_checked.then(|| {
+        ctx.vhost
+            .doc_root
+            .join(resolved_rel_path(path).trim_start_matches('/'))
+    });
     for (_, lexical) in candidates {
         let opened = opened_target_path(&lexical).ok();
+        let same_as_req = req_lexical
+            .as_ref()
+            .is_some_and(|rl| opened.as_ref() == Some(rl));
         if is_script {
             policy.script = Some(OpenedScript {
                 lexical,
@@ -532,6 +561,12 @@ pub(super) fn target_policy(
         let Some(target) = opened else {
             continue;
         };
+        if same_as_req {
+            // Target inode is the lexical request file itself, whose `.htaccess`
+            // chain was already evaluated by `access_policy`.
+            policy.targets.push(target);
+            continue;
+        }
         let Some(checked) = opened_target_policy(state, ctx, request, &target) else {
             continue;
         };

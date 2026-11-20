@@ -275,7 +275,7 @@ fn code_of(b: u8) -> (u32, u8) {
 }
 
 /// Number of octets `data` would occupy Huffman-encoded (RFC 7541 §5.2 padding).
-pub(crate) fn encoded_len(data: &[u8]) -> usize {
+pub fn encoded_len(data: &[u8]) -> usize {
     let bits: usize = data.iter().map(|&b| code_of(b).1 as usize).sum();
     bits.div_ceil(8)
 }
@@ -291,18 +291,28 @@ pub fn encode(out: &mut Vec<u8>, data: &[u8]) {
 /// kilobytes and repeats on every response) made a per-octet `push` the bulk of HPACK
 /// encode time. A wrong `encoded_len` falls back to encoding octet by octet; it never
 /// panics.
-pub(crate) fn encode_sized(out: &mut Vec<u8>, data: &[u8], encoded_len: usize) {
+pub fn encode_sized(out: &mut Vec<u8>, data: &[u8], encoded_len: usize) {
     let start = out.len();
-    out.resize(start + encoded_len, 0);
-    if !fill(out.get_mut(start..).unwrap_or_default(), data) {
-        out.truncate(start);
+    out.reserve(encoded_len);
+    let filled = if let Some(spare) = out.spare_capacity_mut().get_mut(..encoded_len) {
+        fill_uninit(spare, data)
+    } else {
+        false
+    };
+    if filled {
+        // SAFETY: `fill_uninit` only returns `true` when `dst.is_empty()`, meaning
+        // every byte in `start..start + encoded_len` was initialized.
+        unsafe {
+            out.set_len(start + encoded_len);
+        }
+    } else {
         encode_octets(out, data);
     }
 }
 
 /// Encode `data` into exactly `dst`; `false` when it does not fit exactly.
 #[inline(always)]
-fn fill(mut dst: &mut [u8], data: &[u8]) -> bool {
+fn fill_uninit(mut dst: &mut [std::mem::MaybeUninit<u8>], data: &[u8]) -> bool {
     // At most 31 pending bits plus one code of at most 30: never past 61 bits.
     let mut acc: u64 = 0;
     let mut nbits: u32 = 0;
@@ -315,7 +325,10 @@ fn fill(mut dst: &mut [u8], data: &[u8]) -> bool {
             let Some((word, rest)) = std::mem::take(&mut dst).split_first_chunk_mut::<4>() else {
                 return false;
             };
-            *word = ((acc >> nbits) as u32).to_be_bytes();
+            let bytes = ((acc >> nbits) as u32).to_be_bytes();
+            for (slot, byte) in word.iter_mut().zip(bytes) {
+                slot.write(byte);
+            }
             dst = rest;
         }
     }
@@ -324,7 +337,7 @@ fn fill(mut dst: &mut [u8], data: &[u8]) -> bool {
         let Some((octet, rest)) = std::mem::take(&mut dst).split_first_mut() else {
             return false;
         };
-        *octet = (acc >> nbits) as u8;
+        octet.write((acc >> nbits) as u8);
         dst = rest;
     }
     if nbits > 0 {
@@ -333,7 +346,7 @@ fn fill(mut dst: &mut [u8], data: &[u8]) -> bool {
         let Some((octet, rest)) = std::mem::take(&mut dst).split_first_mut() else {
             return false;
         };
-        *octet = ((acc << pad) | ((1u64 << pad) - 1)) as u8;
+        octet.write(((acc << pad) | ((1u64 << pad) - 1)) as u8);
         dst = rest;
     }
     dst.is_empty()
@@ -458,7 +471,7 @@ pub(crate) fn decode_into(out: &mut Vec<u8>, data: &[u8]) -> Option<()> {
     decode_into_limited(out, data, usize::MAX)
 }
 
-fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) -> Option<()> {
+pub fn decode_into_limited(out: &mut Vec<u8>, data: &[u8], max_output: usize) -> Option<()> {
     out.clear();
     let t = decode_tables();
     let estimate = (data.len().saturating_mul(8) / 5).saturating_add(1);

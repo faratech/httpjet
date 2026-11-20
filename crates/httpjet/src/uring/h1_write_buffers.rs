@@ -4,9 +4,10 @@ use std::io;
 
 use bytes::Bytes;
 
-// Retain ordinary response heads without pinning a large backend header block
-// for the remaining keep-alive lifetime. The iovec allocation is exactly two.
-const RETAIN_HEAD_CAPACITY: usize = 4096;
+// Retain ordinary response heads (including responses with 103 Early Hints +
+// Link preload headers, which commonly run 3-8 KiB) without pinning a giant
+// backend header block for the remaining keep-alive lifetime.
+const RETAIN_HEAD_CAPACITY: usize = 16384;
 
 #[derive(Default)]
 pub(super) struct ResponseBuffers {
@@ -238,6 +239,7 @@ mod tests {
             })),
             status,
             headers,
+            shared_headers: None,
             body: super::super::bridge::BridgeBody::Full(Bytes::from_static(body)),
             bw_rate: None,
         }
@@ -252,25 +254,41 @@ mod tests {
             let mut writer = PartialWriter { interrupt: true, ..Default::default() };
             let mut throttle = None;
             let shutdown = tokio_util::sync::CancellationToken::new();
-            let first = super::super::write_h1_response_reusing(
+            // Small bodies coalesce into `head` without allocating `iovecs`.
+            let small = super::super::write_h1_response_reusing(
                 &mut writer, response(b"body", http::StatusCode::OK, "one", events.clone()),
                 false, true, false, &mut throttle, None, None, &shutdown, &mut cache,
             ).await;
-            assert!(!first.failed && !first.close);
+            assert!(!small.failed && !small.close);
             assert_eq!(writer.wire, b"HTTP/1.1 200 OK\r\nx-test: one\r\ncontent-length: 4\r\nconnection: keep-alive\r\n\r\nbody");
+            assert!(cache.iovecs.is_none(), "small body coalesces into head");
             let head = cache.head.as_ptr();
+
+            // Larger bodies (> 4 KiB combined) use vectored `iovecs` and reuse both allocations.
+            static BODY1: [u8; 4096] = [b'a'; 4096];
+            static BODY2: [u8; 4100] = [b'b'; 4100];
+            writer.wire.clear();
+            let first = super::super::write_h1_response_reusing(
+                &mut writer, response(&BODY1, http::StatusCode::OK, "one", events.clone()),
+                false, true, false, &mut throttle, None, None, &shutdown, &mut cache,
+            ).await;
+            assert!(!first.failed && !first.close);
+            assert!(writer.wire.starts_with(b"HTTP/1.1 200 OK\r\nx-test: one\r\ncontent-length: 4096\r\nconnection: keep-alive\r\n\r\n"));
+            assert!(writer.wire.ends_with(&BODY1));
+            assert_eq!(cache.head.as_ptr(), head);
             let metadata = cache.iovecs.as_ref().unwrap().as_ptr();
             writer.wire.clear();
             let second = super::super::write_h1_response_reusing(
-                &mut writer, response(b"updated", http::StatusCode::NOT_FOUND, "two", events.clone()),
+                &mut writer, response(&BODY2, http::StatusCode::NOT_FOUND, "two", events.clone()),
                 false, true, false, &mut throttle, None, None, &shutdown, &mut cache,
             ).await;
             assert!(!second.failed && !second.close);
-            assert_eq!(writer.wire, b"HTTP/1.1 404 Not Found\r\nx-test: two\r\ncontent-length: 7\r\nconnection: keep-alive\r\n\r\nupdated");
+            assert!(writer.wire.starts_with(b"HTTP/1.1 404 Not Found\r\nx-test: two\r\ncontent-length: 4100\r\nconnection: keep-alive\r\n\r\n"));
+            assert!(writer.wire.ends_with(&BODY2));
             assert_eq!(cache.head.as_ptr(), head);
             assert_eq!(cache.iovecs.as_ref().unwrap().as_ptr(), metadata);
         });
-        assert_eq!(*events.lock().unwrap(), [hj_core::ResponseEnd::Complete; 2]);
+        assert_eq!(*events.lock().unwrap(), [hj_core::ResponseEnd::Complete; 3]);
     }
 
     #[test]

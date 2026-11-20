@@ -221,6 +221,43 @@ pub fn http_date_now_with_sec() -> (u64, HeaderValue) {
     })
 }
 
+/// Coarse wall-clock epoch second for `fast_memo` hits, refreshed at most once every
+/// 50 ms from `SystemTime::now()`, returning `Some(HeaderValue)` ONLY when `sec != prev_sec`.
+/// Avoids both a `CLOCK_REALTIME` vDSO call and a `HeaderValue` atomic clone/drop on
+/// 99.99%+ of `fast_memo` hits while keeping `Date` and access-log timestamps within 50 ms.
+#[inline]
+pub fn http_date_sec_if_changed(
+    now_mono: std::time::Instant,
+    prev_sec: u64,
+) -> (u64, Option<HeaderValue>) {
+    thread_local! {
+        static COARSE_DATE: RefCell<(Option<std::time::Instant>, u64, HeaderValue)> =
+            const { RefCell::new((None, 0, HeaderValue::from_static("Thu, 01 Jan 1970 00:00:00 GMT"))) };
+    }
+    COARSE_DATE.with(|cell| {
+        let mut m = cell.borrow_mut();
+        let stale = m.0.is_none_or(|at| {
+            now_mono.saturating_duration_since(at) >= std::time::Duration::from_millis(50)
+        });
+        if stale {
+            let sys = SystemTime::now();
+            let secs = sys
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            m.0 = Some(now_mono);
+            if m.1 != secs {
+                if let Ok(v) = HeaderValue::from_str(&httpdate::fmt_http_date(sys)) {
+                    m.1 = secs;
+                    m.2 = v;
+                }
+            }
+        }
+        let val = (m.1 != prev_sec).then(|| m.2.clone());
+        (m.1, val)
+    })
+}
+
 pub fn http_date_now() -> HeaderValue {
     http_date_now_with_sec().1
 }
@@ -231,8 +268,18 @@ pub fn http_date_now() -> HeaderValue {
 /// and the io_uring H1 writer do NOT — so every non-hyper serve boundary (the tokio
 /// h2/h3 service boundary AND the io_uring bridge / fast path) must stamp it here. Shared
 /// so the tokio and io_uring transports can't drift on whether `Date` is present.
+/// Shared immutable response headers carried as an extension on `fast_memo` hits
+/// (status-200 GET full bodies with hop-by-hop headers already stripped and `Date`
+/// already stamped) so H1/H2/H3 writers serialize directly from `&Arc<HeaderMap>`
+/// without cloning the full `HeaderMap` on every hit.
+#[derive(Clone, Debug)]
+pub struct SharedHeaders(pub std::sync::Arc<http::HeaderMap>);
+
 #[inline]
 pub fn stamp_date<B>(mut resp: http::Response<B>) -> http::Response<B> {
+    if !resp.extensions().is_empty() && resp.extensions().get::<SharedHeaders>().is_some() {
+        return resp;
+    }
     if !resp.headers().contains_key(http::header::DATE) {
         resp.headers_mut()
             .insert(http::header::DATE, http_date_now());

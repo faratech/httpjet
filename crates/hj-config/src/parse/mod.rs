@@ -476,10 +476,10 @@ fn convert_security(r: Option<RawSecurity>, ctx: &SubstCtx, path: &Path) -> Resu
         .unwrap_or_default();
     let mut access_control = Vec::new();
     if let Some(ac) = r.access_control {
-        if let Some(allow) = ac.allow {
+        for allow in ac.allow.into_iter().chain(ac.allow_list) {
             access_control.extend(parse_access(&allow, true));
         }
-        if let Some(deny) = ac.deny {
+        for deny in ac.deny.into_iter().chain(ac.deny_list) {
             access_control.extend(parse_access(&deny, false));
         }
     }
@@ -1693,8 +1693,9 @@ mod tests {
             file_access_control: None,
             access_deny_dir: None,
             access_control: Some(RawAccessControl {
-                allow: Some("173.245.48.0/20T".into()),
-                deny: Some("5.6.7.0/24T".into()),
+                allow: vec!["173.245.48.0/20T".into()],
+                deny: vec!["5.6.7.0/24T".into()],
+                ..Default::default()
             }),
             cgi_rlimit: None,
             ..Default::default()
@@ -1705,6 +1706,19 @@ mod tests {
         let deny_rule = sec.access_control.iter().find(|r| !r.allow).unwrap();
         assert_eq!(deny_rule.spec, "5.6.7.0/24");
         assert!(!deny_rule.trusted);
+    }
+
+    #[test]
+    fn raw_access_control_parses_allowlist_denylist_and_repeated_tags() {
+        let xml = r#"<accessControl>
+            <denyList>ALL</denyList>
+            <allowList>10.0.0.0/8T</allowList>
+            <allow>192.168.0.0/16</allow>
+        </accessControl>"#;
+        let raw: RawAccessControl = quick_xml::de::from_str(xml).unwrap();
+        assert_eq!(raw.deny_list, vec!["ALL"]);
+        assert_eq!(raw.allow_list, vec!["10.0.0.0/8T"]);
+        assert_eq!(raw.allow, vec!["192.168.0.0/16"]);
     }
 
     #[test]

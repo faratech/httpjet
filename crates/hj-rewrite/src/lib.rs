@@ -66,7 +66,9 @@ pub use cache::HtaccessCache;
 pub use directives::{
     AccessDecision, EnvAssignment, ErrorDoc, HeaderOp, ReqAttrs, chain_response_headers,
 };
-pub use directives::{HeaderOpKind, PreparedHeaderOp, chain_prepared_headers};
+pub use directives::{
+    HeaderOpKind, PreparedHeaderOp, chain_prepared_headers, for_each_prepared_header,
+};
 pub use error::RewriteError;
 pub use htaccess::{
     AccessMatcher, AccessOrder, AccessRule, AccessSubject, CacheDirectives, CacheKeyModifier,
@@ -78,7 +80,9 @@ pub use htaccess::{
 pub use htaccess::{
     AuthPolicy, InvalidAuth, resolve_auth, resolve_auth_for_request, resolve_auth_for_request_paths,
 };
-pub use input::{FileTests, HeaderLookup, RewriteInput, StatSource};
+pub use input::{
+    FileTests, HeaderFn, HeaderLookup, HeaderLookupFn, RewriteInput, StatSource, header_fn,
+};
 pub use rules::{
     CacheKeyVar, RewriteOutcome, RuleSet, evaluate, evaluate_with_engine,
     proxy_authority_substituted,

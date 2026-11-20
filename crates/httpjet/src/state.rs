@@ -259,11 +259,11 @@ pub struct ServerState {
     /// gzip response compression (type-gated).
     pub compress: Arc<Compress>,
     pub buffered_work: Arc<crate::buffered_work::BufferedWork>,
-    /// The post-handler response-transform pipeline, applied in order by
-    /// `pipeline::handle` (cache-small-static → expires → compress → deny-CDN-cache
-    /// → advertise-h3). A new transform plugs in here; built once per generation
-    /// from the fields above (see `build_transforms`).
-    pub transforms: Vec<Arc<dyn hj_core::ResponseTransform>>,
+    /// Host-owned expires transform state; invoked directly by
+    /// `pipeline::apply_response_transforms` alongside the other fixed host
+    /// stages (cache-small-static → expires → sub_filter → compress →
+    /// deny-CDN-cache → advertise-h3) with no `#[async_trait]` `Box::pin`.
+    pub expires_transform: Arc<crate::pipeline::ExpiresTransform>,
     /// Access logger (None if logging could not be set up).
     pub access_log: Option<Arc<AccessLogger>>,
     /// (#248) Per-vhost access loggers for vhosts declaring their OWN
@@ -582,20 +582,20 @@ pub struct Metrics {
     /// `/cache-entries` requests rejected by the debug-render throttle.
     pub cache_entries_throttled: Arc<AtomicU64>,
     /// Rewrite-outcome cache hits (a memoized result skipped full chain evaluation).
-    pub rewrite_outcome_hits: Arc<AtomicU64>,
+    pub rewrite_outcome_hits: Arc<PaddedAtomic>,
     /// Rewrite-outcome cache misses (cacheable chain, evaluated + stored).
-    pub rewrite_outcome_misses: Arc<AtomicU64>,
+    pub rewrite_outcome_misses: Arc<PaddedAtomic>,
     /// Requests whose rewrite chain was not outcome-cacheable (an unkeyable
     /// per-request input — e.g. `%{HTTP_COOKIE}` — poisons the whole chain), or
     /// whose live env seed carried an assumed-empty name. Not counted when the
     /// cache is disabled outright (`--rewrite-outcome-ttl-ms 0`).
-    pub rewrite_outcome_uncacheable: Arc<AtomicU64>,
+    pub rewrite_outcome_uncacheable: Arc<PaddedAtomic>,
     /// XenForo capsule hits served from the dedicated capsule key.
-    pub xf_capsule_hits_dedicated: Arc<AtomicU64>,
+    pub xf_capsule_hits_dedicated: Arc<PaddedAtomic>,
     /// XenForo capsule stale hits served from the dedicated capsule key.
     pub xf_capsule_stale_hits_dedicated: Arc<AtomicU64>,
     /// XenForo capsule hits served from a safe public shell fallback.
-    pub xf_capsule_hits_public_fallback: Arc<AtomicU64>,
+    pub xf_capsule_hits_public_fallback: Arc<PaddedAtomic>,
     /// XenForo capsule stale hits served from a safe public shell fallback.
     pub xf_capsule_stale_hits_public_fallback: Arc<AtomicU64>,
     /// XenForo capsule misses on the dedicated capsule key.
@@ -623,14 +623,14 @@ pub struct Metrics {
     /// with `xf_capsule_hits_guest` this answers "are members actually hitting the capsule, or
     /// falling through to PHP?" — bumped at every capsule serve site alongside the per-source
     /// counters above.
-    pub xf_capsule_hits_member: Arc<AtomicU64>,
+    pub xf_capsule_hits_member: Arc<PaddedAtomic>,
     /// Capsule hits served to a GUEST request (no member candidate cookie).
-    pub xf_capsule_hits_guest: Arc<AtomicU64>,
+    pub xf_capsule_hits_guest: Arc<PaddedAtomic>,
     /// Shell-age summary (Prometheus summary style): the sum of `now - stored_at` (seconds) over
     /// every capsule hit. `…/count` gives the mean served shell age — validates the stale window.
-    pub xf_capsule_shell_age_secs_sum: Arc<AtomicU64>,
+    pub xf_capsule_shell_age_secs_sum: Arc<PaddedAtomic>,
     /// Count of shell-age observations (one per capsule hit); denominator for the age summary.
-    pub xf_capsule_shell_age_secs_count: Arc<AtomicU64>,
+    pub xf_capsule_shell_age_secs_count: Arc<PaddedAtomic>,
     /// Member capsule requests dropped because the deterministic member-canary bucket rejected
     /// them (the member opted in but their sticky bucket is outside the ramp). Makes the ramp
     /// denominator visible; distinct from `xf_capsule_bypass_not_allowed` (other precondition
@@ -1037,40 +1037,20 @@ fn configured_fastcgi_handlers(
     Ok(handlers)
 }
 
-/// Build the post-handler response-transform pipeline in its fixed order. Called from
-/// both `ServerState::new` and `reload` so the two generations stay identical.
-fn build_transforms(
-    static_cache: &Arc<hj_pagecache::PageStore>,
+/// Build the host-owned expires transform state. Called from both
+/// `ServerState::new` and `reload` so the two generations stay identical.
+fn build_expires_transform(
     expires: &Arc<ExpiresRules>,
     expires_enabled: bool,
     vhost_expires: &HashMap<String, Arc<ExpiresRules>>,
     vhost_expires_enabled: &HashMap<String, bool>,
-    compress: &Arc<Compress>,
-    alt_svc: &Option<http::HeaderValue>,
-) -> Vec<Arc<dyn hj_core::ResponseTransform>> {
-    use crate::pipeline::{
-        AltSvcTransform, CacheStaticTransform, DenyRedirectCdnTransform, ExpiresTransform,
-        SubFilterTransform,
-    };
-    vec![
-        Arc::new(CacheStaticTransform {
-            static_cache: static_cache.clone(),
-        }),
-        Arc::new(ExpiresTransform {
-            expires: expires.clone(),
-            expires_enabled,
-            vhost_expires: vhost_expires.clone(),
-            vhost_expires_enabled: vhost_expires_enabled.clone(),
-        }),
-        // (Tier 2) sub_filter runs BEFORE compress so the filtered body is then
-        // compressed by the ordinary transform (nginx's filter order).
-        Arc::new(SubFilterTransform),
-        compress.clone(),
-        Arc::new(DenyRedirectCdnTransform),
-        Arc::new(AltSvcTransform {
-            alt_svc: alt_svc.clone(),
-        }),
-    ]
+) -> Arc<crate::pipeline::ExpiresTransform> {
+    Arc::new(crate::pipeline::ExpiresTransform {
+        expires: expires.clone(),
+        expires_enabled,
+        vhost_expires: vhost_expires.clone(),
+        vhost_expires_enabled: vhost_expires_enabled.clone(),
+    })
 }
 
 /// Per-vhost `<expires>` blocks, resolved the way OLS does: `enableExpires`
@@ -1133,7 +1113,11 @@ impl ServerState {
 
     /// (#248) The access logger for a request served by `vhost_name`: the vhost's
     /// own `<logging><accessLog>` file when it declares one, else the unified log.
+    #[inline]
     pub fn access_logger_for(&self, vhost_name: &str) -> Option<&Arc<AccessLogger>> {
+        if self.vhost_access_logs.is_empty() {
+            return self.access_log.as_ref();
+        }
         self.vhost_access_logs
             .get(vhost_name)
             .map(|v| &v.logger)
@@ -1141,7 +1125,11 @@ impl ServerState {
     }
 
     /// (#248) The vhost's own error-log writer, if its `<logging><log>` declares one.
+    #[inline]
     pub fn vhost_error_logger(&self, vhost_name: &str) -> Option<&Arc<AccessLogger>> {
+        if self.vhost_error_logs.is_empty() {
+            return None;
+        }
         self.vhost_error_logs.get(vhost_name)
     }
 
@@ -1244,14 +1232,11 @@ impl ServerState {
         // Parse Alt-Svc once (unparseable degrades to none) and build the transform pipeline.
         let alt_svc = alt_svc.and_then(|s| http::HeaderValue::from_str(&s).ok());
         let (vhost_expires, vhost_expires_enabled) = build_vhost_expires(&server);
-        let transforms = build_transforms(
-            &static_cache,
+        let expires_transform = build_expires_transform(
             &cd.expires,
             server.expires.enabled,
             &vhost_expires,
             &vhost_expires_enabled,
-            &cd.compress,
-            &alt_svc,
         );
         // Bound on concurrent stale-while-revalidate background renders. Kept small so a
         // burst of stale hits can't starve live traffic of lsphp workers; excess refreshes
@@ -1327,7 +1312,7 @@ impl ServerState {
             geo,
             compress: cd.compress,
             buffered_work: Arc::default(),
-            transforms,
+            expires_transform,
             access_log,
             vhost_access_logs,
             vhost_error_logs,
@@ -1379,15 +1364,12 @@ impl ServerState {
         // Rebuild the transform pipeline from the NEW expires/compress + carried-over
         // static cache/alt_svc, so the reloaded generation behaves identically.
         let (vhost_expires, vhost_expires_enabled) = build_vhost_expires(&server);
-        let transforms = build_transforms(
-            &old.static_cache,
+        let expires_transform = build_expires_transform(
             &cd.expires,
             server.expires.enabled,
             // Per-vhost <expires> is config-derived: a SIGHUP re-reads it live.
             &vhost_expires,
             &vhost_expires_enabled,
-            &cd.compress,
-            &old.alt_svc,
         );
         let proxy = Arc::new(old.proxy.next_generation(configured_proxy_targets(&server)));
         // (#234) The PageStore freezes its `StoreConfig` at BOOT (main.rs builds it
@@ -1477,7 +1459,7 @@ impl ServerState {
             geo,
             compress: cd.compress,
             buffered_work: old.buffered_work.clone(),
-            transforms,
+            expires_transform,
             mtls_required_vhosts: cd.mtls_required_vhosts,
             // ---- runtime half: carried forward (proxy filtered to new config) ----
             lsapi: old.lsapi.clone(),

@@ -1,3 +1,21 @@
+httpjet (0.2.4-1) stable; urgency=medium
+
+  * Transport & framing (H1/H2/H3): stack-local zero-map fast path for
+    single-frame H2 requests, small-body coalescing into inline/head buffers,
+    direct HPACK/QPACK encoding without scratch copies, compile-time QPACK
+    static lookup, single-pass HPACK lookups, and inherited listener TCP
+    socket options.
+  * Fast memo & pipeline: shared Arc<HeaderMap> zero-clone fast_memo egress,
+    50 ms coarse HTTP Date clock cache, single-probe router host resolution,
+    compact ACL bitmask tables with TLS peer cache, and cached static RootDir
+    descriptors with FxHash metadata lookups.
+  * Rewrite, cache, compression & backends: borrowed zero-alloc header/path
+    lookups across .htaccess and rewrite evaluation, pooled plain-zstd and
+    streamed-gzip codecs, borrowed LSAPI CGI builders, and reliability fixes
+    across transport, page cache, rewrite, proxy, and lifecycle paths.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Fri, 20 Nov 2026 23:40:00 +0000
+
 httpjet (0.2.3-1) stable; urgency=medium
 
   * Page cache: a no-Content-Length public miss on a stream-fill vhost goes to

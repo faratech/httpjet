@@ -73,13 +73,43 @@ impl std::fmt::Debug for StatSource<'_> {
     }
 }
 
+/// Trait for lazy request-header / env lookups returning a borrowed or owned
+/// string tied to `&self` so [`HeaderLookup<'a>`] stays covariant in `'a`.
+pub trait HeaderLookupFn {
+    fn get(&self, name: &str) -> Option<Cow<'_, str>>;
+}
+
+/// Adapter that implements [`HeaderLookupFn`] for any closure returning
+/// `Option<Cow<'h, str>>` borrowing from request state of lifetime `'h`.
+pub struct HeaderFn<'h, F>(pub F, pub std::marker::PhantomData<&'h ()>);
+
+impl<'h, F: Fn(&str) -> Option<Cow<'h, str>>> HeaderLookupFn for HeaderFn<'h, F> {
+    #[inline]
+    fn get(&self, name: &str) -> Option<Cow<'_, str>> {
+        (self.0)(name)
+    }
+}
+
+/// Wrap a header/env lookup closure for [`HeaderLookup`].
+#[inline]
+pub fn header_fn<'h, F: Fn(&str) -> Option<Cow<'h, str>>>(f: F) -> HeaderFn<'h, F> {
+    HeaderFn(f, std::marker::PhantomData)
+}
+
 /// Lazy request-header source: given a header name, return its value (the engine
 /// never copies the full header set up front on the hot path). Wrapped in a
 /// newtype so [`RewriteInput`] can keep `#[derive(Debug)]`. The callback MUST
 /// reproduce the eager-path semantics: case-insensitive name match, and on a
 /// duplicate header name the LAST decodable value wins (see `pipeline::do_rewrite`).
 #[derive(Clone, Copy)]
-pub struct HeaderLookup<'a>(pub &'a dyn Fn(&str) -> Option<String>);
+pub struct HeaderLookup<'a>(pub &'a dyn HeaderLookupFn);
+
+impl<'a> HeaderLookup<'a> {
+    #[inline]
+    pub fn get(&self, name: &str) -> Option<Cow<'a, str>> {
+        self.0.get(name)
+    }
+}
 
 impl std::fmt::Debug for HeaderLookup<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -294,7 +324,7 @@ impl<'a> RewriteInput<'a> {
             }
         }
         if let Some(hl) = &self.header_lookup {
-            return (hl.0)(name).map(Cow::Owned);
+            return hl.get(name);
         }
         None
     }

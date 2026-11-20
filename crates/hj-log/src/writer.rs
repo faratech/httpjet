@@ -52,6 +52,11 @@ struct Writer {
     archive_jobs: tokio::task::JoinSet<ArchiveOutcome>,
 }
 
+enum WriteError {
+    Write(io::Error),
+    Roll(io::Error),
+}
+
 impl Writer {
     async fn open(cfg: RollConfig) -> io::Result<Self> {
         Self::open_with_archiver(cfg, Arc::new(gzip_file)).await
@@ -74,9 +79,15 @@ impl Writer {
         })
     }
 
-    async fn write_line(&mut self, line: &str) -> io::Result<()> {
-        self.file.write_all(line.as_bytes()).await?;
-        self.file.write_all(b"\n").await?;
+    async fn write_line(&mut self, line: &str) -> Result<(), WriteError> {
+        self.file
+            .write_all(line.as_bytes())
+            .await
+            .map_err(WriteError::Write)?;
+        self.file
+            .write_all(b"\n")
+            .await
+            .map_err(WriteError::Write)?;
         self.size += line.len() as u64 + 1;
         if self.cfg.rolling_size > 0 && self.size >= self.cfg.rolling_size {
             if let Err(e) = self.roll().await {
@@ -90,21 +101,24 @@ impl Writer {
                 // output accumulates regardless of why the roll failed.
                 let _ = self.reopen().await;
                 self.size = 0;
-                return Err(e);
+                return Err(WriteError::Roll(e));
             }
         }
         Ok(())
     }
 
     /// (#349) Append a pre-rendered block of newline-terminated lines verbatim.
-    async fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.file.write_all(bytes).await?;
+    async fn write_raw(&mut self, bytes: &[u8]) -> Result<(), WriteError> {
+        self.file
+            .write_all(bytes)
+            .await
+            .map_err(WriteError::Write)?;
         self.size += bytes.len() as u64;
         if self.cfg.rolling_size > 0 && self.size >= self.cfg.rolling_size {
             if let Err(e) = self.roll().await {
                 let _ = self.reopen().await;
                 self.size = 0;
-                return Err(e);
+                return Err(WriteError::Roll(e));
             }
         }
         Ok(())
@@ -442,23 +456,37 @@ async fn run_with_archiver(
             }
             if let Some(bytes) = raw_chunk {
                 if let Some(w) = writer.as_mut() {
-                    if let Err(e) = w.write_raw(&bytes).await {
-                        let now = std::time::Instant::now();
-                        if last_write_err.is_none_or(|t| {
-                            now.duration_since(t) >= std::time::Duration::from_secs(5)
-                        }) {
-                            tracing::error!(target: "hj_log", error = %e, "log chunk write failed (rate-limited to 1/5s)");
-                            last_write_err = Some(now);
+                    match w.write_raw(&bytes).await {
+                        Ok(()) => wrote_line = true,
+                        Err(WriteError::Roll(e)) => {
+                            // Bytes were written and `write_raw` already reopened and
+                            // reset `w.size = 0`; do not overwrite `w.size` with the
+                            // on-disk length (`>= rolling_size`).
+                            wrote_line = true;
+                            let now = std::time::Instant::now();
+                            if last_write_err.is_none_or(|t| {
+                                now.duration_since(t) >= std::time::Duration::from_secs(5)
+                            }) {
+                                tracing::error!(target: "hj_log", error = %e, "log roll failed after chunk write (rate-limited to 1/5s)");
+                                last_write_err = Some(now);
+                            }
                         }
-                        let reopen_cfg = w.cfg.clone();
-                        if let Ok(fresh) =
-                            Writer::open_with_archiver(reopen_cfg, w.archiver.clone()).await
-                        {
-                            w.file = fresh.file;
-                            w.size = fresh.size;
+                        Err(WriteError::Write(e)) => {
+                            let now = std::time::Instant::now();
+                            if last_write_err.is_none_or(|t| {
+                                now.duration_since(t) >= std::time::Duration::from_secs(5)
+                            }) {
+                                tracing::error!(target: "hj_log", error = %e, "log chunk write failed (rate-limited to 1/5s)");
+                                last_write_err = Some(now);
+                            }
+                            let reopen_cfg = w.cfg.clone();
+                            if let Ok(fresh) =
+                                Writer::open_with_archiver(reopen_cfg, w.archiver.clone()).await
+                            {
+                                w.file = fresh.file;
+                                w.size = fresh.size;
+                            }
                         }
-                    } else {
-                        wrote_line = true;
                     }
                 }
             }
@@ -466,7 +494,17 @@ async fn run_with_archiver(
                 if let Some(w) = writer.as_mut() {
                     match w.write_line(&line).await {
                         Ok(()) => wrote_line = true,
-                        Err(e) => {
+                        Err(WriteError::Roll(e)) => {
+                            wrote_line = true;
+                            let now = std::time::Instant::now();
+                            if last_write_err.is_none_or(|t| {
+                                now.duration_since(t) >= std::time::Duration::from_secs(5)
+                            }) {
+                                tracing::error!(target: "hj_log", error = %e, "log roll failed after write (rate-limited to 1/5s)");
+                                last_write_err = Some(now);
+                            }
+                        }
+                        Err(WriteError::Write(e)) => {
                             let now = std::time::Instant::now();
                             if last_write_err.is_none_or(|t| {
                                 now.duration_since(t) >= std::time::Duration::from_secs(5)

@@ -70,95 +70,64 @@ pub static TABLE: [(&str, &str); 61] = [
     ("www-authenticate", ""),
 ];
 
-/// 1-based index of an exact `(name, value)` match, if present.
-///
-/// O(1) `match` over the compile-time-constant table (the encoder calls this once
-/// per response header; a 51-header response previously paid 51 × O(61) linear
-/// scans here). Every `(name, value)` pair in [`TABLE`] is unique, so this is
-/// exactly the old `position()` first-match — proven byte-identical to
-/// `find_name_value_linear` by the `fast_lookup_matches_linear_oracle` test.
-pub fn find_name_value(name: &str, value: &[u8]) -> Option<usize> {
-    Some(match (name, value) {
-        (":authority", b"") => 1,
-        (":method", b"GET") => 2,
-        (":method", b"POST") => 3,
-        (":path", b"/") => 4,
-        (":path", b"/index.html") => 5,
-        (":scheme", b"http") => 6,
-        (":scheme", b"https") => 7,
-        (":status", b"200") => 8,
-        (":status", b"204") => 9,
-        (":status", b"206") => 10,
-        (":status", b"304") => 11,
-        (":status", b"400") => 12,
-        (":status", b"404") => 13,
-        (":status", b"500") => 14,
-        ("accept-charset", b"") => 15,
-        ("accept-encoding", b"gzip, deflate") => 16,
-        ("accept-language", b"") => 17,
-        ("accept-ranges", b"") => 18,
-        ("accept", b"") => 19,
-        ("access-control-allow-origin", b"") => 20,
-        ("age", b"") => 21,
-        ("allow", b"") => 22,
-        ("authorization", b"") => 23,
-        ("cache-control", b"") => 24,
-        ("content-disposition", b"") => 25,
-        ("content-encoding", b"") => 26,
-        ("content-language", b"") => 27,
-        ("content-length", b"") => 28,
-        ("content-location", b"") => 29,
-        ("content-range", b"") => 30,
-        ("content-type", b"") => 31,
-        ("cookie", b"") => 32,
-        ("date", b"") => 33,
-        ("etag", b"") => 34,
-        ("expect", b"") => 35,
-        ("expires", b"") => 36,
-        ("from", b"") => 37,
-        ("host", b"") => 38,
-        ("if-match", b"") => 39,
-        ("if-modified-since", b"") => 40,
-        ("if-none-match", b"") => 41,
-        ("if-range", b"") => 42,
-        ("if-unmodified-since", b"") => 43,
-        ("last-modified", b"") => 44,
-        ("link", b"") => 45,
-        ("location", b"") => 46,
-        ("max-forwards", b"") => 47,
-        ("proxy-authenticate", b"") => 48,
-        ("proxy-authorization", b"") => 49,
-        ("range", b"") => 50,
-        ("referer", b"") => 51,
-        ("refresh", b"") => 52,
-        ("retry-after", b"") => 53,
-        ("server", b"") => 54,
-        ("set-cookie", b"") => 55,
-        ("strict-transport-security", b"") => 56,
-        ("transfer-encoding", b"") => 57,
-        ("user-agent", b"") => 58,
-        ("vary", b"") => 59,
-        ("via", b"") => 60,
-        ("www-authenticate", b"") => 61,
-        _ => return None,
-    })
+/// Result of a single-pass static-table lookup for `(name, value)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticMatch {
+    /// Both `name` and `value` matched this 1-based static-table entry.
+    Exact(usize),
+    /// Only `name` matched; carries the first 1-based static-table index for `name`.
+    NameOnly(usize),
+    /// `name` is not in the static table.
+    None,
 }
 
-/// 1-based index of the FIRST entry matching `name` (value ignored), if present.
-/// `name` must already be lowercase (HTTP/2 requires lowercase header names).
-///
-/// O(1) `match` over the 57 distinct names; the 4 duplicated names return their
-/// first table entry (`:method`→2, `:path`→4, `:scheme`→6, `:status`→8), matching
-/// the old `position()`. Proven equal to `find_name_linear` by the equivalence test.
-pub fn find_name(name: &str) -> Option<usize> {
-    Some(match name {
+/// Single-pass static-table lookup returning either an exact `(name, value)` index or
+/// the first `name`-only index in one `match` over `name`.
+#[inline]
+pub fn lookup(name: &str, value: &[u8]) -> StaticMatch {
+    let idx = match name {
         ":authority" => 1,
-        ":method" => 2,
-        ":path" => 4,
-        ":scheme" => 6,
-        ":status" => 8,
+        ":method" => {
+            return match value {
+                b"GET" => StaticMatch::Exact(2),
+                b"POST" => StaticMatch::Exact(3),
+                _ => StaticMatch::NameOnly(2),
+            };
+        }
+        ":path" => {
+            return match value {
+                b"/" => StaticMatch::Exact(4),
+                b"/index.html" => StaticMatch::Exact(5),
+                _ => StaticMatch::NameOnly(4),
+            };
+        }
+        ":scheme" => {
+            return match value {
+                b"http" => StaticMatch::Exact(6),
+                b"https" => StaticMatch::Exact(7),
+                _ => StaticMatch::NameOnly(6),
+            };
+        }
+        ":status" => {
+            return match value {
+                b"200" => StaticMatch::Exact(8),
+                b"204" => StaticMatch::Exact(9),
+                b"206" => StaticMatch::Exact(10),
+                b"304" => StaticMatch::Exact(11),
+                b"400" => StaticMatch::Exact(12),
+                b"404" => StaticMatch::Exact(13),
+                b"500" => StaticMatch::Exact(14),
+                _ => StaticMatch::NameOnly(8),
+            };
+        }
         "accept-charset" => 15,
-        "accept-encoding" => 16,
+        "accept-encoding" => {
+            return if value == b"gzip, deflate" {
+                StaticMatch::Exact(16)
+            } else {
+                StaticMatch::NameOnly(16)
+            };
+        }
         "accept-language" => 17,
         "accept-ranges" => 18,
         "accept" => 19,
@@ -204,8 +173,31 @@ pub fn find_name(name: &str) -> Option<usize> {
         "vary" => 59,
         "via" => 60,
         "www-authenticate" => 61,
-        _ => return None,
-    })
+        _ => return StaticMatch::None,
+    };
+    if value.is_empty() {
+        StaticMatch::Exact(idx)
+    } else {
+        StaticMatch::NameOnly(idx)
+    }
+}
+
+/// 1-based index of an exact `(name, value)` match, if present.
+#[cfg(test)]
+pub fn find_name_value(name: &str, value: &[u8]) -> Option<usize> {
+    match lookup(name, value) {
+        StaticMatch::Exact(idx) => Some(idx),
+        _ => None,
+    }
+}
+
+/// 1-based index of the FIRST entry matching `name` (value ignored), if present.
+#[cfg(test)]
+pub fn find_name(name: &str) -> Option<usize> {
+    match lookup(name, b"\x01") {
+        StaticMatch::Exact(idx) | StaticMatch::NameOnly(idx) => Some(idx),
+        StaticMatch::None => None,
+    }
 }
 
 /// Look up a static-table entry by 1-based index.

@@ -11,7 +11,7 @@
 //! shard is cleared) and a key-length limit.
 
 use std::hash::{BuildHasher, Hasher};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
@@ -21,7 +21,7 @@ const MAX_KEY_BYTES: usize = 1024;
 
 #[derive(Default)]
 pub struct AccessMatchMemo {
-    shards: [Mutex<FxHashMap<Box<str>, Arc<[u16]>>>; SHARDS],
+    shards: [RwLock<FxHashMap<Box<str>, Arc<[u16]>>>; SHARDS],
 }
 
 impl std::fmt::Debug for AccessMatchMemo {
@@ -29,7 +29,7 @@ impl std::fmt::Debug for AccessMatchMemo {
         let entries: usize = self
             .shards
             .iter()
-            .map(|s| s.lock().map_or(0, |m| m.len()))
+            .map(|s| s.read().map_or(0, |m| m.len()))
             .sum();
         f.debug_struct("AccessMatchMemo")
             .field("entries", &entries)
@@ -42,9 +42,69 @@ thread_local! {
 }
 
 impl AccessMatchMemo {
+    /// Visit the ascending indices of the matching rules for this request without
+    /// cloning the `Arc<[u16]>` on memo hits (eliminates cross-core `Arc` refcount
+    /// ping-pong on hot paths like `/index.php`). Returns `false` when the key is
+    /// not memoizable and the caller should scan directly.
+    pub(crate) fn visit_matched(
+        &self,
+        rel_path: &str,
+        request_path: &str,
+        method: &str,
+        rule_count: usize,
+        scan: impl FnOnce() -> Vec<usize>,
+        mut visit: impl FnMut(usize),
+    ) -> bool {
+        if rule_count > usize::from(u16::MAX)
+            || rel_path.len() + request_path.len() + method.len() > MAX_KEY_BYTES
+        {
+            return false;
+        }
+        KEY.with(|k| {
+            let mut key = k.borrow_mut();
+            key.clear();
+            // Length prefixes make the concatenation injective.
+            use std::fmt::Write;
+            let _ = write!(
+                key,
+                "{}:{method}{}:{rel_path}{request_path}",
+                method.len(),
+                rel_path.len()
+            );
+            let mut h = FxBuildHasher.build_hasher();
+            h.write(key.as_bytes());
+            let Some(shard) = self.shards.get((h.finish() as usize) % SHARDS) else {
+                return false;
+            };
+            if let Ok(guard) = shard.read()
+                && let Some(hit) = guard.get(key.as_str())
+            {
+                for &i in hit.iter() {
+                    visit(usize::from(i));
+                }
+                return true;
+            }
+            let indices: Arc<[u16]> = scan()
+                .into_iter()
+                .map(|i| u16::try_from(i).unwrap_or(u16::MAX))
+                .collect();
+            for &i in indices.iter() {
+                visit(usize::from(i));
+            }
+            if let Ok(mut map) = shard.write() {
+                if map.len() >= SHARD_CAP {
+                    map.clear();
+                }
+                map.insert(key.as_str().into(), indices);
+            }
+            true
+        })
+    }
+
     /// The ascending indices of the matching rules for this request, computing them
     /// with `scan` on a miss. `None` (key too long, rule count beyond `u16`) means
     /// "not memoizable": the caller scans directly.
+    #[cfg(test)]
     pub(crate) fn matched(
         &self,
         rel_path: &str,
@@ -72,14 +132,14 @@ impl AccessMatchMemo {
             let mut h = FxBuildHasher.build_hasher();
             h.write(key.as_bytes());
             let shard = self.shards.get((h.finish() as usize) % SHARDS)?;
-            if let Some(hit) = shard.lock().ok()?.get(key.as_str()) {
+            if let Some(hit) = shard.read().ok()?.get(key.as_str()) {
                 return Some(hit.clone());
             }
             let indices: Arc<[u16]> = scan()
                 .into_iter()
                 .map(|i| u16::try_from(i).unwrap_or(u16::MAX))
                 .collect();
-            let mut map = shard.lock().ok()?;
+            let mut map = shard.write().ok()?;
             if map.len() >= SHARD_CAP {
                 map.clear();
             }
@@ -92,7 +152,7 @@ impl AccessMatchMemo {
     pub(crate) fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.lock().map_or(0, |m| m.len()))
+            .map(|s| s.read().map_or(0, |m| m.len()))
             .sum()
     }
 }

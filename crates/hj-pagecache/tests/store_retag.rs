@@ -35,6 +35,7 @@ fn entry(body: &[u8], tags: &[&str]) -> CachedResponse {
         status: 200,
         identity: "id".to_string(),
         headers: Vec::new(),
+        prebuilt_headers: None,
         body: PageBody::InMem(Bytes::copy_from_slice(body)),
         variants: Vec::new(),
         variants_filled: false,

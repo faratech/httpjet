@@ -319,7 +319,16 @@ impl AccessRecord {
     /// newline). Quotes and backslashes inside header values are escaped so a
     /// crafted `User-Agent` cannot break the line structure.
     pub fn render(&self, format: LogFormat) -> String {
-        let reqid = self.request_id.as_deref().map(escape);
+        let escaped_reqid = (format != LogFormat::Json)
+            .then(|| self.request_id.as_deref().map(escape))
+            .flatten();
+        let reqid_disp: Option<&dyn std::fmt::Display> = match format {
+            LogFormat::Json => self
+                .request_id
+                .as_ref()
+                .map(|r| r as &dyn std::fmt::Display),
+            _ => escaped_reqid.as_ref().map(|r| r as &dyn std::fmt::Display),
+        };
         let mut out = Vec::with_capacity(192);
         render_line(
             &mut out,
@@ -337,7 +346,7 @@ impl AccessRecord {
                 user_agent: self.user_agent.as_deref(),
                 host: self.host.as_deref(),
                 remote_user: self.remote_user.as_deref(),
-                request_id: reqid.as_ref().map(|r| r as &dyn std::fmt::Display),
+                request_id: reqid_disp,
                 request_id_u64: None,
                 peer_unix: self.peer_unix,
             },
@@ -492,54 +501,89 @@ struct LineFields<'a> {
 fn render_line(out: &mut Vec<u8>, format: LogFormat, f: &LineFields<'_>) {
     use std::io::Write;
     if format == LogFormat::Json {
-        let jopt = |v: Option<&[u8]>| {
-            v.map(|s| format!("\"{}\"", json_escape_bytes(s)))
-                .unwrap_or_else(|| "null".to_string())
-        };
-        let mut line = String::with_capacity(192);
-        line.push_str("{\"ts\":\"");
-        line.push_str(&json_escape(&fmt::clf_time(f.ts)));
-        line.push_str("\",\"client_ip\":\"");
-        if f.peer_unix {
-            line.push_str("unix:");
-        } else {
-            line.push_str(&json_escape(&f.client_ip.to_string()));
-        }
-        line.push_str("\",\"remote_user\":");
-        line.push_str(&jopt(f.remote_user.map(str::as_bytes)));
-        line.push_str(",\"method\":\"");
-        line.push_str(&json_escape(f.method));
-        line.push_str("\",\"uri\":\"");
-        line.push_str(&json_escape(f.path));
-        if let Some(q) = f.query {
-            line.push('?');
-            line.push_str(&json_escape(q));
-        }
-        line.push_str("\",\"protocol\":\"");
-        line.push_str(&json_escape(f.protocol));
-        line.push_str("\",\"status\":");
-        line.push_str(&f.status.to_string());
-        line.push_str(",\"bytes\":");
-        line.push_str(&f.bytes.to_string());
-        line.push_str(",\"referer\":");
-        line.push_str(&jopt(f.referer));
-        line.push_str(",\"user_agent\":");
-        line.push_str(&jopt(f.user_agent));
-        line.push_str(",\"reqid\":");
-        if let Some(id_u64) = f.request_id_u64 {
-            line.push('"');
-            let mut hex = [0u8; 16];
-            format_hex_u64(id_u64, &mut hex);
-            line.push_str(std::str::from_utf8(&hex).unwrap_or_default());
-            line.push('"');
-        } else {
-            match f.request_id {
-                Some(id) => line.push_str(&format!("\"{}\"", json_escape(&id.to_string()))),
-                None => line.push_str("null"),
+        fn push_json_str(out: &mut Vec<u8>, s: &str) {
+            for c in s.chars() {
+                match c {
+                    '"' => out.extend_from_slice(b"\\\""),
+                    '\\' => out.extend_from_slice(b"\\\\"),
+                    '\n' => out.extend_from_slice(b"\\n"),
+                    '\r' => out.extend_from_slice(b"\\r"),
+                    '\t' => out.extend_from_slice(b"\\t"),
+                    c if (c as u32) < 0x20 => {
+                        let _ = write!(out, "\\u{:04x}", c as u32);
+                    }
+                    c => {
+                        let mut enc = [0u8; 4];
+                        out.extend_from_slice(c.encode_utf8(&mut enc).as_bytes());
+                    }
+                }
             }
         }
-        line.push('}');
-        out.extend_from_slice(line.as_bytes());
+        fn push_json_bytes_opt(out: &mut Vec<u8>, v: Option<&[u8]>) {
+            let Some(bytes) = v else {
+                out.extend_from_slice(b"null");
+                return;
+            };
+            out.push(b'"');
+            for chunk in bytes.utf8_chunks() {
+                push_json_str(out, chunk.valid());
+                for &b in chunk.invalid() {
+                    let _ = write!(out, "\\\\x{b:02x}");
+                }
+            }
+            out.push(b'"');
+        }
+        out.reserve(192);
+        out.extend_from_slice(b"{\"ts\":\"");
+        fmt::clf_time_into(f.ts, out);
+        out.extend_from_slice(b"\",\"client_ip\":\"");
+        if f.peer_unix {
+            out.extend_from_slice(b"unix:");
+        } else {
+            push_ip(out, f.client_ip);
+        }
+        out.extend_from_slice(b"\",\"remote_user\":");
+        push_json_bytes_opt(out, f.remote_user.map(str::as_bytes));
+        out.extend_from_slice(b",\"method\":\"");
+        push_json_str(out, f.method);
+        out.extend_from_slice(b"\",\"uri\":\"");
+        push_json_str(out, f.path);
+        if let Some(q) = f.query {
+            out.push(b'?');
+            push_json_str(out, q);
+        }
+        out.extend_from_slice(b"\",\"protocol\":\"");
+        push_json_str(out, f.protocol);
+        out.extend_from_slice(b"\",\"status\":");
+        push_decimal(out, u64::from(f.status));
+        out.extend_from_slice(b",\"bytes\":");
+        push_decimal(out, f.bytes);
+        out.extend_from_slice(b",\"referer\":");
+        push_json_bytes_opt(out, f.referer);
+        out.extend_from_slice(b",\"user_agent\":");
+        push_json_bytes_opt(out, f.user_agent);
+        out.extend_from_slice(b",\"reqid\":");
+        if let Some(id_u64) = f.request_id_u64 {
+            out.push(b'"');
+            let mut hex = [0u8; 16];
+            format_hex_u64(id_u64, &mut hex);
+            out.extend_from_slice(&hex);
+            out.push(b'"');
+        } else if let Some(id) = f.request_id {
+            struct JsonEsc<'a>(&'a mut Vec<u8>);
+            impl std::fmt::Write for JsonEsc<'_> {
+                fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                    push_json_str(self.0, s);
+                    Ok(())
+                }
+            }
+            out.push(b'"');
+            let _ = std::fmt::write(&mut JsonEsc(out), format_args!("{id}"));
+            out.push(b'"');
+        } else {
+            out.extend_from_slice(b"null");
+        }
+        out.push(b'}');
         return;
     }
     // Fields are appended as bytes rather than through core::fmt, which runs
@@ -685,6 +729,17 @@ fn push_quoted_bytes(out: &mut Vec<u8>, v: Option<&[u8]>) {
 /// well-behaved headers), allocating only when a special char is present. `render`
 /// now runs on the writer task (see [`AccessLogger::log`]), so this saves work on
 /// the writer rather than the request path, but the borrow-on-clean-input win stands.
+#[inline]
+fn push_hex_escape(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hi = HEX.get((byte >> 4) as usize).copied().unwrap_or(b'0');
+    let lo = HEX.get((byte & 0x0f) as usize).copied().unwrap_or(b'0');
+    let buf = [b'\\', b'x', hi, lo];
+    if let Ok(s) = std::str::from_utf8(&buf) {
+        out.push_str(s);
+    }
+}
+
 fn escape(s: &str) -> Cow<'_, str> {
     let needs = s
         .bytes()
@@ -700,9 +755,9 @@ fn escape(s: &str) -> Cow<'_, str> {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if (c as u32) < 0x20 => push_hex_escape(&mut out, c as u8),
             c if (c as u32) == 0x7f || (0x80..=0x9f).contains(&(c as u32)) => {
-                out.push_str(&format!("\\x{:02x}", c as u32))
+                push_hex_escape(&mut out, c as u8)
             }
             c => out.push(c),
         }
@@ -729,25 +784,11 @@ fn escape_bytes(s: &[u8]) -> Cow<'_, str> {
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
-            b if !(0x20..0x7f).contains(&b) => out.push_str(&format!("\\x{b:02x}")),
+            b if !(0x20..0x7f).contains(&b) => push_hex_escape(&mut out, b),
             b => out.push(char::from(b)),
         }
     }
     Cow::Owned(out)
-}
-
-/// JSON string body for raw header bytes: valid UTF-8 is escaped as
-/// [`json_escape`] does; each byte of an invalid sequence becomes the literal
-/// text `\xNN` (JSON-encoded as `\\xNN`).
-fn json_escape_bytes(s: &[u8]) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for chunk in s.utf8_chunks() {
-        out.push_str(&json_escape(chunk.valid()));
-        for b in chunk.invalid() {
-            out.push_str(&format!("\\\\x{b:02x}"));
-        }
-    }
-    out
 }
 
 /// Messages on the writer control channel.
@@ -1625,6 +1666,17 @@ mod tests {
         assert!(
             r.render(LogFormat::Json)
                 .contains("\"remote_user\":\"bob \\\"x\\\" caf\u{e9}\"")
+        );
+    }
+
+    #[test]
+    fn json_request_id_is_escaped() {
+        let mut r = sample();
+        r.request_id = Some("id\"\\line\nnext".into());
+        let json = r.render(LogFormat::Json);
+        assert!(
+            json.contains(r#""reqid":"id\"\\line\nnext""#),
+            "request_id must be JSON-escaped, got: {json}"
         );
     }
 }

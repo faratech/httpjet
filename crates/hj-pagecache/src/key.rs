@@ -56,7 +56,60 @@ pub struct PageCacheKey {
     pub private_owner: u64,
 }
 
+/// Borrowed view of a [`PageCacheKey`] for zero-allocation lookups and hashing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCacheKeyRef<'a> {
+    pub vhost_id: u32,
+    pub secure: bool,
+    pub host: &'a str,
+    pub path: &'a str,
+    pub normalized_query: &'a str,
+    pub vary_value: &'a str,
+    pub private_owner: u64,
+}
+
+impl PageCacheKeyRef<'_> {
+    /// Materialize an owned [`PageCacheKey`].
+    pub fn to_owned(&self) -> PageCacheKey {
+        PageCacheKey {
+            vhost_id: self.vhost_id,
+            secure: self.secure,
+            host: self.host.to_string(),
+            path: self.path.to_string(),
+            normalized_query: self.normalized_query.to_string(),
+            vary_value: self.vary_value.to_string(),
+            private_owner: self.private_owner,
+        }
+    }
+}
+
 impl PageCacheKey {
+    /// Borrow all fields as a [`PageCacheKeyRef`].
+    #[inline]
+    pub fn as_ref(&self) -> PageCacheKeyRef<'_> {
+        PageCacheKeyRef {
+            vhost_id: self.vhost_id,
+            secure: self.secure,
+            host: &self.host,
+            path: &self.path,
+            normalized_query: &self.normalized_query,
+            vary_value: &self.vary_value,
+            private_owner: self.private_owner,
+        }
+    }
+
+    /// Compare against a borrowed [`PageCacheKeyRef`] without allocating.
+    #[inline]
+    pub fn eq_ref(&self, other: &PageCacheKeyRef<'_>) -> bool {
+        self.vhost_id == other.vhost_id
+            && self.secure == other.secure
+            && self.private_owner == other.private_owner
+            && self.host == other.host
+            && self.path == other.path
+            && self.normalized_query == other.normalized_query
+            && self.vary_value == other.vary_value
+    }
+
     /// Build a public key (no vary, no private owner).
     pub fn public(
         vhost_id: u32,
@@ -99,24 +152,27 @@ pub fn normalize_query<'q>(raw_query: &'q str, modifiers: &[QsStrip]) -> Cow<'q,
     if modifiers.is_empty() {
         return Cow::Borrowed(raw_query);
     }
-    let pairs: Vec<(&str, Option<&str>)> = raw_query
-        .split('&')
-        .map(|kv| match kv.split_once('=') {
-            Some((name, val)) => (name, Some(val)),
-            None => (kv, None),
-        })
-        .filter(|(name, _)| !should_strip(name, modifiers))
-        .collect();
+    // Fast path: when no query parameter matches any strip rule (99% of requests),
+    // borrow `raw_query` directly with zero allocations.
+    let any_stripped = raw_query.split('&').any(|kv| {
+        let name = kv.split_once('=').map_or(kv, |(n, _)| n);
+        should_strip(name, modifiers)
+    });
+    if !any_stripped {
+        return Cow::Borrowed(raw_query);
+    }
     let mut out = String::with_capacity(raw_query.len());
-    for (i, (name, val)) in pairs.iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for kv in raw_query.split('&') {
+        let name = kv.split_once('=').map_or(kv, |(n, _)| n);
+        if should_strip(name, modifiers) {
+            continue;
+        }
+        if !first {
             out.push('&');
         }
-        out.push_str(name);
-        if let Some(v) = val {
-            out.push('=');
-            out.push_str(v);
-        }
+        first = false;
+        out.push_str(kv);
     }
     Cow::Owned(out)
 }
@@ -268,27 +324,60 @@ pub fn compute_vary_value_with_defaults<S: AsRef<str>>(
     vary_cookies: &[S],
     defaults: &[(String, String)],
 ) -> String {
-    let vary_cookies: Vec<&str> = vary_cookies.iter().map(|s| s.as_ref()).collect();
-    let vary_cookies: &[&str] = &vary_cookies;
     let Some(cookies) = cookie_header else {
         return String::new();
     };
     if vary_cookies.is_empty() {
         return String::new();
     }
-    // Matched pairs stay borrowed from the header and render once into a single
-    // output String — the matched case used to allocate two Strings per pair plus
-    // a format!/Vec<String>/join chain. The no-match guest case allocates nothing.
-    let mut found: Vec<(&str, String)> = Vec::new();
-    for configured_name in vary_cookies {
-        if let Some((parsed, raw_name, value)) = php_cookie_lookup(cookies, configured_name) {
-            let is_default = matches!(parsed, PhpCookieName::Scalar(_))
-                && defaults
-                    .iter()
-                    .any(|(n, v)| n == *configured_name && v == value);
-            if !is_default {
-                found.push((configured_name, cookie_vary_token(&parsed, raw_name, value)));
+    // Single-pass scan over `cookies.split(';')` (instead of rescanning the full Cookie
+    // header once per configured vary cookie). Zero allocations when no vary cookie matches.
+    let mut matched: Vec<Option<(PhpCookieName<'_>, &str, &str)>> = Vec::new();
+    for pair in cookies.split(';') {
+        let pair = pair.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '\x0b');
+        let (raw_name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(parsed) = php_cookie_name(raw_name) else {
+            continue;
+        };
+        let parsed_name = parsed.name();
+        let is_array = matches!(parsed, PhpCookieName::Array(_));
+        for (idx, configured) in vary_cookies.iter().enumerate() {
+            if configured.as_ref() != parsed_name {
+                continue;
             }
+            if matched.is_empty() {
+                matched.resize_with(vary_cookies.len(), || None);
+            }
+            if let Some(slot) = matched.get_mut(idx) {
+                match slot {
+                    // Array-form overrides a scalar (first array wins, matching php_cookie_lookup).
+                    Some((PhpCookieName::Array(_), _, _)) => {}
+                    Some((PhpCookieName::Scalar(_), _, _)) if is_array => {
+                        *slot = Some((parsed.clone(), raw_name, value));
+                    }
+                    Some((PhpCookieName::Scalar(_), _, _)) => {}
+                    None => {
+                        *slot = Some((parsed.clone(), raw_name, value));
+                    }
+                }
+            }
+        }
+    }
+    if matched.is_empty() {
+        return String::new();
+    }
+    let mut found: Vec<(&str, String)> = Vec::new();
+    for (configured, slot) in vary_cookies.iter().zip(matched.into_iter()) {
+        let Some((parsed, raw_name, value)) = slot else {
+            continue;
+        };
+        let configured_name = configured.as_ref();
+        let is_default = matches!(parsed, PhpCookieName::Scalar(_))
+            && defaults
+                .iter()
+                .any(|(n, v)| n == configured_name && v == value);
+        if !is_default {
+            found.push((configured_name, cookie_vary_token(&parsed, raw_name, value)));
         }
     }
     if found.is_empty() {
@@ -779,5 +868,28 @@ mod tests {
             compute_vary_value(Some("xf_style_id=50"), &names),
             "no defaults configured: unchanged"
         );
+    }
+
+    #[test]
+    fn page_cache_key_ref_matches_owned_hash_and_eq() {
+        let owned = PageCacheKey {
+            vhost_id: 42,
+            secure: true,
+            host: "example.com".into(),
+            path: "/threads/hello.123/".into(),
+            normalized_query: "page=2".into(),
+            vary_value: "xf_style_id=v:17".into(),
+            private_owner: 99,
+        };
+        let borrowed = owned.as_ref();
+        assert!(owned.eq_ref(&borrowed));
+        assert_eq!(borrowed.to_owned(), owned);
+        assert_eq!(
+            crate::diskstore::key_hash(&owned),
+            crate::diskstore::key_hash_ref(&borrowed)
+        );
+        let mut diff = borrowed;
+        diff.secure = false;
+        assert!(!owned.eq_ref(&diff));
     }
 }

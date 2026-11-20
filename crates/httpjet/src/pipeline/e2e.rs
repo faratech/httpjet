@@ -3192,6 +3192,7 @@ async fn cookieless_route_the_cache_cannot_hold_bridges_before_the_prefix() {
             status: 200,
             identity: "unrelated".into(),
             headers: Vec::new(),
+            prebuilt_headers: None,
             body: hj_pagecache::PageBody::InMem(bytes::Bytes::from_static(b"x")),
             variants: Vec::new(),
             variants_filled: true,

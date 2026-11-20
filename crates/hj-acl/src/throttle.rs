@@ -17,12 +17,11 @@
 //! * **Fixed window.** Cheap and deterministic; the boundary burst (2× rate) is
 //!   acceptable for an origin shielded by Cloudflare's edge.
 
-use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 
 /// Shard count: lock isolation across cores without per-IP hashing cost beyond
 /// one multiply. 64 × 128-entry typical occupancy is a few KB.
@@ -40,19 +39,25 @@ struct Window {
 
 #[derive(Default)]
 struct Shard {
-    map: HashMap<IpAddr, Window>,
+    map: FxHashMap<IpAddr, Window>,
     /// When a full shard's earliest window expires. Until then an expiry sweep frees
     /// nothing, and sweeping on every new address of a distinct-IP flood would cost a
     /// full pass under the lock per request.
     sweep_after: Option<Instant>,
+    /// Per-shard counters updated under the shard lock (zero cross-core atomic RMWs).
+    allowed: u64,
+    rejected: u64,
 }
+
+/// Cache-line-padded shard mutex to prevent false sharing across worker cores.
+#[repr(align(128))]
+#[derive(Default)]
+struct PaddedShard(Mutex<Shard>);
 
 pub struct ClientThrottle {
     rate: u32,
     window: Duration,
-    shards: Vec<Mutex<Shard>>,
-    rejected: AtomicU64,
-    allowed: AtomicU64,
+    shards: Vec<PaddedShard>,
 }
 
 impl std::fmt::Debug for ClientThrottle {
@@ -70,9 +75,7 @@ impl ClientThrottle {
         Self {
             rate: 0,
             window: Duration::from_secs(1),
-            shards: (0..SHARDS).map(|_| Mutex::default()).collect(),
-            rejected: AtomicU64::new(0),
-            allowed: AtomicU64::new(0),
+            shards: (0..SHARDS).map(|_| PaddedShard::default()).collect(),
         }
     }
 
@@ -102,22 +105,32 @@ impl ClientThrottle {
 
     /// Continue `old`'s monotonic counters when a reload changes the limits.
     pub fn inherit_counters(&self, old: &Self) {
-        self.rejected
-            .fetch_add(old.rejected.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.allowed
-            .fetch_add(old.allowed.load(Ordering::Relaxed), Ordering::Relaxed);
+        let rej = old.rejected_total();
+        let all = old.allowed_total();
+        if let Some(first) = self.shards.first() {
+            let mut s = first.0.lock();
+            s.rejected += rej;
+            s.allowed += all;
+        }
     }
 
     /// Count one request from `ip`; `false` when the IP is over its window rate.
     pub fn allow(&self, ip: IpAddr) -> bool {
-        self.admit(ip, true)
+        self.admit_at(ip, true, None)
     }
 
     /// [`allow`](Self::allow) for a caller that hands a refusal to another path
     /// which calls `allow` itself: an admission is charged, a refusal is not
     /// counted here, so one 429 counts once.
     pub fn allow_deferring_rejection(&self, ip: IpAddr) -> bool {
-        self.admit(ip, false)
+        self.admit_at(ip, false, None)
+    }
+
+    /// Like [`allow_deferring_rejection`](Self::allow_deferring_rejection), reusing a
+    /// caller-captured `now` timestamp to avoid an extra `Instant::now()` syscall.
+    #[inline]
+    pub fn allow_deferring_rejection_at(&self, ip: IpAddr, now: Instant) -> bool {
+        self.admit_at(ip, false, Some(now))
     }
 
     /// Whether `ip` is under its rate right now, without counting anything: a
@@ -127,13 +140,15 @@ impl ClientThrottle {
             return true;
         }
         let ip = ip.to_canonical();
-        let shard = self.shards[shard_of_canonical(ip)].lock();
-        shard.map.get(&ip).is_none_or(|w| {
-            Instant::now().duration_since(w.start) >= self.window || w.count < self.rate
-        })
+        let now = Instant::now();
+        let shard = self.shards[shard_of_canonical(ip)].0.lock();
+        shard
+            .map
+            .get(&ip)
+            .is_none_or(|w| now.duration_since(w.start) >= self.window || w.count < self.rate)
     }
 
-    fn admit(&self, ip: IpAddr, count_rejection: bool) -> bool {
+    fn admit_at(&self, ip: IpAddr, count_rejection: bool, now: Option<Instant>) -> bool {
         if self.rate == 0 {
             return true;
         }
@@ -141,8 +156,8 @@ impl ClientThrottle {
         // canonicalize the map key too so one client cannot obtain two windows
         // through equivalent address representations.
         let ip = ip.to_canonical();
-        let now = Instant::now();
-        let mut shard = self.shards[shard_of_canonical(ip)].lock();
+        let now = now.unwrap_or_else(Instant::now);
+        let mut shard = self.shards[shard_of_canonical(ip)].0.lock();
         let shard = &mut *shard;
         let map = &mut shard.map;
         if map.len() >= MAX_IPS_PER_SHARD && shard.sweep_after.is_none_or(|at| now >= at) {
@@ -159,7 +174,7 @@ impl ClientThrottle {
         let Some(w) = map.get_mut(&ip) else {
             if map.len() >= MAX_IPS_PER_SHARD {
                 // Still saturated after eviction: allow untracked (fail-open).
-                self.allowed.fetch_add(1, Ordering::Relaxed);
+                shard.allowed += 1;
                 return true;
             }
             map.insert(
@@ -169,7 +184,7 @@ impl ClientThrottle {
                     count: 1,
                 },
             );
-            self.allowed.fetch_add(1, Ordering::Relaxed);
+            shard.allowed += 1;
             return true;
         };
         if now.duration_since(w.start) >= self.window {
@@ -177,26 +192,26 @@ impl ClientThrottle {
                 start: now,
                 count: 1,
             };
-            self.allowed.fetch_add(1, Ordering::Relaxed);
+            shard.allowed += 1;
             return true;
         }
         if w.count >= self.rate {
             if count_rejection {
-                self.rejected.fetch_add(1, Ordering::Relaxed);
+                shard.rejected += 1;
             }
             return false;
         }
         w.count += 1;
-        self.allowed.fetch_add(1, Ordering::Relaxed);
+        shard.allowed += 1;
         true
     }
 
     pub fn rejected_total(&self) -> u64 {
-        self.rejected.load(Ordering::Relaxed)
+        self.shards.iter().map(|s| s.0.lock().rejected).sum()
     }
 
     pub fn allowed_total(&self) -> u64 {
-        self.allowed.load(Ordering::Relaxed)
+        self.shards.iter().map(|s| s.0.lock().allowed).sum()
     }
 }
 
@@ -333,17 +348,17 @@ mod tests {
             .find(|v| shard_of_canonical(*v) == target)
             .unwrap();
         assert!(t.allow(newcomer), "a full shard fails open");
-        let sweep_after = t.shards[target].lock().sweep_after;
+        let sweep_after = t.shards[target].0.lock().sweep_after;
         assert!(sweep_after.is_some_and(|at| at > Instant::now()));
         assert!(
             t.allow(newcomer),
             "still untracked: no sweep before the earliest expiry"
         );
-        assert_eq!(t.shards[target].lock().sweep_after, sweep_after);
+        assert_eq!(t.shards[target].0.lock().sweep_after, sweep_after);
         std::thread::sleep(Duration::from_millis(250));
         assert!(t.allow(newcomer), "the sweep freed the expired windows");
         assert!(!t.allow(newcomer), "and the newcomer is now tracked");
-        assert_eq!(t.shards[target].lock().map.len(), 1);
+        assert_eq!(t.shards[target].0.lock().map.len(), 1);
     }
 
     #[test]

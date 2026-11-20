@@ -136,11 +136,13 @@ fn passing_header_cond_reads_the_header_once() {
     )
     .expect("parse");
     let reads = Cell::new(0);
-    let lookup = |name: &str| {
+    let lookup = hj_rewrite::header_fn(|name: &str| {
         reads.set(reads.get() + 1);
         name.eq_ignore_ascii_case("User-Agent")
-            .then(|| "Mozilla/5.0 (compatible; Googlebot/2.1)".to_string())
-    };
+            .then_some(std::borrow::Cow::Borrowed(
+                "Mozilla/5.0 (compatible; Googlebot/2.1)",
+            ))
+    });
     let mut input = RewriteInput::new("/threads/x.1/".to_string(), "/docroot");
     input.header_lookup = Some(HeaderLookup(&lookup));
     match evaluate(&rs, &input) {
@@ -338,15 +340,15 @@ fn nested_evaluation_keeps_its_own_memo() {
             }
             outer_dir(p)
         };
-        let lookup = |name: &str| {
+        let lookup = hj_rewrite::header_fn(|name: &str| {
             if !name.eq_ignore_ascii_case("User-Agent") {
                 return None;
             }
             if nest == NestAt::HeaderLookup {
                 run_inner();
             }
-            Some("outer-agent".to_string())
-        };
+            Some(std::borrow::Cow::Borrowed("outer-agent"))
+        });
         let mut input = RewriteInput::new(uri.to_string(), "/outer");
         input.stat = StatSource::LiveTests(&outer_stat);
         input.header_lookup = Some(HeaderLookup(&lookup));

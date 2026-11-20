@@ -314,12 +314,7 @@ pub(super) fn disabled_path_resolves_to_script(
     if ctx.vhost.allow_symbol_link {
         return true;
     }
-    let Some(doc_root) = std::fs::canonicalize(&ctx.vhost.doc_root).ok() else {
-        return false;
-    };
-    std::fs::canonicalize(script)
-        .ok()
-        .is_some_and(|script| script.starts_with(doc_root))
+    script_path_has_no_symlink(&ctx.vhost.doc_root, &script)
 }
 
 /// Classify the actual file selected by the static resolver. This is the
@@ -476,18 +471,98 @@ where
     // chosen script that resolves (through symlinks) outside the docroot is refused
     // — one canonicalize on the FINAL candidate only, so the hot path pays nothing
     // for allow_symlink vhosts or non-PHP requests.
-    if !ctx.vhost.allow_symbol_link {
-        let doc_canon = std::fs::canonicalize(&ctx.vhost.doc_root).ok()?;
-        let script_canon = std::fs::canonicalize(&resolved.0).ok()?;
-        if !script_canon.starts_with(&doc_canon) {
-            tracing::debug!(
-                script = %resolved.0.display(),
-                "php dir-index/script candidate escapes docroot via symlink; refusing"
-            );
-            return None;
-        }
+    if !ctx.vhost.allow_symbol_link && !script_path_has_no_symlink(&ctx.vhost.doc_root, &resolved.0)
+    {
+        tracing::debug!(
+            script = %resolved.0.display(),
+            "php dir-index/script candidate traverses a symlink while allow_symbol_link=false; refusing"
+        );
+        return None;
     }
     Some(resolved)
+}
+
+/// Verify that `candidate` lies under `doc_root` and traverses no symlink
+/// components (matching `hj-static`'s `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`
+/// policy when `allow_symbol_link = false`).
+fn script_path_has_no_symlink(doc_root: &Path, candidate: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let Ok(rel) = candidate.strip_prefix(doc_root) else {
+        return false;
+    };
+    let mut parts = Vec::new();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(s) => parts.push(s),
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    let Some((last, dirs)) = parts.split_last() else {
+        return false;
+    };
+    let Ok(root_c) = CString::new(doc_root.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `root_c` is a valid NUL-terminated path; a non-negative fd is owned by `OwnedFd`.
+    let raw_root = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if raw_root < 0 {
+        return false;
+    }
+    // SAFETY: `raw_root` is a freshly opened valid file descriptor.
+    let mut dir_fd = unsafe { OwnedFd::from_raw_fd(raw_root) };
+
+    for comp in dirs {
+        let Ok(c) = CString::new(comp.as_bytes()) else {
+            return false;
+        };
+        // SAFETY: `dir_fd` is an open directory fd and `c` is a NUL-terminated component name.
+        let next = unsafe {
+            libc::openat(
+                dir_fd.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if next < 0 {
+            return false;
+        }
+        // SAFETY: `next` is a freshly opened valid file descriptor.
+        dir_fd = unsafe { OwnedFd::from_raw_fd(next) };
+    }
+    let Ok(last_c) = CString::new(last.as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `dir_fd` is an open directory fd and `last_c` is a NUL-terminated filename.
+    let raw_file = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            last_c.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if raw_file < 0 {
+        return false;
+    }
+    // SAFETY: `raw_file` is a freshly opened valid file descriptor.
+    let file_fd = unsafe { OwnedFd::from_raw_fd(raw_file) };
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `file_fd` is open and `st` is valid writable storage for `libc::stat`.
+    if unsafe { libc::fstat(file_fd.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: `fstat` succeeded and initialized `st`.
+    let st = unsafe { st.assume_init() };
+    (st.st_mode & libc::S_IFMT) == libc::S_IFREG
 }
 
 /// Pure core of [`split_script_path`]: independent of `ServerState`/`ReqCtx` so it

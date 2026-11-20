@@ -1681,17 +1681,27 @@ impl Lsapi {
                     return Err(ReadFail::terminal(HandlerError::GatewayTimeout));
                 }
                 Err(e) => {
-                    // Connection reset before any response byte (e.g. ECONNRESET):
-                    // the stale-reuse race → retryable on a fresh dial. Before any
-                    // packet, a reset also proves the request went unread.
+                    // Only a transport drop BEFORE any packet/partial bytes (e.g.
+                    // ECONNRESET/EPIPE on a stale keep-alive socket) is retryable.
+                    // Protocol parse errors (InvalidData) or mid-packet EOF are
+                    // terminal.
                     fail(&guard, &cancel);
-                    let unread = !saw_packet
-                        && reader.unparsed().is_empty()
-                        && e.kind() == std::io::ErrorKind::ConnectionReset;
-                    let mut fail =
-                        ReadFail::retryable(HandlerError::BadGateway(format!("lsapi read: {e}")));
-                    fail.unread = unread;
-                    return Err(fail);
+                    let transport_drop = matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                    );
+                    if !saw_packet && reader.unparsed().is_empty() && transport_drop {
+                        let mut fail = ReadFail::retryable(HandlerError::BadGateway(format!(
+                            "lsapi read: {e}"
+                        )));
+                        fail.unread = e.kind() == std::io::ErrorKind::ConnectionReset;
+                        return Err(fail);
+                    }
+                    return Err(ReadFail::terminal(HandlerError::BadGateway(format!(
+                        "lsapi read: {e}"
+                    ))));
                 }
             }
         };

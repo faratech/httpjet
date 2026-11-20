@@ -15,6 +15,7 @@ fn prepare(body: Body) -> (OutQueue, FxHashMap<u32, OutStream>, VecDeque<u32>, E
     let mut out = OutQueue::default();
     let mut streams = FxHashMap::default();
     let mut schedule = VecDeque::new();
+    let mut send_conn = 0i64;
     send::begin_response(
         1,
         false,
@@ -24,6 +25,7 @@ fn prepare(body: Body) -> (OutQueue, FxHashMap<u32, OutStream>, VecDeque<u32>, E
         &mut streams,
         &mut schedule,
         &mut FxHashMap::default(),
+        &mut send_conn,
         &PeerSettings::default(),
         &mut Vec::new(),
     );
@@ -194,14 +196,20 @@ fn adjacent_inline_frames_share_one_segment() {
     let mut out = OutQueue::default();
     out.frames(|b| b.extend_from_slice(b"ab"));
     out.frames(|b| b.extend_from_slice(b"cd"));
-    out.body(Bytes::from_static(b"body"));
+    // Small bodies (<= 2 KiB) coalesce into the trailing inline segment.
+    out.body(Bytes::from_static(b"tiny"));
+    assert_eq!(out.segs.len(), 1);
+    assert!(matches!(out.segs[0], Seg::Inline(0, 8)));
+    // Bodies larger than the inline threshold remain zero-copy Seg::Body entries.
+    let big = Bytes::from(vec![b'x'; 2049]);
+    out.body(big);
     out.frames(|b| b.extend_from_slice(b"ef"));
     out.frames(|_| {});
     assert_eq!(out.segs.len(), 3);
-    assert!(matches!(out.segs[0], Seg::Inline(0, 4)));
+    assert!(matches!(out.segs[0], Seg::Inline(0, 8)));
     assert!(matches!(out.segs[1], Seg::Body(_)));
-    assert!(matches!(out.segs[2], Seg::Inline(4, 2)));
-    assert_eq!(out.total_bytes(), 10);
+    assert!(matches!(out.segs[2], Seg::Inline(8, 2)));
+    assert_eq!(out.total_bytes(), 2059);
 }
 
 #[cfg(feature = "monoio")]
@@ -279,7 +287,7 @@ fn monoio_flush_reuses_bounded_metadata_and_releases_bodies() {
         // Below IOV_MAX but above the retained allowance: delivered intact, and no
         // oversized metadata is kept afterwards.
         for _ in 0..over {
-            out.body(Bytes::from_static(b"x"));
+            out.segs.push(Seg::Body(Bytes::from_static(b"x")));
         }
         monoio_flush(&mut stream, &mut out, None).await.unwrap();
         assert_eq!(out.segs.capacity(), 0);
@@ -288,7 +296,7 @@ fn monoio_flush_reuses_bounded_metadata_and_releases_bodies() {
 
         // Above IOV_MAX takes the coalescing fallback under the same bound.
         for _ in 0..1025 {
-            out.body(Bytes::from_static(b"y"));
+            out.segs.push(Seg::Body(Bytes::from_static(b"y")));
         }
         monoio_flush(&mut stream, &mut out, None).await.unwrap();
         assert_eq!(out.segs.capacity(), 0);

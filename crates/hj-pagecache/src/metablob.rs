@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{HeaderName, HeaderValue};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use zstd::bulk::{Compressor, Decompressor};
 use zstd::dict::{DecoderDictionary, EncoderDictionary};
 
@@ -269,12 +269,11 @@ impl MetaBlob {
 }
 
 impl DecodedMeta {
-    /// Build a `CachedResponse` from this (possibly memoized) decoded metadata plus the
-    /// per-hit body/timing. Takes `&self` and clones the metadata fields so a single
-    /// `DecodedMeta` decoded once can back every cache HIT for the entry (the resident
-    /// `MetaBlob` is decoded at most once per entry — see `ResidentEntry::to_cached`).
-    pub fn to_cached_response(
-        &self,
+    /// Consume `DecodedMeta` to build a `CachedResponse` without cloning headers,
+    /// identity, tags, or vary strings, and pre-build the `HeaderMap` once so
+    /// every subsequent cache hit clones the table instead of re-hashing ~40 headers.
+    pub fn into_cached_response(
+        self,
         body: PageBody,
         variants: Vec<(String, Bytes)>,
         variants_filled: bool,
@@ -283,24 +282,32 @@ impl DecodedMeta {
         ttl: Duration,
         swr: Duration,
         sie: Duration,
-    ) -> CachedResponse {
-        CachedResponse {
-            status: self.status,
-            identity: self.identity.clone(),
-            headers: self.headers.clone(),
-            body,
-            variants,
-            variants_filled,
-            dict_gen,
-            tags: self.tags.clone(),
-            vary_cookie_name: self.vary_cookie_name.clone(),
-            vary_value: self.vary_value.clone(),
-            scope: self.scope,
-            stored_at,
-            ttl,
-            swr,
-            sie,
+    ) -> (PageCacheKey, CachedResponse) {
+        let mut h = HeaderMap::with_capacity(self.headers.len() + 5);
+        for (k, v) in &self.headers {
+            h.append(k.clone(), v.clone());
         }
+        (
+            self.key,
+            CachedResponse {
+                status: self.status,
+                identity: self.identity,
+                headers: self.headers,
+                prebuilt_headers: Some(Arc::new(crate::store::PrebuiltHeaders::new(h))),
+                body,
+                variants,
+                variants_filled,
+                dict_gen,
+                tags: self.tags,
+                vary_cookie_name: self.vary_cookie_name,
+                vary_value: self.vary_value,
+                scope: self.scope,
+                stored_at,
+                ttl,
+                swr,
+                sie,
+            },
+        )
     }
 }
 
@@ -508,6 +515,7 @@ mod tests {
                         status: se.status,
                         identity: se.identity.clone(),
                         headers: se.headers.clone(),
+                        prebuilt_headers: None,
                         body: PageBody::InMem(Bytes::new()),
                         variants: Vec::new(),
                         variants_filled: false,
@@ -574,6 +582,7 @@ mod tests {
                     HeaderValue::from_static("public, max-age=900"),
                 ),
             ],
+            prebuilt_headers: None,
             body: PageBody::InMem(Bytes::from_static(b"body")),
             variants: Vec::new(),
             variants_filled: false,
@@ -637,6 +646,7 @@ mod tests {
         CachedResponse {
             status: 200,
             identity: "https\ncache-a.example\n/articles/amber-atlas.12345/".to_string(),
+            prebuilt_headers: None,
             headers: vec![
                 (
                     CONTENT_TYPE,

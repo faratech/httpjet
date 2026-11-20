@@ -161,6 +161,7 @@ pub(super) enum FrameOutcome {
 /// Handle one decoded frame: control frames queue responses into `wbuf`; a completed
 /// request pushes its `service(req)` future into `inflight` (NOT awaited here, so other
 /// streams keep flowing).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_frame<S, F>(
     hdr: FrameHeader,
@@ -177,6 +178,51 @@ pub(super) fn process_frame<S, F>(
     inflight: &mut Inflight<F>,
     cancelled: &mut FxHashSet<u32>,
     inflight_sids: &mut FxHashMap<u32, AbortHandle>,
+) -> FrameOutcome
+where
+    S: Fn(Request) -> F,
+    F: Future<Output = Response> + Send + 'static,
+{
+    process_frame_with_ready(
+        hdr,
+        payload,
+        streams,
+        dec,
+        enc,
+        out,
+        peer,
+        recv,
+        outstreams_len,
+        accept_new_streams,
+        service,
+        inflight,
+        cancelled,
+        inflight_sids,
+        None,
+    )
+}
+
+/// Like [`process_frame`], but when `ready_out` is `Some` (and inline execution is active),
+/// polls each completed request's future once inline before allocating `AbortHandle` +
+/// `FuturesUnordered` + `inflight_sids`. Immediate on-core hits (fast-memo, page-cache,
+/// cached static) resolve directly into `ready_out` with zero cancellation-handle allocations.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn process_frame_with_ready<S, F>(
+    hdr: FrameHeader,
+    payload: &[u8],
+    streams: &mut FxHashMap<u32, StreamState>,
+    dec: &mut Decoder,
+    enc: &mut Encoder,
+    out: &mut OutQueue,
+    peer: &mut PeerSettings,
+    recv: &mut Recv,
+    outstreams_len: usize,
+    accept_new_streams: bool,
+    service: &S,
+    inflight: &mut Inflight<F>,
+    cancelled: &mut FxHashSet<u32>,
+    inflight_sids: &mut FxHashMap<u32, AbortHandle>,
+    mut ready_out: Option<&mut Vec<(u32, bool, Response)>>,
 ) -> FrameOutcome
 where
     S: Fn(Request) -> F,
@@ -308,45 +354,44 @@ where
         }};
     }
     // Build the request for a completed stream and push its handler future.
-    macro_rules! complete {
-        ($sid:expr_2021) => {{
-            if let Some(st) = streams.remove(&$sid) {
-                recv.no_progress_frames = 0; // a dispatched request is forward progress
-                recv.release_stream(&st);
-                if st.content_length.is_some_and(|cl| cl != st.body.len() as u64) {
-                    // §8.1.2.6: declared content-length must equal the DATA bytes received.
-                    // `rst!` also drops the stream's early WINDOW_UPDATE credit.
-                    rst!($sid, error_code::PROTOCOL_ERROR);
-                } else {
-                    // §8.3.1: a HEAD response carries the GET's headers but never a body — captured
-                    // here so the writer sends headers-only regardless of what the handler returns.
-                    let is_head = st.method.as_ref() == Some(&http::Method::HEAD);
-                    recv.header_count_hint =
-                        (st.headers.len() + usize::from(st.authority.is_some())).min(HEADER_COUNT_HINT_MAX);
-                    match build_request(st) {
-                        Some(req) => {
-                            let fut = service(req);
-                            let sid = $sid;
-                            // Every stream's handler future on this connection is polled by the ONE
-                            // connection task, so a single h2 connection is confined to ~one CPU core
-                            // no matter how many streams it multiplexes — a CPU-bound rewrite or
-                            // backend-bound PHP burst over one (or a few) connections then pins ~1
-                            // core while the rest of the box sits idle. When there are fewer active
-                            // h2 connections than worker threads, connection-level parallelism alone
-                            // can't fill the cores, so spawn the handler (work-stolen onto an idle
-                            // worker); the single multiplexed connection then fans out across cores.
-                            //
-                            // At/above the worker count, inline is optimal — spawning only adds a
-                            // cross-thread handoff per request and measurably *cuts* throughput
-                            // (the common case: the loopback bench and real CF→origin traffic both
-                            // arrive over many connections). `super::spare_cores()` reads a global
-                            // active-connection counter, so the decision tracks live load. A single
-                            // CPU-bound connection's backlog hides in the kernel socket buffer — it
-                            // never shows up in `streams`/`inflight` — so a per-connection depth
-                            // check can't detect this; only the global connection count can.
-                            let fut = hj_core::Recycled::new(fut);
+    macro_rules! complete_stream {
+        ($sid:expr_2021, $st:expr_2021) => {{
+            let st = $st;
+            recv.no_progress_frames = 0; // a dispatched request is forward progress
+            recv.release_stream(&st);
+            if st.content_length.is_some_and(|cl| cl != st.body.len() as u64) {
+                // §8.1.2.6: declared content-length must equal the DATA bytes received.
+                // `rst!` also drops the stream's early WINDOW_UPDATE credit.
+                rst!($sid, error_code::PROTOCOL_ERROR);
+            } else {
+                // §8.3.1: a HEAD response carries the GET's headers but never a body — captured
+                // here so the writer sends headers-only regardless of what the handler returns.
+                let is_head = st.method.as_ref() == Some(&http::Method::HEAD);
+                recv.header_count_hint =
+                    (st.headers.len() + usize::from(st.authority.is_some())).min(HEADER_COUNT_HINT_MAX);
+                match build_request(st) {
+                    Some(req) => {
+                        let fut = service(req);
+                        let sid = $sid;
+                        let mut fut = hj_core::Recycled::new(fut);
+                        let mut inline_ready = false;
+                        if !super::spare_cores()
+                            && let Some(ready) = ready_out.as_deref_mut()
+                        {
+                            let waker = std::task::Waker::noop();
+                            let mut cx = std::task::Context::from_waker(waker);
+                            if let std::task::Poll::Ready(resp) =
+                                std::pin::Pin::new(&mut fut).poll(&mut cx)
+                            {
+                                ready.push((sid, is_head, resp));
+                                inline_ready = true;
+                            }
+                        }
+                        if !inline_ready {
                             let inner = if super::spare_cores() {
-                                super::TaggedInner::Spawned(super::AbortOnDrop(tokio::spawn(fut)))
+                                super::TaggedInner::Spawned(super::AbortOnDrop(tokio::spawn(
+                                    fut,
+                                )))
                             } else {
                                 super::TaggedInner::Inline(fut)
                             };
@@ -357,9 +402,16 @@ where
                             // and aborting spawned work instead of merely discarding a late response.
                             inflight_sids.insert(sid, abort);
                         }
-                        None => rst!($sid, error_code::PROTOCOL_ERROR),
                     }
+                    None => rst!($sid, error_code::PROTOCOL_ERROR),
                 }
+            }
+        }};
+    }
+    macro_rules! complete {
+        ($sid:expr_2021) => {{
+            if let Some(st) = streams.remove(&$sid) {
+                complete_stream!($sid, st);
             }
         }};
     }
@@ -533,7 +585,9 @@ where
             return FrameOutcome::PeerGoaway;
         }
         kind::HEADERS => {
-            let opens_new_stream = !streams.contains_key(&sid);
+            // A monotonically increasing odd stream id (> last_client_stream) is
+            // guaranteed absent from `streams`, avoiding a hash probe on every new stream.
+            let opens_new_stream = sid > recv.last_client_stream || !streams.contains_key(&sid);
             if opens_new_stream && sid.is_multiple_of(2) {
                 goaway!(error_code::PROTOCOL_ERROR);
             }
@@ -574,7 +628,8 @@ where
                 recv.last_client_stream = sid;
             }
             let self_priority = priority_dependency(hdr.flags, payload, true) == Some(sid);
-            let unterminated_trailers = streams.get(&sid).is_some_and(|s| s.headers_done)
+            let unterminated_trailers = !opens_new_stream
+                && streams.get(&sid).is_some_and(|s| s.headers_done)
                 && hdr.flags & flags::END_STREAM == 0;
             if self_priority || unterminated_trailers {
                 let block = match headers_block(hdr.flags, payload) {
@@ -616,6 +671,41 @@ where
             // New streams open with the per-stream receive window we advertise (§6.9.2).
             let iw = recv.our_initial_window;
             let hint = recv.header_count_hint;
+            // Zero-map fast path for single-frame bodiless requests (END_HEADERS | END_STREAM,
+            // 99%+ of H2 GET/HEAD traffic): decode into a stack-local StreamState and dispatch
+            // directly without inserting/probing/removing in `streams`.
+            if opens_new_stream
+                && !refuse_new_stream
+                && (hdr.flags & (flags::END_HEADERS | flags::END_STREAM))
+                    == (flags::END_HEADERS | flags::END_STREAM)
+            {
+                if block.len() > MAX_HEADER_BLOCK {
+                    goaway!(error_code::COMPRESSION_ERROR);
+                }
+                recv.open_header_block = None;
+                let mut st = StreamState {
+                    recv_window: iw,
+                    headers: http::HeaderMap::with_capacity(hint),
+                    end_stream: true,
+                    ..Default::default()
+                };
+                match decode_block_from(dec, &mut st, block) {
+                    Decoded::Ok => {
+                        if declared_body_too_large(Some(&st), recv.max_request_body) {
+                            reject_too_large!(sid, "413", true);
+                        }
+                        complete_stream!(sid, st);
+                    }
+                    Decoded::Compression => goaway!(error_code::COMPRESSION_ERROR),
+                    Decoded::TooLarge => {
+                        reject_too_large!(sid, "431", false);
+                    }
+                    Decoded::Malformed => {
+                        rst!(sid, error_code::PROTOCOL_ERROR);
+                    }
+                }
+                return FrameOutcome::Continue;
+            }
             let st = streams.entry(sid).or_insert_with(|| StreamState {
                 recv_window: iw,
                 headers: http::HeaderMap::with_capacity(hint),
@@ -978,165 +1068,175 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
     let mut scheme_is_http = false;
     let mut path_is_asterisk = false;
     let mut seen = [false; 4]; // :method, :scheme, :path, :authority
-    let result = dec.decode_octets_with_header_name(block, |name, pre_validated, value| {
-        if malformed {
-            return;
-        }
-        let n = if let Some(n) = pre_validated {
-            seen_regular = true;
-            n
-        } else if name.first() == Some(&b':') {
-            if is_trailers || seen_regular {
-                malformed = true; // pseudo-header in trailers, or after a regular field
+    let result =
+        dec.decode_octets_with_header_name(block, |name, pre_validated, value, pre_val| {
+            if malformed {
                 return;
             }
-            // Pseudo-header values are URI components / a method token: non-UTF-8 octets
-            // are malformed at stream scope, never an HPACK (connection) error.
-            let (Ok(name), Ok(value)) = (std::str::from_utf8(name), std::str::from_utf8(value))
-            else {
-                malformed = true;
-                return;
-            };
-            let idx = match name {
-                ":method" => 0,
-                ":scheme" => 1,
-                ":path" => 2,
-                ":authority" => 3,
-                _ => {
-                    malformed = true; // unknown or response (:status) pseudo-header
+            let n = if let Some(n) = pre_validated {
+                seen_regular = true;
+                n
+            } else if name.first() == Some(&b':') {
+                if is_trailers || seen_regular {
+                    malformed = true; // pseudo-header in trailers, or after a regular field
                     return;
                 }
-            };
-            if seen[idx] {
-                malformed = true; // duplicate pseudo-header
-                return;
-            }
-            seen[idx] = true;
-            match name {
-                // Parse to the typed form now (value is still borrowed from the HPACK
-                // buffer). A conversion failure is a §8.1.2 malformed request → RST, exactly
-                // as the old `build_request` rejection (builder error → None → PROTOCOL_ERROR).
-                ":method" => match http::Method::from_bytes(value.as_bytes()) {
-                    Ok(m) => st.method = Some(m),
-                    Err(_) => {
-                        malformed = true;
+                // Pseudo-header values are URI components / a method token: non-UTF-8 octets
+                // are malformed at stream scope, never an HPACK (connection) error.
+                let (Ok(name), Ok(value)) = (std::str::from_utf8(name), std::str::from_utf8(value))
+                else {
+                    malformed = true;
+                    return;
+                };
+                let idx = match name {
+                    ":method" => 0,
+                    ":scheme" => 1,
+                    ":path" => 2,
+                    ":authority" => 3,
+                    _ => {
+                        malformed = true; // unknown or response (:status) pseudo-header
                         return;
                     }
-                },
-                // RFC 9113 §8.3.1: :path MUST be origin-form (path-absolute, begins with
-                // "/") or "*" for OPTIONS — NEVER absolute-form. An absolute-form :path
-                // carrying its own scheme/authority is malformed AND dangerous: it lets
-                // uri().host() disagree with the routed :authority/Host downstream (the
-                // foreign-host CDN-cache-protection bypass). Reject anything with a scheme
-                // or authority.
-                ":path" => {
-                    // Check the raw value before `http::Uri` parsing: that parser accepts a
-                    // fragment and silently drops `#...`, but fragments are not request-target
-                    // data and are outside the HTTP/2 :path grammar.
-                    if value.contains('#') || (value != "*" && !value.starts_with('/')) {
-                        malformed = true;
-                        return;
-                    }
-                    match http::Uri::try_from(value) {
-                        Ok(u) if u.scheme().is_none() && u.authority().is_none() => {
-                            path_is_asterisk = value == "*";
-                            st.path = Some(u)
-                        }
-                        _ => {
-                            malformed = true;
-                            return;
-                        }
-                    }
-                }
-                ":authority" => {
-                    match (
-                        hj_core::valid_uri_authority(value),
-                        http::HeaderValue::from_str(value),
-                    ) {
-                        (true, Ok(v)) => st.authority = Some(v),
-                        _ => {
-                            malformed = true;
-                            return;
-                        }
-                    }
-                }
-                ":scheme" => {
-                    if !hj_core::valid_uri_scheme(value) {
-                        malformed = true;
-                        return;
-                    }
-                    // Routing continues to use the listener scheme, as before. This flag is
-                    // only for RFC 9113's http/https-specific userinfo restriction.
-                    scheme_is_http =
-                        value.eq_ignore_ascii_case("http") || value.eq_ignore_ascii_case("https");
-                }
-                _ => unreachable!("known pseudo-header matched above"),
-            }
-            return;
-        } else {
-            seen_regular = true;
-            let Some(n) = crate::hpack::validate_request_header_name(name) else {
-                malformed = true;
-                return;
-            };
-            n
-        };
-        if n == http::header::TE && !value.eq_ignore_ascii_case(b"trailers") {
-            malformed = true; // §8.1.2.2: TE may only be "trailers"
-            return;
-        }
-        // §8.2.1 (RFC 9113): a field name/value that fails validation makes the message
-        // malformed — it is NOT silently dropped — because an unvalidated field can enable
-        // request smuggling once forwarded to a backend over HTTP/1.x (httpjet is an
-        // intermediary; cf. §10.3). `HeaderName::from_bytes` rejects control/non-token bytes
-        // and a bare colon; `HeaderValue::from_bytes` rejects NUL/CR/LF but, like H1 and H3,
-        // admits obs-text; we add the §8.2.1 rule that a value MUST NOT start or end with
-        // SP/HTAB.
-        let vb = value;
-        let edge_ws =
-            matches!(vb.first(), Some(b' ' | b'\t')) || matches!(vb.last(), Some(b' ' | b'\t'));
-        match http::HeaderValue::from_bytes(value) {
-            Ok(v) if !edge_ws => {
-                if is_trailers {
-                    // Trailer fields obey the same field syntax and connection-header
-                    // rules, but valid trailers are discarded after HPACK decoding. This
-                    // keeps the dynamic table synchronized without forwarding trailers as
-                    // ordinary request headers.
+                };
+                if seen[idx] {
+                    malformed = true; // duplicate pseudo-header
                     return;
                 }
-                if n == http::header::CONTENT_LENGTH {
-                    // (security #264) Digit-only, mirroring hj-core/H1's #232 strict
-                    // resolver: Rust's unsigned parse() accepts a leading '+', which
-                    // H1/H3 reject for the same bytes — a per-protocol divergence.
-                    if value.is_empty() || !value.iter().all(|b| b.is_ascii_digit()) {
-                        malformed = true;
-                        return;
-                    }
-                    // Overflow (not encoding) is the only parse failure left.
-                    match std::str::from_utf8(value).unwrap_or("").parse::<u64>() {
-                        // A second, conflicting content-length is malformed (§8.1.2.6).
-                        Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
-                            st.content_length = Some(cl)
-                        }
-                        _ => {
+                seen[idx] = true;
+                match name {
+                    // Parse to the typed form now (value is still borrowed from the HPACK
+                    // buffer). A conversion failure is a §8.1.2 malformed request → RST, exactly
+                    // as the old `build_request` rejection (builder error → None → PROTOCOL_ERROR).
+                    ":method" => match http::Method::from_bytes(value.as_bytes()) {
+                        Ok(m) => st.method = Some(m),
+                        Err(_) => {
                             malformed = true;
                             return;
                         }
+                    },
+                    // RFC 9113 §8.3.1: :path MUST be origin-form (path-absolute, begins with
+                    // "/") or "*" for OPTIONS — NEVER absolute-form. An absolute-form :path
+                    // carrying its own scheme/authority is malformed AND dangerous: it lets
+                    // uri().host() disagree with the routed :authority/Host downstream (the
+                    // foreign-host CDN-cache-protection bypass). Reject anything with a scheme
+                    // or authority.
+                    ":path" => {
+                        // Check the raw value before `http::Uri` parsing: that parser accepts a
+                        // fragment and silently drops `#...`, but fragments are not request-target
+                        // data and are outside the HTTP/2 :path grammar.
+                        if value.contains('#') || (value != "*" && !value.starts_with('/')) {
+                            malformed = true;
+                            return;
+                        }
+                        match http::Uri::try_from(value) {
+                            Ok(u) if u.scheme().is_none() && u.authority().is_none() => {
+                                path_is_asterisk = value == "*";
+                                st.path = Some(u)
+                            }
+                            _ => {
+                                malformed = true;
+                                return;
+                            }
+                        }
                     }
-                } else if n == http::header::HOST {
-                    if host_value.is_some() {
-                        malformed = true; // duplicate Host line
+                    ":authority" => {
+                        match (
+                            hj_core::valid_uri_authority(value),
+                            http::HeaderValue::from_str(value),
+                        ) {
+                            (true, Ok(v)) => st.authority = Some(v),
+                            _ => {
+                                malformed = true;
+                                return;
+                            }
+                        }
+                    }
+                    ":scheme" => {
+                        if !hj_core::valid_uri_scheme(value) {
+                            malformed = true;
+                            return;
+                        }
+                        // Routing continues to use the listener scheme, as before. This flag is
+                        // only for RFC 9113's http/https-specific userinfo restriction.
+                        scheme_is_http = value.eq_ignore_ascii_case("http")
+                            || value.eq_ignore_ascii_case("https");
+                    }
+                    _ => unreachable!("known pseudo-header matched above"),
+                }
+                return;
+            } else {
+                seen_regular = true;
+                let Some(n) = crate::hpack::validate_request_header_name(name) else {
+                    malformed = true;
+                    return;
+                };
+                n
+            };
+            if n == http::header::TE && !value.eq_ignore_ascii_case(b"trailers") {
+                malformed = true; // §8.1.2.2: TE may only be "trailers"
+                return;
+            }
+            // §8.2.1 (RFC 9113): a field name/value that fails validation makes the message
+            // malformed — it is NOT silently dropped — because an unvalidated field can enable
+            // request smuggling once forwarded to a backend over HTTP/1.x (httpjet is an
+            // intermediary; cf. §10.3). `HeaderName::from_bytes` rejects control/non-token bytes
+            // and a bare colon; `HeaderValue::from_bytes` rejects NUL/CR/LF but, like H1 and H3,
+            // admits obs-text; we add the §8.2.1 rule that a value MUST NOT start or end with
+            // SP/HTAB.
+            let validated_v = match pre_val {
+                Some(v) => Ok(v),
+                None => {
+                    let edge_ws = matches!(value.first(), Some(b' ' | b'\t'))
+                        || matches!(value.last(), Some(b' ' | b'\t'));
+                    if edge_ws {
+                        Err(())
+                    } else {
+                        http::HeaderValue::from_bytes(value).map_err(|_| ())
+                    }
+                }
+            };
+            match validated_v {
+                Ok(v) => {
+                    if is_trailers {
+                        // Trailer fields obey the same field syntax and connection-header
+                        // rules, but valid trailers are discarded after HPACK decoding. This
+                        // keeps the dynamic table synchronized without forwarding trailers as
+                        // ordinary request headers.
                         return;
                     }
-                    host_value = Some(v.clone());
-                } else if n == http::header::COOKIE {
-                    st.cookie_count = st.cookie_count.saturating_add(1).min(2);
+                    if n == http::header::CONTENT_LENGTH {
+                        // (security #264) Digit-only, mirroring hj-core/H1's #232 strict
+                        // resolver: Rust's unsigned parse() accepts a leading '+', which
+                        // H1/H3 reject for the same bytes — a per-protocol divergence.
+                        if value.is_empty() || !value.iter().all(|b| b.is_ascii_digit()) {
+                            malformed = true;
+                            return;
+                        }
+                        // Overflow (not encoding) is the only parse failure left.
+                        match std::str::from_utf8(value).unwrap_or("").parse::<u64>() {
+                            // A second, conflicting content-length is malformed (§8.1.2.6).
+                            Ok(cl) if st.content_length.is_none_or(|prev| prev == cl) => {
+                                st.content_length = Some(cl)
+                            }
+                            _ => {
+                                malformed = true;
+                                return;
+                            }
+                        }
+                    } else if n == http::header::HOST {
+                        if host_value.is_some() {
+                            malformed = true; // duplicate Host line
+                            return;
+                        }
+                        host_value = Some(v.clone());
+                    } else if n == http::header::COOKIE {
+                        st.cookie_count = st.cookie_count.saturating_add(1).min(2);
+                    }
+                    st.headers.append(n, v);
                 }
-                st.headers.append(n, v);
+                _ => malformed = true,
             }
-            _ => malformed = true,
-        }
-    });
+        });
     match result {
         Ok(()) => {}
         Err(crate::hpack::Error::HeaderListTooLarge) => return Decoded::TooLarge,

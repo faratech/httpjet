@@ -100,7 +100,6 @@ impl Htaccess {
             return AccessDecision::NoOpinion;
         }
         let basename = basename(rel_path);
-        let ext = ext_lower(basename);
         let mut decision = AccessDecision::NoOpinion;
         let mut winner_phase = 0;
         // The `access_rules` model is authoritative: it carries directory-wide
@@ -114,6 +113,8 @@ impl Htaccess {
         // is an httpjet `<Directory*>` deny.
         let mut directory_deny = false;
         let scan = || -> Vec<usize> {
+            // Defer `ext_lower` until a memo miss (common hits skip it altogether).
+            let ext = ext_lower(basename);
             self.access_index
                 .candidates(basename, &ext)
                 .filter(|&i| {
@@ -144,21 +145,17 @@ impl Htaccess {
         // Which rules MATCH is a pure function of the paths and method, memoized per
         // parsed file; the subject-dependent verdict is still evaluated on every call.
         // Rules with nothing but `<Limit>` methods match in less than a memo probe.
-        let memo = self
-            .access_memo_useful
-            .then(|| {
-                self.access_memo.matched(
-                    rel_path,
-                    request_path,
-                    method,
-                    self.access_rules.len(),
-                    || scan(),
-                )
-            })
-            .flatten();
-        match memo {
-            Some(hit) => hit.iter().for_each(|&i| visit(usize::from(i))),
-            None => scan().into_iter().for_each(visit),
+        let visited = self.access_memo_useful
+            && self.access_memo.visit_matched(
+                rel_path,
+                request_path,
+                method,
+                self.access_rules.len(),
+                || scan(),
+                &mut visit,
+            );
+        if !visited {
+            scan().into_iter().for_each(visit);
         }
         // A `<Files>`/`<If>` grant must not open a sensitive directory denied by a
         // `<Directory*>` matcher (no Apache .htaccess analogue; the live forum file
@@ -389,7 +386,18 @@ fn stage_chain_headers<'a>(
             ht.stage_response_headers(rel_path, basename, request_path, status, env, &mut staged);
         }
     }
-    staged.sort_by_key(|(phase, ..)| *phase);
+    let mut needs_sort = false;
+    let mut prev_phase = 0u8;
+    for (phase, ..) in &staged {
+        if *phase < prev_phase {
+            needs_sort = true;
+            break;
+        }
+        prev_phase = *phase;
+    }
+    if needs_sort {
+        staged.sort_by_key(|(phase, ..)| *phase);
+    }
     staged
 }
 
@@ -427,6 +435,31 @@ pub fn chain_response_headers<'a>(
             }
         })
         .collect()
+}
+
+/// Visitor form of [`chain_prepared_headers`] that invokes `visit` for each valid
+/// prepared header op without allocating a second `Vec<PreparedHeaderOp>`.
+pub fn for_each_prepared_header<'a>(
+    chain: impl IntoIterator<Item = &'a Htaccess>,
+    rel_path: &str,
+    target_basename: Option<&str>,
+    request_path: &str,
+    status: u16,
+    env: &[(String, String)],
+    mut visit: impl FnMut(PreparedHeaderOp<'a>),
+) {
+    let staged = stage_chain_headers(chain, rel_path, target_basename, request_path, status, env);
+    for (_, kind, h, value) in staged {
+        let Some(name) = h.field_name.as_ref() else {
+            continue;
+        };
+        visit(PreparedHeaderOp {
+            kind,
+            name,
+            value,
+            field_value: h.static_value.as_ref(),
+        });
+    }
 }
 
 /// [`chain_response_headers`] as [`PreparedHeaderOp`]s: the same ops in the same
@@ -800,11 +833,11 @@ impl<'a> ReqAttrs<'a> {
     /// special nor a present header names an env variable. `pending` holds this
     /// file's earlier assignments (in order, `!VAR` = unset), which shadow the
     /// base env.
-    fn resolve_env(&self, attribute: &str, pending: &[(String, String)]) -> Option<String> {
+    fn resolve_env(&self, attribute: &str, pending: &[(String, String)]) -> Option<Cow<'a, str>> {
         for (key, value) in pending.iter().rev() {
             match EnvAssignment::classify(key, value) {
                 EnvAssignment::Set { name, value } if name.eq_ignore_ascii_case(attribute) => {
-                    return Some(value.to_string());
+                    return Some(Cow::Owned(value.to_string()));
                 }
                 EnvAssignment::Unset { name } if name.eq_ignore_ascii_case(attribute) => {
                     return None;
@@ -812,7 +845,7 @@ impl<'a> ReqAttrs<'a> {
                 _ => {}
             }
         }
-        (self.env_lookup.as_ref()?.0)(attribute)
+        self.env_lookup.as_ref()?.get(attribute)
     }
 
     /// The value of a special attribute; `None` for a header attribute.
@@ -829,20 +862,30 @@ impl<'a> ReqAttrs<'a> {
         })
     }
 
-    fn lookup_header(&self, want: &str) -> Option<String> {
+    fn lookup_header(&self, want: &str) -> Option<Cow<'a, str>> {
         let hl = self.header_lookup.as_ref()?;
         // SetEnvIf matches `_` and `-` equivalently; fold to dash form before the (case-
-        // insensitive) callback so `User_Agent` resolves the `User-Agent` header. Only
-        // allocate the folded copy when an underscore is actually present — without one
-        // the fold is a no-op, so the borrowed name resolves identically (byte-for-byte).
+        // insensitive) callback so `User_Agent` resolves the `User-Agent` header. Use a
+        // stack buffer for common header names so folding allocates nothing.
         if want.contains('_') {
+            if want.len() <= 128 {
+                let mut stack = [0u8; 128];
+                if let Some(dst) = stack.get_mut(..want.len()) {
+                    for (d, &b) in dst.iter_mut().zip(want.as_bytes()) {
+                        *d = if b == b'_' { b'-' } else { b };
+                    }
+                    if let Ok(folded) = std::str::from_utf8(dst) {
+                        return hl.get(folded);
+                    }
+                }
+            }
             let folded: String = want
                 .chars()
                 .map(|c| if c == '_' { '-' } else { c })
                 .collect();
-            (hl.0)(&folded)
+            hl.get(&folded)
         } else {
-            (hl.0)(want)
+            hl.get(want)
         }
     }
 }
@@ -851,16 +894,19 @@ impl<'a> ReqAttrs<'a> {
 /// looked up per directive, as before.
 const HEADER_CACHE_SLOTS: usize = 4;
 
-type HeaderCache<'r> = [Option<(&'r str, Option<String>)>; HEADER_CACHE_SLOTS];
+type HeaderCache<'a, 'r> = [Option<(&'r str, Option<Cow<'a, str>>)>; HEADER_CACHE_SLOTS];
 
 /// `attribute`'s request header, looked up once per evaluation: header values
 /// do not depend on the assignments made so far, so a Cookie read by several
-/// rules is copied once.
-fn cached_header<'h, 'r>(
-    cache: &'h mut HeaderCache<'r>,
-    attrs: &ReqAttrs<'_>,
+/// rules is looked up once (borrowed from the request `HeaderMap`).
+fn cached_header<'h, 'a, 'r>(
+    cache: &'h mut HeaderCache<'a, 'r>,
+    attrs: &ReqAttrs<'a>,
     attribute: &'r str,
-) -> Option<Cow<'h, str>> {
+) -> Option<Cow<'h, str>>
+where
+    'a: 'h,
+{
     let slot = match cache
         .iter()
         .position(|slot| matches!(slot, Some((name, _)) if *name == attribute))
@@ -868,7 +914,7 @@ fn cached_header<'h, 'r>(
         Some(i) => i,
         None => {
             let Some(free) = cache.iter().position(Option::is_none) else {
-                return attrs.lookup_header(attribute).map(Cow::Owned);
+                return attrs.lookup_header(attribute);
             };
             if let Some(entry) = cache.get_mut(free) {
                 *entry = Some((attribute, attrs.lookup_header(attribute)));
@@ -917,7 +963,7 @@ impl Htaccess {
             attrs.if_path
         };
         let scope_basename = attrs.scope_basename.unwrap_or_else(|| basename(scope_path));
-        let mut headers: HeaderCache<'_> = Default::default();
+        let mut headers: HeaderCache<'_, '_> = Default::default();
         // The previous directive's match result, for a `reuse_prev` directive.
         let mut prev: Option<bool> = None;
         for s in &self.set_env_if {
@@ -1204,13 +1250,13 @@ mod directive_tests {
     /// A case-insensitive header lookup closure over a `(name, value)` slice — the test analogue
     /// of the production `req.headers()` callback. Bind it to a `let` so the `&` lives long enough
     /// for `HeaderLookup`. (`lookup_header` folds `_`→`-` before calling this, mirroring prod.)
-    fn lookup_from(headers: &[(String, String)]) -> impl Fn(&str) -> Option<String> + '_ {
-        move |n: &str| {
+    fn lookup_from<'a>(headers: &'a [(String, String)]) -> impl crate::HeaderLookupFn + 'a {
+        crate::header_fn(move |n: &str| {
             headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(n))
-                .map(|(_, v)| v.clone())
-        }
+                .map(|(_, v)| Cow::Borrowed(v.as_str()))
+        })
     }
 
     #[test]

@@ -578,14 +578,8 @@ impl Compress {
         if streamed {
             resp.headers_mut().remove(CONTENT_LENGTH);
         } else if let Some(len) = resp.body().content_length() {
-            match HeaderValue::from_str(&len.to_string()) {
-                Ok(hv) => {
-                    resp.headers_mut().insert(CONTENT_LENGTH, hv);
-                }
-                Err(_) => {
-                    resp.headers_mut().remove(CONTENT_LENGTH);
-                }
-            }
+            resp.headers_mut()
+                .insert(CONTENT_LENGTH, HeaderValue::from(len));
         }
 
         // A transformed body invalidates any chunked TE header from upstream;
@@ -645,11 +639,9 @@ impl Compress {
         }
         self.transform(ctx, resp).await;
     }
-}
-
-#[async_trait]
-impl ResponseTransform for Compress {
-    async fn transform(&self, ctx: &ReqCtx, resp: &mut Response) {
+    /// Synchronous response compression entry point used directly by the
+    /// response-transform pipeline to avoid `#[async_trait]` `Box::pin` overhead.
+    pub fn transform_sync(&self, ctx: &ReqCtx, resp: &mut Response) {
         // (CF_SEND_ZSTD) For a trusted-proxy peer, ignore the forwarded Accept-Encoding and
         // negotiate as if the client sent `zstd` — CF decodes our zstd and re-encodes per
         // browser at its edge, and zstd is the cheapest form for us to produce. Untrusted
@@ -691,31 +683,57 @@ impl ResponseTransform for Compress {
     }
 }
 
+#[async_trait]
+impl ResponseTransform for Compress {
+    async fn transform(&self, ctx: &ReqCtx, resp: &mut Response) {
+        self.transform_sync(ctx, resp);
+    }
+}
+
 /// Insert `Vary: Accept-Encoding`, merging with any existing `Vary` value
 /// rather than clobbering it (e.g. stacking on a vhost's `Vary: Cookie`).
 fn add_vary_accept_encoding(resp: &mut Response) {
+    const SUFFIX: &[u8] = b", Accept-Encoding";
     let headers = resp.headers_mut();
-    // Already present (case-insensitive token search across all Vary values)?
-    let already = headers.get_all(VARY).iter().any(|v| {
-        v.to_str()
-            .map(|s| {
-                s.split(',')
-                    .any(|t| t.trim().eq_ignore_ascii_case("accept-encoding"))
-            })
-            .unwrap_or(false)
-    });
-    if already {
-        return;
+    let mut count = 0usize;
+    for v in headers.get_all(VARY).iter() {
+        count += 1;
+        if let Ok(s) = v.to_str()
+            && s.split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("accept-encoding"))
+        {
+            return;
+        }
     }
     // (#12) Merge into a single line ONLY when there is exactly one existing Vary
     // line — `insert` REPLACES all values, so the old "get(VARY) first value +
     // insert" path silently dropped any further Vary lines (e.g. `Vary: User-Agent`
     // after `Vary: Cookie`). With 0 or 2+ existing lines, append a fresh line
     // instead (multiple Vary lines are valid and combine per RFC 9110).
-    if headers.get_all(VARY).iter().count() == 1 {
-        if let Some(existing) = headers.get(VARY).and_then(|v| v.to_str().ok()) {
-            let merged = format!("{existing}, Accept-Encoding");
-            if let Ok(hv) = HeaderValue::from_str(&merged) {
+    if count == 1
+        && let Some(existing) = headers.get(VARY).and_then(|v| v.to_str().ok())
+    {
+        let existing_bytes = existing.as_bytes();
+        let merged_len = existing_bytes.len().saturating_add(SUFFIX.len());
+        if merged_len <= 256 {
+            let mut buf = [0u8; 256];
+            if let Some((head, rest)) = buf.split_at_mut_checked(existing_bytes.len())
+                && let Some(tail) = rest.get_mut(..SUFFIX.len())
+            {
+                head.copy_from_slice(existing_bytes);
+                tail.copy_from_slice(SUFFIX);
+                if let Some(slice) = buf.get(..merged_len)
+                    && let Ok(hv) = HeaderValue::from_bytes(slice)
+                {
+                    headers.insert(VARY, hv);
+                    return;
+                }
+            }
+        } else {
+            let mut buf = Vec::with_capacity(merged_len);
+            buf.extend_from_slice(existing_bytes);
+            buf.extend_from_slice(SUFFIX);
+            if let Ok(hv) = HeaderValue::from_bytes(&buf) {
                 headers.insert(VARY, hv);
                 return;
             }
@@ -760,11 +778,39 @@ pub fn tag_etag_variant(resp: &mut Response, enc: Encoding) {
         return;
     }
     // `"<core>;;;"` -> `"<core>;<marker>"` (keeps the first slot, fills the rest).
-    let mut new = Vec::with_capacity(n);
-    new.extend_from_slice(&bytes[..n - 3]);
-    new.extend_from_slice(marker);
-    new.push(b'"');
-    if let Ok(hv) = HeaderValue::from_bytes(&new) {
+    // Stack buffer for the common ETag length (20-40 bytes), avoiding a heap Vec.
+    let hv = if n <= 128 {
+        let mut stack = [0u8; 128];
+        let prefix = n - 3;
+        let out_len = prefix + marker.len() + 1;
+        let copied = if let (Some(src), Some(p)) = (bytes.get(..prefix), stack.get_mut(..prefix)) {
+            p.copy_from_slice(src);
+            true
+        } else {
+            false
+        };
+        if copied
+            && let Some(m) = stack.get_mut(prefix..prefix + marker.len())
+            && let Some(q) = {
+                m.copy_from_slice(marker);
+                stack.get_mut(prefix + marker.len())
+            }
+        {
+            *q = b'"';
+            stack
+                .get(..out_len)
+                .and_then(|s| HeaderValue::from_bytes(s).ok())
+        } else {
+            None
+        }
+    } else {
+        let mut new = Vec::with_capacity(n);
+        new.extend_from_slice(&bytes[..n - 3]);
+        new.extend_from_slice(marker);
+        new.push(b'"');
+        HeaderValue::from_bytes(&new).ok()
+    };
+    if let Some(hv) = hv {
         resp.headers_mut().insert(ETAG, hv);
     }
 }
@@ -893,11 +939,15 @@ impl TypePattern {
 #[derive(Debug, Clone)]
 struct CompressibleSet {
     rules: Vec<(TypePattern, bool)>,
+    has_exclusions: bool,
 }
 
 impl Default for CompressibleSet {
     fn default() -> Self {
-        let mut set = CompressibleSet { rules: Vec::new() };
+        let mut set = CompressibleSet {
+            rules: Vec::new(),
+            has_exclusions: false,
+        };
         set.push_default();
         set
     }
@@ -907,7 +957,10 @@ impl CompressibleSet {
     /// OLS `HttpMime::setCompressibleByType`: `default` (matched on its first
     /// seven bytes, with or without `!`) adds the default list as compressible.
     fn from_entries<S: AsRef<str>>(entries: &[S]) -> Self {
-        let mut set = CompressibleSet { rules: Vec::new() };
+        let mut set = CompressibleSet {
+            rules: Vec::new(),
+            has_exclusions: false,
+        };
         for entry in entries {
             let entry = entry.as_ref().trim();
             let (compressible, ty) = match entry.strip_prefix('!') {
@@ -920,6 +973,9 @@ impl CompressibleSet {
             {
                 set.push_default();
             } else if let Some(pattern) = TypePattern::parse(ty) {
+                if !compressible {
+                    set.has_exclusions = true;
+                }
                 set.rules.push((pattern, compressible));
             }
         }
@@ -941,6 +997,11 @@ impl CompressibleSet {
         let base = ct_base(content_type);
         if base.is_empty() {
             return false;
+        }
+        if !self.has_exclusions {
+            // Pure allowlist (including `default`): order does not affect the
+            // boolean outcome, so scan forward (`text/*` matches at index 0).
+            return self.rules.iter().any(|(p, _)| p.matches(base));
         }
         self.rules
             .iter()

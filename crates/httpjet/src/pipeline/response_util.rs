@@ -632,9 +632,16 @@ pub(super) fn matching_static_context_vhost<'a>(
     vhost: &'a hj_core::config::VHostConfig,
     path: &str,
 ) -> Option<&'a hj_core::config::Context> {
-    enclosing_static_contexts(&vhost.contexts, path)
-        .last()
-        .copied()
+    use hj_core::config::ContextKind;
+    // Pick the deepest matching static context (matching sort_by_key + last:
+    // on equal lengths, later element wins, which Iterator::max_by_key provides).
+    vhost
+        .contexts
+        .iter()
+        .filter(|c| {
+            c.kind == ContextKind::Static && c.enabled && super::context_uri_matches(path, &c.uri)
+        })
+        .max_by_key(|c| c.uri.len())
 }
 
 /// Every enabled static context enclosing `path`, outermost first.
@@ -713,9 +720,7 @@ fn vhost_static_location_override<'a>(
     vhost: &'a hj_core::config::VHostConfig,
     path: &str,
 ) -> Option<(&'a std::path::PathBuf, &'a str)> {
-    let context = enclosing_static_contexts(&vhost.contexts, path)
-        .last()
-        .copied()?;
+    let context = matching_static_context_vhost(vhost, path)?;
     let location = context.location.as_ref()?;
     (*location != vhost.doc_root || !context.uri.trim_matches('/').is_empty())
         .then_some((location, context.uri.as_str()))

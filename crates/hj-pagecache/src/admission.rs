@@ -148,12 +148,9 @@ impl AdmissionFilter {
         let (block, slots) = self.slots(key);
         for slot in slots {
             let c = &block.0[slot];
-            let mut cur = c.load(Ordering::Relaxed);
-            while cur < u8::MAX {
-                match c.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
-                    Ok(_) => break,
-                    Err(v) => cur = v,
-                }
+            let cur = c.load(Ordering::Relaxed);
+            if cur < u8::MAX {
+                c.store(cur + 1, Ordering::Relaxed);
             }
         }
         // Approximate aging, batched per thread: only every OPS_FLUSH_EVERY-th record()

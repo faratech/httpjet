@@ -38,7 +38,7 @@ pub struct StatCache {
     /// Keyed by the raw path bytes: `PathBuf` equality ignores a trailing `/`, but
     /// `file/` fails with ENOTDIR where `file` exists, so they must not share an
     /// entry (#899).
-    map: DashMap<OsString, (Instant, Option<FileTests>)>,
+    map: DashMap<OsString, (Instant, Option<FileTests>), rustc_hash::FxBuildHasher>,
     ttl: Duration,
     cap: usize,
     /// Approximate entry count for the cap gate: `DashMap::len()` sweeps (and
@@ -56,7 +56,7 @@ impl StatCache {
     /// `ttl == 0` disables caching (every call `statx`es) — useful in tests.
     pub fn new(ttl: Duration) -> Self {
         Self {
-            map: DashMap::new(),
+            map: DashMap::with_hasher(rustc_hash::FxBuildHasher),
             ttl,
             cap: DEFAULT_CAP,
             count: AtomicUsize::new(0),

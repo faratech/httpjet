@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use zstd::bulk::Compressor;
 use zstd::dict::DecoderDictionary;
-use zstd::zstd_safe::{CParameter, DCtx};
+use zstd::zstd_safe::{CParameter, DCtx, DParameter};
 
 /// Default zstd level for dict-compressing a stored body. Level 12 is the last level on zstd's
 /// row-based lazy matcher; 13-15 switch to the binary-tree btlazy2 search, which was ~55% of all
@@ -159,9 +159,35 @@ impl PageDict {
     /// (decompression-bomb guard). `None` on malformed input, a dictionary mismatch, or if the
     /// content would exceed `max`.
     pub fn decode(&self, input: &[u8], max: usize) -> Option<Vec<u8>> {
-        let capacity = zstd::bulk::Decompressor::upper_bound(input)
-            .unwrap_or(max)
-            .min(max);
+        let Some(bound) = zstd::bulk::Decompressor::upper_bound(input) else {
+            // Streaming zstd frames (e.g. stream-fill PLAIN_GENERATION bodies) omit the
+            // Frame Content Size header, so `upper_bound` is `None`. Decode incrementally
+            // rather than reserving `max` (up to 100 MiB) up front, and shrink before
+            // returning so callers like `HotTier` never pin oversized heap capacity.
+            let mut out = match &self.dec {
+                None => {
+                    crate::encoding::decode_bytes_bounded(crate::Encoding::Zstd, input, max as u64)?
+                }
+                Some(dec) => {
+                    use std::io::Read;
+                    let read_cap = max.saturating_add(1);
+                    let mut reader =
+                        zstd::stream::read::Decoder::with_prepared_dictionary(input, dec).ok()?;
+                    reader.window_log_max(24).ok()?;
+                    let mut buf =
+                        Vec::with_capacity(input.len().saturating_mul(3).max(64).min(max));
+                    let mut limited = reader.take(read_cap as u64);
+                    limited.read_to_end(&mut buf).ok()?;
+                    if buf.len() > max {
+                        return None;
+                    }
+                    buf
+                }
+            };
+            out.shrink_to_fit();
+            return Some(out);
+        };
+        let capacity = bound.min(max);
         let mut out = Vec::with_capacity(capacity);
         DECODE_CTX
             .try_with(|cell| {
@@ -178,6 +204,7 @@ impl PageDict {
             })
             .ok()
             .flatten()?;
+        out.shrink_to_fit();
         Some(out)
     }
 }
@@ -187,6 +214,56 @@ thread_local! {
     /// faulted in again on every decode. The dictionary is passed per call, so one
     /// context serves every vhost's dictionary.
     static DECODE_CTX: RefCell<Option<DCtx<'static>>> = const { RefCell::new(None) };
+}
+
+/// Decompress a plain (non-dictionary) zstd frame whose header declares a content size
+/// `<= cap` using the thread-local [`DECODE_CTX`] (zero ~100 KiB context allocation).
+/// Returns `Ok(Some(out))` on success, `Ok(None)` when the frame has no declared size or
+/// exceeds `cap` (caller falls back to streaming decode), or `Err(())` on corrupt input.
+pub(crate) fn decompress_plain_tls(
+    input: &[u8],
+    cap: usize,
+    expected: usize,
+) -> Result<Option<Vec<u8>>, ()> {
+    let Some(bound) = zstd::bulk::Decompressor::upper_bound(input) else {
+        return Ok(None);
+    };
+    if bound > cap {
+        return Ok(None);
+    }
+    let capacity = bound.max(expected).min(cap);
+    let mut out = Vec::with_capacity(capacity);
+    let res = DECODE_CTX.try_with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            return Ok(false);
+        };
+        let dctx = match &mut *slot {
+            Some(dctx) => dctx,
+            None => {
+                let Some(mut fresh) = DCtx::try_create() else {
+                    return Ok(false);
+                };
+                let _ = fresh.set_parameter(DParameter::WindowLogMax(24));
+                slot.insert(fresh)
+            }
+        };
+        let _ = dctx.set_parameter(DParameter::WindowLogMax(24));
+        match dctx.decompress(&mut out, input) {
+            Ok(_) => Ok(true),
+            Err(_) => Err(()),
+        }
+    });
+    match res {
+        Ok(Ok(true)) => {
+            if out.len() > cap {
+                Err(())
+            } else {
+                Ok(Some(out))
+            }
+        }
+        Ok(Ok(false)) | Err(_) => Ok(None),
+        Ok(Err(())) => Err(()),
+    }
 }
 
 /// FNV-1a 32-bit hash of the dictionary bytes → its generation id.
@@ -495,6 +572,36 @@ mod tests {
         assert!(plain.decode(&standard, body.len() - 1).is_none(), "bounded");
         let own = plain.encode(&body).expect("plain encode");
         assert_eq!(zstd::decode_all(&own[..]).unwrap(), body);
+    }
+
+    #[test]
+    fn plain_decode_streaming_frame_without_content_size_does_not_overallocate() {
+        use std::io::Write;
+        let plain = PageDict::plain(3);
+        let mut body = Vec::new();
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        for _ in 0..20 {
+            enc.write_all(CHROME).unwrap();
+            enc.flush().unwrap();
+            body.extend_from_slice(CHROME);
+        }
+        let streamed = enc.finish().unwrap();
+        // Streaming zstd frames without Frame Content Size either return None or
+        // overestimate via `nb_blocks * 128 KiB` (multi-MiB for a few KiB body).
+        let decoded = plain
+            .decode(&streamed, 100 * 1024 * 1024)
+            .expect("decode streaming frame");
+        assert_eq!(decoded, body);
+        assert!(
+            decoded.capacity() <= decoded.len().saturating_mul(2).max(1024),
+            "decoded Vec must not retain oversized capacity (got {} for {} bytes)",
+            decoded.capacity(),
+            decoded.len()
+        );
+        assert!(
+            plain.decode(&streamed, body.len() - 1).is_none(),
+            "streaming decode must still enforce max bound"
+        );
     }
 
     #[test]

@@ -48,6 +48,7 @@ fn fill(store: &PageStore) {
                     http::header::CONTENT_TYPE,
                     HeaderValue::from_static("text/html"),
                 )],
+                prebuilt_headers: None,
                 body: PageBody::InMem(Bytes::from(vec![b'a'; 1000])),
                 variants: Vec::new(),
                 variants_filled: false,

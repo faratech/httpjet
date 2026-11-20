@@ -173,7 +173,7 @@ impl RuleSet {
         let mut sig = 0u64;
         for (bit, (ri, ci)) in self.ua_conds.iter().enumerate() {
             if let CondPattern::Regex(re, _) = &self.rules[*ri].conds[*ci].pattern
-                && re.captures(ua).is_some()
+                && re.is_match_checked(ua).unwrap_or(false)
             {
                 sig |= 1 << bit;
             }
@@ -245,6 +245,11 @@ pub(crate) struct Rule {
     /// skip building the `$0..$9` capture vector on a match (the common case for
     /// `-`/`[F]`/`[L]`/redirect rules), avoiding a per-match 10-slot `String` alloc.
     pub(crate) needs_rule_caps: bool,
+    /// Precomputed at parse time: does anything in this rule (substitution, `[E=...]`,
+    /// or any `RewriteCond` test/RHS) reference a `%N` condition backreference? When
+    /// false, regex `RewriteCond`s use `is_match_checked` and skip capture `String`
+    /// allocations entirely.
+    pub(crate) needs_cond_caps: bool,
     /// Precomputed at parse time: do any of this rule's `RewriteCond`s reference a
     /// rule backref `$N` (in the test string or a lexical/numeric RHS)? When false,
     /// the conds depend only on `%{VAR}`/`%N` — not the rule pattern's captures — so
@@ -769,8 +774,8 @@ thread_local! {
     /// are tied to a specific `meta::Regex`, so they are reused per id and never
     /// shared across regexes. No locking: a thread only ever touches its own map.
     static FAST_REGEX_CACHES: std::cell::RefCell<
-        std::collections::HashMap<usize, (meta::Cache, Captures)>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+        rustc_hash::FxHashMap<usize, (meta::Cache, Captures)>,
+    > = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
 impl FastRegex {
@@ -930,23 +935,72 @@ impl PrefilterSet {
             .ok()?;
         Some(PrefilterSet { dfa })
     }
+}
 
+struct PooledPatternSet(Option<PatternSet>);
+
+impl PooledPatternSet {
+    fn as_ref_set(&self) -> Option<&PatternSet> {
+        self.0.as_ref()
+    }
+}
+
+impl Drop for PooledPatternSet {
+    fn drop(&mut self) {
+        if let Some(set) = self.0.take() {
+            return_pattern_set(set);
+        }
+    }
+}
+
+thread_local! {
+    static PATTERN_SET_POOL: std::cell::RefCell<Vec<PatternSet>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_pattern_set(capacity: usize) -> PatternSet {
+    PATTERN_SET_POOL
+        .with(|cell| {
+            cell.try_borrow_mut().ok().and_then(|mut v| {
+                let pos = v.iter().position(|s| s.capacity() >= capacity)?;
+                let mut set = v.swap_remove(pos);
+                set.clear();
+                Some(set)
+            })
+        })
+        .unwrap_or_else(|| PatternSet::new(capacity))
+}
+
+fn return_pattern_set(set: PatternSet) {
+    if set.capacity() <= 1024 {
+        PATTERN_SET_POOL.with(|cell| {
+            if let Ok(mut v) = cell.try_borrow_mut()
+                && v.len() < 4
+            {
+                v.push(set);
+            }
+        });
+    }
+}
+
+impl PrefilterSet {
     /// The set of pattern ids matching `text` (anywhere). On the unusual DFA error
     /// path (e.g. a quit byte) it fails **open** — every pattern is reported as a
     /// possible match so the per-rule regex still runs; the prefilter only ever
     /// *skips* a guaranteed non-match, never a possible one.
-    fn matches(&self, text: &str) -> PatternSet {
-        let mut set = PatternSet::new(self.dfa.pattern_len());
+    fn matches(&self, text: &str) -> PooledPatternSet {
+        let len = self.dfa.pattern_len();
+        let mut set = take_pattern_set(len);
         if self
             .dfa
             .try_which_overlapping_matches(&Input::new(text), &mut set)
             .is_err()
         {
-            for i in 0..self.dfa.pattern_len() {
+            for i in 0..len {
                 set.insert(PatternID::new_unchecked(i));
             }
         }
-        set
+        PooledPatternSet(Some(set))
     }
 
     /// Whether the rule at prefilter index `idx` matched. An out-of-range id never
@@ -1050,6 +1104,7 @@ impl CompiledRegex {
     }
 
     /// Run the pattern against `text`, returning the captures on a match.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn captures<'t>(&self, text: &'t str) -> Option<Caps<'t>> {
         match self {
@@ -1207,11 +1262,11 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
     // Run the multi-pattern prefilter once against the initial stripped target.
     // `state.prefilter_valid` guards its use after any URI rewrite.
     let prefilter_target = rule_match_target(input, &input.uri);
-    let hits: Option<PatternSet> = rs
+    let hits = rs
         .prefilter
         .get()
         .map(|pf| pf.matches(prefilter_target.as_ref()));
-    let hits = hits.as_ref();
+    let hits = hits.as_ref().and_then(PooledPatternSet::as_ref_set);
 
     // One pass, as OLS `processRuleSet`: a changed URI is final for this ruleset
     // (a target in another directory is handed to that directory's chain by the
@@ -1252,14 +1307,15 @@ pub fn evaluate_with_engine(rs: &RuleSet, input: &RewriteInput, engine_on: bool)
         // `new_query` reports the *effective* query the rewritten URI carries:
         // `Some(q)` for a non-empty query (whether newly set or carried over via
         // QSA), `None` when the rewrite leaves no query string at all.
+        let env = state.env_vec();
         RewriteOutcome::Rewritten {
-            new_uri: state.uri.clone(),
+            new_uri: state.uri,
             new_query: if state.query.is_empty() {
                 None
             } else {
-                Some(state.query.clone())
+                Some(state.query)
             },
-            env: state.env_vec(),
+            env,
             end: ended,
         }
     } else {

@@ -41,8 +41,6 @@
 //!   every reparse, so it shares the file's `Arc` identity + mtime TTL and can
 //!   never be stale relative to the rules it indexes.
 
-use std::collections::HashMap;
-
 use super::{AccessMatcher, AccessRule, HeaderDirective, Scope, ScopeKind};
 
 /// A per-`.htaccess` index over either the access rules or the header directives.
@@ -52,9 +50,9 @@ use super::{AccessMatcher, AccessRule, HeaderDirective, Scope, ScopeKind};
 #[derive(Debug, Default, Clone)]
 pub struct ScopeIndex {
     /// Exact-literal basename (`<Files "robots.txt">` → `^robots\.txt$`) → rules.
-    pub exact: HashMap<String, Vec<usize>>,
+    pub exact: rustc_hash::FxHashMap<String, Vec<usize>>,
     /// File extension, lowercased (`<FilesMatch "\.(js|css)$">` → `js`,`css`) → rules.
-    pub suffix: HashMap<String, Vec<usize>>,
+    pub suffix: rustc_hash::FxHashMap<String, Vec<usize>>,
     /// Directory-wide / unconditional rules (no scope, or a `<Directory*>`/`<If>`
     /// path scope that cannot be basename-indexed). Always candidates.
     pub dir_wide: Vec<usize>,
@@ -248,22 +246,26 @@ fn exact_literal_body(body: &str) -> Option<String> {
 /// with every arm `[A-Za-z0-9]+`, return the lowercased arms; else `None`.
 fn suffix_arms(s: &str) -> Option<Vec<String>> {
     let body = s.strip_prefix("\\.")?.strip_suffix('$')?;
-    // `(a|b|c)` group or a single bare `arm`.
-    let inner = match body.strip_prefix('(').and_then(|b| b.strip_suffix(')')) {
-        Some(group) => group,
-        None => body,
-    };
-    if inner.is_empty() {
-        return None;
-    }
-    let mut arms = Vec::new();
-    for arm in inner.split('|') {
-        if arm.is_empty() || !arm.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    // Only split on `|` when wrapped in an explicit `(...)` group; an
+    // unparenthesized `\.log|bak$` parses as `(\.log)|(bak$)` and matches
+    // names without a `.log`/`.bak` extension (e.g. `app.log.1`, `secretbak`).
+    if let Some(group) = body.strip_prefix('(').and_then(|b| b.strip_suffix(')')) {
+        if group.is_empty() {
             return None;
         }
-        arms.push(arm.to_ascii_lowercase());
+        let mut arms = Vec::new();
+        for arm in group.split('|') {
+            if arm.is_empty() || !arm.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                return None;
+            }
+            arms.push(arm.to_ascii_lowercase());
+        }
+        Some(arms)
+    } else if !body.is_empty() && body.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        Some(vec![body.to_ascii_lowercase()])
+    } else {
+        None
     }
-    Some(arms)
 }
 
 #[cfg(test)]
@@ -378,5 +380,12 @@ mod tests {
         let idx = build_access_index(&[files, dir, iff]);
         assert_eq!(idx.suffix.get("log"), Some(&vec![0]));
         assert_eq!(idx.dir_wide, vec![1, 2]);
+    }
+
+    #[test]
+    fn unparenthesized_alternation_is_residual() {
+        assert_eq!(bucket_of(r"\.log|bak$"), "residual");
+        assert_eq!(bucket_of(r"^\.log|bak$"), "residual");
+        assert_eq!(bucket_of(r"\.(log|bak)$"), "suffix");
     }
 }

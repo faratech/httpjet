@@ -182,7 +182,12 @@ impl SniCertMap {
         server_name: Option<&str>,
         signature_schemes: &[rustls::SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let name = server_name?.to_ascii_lowercase();
+        let raw = server_name?;
+        let name: std::borrow::Cow<'_, str> = if raw.bytes().any(|b| b.is_ascii_uppercase()) {
+            std::borrow::Cow::Owned(raw.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
         let mapped = |name: &str| -> Option<Option<Arc<CertifiedKey>>> {
             if let Some(certs) = self.by_name.get(name) {
                 return Some(pick_key(certs, signature_schemes));
@@ -209,8 +214,13 @@ impl SniCertMap {
         server_name: Option<&str>,
         signature_schemes: &[rustls::SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
-        let name = server_name?;
-        let certs = self.by_name.get(&name.to_ascii_lowercase())?;
+        let raw = server_name?;
+        let name: std::borrow::Cow<'_, str> = if raw.bytes().any(|b| b.is_ascii_uppercase()) {
+            std::borrow::Cow::Owned(raw.to_ascii_lowercase())
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
+        let certs = self.by_name.get(name.as_ref())?;
         pick_key(certs, signature_schemes)
     }
 }
@@ -849,13 +859,33 @@ struct DepthLimitedClientVerifier {
     /// Reuse a verified chain only for the identical verifier UnixTime. A new
     /// handshake time must recheck certificate and revocation validity. Exact
     /// DER keys and per-policy verifier instances retain the trust boundary.
-    chain_memo: parking_lot::Mutex<Vec<ChainMemo>>,
+    /// Published via `ArcSwap` so the read hot path is lock-free and allocation-free.
+    chain_memo: ArcSwap<Vec<ChainMemo>>,
+    chain_memo_write: parking_lot::Mutex<()>,
 }
 
+#[derive(Clone)]
 struct ChainMemo {
-    key: Vec<u8>,
+    end_entity: Box<[u8]>,
+    intermediates: Box<[Box<[u8]>]>,
     verified_at: u64,
     valid_until: std::time::Instant,
+}
+
+impl ChainMemo {
+    fn matches(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+    ) -> bool {
+        self.end_entity.as_ref() == end_entity.as_ref()
+            && self.intermediates.len() == intermediates.len()
+            && self
+                .intermediates
+                .iter()
+                .zip(intermediates.iter())
+                .all(|(a, b)| a.as_ref() == b.as_ref())
+    }
 }
 
 impl std::fmt::Debug for ChainMemo {
@@ -870,21 +900,6 @@ const CHAIN_MEMO_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 /// overlap); oldest entry is dropped beyond this.
 const CHAIN_MEMO_CAP: usize = 8;
 
-/// Unambiguous memo key: each chain certificate length-prefixed, leaf first.
-fn chain_memo_key(
-    end_entity: &CertificateDer<'_>,
-    intermediates: &[CertificateDer<'_>],
-) -> Vec<u8> {
-    let total: usize =
-        4 + end_entity.len() + intermediates.iter().map(|c| 4 + c.len()).sum::<usize>();
-    let mut key = Vec::with_capacity(total);
-    for cert in std::iter::once(end_entity).chain(intermediates.iter()) {
-        key.extend_from_slice(&(cert.len() as u32).to_le_bytes());
-        key.extend_from_slice(cert.as_ref());
-    }
-    key
-}
-
 impl DepthLimitedClientVerifier {
     fn wrap(
         inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
@@ -895,7 +910,8 @@ impl DepthLimitedClientVerifier {
             inner,
             max_intermediates,
             anchors,
-            chain_memo: parking_lot::Mutex::new(Vec::new()),
+            chain_memo: ArcSwap::from_pointee(Vec::new()),
+            chain_memo_write: parking_lot::Mutex::new(()),
         })
     }
 }
@@ -934,31 +950,41 @@ impl rustls::server::danger::ClientCertVerifier for DepthLimitedClientVerifier {
                 )))),
             ));
         }
-        let key = chain_memo_key(end_entity, intermediates);
         let mono_now = std::time::Instant::now();
         {
-            let mut memo = self.chain_memo.lock();
-            memo.retain(|m| m.valid_until > mono_now);
-            if memo
-                .iter()
-                .any(|m| m.key == key && m.verified_at == now.as_secs())
-            {
+            let memo = self.chain_memo.load();
+            if memo.iter().any(|m| {
+                m.valid_until > mono_now
+                    && m.verified_at == now.as_secs()
+                    && m.matches(end_entity, intermediates)
+            }) {
                 return Ok(rustls::server::danger::ClientCertVerified::assertion());
             }
         }
         let verified = self
             .inner
             .verify_client_cert(end_entity, intermediates, now)?;
-        let mut memo = self.chain_memo.lock();
-        memo.retain(|m| m.key != key);
-        if memo.len() >= CHAIN_MEMO_CAP {
-            memo.remove(0);
+        let _write_guard = self.chain_memo_write.lock();
+        let mut next: Vec<ChainMemo> = self
+            .chain_memo
+            .load()
+            .iter()
+            .filter(|m| m.valid_until > mono_now && !m.matches(end_entity, intermediates))
+            .cloned()
+            .collect();
+        if next.len() >= CHAIN_MEMO_CAP {
+            next.remove(0);
         }
-        memo.push(ChainMemo {
-            key,
+        next.push(ChainMemo {
+            end_entity: end_entity.as_ref().into(),
+            intermediates: intermediates
+                .iter()
+                .map(|c| Box::<[u8]>::from(c.as_ref()))
+                .collect(),
             verified_at: now.as_secs(),
             valid_until: mono_now + CHAIN_MEMO_TTL,
         });
+        self.chain_memo.store(Arc::new(next));
         Ok(verified)
     }
     fn verify_tls12_signature(
@@ -1172,10 +1198,51 @@ fn new_session_storage() -> Arc<dyn rustls::server::StoresServerSessions + Send 
     session_storage_for(session_tickets())
 }
 
+const SESSION_CACHE_SHARDS: usize = 64;
+
+#[derive(Debug)]
+struct ShardedSessionCache([Arc<ServerSessionMemoryCache>; SESSION_CACHE_SHARDS]);
+
+impl ShardedSessionCache {
+    fn new(total_capacity: usize) -> Arc<Self> {
+        let per_shard = total_capacity.div_ceil(SESSION_CACHE_SHARDS).max(1);
+        Arc::new(Self(std::array::from_fn(|_| {
+            ServerSessionMemoryCache::new(per_shard)
+        })))
+    }
+
+    #[inline]
+    fn shard(&self, key: &[u8]) -> Option<&ServerSessionMemoryCache> {
+        let idx = key.first().copied().unwrap_or(0) as usize & (SESSION_CACHE_SHARDS - 1);
+        self.0.get(idx).map(Arc::as_ref)
+    }
+}
+
+impl rustls::server::StoresServerSessions for ShardedSessionCache {
+    fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let Some(shard) = self.shard(&key) else {
+            return false;
+        };
+        shard.put(key, value)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.shard(key)?.get(key)
+    }
+
+    fn take(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.shard(key)?.take(key)
+    }
+
+    fn can_cache(&self) -> bool {
+        true
+    }
+}
+
 fn session_storage_for(
     tickets: usize,
 ) -> Arc<dyn rustls::server::StoresServerSessions + Send + Sync> {
-    ServerSessionMemoryCache::new(if tickets == 0 {
+    ShardedSessionCache::new(if tickets == 0 {
         TLS12_SESSION_CACHE_SIZE
     } else {
         TLS_SESSION_CACHE_SIZE
@@ -2475,7 +2542,8 @@ mod tests {
             inner: Arc::new(AlwaysOkVerifier),
             max_intermediates: 1,
             anchors: vec![root.clone()],
-            chain_memo: parking_lot::Mutex::new(Vec::new()),
+            chain_memo: ArcSwap::from_pointee(Vec::new()),
+            chain_memo_write: parking_lot::Mutex::new(()),
         };
         let now = rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(
             1_700_000_000,
@@ -3620,5 +3688,20 @@ mod resumption_tests {
             srv2.peer_certificates().is_none(),
             "uncertified reconnect must not fabricate a client chain"
         );
+    }
+
+    #[test]
+    fn sharded_session_cache_round_trips_across_shards() {
+        use rustls::server::StoresServerSessions as _;
+        let cache = ShardedSessionCache::new(1024);
+        assert!(cache.can_cache());
+        for first_byte in [0u8, 1, 63, 64, 127, 255] {
+            let key = vec![first_byte, 0xaa, 0xbb];
+            let val = vec![first_byte, 1, 2, 3];
+            assert!(cache.put(key.clone(), val.clone()));
+            assert_eq!(cache.get(&key), Some(val.clone()));
+            assert_eq!(cache.take(&key), Some(val));
+            assert_eq!(cache.get(&key), None);
+        }
     }
 }

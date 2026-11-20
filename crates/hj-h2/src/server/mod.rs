@@ -43,7 +43,7 @@ use hj_core::{Request, Response};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::frame::{self, FrameHeader, error_code, settings};
-use recv::{FrameOutcome, process_frame};
+use recv::{FrameOutcome, process_frame_with_ready};
 use send::{
     Pulls, apply_pull, begin_response, cancel_outstream, pump_streams, reset_drain_idle_streams,
     reset_stalled_streams,
@@ -791,6 +791,7 @@ where
     // Per-stream cancellation handles for handler futures in `inflight`. A reset removes and
     // fires the handle immediately; the two drain sites remove it on normal completion.
     let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
+    let mut ready_responses: Vec<(u32, bool, Response)> = Vec::new();
 
     let mut inbuf: Vec<u8> = Vec::with_capacity(H2_INBUF_IDLE);
     let mut cursor = 0usize;
@@ -861,7 +862,7 @@ where
             cursor += total;
             completed_frame = true;
             let block_was_open = recv.open_header_block.is_some();
-            let outcome = process_frame(
+            let outcome = process_frame_with_ready(
                 hdr,
                 &inbuf[payload],
                 &mut streams,
@@ -876,7 +877,23 @@ where
                 &mut inflight,
                 &mut cancelled,
                 &mut inflight_sids,
+                Some(&mut ready_responses),
             );
+            for (sid, is_head, resp) in ready_responses.drain(..) {
+                begin_response(
+                    sid,
+                    is_head,
+                    resp,
+                    &mut enc,
+                    &mut out,
+                    &mut outstreams,
+                    &mut send_schedule,
+                    &mut pending_window,
+                    &mut send_conn,
+                    &peer,
+                    &mut block_scratch,
+                );
+            }
             header_block_deadline = next_header_block_deadline(
                 block_was_open,
                 recv.open_header_block.is_some(),
@@ -1020,6 +1037,9 @@ where
                         st.window += delta;
                         overflow |= st.window > i32::MAX as i64;
                     }
+                    for &credit in pending_window.values() {
+                        overflow |= peer.initial_window + credit > i32::MAX as i64;
+                    }
                     if overflow {
                         {
                             // Report the streams already processed (RFC 9113 §6.8, #876).
@@ -1112,6 +1132,7 @@ where
                 &mut outstreams,
                 &mut send_schedule,
                 &mut pending_window,
+                &mut send_conn,
                 &peer,
                 &mut block_scratch,
             );
@@ -1188,7 +1209,7 @@ where
             Some((sid, is_head, resp)) = inflight.next(), if !inflight.is_empty() => {
                 inflight_sids.remove(&sid);
                 if let Some(resp) = resp && !cancelled.remove(&sid) {
-                    begin_response(sid, is_head, resp, &mut enc, &mut out, &mut outstreams, &mut send_schedule, &mut pending_window, &peer, &mut block_scratch);
+                    begin_response(sid, is_head, resp, &mut enc, &mut out, &mut outstreams, &mut send_schedule, &mut pending_window, &mut send_conn, &peer, &mut block_scratch);
                 } else {
                     cancelled.remove(&sid);
                 }
@@ -1455,15 +1476,26 @@ impl OutQueue {
             self.segs.push(Seg::Inline(start, len));
         }
     }
-    /// Append a DATA body chunk by reference — zero copy.
+    /// Append a DATA body chunk. Small bodies (<= 2 KiB) coalesce into `inline` so a
+    /// multiplexed batch of small responses flushes as one contiguous segment instead of
+    /// overflowing `STACK_IOV` / `RETAINED_FLUSH_METADATA` (64). Larger bodies stay zero-copy.
     #[inline]
     pub(super) fn body(&mut self, b: Bytes) {
-        if !b.is_empty() {
-            self.segs.push(Seg::Body(b));
+        const SMALL_BODY_INLINE_MAX: usize = 2048;
+        if b.is_empty() {
+            return;
         }
+        if b.len() <= SMALL_BODY_INLINE_MAX {
+            self.frames(|buf| buf.extend_from_slice(&b));
+            return;
+        }
+        self.segs.push(Seg::Body(b));
     }
     fn clear(&mut self) {
         self.inline.clear();
+        if self.inline.capacity() > 256 * 1024 {
+            self.inline.shrink_to(64 * 1024);
+        }
         self.segs.clear();
     }
 }
@@ -1575,7 +1607,18 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
     #[cfg(feature = "monoio")]
     if let Some(fd) = ktls_fd {
         if q.segs.len() <= 1024 {
-            let mut iov: Vec<libc::iovec> = Vec::with_capacity(q.segs.len());
+            const STACK_IOV: usize = 64;
+            let mut stack_iov = [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; STACK_IOV];
+            let mut heap_iov: Vec<libc::iovec> = if q.segs.len() > STACK_IOV {
+                Vec::with_capacity(q.segs.len())
+            } else {
+                Vec::new()
+            };
+            let use_stack = q.segs.len() <= STACK_IOV;
+            let mut stack_len = 0usize;
             let mut total = 0usize;
             for seg in &q.segs {
                 let (ptr, len) = match seg {
@@ -1589,16 +1632,29 @@ async fn monoio_flush_inner<IO: monoio::io::AsyncWriteRent>(
                     Seg::Body(b) => (b.as_ptr() as *mut libc::c_void, b.len()),
                 };
                 if len > 0 {
-                    iov.push(libc::iovec {
+                    let entry = libc::iovec {
                         iov_base: ptr,
                         iov_len: len,
-                    });
+                    };
+                    if use_stack {
+                        if let Some(slot) = stack_iov.get_mut(stack_len) {
+                            *slot = entry;
+                            stack_len += 1;
+                        }
+                    } else {
+                        heap_iov.push(entry);
+                    }
                     total += len;
                 }
             }
+            let (iov_ptr, iov_cnt) = if use_stack {
+                (stack_iov.as_ptr(), stack_len as libc::c_int)
+            } else {
+                (heap_iov.as_ptr(), heap_iov.len() as libc::c_int)
+            };
             // SAFETY: every iovec points into a segment of `q` (inline Vec or a refcounted
-            // `Bytes`) that outlives this synchronous syscall; `iov` has <= 1024 entries.
-            let n = unsafe { libc::writev(fd, iov.as_ptr(), iov.len() as libc::c_int) };
+            // `Bytes`) that outlives this synchronous syscall; `iov_cnt <= 1024`.
+            let n = unsafe { libc::writev(fd, iov_ptr, iov_cnt) };
             let written = if n >= 0 { n as usize } else { 0 };
             if written < total {
                 let mut rest = Vec::with_capacity(total - written);
@@ -1923,6 +1979,7 @@ where
     let mut pending_window: FxHashMap<u32, i64> = FxHashMap::default();
     let mut cancelled: FxHashSet<u32> = FxHashSet::default();
     let mut inflight_sids: FxHashMap<u32, AbortHandle> = FxHashMap::default();
+    let mut ready_responses: Vec<(u32, bool, Response)> = Vec::new();
     let mut cursor = 0usize;
     let mut reading = true;
     let mut accepting = true;
@@ -1959,6 +2016,12 @@ where
     let mut read_fut = Box::pin(monoio_read_once(rh, vec![0u8; H2_READ_CHUNK]));
     // A completed `read_fut` must never be polled again; only EOF leaves it so.
     let mut read_eof = false;
+    // Lazy pinned idle timer: armed once per idle window instead of inserting
+    // and cancelling a fresh timer-wheel entry on every H2 turn.
+    let mut last_activity = std::time::Instant::now();
+    let mut idle_sleep = config
+        .conn_idle_timeout
+        .map(|d| Box::pin(monoio::time::sleep(d)));
 
     loop {
         // 1) Process every complete buffered frame (mirrors serve()).
@@ -1994,7 +2057,7 @@ where
             cursor += total;
             completed_frame = true;
             let block_was_open = recv.open_header_block.is_some();
-            let outcome = process_frame(
+            let outcome = process_frame_with_ready(
                 hdr,
                 &inbuf[payload],
                 &mut streams,
@@ -2009,7 +2072,23 @@ where
                 &mut inflight,
                 &mut cancelled,
                 &mut inflight_sids,
+                Some(&mut ready_responses),
             );
+            for (sid, is_head, resp) in ready_responses.drain(..) {
+                begin_response(
+                    sid,
+                    is_head,
+                    resp,
+                    &mut enc,
+                    &mut out,
+                    &mut outstreams,
+                    &mut send_schedule,
+                    &mut pending_window,
+                    &mut send_conn,
+                    &peer,
+                    &mut block_scratch,
+                );
+            }
             header_block_deadline = next_header_block_deadline(
                 block_was_open,
                 recv.open_header_block.is_some(),
@@ -2127,6 +2206,9 @@ where
                         st.window += delta;
                         overflow |= st.window > i32::MAX as i64;
                     }
+                    for &credit in pending_window.values() {
+                        overflow |= peer.initial_window + credit > i32::MAX as i64;
+                    }
                     if overflow {
                         {
                             // Report the streams already processed (RFC 9113 §6.8, #876).
@@ -2173,22 +2255,24 @@ where
         // Start body deadlines only after the initial header block is fully decoded
         // (END_STREAM requests dispatch synchronously) and extend those that progressed,
         // then expire any stream whose body stalled: release its body accounting and RST it.
-        if let Some(d) = request_body_timeout {
-            advance_body_deadlines(&mut streams, &mut body_progress, d, request_body_ceiling);
-        }
-        let now = std::time::Instant::now();
-        let expired: Vec<u32> = streams
-            .iter()
-            .filter_map(|(&sid, st)| {
-                st.body_deadline
-                    .filter(|&deadline| deadline.into_std() <= now)
-                    .map(|_| sid)
-            })
-            .collect();
-        for sid in expired {
-            pending_window.remove(&sid);
-            if recv.expire_receiving(&mut streams, sid) {
-                out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+        if !streams.is_empty() || !body_progress.is_empty() {
+            if let Some(d) = request_body_timeout {
+                advance_body_deadlines(&mut streams, &mut body_progress, d, request_body_ceiling);
+            }
+            let now = std::time::Instant::now();
+            let expired: Vec<u32> = streams
+                .iter()
+                .filter_map(|(&sid, st)| {
+                    st.body_deadline
+                        .filter(|&deadline| deadline.into_std() <= now)
+                        .map(|_| sid)
+                })
+                .collect();
+            for sid in expired {
+                pending_window.remove(&sid);
+                if recv.expire_receiving(&mut streams, sid) {
+                    out.frames(|b| frame::write_rst_stream(b, sid, error_code::CANCEL));
+                }
             }
         }
 
@@ -2213,6 +2297,7 @@ where
                 &mut outstreams,
                 &mut send_schedule,
                 &mut pending_window,
+                &mut send_conn,
                 &peer,
                 &mut block_scratch,
             );
@@ -2311,7 +2396,7 @@ where
             Some((sid, is_head, resp)) = inflight.next(), if !inflight.is_empty() => {
                 inflight_sids.remove(&sid);
                 if let Some(resp) = resp && !cancelled.remove(&sid) {
-                    begin_response(sid, is_head, resp, &mut enc, &mut out, &mut outstreams, &mut send_schedule, &mut pending_window, &peer, &mut block_scratch);
+                    begin_response(sid, is_head, resp, &mut enc, &mut out, &mut outstreams, &mut send_schedule, &mut pending_window, &mut send_conn, &peer, &mut block_scratch);
                 } else {
                     cancelled.remove(&sid);
                 }
@@ -2332,25 +2417,42 @@ where
                     draining = true;
                 }
             }
-            // Idle bound: no inbound frame within `conn_idle_timeout`. The sleep is
-            // recreated each iteration, so it measures time since the last event. First
+            // Idle bound: no inbound frame within `conn_idle_timeout`. The pinned
+            // timer is re-armed lazily when it fires if activity occurred since it
+            // was armed, avoiding per-turn timer-wheel insert/cancel churn. First
             // fire GOAWAY + drain (let in-flight responses finish); a second idle while
-            // already draining forces the close — bounds a post-handshake slowloris that
-            // the monoio path otherwise never timed out (the tokio `serve` does this).
-            _ = async { match config.conn_idle_timeout { Some(d) => monoio::time::sleep(d).await, None => std::future::pending::<()>().await } }, if reading => {
-                if accepting {
-                    IDLE_CLOSES.fetch_add(1, Ordering::Relaxed);
-                    end.note(ConnEnd::Idle);
-                    let last = recv.goaway_last_stream_id();
-                    out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
-                    accepting = false;
-                    draining = true;
-                } else {
-                    reading = false;
+            // already draining forces the close.
+            _ = async {
+                match idle_sleep.as_mut() {
+                    Some(sleep) => sleep.as_mut().await,
+                    None => std::future::pending::<()>().await,
+                }
+            }, if reading && idle_sleep.is_some() => {
+                if let Some(d) = config.conn_idle_timeout {
+                    let elapsed = last_activity.elapsed();
+                    if elapsed < d {
+                        if let Some(sleep) = idle_sleep.as_mut() {
+                            sleep.as_mut().set(monoio::time::sleep(d - elapsed));
+                        }
+                    } else if accepting {
+                        IDLE_CLOSES.fetch_add(1, Ordering::Relaxed);
+                        end.note(ConnEnd::Idle);
+                        let last = recv.goaway_last_stream_id();
+                        out.frames(|b| frame::write_goaway(b, last, error_code::NO_ERROR));
+                        accepting = false;
+                        draining = true;
+                        last_activity = std::time::Instant::now();
+                        if let Some(sleep) = idle_sleep.as_mut() {
+                            sleep.as_mut().set(monoio::time::sleep(d));
+                        }
+                    } else {
+                        reading = false;
+                    }
                 }
             }
         }
-        if let Some((res, b, reader)) = read_done {
+        if let Some((res, mut b, reader)) = read_done {
+            last_activity = std::time::Instant::now();
             match res {
                 Ok(0) => {
                     if accepting {
@@ -2361,7 +2463,15 @@ where
                     accepting = false;
                     read_eof = true;
                 }
-                Ok(n) => inbuf.extend_from_slice(&b[..n]),
+                Ok(n) => {
+                    if inbuf.is_empty() && cursor == 0 {
+                        b.truncate(n);
+                        std::mem::swap(&mut inbuf, &mut b);
+                        b.resize(H2_READ_CHUNK, 0);
+                    } else {
+                        inbuf.extend_from_slice(&b[..n]);
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     if accepting {
                         PEER_CLOSES.fetch_add(1, Ordering::Relaxed);

@@ -94,7 +94,7 @@ impl Stapling {
                 leaf.to_vec(),
                 Entry {
                     slot,
-                    stapled: Mutex::new(None),
+                    stapled: arc_swap::ArcSwapOption::empty(),
                 },
             );
         }
@@ -134,7 +134,7 @@ impl Stapling {
 
 struct Entry {
     slot: Arc<Slot>,
-    stapled: Mutex<Option<(Arc<Staple>, Arc<CertifiedKey>)>>,
+    stapled: arc_swap::ArcSwapOption<(Arc<Staple>, Arc<CertifiedKey>)>,
 }
 pub(crate) struct Slots {
     selected: HashMap<Vec<u8>, Entry>,
@@ -149,47 +149,38 @@ impl std::fmt::Debug for Slots {
 impl Slots {
     pub(crate) fn resolve(&self, key: Arc<CertifiedKey>) -> Option<Arc<CertifiedKey>> {
         let entry = self.selected.get(key.cert.first()?.as_ref())?;
-        match entry.slot.decision() {
-            Decision::Reject => None,
-            Decision::Omit => {
-                if key.ocsp.is_none() {
-                    Some(key)
-                } else {
-                    let mut clean = (*key).clone();
-                    clean.ocsp = None;
-                    Some(Arc::new(clean))
-                }
-            }
-            Decision::Staple(staple) => {
-                let Some(bytes) = staple.bytes() else {
-                    // Expired between decision() and use: re-decide so an
-                    // optional slot omits the staple instead of failing.
-                    return match entry.slot.decision() {
-                        Decision::Omit => {
-                            if key.ocsp.is_none() {
-                                Some(key)
-                            } else {
-                                let mut clean = (*key).clone();
-                                clean.ocsp = None;
-                                Some(Arc::new(clean))
-                            }
-                        }
-                        _ => None,
+        for _ in 0..2 {
+            match entry.slot.decision() {
+                Decision::Reject => return None,
+                Decision::Omit => {
+                    return if key.ocsp.is_none() {
+                        Some(key)
+                    } else {
+                        let mut clean = (*key).clone();
+                        clean.ocsp = None;
+                        Some(Arc::new(clean))
                     };
-                };
-                let mut cached = entry.stapled.lock();
-                if let Some((old, key)) = &*cached {
-                    if Arc::ptr_eq(old, &staple) {
-                        return Some(key.clone());
-                    }
                 }
-                let mut next = (*key).clone();
-                next.ocsp = Some(bytes.to_vec());
-                let next = Arc::new(next);
-                *cached = Some((staple, next.clone()));
-                Some(next)
+                Decision::Staple(staple) => {
+                    if let Some(bytes) = staple.bytes() {
+                        let cached = entry.stapled.load();
+                        if let Some(pair) = cached.as_deref()
+                            && Arc::ptr_eq(&pair.0, &staple)
+                        {
+                            return Some(pair.1.clone());
+                        }
+                        let mut next = (*key).clone();
+                        next.ocsp = Some(bytes.to_vec());
+                        let next = Arc::new(next);
+                        entry.stapled.store(Some(Arc::new((staple, next.clone()))));
+                        return Some(next);
+                    }
+                    // Expired between decision() and use: retry once so a
+                    // concurrently installed fresh staple or optional Omit is honored.
+                }
             }
         }
+        None
     }
 }
 

@@ -217,10 +217,29 @@ fn looks_like_route(path: &str) -> bool {
 /// moves where the request is served: a stale "missing" bridges, and dispatch()
 /// consults the same cache.
 fn docroot_target_may_exist(state: &ServerState, doc_root: &Path, path: &str) -> bool {
-    state
-        .stat_cache
-        .tests(&doc_root.join(path.trim_start_matches('/')))
-        .is_some()
+    thread_local! {
+        static JOIN_SCRATCH: std::cell::RefCell<std::ffi::OsString> =
+            const { std::cell::RefCell::new(std::ffi::OsString::new()) };
+    }
+    let rel = path.trim_start_matches('/');
+    JOIN_SCRATCH.with(|cell| {
+        let Ok(mut buf) = cell.try_borrow_mut() else {
+            return state.stat_cache.tests(&doc_root.join(rel)).is_some();
+        };
+        buf.clear();
+        buf.push(doc_root.as_os_str());
+        if !rel.is_empty() {
+            if !doc_root.as_os_str().as_encoded_bytes().ends_with(b"/") {
+                buf.push("/");
+            }
+            buf.push(rel);
+        }
+        let hit = state.stat_cache.tests(Path::new(&*buf)).is_some();
+        if buf.capacity() > 4096 {
+            *buf = std::ffi::OsString::new();
+        }
+        hit
+    })
 }
 
 /// Decline the on-core path (dispatch() serves the request) and count why.
@@ -229,6 +248,7 @@ fn bridge(state: &ServerState, why: FastBridge) -> Option<Response> {
     None
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn fast_serve(
     state: &Arc<ServerState>,
@@ -242,6 +262,72 @@ pub(crate) async fn fast_serve(
     proto: Proto,
     tls: Option<hj_core::TlsParams>,
     req: &Request,
+) -> Option<Response> {
+    fast_serve_inner(
+        state,
+        listener,
+        peer_ip,
+        local_addr,
+        peer_port,
+        is_tls,
+        client_auth_requested,
+        peer_unix,
+        proto,
+        tls.as_ref(),
+        req,
+        false,
+    )
+    .await
+}
+
+/// On-core fast path for the io_uring transports: allows `fast_memo` hits to
+/// return `hj_core::SharedHeaders(Arc<HeaderMap>)` when `!state.request_id_header`,
+/// eliminating `HeaderMap::clone()` on every H1/H2/H3 fast-memo hit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fast_serve_uring(
+    state: &Arc<ServerState>,
+    listener: &str,
+    peer_ip: IpAddr,
+    local_addr: std::net::SocketAddr,
+    peer_port: u16,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    proto: Proto,
+    tls: Option<&hj_core::TlsParams>,
+    req: &Request,
+) -> Option<Response> {
+    fast_serve_inner(
+        state,
+        listener,
+        peer_ip,
+        local_addr,
+        peer_port,
+        is_tls,
+        client_auth_requested,
+        peer_unix,
+        proto,
+        tls,
+        req,
+        !state.request_id_header,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fast_serve_inner(
+    state: &Arc<ServerState>,
+    listener: &str,
+    peer_ip: IpAddr,
+    local_addr: std::net::SocketAddr,
+    peer_port: u16,
+    is_tls: bool,
+    client_auth_requested: bool,
+    peer_unix: bool,
+    proto: Proto,
+    tls: Option<&hj_core::TlsParams>,
+    req: &Request,
+    use_shared_headers: bool,
 ) -> Option<Response> {
     let proto = effective_proto(proto, req);
     let req_start = std::time::Instant::now();
@@ -345,16 +431,18 @@ pub(crate) async fn fast_serve(
             None => return bridge(state, FastBridge::NoHost),
         },
     };
-    let Some((vhost_name, vhost_cfg)) = state.router.resolve_ref(listener, route_key) else {
+    let Some((vhost_name, vhost_cfg, route_exact)) =
+        state.router.resolve_ref_with_exact(listener, route_key)
+    else {
         return bridge(state, FastBridge::NoVhost);
     };
     if vhost_cfg.disabled {
         return bridge(state, FastBridge::VhostDisabled);
     }
-    if !state.acl.check_peer(peer_ip).is_allowed() {
+    let (peer_acl, trusted_proxy) = state.acl.classify_peer(peer_ip);
+    if !peer_acl.is_allowed() {
         return bridge(state, FastBridge::Acl); // let the bridge render the 403 with the full pipeline
     }
-    let trusted_proxy = state.acl.is_trusted(peer_ip);
     let effective_https = effective_request_https(is_tls, trusted_proxy, req.headers());
     // (SEC) mTLS trust-boundary parity with `handle()`: a plaintext request to an
     // mTLS-required vhost from a non-internal peer must be 301'd to HTTPS *before* any
@@ -413,21 +501,26 @@ pub(crate) async fn fast_serve(
             query: req.uri().query().unwrap_or(""),
             ae: ae_bytes,
         };
-        let tls_ref = tls.as_ref();
         if let Some(probed) = fast_memo::probe_serve(
             &mk,
             req,
             &state.ua_classify,
             req_start,
+            use_shared_headers,
             || {
-                let mtls_ok = mtls_ok(client_auth_requested, is_tls, tls_ref);
-                let client_ip = state.acl.resolve_client_ip(
+                let mtls_ok = mtls_ok(client_auth_requested, is_tls, tls);
+                let client_ip = state.acl.resolve_client_ip_with_trust(
                     peer_ip,
+                    trusted_proxy,
                     req.headers(),
                     state.server.use_ip_in_proxy_header,
                     mtls_ok,
                 );
-                if !state.acl.check_client(peer_ip, client_ip).is_allowed() {
+                if !state
+                    .acl
+                    .check_client_after_peer(peer_ip, true, client_ip)
+                    .is_allowed()
+                {
                     return Err(FastBridge::Acl);
                 }
                 if !state.geo.allows(client_ip) {
@@ -443,11 +536,14 @@ pub(crate) async fn fast_serve(
             },
             FastBridge::MemoChanged,
         ) {
-            let (mut resp, client_ip, page_serve) = match probed {
+            let (mut resp, client_ip, page_serve, date_sec) = match probed {
                 Ok(hit) => hit,
                 Err(why) => return bridge(state, why),
             };
-            if !state.client_throttle.allow_deferring_rejection(client_ip) {
+            if !state
+                .client_throttle
+                .allow_deferring_rejection_at(client_ip, req_start)
+            {
                 return bridge(state, FastBridge::Throttle); // over the per-IP rate: dispatch() renders the 429
             }
             // Counted only once admitted: a refused probe is rendered (and counted) by handle().
@@ -469,20 +565,22 @@ pub(crate) async fn fast_serve(
                 };
                 stamp_bandwidth_vhost(
                     vhost_cfg,
-                    &normalized_request_path(&path),
+                    &rewrite_glue::normalized_request_path_cow(&path),
                     state.serve_config.bandwidth_limit,
                     &mut resp,
                 );
             }
             return Some(record_fast_memo_serve(
-                state, vhost_name, vhost_idx, client_ip, peer_unix, proto, req, req_start, resp,
+                state, vhost_name, vhost_idx, client_ip, peer_unix, proto, req, req_start,
+                date_sec, resp,
             ));
         }
     }
-    let orig_path = match decode_request_path(req.uri().path()) {
-        Some(p) => normalized_request_path(&p),
+    let orig_path_decoded = match decode_request_path(req.uri().path()) {
+        Some(p) => p,
         None => return bridge(state, FastBridge::MalformedPath), // let the bridge render the error
     };
+    let orig_path = rewrite_glue::normalized_request_path_cow(&orig_path_decoded);
     let orig_query = req.uri().query().unwrap_or("");
     // (#343 Step 1) Cookie census on every fast-path GET/HEAD that reaches the routed
     // prefix: names only, values never read — the benign-only share among cookied
@@ -537,19 +635,18 @@ pub(crate) async fn fast_serve(
         is_tls: effective_https,
         peer_unix,
         protocol: proto,
-        forwarding_trusted: forwarding_trusted(trusted_proxy, client_auth_requested, tls.as_ref()),
+        forwarding_trusted: forwarding_trusted(trusted_proxy, client_auth_requested, tls),
         trusted_proxy,
         env: Vec::new(),
         local_addr,
         peer_port,
-        tls,
+        tls: tls.cloned(),
         request_time: std::time::SystemTime::now(),
         request_id: hj_core::reqid::next(),
         redirect_guard: None,
     };
     let req_host = lscache::request_host(req, &ctx);
-    let host_foreign = !req_host.eq_ignore_ascii_case(&ctx.vhost_name)
-        && !state.router.host_is_exact(listener, &req_host);
+    let host_foreign = !route_exact && !req_host.eq_ignore_ascii_case(&ctx.vhost_name);
     // (--fast-early-bridge) The same certainty for a cookieless request, once the page cache
     // provably cannot answer it either.
     let mut early_predicted = false;
@@ -611,13 +708,18 @@ pub(crate) async fn fast_serve(
     // peer (the Cloudflare edge IP). Mirrors `record_fast_serve` / `handle()`; honors
     // the mtls-ok-vs-real-IP invariant (no client cert required under a non-mTLS vhost).
     let mtls_ok = mtls_ok(client_auth_requested, is_tls, ctx.tls.as_ref());
-    ctx.client_ip = state.acl.resolve_client_ip(
+    ctx.client_ip = state.acl.resolve_client_ip_with_trust(
         peer_ip,
+        trusted_proxy,
         req.headers(),
         state.server.use_ip_in_proxy_header,
         mtls_ok,
     );
-    if !state.acl.check_client(peer_ip, ctx.client_ip).is_allowed() {
+    if !state
+        .acl
+        .check_client_after_peer(peer_ip, true, ctx.client_ip)
+        .is_allowed()
+    {
         return bridge(state, FastBridge::Acl); // the full pipeline renders the identical ACL 403
     }
     if !state.geo.allows(ctx.client_ip) {
@@ -626,11 +728,7 @@ pub(crate) async fn fast_serve(
         return bridge(state, FastBridge::Acl);
     }
     ctx.env.reserve(8);
-    if let Some(ae) = req
-        .headers()
-        .get(http::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-    {
+    if seen_ae && let Ok(ae) = std::str::from_utf8(ae_bytes) {
         ctx.set_env("HTTP_ACCEPT_ENCODING", ae.to_string());
     }
     set_redirect_guard(&mut ctx, req.uri(), &req_host);
@@ -648,7 +746,7 @@ pub(crate) async fn fast_serve(
     {
         return bridge(state, FastBridge::SetEnv);
     }
-    let orig_rel = resolved_rel_path(&orig_path);
+    let orig_rel = rewrite_glue::rel_from_normalized(&orig_path);
     if access_denied(&chain, &orig_path, method.as_str(), &ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
     {
@@ -679,17 +777,21 @@ pub(crate) async fn fast_serve(
         return bridge(state, FastBridge::RewriteCrossDir);
     }
     let cache_vary_env;
+    let rewrite_env_empty;
     let mut rewritten_query = None;
     let (cache_path, cache_rel, rewrite_unchanged): (Cow<'_, str>, Cow<'_, str>, bool) = match rw {
         RwResult::Unchanged { env } => {
+            rewrite_env_empty = env.is_empty();
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
             (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), true)
         }
         RwResult::Proxy { env, .. } => {
+            rewrite_env_empty = env.is_empty();
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
             (Cow::Borrowed(&orig_path), Cow::Borrowed(&orig_rel), false)
         }
         RwResult::Rewritten { path, query, env } => {
+            rewrite_env_empty = env.is_empty();
             cache_vary_env = merge_rewrite_env(&mut ctx, env);
             // A rewrite INTO a non-ancestor directory makes dispatch() reload the
             // destination chain (#8); the on-core path bridges instead of guessing.
@@ -724,7 +826,7 @@ pub(crate) async fn fast_serve(
     // (#857) `needs_dispatch` above guarantees `chain_with_dirs` is every chain
     // whose rules ran, so it is the whole input set of this request's response.
     let page_cache_branch = state.page_cache.is_some()
-        && !req.headers().contains_key(http::header::COOKIE)
+        && !has_cookie
         && lscache::raw_path_is_cache_canonical(req.uri().path(), &orig_path)
         && lscache::raw_host_is_cache_canonical(req, ctx.is_tls)
         && !rewrite_glue::page_cache_unkeyed(state, &ctx, chain.iter().map(|h| &**h));
@@ -739,6 +841,7 @@ pub(crate) async fn fast_serve(
             method.as_str(),
             host_foreign,
             rewrite_unchanged,
+            rewrite_env_empty,
         )
     {
         return bridge(state, why);
@@ -752,6 +855,7 @@ pub(crate) async fn fast_serve(
         ResourceRequest::new(req, &orig_query),
         &orig_path,
         &chain,
+        rewrite_env_empty,
     );
     if let Some(deadline) = target_policy.deadline {
         policy_deadline = policy_deadline.min(deadline);
@@ -771,6 +875,7 @@ pub(crate) async fn fast_serve(
             &cache_rel,
             ResourceRequest::new(req, rewritten_query.as_deref().unwrap_or(orig_query)),
             *cache_path != *orig_path,
+            rewrite_env_empty,
             target_policy.script.as_ref(),
         ) {
             return bridge(state, FastBridge::PostRewrite);
@@ -784,7 +889,7 @@ pub(crate) async fn fast_serve(
         let origin_vary = req
             .headers()
             .get(http::header::ORIGIN)
-            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            .map(hj_core::header_value_lossy);
         let ua_class =
             rewrite_glue::page_cache_ua_class(state, &ctx, &chain_with_dirs, req.headers());
         let header_vary =
@@ -800,7 +905,8 @@ pub(crate) async fn fast_serve(
             chain: &chain,
             // Only a store reads the render epoch, and this branch never stores.
             render_epoch: 0,
-            has_range: req.headers().contains_key(http::header::RANGE),
+            // Range requests already returned early at the top of `fast_serve`.
+            has_range: false,
             host_foreign,
             // Cookieless by branch precondition ⇒ the public vary value is "".
             vary_value: Some(""),
@@ -809,10 +915,13 @@ pub(crate) async fn fast_serve(
             header_vary: header_vary.as_deref(),
             env_vary: cache_vary_env,
         };
-        let inm = req
-            .headers()
-            .get(http::header::IF_NONE_MATCH)
-            .and_then(|v| v.to_str().ok());
+        let inm = if has_conditional_or_auth {
+            req.headers()
+                .get(http::header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+        } else {
+            None
+        };
         // The fast-path lookup records the hit it returns; an over-rate client must
         // not reach it, or its 429 would count as a cache hit (#838).
         if !state.client_throttle.would_allow(ctx.client_ip) {
@@ -833,7 +942,7 @@ pub(crate) async fn fast_serve(
             );
             // Same funnel as handle(): an Authorization request is never shared-cacheable (#414, #841).
             mark_auth_sensitive(
-                req.headers().contains_key(http::header::AUTHORIZATION),
+                has_conditional_or_auth && req.headers().contains_key(http::header::AUTHORIZATION),
                 &ctx,
                 &mut resp,
             );
@@ -878,10 +987,7 @@ pub(crate) async fn fast_serve(
                         host: route_key.as_deref().unwrap_or("").as_bytes(),
                         path: req.uri().path(),
                         query: req.uri().query().unwrap_or(""),
-                        ae: req
-                            .headers()
-                            .get(http::header::ACCEPT_ENCODING)
-                            .map_or(b"", http::HeaderValue::as_bytes),
+                        ae: ae_bytes,
                     },
                     vary,
                     &resp,
@@ -915,6 +1021,7 @@ pub(crate) async fn fast_serve(
             method.as_str(),
             host_foreign,
             rewrite_unchanged,
+            rewrite_env_empty,
         )
     {
         return bridge(state, why);
@@ -1291,6 +1398,7 @@ fn static_branch_bridge(
     method: &str,
     host_foreign: bool,
     rewrite_unchanged: bool,
+    rewrite_env_empty: bool,
 ) -> Option<FastBridge> {
     if host_foreign {
         return Some(FastBridge::HostForeign);
@@ -1298,7 +1406,7 @@ fn static_branch_bridge(
     if !rewrite_unchanged {
         return Some(FastBridge::Rewritten);
     }
-    if access_denied(chain, path, method, ctx) {
+    if !rewrite_env_empty && access_denied(chain, path, method, ctx) {
         return Some(FastBridge::AccessDenied);
     }
     if matching_proxy_context(ctx, path).is_some() {
@@ -1331,11 +1439,13 @@ fn fast_post_rewrite_bridges(
     cur_rel: &str,
     request: ResourceRequest<'_>,
     rewritten: bool,
+    rewrite_env_empty: bool,
     opened: Option<&scoped_auth::OpenedScript>,
 ) -> bool {
     let method = request.method;
-    if access_denied(chain, cur_path, method, ctx)
-        || access_deny_dir(&state.acl, &ctx.vhost.doc_root, cur_rel)
+    if (rewritten || !rewrite_env_empty)
+        && (access_denied(chain, cur_path, method, ctx)
+            || access_deny_dir(&state.acl, &ctx.vhost.doc_root, cur_rel))
     {
         return true;
     }
@@ -1405,6 +1515,7 @@ fn fast_post_rewrite_bridges(
 /// trusted+mTLS peer) before calling, so the fast path does not log the Cloudflare edge
 /// IP for every guest.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn record_fast_memo_serve(
     state: &Arc<ServerState>,
     vhost_name: &str,
@@ -1414,6 +1525,7 @@ fn record_fast_memo_serve(
     proto: Proto,
     req: &Request,
     req_start: std::time::Instant,
+    date_sec: u64,
     mut resp: Response,
 ) -> Response {
     let log = state.access_logger_for(vhost_name);
@@ -1433,9 +1545,13 @@ fn record_fast_memo_serve(
         .requests_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let status = resp.status().as_u16();
-    state
-        .telemetry
-        .record_request(proto, status, req_start.elapsed(), vhost_idx);
+    let end = std::time::Instant::now();
+    state.telemetry.record_request(
+        proto,
+        status,
+        end.saturating_duration_since(req_start),
+        vhost_idx,
+    );
     let Some(log) = log else {
         return resp;
     };
@@ -1457,8 +1573,8 @@ fn record_fast_memo_serve(
         } else {
             None
         };
-        let ts = std::time::SystemTime::now();
-        chunk_access_line(log, |buf, format| {
+        let ts = std::time::UNIX_EPOCH + std::time::Duration::from_secs(date_sec);
+        chunk_access_line_at(log, end, |buf, format| {
             hj_log::render_access_line_with_host_reqid_u64_into(
                 buf,
                 format,
@@ -1721,38 +1837,59 @@ async fn apply_response_transforms(
     if !state.extensions.is_empty() {
         state.extensions.run_response_transforms(ctx, resp).await;
     }
+    // 1. Cache small static files in RAM (sync).
+    maybe_cache_static(
+        &state.static_cache,
+        crate::lscache::vhost_id_hash(&ctx.vhost_name),
+        resp,
+    );
+    // 2. Apply Expires / Cache-Control rules (sync; short-circuits on existing CC/Expires).
+    state.expires_transform.apply(ctx, resp);
+    // 3. (Tier 2) sub_filter runs BEFORE compress; only async when a plan is stamped.
+    if resp.extensions().get::<SubFilterPlan>().is_some() {
+        SubFilterTransform.transform(ctx, resp).await;
+    }
+    // 4. Response compression (sync, or sliced async when above buffered_work threshold).
     let threshold = if bridged {
         state.buffered_work.threshold()
     } else {
         0
     };
-    for transform in &state.transforms {
-        if threshold == 0
-            || Arc::as_ptr(transform).cast::<()>() != Arc::as_ptr(&state.compress).cast::<()>()
-        {
-            transform.transform(ctx, resp).await;
-            continue;
-        }
+    if threshold > 0 {
         let bytes = match resp.body() {
             Body::Full(bytes) => bytes.len() as u64,
             Body::File(file) => file.cached.as_ref().map_or(0, |bytes| bytes.len() as u64),
             _ => 0,
         };
-        let accept = if state.compress.cf_send_zstd() && ctx.trusted_proxy {
-            "zstd"
+        if bytes >= threshold && !hj_compress::no_gzip(ctx) {
+            let accept = if state.compress.cf_send_zstd() && ctx.trusted_proxy {
+                "zstd"
+            } else {
+                ctx.get_env(hj_compress::ACCEPT_ENCODING_ENV)
+                    .or_else(|| ctx.get_env("accept-encoding"))
+                    .unwrap_or("")
+            };
+            if state.compress.should_compress(resp, accept).is_some() {
+                state.buffered_work.record_encode(bytes);
+                state.compress.transform_in_slices(ctx, resp).await;
+            } else {
+                state.compress.transform_sync(ctx, resp);
+            }
         } else {
-            ctx.get_env(hj_compress::ACCEPT_ENCODING_ENV)
-                .or_else(|| ctx.get_env("accept-encoding"))
-                .unwrap_or("")
-        };
-        if bytes >= threshold
-            && !hj_compress::no_gzip(ctx)
-            && state.compress.should_compress(resp, accept).is_some()
-        {
-            state.buffered_work.record_encode(bytes);
-            state.compress.transform_in_slices(ctx, resp).await;
-        } else {
-            transform.transform(ctx, resp).await;
+            state.compress.transform_sync(ctx, resp);
+        }
+    } else {
+        state.compress.transform_sync(ctx, resp);
+    }
+    // 5. Deny CDN caching on same-host origin redirects and strip internal label (sync).
+    DenyRedirectCdnTransform::apply(ctx, resp);
+    // 6. Advertise HTTP/3 via Alt-Svc on TLS H1/H2 responses (sync).
+    if ctx.tls.is_some() && ctx.protocol != Proto::Http3 {
+        if let Some(alt) = &state.alt_svc {
+            if !resp.headers().contains_key(http::header::ALT_SVC) {
+                resp.headers_mut()
+                    .insert(http::header::ALT_SVC, alt.clone());
+            }
         }
     }
 }
@@ -1948,7 +2085,10 @@ async fn handle_inner(
 
     let route_key = request_route_key(&req, sni);
 
-    let resolved = match state.router.resolve(listener, route_key.as_deref()) {
+    let (resolved, route_exact) = match state
+        .router
+        .resolve_with_exact(listener, route_key.as_deref())
+    {
         Some(r) => r,
         None => {
             // A host that resolves to a real vhost whose per-vhost config file failed to load is an
@@ -1998,7 +2138,7 @@ async fn handle_inner(
     // `tls.is_some()` stays the test for a *physical* TLS handshake (client cert / SSL_*
     // env / Alt-Svc). With the current CF→origin-over-HTTPS topology this is identical to
     // `is_tls` for live traffic; it only engages if CF is switched to "Flexible" SSL.
-    let trusted_proxy = state.acl.is_trusted(peer_ip);
+    let (peer_acl, trusted_proxy) = state.acl.classify_peer(peer_ip);
     let effective_https = effective_request_https(is_tls, trusted_proxy, req.headers());
 
     match mtls_gate(
@@ -2032,23 +2172,42 @@ async fn handle_inner(
     // disabling CF-Connecting-IP real-IP resolution (every visitor resolved to the CF edge IP).
     let mtls_ok = mtls_ok(client_auth_requested, is_tls, tls.as_ref());
     let forwarding_trusted = forwarding_trusted(trusted_proxy, client_auth_requested, tls.as_ref());
-    let client_ip = state.acl.resolve_client_ip(
+    let client_ip = state.acl.resolve_client_ip_with_trust(
         peer_ip,
+        trusted_proxy,
         req.headers(),
         state.server.use_ip_in_proxy_header,
         mtls_ok,
     );
 
-    // Capture log fields before the request body is consumed downstream.
+    // Capture log fields before the request body is consumed downstream, gated on
+    // whether an access logger is active and which headers its LogFormat renders.
+    let access_log = state.access_logger_for(&resolved.name);
+    let log_mask = access_log.map_or(0, |l| l.format().header_mask());
     let log_method = method_static(req.method());
-    let log_uri = req
-        .uri()
-        .path_and_query()
-        .map_or("/", http::uri::PathAndQuery::as_str)
-        .to_owned();
-    let referer = header_bytes(&req, http::header::REFERER);
-    let user_agent = header_bytes(&req, http::header::USER_AGENT);
-    let host_hdr = header_bytes(&req, http::header::HOST);
+    let log_uri = if access_log.is_some() || state.vhost_error_logger(&resolved.name).is_some() {
+        req.uri()
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str)
+            .to_owned()
+    } else {
+        String::new()
+    };
+    let referer = if log_mask & 1 != 0 {
+        header_bytes(&req, http::header::REFERER)
+    } else {
+        None
+    };
+    let user_agent = if log_mask & 2 != 0 {
+        header_bytes(&req, http::header::USER_AGENT)
+    } else {
+        None
+    };
+    let host_hdr = if log_mask & 4 != 0 {
+        header_bytes(&req, http::header::HOST)
+    } else {
+        None
+    };
 
     let mut ctx = ReqCtx {
         server: state.server.clone(),
@@ -2082,8 +2241,7 @@ async fn handle_inner(
     // Computed ONCE here (B4) and moved into `dispatch`, which reuses it as `cache_host` instead
     // of recomputing the identical value — the comment below already requires the two to agree.
     let req_host = lscache::request_host(&req, &ctx);
-    let host_foreign = !req_host.eq_ignore_ascii_case(&ctx.vhost_name)
-        && !state.router.host_is_exact(listener, &req_host);
+    let host_foreign = !route_exact && !req_host.eq_ignore_ascii_case(&ctx.vhost_name);
 
     // (Tier 2) Captured only when a context declares a bandwidthLimit — the per-request
     // path allocation stays off the hot path otherwise (the connection-wide tuning rate
@@ -2106,7 +2264,11 @@ async fn handle_inner(
     // request before any handler or the page cache runs (#1000).
     let mut resp = if ctx.vhost.disabled {
         error_page(StatusCode::FORBIDDEN)
-    } else if !state.acl.check_client(peer_ip, client_ip).is_allowed() {
+    } else if !state
+        .acl
+        .check_client_after_peer(peer_ip, peer_acl.is_allowed(), client_ip)
+        .is_allowed()
+    {
         error_page(StatusCode::FORBIDDEN)
     } else if !state.client_throttle.allow(client_ip) {
         error_page(StatusCode::TOO_MANY_REQUESTS)
@@ -2214,7 +2376,7 @@ async fn handle_inner(
     // ---- Access log ------------------------------------------------------
     // (#248) A vhost declaring its own `<logging><accessLog>` records there;
     // everyone else rides the unified log.
-    if let Some(log) = state.access_logger_for(&ctx.vhost_name) {
+    if let Some(log) = access_log {
         // (#248) Mirror 5xx responses into the vhost's own error file when it
         // declares one — the closest per-vhost analogue of LSWS's error log
         // (httpjet has no per-vhost stderr stream to route). Built before the
@@ -2351,6 +2513,14 @@ fn chunk_access_line(
     log: &Arc<hj_log::AccessLogger>,
     render: impl FnOnce(&mut Vec<u8>, hj_log::LogFormat),
 ) {
+    chunk_access_line_at(log, std::time::Instant::now(), render);
+}
+
+fn chunk_access_line_at(
+    log: &Arc<hj_log::AccessLogger>,
+    now: std::time::Instant,
+    render: impl FnOnce(&mut Vec<u8>, hj_log::LogFormat),
+) {
     let key = Arc::as_ptr(log) as usize;
     ACCESS_CHUNKS.with(|chunks| {
         let mut chunks = chunks.borrow_mut();
@@ -2358,16 +2528,16 @@ fn chunk_access_line(
             logger: log.clone(),
             buf: Vec::with_capacity(ACCESS_CHUNK_CAPACITY),
             lines: 0,
-            first: std::time::Instant::now(),
+            first: now,
         });
         let started = entry.lines == 0;
         if started {
-            entry.first = std::time::Instant::now();
+            entry.first = now;
         }
         render(&mut entry.buf, log.format());
         entry.lines += 1;
         if entry.buf.len() >= ACCESS_CHUNK_FLUSH_BYTES
-            || entry.first.elapsed() >= ACCESS_CHUNK_MAX_AGE
+            || now.saturating_duration_since(entry.first) >= ACCESS_CHUNK_MAX_AGE
         {
             entry.ship();
         } else if started {
@@ -3840,7 +4010,7 @@ async fn dispatch(
     // index.php and escape the deny (403 only happens for existing files), and a
     // `[P]` rule could proxy a denied path. The post-rewrite checks below still
     // catch a rewrite INTO a denied path; this adds the pre-rewrite guarantee.
-    let orig_rel = resolved_rel_path(&orig_path);
+    let orig_rel = rewrite_glue::rel_from_normalized(&orig_path);
     if access_denied(&chain, &orig_path, req.method().as_str(), ctx)
         || access_deny_dir(&state.acl, &ctx.vhost.doc_root, &orig_rel)
     {
@@ -4121,10 +4291,10 @@ async fn dispatch(
     // The docroot-relative, normalized path used for access / header scoping. When the rewrite
     // left the path unchanged (the common case), this equals `orig_rel` already computed for the
     // pre-rewrite access check — reuse it (a move, no second normalization alloc).
-    let rel_path = if rewritten {
-        resolved_rel_path(&cur_path)
+    let rel_path: Cow<'_, str> = if rewritten {
+        Cow::Owned(resolved_rel_path(&cur_path))
     } else {
-        orig_rel
+        Cow::Borrowed(orig_rel)
     };
 
     // A rewrite may route an originally unbounded URI into a context with a
@@ -7019,6 +7189,7 @@ pub(super) fn apply_expires(expires: &hj_compress::ExpiresRules, now: i64, resp:
 // compress -> deny-CDN-cache-on-redirects -> advertise-h3. Built once per ServerState.
 
 /// Promote a small static `Body::File` to an in-memory `Body::Full` (lets gzip run).
+#[allow(dead_code)]
 pub(crate) struct CacheStaticTransform {
     pub static_cache: std::sync::Arc<hj_pagecache::PageStore>,
 }
@@ -7042,9 +7213,74 @@ pub(crate) struct ExpiresTransform {
     pub vhost_expires: std::collections::HashMap<String, std::sync::Arc<hj_compress::ExpiresRules>>,
     pub vhost_expires_enabled: std::collections::HashMap<String, bool>,
 }
-#[async_trait]
-impl ResponseTransform for ExpiresTransform {
-    async fn transform(&self, ctx: &ReqCtx, resp: &mut Response) {
+impl ExpiresTransform {
+    pub(crate) fn apply(&self, ctx: &ReqCtx, resp: &mut Response) {
+        // Fast short-circuit BEFORE any HashMap lookup or Content-Type scan:
+        // page-cache hits and most dynamic responses already carry Cache-Control
+        // or Expires, and non-200/206/304 statuses never receive expires headers.
+        if !matches!(
+            resp.status(),
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::NOT_MODIFIED
+        ) {
+            return;
+        }
+        if resp.headers().contains_key(http::header::CACHE_CONTROL)
+            || resp.headers().contains_key(http::header::EXPIRES)
+        {
+            return;
+        }
+        if resp.extensions().get::<AuthSensitiveResponse>().is_some() {
+            resp.headers_mut().insert(
+                http::header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            );
+            return;
+        }
+        let decision = resp
+            .extensions()
+            .get::<hj_rewrite::ExpiresDecision>()
+            .copied()
+            .unwrap_or(hj_rewrite::ExpiresDecision::Inherit);
+        let native_enabled = || {
+            self.vhost_expires_enabled
+                .get(&ctx.vhost_name)
+                .copied()
+                .unwrap_or(self.expires_enabled)
+        };
+        let lookup_native = || {
+            let native_rules = self
+                .vhost_expires
+                .get(&ctx.vhost_name)
+                .unwrap_or(&self.expires);
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|content_type| native_rules.lookup(content_type))
+        };
+        let selected = match decision {
+            hj_rewrite::ExpiresDecision::Off => None,
+            hj_rewrite::ExpiresDecision::On => lookup_native(),
+            hj_rewrite::ExpiresDecision::Rule {
+                rule,
+                kind,
+                inherit_active,
+            } => (!inherit_active || native_enabled()).then(|| match kind {
+                hj_rewrite::ExpiresRuleKind::ByType => rule,
+                // OLS selects a MIME setting (including an ExpiresByType
+                // wildcard) before the context's ExpiresDefault.
+                hj_rewrite::ExpiresRuleKind::Default => lookup_native().unwrap_or(rule),
+            }),
+            hj_rewrite::ExpiresDecision::Inherit => {
+                if native_enabled() {
+                    lookup_native()
+                } else {
+                    None
+                }
+            }
+        };
+        if selected.is_none() {
+            return;
+        }
         // Expiry is relative to the request's arrival stamp — one clock read per
         // request (taken at ReqCtx build) instead of another here.
         let now = ctx
@@ -7052,49 +7288,13 @@ impl ResponseTransform for ExpiresTransform {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or_else(|_| unix_now());
-        let native_enabled = self
-            .vhost_expires_enabled
-            .get(&ctx.vhost_name)
-            .copied()
-            .unwrap_or(self.expires_enabled);
-        let native_rules = self
-            .vhost_expires
-            .get(&ctx.vhost_name)
-            .unwrap_or(&self.expires);
-        let native_rule = resp
-            .headers()
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| native_rules.lookup(content_type));
-        match resp
-            .extensions()
-            .get::<hj_rewrite::ExpiresDecision>()
-            .copied()
-            .unwrap_or(hj_rewrite::ExpiresDecision::Inherit)
-        {
-            hj_rewrite::ExpiresDecision::Off => apply_selected_expires(None, now, resp),
-            hj_rewrite::ExpiresDecision::On => apply_selected_expires(native_rule, now, resp),
-            hj_rewrite::ExpiresDecision::Rule {
-                rule,
-                kind,
-                inherit_active,
-            } => {
-                let selected = (!inherit_active || native_enabled).then(|| match kind {
-                    hj_rewrite::ExpiresRuleKind::ByType => rule,
-                    // OLS selects a MIME setting (including an ExpiresByType
-                    // wildcard) before the context's ExpiresDefault.
-                    hj_rewrite::ExpiresRuleKind::Default => native_rule.unwrap_or(rule),
-                });
-                apply_selected_expires(selected, now, resp)
-            }
-            hj_rewrite::ExpiresDecision::Inherit => {
-                if native_enabled {
-                    apply_selected_expires(native_rule, now, resp);
-                } else {
-                    apply_selected_expires(None, now, resp);
-                }
-            }
-        }
+        apply_selected_expires(selected, now, resp);
+    }
+}
+#[async_trait]
+impl ResponseTransform for ExpiresTransform {
+    async fn transform(&self, ctx: &ReqCtx, resp: &mut Response) {
+        self.apply(ctx, resp);
     }
 }
 
@@ -7106,9 +7306,8 @@ impl ResponseTransform for ExpiresTransform {
 /// redirects (the news img-proxy 301s to the CF-bound R2 attachments domain, which this
 /// origin does not serve at all).
 pub(crate) struct DenyRedirectCdnTransform;
-#[async_trait]
-impl ResponseTransform for DenyRedirectCdnTransform {
-    async fn transform(&self, ctx: &ReqCtx, resp: &mut Response) {
+impl DenyRedirectCdnTransform {
+    pub(crate) fn apply(ctx: &ReqCtx, resp: &mut Response) {
         deny_redirect_cdn_headers(ctx, resp);
         // The label is internal metadata (origin CacheOptimizer -> this
         // transform). The page-cache stored copy KEEPS it — a hit re-runs this
@@ -7116,6 +7315,12 @@ impl ResponseTransform for DenyRedirectCdnTransform {
         // but it must not leak to Cloudflare/clients, so strip after the
         // evaluation above, on every exit path.
         resp.headers_mut().remove("x-cache-optimizer");
+    }
+}
+#[async_trait]
+impl ResponseTransform for DenyRedirectCdnTransform {
+    async fn transform(&self, ctx: &ReqCtx, resp: &mut Response) {
+        Self::apply(ctx, resp);
     }
 }
 
@@ -7163,6 +7368,7 @@ fn redirect_target_host(loc: &str) -> Option<String> {
 }
 
 /// Advertise HTTP/3 to TLS clients via `Alt-Svc` (cheap pre-parsed HeaderValue clone).
+#[allow(dead_code)]
 pub(crate) struct AltSvcTransform {
     pub alt_svc: Option<http::HeaderValue>,
 }

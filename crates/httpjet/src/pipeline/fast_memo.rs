@@ -217,7 +217,7 @@ struct MemoEntry {
     ae: Vec<u8>,
     vary: Vec<VaryItem>,
     status: http::StatusCode,
-    headers: http::HeaderMap,
+    headers: Arc<http::HeaderMap>,
     /// `headers` ends with a placeholder `Date` that each replay overwrites in place.
     stamp_date: bool,
     /// Unix epoch second of the `Date` currently stamped into `headers` (0 if none).
@@ -282,6 +282,39 @@ impl Memo {
             }
         }
     }
+
+    fn evict_for_capacity(&mut self, incoming_bytes: usize, now: Instant) {
+        if self.expiry.len() >= MAX_QUEUED {
+            self.clear();
+            return;
+        }
+        // First drain all expired entries from the front of the expiry queue.
+        while let Some(&(expires, h)) = self.expiry.front() {
+            if expires > now {
+                break;
+            }
+            self.expiry.pop_front();
+            self.drop_expired(h, now);
+        }
+        // If still over budget, evict oldest buckets incrementally instead of
+        // wiping the entire 2,048-entry hot working set via `self.clear()`.
+        while (self.count >= MAX_ENTRIES || self.bytes + incoming_bytes > MAX_BYTES)
+            && let Some((_, h)) = self.expiry.pop_front()
+        {
+            if let Some(bucket) = self.map.remove(&h) {
+                for e in bucket {
+                    self.bytes -= e.body.len();
+                    self.count -= 1;
+                }
+            }
+        }
+        if self.count >= MAX_ENTRIES
+            || self.bytes + incoming_bytes > MAX_BYTES
+            || self.expiry.len() >= MAX_QUEUED
+        {
+            self.clear();
+        }
+    }
 }
 
 thread_local! {
@@ -333,63 +366,95 @@ pub(super) struct PageMemoServe {
     pub variant_codec: Option<u8>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn probe_serve<E>(
     k: &MemoKey,
     req: &Request,
     ua_cache: &UaClassifyCache,
     now: Instant,
+    use_shared_headers: bool,
     check_acl: impl FnOnce() -> Result<std::net::IpAddr, E>,
     purge_epoch_current: impl Fn(u64) -> bool,
     memo_changed_err: E,
-) -> Option<Result<(Response, std::net::IpAddr, Option<PageMemoServe>), E>> {
+) -> Option<Result<(Response, std::net::IpAddr, Option<PageMemoServe>, u64), E>> {
     let h = key_hash(k);
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
         m.reclaim_expired(now);
-        if !m.drop_expired(h, now) {
-            return None;
-        }
-        let e = m.map.get_mut(&h)?.iter_mut().find(|e| {
-            (k.allow_page_responses || e.page.is_none())
-                && e.page.as_ref().is_none_or(|page| page.lease.is_current())
-                && matches(e, k)
-                && e.vary.iter().all(|v| v.matches(req, ua_cache))
-        })?;
-        if e.page.is_some() && Instant::now() >= e.expires {
-            return None;
-        }
-        if !purge_epoch_current(k.purge_epoch) {
-            return None;
-        }
-        let client_ip = match check_acl() {
-            Ok(ip) => ip,
-            Err(err) => return Some(Err(err)),
-        };
-        let page_serve = if let Some(page) = &e.page {
-            if Instant::now() >= page.deadline
-                || !page.lease.is_current()
-                || !purge_epoch_current(page.purge_epoch)
-            {
-                return Some(Err(memo_changed_err));
+        // Single map lookup: expire stale entries in `h`'s bucket and find our match
+        // in one `map.entry(h)` probe instead of `drop_expired` + `get_mut`.
+        let mut removed_bytes = 0usize;
+        let mut removed_count = 0usize;
+        let result = {
+            let std::collections::hash_map::Entry::Occupied(mut occ) = m.map.entry(h) else {
+                return None;
+            };
+            let bucket = occ.get_mut();
+            bucket.retain(|e| {
+                if e.expires > now && e.page.as_ref().is_none_or(|p| p.lease.is_current()) {
+                    true
+                } else {
+                    removed_bytes += e.body.len();
+                    removed_count += 1;
+                    false
+                }
+            });
+            if bucket.is_empty() {
+                occ.remove();
+                None
+            } else {
+                bucket
+                    .iter_mut()
+                    .find(|e| {
+                        (k.allow_page_responses || e.page.is_none())
+                            && matches(e, k)
+                            && e.vary.iter().all(|v| v.matches(req, ua_cache))
+                    })
+                    .and_then(|e| {
+                        if !purge_epoch_current(k.purge_epoch) {
+                            return None;
+                        }
+                        let client_ip = match check_acl() {
+                            Ok(ip) => ip,
+                            Err(err) => return Some(Err(err)),
+                        };
+                        let page_serve = if let Some(page) = &e.page {
+                            if now >= page.deadline || !purge_epoch_current(page.purge_epoch) {
+                                return Some(Err(memo_changed_err));
+                            }
+                            Some(PageMemoServe {
+                                key_hash: page.key_hash,
+                                variant_codec: e.variant_codec,
+                            })
+                        } else {
+                            None
+                        };
+                        let date_sec = if e.stamp_date {
+                            let (sec, maybe_val) =
+                                hj_core::http_date_sec_if_changed(now, e.stamped_date_sec);
+                            if let Some(date_val) = maybe_val {
+                                Arc::make_mut(&mut e.headers).insert(http::header::DATE, date_val);
+                                e.stamped_date_sec = sec;
+                            }
+                            sec
+                        } else {
+                            hj_core::http_date_sec_if_changed(now, u64::MAX).0
+                        };
+                        let mut resp = http::Response::new(Body::Full(e.body.clone()));
+                        *resp.status_mut() = e.status;
+                        if use_shared_headers {
+                            resp.extensions_mut()
+                                .insert(hj_core::SharedHeaders(Arc::clone(&e.headers)));
+                        } else {
+                            *resp.headers_mut() = (*e.headers).clone();
+                        }
+                        Some(Ok((resp, client_ip, page_serve, date_sec)))
+                    })
             }
-            Some(PageMemoServe {
-                key_hash: page.key_hash,
-                variant_codec: e.variant_codec,
-            })
-        } else {
-            None
         };
-        if e.stamp_date {
-            let (sec, date_val) = hj_core::http_date_now_with_sec();
-            if e.stamped_date_sec != sec {
-                e.headers.insert(http::header::DATE, date_val);
-                e.stamped_date_sec = sec;
-            }
-        }
-        let mut resp = http::Response::new(Body::Full(e.body.clone()));
-        *resp.status_mut() = e.status;
-        *resp.headers_mut() = e.headers.clone();
-        Some(Ok((resp, client_ip, page_serve)))
+        m.bytes -= removed_bytes;
+        m.count -= removed_count;
+        result
     })
 }
 
@@ -419,13 +484,13 @@ pub(super) fn probe(
         if e.stamp_date {
             let (sec, date_val) = hj_core::http_date_now_with_sec();
             if e.stamped_date_sec != sec {
-                e.headers.insert(http::header::DATE, date_val);
+                Arc::make_mut(&mut e.headers).insert(http::header::DATE, date_val);
                 e.stamped_date_sec = sec;
             }
         }
         let mut resp = http::Response::new(Body::Full(e.body.clone()));
         *resp.status_mut() = e.status;
-        *resp.headers_mut() = e.headers.clone();
+        *resp.headers_mut() = (*e.headers).clone();
         Some((resp, e.page.clone()))
     })
 }
@@ -502,6 +567,9 @@ pub(super) fn store_until(
     } else {
         resp.headers().clone()
     };
+    // Pre-strip hop-by-hop headers once at store time so H2/H3 writers can
+    // serialize directly from `SharedHeaders(Arc<HeaderMap>)` without cloning.
+    hj_core::strip_hop_by_hop_response(&mut headers);
     let stamp_date = !headers.contains_key(http::header::DATE);
     let stamped_date_sec = if stamp_date {
         let (sec, date_val) = hj_core::http_date_now_with_sec();
@@ -510,6 +578,7 @@ pub(super) fn store_until(
     } else {
         0
     };
+    let headers = Arc::new(headers);
     let is_page = page.is_some();
     let variant_codec = if is_page {
         crate::lscache::response_variant_codec(resp)
@@ -559,7 +628,7 @@ pub(super) fn store_until(
             || m.bytes + entry.body.len() > MAX_BYTES
             || m.expiry.len() >= MAX_QUEUED
         {
-            m.clear();
+            m.evict_for_capacity(entry.body.len(), now);
         }
         m.expiry.push_back((expires, h));
         let Memo {
@@ -645,6 +714,7 @@ mod tests {
                 status: 200,
                 identity: "memo-test".into(),
                 headers: Vec::new(),
+                prebuilt_headers: None,
                 body: hj_pagecache::PageBody::InMem(Bytes::from_static(b"lease")),
                 variants: Vec::new(),
                 variants_filled: false,
@@ -1213,11 +1283,16 @@ mod tests {
             probe(&key(&paths[0], b""), &r, &c, t0).is_some(),
             "budget full, all kept"
         );
-        // One more store exceeds MAX_BYTES: the map clears instead of growing.
+        // One more store exceeds MAX_BYTES: oldest entry is evicted incrementally
+        // instead of wiping the entire hot working set.
         store(&key(&paths[n], b""), Vec::new(), &big_resp(), t0);
         assert!(
             probe(&key(&paths[0], b""), &r, &c, t0).is_none(),
-            "cleared on overflow"
+            "oldest entry evicted on overflow"
+        );
+        assert!(
+            probe(&key(&paths[1], b""), &r, &c, t0).is_some(),
+            "remaining hot entries survive incremental eviction"
         );
         assert!(
             probe(&key(&paths[n], b""), &r, &c, t0).is_some(),
@@ -1225,8 +1300,8 @@ mod tests {
         );
         MEMO.with(|m| {
             let m = m.borrow();
-            assert_eq!(m.bytes, MAX_BODY, "accounting reset with the clear");
-            assert_eq!(m.count, 1);
+            assert_eq!(m.bytes, MAX_BYTES, "accounting stays within byte budget");
+            assert_eq!(m.count, n);
         });
     }
 

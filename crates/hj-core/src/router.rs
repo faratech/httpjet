@@ -78,11 +78,26 @@ impl Router {
     /// bypass + CDN de-cache), so the backend issues its own canonical redirect to the
     /// parent root; a fallback never serves another brand's body.
     pub fn resolve(&self, listener: &str, key_host: Option<&str>) -> Option<ResolvedVhost> {
-        let (name, config) = self.resolve_ref(listener, key_host)?;
-        Some(ResolvedVhost {
-            name: name.to_owned(),
-            config: config.clone(),
-        })
+        let (resolved, _) = self.resolve_with_exact(listener, key_host)?;
+        Some(resolved)
+    }
+
+    /// Like [`resolve`](Self::resolve), also returning `true` when `key_host` matched
+    /// an exact `<vhostMap>` domain on `listener` (rather than a parent domain or the
+    /// `*` wildcard fallback), avoiding a duplicate `host_is_exact` lookup downstream.
+    pub fn resolve_with_exact(
+        &self,
+        listener: &str,
+        key_host: Option<&str>,
+    ) -> Option<(ResolvedVhost, bool)> {
+        let (name, config, exact) = self.resolve_ref_with_exact(listener, key_host)?;
+        Some((
+            ResolvedVhost {
+                name: name.to_owned(),
+                config: config.clone(),
+            },
+            exact,
+        ))
     }
 
     /// Zero-allocation / zero-refcount-bump vhost resolution for the on-core fast path:
@@ -94,15 +109,32 @@ impl Router {
         listener: &str,
         key_host: Option<&str>,
     ) -> Option<(&'a str, &'a Arc<VHostConfig>)> {
+        let (name, cfg, _) = self.resolve_ref_with_exact(listener, key_host)?;
+        Some((name, cfg))
+    }
+
+    /// Like [`resolve_ref`](Self::resolve_ref), also returning whether `key_host`
+    /// matched an exact `<vhostMap>` entry on `listener` from the same hash probe.
+    #[inline]
+    pub fn resolve_ref_with_exact<'a>(
+        &'a self,
+        listener: &str,
+        key_host: Option<&str>,
+    ) -> Option<(&'a str, &'a Arc<VHostConfig>, bool)> {
         let routes = self.listeners.get(listener)?;
         // Use the shared IPv6-aware helper; plain split(':').next() mangles
         // bracketed literals like [::1]:443 down to '[', missing every vhost match.
         let key = key_host.map(host_without_port_cow);
-        let (name, config) = key
-            .as_deref()
-            .and_then(|k| Self::match_exact_or_parent(routes, k))
-            .or(routes.default.as_ref())?;
-        Some((name.as_str(), config.as_ref()?))
+        if let Some(k) = key.as_deref() {
+            if let Some((name, config)) = routes.exact.get(k) {
+                return Some((name.as_str(), config.as_ref()?, true));
+            }
+            if let Some((name, config)) = Self::match_parent(routes, k) {
+                return Some((name.as_str(), config.as_ref()?, false));
+            }
+        }
+        let (name, config) = routes.default.as_ref()?;
+        Some((name.as_str(), config.as_ref()?, false))
     }
 
     /// When [`resolve`](Self::resolve) returns `None`, distinguish "the host is genuinely unknown"
@@ -139,6 +171,10 @@ impl Router {
         if let Some(v) = routes.exact.get(host) {
             return Some(v);
         }
+        Self::match_parent(routes, host)
+    }
+
+    fn match_parent<'a>(routes: &'a ListenerRoutes, host: &str) -> Option<&'a RouteTarget> {
         let mut rest = host;
         while let Some((_, parent)) = rest.split_once('.') {
             if !parent.contains('.') {
