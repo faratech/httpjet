@@ -103,7 +103,22 @@ run, not across runs — and PHP for v0.0.1–v0.0.3 measures cold `lsphp`-pool
 ramp rather than steady state (warm, v0.0.1 sustains ~32K req/s).
 
 These are loopback-class synthetic numbers: they isolate the server's code
-path, not end-user latency. The lab is reproducible from this repo
+path, not end-user latency.
+
+**0.2.4 vs 0.2.3 (2026-11-20, same-host loopback A/B):** 11 waves of transport,
+`fast_memo`, rewrite, static, page-cache, and backend optimizations plus 36
+reliability fixes (native release builds, `-Ctarget-cpu=native`, 4 server
+workers vs 4 `h2load` threads, 1 s warmup + 5 s measured, median of 3
+interleaved rounds, 100% `2xx`):
+
+| Workload | httpjet 0.2.3 | httpjet 0.2.4 | Delta |
+|---|---:|---:|---:|
+| HTTP/2 `fast_memo` (64 B, TLS) | 1,084,102 req/s | **1,346,816 req/s** | **+24.2%** |
+| HTTP/2 `--no-fast-memo` heavy `.htaccess` (64 B, TLS) | 273,773 req/s | **331,930 req/s** | **+21.2%** |
+| HTTP/1.1 `--no-fast-memo` heavy `.htaccess` (64 B) | 180,417 req/s | **220,519 req/s** | **+22.2%** |
+| HTTP/2 `fast_memo` (8 KiB HTML, TLS, gzip/br) | 561,555 req/s | **620,061 req/s** | **+10.4%** |
+
+The lab is reproducible from this repo
 (`scripts/lab/lab-up.sh` brings it up, `lab-down.sh` deletes it). The full
 methodology, the per-release speed curve, per-round TSVs, checks, and all
 raw logs are at
