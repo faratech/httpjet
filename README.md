@@ -81,44 +81,36 @@ set for parity), so its HTTP/2 cells are short and noisier.
 | HTTP/1.1, 1 KiB file, c=100 (`h2load --h1`) | **517,643 req/s** | 353,405 req/s | 424,879 req/s |
 | HTTP/1.1, 1 KiB file, c=100 (`wrk`, 15 s) | **571,500 req/s** | 377,631 req/s | 430,111 req/s |
 
-For version-to-version comparison, every release from v0.0.1 to v0.2.2 was
-also re-measured on 2026-11-12 under **identical conditions** on a dedicated lab VM
+For version-to-version comparison, every release from v0.0.1 to v0.2.4 was
+re-measured on 2026-11-21 under **identical conditions** on a dedicated lab VM
 (c4-highmem-8, loopback, server pinned to 4 cores, load generator on the
 other 4, each release PGO-built from its tag the same way, 3 rotated rounds,
 median shown). Before benching, each binary passed the same functional
 checks (start, static file, `.htaccess` page, PHP page, page-cache hit,
-empty and 64 KiB files, config lint) — 11 of 11 pass. Lab medians, 0.2.2
-against 0.2.1 in the same run: 666K vs 669K req/s HTTP/2 1 KiB static, 311K vs
-304K HTTP/1.1 static, 538K vs 546K heavy `.htaccess` HTTP/2, 542K vs 541K
-page-cache hits, 32.5K vs 32.6K PHP/LSAPI — flat, as expected for releases
-with no hot-path work (0.2.1 vs 0.2.0: 669K vs 699K, 546K vs 519K, 541K vs
-604K, 32.6K vs 32.3K). Absolute numbers move with VM placement between runs
-(v0.2.0 was 625K on 2026-11-11, 699K here); compare within a run. In the
-same lab nginx reached 185K (HTTP/2 1 KiB), 295K (empty) and
-271K (`wrk` HTTP/1.1) against httpjet 0.2.2's 728K, 695K and 356K. (OpenLiteSpeed
-does not run in the lab layout; its cross-server comparison is the
-dedicated-client table above.) Two caveats travel with
+empty and 64 KiB files, config lint) — 15 of 15 pass.
+
+| Workload (lab VM, 4 server / 4 loadgen cores, Unified PGO) | httpjet 0.2.2 | httpjet 0.2.3 | **httpjet 0.2.4** | 0.2.4 vs 0.2.3 |
+|---|---:|---:|---:|---:|
+| HTTP/2 empty body (`c=32 × 10`) | 904.0K | 860.1K | **1,291.7K** | **+50.2%** |
+| HTTP/2 static 1 KiB (`c=32 × 10`) | 794.6K | 849.1K | **1,092.6K** | **+28.7%** |
+| Heavy 806-line `.htaccess` H2 (`c=32 × 10`) | 672.6K | 656.9K | **879.5K** | **+33.9%** |
+| Page-cache hit H2 (37 KB, `c=32 × 32`) | 679.3K | 720.3K | **849.6K** | **+18.0%** |
+| HTTP/1.1 static 1 KiB (`c=100`) | 378.8K | 383.4K | **415.7K** | **+8.4%** |
+| Heavy 806-line `.htaccess` H1 (`c=100`) | 341.6K | 343.1K | **381.5K** | **+11.2%** |
+| PHP/LSAPI H1 (`c=40`) | 39.6K | 39.6K | **41.8K** | **+5.6%** |
+
+In the same 2026-11-21 lab three-way, `nginx` reached 312K (HTTP/2 empty),
+215K (HTTP/2 1 KiB), 265K (HTTP/2 `/robots.txt`, without `.htaccess`), 269K
+(HTTP/1.1 1 KiB), and 334K (`wrk` HTTP/1.1) against httpjet 0.2.4's **1,161K**
+(3.73×), **933K** (4.33×), **940K** (3.54×), **416K** (1.54×), and **486K**
+(1.46×). (OpenLiteSpeed does not run in the lab layout; its cross-server
+comparison is the dedicated-client table above.) Two caveats travel with
 the lab data: absolute numbers move with VM placement — compare within a
 run, not across runs — and PHP for v0.0.1–v0.0.3 measures cold `lsphp`-pool
 ramp rather than steady state (warm, v0.0.1 sustains ~32K req/s).
 
 These are loopback-class synthetic numbers: they isolate the server's code
-path, not end-user latency.
-
-**0.2.4 vs 0.2.3 (2026-11-20, same-host loopback A/B):** 11 waves of transport,
-`fast_memo`, rewrite, static, page-cache, and backend optimizations plus 36
-reliability fixes (native release builds, `-Ctarget-cpu=native`, 4 server
-workers vs 4 `h2load` threads, 1 s warmup + 5 s measured, median of 3
-interleaved rounds, 100% `2xx`):
-
-| Workload | httpjet 0.2.3 | httpjet 0.2.4 | Delta |
-|---|---:|---:|---:|
-| HTTP/2 `fast_memo` (64 B, TLS) | 1,084,102 req/s | **1,346,816 req/s** | **+24.2%** |
-| HTTP/2 `--no-fast-memo` heavy `.htaccess` (64 B, TLS) | 273,773 req/s | **331,930 req/s** | **+21.2%** |
-| HTTP/1.1 `--no-fast-memo` heavy `.htaccess` (64 B) | 180,417 req/s | **220,519 req/s** | **+22.2%** |
-| HTTP/2 `fast_memo` (8 KiB HTML, TLS, gzip/br) | 561,555 req/s | **620,061 req/s** | **+10.4%** |
-
-The lab is reproducible from this repo
+path, not end-user latency. The lab is reproducible from this repo
 (`scripts/lab/lab-up.sh` brings it up, `lab-down.sh` deletes it). The full
 methodology, the per-release speed curve, per-round TSVs, checks, and all
 raw logs are at
