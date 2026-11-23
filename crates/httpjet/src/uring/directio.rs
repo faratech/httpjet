@@ -103,15 +103,11 @@ impl AsyncWriteRent for DirectWriteSocket {
             if count == 0 {
                 return (Ok(0), buf_vec);
             }
-            let message = libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: buf_vec.read_iovec_ptr().cast_mut(),
-                msg_iovlen: count,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            };
+            // SAFETY: an all-zero msghdr is an empty C message header. Set
+            // only the iovecs so both libc layouts retain zeroed padding.
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_iov = buf_vec.read_iovec_ptr().cast_mut();
+            message.msg_iovlen = count as _; // bounded to 64 on all targets
             loop {
                 // SAFETY: the IoVecBuf owns count readable descriptors and
                 // their payloads for this synchronous, nonblocking call.

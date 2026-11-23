@@ -1,3 +1,9 @@
+httpjet (0.2.6-2) stable; urgency=medium
+
+  * Initialize the TLS vectored-write message header for both glibc and musl.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Mon, 23 Nov 2026 09:54:42 -0500
+
 httpjet (0.2.6-1) stable; urgency=medium
 
   * Consolidate the retained HTTP/1.1 request-head, HTTP/2 dispatch and HPACK,
