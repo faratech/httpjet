@@ -100,7 +100,7 @@ jobs:
             --ulimit memlock=8388608:8388608 \
             --volume "$GITHUB_WORKSPACE:/work" --volume "$RUNNER_TEMP/archive.asc:/tmp/archive.asc:ro" \
             --workdir /work --env RELEASE_TAG --env ARCHIVE_FINGERPRINT --env CARGO_BUILD_JOBS=2 \
-            rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 \
+            rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea \
             bash -c 'apt-get update && apt-get install -y --no-install-recommends git ca-certificates curl python3 build-essential musl-tools rpm cmake pkg-config clang debhelper gnupg ripgrep xz-utils && git config --global --add safe.directory /work && bash packaging/release/build.sh "$RELEASE_TAG" /work/dist /tmp/archive.asc "$ARCHIVE_FINGERPRINT"'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

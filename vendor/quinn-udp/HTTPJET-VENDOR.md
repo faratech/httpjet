@@ -1,7 +1,8 @@
 # HTTPJet quinn-udp experiment
 
 Upstream: quinn-udp 0.6.3, https://github.com/quinn-rs/quinn.
-Crates.io checksum: `47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247`.
+Source base: `0f9432f7c1cab0ea1469d02a935a89dae28693b7` (post-0.6.3).
+0.6.3 crates.io checksum: `47091c86514c2e11452cb228dee77037334b99d92a23e4c69aa5982261f39247`.
 The original MIT and Apache-2.0 licenses are retained.
 
 This pinned copy adds a Linux/Android `try_send_batch` API, bounded at sixteen

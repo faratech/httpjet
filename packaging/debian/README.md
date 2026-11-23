@@ -21,7 +21,7 @@ startup deadline.
 ## Build
 
 Build natively for each architecture in the pinned Debian 12 Rust builder used
-by release CI. Rust 1.99.1 and the `debian/control` build dependencies are
+by release CI. Rust 1.100.0 and the `debian/control` build dependencies are
 required. Supply the real ASCII-armored public signing key as
 `packaging/debian/archive-keyring.asc`; a missing or invalid key fails the build.
 The keyring package installs it as
@@ -37,7 +37,7 @@ The build uses the native `*-unknown-linux-musl` Rust target, musl-gcc, no
 optional features, static CRT and explicit Rust/C baseline CPU flags. It never
 uses native CPU flags or host PGO. ELF validation requires no interpreter,
 no shared-library dependencies and no GLIBC symbol requirements. musl-tools
-and the matching Rust 1.99.1 target component are builder prerequisites.
+and the matching Rust 1.100.0 target component are builder prerequisites.
 
 The Debian upstream version must equal Cargo's version; revision `N` yields the
 canonical release identity `X.Y.Z-N`. The source producer creates a private

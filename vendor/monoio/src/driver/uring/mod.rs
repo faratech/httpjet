@@ -11,7 +11,7 @@ use std::{
 };
 
 use io_uring::{cqueue, opcode, types::Timespec, IoUring};
-use lifecycle::Lifecycle;
+use lifecycle::MaybeFdLifecycle;
 
 use super::{
     op::{CompletionMeta, Op, OpAble},
@@ -44,13 +44,6 @@ pub(crate) const MIN_REVERSED_USERDATA: u64 = u64::MAX - 3;
 pub struct IoUringDriver {
     inner: Rc<UnsafeCell<UringInner>>,
 
-    // Used as timeout buffer
-    timespec: *mut Timespec,
-
-    // Used as read eventfd buffer
-    #[cfg(feature = "sync")]
-    eventfd_read_dst: *mut u8,
-
     // Used for drop
     #[cfg(feature = "sync")]
     thread_id: usize,
@@ -59,6 +52,13 @@ pub struct IoUringDriver {
 pub(crate) struct UringInner {
     /// In-flight operations
     ops: Ops,
+
+    // Used as timeout buffer
+    timespec: Timespec,
+
+    // Used as read eventfd buffer
+    #[cfg(feature = "sync")]
+    eventfd_read_dst: [u8; 8],
 
     #[cfg(feature = "poll-io")]
     poll: super::poll::Poll,
@@ -89,7 +89,7 @@ pub(crate) struct UringInner {
 // When dropping the driver, all in-flight operations must have completed. This
 // type wraps the slab and ensures that, on drop, the slab is empty.
 struct Ops {
-    slab: Slab<Lifecycle>,
+    slab: Slab<MaybeFdLifecycle>,
 }
 
 fn no_iowait_enabled(params: &io_uring::Parameters) -> bool {
@@ -195,15 +195,13 @@ impl IoUringDriver {
             #[cfg(feature = "poll-io")]
             poller_installed: false,
             ops: Ops::new(),
+            timespec: Timespec::new(),
             ext_arg: uring.params().is_feature_ext_arg(),
             no_iowait: no_iowait_enabled(uring.params()),
             uring,
         }));
 
-        Ok(IoUringDriver {
-            inner,
-            timespec: Box::leak(Box::new(Timespec::new())) as *mut Timespec,
-        })
+        Ok(IoUringDriver { inner })
     }
 
     #[cfg(feature = "sync")]
@@ -215,7 +213,7 @@ impl IoUringDriver {
 
         // Create eventfd and register it to the ring.
         let waker = {
-            let fd = crate::syscall!(eventfd(0, libc::EFD_CLOEXEC))?;
+            let fd = crate::syscall!(eventfd@RAW(0, libc::EFD_CLOEXEC))?;
             unsafe {
                 use std::os::unix::io::FromRawFd;
                 std::fs::File::from_raw_fd(fd)
@@ -230,21 +228,18 @@ impl IoUringDriver {
             #[cfg(feature = "poll-io")]
             poll: super::poll::Poll::with_capacity(entries as usize)?,
             ops: Ops::new(),
+            timespec: Timespec::new(),
             ext_arg: uring.params().is_feature_ext_arg(),
             no_iowait: no_iowait_enabled(uring.params()),
             uring,
             shared_waker: std::sync::Arc::new(waker::EventWaker::new(waker)),
             eventfd_installed: false,
+            eventfd_read_dst: [0_u8; 8],
             waker_receiver,
         }));
 
         let thread_id = crate::builder::BUILD_THREAD_ID.with(|id| *id);
-        let driver = IoUringDriver {
-            inner,
-            timespec: Box::leak(Box::new(Timespec::new())) as *mut Timespec,
-            eventfd_read_dst: Box::leak(Box::new([0_u8; 8])) as *mut u8,
-            thread_id,
-        };
+        let driver = IoUringDriver { inner, thread_id };
 
         // Register unpark handle
         super::thread::register_unpark_handle(thread_id, driver.unpark().into());
@@ -271,9 +266,13 @@ impl IoUringDriver {
 
     #[cfg(feature = "sync")]
     fn install_eventfd(&self, inner: &mut UringInner, fd: RawFd) {
-        let entry = opcode::Read::new(io_uring::types::Fd(fd), self.eventfd_read_dst, 8)
-            .build()
-            .user_data(EVENTFD_USERDATA);
+        let entry = opcode::Read::new(
+            io_uring::types::Fd(fd),
+            inner.eventfd_read_dst.as_mut_ptr(),
+            8,
+        )
+        .build()
+        .user_data(EVENTFD_USERDATA);
 
         let mut sq = inner.uring.submission();
         let _ = unsafe { sq.push(&entry) };
@@ -292,11 +291,8 @@ impl IoUringDriver {
     }
 
     fn install_timeout(&self, inner: &mut UringInner, duration: Duration) {
-        let timespec = timespec(duration);
-        unsafe {
-            std::ptr::replace(self.timespec, timespec);
-        }
-        let entry = opcode::Timeout::new(self.timespec as *const Timespec)
+        inner.timespec = timespec(duration);
+        let entry = opcode::Timeout::new(&inner.timespec as *const Timespec)
             .build()
             .user_data(TIMEOUT_USERDATA);
 
@@ -478,7 +474,9 @@ impl UringInner {
                     self.poll.tick(Some(Duration::ZERO))?;
                 }
                 _ if index >= MIN_REVERSED_USERDATA => (),
-                _ => self.ops.complete(index as _, resultify(&cqe), cqe.flags()),
+                // # Safety
+                // Here we can make sure the result is valid.
+                _ => unsafe { self.ops.complete(index as _, resultify(&cqe), cqe.flags()) },
             }
         }
         Ok(())
@@ -508,10 +506,10 @@ impl UringInner {
         }
     }
 
-    fn new_op<T>(data: T, inner: &mut UringInner, driver: Inner) -> Op<T> {
+    fn new_op<T: OpAble>(data: T, inner: &mut UringInner, driver: Inner) -> Op<T> {
         Op {
             driver,
-            index: inner.ops.insert(),
+            index: inner.ops.insert(T::RET_IS_FD),
             data: Some(data),
         }
     }
@@ -573,13 +571,7 @@ impl UringInner {
         if inner.uring.submission().is_full() {
             inner.submit()?;
         }
-        let index = inner.ops.slab.insert(Lifecycle::MultiShot {
-            results: std::collections::VecDeque::new(),
-            waker: None,
-            done: false,
-            detached: false,
-            owns_fds,
-        });
+        let index = inner.ops.slab.insert(MaybeFdLifecycle::new_multi(owns_fds));
         let mut op = crate::driver::op::MultiOp::new(Inner::Uring(this.clone()), index, data);
         let sqe = OpAble::uring_op(op.data_mut()).user_data(index as _);
         {
@@ -662,6 +654,7 @@ impl UringInner {
         this: &Rc<UnsafeCell<UringInner>>,
         index: usize,
         data: &mut Option<T>,
+        _skip_cancel: bool,
     ) {
         let inner = unsafe { &mut *this.get() };
         if index == usize::MAX {
@@ -671,7 +664,7 @@ impl UringInner {
         if let Some(lifecycle) = inner.ops.slab.get(index) {
             let _must_finished = lifecycle.drop_op(data);
             #[cfg(feature = "async-cancel")]
-            if !_must_finished {
+            if !_must_finished && !_skip_cancel {
                 unsafe {
                     let cancel = opcode::AsyncCancel::new(index as u64)
                         .build()
@@ -716,14 +709,6 @@ impl Drop for IoUringDriver {
     fn drop(&mut self) {
         trace!("MONOIO DEBUG[IoUringDriver]: drop");
 
-        // Dealloc leaked memory
-        unsafe { std::ptr::drop_in_place(self.timespec) };
-
-        #[cfg(feature = "sync")]
-        unsafe {
-            std::ptr::drop_in_place(self.eventfd_read_dst)
-        };
-
         // Deregister thread id
         #[cfg(feature = "sync")]
         {
@@ -750,11 +735,16 @@ impl Ops {
     }
 
     // Insert a new operation
-    pub(crate) fn insert(&mut self) -> usize {
-        self.slab.insert(Lifecycle::Submitted)
+    #[inline]
+    pub(crate) fn insert(&mut self, is_fd: bool) -> usize {
+        self.slab.insert(MaybeFdLifecycle::new(is_fd))
     }
 
-    fn complete(&mut self, index: usize, result: io::Result<u32>, flags: u32) {
+    // Complete an operation
+    // # Safety
+    // Caller must make sure the result is valid.
+    #[inline]
+    unsafe fn complete(&mut self, index: usize, result: io::Result<u32>, flags: u32) {
         let lifecycle = unsafe { self.slab.get(index).unwrap_unchecked() };
         lifecycle.complete(result, flags);
     }

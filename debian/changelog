@@ -1,3 +1,10 @@
+httpjet (0.2.5-1) stable; urgency=medium
+
+  * Build with Rust 1.100.0 and refresh vendored transport, profiling, and
+    OpenSSL dependencies. Update release packaging regression tests.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Sun, 22 Nov 2026 03:44:18 +0000
+
 httpjet (0.2.4-1) stable; urgency=medium
 
   * Transport & framing (H1/H2/H3): stack-local zero-map fast path for

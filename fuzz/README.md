@@ -76,7 +76,7 @@ cargo test --locked -p httpjet --test h1_corpus -- --nocapture
 For local ASan fuzzing with explicit budgets:
 
 ```bash
-# Default pinned toolchain: nightly-2026-08-31; cargo-fuzz 0.13.2.
+# Default pinned toolchain: nightly-2026-11-22; cargo-fuzz 0.13.2.
 FUZZ_SECONDS=300 bash scripts/fuzz-bounded.sh h1_request_framing
 ```
 

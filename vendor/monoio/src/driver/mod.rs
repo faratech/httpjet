@@ -1,7 +1,7 @@
 /// Monoio Driver.
 #[allow(dead_code)]
 pub(crate) mod op;
-#[cfg(all(feature = "poll-io", unix))]
+#[cfg(feature = "poll-io")]
 pub(crate) mod poll;
 #[cfg(any(feature = "legacy", feature = "poll-io"))]
 pub(crate) mod ready;
@@ -16,6 +16,10 @@ pub(crate) mod thread;
 mod legacy;
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 mod uring;
+
+#[allow(missing_docs, unreachable_pub, dead_code, unused_imports)]
+#[cfg(all(windows, any(feature = "legacy", feature = "poll-io")))]
+pub(crate) mod iocp;
 
 mod util;
 
@@ -38,7 +42,7 @@ use self::uring::UringInner;
 
 /// Unpark a runtime of another thread.
 pub(crate) mod unpark {
-    #[allow(dead_code, unreachable_pub)]
+    #[allow(unreachable_pub, dead_code)]
     pub trait Unpark: Sync + Send + 'static {
         /// Unblocks a thread that is blocked by the associated `Park` handle.
         ///
@@ -156,20 +160,13 @@ impl Inner {
         }
     }
 
-    #[allow(unused)]
-    fn drop_op<T: 'static>(&self, index: usize, data: &mut Option<T>) {
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    #[inline]
+    fn drop_op<T: 'static>(&self, index: usize, data: &mut Option<T>, skip_cancel: bool) {
         match self {
-            #[cfg(all(target_os = "linux", feature = "iouring"))]
-            Inner::Uring(this) => UringInner::drop_op(this, index, data),
+            Inner::Uring(this) => UringInner::drop_op(this, index, data, skip_cancel),
             #[cfg(feature = "legacy")]
             Inner::Legacy(_) => {}
-            #[cfg(all(
-                not(feature = "legacy"),
-                not(all(target_os = "linux", feature = "iouring"))
-            ))]
-            _ => {
-                util::feature_panic();
-            }
         }
     }
 

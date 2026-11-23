@@ -49,7 +49,7 @@ version = "0.8"
 version = "1.0.1"
 
 [dependencies.hashbrown]
-version = "0.17.1"
+version = "0.17.2"
 default-features = false
 
 [dependencies.lock_api]

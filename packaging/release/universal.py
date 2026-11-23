@@ -73,7 +73,7 @@ def create_manifest(directory,output):
     for arch,build in zip(support.ARCHES,builds):
         for field in ('release_id','commit','source_date_epoch','archive_fingerprint'):
             if build[field]!=first[field]:raise ValueError('builders disagree on '+field)
-        if build['architecture']!=arch or build.get('rustc_version')!='1.99.1':raise ValueError('architecture/toolchain mismatch')
+        if build['architecture']!=arch or build.get('rustc_version')!='1.100.0':raise ValueError('architecture/toolchain mismatch')
         if '--no-multishot-accept' not in build.get('compatibility_flags',[]):raise ValueError('fresh compatibility launch profile was not attested')
         if build.get('tag')!=ident['tag']:raise ValueError('tag does not identify package revision')
         target={'amd64':'x86_64-unknown-linux-musl','arm64':'aarch64-unknown-linux-musl'}[arch]

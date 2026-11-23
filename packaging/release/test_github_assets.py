@@ -383,25 +383,56 @@ if [ "${HTTPJET_TEST_FAIL:-}" = "$phase" ]; then exit 23; fi
         self.assertIn('--github-assets github-release-assets',text)
         self.assertNotIn('github_assets.py latest ',text)
         self.assertIn('release.REPO_URL.removesuffix',text)
-        qualification=self.workflow('installer-release.yml')
-        self.assertLess(qualification.index('github_assets.py qualified'),qualification.index('Attest final signed software'))
-        self.assertIn('subject-path: github-qualified-assets/*',qualification)
+
+    def test_build_only_attests_exact_public_assets_before_publication(self):
+        build=self.workflow('installer-release.yml')
+        publish=self.workflow('installer-publish-now.yml')
+        self.assertLess(build.index('release.py sign-carriers'),build.index('release.stage('))
+        self.assertLess(build.index('release.stage('),build.index('name: signed-candidate'))
+        self.assertIn('candidate=True',build)
+        self.assertIn('environment: httpjet-candidate-signing',build)
+        markers=['name: signed-candidate','Confirm the candidate source and signing job',
+                 'publish_build_only.py --candidate candidate-input',
+                 'subject-path: public-assets/*','Publish GitHub assets',
+                 'Publish Pages and promote the release']
+        positions=[publish.index(marker) for marker in markers]
+        self.assertEqual(positions,sorted(positions))
+        self.assertIn('environment: httpjet-stable',publish)
+        self.assertIn('attestations: write',publish)
+        self.assertIn('--assets public-assets',publish)
+        self.assertIn('gh release create "$HTTPJET_RELEASE_TAG" public-assets/*',publish)
+        self.assertIn('--draft=false --latest=false',publish)
+        deploy=publish[publish.index('with publication_lock(store,'):]
+        self.assertLess(deploy.index('pages.precondition('),deploy.index("'pages', 'deploy'"))
+        self.assertLess(deploy.index('hashlib.sha256(response.read())'),deploy.index("'--latest'"))
 
     def test_refresh_retains_current_and_uses_same_protected_private_lease(self):
-        promotion=self.workflow('installer-publish.yml');refresh=self.workflow('installer-refresh.yml')
-        self.assertIn('fetch-current --universal',refresh)
-        self.assertIn('--directory approved --previous approved',refresh)
-        self.assertIn('--previous approved --repository',refresh)
-        self.assertNotIn('github_assets.py',refresh);self.assertNotIn('--github-assets',refresh)
+        promotion=self.workflow('installer-publish-now.yml');refresh=self.workflow('installer-refresh.yml')
+        self.assertIn('fetch-current --universal --allow-unqualified',refresh)
+        self.assertIn("approved=pathlib.Path('refresh-input/candidate')",refresh)
+        self.assertIn("release.load(approved/'current-stable.json')['qualification_sha256']=='unqualified'",refresh)
+        self.assertIn("universal.refresh_build_only(approved,pathlib.Path('refresh-input/snapshot')",refresh)
+        self.assertRegex(refresh,r"(?s)release\.stage\(approved,.*?previous=approved\)")
+        self.assertRegex(refresh,r"(?s)publish_build_only\.assemble\(root,.*?status\['source_run_id'\],previous=approved\)")
+        self.assertRegex(refresh,r"(?s)pages\.project\(root/'snapshot',.*?previous=approved,repository=")
+        self.assertNotIn('github_assets.py',refresh)
+        self.assertNotIn('gh release',refresh)
         self.assertNotIn('contents: write',refresh)
-        self.assertEqual(re.search(r'^  group: (.+)$',promotion,re.M).group(1),re.search(r'^  group: (.+)$',refresh,re.M).group(1))
+        self.assertEqual(re.search(r'^  group: (.+)$',promotion,re.M).group(1),
+                         re.search(r'^  group: (.+)$',refresh,re.M).group(1))
         for text in (promotion,refresh):
             self.assertIn('environment: httpjet-stable',text)
-            self.assertIn('pages.py deploy --snapshot snapshot --directory pages-site',text)
+            self.assertIn('from publish_v2 import',text)
+            self.assertIn('publication_lock',text)
             self.assertNotIn('publish.py snapshot',text)
             self.assertIn('CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}',text)
             self.assertIn('CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}',text)
             self.assertIn('HTTPJET_S3_BUCKET:',text)
+        deploy=refresh[refresh.index("with publication_lock(S3(),"):]
+        markers=['pages.precondition(',"'pages','deploy'",'pages.verify(','release.write_json(receipt']
+        positions=[deploy.index(marker) for marker in markers]
+        self.assertEqual(positions,sorted(positions))
+        self.assertIn("pages.deploy(root/'snapshot',pathlib.Path('pages-site'),key,fingerprint,receipt)",refresh)
 
 
 class SignedSnapshotRoundTrip(unittest.TestCase):

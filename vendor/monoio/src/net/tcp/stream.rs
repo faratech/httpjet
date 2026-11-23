@@ -97,7 +97,7 @@ impl TcpStream {
         let addr = addr
             .to_socket_addrs()?
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty address"))?;
+            .ok_or_else(|| io::Error::other("empty address"))?;
 
         Self::connect_addr(addr).await
     }
@@ -268,6 +268,25 @@ impl TcpStream {
         let op = Op::poll_write(&self.fd, relaxed).unwrap();
         op.wait().await
     }
+
+    /// Attempts a zero-copy write using `IORING_OP_SEND_ZC` (Linux 6.0+).
+    ///
+    /// When supported by the kernel, NIC and socket configuration, the kernel
+    /// may pin the userspace buffer and DMA directly from it, avoiding a copy
+    /// into the socket buffer. The buffer is then held until the kernel
+    /// signals it is safe to release via a notification CQE.
+    ///
+    /// In practice, `SEND_ZC` is best-effort: it may fall back to a regular
+    /// send (with copying) or fail with errors such as `EOPNOTSUPP` or
+    /// `EINVAL`. Callers should treat this like a normal write and must not
+    /// assume that a successful call always performed true zero-copy.
+    ///
+    /// This is most effective for large writes (e.g. 10KB+).
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    pub async fn write_zc<T: IoBuf>(&self, buf: T) -> BufResult<usize, T> {
+        let op = Op::send_zc(self.fd.clone(), buf).unwrap();
+        op.result().await
+    }
 }
 
 impl AsReadFd for TcpStream {
@@ -330,19 +349,19 @@ impl AsyncWriteRent for TcpStream {
     fn write<T: IoBuf>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the write operation
         let op = Op::send(self.fd.clone(), buf).unwrap();
-        op.write()
+        op.result()
     }
 
     #[inline]
     fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> impl Future<Output = BufResult<usize, T>> {
-        let op = Op::writev(&self.fd, buf_vec).unwrap();
-        op.write()
+        let op = Op::writev(self.fd.clone(), buf_vec).unwrap();
+        op.result()
     }
 
     #[inline]
-    async fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> impl Future<Output = std::io::Result<()>> {
         // Tcp stream does not need flush.
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     fn shutdown(&mut self) -> impl Future<Output = std::io::Result<()>> {
@@ -356,7 +375,7 @@ impl AsyncWriteRent for TcpStream {
             -1 => Err(io::Error::last_os_error()),
             _ => Ok(()),
         };
-        async move { res }
+        std::future::ready(res)
     }
 }
 
@@ -375,7 +394,7 @@ impl CancelableAsyncWriteRent for TcpStream {
 
         let op = Op::send(fd, buf).unwrap();
         let _guard = c.associate_op(op.op_canceller());
-        op.write().await
+        op.result().await
     }
 
     #[inline]
@@ -390,9 +409,9 @@ impl CancelableAsyncWriteRent for TcpStream {
             return (Err(operation_canceled()), buf_vec);
         }
 
-        let op = Op::writev(&fd, buf_vec).unwrap();
+        let op = Op::writev(fd.clone(), buf_vec).unwrap();
         let _guard = c.associate_op(op.op_canceller());
-        op.write().await
+        op.result().await
     }
 
     #[inline]
@@ -412,7 +431,7 @@ impl CancelableAsyncWriteRent for TcpStream {
             -1 => Err(io::Error::last_os_error()),
             _ => Ok(()),
         };
-        async move { res }
+        std::future::ready(res)
     }
 }
 
@@ -421,14 +440,14 @@ impl AsyncReadRent for TcpStream {
     fn read<T: IoBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
         let op = Op::recv(self.fd.clone(), buf).unwrap();
-        op.read()
+        op.result()
     }
 
     #[inline]
     fn readv<T: IoVecBufMut>(&mut self, buf: T) -> impl Future<Output = BufResult<usize, T>> {
         // Submit the read operation
         let op = Op::readv(self.fd.clone(), buf).unwrap();
-        op.read()
+        op.result()
     }
 }
 
@@ -447,7 +466,7 @@ impl CancelableAsyncReadRent for TcpStream {
 
         let op = Op::recv(fd, buf).unwrap();
         let _guard = c.associate_op(op.op_canceller());
-        op.read().await
+        op.result().await
     }
 
     #[inline]
@@ -464,7 +483,7 @@ impl CancelableAsyncReadRent for TcpStream {
 
         let op = Op::readv(fd, buf).unwrap();
         let _guard = c.associate_op(op.op_canceller());
-        op.read().await
+        op.result().await
     }
 }
 
@@ -482,6 +501,7 @@ impl tokio::io::AsyncRead for TcpStream {
             let ret = ready!(crate::driver::op::PollLegacy::poll_legacy(&mut recv, cx));
 
             std::task::Poll::Ready(ret.result.map(|n| {
+                let n = n.into_inner();
                 buf.assume_init(n as usize);
                 buf.advance(n as usize);
             }))
@@ -501,7 +521,7 @@ impl tokio::io::AsyncWrite for TcpStream {
             let mut send = Op::send_raw(&self.fd, raw_buf);
             let ret = ready!(crate::driver::op::PollLegacy::poll_legacy(&mut send, cx));
 
-            std::task::Poll::Ready(ret.result.map(|n| n as usize))
+            std::task::Poll::Ready(ret.result.map(|n| n.into_inner() as usize))
         }
     }
 
@@ -535,7 +555,7 @@ impl tokio::io::AsyncWrite for TcpStream {
             let mut writev = Op::writev_raw(&self.fd, raw_buf);
             let ret = ready!(crate::driver::op::PollLegacy::poll_legacy(&mut writev, cx));
 
-            std::task::Poll::Ready(ret.result.map(|n| n as usize))
+            std::task::Poll::Ready(ret.result.map(|n| n.into_inner() as usize))
         }
     }
 

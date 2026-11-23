@@ -6,7 +6,7 @@ name = "httpjet-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.100.0"
 
 [package.metadata]
 cargo-fuzz = true
@@ -15,6 +15,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 httparse = "1"
+memchr = "2"
 # Light library crates with clean byte-parser entry points (no monoio/TLS pulled in).
 hj-h2 = { path = "../crates/hj-h2" }
 hj-lsapi = { path = "../crates/hj-lsapi" }

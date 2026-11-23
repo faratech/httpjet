@@ -6,9 +6,9 @@ use std::os::windows::io::{
 };
 use std::{cell::UnsafeCell, io, rc::Rc};
 
-#[cfg(windows)]
-use super::legacy::iocp::SocketState as RawFd;
 use super::CURRENT;
+#[cfg(windows)]
+use crate::driver::iocp::SocketState as RawFd;
 
 // Tracks in-flight operations on a file descriptor. Ensures all in-flight
 // operations complete before submitting the close.
@@ -45,7 +45,7 @@ impl State {
         // TODO: only Init state can convert?
         if matches!(state, UringState::Init) {
             let mut source = mio::unix::SourceFd(&fd);
-            crate::syscall!(fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK))?;
+            crate::syscall!(fcntl@RAW(fd, libc::F_SETFL, libc::O_NONBLOCK))?;
             let reg = CURRENT
                 .with(|inner| match inner {
                     #[cfg(all(target_os = "linux", feature = "iouring"))]
@@ -58,14 +58,11 @@ impl State {
                     crate::driver::Inner::Legacy(_) => panic!("unexpected legacy runtime"),
                 })
                 .inspect_err(|_| {
-                    let _ = crate::syscall!(fcntl(fd, libc::F_SETFL, 0));
+                    let _ = crate::syscall!(fcntl@RAW(fd, libc::F_SETFL, 0));
                 })?;
             *state = UringState::Legacy(Some(reg));
         } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "not clear uring state",
-            ));
+            return Err(io::Error::other("not clear uring state"));
         }
         Ok(())
     }
@@ -83,10 +80,10 @@ impl State {
             _ => return Ok(()),
         };
         let Some(token) = inner else {
-            return Err(io::Error::new(io::ErrorKind::Other, "empty token"));
+            return Err(io::Error::other("empty token"));
         };
         let mut source = mio::unix::SourceFd(&fd);
-        crate::syscall!(fcntl(fd, libc::F_SETFL, 0))?;
+        crate::syscall!(fcntl@RAW(fd, libc::F_SETFL, 0))?;
         CURRENT
             .with(|inner| match inner {
                 #[cfg(all(target_os = "linux", feature = "iouring"))]
@@ -97,7 +94,7 @@ impl State {
                 crate::driver::Inner::Legacy(_) => panic!("unexpected legacy runtime"),
             })
             .inspect_err(|_| {
-                let _ = crate::syscall!(fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK));
+                let _ = crate::syscall!(fcntl@RAW(fd, libc::F_SETFL, libc::O_NONBLOCK));
             })?;
         *self = State::Uring(UringState::Init);
         Ok(())
@@ -526,10 +523,10 @@ impl Drop for Inner {
         #[allow(unreachable_patterns)]
         match state {
             #[cfg(all(target_os = "linux", feature = "iouring"))]
-            State::Uring(UringState::Init) | State::Uring(UringState::Waiting(..)) => {
-                if super::op::Op::close(fd).is_err() {
-                    let _ = unsafe { std::fs::File::from_raw_fd(fd) };
-                };
+            State::Uring(UringState::Init) | State::Uring(UringState::Waiting(..))
+                if super::op::Op::close(fd).is_err() =>
+            {
+                let _ = unsafe { std::fs::File::from_raw_fd(fd) };
             }
             #[cfg(feature = "legacy")]
             State::Legacy(idx) => drop_legacy(fd, *idx),

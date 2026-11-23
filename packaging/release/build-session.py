@@ -115,7 +115,7 @@ def seal(session_path, binary):
     receipt = {key: session[key] for key in ('source_root', 'source_tree_sha256', 'commit', 'tag',
         'architecture', 'release_id', 'version', 'source_date_epoch')}
     receipt.update({'schema': 1, 'binary': str(destination), 'binary_sha256': sha(destination),
-                    'libc': 'musl', 'linkage': 'static', 'rustc_version': '1.99.1',
+                    'libc': 'musl', 'linkage': 'static', 'rustc_version': '1.100.0',
                     'target': {'amd64': 'x86_64-unknown-linux-musl', 'arm64': 'aarch64-unknown-linux-musl'}[session['architecture']]})
     receipt['mac'] = hmac.new(bytes.fromhex(session['token']), canonical(receipt), hashlib.sha256).hexdigest()
     save(session_path / 'payload.json', receipt)

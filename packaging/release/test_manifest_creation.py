@@ -31,7 +31,7 @@ class ManifestCreation(unittest.TestCase):
                     artifacts[name]={'kind':kind,'architecture':architecture,'libc':libc,'sha256':digest,'size':len(binary)}
                     if kind in ('rpm','keyring-rpm'):signatures[name]={'sha256':digest}
                 build={**ident,'architecture':arch,'commit':'0'*40,'source_date_epoch':0,'archive_fingerprint':fingerprint,
-                       'rustc_version':'1.99.1','compatibility_flags':['--no-multishot-accept'],
+                       'rustc_version':'1.100.0','compatibility_flags':['--no-multishot-accept'],
                        'target':{'amd64':'x86_64-unknown-linux-musl','arm64':'aarch64-unknown-linux-musl'}[arch],
                        'binary_sha256':digest,'artifacts':artifacts,'oci_images':{arch:{
                            'artifact':f'httpjet-1.2.3-1-linux-{arch}-oci.tar','image_id':'sha256:'+'b'*64,'base_image':base}}}

@@ -32,7 +32,9 @@ scripts/h3get.py
 scripts/h3load.py
 scripts/oci-smoke.sh
 scripts/ocsp-runtime-test.py
+scripts/rebase-vendor.py
 scripts/otel_h3_client.py
 scripts/public-source-files.txt
 scripts/train-pagecache-dict-from-files.sh
+scripts/update-deps.sh
 vendor

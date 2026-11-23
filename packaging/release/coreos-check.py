@@ -44,7 +44,7 @@ POST_REBOOT_READINESS_SECONDS = 300
 
 def selinux_descriptor():
     return {'domain':SELINUX_DOMAIN,'policy_sha256':release_api.sha(SELINUX_POLICY),'base_template':SELINUX_BASE}
-TOOLS = 'rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8'
+TOOLS = 'rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea'
 
 
 def tree_hash(directory):

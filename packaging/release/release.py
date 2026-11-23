@@ -27,7 +27,7 @@ CHECKS = ('install', 'rerun', 'http', 'scripts-denied', 'bridged-transfer', 'res
           'config-preserved', 'upgrade', 'downgrade', 'remove', 'purge', 'occupied-port',
           'no-php-no-cache', 'io-uring-denied', 'reinstall', 'reboot')
 REPO_URL = 'https://httpjet-packages.pages.dev/apt'
-USER_AGENT = 'httpjet-release/0.2.4'
+USER_AGENT = 'httpjet-release/0.2.5'
 
 def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, stdout=subprocess.PIPE,
@@ -154,7 +154,7 @@ def create_manifest(directory, output):
                 raise ValueError(f'native builds disagree on {field}')
         if provenance['architecture'] != arch or provenance['debian_version'] != release_version + '-1':
             raise ValueError('invalid package version/architecture')
-        if provenance['tag'] != 'v' + release_version or provenance['rustc_version'] != '1.99.1':
+        if provenance['tag'] != 'v' + release_version or provenance['rustc_version'] != '1.100.0':
             raise ValueError('tag/Cargo identity or toolchain mismatch')
         if not re.fullmatch(r'[0-9a-f]{40}', provenance['commit']):
             raise ValueError('invalid source commit')

@@ -26,17 +26,15 @@ fn generate_prost() {
     use std::{
         fmt::Write,
         fs::{self, File},
-        io::{self, BufRead, BufReader},
+        io::{BufRead, BufReader},
     };
 
     const PRE_GENERATED_PATH: &str = "proto/perftools.profiles.rs";
 
     // Calculate the SHA256 of the proto file
-    let mut hasher = Sha256::new();
-    let mut proto_file = BufReader::new(File::open("proto/profile.proto").unwrap());
-    io::copy(&mut proto_file, &mut hasher).unwrap();
+    let digest = Sha256::digest(fs::read("proto/profile.proto").unwrap());
     let mut hex = String::new();
-    for b in hasher.finalize() {
+    for b in digest {
         write!(&mut hex, "{:x}", b).unwrap();
     }
     let hash_comment = format!("// {}  proto/profile.proto", hex);

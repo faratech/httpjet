@@ -113,3 +113,8 @@ unused_qualifications = "warn"
 level = "warn"
 priority = 0
 check-cfg = ["cfg(fuzzing)"]
+
+[target.'cfg(target_vendor = "apple")'.dev-dependencies.nix]
+version = "0.32.0"
+default-features = false
+features = ["net"]

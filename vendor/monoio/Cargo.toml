@@ -225,6 +225,7 @@ signal-termination = [
     "ctrlc/termination",
 ]
 splice = []
+symlinkat = []
 sync = [
     "flume",
     "threadpool",

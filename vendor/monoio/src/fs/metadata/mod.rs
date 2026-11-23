@@ -48,7 +48,7 @@ pub async fn metadata<P: AsRef<Path>>(path: P) -> std::io::Result<Metadata> {
     #[cfg(target_os = "macos")]
     let op = Op::statx_using_path(path, true)?;
 
-    op.statx_result().await.map(FileAttr::from).map(Metadata)
+    op.result().await.map(FileAttr::from).map(Metadata)
 }
 
 /// Query the metadata about a file without following symlinks.
@@ -88,7 +88,7 @@ pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> std::io::Result<Metada
     #[cfg(target_os = "macos")]
     let op = Op::statx_using_path(path, false)?;
 
-    op.statx_result().await.map(FileAttr::from).map(Metadata)
+    op.result().await.map(FileAttr::from).map(Metadata)
 }
 
 #[cfg(unix)]
@@ -248,17 +248,11 @@ impl Metadata {
 
                 Ok(SystemTime::UNIX_EPOCH + std::time::Duration::new(btime as u64, btime_nsec))
             } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Creation time is not available",
-                ))
+                Err(std::io::Error::other("Creation time is not available"))
             };
         }
 
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Creation time is not available",
-        ))
+        Err(std::io::Error::other("Creation time is not available"))
     }
 
     /// Returns the permissions of the file this metadata is for.
@@ -343,9 +337,11 @@ impl MetadataExt for Metadata {
         self.0.stat.st_nlink.into()
     }
 
+    /// longarch64 need the `into` convert.
+    #[allow(clippy::useless_conversion)]
     #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     fn nlink(&self) -> u64 {
-        self.0.stat.st_nlink
+        self.0.stat.st_nlink.into()
     }
 
     fn uid(&self) -> u32 {

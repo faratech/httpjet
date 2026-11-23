@@ -15,7 +15,7 @@ seconds=${FUZZ_SECONDS:-300}
 [[ "$seconds" =~ ^[1-9][0-9]{0,2}$ ]] && (( seconds <= 600 )) || {
   echo "FUZZ_SECONDS must be 1..600" >&2; exit 2;
 }
-toolchain=${FUZZ_TOOLCHAIN:-nightly-2026-08-31}
+toolchain=${FUZZ_TOOLCHAIN:-nightly-2026-11-22}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
 export CARGO_INCREMENTAL=0
 mkdir -p "fuzz/artifacts/$target"

@@ -13,9 +13,9 @@ esac
 for payload_tool in rustup rustc cargo musl-gcc readelf python3; do
   command -v "$payload_tool" >/dev/null || { echo "static build needs $payload_tool" >&2; exit 1; }
 done
-export RUSTUP_TOOLCHAIN=1.99.1
-[ "$(rustc --version | awk '{print $2}')" = 1.99.1 ] || { echo 'Rust1.99.1 required' >&2; exit 1; }
-rustup target add --toolchain 1.99.1 "$payload_target"
+export RUSTUP_TOOLCHAIN=1.100.0
+[ "$(rustc --version | awk '{print $2}')" = 1.100.0 ] || { echo 'Rust1.100.0 required' >&2; exit 1; }
+rustup target add --toolchain 1.100.0 "$payload_target"
 export RUSTFLAGS="-Ctarget-cpu=$payload_cpu -Cforce-frame-pointers=yes -Ctarget-feature=+crt-static -Clinker=musl-gcc"
 unset CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_TARGET
 export CC=musl-gcc CXX=musl-gcc TARGET_CC=musl-gcc TARGET_CXX=musl-gcc

@@ -5,6 +5,7 @@ exclude = [
     "vendor/dashmap",
     "vendor/monoio",
     "vendor/monoio-rustls",
+    "vendor/openssl",
     "vendor/pprof",
     "vendor/quinn-udp",
 ]
@@ -24,10 +25,10 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 publish = false
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 license = "GPL-3.0-only"
 repository = "https://github.com/faratech/httpjet"
 homepage = "https://httpjet.net"
@@ -101,7 +102,7 @@ ipnet = "2"
 hj-geo = { path = "crates/hj-geo" }
 globset = "0.4"
 dashmap = { version = "=7.0.0-rc2", features = ["inline-more"] }
-hashbrown = "0.17.1"
+hashbrown = "0.17.2"
 # Fast non-cryptographic hasher (FxHash) for INTERNAL maps keyed by trusted values
 # (h2 stream IDs, etc.) — SipHash's DoS resistance is wasted on a u32 key. Never use
 # for maps keyed by untrusted external input.
@@ -155,6 +156,7 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 dashmap = { path = "vendor/dashmap" }
 monoio = { path = "vendor/monoio" }
 monoio-rustls = { path = "vendor/monoio-rustls" }
+openssl = { path = "vendor/openssl" }
 pprof = { path = "vendor/pprof" }
 quinn-udp = { path = "vendor/quinn-udp" }
 

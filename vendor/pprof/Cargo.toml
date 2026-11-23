@@ -160,7 +160,7 @@ version = "3.7.2"
 optional = true
 
 [build-dependencies.sha2]
-version = "0.10"
+version = "0.11.1"
 optional = true
 
 [features]

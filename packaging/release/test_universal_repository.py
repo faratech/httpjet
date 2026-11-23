@@ -65,7 +65,7 @@ class UniversalRepository(unittest.TestCase):
                          'binaries': {}, 'packages': {}, 'rpm_packages': {}, 'oci_images': {}, 'artifacts': {}}
         self.make_artifacts()
         self.make_qualification()
-        self.rpm_patch = patch.object(universal, 'rpm_repository', side_effect=self.rpm_metadata_fixture)
+        self.rpm_patch = patch.object(release, 'run', side_effect=self.rpm_metadata_fixture(release.run))
         self.rpm_patch.start(); self.addCleanup(self.rpm_patch.stop)
         self.rpm_signatures = patch.object(universal, 'verify_rpm_signatures')
         self.rpm_signatures.start(); self.addCleanup(self.rpm_signatures.stop)
@@ -168,21 +168,30 @@ class UniversalRepository(unittest.TestCase):
             'manifest_sha256':release.sha(self.directory/'manifest.json'), 'support_matrix_sha256':self.manifest['support_matrix']['sha256'],
             'status':'passed','targets':targets})
 
-    def rpm_metadata_fixture(self, directory, output, manifest, previous, key, expected):
-        # Simulate createrepo-c output, retaining real detached-signature checks.
-        for arch, machine in (('amd64','x86_64'),('arm64','aarch64')):
-            root = output/'rpm'/machine; (root/'Packages').mkdir(parents=True); (root/'repodata').mkdir()
-            name = manifest['rpm_packages'][arch]; package = root/'Packages'/name
-            shutil.copyfile(directory/name,package)
-            primary = gzip.compress(('<metadata xmlns="http://linux.duke.edu/metadata/common"><package>'
-                '<checksum type="sha256">'+release.sha(package)+'</checksum><location href="Packages/'+name+'"/>'
-                '</package></metadata>').encode(), mtime=0)
-            (root/'repodata/primary.xml.gz').write_bytes(primary)
-            document = root/'repodata/repomd.xml'
-            document.write_text('<repomd xmlns="http://linux.duke.edu/metadata/repo"><data type="primary">'
+    def rpm_metadata_fixture(self, real_run):
+        # Stub the external metadata generator only. Exercise the real package
+        # selection, history retention, and detached-signature code.
+        def run(args, **kwargs):
+            if args[0] != 'createrepo_c':
+                return real_run(args, **kwargs)
+            root = Path(args[-1])
+            metadata = root/'repodata'
+            metadata.mkdir()
+            entries = ''.join(
+                '<package><checksum type="sha256">'+release.sha(package)+'</checksum>'
+                '<location href="Packages/'+package.name+'"/></package>'
+                for package in sorted((root/'Packages').glob('*.rpm'))
+            )
+            primary = gzip.compress(
+                ('<metadata xmlns="http://linux.duke.edu/metadata/common">'
+                 +entries+'</metadata>').encode(), mtime=0)
+            (metadata/'primary.xml.gz').write_bytes(primary)
+            (metadata/'repomd.xml').write_text(
+                '<repomd xmlns="http://linux.duke.edu/metadata/repo"><data type="primary">'
                 '<checksum type="sha256">'+payload.sha_bytes(primary)+'</checksum>'
                 '<location href="repodata/primary.xml.gz"/></data></repomd>')
-            universal.sign(document,expected)
+            return ''
+        return run
 
     def stage(self, candidate=False):
         return universal.stage(self.directory,self.work/'snapshot',self.key,self.fingerprint,

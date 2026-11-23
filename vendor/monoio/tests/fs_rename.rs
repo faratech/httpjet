@@ -1,6 +1,4 @@
-#![cfg(all(unix, feature = "renameat"))]
-
-use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+#![cfg(feature = "renameat")]
 
 #[monoio::test_all]
 async fn rename_file_in_the_same_directory() {
@@ -51,10 +49,10 @@ async fn mv_file_in_different_directory() {
 }
 
 #[monoio::test_all]
-async fn rename_inexist_file() {
+async fn rename_nonexistent_file() {
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let old_file_path = temp_dir.path().join("inexist.txt");
+    let old_file_path = temp_dir.path().join("nonexistent.txt");
     let new_file_path = temp_dir.path().join("renamed.txt");
 
     let result = monoio::fs::rename(old_file_path, new_file_path).await;
@@ -62,8 +60,11 @@ async fn rename_inexist_file() {
     assert!(result.is_err());
 }
 
+#[cfg(unix)]
 #[monoio::test_all]
 async fn rename_file_without_permission() {
+    use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_file = tempfile::NamedTempFile::new_in(&temp_dir).unwrap();
 

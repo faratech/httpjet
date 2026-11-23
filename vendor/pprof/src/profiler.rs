@@ -33,7 +33,11 @@ pub struct Profiler {
     pub(crate) data: Collector<UnresolvedFrames>,
     sample_counter: i32,
 
+    old_sigaction: Option<signal::SigAction>,
     running: bool,
+
+    #[cfg(feature = "frame-pointer")]
+    on_stack: bool,
 
     #[cfg(any(
         target_arch = "x86_64",
@@ -47,6 +51,10 @@ pub struct Profiler {
 #[derive(Clone)]
 pub struct ProfilerGuardBuilder {
     frequency: c_int,
+
+    #[cfg(feature = "frame-pointer")]
+    on_stack: bool,
+
     #[cfg(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
@@ -60,6 +68,9 @@ impl Default for ProfilerGuardBuilder {
     fn default() -> ProfilerGuardBuilder {
         ProfilerGuardBuilder {
             frequency: 99,
+
+            #[cfg(feature = "frame-pointer")]
+            on_stack: false,
 
             #[cfg(any(
                 target_arch = "x86_64",
@@ -75,6 +86,21 @@ impl Default for ProfilerGuardBuilder {
 impl ProfilerGuardBuilder {
     pub fn frequency(self, frequency: c_int) -> Self {
         Self { frequency, ..self }
+    }
+
+    #[cfg(feature = "frame-pointer")]
+    /// Sets whether to use an alternate signal stack via `SA_ONSTACK`.
+    ///
+    /// This is only available and only works correctly when the `frame-pointer` feature is enabled.
+    ///
+    /// The `backtrace-rs` unwinder ignores the signal context and unwinds the current stack. Using
+    /// an alternate stack with it would produce meaningless results. The `frame-pointer` unwinder,
+    /// however, uses the provided `ucontext` to correctly walk the original application stack.
+    ///
+    /// This should be enabled when the profiler is used in an environment
+    /// with small stacks (e.g., inside a Go program) to prevent stack overflow.
+    pub fn on_stack(self, on_stack: bool) -> Self {
+        Self { on_stack, ..self }
     }
 
     #[cfg(any(
@@ -128,6 +154,11 @@ impl ProfilerGuardBuilder {
                 Err(Error::CreatingError)
             }
             Ok(profiler) => {
+                #[cfg(feature = "frame-pointer")]
+                {
+                    profiler.on_stack = self.on_stack;
+                }
+
                 #[cfg(any(
                     target_arch = "x86_64",
                     target_arch = "aarch64",
@@ -159,6 +190,7 @@ pub struct ProfilerGuard<'a> {
 fn trigger_lazy() {
     let _ = backtrace::Backtrace::new();
     let _profiler = PROFILER.read();
+    TraceImpl::init();
 }
 
 impl ProfilerGuard<'_> {
@@ -389,7 +421,11 @@ impl Profiler {
         Ok(Profiler {
             data: Collector::new()?,
             sample_counter: 0,
+            old_sigaction: None,
             running: false,
+
+            #[cfg(feature = "frame-pointer")]
+            on_stack: false,
 
             #[cfg(any(
                 target_arch = "x86_64",
@@ -450,24 +486,30 @@ impl Profiler {
         }
     }
 
-    fn register_signal_handler(&self) -> Result<()> {
+    fn register_signal_handler(&mut self) -> Result<()> {
         let handler = signal::SigHandler::SigAction(perf_signal_handler);
-        let sigaction = signal::SigAction::new(
-            handler,
-            // SA_RESTART will only restart a syscall when it's safe to do so,
-            // e.g. when it's a blocking read(2) or write(2). See man 7 signal.
-            signal::SaFlags::SA_SIGINFO | signal::SaFlags::SA_RESTART,
-            signal::SigSet::empty(),
-        );
-        unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }?;
-
+        // SA_RESTART will only restart a syscall when it's safe to do so,
+        // e.g. when it's a blocking read(2) or write(2). See man 7 signal.
+        let flags = signal::SaFlags::SA_SIGINFO | signal::SaFlags::SA_RESTART;
+        #[cfg(feature = "frame-pointer")]
+        let flags = if self.on_stack {
+            // SA_ONSTACK will deliver the signal on an alternate stack. This is crucial
+            // to prevent a stack overflow if the signal arrives at a thread with
+            // a small stack, which is common when use pprof-rs in Go runtimes.
+            flags | signal::SaFlags::SA_ONSTACK
+        } else {
+            flags
+        };
+        let sigaction = signal::SigAction::new(handler, flags, signal::SigSet::empty());
+        let old_action = unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }?;
+        self.old_sigaction = Some(old_action);
         Ok(())
     }
 
-    fn unregister_signal_handler(&self) -> Result<()> {
-        let handler = signal::SigHandler::SigIgn;
-        unsafe { signal::signal(signal::SIGPROF, handler) }?;
-
+    fn unregister_signal_handler(&mut self) -> Result<()> {
+        if let Some(old_action) = self.old_sigaction.take() {
+            unsafe { signal::sigaction(signal::SIGPROF, &old_action) }?;
+        }
         Ok(())
     }
 
@@ -483,5 +525,79 @@ impl Profiler {
         self.sample_counter += 1;
 
         if let Ok(()) = self.data.add(frames, 1) {}
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    struct AllocDetector {
+        should_count_alloc: std::sync::atomic::AtomicBool,
+        alloc_count: std::sync::atomic::AtomicUsize,
+    }
+
+    unsafe impl std::alloc::GlobalAlloc for AllocDetector {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            if self
+                .should_count_alloc
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.alloc_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) }
+        }
+    }
+    impl AllocDetector {
+        fn enable_count_alloc(&self) {
+            self.should_count_alloc
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn disable_count_alloc(&self) {
+            self.should_count_alloc
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn alloc_count(&self) -> usize {
+            self.alloc_count.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: AllocDetector = AllocDetector {
+        should_count_alloc: std::sync::atomic::AtomicBool::new(false),
+        alloc_count: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    #[test]
+    fn test_no_alloc_during_unwind() {
+        // This test cannot run parallelly because it requires the global allocator to
+        // record the allocation count.
+
+        trigger_lazy();
+        PROFILER.write().as_mut().unwrap().start().unwrap();
+        let timer = Timer::new(999);
+        let start = std::time::Instant::now();
+        ALLOC.enable_count_alloc();
+
+        // alloc something to make sure the ALLOC works fine.
+        let _alloc = Box::new(1usize);
+        // busy loop for a while to trigger some samples
+        while start.elapsed().as_millis() < 500 {
+            std::hint::black_box(());
+        }
+        ALLOC.disable_count_alloc();
+
+        assert_eq!(ALLOC.alloc_count(), 1);
+
+        drop(timer);
+        PROFILER.write().as_mut().unwrap().stop().unwrap();
     }
 }

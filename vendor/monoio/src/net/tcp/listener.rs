@@ -50,7 +50,7 @@ impl TcpListener {
         let addr = addr
             .to_socket_addrs()?
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "empty address"))?;
+            .ok_or_else(|| io::Error::other("empty address"))?;
 
         let domain = if addr.is_ipv6() {
             socket2::Domain::IPV6
@@ -129,7 +129,7 @@ impl TcpListener {
         let fd = completion.meta.result?;
 
         // Construct stream
-        let stream = TcpStream::from_shared_fd(SharedFd::new::<false>(fd as _)?);
+        let stream = TcpStream::from_shared_fd(SharedFd::new::<false>(fd.into_inner() as _)?);
 
         // Construct SocketAddr
         let storage = completion.data.addr.0.as_ptr();
@@ -186,7 +186,7 @@ impl TcpListener {
         let fd = completion.meta.result?;
 
         // Construct stream
-        let stream = TcpStream::from_shared_fd(SharedFd::new::<false>(fd as _)?);
+        let stream = TcpStream::from_shared_fd(SharedFd::new::<false>(fd.into_inner() as _)?);
 
         // Construct SocketAddr
         let storage = completion.data.addr.0.as_ptr();
@@ -353,7 +353,7 @@ impl AcceptMultiStream {
     pub async fn next(&mut self) -> Option<io::Result<TcpStream>> {
         let meta = std::future::poll_fn(|cx| self.op.poll_next_completion(cx)).await?;
         Some(match meta.result {
-            Ok(fd) => SharedFd::new::<false>(fd as _).map(TcpStream::from_shared_fd),
+            Ok(fd) => SharedFd::new::<false>(fd.into_inner() as _).map(TcpStream::from_shared_fd),
             Err(e) => Err(e),
         })
     }

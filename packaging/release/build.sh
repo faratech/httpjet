@@ -23,7 +23,7 @@ release_arch=$(dpkg --print-architecture)
 case "$release_arch:$(uname -m)" in amd64:x86_64|arm64:aarch64) ;; *) echo 'native architecture required' >&2; exit 1;; esac
 . /etc/os-release
 [ "$ID:$VERSION_ID" = debian:12 ] || { echo 'Debian12 builder required' >&2; exit 1; }
-[ "$(rustc --version | awk '{print $2}')" = 1.99.1 ] || { echo 'Rust1.99.1 required' >&2; exit 1; }
+[ "$(rustc --version | awk '{print $2}')" = 1.100.0 ] || { echo 'Rust1.100.0 required' >&2; exit 1; }
 [ ! -e "$release_output" ] || { echo 'output already exists' >&2; exit 1; }
 python3 - "$release_root" "$release_version" "$release_key" "$release_fingerprint" <<'PY'
 import importlib.util,pathlib,sys,tomllib
@@ -88,7 +88,7 @@ for path in sorted(out.iterdir()):
     artifacts[name]={'sha256':m.sha(path),'size':path.stat().st_size,'kind':kind,'architecture':artifact_arch,'libc':libc}
 p={'schema':2,'version':version,'upstream_version':version,'revision':int(revision),'package_revision':int(revision),
  'release_id':rid,'debian_version':rid,'tag':tag,'commit':commit,'architecture':arch,'archive_fingerprint':fpr,
- 'rustc_version':'1.99.1','source_date_epoch':int(epoch),'builder':'native Debian12/Rust1.99.1; static musl source payload; authenticated same-run carriers',
+ 'rustc_version':'1.100.0','source_date_epoch':int(epoch),'builder':'native Debian12/Rust1.100.0; static musl source payload; authenticated same-run carriers',
  'features':[],'compatibility_flags':['--no-multishot-accept'],'libc':'musl',
  'target':{'amd64':'x86_64-unknown-linux-musl','arm64':'aarch64-unknown-linux-musl'}[arch],
  'elf':m.load(work/'elf.json'),'dictionary_trainer':m.load(work/'trainer/trainer.json'),

@@ -1,50 +1,113 @@
 use std::io;
-#[cfg(all(unix, any(feature = "legacy", feature = "poll-io")))]
+#[cfg(unix)]
 use std::os::unix::prelude::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 
+#[cfg(any(feature = "legacy", feature = "poll-io"))]
+pub(crate) use impls::*;
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 use io_uring::{opcode, types};
 #[cfg(all(windows, any(feature = "legacy", feature = "poll-io")))]
-use windows_sys::Win32::{
-    Foundation::TRUE,
-    Networking::WinSock::WSASend,
-    Storage::FileSystem::{SetFilePointer, WriteFile, FILE_CURRENT, INVALID_SET_FILE_POINTER},
-};
+use windows_sys::Win32::{Foundation::TRUE, Storage::FileSystem::WriteFile};
 
 use super::{super::shared_fd::SharedFd, Op, OpAble};
 #[cfg(any(feature = "legacy", feature = "poll-io"))]
-use crate::driver::ready::Direction;
+use super::{driver::ready::Direction, MaybeFd};
 use crate::{
     buf::{IoBuf, IoVecBuf},
-    syscall_u32, BufResult,
+    BufResult,
 };
 
-pub(crate) struct Write<T> {
-    /// Holds a strong ref to the FD, preventing the file from being closed
-    /// while the operation is in-flight.
-    #[allow(unused)]
-    fd: SharedFd,
-    offset: u64,
+macro_rules! write_result {
+    ($($name:ident<$T:ident : $Trait:ident> { $buf:ident }), * $(,)?) => {
+        $(
+            impl<$T: $Trait> super::Op<$name<$T>> {
+                pub(crate) async fn result(self) -> BufResult<usize, $T> {
+                    let complete = self.await;
+                    (complete.meta.result.map(|v| v.into_inner() as _), complete.data.$buf)
+                }
+            }
+        )*
+    };
+}
 
+write_result! {
+    Write<T: IoBuf> { buf },
+    WriteAt<T: IoBuf> { buf },
+    WriteVec<T: IoVecBuf> { buf_vec },
+}
+
+#[cfg(not(windows))]
+write_result! {
+    WriteVecAt<T: IoVecBuf> { buf_vec },
+}
+
+pub(crate) struct Write<T> {
+    fd: SharedFd,
     pub(crate) buf: T,
 }
 
 impl<T: IoBuf> Op<Write<T>> {
-    pub(crate) fn write_at(fd: &SharedFd, buf: T, offset: u64) -> io::Result<Op<Write<T>>> {
-        Op::submit_with(Write {
-            fd: fd.clone(),
-            offset,
-            buf,
-        })
-    }
-
-    pub(crate) async fn write(self) -> BufResult<usize, T> {
-        let complete = self.await;
-        (complete.meta.result.map(|v| v as _), complete.data.buf)
+    pub(crate) fn write(fd: SharedFd, buf: T) -> io::Result<Self> {
+        Op::submit_with(Write { fd, buf })
     }
 }
 
 impl<T: IoBuf> OpAble for Write<T> {
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    fn uring_op(&mut self) -> io_uring::squeue::Entry {
+        // Refers to https://docs.rs/io-uring/latest/io_uring/opcode/struct.Write.html.
+        //
+        // If `offset` is set to `-1`, the offset will use (and advance) the file position, like
+        // the write(2) system calls
+        opcode::Write::new(
+            types::Fd(self.fd.as_raw_fd()),
+            self.buf.read_ptr(),
+            self.buf.bytes_init() as _,
+        )
+        .offset(-1i64 as _)
+        .build()
+    }
+
+    #[cfg(any(feature = "legacy", feature = "poll-io"))]
+    #[inline]
+    fn legacy_interest(&self) -> Option<(crate::driver::ready::Direction, usize)> {
+        self.fd
+            .registered_index()
+            .map(|idx| (Direction::Write, idx))
+    }
+
+    #[cfg(any(feature = "legacy", feature = "poll-io"))]
+    fn legacy_call(&mut self) -> io::Result<MaybeFd> {
+        #[cfg(windows)]
+        let fd = self.fd.as_raw_handle() as _;
+        #[cfg(unix)]
+        let fd = self.fd.as_raw_fd();
+        write(fd, self.buf.read_ptr(), self.buf.bytes_init())
+    }
+}
+
+pub(crate) struct WriteAt<T> {
+    /// Holds a strong ref to the FD, preventing the file from being closed
+    /// while the operation is in-flight.
+    #[allow(unused)]
+    fd: SharedFd,
+    /// Refers to https://docs.rs/io-uring/latest/io_uring/opcode/struct.Write.html.
+    ///
+    /// If `offset` is set to `-1`, the offset will use (and advance) the file position, like
+    /// the write(2) system calls.
+    offset: u64,
+    pub(crate) buf: T,
+}
+
+impl<T: IoBuf> Op<WriteAt<T>> {
+    pub(crate) fn write_at(fd: SharedFd, buf: T, offset: u64) -> io::Result<Op<WriteAt<T>>> {
+        Op::submit_with(WriteAt { fd, offset, buf })
+    }
+}
+
+impl<T: IoBuf> OpAble for WriteAt<T> {
     #[cfg(all(target_os = "linux", feature = "iouring"))]
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         opcode::Write::new(
@@ -64,87 +127,34 @@ impl<T: IoBuf> OpAble for Write<T> {
             .map(|idx| (Direction::Write, idx))
     }
 
-    #[cfg(all(any(feature = "legacy", feature = "poll-io"), unix))]
-    fn legacy_call(&mut self) -> io::Result<u32> {
+    #[cfg(any(feature = "legacy", feature = "poll-io"))]
+    fn legacy_call(&mut self) -> io::Result<MaybeFd> {
+        #[cfg(windows)]
+        let fd = self.fd.as_raw_handle() as _;
+        #[cfg(unix)]
         let fd = self.fd.as_raw_fd();
-        let seek_offset = libc::off_t::try_from(self.offset)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "offset too big"))?;
-        #[cfg(not(target_os = "macos"))]
-        return syscall_u32!(pwrite64(
-            fd,
-            self.buf.read_ptr() as _,
-            self.buf.bytes_init(),
-            seek_offset as _
-        ));
 
-        #[cfg(target_os = "macos")]
-        return syscall_u32!(pwrite(
-            fd,
-            self.buf.read_ptr() as _,
-            self.buf.bytes_init(),
-            seek_offset
-        ));
-    }
-
-    #[cfg(all(any(feature = "legacy", feature = "poll-io"), windows))]
-    fn legacy_call(&mut self) -> io::Result<u32> {
-        let fd = self.fd.raw_handle() as _;
-        let seek_offset = libc::off_t::try_from(self.offset)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "offset too big"))?;
-        let mut bytes_write = 0;
-        let ret = unsafe {
-            // see https://learn.microsoft.com/zh-cn/windows/win32/api/fileapi/nf-fileapi-setfilepointer
-            if seek_offset != 0 {
-                let r = SetFilePointer(fd, seek_offset, std::ptr::null_mut(), FILE_CURRENT);
-                if INVALID_SET_FILE_POINTER == r {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            // see https://learn.microsoft.com/zh-cn/windows/win32/api/fileapi/nf-fileapi-writefile
-            WriteFile(
-                fd,
-                self.buf.read_ptr(),
-                self.buf.bytes_init() as u32,
-                &mut bytes_write,
-                std::ptr::null_mut(),
-            )
-        };
-        if TRUE == ret {
-            Ok(bytes_write)
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        write_at(fd, self.buf.read_ptr(), self.buf.bytes_init(), self.offset)
     }
 }
 
 pub(crate) struct WriteVec<T> {
     /// Holds a strong ref to the FD, preventing the file from being closed
     /// while the operation is in-flight.
-    #[allow(unused)]
     fd: SharedFd,
-
     pub(crate) buf_vec: T,
 }
 
 impl<T: IoVecBuf> Op<WriteVec<T>> {
-    pub(crate) fn writev(fd: &SharedFd, buf_vec: T) -> io::Result<Self> {
-        Op::submit_with(WriteVec {
-            fd: fd.clone(),
-            buf_vec,
-        })
+    pub(crate) fn writev(fd: SharedFd, buf_vec: T) -> io::Result<Self> {
+        Op::submit_with(WriteVec { fd, buf_vec })
     }
 
-    #[allow(unused)]
     pub(crate) fn writev_raw(fd: &SharedFd, buf_vec: T) -> WriteVec<T> {
         WriteVec {
             fd: fd.clone(),
             buf_vec,
         }
-    }
-
-    pub(crate) async fn write(self) -> BufResult<usize, T> {
-        let complete = self.await;
-        (complete.meta.result.map(|v| v as _), complete.data.buf_vec)
     }
 }
 
@@ -153,7 +163,13 @@ impl<T: IoVecBuf> OpAble for WriteVec<T> {
     fn uring_op(&mut self) -> io_uring::squeue::Entry {
         let ptr = self.buf_vec.read_iovec_ptr() as *const _;
         let len = self.buf_vec.read_iovec_len() as _;
-        opcode::Writev::new(types::Fd(self.fd.raw_fd()), ptr, len).build()
+        // Refers to https://docs.rs/io-uring/latest/io_uring/opcode/struct.Write.html.
+        //
+        // If `offset` is set to `-1`, the offset will use (and advance) the file position, like
+        // the writev(2) system calls
+        opcode::Writev::new(types::Fd(self.fd.raw_fd()), ptr, len)
+            .offset(-1i64 as u64)
+            .build()
     }
 
     #[cfg(any(feature = "legacy", feature = "poll-io"))]
@@ -164,27 +180,212 @@ impl<T: IoVecBuf> OpAble for WriteVec<T> {
             .map(|idx| (Direction::Write, idx))
     }
 
-    #[cfg(all(any(feature = "legacy", feature = "poll-io"), unix))]
-    fn legacy_call(&mut self) -> io::Result<u32> {
-        syscall_u32!(writev(
-            self.fd.raw_fd(),
+    #[cfg(any(feature = "legacy", feature = "poll-io"))]
+    fn legacy_call(&mut self) -> io::Result<MaybeFd> {
+        #[cfg(windows)]
+        let fd = self.fd.as_raw_handle() as _;
+        #[cfg(unix)]
+        let fd = self.fd.as_raw_fd();
+
+        let (buf_vec, len) = {
+            #[cfg(unix)]
+            {
+                (self.buf_vec.read_iovec_ptr(), self.buf_vec.read_iovec_len())
+            }
+            #[cfg(windows)]
+            {
+                (
+                    self.buf_vec.read_wsabuf_ptr(),
+                    self.buf_vec.read_wsabuf_len(),
+                )
+            }
+        };
+
+        write_vectored(fd, buf_vec, len)
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) struct WriteVecAt<T> {
+    fd: SharedFd,
+    /// Refers to https://docs.rs/io-uring/latest/io_uring/opcode/struct.Write.html.
+    ///
+    /// If `offset` is set to `-1`, the offset will use (and advance) the file position, like
+    /// the writev(2) system calls.
+    offset: u64,
+    buf_vec: T,
+}
+
+#[cfg(not(windows))]
+impl<T: IoVecBuf> OpAble for WriteVecAt<T> {
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    fn uring_op(&mut self) -> io_uring::squeue::Entry {
+        opcode::Writev::new(
+            types::Fd(libc::AT_FDCWD),
             self.buf_vec.read_iovec_ptr(),
-            self.buf_vec.read_iovec_len().min(i32::MAX as usize) as _
-        ))
+            self.buf_vec.read_iovec_len() as _,
+        )
+        .offset(self.offset)
+        .build()
     }
 
-    #[cfg(all(any(feature = "legacy", feature = "poll-io"), windows))]
-    fn legacy_call(&mut self) -> io::Result<u32> {
+    #[cfg(any(feature = "legacy", feature = "poll-io"))]
+    fn legacy_interest(&self) -> Option<(crate::driver::ready::Direction, usize)> {
+        self.fd
+            .registered_index()
+            .map(|idx| (Direction::Write, idx))
+    }
+
+    #[cfg(any(feature = "legacy", feature = "poll-io"))]
+    fn legacy_call(&mut self) -> io::Result<MaybeFd> {
+        write_vectored_at(
+            self.fd.raw_fd(),
+            self.buf_vec.read_iovec_ptr(),
+            self.buf_vec.read_iovec_len(),
+            self.offset,
+        )
+    }
+}
+
+#[cfg(all(any(feature = "legacy", feature = "poll-io"), unix))]
+pub(crate) mod impls {
+    use libc::iovec;
+
+    use super::*;
+
+    /// A wrapper of [`libc::write`]
+    pub(crate) fn write(fd: i32, buf: *const u8, len: usize) -> io::Result<MaybeFd> {
+        crate::syscall!(write@NON_FD(fd, buf as _, len))
+    }
+
+    /// A wrapper of [`libc::write`]
+    pub(crate) fn write_at(
+        fd: i32,
+        buf: *const u8,
+        len: usize,
+        offset: u64,
+    ) -> io::Result<MaybeFd> {
+        let offset =
+            libc::off_t::try_from(offset).map_err(|_| io::Error::other("offset too big"))?;
+
+        crate::syscall!(pwrite@NON_FD(fd, buf as _, len, offset))
+    }
+
+    /// A wrapper of [`libc::writev`]
+    pub(crate) fn write_vectored(
+        fd: i32,
+        buf_vec: *const iovec,
+        len: usize,
+    ) -> io::Result<MaybeFd> {
+        crate::syscall!(writev@NON_FD(fd, buf_vec as _, len as _))
+    }
+
+    /// A wrapper of [`libc::pwritev`]
+    pub(crate) fn write_vectored_at(
+        fd: i32,
+        buf_vec: *const iovec,
+        len: usize,
+        offset: u64,
+    ) -> io::Result<MaybeFd> {
+        let offset =
+            libc::off_t::try_from(offset).map_err(|_| io::Error::other("offset too big"))?;
+
+        crate::syscall!(pwritev@NON_FD(fd, buf_vec as _, len as _, offset))
+    }
+}
+
+#[cfg(all(any(feature = "legacy", feature = "poll-io"), windows))]
+pub(crate) mod impls {
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_HANDLE_EOF},
+        Networking::WinSock::WSABUF,
+        System::IO::OVERLAPPED,
+    };
+
+    use super::*;
+
+    /// A wrapper of [`windows_sys::Win32::Storage::FileSystem::WriteFile`]
+    pub(crate) fn write(fd: isize, buf: *const u8, len: usize) -> io::Result<MaybeFd> {
+        let mut bytes_write = 0;
+
+        let ret = unsafe { WriteFile(fd, buf, len as _, &mut bytes_write, std::ptr::null_mut()) };
+        if ret == TRUE {
+            return Ok(MaybeFd::new_non_fd(bytes_write));
+        }
+
+        match unsafe { GetLastError() } {
+            ERROR_HANDLE_EOF => Ok(MaybeFd::new_non_fd(bytes_write)),
+            error => Err(io::Error::from_raw_os_error(error as _)),
+        }
+    }
+
+    /// A wrapper of [`windows_sys::Win32::Storage::FileSystem::WriteFile`],
+    /// using [`windows_sys::Win32::System::IO::OVERLAPPED`] to write at specific offset.
+    pub(crate) fn write_at(
+        fd: isize,
+        buf: *const u8,
+        len: usize,
+        offset: u64,
+    ) -> io::Result<MaybeFd> {
+        let mut bytes_write = 0;
+
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        overlapped.Anonymous.Anonymous.Offset = offset as u32; // Lower 32 bits of the offset
+        overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32; // Higher 32 bits of the offset
+
+        let ret = unsafe {
+            WriteFile(
+                fd,
+                buf,
+                len as _,
+                &mut bytes_write,
+                &overlapped as *const _ as *mut _,
+            )
+        };
+
+        if ret == TRUE {
+            return Ok(MaybeFd::new_non_fd(bytes_write));
+        }
+
+        match unsafe { GetLastError() } {
+            ERROR_HANDLE_EOF => Ok(MaybeFd::new_non_fd(bytes_write)),
+            error => Err(io::Error::from_raw_os_error(error as _)),
+        }
+    }
+
+    /// There is no `writev` like syscall of file on windows, but this will be used to send socket
+    /// message.
+    pub(crate) fn write_vectored(
+        fd: usize,
+        buf_vec: *const WSABUF,
+        len: usize,
+    ) -> io::Result<MaybeFd> {
+        use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSASend, WSAESHUTDOWN};
+
         let mut bytes_sent = 0;
-        syscall_u32!(WSASend(
-            self.fd.raw_socket() as _,
-            self.buf_vec.read_wsabuf_ptr(),
-            self.buf_vec.read_wsabuf_len() as _,
-            &mut bytes_sent,
-            0,
-            std::ptr::null_mut(),
-            None,
-        ))
-        .map(|_| bytes_sent)
+
+        let ret = unsafe {
+            WSASend(
+                fd,
+                buf_vec,
+                len as _,
+                &mut bytes_sent,
+                0,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+
+        match ret {
+            0 => Ok(MaybeFd::new_non_fd(bytes_sent)),
+            _ => {
+                let error = unsafe { WSAGetLastError() };
+                if error == WSAESHUTDOWN {
+                    Ok(MaybeFd::zero())
+                } else {
+                    Err(io::Error::from_raw_os_error(error))
+                }
+            }
+        }
     }
 }

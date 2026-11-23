@@ -288,7 +288,7 @@ not evidence that it has been qualified.
 
 ## Build and try it
 
-Requires Linux with io_uring and Rust 1.99.1 or newer (the workspace
+Requires Linux with io_uring and Rust 1.100.0 or newer (the workspace
 `rust-version`).
 
 ```bash
