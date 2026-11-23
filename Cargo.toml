@@ -8,6 +8,7 @@ exclude = [
     "vendor/openssl",
     "vendor/pprof",
     "vendor/quinn-udp",
+    "vendor/rustls",
 ]
 
 [workspace.lints.rust]
@@ -25,7 +26,7 @@ panic = "warn"
 unreachable = "warn"
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 publish = false
 rust-version = "1.100.0"
@@ -87,7 +88,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 httpdate = "1"
 
 # tls
-rustls = "0.23"
+rustls = "=0.23.46"
 tokio-rustls = "0.26"
 rustls-pki-types = "1"
 webpki-roots = "1.0"
@@ -159,6 +160,7 @@ monoio-rustls = { path = "vendor/monoio-rustls" }
 openssl = { path = "vendor/openssl" }
 pprof = { path = "vendor/pprof" }
 quinn-udp = { path = "vendor/quinn-udp" }
+rustls = { path = "vendor/rustls" }
 
 [profile.release]
 opt-level = 3

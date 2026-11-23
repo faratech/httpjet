@@ -202,12 +202,12 @@ pub(super) fn begin_response(
     let body_forbidden = hj_core::response_body_forbidden(is_head, head.status);
     // Fast-memo hits carry pre-sanitized status-200 GET headers in `SharedHeaders`
     // so we encode straight from `&Arc<HeaderMap>` without cloning `HeaderMap`.
-    let headers_ref: &http::HeaderMap = if let Some(ref shared) = shared_headers
+    let (headers_ref, shared_for_replay) = if let Some(ref shared) = shared_headers
         && !body_forbidden
         && !streaming_unknown_len
         && head.status == http::StatusCode::OK
     {
-        &shared.0
+        (&*shared.0, Some(&shared.0))
     } else {
         if let Some(shared) = shared_headers
             && head.headers.is_empty()
@@ -224,7 +224,7 @@ pub(super) fn begin_response(
             head.status,
             streaming_unknown_len,
         );
-        &head.headers
+        (&head.headers, None)
     };
     // §4.2: every frame we emit for this response (HEADERS/CONTINUATION/DATA) is bounded by the
     // peer's advertised max frame size.
@@ -264,11 +264,40 @@ pub(super) fn begin_response(
         }
     }
 
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let replay_headers = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        shared_for_replay.filter(|headers| {
+            let short_response = match &body {
+                Body::Empty => true,
+                Body::Full(bytes) => bytes.len() <= 2048,
+                _ => false,
+            };
+            short_response
+                && *ENABLED.get_or_init(|| {
+                    std::env::var_os("HJ_H2_HEADER_REPLAY").as_deref()
+                        != Some(std::ffi::OsStr::new("0"))
+                })
+                && !headers.contains_key(http::header::LINK)
+        })
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = shared_for_replay;
+
     // Encode the HPACK header block directly into `out.inline` (reserving a 9-byte
     // FrameHeader prefix and backfilling it in place when the block fits in one frame,
     // which is 99.99% of responses — zero `block_scratch` memcpy). Oversized blocks
     // (> peer.max_frame_size) copy out to `block_scratch` and split into CONTINUATIONs.
     let mut emit_headers = |out: &mut OutQueue, lead_flags: u8| {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if let Some(shared) = replay_headers
+            && let Some(wire) = enc.replay_shared_response(shared)
+        {
+            out.frames(|b| write_field_block(b, stream_id, lead_flags, wire, mf));
+            return;
+        }
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let before = replay_headers.and_then(|_| enc.table_position());
         out.frames(|b| {
             let hdr_pos = b.len();
             b.resize(hdr_pos + 9, 0);
@@ -277,6 +306,10 @@ pub(super) fn begin_response(
                 enc.encode_header(b, name.as_str(), value.as_bytes());
             }
             let block_len = b.len() - (hdr_pos + 9);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if let Some(shared) = replay_headers {
+                enc.remember_shared_response(shared, before, &b[hdr_pos + 9..]);
+            }
             if block_len <= mf {
                 let mut hdr_bytes = [0u8; 9];
                 let len = block_len as u32;

@@ -149,6 +149,48 @@ struct LsphpReloadArgs {
     timeout_secs: u64,
 }
 
+fn h3_udp_settings(
+    engine: uring::h3::H3EngineMode,
+    gso: Option<uring::h3::GsoSegments>,
+    batch: Option<uring::h3::SendBatch>,
+) -> (uring::h3::GsoSegments, uring::h3::SendBatch) {
+    use uring::h3::{GsoSegments, H3EngineMode, SendBatch};
+
+    let defaults = if cfg!(target_arch = "x86_64") && engine != H3EngineMode::Legacy {
+        (GsoSegments::Twenty, SendBatch::Four)
+    } else {
+        (GsoSegments::Ten, SendBatch::One)
+    };
+    (gso.unwrap_or(defaults.0), batch.unwrap_or(defaults.1))
+}
+
+#[test]
+fn h3_udp_settings_keep_legacy_and_independent_operator_overrides() {
+    use uring::h3::{GsoSegments as G, H3EngineMode as Mode, SendBatch as B};
+
+    assert_eq!(h3_udp_settings(Mode::Legacy, None, None), (G::Ten, B::One));
+    let defaults = if cfg!(target_arch = "x86_64") {
+        (G::Twenty, B::Four)
+    } else {
+        (G::Ten, B::One)
+    };
+    for mode in [Mode::Auto, Mode::Accelerated] {
+        assert_eq!(h3_udp_settings(mode, None, None), defaults);
+        assert_eq!(
+            h3_udp_settings(mode, Some(G::Ten), None),
+            (G::Ten, defaults.1)
+        );
+        assert_eq!(
+            h3_udp_settings(mode, None, Some(B::One)),
+            (defaults.0, B::One)
+        );
+        assert_eq!(
+            h3_udp_settings(mode, Some(G::Twenty), Some(B::One)),
+            (G::Twenty, B::One)
+        );
+    }
+}
+
 #[derive(Parser, Debug)]
 struct ServeArgs {
     /// Atomically publish this process's PID after worker activation. The absolute
@@ -174,13 +216,14 @@ struct ServeArgs {
     /// cache path before dispatching misses through the io_uring bridge.
     #[arg(long, value_enum, default_value_t = uring::h3::H3EngineMode::Legacy)]
     h3_engine: uring::h3::H3EngineMode,
-    /// Maximum HTTP/3 datagrams in one GSO transmit. The experimental value 20
-    /// retains the same 20-datagram flush budget; the default remains 10.
-    #[arg(long, value_enum, default_value_t = uring::h3::GsoSegments::Ten)]
-    h3_gso_segments: uring::h3::GsoSegments,
-    /// Maximum UDP messages per send syscall; 1 retains the scalar path.
-    #[arg(long, value_enum, default_value_t = uring::h3::SendBatch::One)]
-    h3_send_batch: uring::h3::SendBatch,
+    /// HTTP/3 GSO segment cap. On x86_64 the accelerated and auto modes default
+    /// to 20. All other configurations default to 10.
+    #[arg(long, value_enum)]
+    h3_gso_segments: Option<uring::h3::GsoSegments>,
+    /// UDP messages per send syscall. On x86_64 the accelerated and auto modes
+    /// default to 4. All other configurations default to 1 (scalar sends).
+    #[arg(long, value_enum)]
+    h3_send_batch: Option<uring::h3::SendBatch>,
     /// Ask HTTP/3 peers that support QUIC ACK_FREQUENCY to acknowledge every N
     /// ack-eliciting packets instead of every second one. 0 (default) asks nothing.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=255))]
@@ -245,13 +288,14 @@ struct ServeArgs {
     /// `pipeline::fast_memo`). Env `HJ_FAST_MEMO=0` is equivalent.
     #[arg(long)]
     no_fast_memo: bool,
-    /// Bridge a cookieless request to the full pipeline before the on-core prefix when nothing
-    /// on-core can serve it: the page cache cannot answer the path and the static branch would
-    /// decline. `off` (default) is today's path; `shadow` only counts what `on` would do
-    /// (`httpjet_fast_early_predicted_total`, `httpjet_fast_early_forfeit_total`). Env
-    /// `HJ_FAST_EARLY_BRIDGE` is equivalent.
-    #[arg(long, default_value = "off")]
-    fast_early_bridge: String,
+    /// Bridge a cookieless request early when the page cache cannot answer the path
+    /// and the static branch would decline. `scripts` checks configured script
+    /// suffixes. `on` also checks route-shaped paths. `off` disables early bridging.
+    /// `shadow` counts predictions without bridging. By default x86_64 checks
+    /// scripts on all protocols and AArch64 checks scripts on accelerated H3.
+    /// Env `HJ_FAST_EARLY_BRIDGE` is equivalent.
+    #[arg(long)]
+    fast_early_bridge: Option<String>,
     /// (Tier 1.1) Per-client-IP request throttle: max requests per client IP per
     /// second. 0 (default) = disabled — overrides the `<perIpRate>` tuning field
     /// when set. Protects the origin from single-source floods; a shared NAT
@@ -1107,11 +1151,13 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
 
     let mut cfg = hj_config::load(root)?;
 
+    let (gso_segments, send_batch) =
+        h3_udp_settings(args.h3_engine, args.h3_gso_segments, args.h3_send_batch);
     uring::h3::configure_engine_mode(args.h3_engine);
-    uring::h3::configure_gso_segments(args.h3_gso_segments);
+    uring::h3::configure_gso_segments(gso_segments);
     uring::h3::configure_ack_frequency(args.h3_ack_eliciting_threshold, args.h3_max_ack_delay_us);
-    uring::h3::configure_send_batch(args.h3_send_batch);
-    tracing::info!(segments = ?args.h3_gso_segments, "HTTP/3 GSO segment limit selected");
+    uring::h3::configure_send_batch(send_batch);
+    tracing::info!(segments = ?gso_segments, batch = ?send_batch, "HTTP/3 GSO segment limit selected");
 
     tracing::info!(engine = ?args.h3_engine, "HTTP/3 request engine selected");
 
@@ -1137,15 +1183,21 @@ fn serve(root: &std::path::Path, args: ServeArgs) -> anyhow::Result<()> {
         tracing::info!("--no-multishot-accept: single-shot accept SQE per connection");
     }
 
-    let early_bridge_mode = std::env::var("HJ_FAST_EARLY_BRIDGE")
-        .ok()
-        .unwrap_or_else(|| args.fast_early_bridge.clone());
-    let early_bridge_mode =
-        pipeline::early_bridge::Mode::parse(&early_bridge_mode).ok_or_else(|| {
+    let early_bridge_override = std::env::var("HJ_FAST_EARLY_BRIDGE").ok();
+    let early_bridge_mode = match early_bridge_override
+        .as_deref()
+        .or(args.fast_early_bridge.as_deref())
+    {
+        Some(mode) => pipeline::early_bridge::Mode::parse(mode).ok_or_else(|| {
             anyhow::anyhow!(
-                "--fast-early-bridge: expected off, shadow or on, got {early_bridge_mode:?}"
+                "--fast-early-bridge: expected off, shadow, scripts or on, got {mode:?}"
             )
-        })?;
+        })?,
+        None => pipeline::early_bridge::Mode::default_for(
+            std::env::consts::ARCH,
+            args.h3_engine != uring::h3::H3EngineMode::Legacy,
+        ),
+    };
     pipeline::early_bridge::DEFAULT_MODE.store(
         early_bridge_mode as u8,
         std::sync::atomic::Ordering::Relaxed,

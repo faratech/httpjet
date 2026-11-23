@@ -1,3 +1,12 @@
+httpjet (0.2.6-1) stable; urgency=medium
+
+  * Consolidate the retained HTTP/1.1 request-head, HTTP/2 dispatch and HPACK,
+    TLS record write, and HTTP/3 UDP batching improvements.
+  * Carry forward the Rust 1.100.0 toolchain, dependency refresh, and vendor
+    rebase tooling.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Mon, 23 Nov 2026 08:25:26 -0500
+
 httpjet (0.2.5-1) stable; urgency=medium
 
   * Build with Rust 1.100.0 and refresh vendored transport, profiling, and

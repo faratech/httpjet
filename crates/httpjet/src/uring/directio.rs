@@ -1,6 +1,5 @@
-//! `DirectWriteSocket`: a monoio `TcpStream` wrapper whose WRITES use a direct
-//! `write(2)` syscall (with an io_uring fallback on `EAGAIN`) instead of an io_uring
-//! write op. Reads stay on io_uring.
+//! `DirectWriteSocket`: a monoio `TcpStream` wrapper with direct nonblocking
+//! TCP writes and an io_uring fallback on `EAGAIN`. Reads stay on io_uring.
 //!
 //! Why: on loopback bulk transfer io_uring's write is *slower* than a plain `write(2)`
 //! — io_uring's edge is hiding *blocking* I/O, but a loopback socket write never blocks,
@@ -99,8 +98,37 @@ impl AsyncWriteRent for DirectWriteSocket {
         }
     }
     fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> impl Future<Output = BufResult<usize, T>> {
-        // monoio-rustls's write path uses scalar write_all (not writev), so this delegates.
-        self.inner.writev(buf_vec)
+        async move {
+            let count = buf_vec.read_iovec_len().min(64);
+            if count == 0 {
+                return (Ok(0), buf_vec);
+            }
+            let message = libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: buf_vec.read_iovec_ptr().cast_mut(),
+                msg_iovlen: count,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            };
+            loop {
+                // SAFETY: the IoVecBuf owns count readable descriptors and
+                // their payloads for this synchronous, nonblocking call.
+                let sent = unsafe {
+                    libc::sendmsg(self.fd, &message, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+                };
+                if sent >= 0 {
+                    return (Ok(sent as usize), buf_vec);
+                }
+                let error = std::io::Error::last_os_error();
+                match error.kind() {
+                    std::io::ErrorKind::Interrupted => {}
+                    std::io::ErrorKind::WouldBlock => return self.inner.writev(buf_vec).await,
+                    _ => return (Err(error), buf_vec),
+                }
+            }
+        }
     }
     fn flush(&mut self) -> impl Future<Output = std::io::Result<()>> {
         self.inner.flush()

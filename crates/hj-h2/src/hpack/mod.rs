@@ -20,6 +20,8 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+use std::sync::{Arc, Weak};
 
 use rustc_hash::FxHashMap;
 
@@ -347,6 +349,23 @@ pub struct Encoder {
     /// header block was emitted. Must be signaled before `pending_size_update` when it
     /// is below the currently active `max_size` (RFC 7541 §4.2 intermediate-minimum rule).
     pending_min_size: Option<usize>,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    shared_response: Option<SharedHeaderBlock>,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TablePosition {
+    insertions: u64,
+    limit: usize,
+    size: usize,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct SharedHeaderBlock {
+    headers: Weak<http::HeaderMap>,
+    position: TablePosition,
+    wire: Vec<u8>,
 }
 
 impl Default for Encoder {
@@ -362,6 +381,8 @@ impl Default for Encoder {
             preferred_max: 4096,
             pending_size_update: None,
             pending_min_size: None,
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            shared_response: None,
         }
     }
 }
@@ -369,6 +390,52 @@ impl Default for Encoder {
 impl Encoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // With no queued size update, every insertion advances ins_count and
+    // an eviction without an insertion reduces size. Those are the only
+    // changes to dynamic indices. Limit is also part of the encoder state.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(crate) fn table_position(&self) -> Option<TablePosition> {
+        if self.pending_size_update.is_some() || self.pending_min_size.is_some() {
+            return None;
+        }
+        Some(TablePosition {
+            insertions: self.ins_count,
+            limit: self.max_size,
+            size: self.size,
+        })
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(crate) fn replay_shared_response(&self, headers: &Arc<http::HeaderMap>) -> Option<&[u8]> {
+        let cached = self.shared_response.as_ref()?;
+        if self.table_position() != Some(cached.position)
+            || !std::ptr::eq(cached.headers.as_ptr(), Arc::as_ptr(headers))
+        {
+            return None;
+        }
+        // Holding a Weak prevents pointer reuse and forces Arc::make_mut to
+        // dissociate the old allocation before changing that header map.
+        Some(&cached.wire)
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(crate) fn remember_shared_response(
+        &mut self,
+        headers: &Arc<http::HeaderMap>,
+        before: Option<TablePosition>,
+        wire: &[u8],
+    ) {
+        let Some(position) = before else { return };
+        if self.table_position() != Some(position) || wire.len() > 1024 {
+            return;
+        }
+        self.shared_response = Some(SharedHeaderBlock {
+            headers: Arc::downgrade(headers),
+            position,
+            wire: wire.to_vec(),
+        });
     }
 
     /// Apply the peer's advertised SETTINGS_HEADER_TABLE_SIZE (RFC 7541 §6.3, RFC 7540
@@ -688,6 +755,8 @@ impl DynValue {
 pub struct Decoder {
     dynamic: VecDeque<(Box<[u8]>, DynValue, Option<http::HeaderName>)>,
     size: usize,
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+    table_revision: u64,
     /// Current dynamic-table size limit (mutated by §6.3 size updates).
     max_size: usize,
     /// Hard protocol limit = the SETTINGS_HEADER_TABLE_SIZE we advertise. A size update
@@ -707,10 +776,18 @@ impl Decoder {
         Decoder {
             dynamic: VecDeque::new(),
             size: 0,
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+            table_revision: 0,
             max_size,
             hard_max: max_size,
             max_list_size,
         }
+    }
+
+    /// Dynamic indexed fields depend on the current table revision.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+    pub(crate) fn table_revision(&self) -> u64 {
+        self.table_revision
     }
 
     /// Borrow a table entry's `(name, pre_validated_header_name, value, pre_validated_header_value)`
@@ -752,6 +829,10 @@ impl Decoder {
         dyn_val: DynValue,
         hdr_name: Option<http::HeaderName>,
     ) {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+        {
+            self.table_revision = self.table_revision.wrapping_add(1);
+        }
         let entry_size = name.len() + dyn_val.len() + ENTRY_OVERHEAD;
         self.evict_to(self.max_size.saturating_sub(entry_size));
         if entry_size <= self.max_size {
@@ -775,6 +856,10 @@ impl Decoder {
         // (the SETTINGS_HEADER_TABLE_SIZE we advertised). Exceeding it is a decode error.
         if new_max > self.hard_max {
             return Err(Error::InvalidSizeUpdate);
+        }
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+        {
+            self.table_revision = self.table_revision.wrapping_add(1);
         }
         self.max_size = new_max;
         self.evict_to(new_max);
@@ -933,6 +1018,50 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn shared_response_block_requires_stable_table_and_header_identity() {
+        let mut encoder = Encoder::new();
+        let mut decoder = Decoder::new(4096, 65536);
+        let mut fields = http::HeaderMap::new();
+        fields.insert("x-fixture", http::HeaderValue::from_static("one"));
+        let fields = Arc::new(fields);
+        let mut bytes = Vec::new();
+        let start = encoder.table_position();
+        encoder.encode_header(&mut bytes, ":status", "200");
+        encoder.encode_header(&mut bytes, "x-fixture", "one");
+        decoder.decode(&bytes, |_, _| {}).unwrap();
+        encoder.remember_shared_response(&fields, start, &bytes);
+        assert!(encoder.replay_shared_response(&fields).is_none());
+
+        bytes.clear();
+        let steady = encoder.table_position();
+        encoder.encode_header(&mut bytes, ":status", "200");
+        encoder.encode_header(&mut bytes, "x-fixture", "one");
+        encoder.remember_shared_response(&fields, steady, &bytes);
+        let mut decoded = Vec::new();
+        decoder
+            .decode(encoder.replay_shared_response(&fields).unwrap(), |n, v| {
+                decoded.push((n.to_owned(), v.to_owned()));
+            })
+            .unwrap();
+        assert_eq!(decoded[1], ("x-fixture".into(), "one".into()));
+
+        let mut different = fields.clone();
+        Arc::make_mut(&mut different).insert("x-fixture", http::HeaderValue::from_static("two"));
+        assert!(encoder.replay_shared_response(&different).is_none());
+        assert!(encoder.replay_shared_response(&fields).is_some());
+
+        encoder.set_peer_max_size(0);
+        assert!(encoder.replay_shared_response(&fields).is_none());
+        encoder.set_peer_max_size(4096);
+        assert!(encoder.replay_shared_response(&fields).is_none());
+        bytes.clear();
+        encoder.encode_header(&mut bytes, ":status", "200");
+        assert!(encoder.table_position().is_some());
+        assert!(encoder.replay_shared_response(&fields).is_none());
+    }
 
     fn check_date_block(enc: &mut Encoder, dec: &mut Decoder, date: &[u8], marker: &str) {
         let mut wire = Vec::new();

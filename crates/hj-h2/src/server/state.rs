@@ -78,6 +78,10 @@ pub(super) struct Recv {
     /// next stream's `HeaderMap`: a proxy repeats the same header set on every request, and
     /// an unsized map regrew several times per request. Capped at `recv::HEADER_COUNT_HINT_MAX`.
     pub(super) header_count_hint: usize,
+    #[cfg(target_arch = "x86_64")]
+    pub(super) stable_request: super::recv::StableRequestHead,
+    #[cfg(target_arch = "aarch64")]
+    pub(super) sampled_request: Option<super::recv::SampledRequestHead>,
     /// (CVE-2023-44487 rapid-reset) Debt of the reset budget: resets of streams whose
     /// handler was still in flight (backend work started, then discarded), whoever sent the
     /// RST_STREAM. The budget refills with time only, so completed requests cannot pay for

@@ -4608,7 +4608,10 @@ fn store_admitted(
     let headers = headers();
     // (--page-cache-egress-at-rest-vhosts) The zstd encode this response would get on egress
     // is the stored body too, under the dictionary-less generation, with the same savings
-    // gate as the dictionary re-encode. It is handed back so the serve reuses it.
+    // gate as the dictionary re-encode. Egress can still use an inline encode that
+    // the storage savings gate rejects, since the compression transform selects
+    // the same codec and level independently of how the cache stores the body.
+    let inline = matches!(&at_rest, AtRest::Inline(_));
     let encoded = match at_rest {
         AtRest::Background => None,
         AtRest::Inline(compress) => compress.encode_full(Encoding::Zstd, bytes),
@@ -4618,6 +4621,14 @@ fn store_admitted(
         Some(c) if c.len() <= bytes.len().saturating_sub(bytes.len() / 8) => {
             *pre_encoded = Some(c.clone());
             (PageBody::InMem(c), hj_compress::PLAIN_GENERATION)
+        }
+        Some(c)
+            if inline
+                && bytes.len() as u64 >= state.compress.min_size()
+                && state.compress.stored_encodable(&headers) =>
+        {
+            *pre_encoded = Some(c);
+            (PageBody::InMem(bytes.clone()), 0)
         }
         _ => (PageBody::InMem(bytes.clone()), 0),
     };
@@ -8257,6 +8268,80 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(plain_later, "the background pool stores the plain form");
+
+        let identity3 = "https\nforum.example\n/threads/egress.3/";
+        let cc3 = CacheCtx {
+            identity: identity3,
+            req_path: "/threads/egress.3/",
+            ..cc
+        };
+        let key3 = build_cache_key(&ctx, &cc3, &store, &PrivateRoute::Public);
+        state.page_cache_admission.record(hash_key(&key3));
+        let mut seed = 123456789_u32;
+        let data = Bytes::from(
+            (0..16 * 1024)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect::<Vec<_>>(),
+        );
+        let fresh = state.compress.encode_full(Encoding::Zstd, &data).unwrap();
+        assert!(fresh.len() > data.len() - data.len() / 8);
+        let resp = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/plain")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .body(Body::Full(data.clone()))
+            .unwrap();
+        let mut served = cache_store(&state, &ctx, &cc3, resp).await;
+        let hj_pagecache::EntryState::Fresh(entry) =
+            store.get_entry_uncounted(&key3, identity3, Instant::now())
+        else {
+            panic!("the entry stays cacheable even when zstd saves too little space");
+        };
+        assert_eq!(entry.dict_gen, 0);
+        assert_eq!(store.body_bytes_cold(&entry).unwrap(), data);
+        assert!(
+            served
+                .extensions()
+                .get::<hj_compress::PreEncoded>()
+                .is_some()
+        );
+        state.compress.transform(&ctx, &mut served).await;
+        assert_eq!(served.headers()[CONTENT_ENCODING], "zstd");
+        assert!(matches!(served.body(), Body::Full(bytes) if bytes == &fresh));
+        drop(entry);
+
+        let cc4 = CacheCtx {
+            identity: "https\nforum.example\n/threads/egress.4/",
+            req_path: "/threads/egress.4/",
+            ..cc
+        };
+        let key4 = build_cache_key(&ctx, &cc4, &store, &PrivateRoute::Public);
+        state.page_cache_admission.record(hash_key(&key4));
+        let resp = http::Response::builder()
+            .status(200)
+            .header(CONTENT_TYPE, "text/plain")
+            .header(HDR_CACHE_CONTROL, "public,max-age=600")
+            .header(
+                http::header::CACHE_CONTROL,
+                "public,max-age=600,no-transform",
+            )
+            .body(Body::Full(data.clone()))
+            .unwrap();
+        let mut served = cache_store(&state, &ctx, &cc4, resp).await;
+        assert!(
+            served
+                .extensions()
+                .get::<hj_compress::PreEncoded>()
+                .is_none()
+        );
+        state.compress.transform(&ctx, &mut served).await;
+        assert!(!served.headers().contains_key(CONTENT_ENCODING));
+        assert!(matches!(served.body(), Body::Full(bytes) if bytes == &data));
         drop(state);
         drop(store);
         let _ = std::fs::remove_dir_all(root);
@@ -11098,9 +11183,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target")
-            .join(format!("hj-urlvary-{tag}-{}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!("hj-urlvary-{tag}-{}-{n}", std::process::id()))
     }
 
     fn uv_file_boot(
@@ -11113,6 +11196,7 @@ mod tests {
                 cfg.max_mem_bytes = 8 * 1024 * 1024;
                 cfg.max_disk_bytes = 8 * 1024 * 1024;
             });
+        assert!(store.has_disk(), "test requires a working file tier");
         store.load_from_disk(|_| {});
         (state, ctx, store)
     }

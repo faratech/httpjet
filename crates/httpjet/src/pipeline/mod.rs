@@ -608,6 +608,16 @@ async fn fast_serve_inner(
         };
         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    let mode = state.early_bridge.mode();
+    if mode.checks_script_suffix(proto)
+        && !has_cookie
+        && suffix_routing::last_segment_is_script_vhost(state, vhost_cfg, &orig_path)
+        && let Some(why) = early_cache_decline(state, vhost_name, &orig_path, false)
+    {
+        // A script cannot use the static path, and the presence filter rules
+        // out an on-core page-cache hit. The bridge applies the full policy.
+        return bridge(state, why);
+    }
     // A cookied request skips the page-cache branch, so only the static branch below can
     // serve it, and that needs a file at the unrewritten path. With no static `<context>`
     // remapping the path and nothing there (a front-controller URL), it is certain to
@@ -650,11 +660,11 @@ async fn fast_serve_inner(
     // (--fast-early-bridge) The same certainty for a cookieless request, once the page cache
     // provably cannot answer it either.
     let mut early_predicted = false;
-    if state.early_bridge.mode() != early_bridge::Mode::Off
+    if matches!(mode, early_bridge::Mode::On | early_bridge::Mode::Shadow)
         && !has_cookie
         && let Some(why) = early_bridge_reason(state, &ctx, &orig_path, host_foreign)
     {
-        if state.early_bridge.mode() == early_bridge::Mode::On {
+        if mode == early_bridge::Mode::On {
             return bridge(state, why);
         }
         state.early_bridge.predict(why);
@@ -1225,20 +1235,29 @@ fn early_bridge_reason(
     orig_path: &str,
     host_foreign: bool,
 ) -> Option<FastBridge> {
-    let why = match state.page_cache.as_ref() {
-        None => FastBridge::EarlyNoCache,
-        Some(_) if host_foreign => FastBridge::EarlyNoCache,
-        Some(store) if !store.may_hold_path(lscache::vhost_id_hash(&ctx.vhost_name), orig_path) => {
-            FastBridge::EarlyCacheAbsent
-        }
-        Some(_) => return None,
-    };
+    let why = early_cache_decline(state, &ctx.vhost_name, orig_path, host_foreign)?;
     let static_declines = host_foreign
         || suffix_routing::last_segment_is_script(state, ctx, orig_path)
         || (looks_like_route(orig_path)
             && matching_static_context(ctx, orig_path).is_none()
             && !docroot_target_may_exist(state, &ctx.vhost.doc_root, orig_path));
     static_declines.then_some(why)
+}
+
+fn early_cache_decline(
+    state: &ServerState,
+    vhost_name: &str,
+    orig_path: &str,
+    host_foreign: bool,
+) -> Option<FastBridge> {
+    match state.page_cache.as_ref() {
+        None => Some(FastBridge::EarlyNoCache),
+        Some(_) if host_foreign => Some(FastBridge::EarlyNoCache),
+        Some(store) if !store.may_hold_path(lscache::vhost_id_hash(vhost_name), orig_path) => {
+            Some(FastBridge::EarlyCacheAbsent)
+        }
+        Some(_) => None,
+    }
 }
 
 /// (#349) The vary-set a memo entry for this request must carry: the raw value

@@ -138,8 +138,12 @@ impl CoreHandler {
         ctx: &BridgeCtx,
         req: hj_core::Request,
         upgrade: bool,
+        reusable_head: Option<&mut H1RequestHeadCache>,
     ) -> Option<bridge::BridgeResp> {
         if !upgrade && let Some(response) = self.fast(&state, ctx, &req).await {
+            if let Some(cache) = reusable_head {
+                cache.store(req);
+            }
             return Some(bridge::fast_response(response, ctx.direct_file_egress).await);
         }
         // Only a request that crosses to the Tokio runtime carries its selected
@@ -153,18 +157,15 @@ impl CoreHandler {
     }
 
     #[cfg(feature = "otel")]
-    async fn dispatch_h2(
-        &self,
-        mut ctx: BridgeCtx,
-        mut req: hj_core::Request,
-    ) -> hj_core::Response {
+    async fn dispatch_h2(&self, ctx: &BridgeCtx, mut req: hj_core::Request) -> hj_core::Response {
         let state = self.holder.load_full();
         #[cfg(feature = "otel")]
-        let trace = self.trace_request(&state, &ctx, &mut req);
+        let trace = self.trace_request(&state, ctx, &mut req);
         let future = async {
-            if let Some(response) = self.fast(&state, &ctx, &req).await {
+            if let Some(response) = self.fast(&state, ctx, &req).await {
                 return response;
             }
+            let mut ctx = ctx.clone();
             ctx.request_generation = Some(RequestGeneration(state));
             #[cfg(feature = "otel")]
             crate::otel::execution_path(false);
@@ -1639,12 +1640,21 @@ async fn handle_tls_bridged(
         // else: TLS 1.2 ⇒ userspace path below (io+session still intact).
     }
 
-    // Wrap the socket so monoio-rustls writes the encrypted bytes via a direct write(2)
-    // syscall (not an io_uring write) — matching tokio's write path on loopback bulk egress.
-    // rustls/aws-lc-rs still does the AEAD; this only changes the socket write. Mapping
-    // the I/O in place is essential: the adapter may have read ciphertext beyond the
-    // final handshake record which rustls has not consumed yet.
-    let stream = tls.map_io(|io| directio::DirectWriteSocket::new_for(io, proto != Proto::Http2));
+    // Use direct socket writes for bulk ciphertext. Rustls still encodes and
+    // encrypts every record. Mapping the I/O in place preserves ciphertext
+    // that the adapter may have read beyond the final handshake record.
+    let mut stream =
+        tls.map_io(|io| directio::DirectWriteSocket::new_for(io, proto != Proto::Http2));
+    stream.enable_owned_ciphertext_writes();
+    #[cfg(target_arch = "aarch64")]
+    if proto == Proto::Http1 {
+        static H1_TLS_HEADROOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *H1_TLS_HEADROOM.get_or_init(|| {
+            std::env::var_os("HJ_H1_TLS_HEADROOM").as_deref() != Some(std::ffi::OsStr::new("0"))
+        }) {
+            stream.enable_h1_write_headroom();
+        }
+    }
     match proto {
         Proto::Http2 => serve_h2_bridged(stream, prefix, ctx, core, shutdown, None).await,
         _ => handle_h1_bridged(stream, prefix, ctx, core, shutdown, None).await,
@@ -1955,29 +1965,28 @@ async fn serve_h2_bridged<S>(
         )));
     }
 
-    // H2 clones its service captures for every stream.  Keep the connection-local
-    // handler behind one Arc so that does not clone every Arc-bearing field in
-    // CoreHandler (in particular the live and pinned ServerState generations).
-    let core = Arc::new(core);
+    // Each stream holds one reference to the connection's dispatch state.
+    // Fast responses borrow the TLS and peer metadata. Only the bridged
+    // request needs its own context to carry the selected application snapshot.
+    let dispatch = Arc::new((core, ctx));
     let service = move |req: hj_core::Request| {
-        let core = core.clone();
-        let ctx = ctx.clone();
+        let dispatch = Arc::clone(&dispatch);
         #[cfg(feature = "otel")]
         {
-            async move { core.dispatch_h2(ctx, req).await }
+            async move {
+                let (core, ctx) = dispatch.as_ref();
+                core.dispatch_h2(ctx, req).await
+            }
         }
         #[cfg(not(feature = "otel"))]
         {
-            // Keep the ordinary build's fast/bridge state machine directly in
-            // the service future.  An extra async dispatch wrapper made every
-            // FuturesUnordered node substantially larger on the H2 hot path.
             async move {
-                let req = req;
-                let mut ctx = ctx;
+                let (core, ctx) = dispatch.as_ref();
                 let state = core.holder.load_full();
-                if let Some(response) = core.fast(&state, &ctx, &req).await {
+                if let Some(response) = core.fast(&state, ctx, &req).await {
                     return response;
                 }
+                let mut ctx = ctx.clone();
                 ctx.request_generation = Some(RequestGeneration(state));
                 core.bridge.dispatch_response(req, ctx).await
             }
@@ -2081,6 +2090,11 @@ async fn handle_h1_bridged<S>(
     let end = H1EndGuard::new(&core);
     let mut read_scratch: Vec<u8> = Vec::new();
     let mut response_buffers = h1_write_buffers::ResponseBuffers::default();
+    let reuse_heads = cfg!(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        not(feature = "otel")
+    ));
+    let mut head_cache = H1RequestHeadCache::default();
     // (Tier 2) One bucket per CONNECTION — pacing must not reset per response. Rebuilt
     // inside the loop only when a response carries a different rate (context override or
     // a post-reload tuning change).
@@ -2155,22 +2169,27 @@ async fn handle_h1_bridged<S>(
         // Parse a complete request head (drops the borrow before mutating `acc`).
         let mut request_start: Option<std::time::Instant> = None;
         let header_read_timeout = state.serve_config.header_read_timeout;
+        let mut reused_head = false;
         let parsed = loop {
-            let step: ParsedReq = {
-                let mut headers = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
-                let mut req = httparse::Request::new(&mut headers);
-                match request_head_progress(req.parse(&acc), acc.len(), max_head) {
-                    RequestHeadProgress::Complete(head_len)
-                        if head_has_bare_lf(&acc[..head_len]) =>
-                    {
-                        ParsedReq::Bad
+            let step: ParsedReq =
+                if reuse_heads && let Some(parsed) = head_cache.take(&acc, max_head) {
+                    reused_head = true;
+                    parsed
+                } else {
+                    let mut headers = [httparse::EMPTY_HEADER; MAX_REQUEST_HEADERS];
+                    let mut req = httparse::Request::new(&mut headers);
+                    match request_head_progress(req.parse(&acc), acc.len(), max_head) {
+                        RequestHeadProgress::Complete(head_len)
+                            if head_has_bare_lf(&acc[..head_len]) =>
+                        {
+                            ParsedReq::Bad
+                        }
+                        RequestHeadProgress::Complete(head_len) => materialize_head(&req, head_len),
+                        RequestHeadProgress::Partial => ParsedReq::Partial,
+                        RequestHeadProgress::TooLarge => ParsedReq::HeadersTooLarge,
+                        RequestHeadProgress::Bad => ParsedReq::Bad,
                     }
-                    RequestHeadProgress::Complete(head_len) => materialize_head(&req, head_len),
-                    RequestHeadProgress::Partial => ParsedReq::Partial,
-                    RequestHeadProgress::TooLarge => ParsedReq::HeadersTooLarge,
-                    RequestHeadProgress::Bad => ParsedReq::Bad,
-                }
-            };
+                };
             match step {
                 ParsedReq::Done {
                     method,
@@ -2281,6 +2300,22 @@ async fn handle_h1_bridged<S>(
             http10,
             has_upgrade,
         ) = parsed;
+        let retain_head = reused_head
+            || (reuse_heads
+                && head_len <= 512
+                && matches!(framing, BodyFraming::Length(0))
+                && keep_alive
+                && !expect_continue
+                && !http10
+                && !has_upgrade
+                && (method == http::Method::GET || method == http::Method::HEAD)
+                && uri.authority().is_none()
+                && uri.query().is_none()
+                && !headers.contains_key(http::header::COOKIE)
+                && !headers.contains_key(http::header::AUTHORIZATION)
+                && !headers.contains_key(http::header::PROXY_AUTHORIZATION)
+                && !headers.contains_key(http::header::CONTENT_ENCODING)
+                && head_cache.prepare(&acc[..head_len]));
         // Lazily initialized only when a body actually requires another socket read
         // (avoids an Instant::now() vDSO call on every bodiless GET/HEAD request).
         let mut body_deadline: Option<Option<H1BodyDeadline>> = None;
@@ -2635,7 +2670,13 @@ async fn handle_h1_bridged<S>(
         }
         #[cfg(feature = "otel")]
         let mut trace = core.trace_request(&state, &ctx, &mut req);
-        let dispatch = core.dispatch_h1(state, &ctx, req, upgrade_ready.is_some());
+        let dispatch = core.dispatch_h1(
+            state,
+            &ctx,
+            req,
+            upgrade_ready.is_some(),
+            (retain_head && keep_alive).then_some(&mut head_cache),
+        );
         #[cfg(feature = "otel")]
         let response = match &trace {
             Some(trace) => crate::otel::in_context(trace.context(), dispatch).await,
@@ -2726,6 +2767,68 @@ async fn handle_h1_bridged<S>(
                 let _ = stream.shutdown().await;
             }
             return;
+        }
+    }
+}
+
+/// One exactly matched, previously validated, bodiless request head per
+/// connection. Take the typed fields at intake and return them after a fast
+/// response, so a repeated hit needs neither a parse nor a HeaderMap clone.
+#[derive(Default)]
+struct H1RequestHeadCache {
+    last_hash: Option<u64>,
+    entry: Option<Box<H1RequestHeadEntry>>,
+}
+
+struct H1RequestHeadEntry {
+    wire: Box<[u8]>,
+    parsed: Option<http::request::Parts>,
+}
+
+impl H1RequestHeadCache {
+    fn take(&mut self, input: &[u8], max_head: usize) -> Option<ParsedReq> {
+        let entry = self.entry.as_deref_mut()?;
+        let wire = &entry.wire;
+        if wire.len() > max_head || !input.starts_with(wire) {
+            return None;
+        }
+        let parts = entry.parsed.take()?;
+        Some(ParsedReq::Done {
+            method: parts.method,
+            uri: parts.uri,
+            headers: parts.headers,
+            head_len: wire.len(),
+            framing: BodyFraming::Length(0),
+            keep_alive: true,
+            expect_continue: false,
+            http10: false,
+            has_upgrade: false,
+        })
+    }
+
+    fn prepare(&mut self, wire: &[u8]) -> bool {
+        if let Some(entry) = self.entry.as_deref()
+            && entry.wire.as_ref() == wire
+        {
+            return true;
+        }
+        use std::hash::Hasher;
+        let mut hasher = rustc_hash::FxHasher::default();
+        hasher.write(wire);
+        let hash = hasher.finish();
+        let repeated = self.last_hash.replace(hash) == Some(hash);
+        if repeated {
+            self.entry = Some(Box::new(H1RequestHeadEntry {
+                wire: wire.into(),
+                parsed: None,
+            }));
+        }
+        repeated
+    }
+
+    fn store(&mut self, request: hj_core::Request) {
+        if let Some(entry) = self.entry.as_deref_mut() {
+            entry.parsed = Some(request.into_parts().0);
         }
     }
 }
@@ -6225,6 +6328,49 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
             buf.extend_from_slice(b"X: y\r\n");
         }
         assert!(matches!(dec.advance(&buf), ChunkStep::Bad));
+    }
+
+    #[test]
+    fn validated_head_cache_moves_exact_request_and_preserves_pipeline_boundary() {
+        let raw = b"GET /tiny HTTP/1.1\r\nHost: origin.test\r\n\r\n";
+        let mut cache = H1RequestHeadCache::default();
+        assert!(!cache.prepare(raw));
+        assert!(cache.prepare(raw));
+        cache.store(
+            http::Request::builder()
+                .method(http::Method::GET)
+                .uri("/tiny")
+                .header(http::header::HOST, "origin.test")
+                .body(hj_core::empty_incoming())
+                .unwrap(),
+        );
+
+        assert!(cache.take(&raw[..raw.len() - 1], 8192).is_none());
+        assert!(cache.take(raw, raw.len() - 1).is_none());
+        assert!(
+            cache
+                .take(b"GET /other HTTP/1.1\r\nHost: origin.test\r\n\r\n", 8192)
+                .is_none()
+        );
+        let mut pipelined = raw.to_vec();
+        pipelined.extend_from_slice(b"GET /other HTTP/1.1\r\nHost: origin.test\r\n\r\n");
+        let Some(ParsedReq::Done {
+            method,
+            uri,
+            headers,
+            head_len,
+            framing,
+            ..
+        }) = cache.take(&pipelined, 8192)
+        else {
+            panic!("the validated head should be reusable");
+        };
+        assert_eq!(head_len, raw.len());
+        assert_eq!(method, http::Method::GET);
+        assert_eq!(uri.path(), "/tiny");
+        assert_eq!(headers[http::header::HOST], "origin.test");
+        assert!(matches!(framing, BodyFraming::Length(0)));
+        assert!(cache.take(raw, 8192).is_none());
     }
 
     // ---- (U1) response-writer serialization ----

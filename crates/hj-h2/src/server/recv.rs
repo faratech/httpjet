@@ -685,11 +685,26 @@ where
                 recv.open_header_block = None;
                 let mut st = StreamState {
                     recv_window: iw,
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                     headers: http::HeaderMap::with_capacity(hint),
                     end_stream: true,
                     ..Default::default()
                 };
-                match decode_block_from(dec, &mut st, block) {
+                #[cfg(target_arch = "x86_64")]
+                let mut decode_head =
+                    |decoder, stream, wire| recv.stable_request.decode(decoder, stream, wire, hint);
+                #[cfg(target_arch = "aarch64")]
+                let mut decode_head = |decoder, stream: &mut StreamState, wire| {
+                    if let Some(sampled) = recv.sampled_request.as_mut() {
+                        sampled.decode(decoder, stream, wire, hint, sid)
+                    } else {
+                        stream.headers = http::HeaderMap::with_capacity(hint);
+                        decode_block_from(decoder, stream, wire)
+                    }
+                };
+                #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                use self::decode_block_from as decode_head;
+                match decode_head(dec, &mut st, block) {
                     Decoded::Ok => {
                         if declared_body_too_large(Some(&st), recv.max_request_body) {
                             reject_too_large!(sid, "413", true);
@@ -1050,6 +1065,196 @@ fn decode_discard_header_block(dec: &mut Decoder, block: &[u8]) -> bool {
     )
 }
 
+// Reuse a short, successfully decoded request only when its exact compressed
+// bytes and the connection's dynamic table agree. Blocks that mutated the
+// table always go through the decoder, including inserts and size updates.
+// x86-64 checks consecutive heads. AArch64 spaces probes after a miss.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+const STABLE_HEAD_BYTES: usize = 32;
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+pub(super) struct StableRequestHead {
+    block: [u8; STABLE_HEAD_BYTES],
+    len: usize,
+    table_revision: u64,
+    last_hash: Option<u64>,
+    template: Option<Box<RequestHeadTemplate>>,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
+struct RequestHeadTemplate {
+    method: http::Method,
+    path: http::Uri,
+    authority: Option<http::HeaderValue>,
+    headers: http::HeaderMap,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl StableRequestHead {
+    fn decode(
+        &mut self,
+        dec: &mut Decoder,
+        st: &mut StreamState,
+        block: &[u8],
+        header_count_hint: usize,
+    ) -> Decoded {
+        let revision = dec.table_revision();
+        let table_unchanged = revision == self.table_revision;
+        if table_unchanged
+            && self.block.get(..self.len) == Some(block)
+            && let Some(head) = self.template.as_ref()
+        {
+            st.method = Some(head.method.clone());
+            st.path = Some(head.path.clone());
+            st.authority = head.authority.clone();
+            st.headers = head.headers.clone();
+            st.headers_done = true;
+            return Decoded::Ok;
+        }
+
+        st.headers = http::HeaderMap::with_capacity(header_count_hint);
+        let result = decode_block_from(dec, st, block);
+        self.template = None;
+        self.len = 0;
+        if !matches!(result, Decoded::Ok)
+            || block.is_empty()
+            || block.len() > STABLE_HEAD_BYTES
+            || dec.table_revision() != revision
+        {
+            self.last_hash = None;
+            return result;
+        }
+
+        // Use a digest only to identify candidates worth validating and retaining.
+        // The replay check always uses the exact compressed bytes and table.
+        use std::hash::Hasher;
+        let mut hasher = rustc_hash::FxHasher::default();
+        hasher.write(block);
+        let hash = hasher.finish();
+        let repeated = table_unchanged && self.last_hash == Some(hash);
+        self.last_hash = Some(hash);
+        self.table_revision = revision;
+        if repeated
+            && st.content_length.is_none()
+            && pending_header_charge(st) <= 2048
+            && !st.headers.contains_key(http::header::COOKIE)
+            && !st.headers.contains_key(http::header::AUTHORIZATION)
+            && !st.headers.contains_key(http::header::PROXY_AUTHORIZATION)
+            && let (Some(method), Some(path)) = (st.method.as_ref(), st.path.as_ref())
+            && (method == http::Method::GET || method == http::Method::HEAD)
+            && path.query().is_none()
+            && let Some(wire) = self.block.get_mut(..block.len())
+        {
+            wire.copy_from_slice(block);
+            self.len = block.len();
+            self.template = Some(Box::new(RequestHeadTemplate {
+                method: method.clone(),
+                path: path.clone(),
+                authority: st.authority.clone(),
+                headers: st.headers.clone(),
+            }));
+        }
+        result
+    }
+}
+
+/// ARM request-head reuse with bounded work on changing header blocks.
+#[cfg(any(target_arch = "aarch64", test))]
+#[derive(Default)]
+pub(super) struct SampledRequestHead {
+    wire: [u8; STABLE_HEAD_BYTES],
+    len: usize,
+    revision: u64,
+    next_probe: u32,
+    head: Option<Box<RequestHeadTemplate>>,
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+impl SampledRequestHead {
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn configured() -> Option<Self> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        ENABLED
+            .get_or_init(|| {
+                std::env::var_os("HJ_H2_REQUEST_REPLAY").as_deref()
+                    != Some(std::ffi::OsStr::new("0"))
+            })
+            .then(Self::default)
+    }
+
+    fn decode(
+        &mut self,
+        decoder: &mut Decoder,
+        stream: &mut StreamState,
+        wire: &[u8],
+        header_count_hint: usize,
+        sid: u32,
+    ) -> Decoded {
+        if sid < self.next_probe {
+            stream.headers = http::HeaderMap::with_capacity(header_count_hint);
+            return decode_block_from(decoder, stream, wire);
+        }
+        let revision = decoder.table_revision();
+        let matches = self.len != 0 && self.revision == revision && self.wire[..self.len] == *wire;
+        if matches && let Some(head) = self.head.as_ref() {
+            stream.method = Some(head.method.clone());
+            stream.path = Some(head.path.clone());
+            stream.authority = head.authority.clone();
+            stream.headers = head.headers.clone();
+            stream.headers_done = true;
+            return Decoded::Ok;
+        }
+
+        stream.headers = http::HeaderMap::with_capacity(header_count_hint);
+        let result = decode_block_from(decoder, stream, wire);
+        let had_sample = self.len != 0;
+        self.head = None;
+        self.len = 0;
+        if matches!(result, Decoded::Ok)
+            && !wire.is_empty()
+            && wire.len() <= STABLE_HEAD_BYTES
+            && decoder.table_revision() == revision
+            && stream.content_length.is_none()
+            && let (Some(method), Some(path)) = (stream.method.as_ref(), stream.path.as_ref())
+            && (method == http::Method::GET || method == http::Method::HEAD)
+            && path.query().is_none()
+        {
+            if !had_sample {
+                // One sample for the next candidate stream. Most streams on a
+                // connection with varied input bypass this code entirely.
+                self.revision = revision;
+                self.wire[..wire.len()].copy_from_slice(wire);
+                self.len = wire.len();
+                return result;
+            }
+            if matches
+                && pending_header_charge(stream) <= 2048
+                && !stream.headers.contains_key(http::header::COOKIE)
+                && !stream.headers.contains_key(http::header::AUTHORIZATION)
+                && !stream
+                    .headers
+                    .contains_key(http::header::PROXY_AUTHORIZATION)
+            {
+                self.len = wire.len();
+                self.head = Some(Box::new(RequestHeadTemplate {
+                    method: method.clone(),
+                    path: path.clone(),
+                    authority: stream.authority.clone(),
+                    headers: stream.headers.clone(),
+                }));
+                return result;
+            }
+        }
+        // Clients use odd stream IDs. Leave enough startup attempts to get
+        // past the encoder's initial table inserts before spacing attempts.
+        if sid > 7 {
+            self.next_probe = sid.saturating_add(128);
+        }
+        result
+    }
+}
+
 /// Decode a complete HPACK header block into `st`. `block` may borrow the connection
 /// read buffer directly (single-frame HEADERS, zero-copy) or an owned accumulation
 /// buffer (multi-frame CONTINUATION); it MUST NOT alias `st`, since the emit closure
@@ -1299,6 +1504,100 @@ fn decode_block_from(dec: &mut Decoder, st: &mut StreamState, block: &[u8]) -> D
 mod pseudo_header_tests {
     use super::*;
     use crate::hpack::Encoder;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stable_request_reuse_tracks_hpack_table_mutations() {
+        let mut decoder = Decoder::new(4096, 8192);
+        let mut cached = StableRequestHead::default();
+        let block = *b"\x82\x87\x04\x06/stuff\xbe"; // GET, https, literal path, first dynamic entry
+
+        decoder
+            .decode_octets(b"\x41\x0bfirst.local", |_, _| {})
+            .unwrap();
+        for _ in 0..3 {
+            let mut request = StreamState::default();
+            assert!(matches!(
+                cached.decode(&mut decoder, &mut request, &block, 4),
+                Decoded::Ok
+            ));
+            assert_eq!(request.authority.unwrap(), "first.local");
+        }
+        assert!(cached.template.is_some());
+
+        decoder
+            .decode_octets(b"\x41\x0csecond.local", |_, _| {})
+            .unwrap();
+        let mut request = StreamState::default();
+        assert!(matches!(
+            cached.decode(&mut decoder, &mut request, &block, 4),
+            Decoded::Ok
+        ));
+        assert_eq!(request.authority.unwrap(), "second.local");
+
+        decoder.decode_octets(&[0x20], |_, _| {}).unwrap(); // evict all
+        let mut request = StreamState::default();
+        assert!(matches!(
+            cached.decode(&mut decoder, &mut request, &block, 4),
+            Decoded::Compression
+        ));
+        assert!(cached.template.is_none());
+    }
+
+    #[test]
+    fn sampled_request_reuse_preserves_revision_and_skips_repeated_misses() {
+        let mut decoder = Decoder::new(4096, 8192);
+        let mut sampled = SampledRequestHead::default();
+        let block = b"\x82\x87\x04\x06/stuff\xbe";
+        decoder
+            .decode_octets(b"\x41\x0bfirst.local", |_, _| {})
+            .unwrap();
+        for sid in [1, 3, 5] {
+            let mut state = StreamState::default();
+            assert!(matches!(
+                sampled.decode(&mut decoder, &mut state, block, 4, sid),
+                Decoded::Ok
+            ));
+            assert_eq!(state.authority.unwrap(), "first.local");
+        }
+        assert!(sampled.head.is_some());
+
+        decoder
+            .decode_octets(b"\x41\x0csecond.local", |_, _| {})
+            .unwrap();
+        let mut state = StreamState::default();
+        assert!(matches!(
+            sampled.decode(&mut decoder, &mut state, block, 4, 9),
+            Decoded::Ok
+        ));
+        assert_eq!(state.authority.unwrap(), "second.local");
+        assert!(sampled.head.is_none());
+        assert_eq!(sampled.next_probe, 137);
+
+        for sid in [11, 135] {
+            let mut state = StreamState::default();
+            assert!(matches!(
+                sampled.decode(&mut decoder, &mut state, block, 4, sid),
+                Decoded::Ok
+            ));
+            assert_eq!(state.authority.unwrap(), "second.local");
+            assert_eq!(sampled.len, 0);
+        }
+        let mut state = StreamState::default();
+        assert!(matches!(
+            sampled.decode(&mut decoder, &mut state, block, 4, 137),
+            Decoded::Ok
+        ));
+        assert_eq!(sampled.len, block.len());
+
+        decoder.decode_octets(&[0x20], |_, _| {}).unwrap();
+        let mut state = StreamState::default();
+        assert!(matches!(
+            sampled.decode(&mut decoder, &mut state, block, 4, 139),
+            Decoded::Compression
+        ));
+        assert!(sampled.head.is_none());
+    }
 
     fn decode(headers: &[(&str, &str)]) -> Decoded {
         let mut encoder = Encoder::new();

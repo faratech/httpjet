@@ -111,7 +111,7 @@ fn traced_fast_and_bridged_requests() {
             .header("host", "canon.test")
             .body(hj_core::empty_incoming())
             .unwrap();
-        let response = cache_core.dispatch_h2(ctx.clone(), req).await;
+        let response = cache_core.dispatch_h2(&ctx, req).await;
         assert_eq!(response.status(), 200);
         let _ = bridge::buffer_body(response.into_body()).await;
         drop(cache_core);
@@ -124,7 +124,7 @@ fn traced_fast_and_bridged_requests() {
                 .header("baggage", "secret=value")
                 .body(hj_core::empty_incoming())
                 .unwrap();
-            let response = core.dispatch_h2(ctx.clone(), req).await;
+            let response = core.dispatch_h2(&ctx, req).await;
             let _ = bridge::buffer_body(response.into_body()).await;
         }
         let mut h3_ctx = ctx.clone();

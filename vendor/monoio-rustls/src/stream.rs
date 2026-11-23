@@ -48,6 +48,38 @@ fn put_idle_box(buf: Box<[MaybeUninit<u8>]>) {
     });
 }
 
+#[cfg(any(target_arch = "aarch64", test))]
+const H1_TLS_BATCH_LIMIT: usize = 64 * 1024;
+#[cfg(any(target_arch = "aarch64", test))]
+const H1_TLS_HEADROOM: usize = 4 * 1024;
+
+#[cfg(any(target_arch = "aarch64", test))]
+fn h1_write_crosses_batch_limit<T: IoVecBuf>(buffer: &T) -> bool {
+    if buffer.read_iovec_len() != 2 {
+        return false;
+    }
+    // SAFETY: the buffer owns the two readable descriptors it reported.
+    let parts = unsafe { std::slice::from_raw_parts(buffer.read_iovec_ptr(), 2) };
+    let total = parts[0].iov_len.saturating_add(parts[1].iov_len);
+    total > H1_TLS_BATCH_LIMIT && total <= H1_TLS_BATCH_LIMIT + H1_TLS_HEADROOM
+}
+
+#[cfg(test)]
+#[test]
+fn h1_tls_headroom_bounds_the_complete_vectored_write() {
+    for (head, body, expected) in [
+        (512, H1_TLS_BATCH_LIMIT - 512, false),
+        (512, H1_TLS_BATCH_LIMIT, true),
+        (512, H1_TLS_BATCH_LIMIT + H1_TLS_HEADROOM - 512, true),
+        (512, H1_TLS_BATCH_LIMIT + H1_TLS_HEADROOM, false),
+    ] {
+        let buffer = monoio::buf::VecBuf::from(vec![vec![0; head], vec![0; body]]);
+        assert_eq!(h1_write_crosses_batch_limit(&buffer), expected);
+    }
+    let single = monoio::buf::VecBuf::from(vec![vec![0; H1_TLS_BATCH_LIMIT + 512]]);
+    assert!(!h1_write_crosses_batch_limit(&single));
+}
+
 /// Convert rental metadata only for the synchronous rustls plaintext call.
 /// Keep the small H1/H2 stack path and cover the native H2 flush's 64-slice
 /// batch without allocating another descriptor vector. Larger batches retain
@@ -97,6 +129,8 @@ pub struct Stream<IO, C> {
     /// until the first application read, so [`Stream::drain_received`] can tell whether
     /// rustls still holds a partial record (it has no public accessor for that).
     rx_records: Option<RecordBoundary>,
+    #[cfg(target_arch = "aarch64")]
+    h1_write_headroom: bool,
 }
 
 /// Tracks TLS record boundaries over a ciphertext byte stream.
@@ -205,6 +239,8 @@ impl<IO, C> Stream<IO, C> {
             session,
             r_buffer: Default::default(),
             rx_records: Some(RecordBoundary::default()),
+            #[cfg(target_arch = "aarch64")]
+            h1_write_headroom: false,
             // httpjet fork: adaptive TLS write buffer. Nothing is held while idle; a write
             // takes a pooled 64 KiB buffer, large writes still grow to the old 512 KiB
             // batching ceiling for throughput, and the flush releases it again.
@@ -224,6 +260,8 @@ impl<IO, C> Stream<IO, C> {
             r_buffer: ReadBuffer::new_unsafe(),
             w_buffer: WriteBuffer::new_unsafe(),
             rx_records: Some(RecordBoundary::default()),
+            #[cfg(target_arch = "aarch64")]
+            h1_write_headroom: false,
         }
     }
 
@@ -266,6 +304,24 @@ impl<IO, C> Stream<IO, C> {
             r_buffer: self.r_buffer,
             w_buffer: self.w_buffer,
             rx_records: self.rx_records,
+            #[cfg(target_arch = "aarch64")]
+            h1_write_headroom: self.h1_write_headroom,
+        }
+    }
+
+    /// Let an H1 response head share the write batch with a nearly full body.
+    /// The caller uses rustls's default 64 KiB buffer limit at idle.
+    #[cfg(target_arch = "aarch64")]
+    pub fn enable_h1_write_headroom(&mut self) {
+        self.h1_write_headroom = true;
+    }
+
+    /// Allow large writes to transfer the record allocations to the transport.
+    pub fn enable_owned_ciphertext_writes(&mut self) {
+        match &mut self.w_buffer {
+            WriteBuffer::Safe(buffer) => buffer.owned_batches = true,
+            #[cfg(feature = "unsafe_io")]
+            WriteBuffer::Unsafe(_) => {}
         }
     }
 
@@ -276,6 +332,8 @@ impl<IO, C> Stream<IO, C> {
             r_buffer: self.r_buffer,
             w_buffer: self.w_buffer,
             rx_records: self.rx_records,
+            #[cfg(target_arch = "aarch64")]
+            h1_write_headroom: self.h1_write_headroom,
         }
     }
 }
@@ -323,6 +381,50 @@ mod transition_tests {
         async fn shutdown(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn owned_ciphertext_batch_resumes_inside_first_record() {
+        #[derive(Default)]
+        struct ShortSink(Sink);
+
+        impl monoio::io::AsyncWriteRent for ShortSink {
+            async fn write<T: IoBuf>(&mut self, buf: T) -> monoio::BufResult<usize, T> {
+                monoio::io::AsyncWriteRent::write(&mut self.0, buf).await
+            }
+
+            async fn writev<T: monoio::buf::IoVecBuf>(
+                &mut self,
+                buf: T,
+            ) -> monoio::BufResult<usize, T> {
+                let Ok(first) = monoio::buf::IoVecWrapper::new(buf) else {
+                    panic!("owned write submitted an empty batch");
+                };
+                let n = first.bytes_init().min(2);
+                // SAFETY: the first descriptor owns at least n initialized bytes.
+                let bytes = unsafe { std::slice::from_raw_parts(first.read_ptr(), n) };
+                self.0 .0.extend_from_slice(bytes);
+                (Ok(n), first.into_inner())
+            }
+
+            async fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+
+            async fn shutdown(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut buffer = WriteBuffer::idle();
+        let mut sink = ShortSink::default();
+        let records = vec![b"abcd".to_vec(), b"efgh".to_vec()];
+        assert_eq!(
+            ready(buffer.write_owned_batch(&mut sink, records)).unwrap(),
+            8
+        );
+        assert_eq!(sink.0 .0, b"abcdefgh");
+        assert_eq!(capacity(&buffer), 0);
     }
 
     fn capacity(buffer: &WriteBuffer) -> usize {
@@ -620,6 +722,57 @@ impl WriteBuffer {
         true
     }
 
+    fn accepts_owned_batch(&self) -> bool {
+        match self {
+            Self::Safe(buffer) => {
+                buffer.owned_batches
+                    && matches!(buffer.status, WriteStatus::Ok)
+                    && buffer.buffer.as_ref().is_some_and(Buffer::is_empty)
+            }
+            #[cfg(feature = "unsafe_io")]
+            Self::Unsafe(_) => false,
+        }
+    }
+
+    async fn write_owned_batch<IO: AsyncWriteRent>(
+        &mut self,
+        mut io: IO,
+        records: Vec<Vec<u8>>,
+    ) -> io::Result<usize> {
+        #[allow(irrefutable_let_patterns)]
+        let Self::Safe(buffer) = self
+        else {
+            return Err(write_cancelled_in_flight());
+        };
+        // A canceled or failed write leaves this adapter unusable. Once records
+        // leave rustls, continuing on the connection could skip bytes on the wire.
+        let empty = buffer.buffer.take().ok_or_else(write_cancelled_in_flight)?;
+        let total: usize = records.iter().map(Vec::len).sum();
+        let (result, remainder) = io.writev(monoio::buf::VecBuf::from(records)).await;
+        let mut sent = result?;
+        if sent == 0 || sent > total {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "incomplete TLS record write",
+            ));
+        }
+        if sent < total {
+            // A short batch write leaves an exact byte offset, possibly inside
+            // a record. Keep each record owned through its remaining scalar write.
+            for record in Vec::<Vec<u8>>::from(remainder) {
+                if sent >= record.len() {
+                    sent -= record.len();
+                    continue;
+                }
+                let (result, _) = io.write_all(record.slice(sent..)).await;
+                result?;
+                sent = 0;
+            }
+        }
+        buffer.buffer = Some(empty);
+        Ok(total)
+    }
+
     fn shrink_to_idle(&mut self) {
         match self {
             Self::Safe(buf) => buf.release_idle(),
@@ -658,6 +811,7 @@ impl io::Write for WriteBuffer {
 #[derive(Debug)]
 struct SafeWriteBuffer {
     buffer: Option<Buffer>,
+    owned_batches: bool,
     status: WriteStatus,
 }
 
@@ -678,6 +832,7 @@ impl SafeWriteBuffer {
     fn idle() -> Self {
         Self {
             buffer: Some(Buffer::empty()),
+            owned_batches: false,
             status: WriteStatus::Ok,
         }
     }
@@ -1034,6 +1189,11 @@ where
     }
 
     pub(crate) async fn write_io(&mut self) -> io::Result<usize> {
+        if self.w_buffer.accepts_owned_batch() {
+            if let Some(records) = self.session.take_tls_write_batch() {
+                return self.w_buffer.write_owned_batch(&mut self.io, records).await;
+            }
+        }
         let n = loop {
             match self.session.write_tls(&mut self.w_buffer) {
                 Ok(n) => {
@@ -1216,6 +1376,13 @@ where
     C: DerefMut + Deref<Target = ConnectionCommon<SD>>,
 {
     async fn write_io(&mut self) -> io::Result<usize> {
+        #[cfg(not(target_arch = "aarch64"))]
+        if self.w_buffer.accepts_owned_batch() {
+            let batch = self.session.borrow_mut().take_tls_write_batch();
+            if let Some(records) = batch {
+                return self.w_buffer.write_owned_batch(&mut self.io, records).await;
+            }
+        }
         let n = loop {
             let result = {
                 let mut session = self.session.borrow_mut();
@@ -1242,6 +1409,18 @@ where
 
     fn wants_write(&self) -> bool {
         self.session.borrow().wants_write()
+    }
+
+    // On AArch64, keep the ordinary split flush on the buffered write path.
+    #[cfg(target_arch = "aarch64")]
+    async fn write_large_batch(&mut self) -> io::Result<()> {
+        let batch = self.session.borrow_mut().take_tls_write_batch();
+        if let Some(records) = batch {
+            self.w_buffer
+                .write_owned_batch(&mut self.io, records)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn flush_pending(&mut self) -> io::Result<()> {
@@ -1273,6 +1452,12 @@ where
             Ok(n) => n,
             Err(err) => return (Err(err), buf),
         };
+        #[cfg(target_arch = "aarch64")]
+        if written >= 16 * 1024 - 64 && self.w_buffer.accepts_owned_batch() {
+            if let Err(err) = Box::pin(self.write_large_batch()).await {
+                return (Err(err), buf);
+            }
+        }
         if let Err(err) = self.flush_pending().await {
             return (Err(err), buf);
         }
@@ -1294,6 +1479,12 @@ where
             Ok(n) => n,
             Err(err) => return (Err(err), buf_vec),
         };
+        #[cfg(target_arch = "aarch64")]
+        if total >= 16 * 1024 - 64 && self.w_buffer.accepts_owned_batch() {
+            if let Err(err) = Box::pin(self.write_large_batch()).await {
+                return (Err(err), buf_vec);
+            }
+        }
         if let Err(err) = self.flush_pending().await {
             return (Err(err), buf_vec);
         }
@@ -1390,7 +1581,20 @@ where
         // Rustls consumes/copies plaintext synchronously; only its owned
         // ciphertext buffer enters the transport, while buf_vec stays rented
         // through every CQE. Descriptor scratch has already gone out of scope.
-        let total = match write_plaintext_iovecs(&mut self.session.writer(), &buf_vec) {
+        #[cfg(target_arch = "aarch64")]
+        let expand = self.h1_write_headroom && h1_write_crosses_batch_limit(&buf_vec);
+        #[cfg(target_arch = "aarch64")]
+        if expand {
+            self.session
+                .set_buffer_limit(Some(H1_TLS_BATCH_LIMIT + H1_TLS_HEADROOM));
+        }
+        let result = write_plaintext_iovecs(&mut self.session.writer(), &buf_vec);
+        #[cfg(target_arch = "aarch64")]
+        if expand {
+            // Restore before the asynchronous write, including on writer error.
+            self.session.set_buffer_limit(Some(H1_TLS_BATCH_LIMIT));
+        }
+        let total = match result {
             Ok(n) => n,
             Err(e) => return (Err(e), buf_vec),
         };

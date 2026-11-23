@@ -755,6 +755,10 @@ where
         conn_recv_window: (config.initial_window_size.max(65535)) as i64,
         our_initial_window: config.initial_window_size as i64,
         header_count_hint: 0,
+        #[cfg(target_arch = "x86_64")]
+        stable_request: Default::default(),
+        #[cfg(target_arch = "aarch64")]
+        sampled_request: recv::SampledRequestHead::configured(),
         reset_debt_until: None,
         total_buffered: 0,
         max_request_body: config.max_request_body,
@@ -1958,6 +1962,10 @@ where
         conn_recv_window: (config.initial_window_size.max(65535)) as i64,
         our_initial_window: config.initial_window_size as i64,
         header_count_hint: 0,
+        #[cfg(target_arch = "x86_64")]
+        stable_request: Default::default(),
+        #[cfg(target_arch = "aarch64")]
+        sampled_request: recv::SampledRequestHead::configured(),
         reset_debt_until: None,
         total_buffered: 0,
         max_request_body: config.max_request_body,
@@ -3709,6 +3717,10 @@ mod tests {
             conn_recv_window: 65535,
             our_initial_window: 65535,
             header_count_hint: 0,
+            #[cfg(target_arch = "x86_64")]
+            stable_request: Default::default(),
+            #[cfg(target_arch = "aarch64")]
+            sampled_request: recv::SampledRequestHead::configured(),
             reset_debt_until: None,
             total_buffered: 0,
             max_request_body: 1 << 20,
@@ -4233,6 +4245,10 @@ mod tests {
             conn_recv_window: 65535,
             our_initial_window: 65535,
             header_count_hint: 0,
+            #[cfg(target_arch = "x86_64")]
+            stable_request: Default::default(),
+            #[cfg(target_arch = "aarch64")]
+            sampled_request: recv::SampledRequestHead::configured(),
             reset_debt_until: None,
             total_buffered: body_len,
             max_request_body: 1 << 20,
@@ -4323,6 +4339,10 @@ mod tests {
             conn_recv_window: 65535,
             our_initial_window: 65535,
             header_count_hint: 0,
+            #[cfg(target_arch = "x86_64")]
+            stable_request: Default::default(),
+            #[cfg(target_arch = "aarch64")]
+            sampled_request: recv::SampledRequestHead::configured(),
             reset_debt_until: None,
             total_buffered: 10,
             max_request_body: 1 << 20,
@@ -4435,6 +4455,10 @@ mod tests {
             conn_recv_window: 65535,
             our_initial_window: 65535,
             header_count_hint: 0,
+            #[cfg(target_arch = "x86_64")]
+            stable_request: Default::default(),
+            #[cfg(target_arch = "aarch64")]
+            sampled_request: recv::SampledRequestHead::configured(),
             reset_debt_until: None,
             total_buffered: 0,
             max_request_body: 1 << 20,
@@ -4554,6 +4578,10 @@ mod tests {
             conn_recv_window: 65535,
             our_initial_window: 65535,
             header_count_hint: 0,
+            #[cfg(target_arch = "x86_64")]
+            stable_request: Default::default(),
+            #[cfg(target_arch = "aarch64")]
+            sampled_request: recv::SampledRequestHead::configured(),
             reset_debt_until: None,
             total_buffered: 8,
             max_request_body: 1 << 20,
