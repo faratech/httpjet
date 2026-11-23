@@ -14,7 +14,7 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 class VendoredCleanup(unittest.TestCase):
-    def test_initial_and_final_clean_preserve_registry_checksums(self):
+    def test_initial_and_final_clean_preserve_vendored_inputs(self):
         with tempfile.TemporaryDirectory(prefix="httpjet-clean-test-") as temporary:
             root = Path(temporary)
             shutil.copytree(REPO / "debian", root / "debian", ignore=shutil.ignore_patterns(
@@ -29,6 +29,10 @@ class VendoredCleanup(unittest.TestCase):
                 (crate / relative).write_bytes(content)
                 expected[relative] = hashlib.sha256(content).hexdigest()
             (crate / ".cargo-checksum.json").write_text(json.dumps({"files": expected}))
+            path_input = root / "vendor/rustls/Cargo.toml.orig"
+            path_input.parent.mkdir(parents=True)
+            upstream_manifest = b"[package]\nname = 'rustls'\n"
+            path_input.write_bytes(upstream_manifest)
             for _ in range(2):
                 (root / "project-junk.orig").write_text("disposable project build output\n")
                 (root / "debian/build").mkdir(exist_ok=True)
@@ -38,6 +42,7 @@ class VendoredCleanup(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertFalse((root / "project-junk.orig").exists())
                 self.assertFalse((root / "debian/build").exists())
+                self.assertEqual(path_input.read_bytes(), upstream_manifest)
                 for relative, checksum in expected.items():
                     self.assertEqual(hashlib.sha256((crate / relative).read_bytes()).hexdigest(), checksum)
 

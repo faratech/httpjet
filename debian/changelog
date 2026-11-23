@@ -1,3 +1,9 @@
+httpjet (0.2.6-3) stable; urgency=medium
+
+  * Preserve path-vendored Cargo inputs across Debian package cleanup.
+
+ -- Mike Fara <35661811+faratech@users.noreply.github.com>  Mon, 23 Nov 2026 10:01:19 -0500
+
 httpjet (0.2.6-2) stable; urgency=medium
 
   * Initialize the TLS vectored-write message header for both glibc and musl.

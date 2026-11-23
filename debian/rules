@@ -20,8 +20,8 @@ override_dh_auto_clean:
 	rm -rf debian/build
 
 override_dh_clean:
-	# Cargo checksums include legitimate upstream *.orig files in this tree.
-	dh_clean -Xvendor/registry
+	# Release provenance covers both registry and path-vendored inputs.
+	dh_clean -Xvendor/
 
 override_dh_install:
 	dh_install
