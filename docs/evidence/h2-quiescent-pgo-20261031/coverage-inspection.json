@@ -1,0 +1,269 @@
+{
+  "profile_sha256": "0ade3a4f73f5c085826de497088987d8d06b6617edda2fae28baf59a1269ede3",
+  "profile_inputs_sha256": "2299f4acf214de52f1b5214eed861bf74d8e78f3db7e02f373605b805d105d49",
+  "counts_log_sha256": "9b5b58808911e5a6853c5d30d434eac3ee368699f3a2d3267eb78d710039a317",
+  "total_functions": 29500,
+  "nonzero_functions": 5392,
+  "groups": {
+    "read_fence_park": {
+      "pattern": "hj_h2.*kernel.*park",
+      "matching_functions": 6,
+      "nonzero_functions": 2,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNCINvNtNtCsalwd8mO8Ndp_5hj_h26server6kernel4parkNCINvB6_16monoio_read_onceINtNtNtNtCsdo0DfKJVZul_6monoio2io4util5split13OwnedReadHalfNtNtNtNtB1k_3net3tcp6stream9TcpStreamEE0E0CsiGYAq7sC6bz_7httpjet",
+          "slots": 33,
+          "maximum_block_count": 10723,
+          "counter_sum": 80178
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCINvNtNtCsalwd8mO8Ndp_5hj_h26server6kernel4parkNCINvBI_16monoio_read_onceINtNtNtNtCsdo0DfKJVZul_6monoio2io4util5split13OwnedReadHalfNtNtNtNtB1W_3net3tcp6stream9TcpStreamEE0E0ECsiGYAq7sC6bz_7httpjet",
+          "slots": 5,
+          "maximum_block_count": 4457,
+          "counter_sum": 4457
+        }
+      ]
+    },
+    "readiness": {
+      "pattern": "httpjet.*kernel_fastpath.*wakeup",
+      "matching_functions": 21,
+      "nonzero_functions": 15,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCINvNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h16wakeup10wait_eventNCNvMs1_NtNtNtCsdo0DfKJVZul_6monoio3net3tcp6streamNtB1T_9TcpStream8readable0NtNtNtNtB1Z_4time6driver5sleep5SleepNtNtNtCsj4k1HwMMe7E_10tokio_util4sync18cancellation_token25WaitForCancellationFutureE0EBM_",
+          "slots": 5,
+          "maximum_block_count": 9097,
+          "counter_sum": 9097
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNCNvNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h26wakeup10read_ready0B9_",
+          "slots": 6,
+          "maximum_block_count": 5013,
+          "counter_sum": 14718
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCNvNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h26wakeup10read_ready0EBL_",
+          "slots": 5,
+          "maximum_block_count": 4972,
+          "counter_sum": 5232
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h26wakeup10read_ready",
+          "slots": 2,
+          "maximum_block_count": 4972,
+          "counter_sum": 4972
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCNvMNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h26wakeupNtBG_9Readiness5event0EBM_",
+          "slots": 4,
+          "maximum_block_count": 971,
+          "counter_sum": 971
+        }
+      ]
+    },
+    "h2_owner": {
+      "pattern": "httpjet.*kernel_fastpath.*h2.*(Owner|arm|adopt|maintain)",
+      "matching_functions": 19,
+      "nonzero_functions": 18,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h2NtB4_5Owner5drain",
+          "slots": 44,
+          "maximum_block_count": 60360,
+          "counter_sum": 438987
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNCNvXs0_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h2NtB7_5OwnerNtNtNtCsalwd8mO8Ndp_5hj_h26server6kernel11KernelOwner5event0Bb_",
+          "slots": 105,
+          "maximum_block_count": 19631,
+          "counter_sum": 238726
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h2NtB4_5Owner15publish_pending",
+          "slots": 25,
+          "maximum_block_count": 5343,
+          "counter_sum": 14400
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h2NtB4_5Owner12pending_logs",
+          "slots": 3,
+          "maximum_block_count": 4676,
+          "counter_sum": 7900
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvXs0_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h2NtB5_5OwnerNtNtNtCsalwd8mO8Ndp_5hj_h26server6kernel11KernelOwner4busy",
+          "slots": 2,
+          "maximum_block_count": 4651,
+          "counter_sum": 8466
+        }
+      ]
+    },
+    "native_h2": {
+      "pattern": "hj_h2.*server.*(serve|pump_streams|process)",
+      "matching_functions": 86,
+      "nonzero_functions": 51,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNCINvNtCsalwd8mO8Ndp_5hj_h26server11paced_flushINtNtCs2p7T7SofqwL_13monoio_rustls6stream9WriteHalfINtNtNtNtCsdo0DfKJVZul_6monoio2io4util5split14OwnedWriteHalfNtNtNtCsiGYAq7sC6bz_7httpjet5uring8directio17DirectWriteSocketENtNtNtNtCsajFikgJL2xZ_6rustls6server11server_conn10connection16ServerConnectionEE0B2D_",
+          "slots": 144,
+          "maximum_block_count": 424150,
+          "counter_sum": 3206265
+        },
+        {
+          "name": "_RNvNtNtCsalwd8mO8Ndp_5hj_h26server4send12pump_streams",
+          "slots": 50,
+          "maximum_block_count": 321976,
+          "counter_sum": 3822575
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueINtNtB4_6option6OptionINtNtCsalwd8mO8Ndp_5hj_h26server6TaggedNCNCNCINvNtCsiGYAq7sC6bz_7httpjet5uring16serve_h2_bridgedNtNtNtNtCsdo0DfKJVZul_6monoio3net3tcp6stream9TcpStreamE0s3_0s0_0EEEB1L_",
+          "slots": 4,
+          "maximum_block_count": 272185,
+          "counter_sum": 407985
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueINtNtB4_6option6OptionINtNtCsalwd8mO8Ndp_5hj_h26server6TaggedNCNCNCINvNtCsiGYAq7sC6bz_7httpjet5uring16serve_h2_bridgedINtNtCs2p7T7SofqwL_13monoio_rustls6stream6StreamNtNtB1J_8directio17DirectWriteSocketNtNtNtNtCsajFikgJL2xZ_6rustls6server11server_conn10connection16ServerConnectionEE0s3_0s0_0EEEB1L_",
+          "slots": 4,
+          "maximum_block_count": 246598,
+          "counter_sum": 369702
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvXs5_NtNtCsen471MfeTXp_12futures_util6stream17futures_unorderedINtB5_16FuturesUnorderedINtNtCsalwd8mO8Ndp_5hj_h26server6TaggedNCNCNCINvNtCsiGYAq7sC6bz_7httpjet5uring16serve_h2_bridgedINtNtCs2p7T7SofqwL_13monoio_rustls6stream6StreamNtNtB2b_8directio17DirectWriteSocketNtNtNtNtCsajFikgJL2xZ_6rustls6server11server_conn10connection16ServerConnectionEE0s3_0s0_0EENtNtCsiWEfCLxHE2I_12futures_core6stream6Stream9poll_nextB2d_",
+          "slots": 31,
+          "maximum_block_count": 209838,
+          "counter_sum": 1184842
+        }
+      ]
+    },
+    "h1_kernel": {
+      "pattern": "httpjet.*kernel_fastpath.*h1",
+      "matching_functions": 81,
+      "nonzero_functions": 63,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNCNvMs6_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h1NtB7_7Binding4park0Bb_",
+          "slots": 141,
+          "maximum_block_count": 255164,
+          "counter_sum": 1331168
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h112monotonic_ns",
+          "slots": 6,
+          "maximum_block_count": 243609,
+          "counter_sum": 243609
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueINtNtNtNtCs8ZKwes1zzDd_3std4sync6poison5mutex10MutexGuardNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h18RegistryEEB1C_",
+          "slots": 5,
+          "maximum_block_count": 208336,
+          "counter_sum": 416672
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs3_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h1NtB5_7Service8registry",
+          "slots": 4,
+          "maximum_block_count": 208336,
+          "counter_sum": 208336
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs3_NtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h1NtB5_7Service8log_meta",
+          "slots": 20,
+          "maximum_block_count": 187942,
+          "counter_sum": 751768
+        }
+      ]
+    },
+    "h3": {
+      "pattern": "httpjet.*h3.*(dispatch|accelerated|serve)",
+      "matching_functions": 25,
+      "nonzero_functions": 21,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtNtCs8ZKwes1zzDd_3std3sys9backtrace28___rust_begin_short_backtraceNCINvMs6_NtNtCsiGYAq7sC6bz_7httpjet5uring12worker_groupNtB1g_11WorkerGroup5spawnNCNvNtB1i_2h317serve_h3_pipeline0E0uEB1k_",
+          "slots": 26,
+          "maximum_block_count": 694561,
+          "counter_sum": 1760769
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs8_NtNtCsiGYAq7sC6bz_7httpjet5uring2h3NtB5_14H3EgressBudget7reserve",
+          "slots": 7,
+          "maximum_block_count": 492366,
+          "counter_sum": 492366
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtNtCsiGYAq7sC6bz_7httpjet5uring2h317reserve_h3_egress",
+          "slots": 3,
+          "maximum_block_count": 492366,
+          "counter_sum": 492366
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtNtCsiGYAq7sC6bz_7httpjet5uring2h325take_request_for_dispatch",
+          "slots": 30,
+          "maximum_block_count": 492360,
+          "counter_sum": 6399729
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCNvMNtNtNtCsiGYAq7sC6bz_7httpjet5uring2h314request_engineNtBG_15H3RequestEngine8dispatch0EBM_",
+          "slots": 19,
+          "maximum_block_count": 491860,
+          "counter_sum": 491860
+        }
+      ]
+    },
+    "tls": {
+      "pattern": "rustls.*(read_tls|process_new_packets|complete_io)",
+      "matching_functions": 8,
+      "nonzero_functions": 3,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs0_NtCsajFikgJL2xZ_6rustls4connINtB5_16ConnectionCommonNtNtNtB7_6server11server_conn20ServerConnectionDataE8read_tlsCsiGYAq7sC6bz_7httpjet",
+          "slots": 5,
+          "maximum_block_count": 349076,
+          "counter_sum": 873417
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvMs_NtCsajFikgJL2xZ_6rustls4connINtB4_16ConnectionCommonNtNtNtB6_6server11server_conn20ServerConnectionDataE19process_new_packetsCsiGYAq7sC6bz_7httpjet",
+          "slots": 53,
+          "maximum_block_count": 202912,
+          "counter_sum": 1567222
+        },
+        {
+          "name": "rustls.782bb5f8943a719d-cgu.0;_RNvMs8_NtCsajFikgJL2xZ_6rustls4connINtB5_14ConnectionCoreNtNtNtB7_6server11server_conn20ServerConnectionDataE19process_new_packetsB7_",
+          "slots": 18,
+          "maximum_block_count": 1584,
+          "counter_sum": 3168
+        }
+      ]
+    },
+    "response_memo": {
+      "pattern": "httpjet.*(response_memo|cache_lookup_fast_path)",
+      "matching_functions": 4,
+      "nonzero_functions": 4,
+      "representatives": [
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtCsiGYAq7sC6bz_7httpjet7lscache24record_response_memo_hit",
+          "slots": 4,
+          "maximum_block_count": 257272,
+          "counter_sum": 514527
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtCsiGYAq7sC6bz_7httpjet7lscache22cache_lookup_fast_path",
+          "slots": 1,
+          "maximum_block_count": 50896,
+          "counter_sum": 50896
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtCsiGYAq7sC6bz_7httpjet7lscache32cache_lookup_fast_path_with_memo",
+          "slots": 1,
+          "maximum_block_count": 336,
+          "counter_sum": 336
+        },
+        {
+          "name": "httpjet.d9bb256fba82bf17-cgu.0;_RNvNtCsiGYAq7sC6bz_7httpjet7lscache22response_memo_deadline",
+          "slots": 10,
+          "maximum_block_count": 278,
+          "counter_sum": 1946
+        }
+      ]
+    }
+  }
+}

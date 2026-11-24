@@ -1,0 +1,69 @@
+{
+  "files": {
+    "TABLE.md": {
+      "sha256": "44e3c97c6f798acfb57a96962a50d10d7968f822b7bae08564bf51e1fc0aeb7e",
+      "bytes": 3165
+    },
+    "arms.csv": {
+      "sha256": "64a96b5905a91e71528d65e6370e0c3a515fd04685a1327c0869f15265c1194a",
+      "bytes": 8471
+    },
+    "cause/FINDINGS.md": {
+      "sha256": "42e313d31707913da06080da7305784ec3fc4efe178ef37877a9f88072c0dd92",
+      "bytes": 5377
+    },
+    "cause/arms.csv": {
+      "sha256": "6a3b20688d0e81db82df900d86f5c218854b7ac0c9e8433a00955b2ef2efa0b8",
+      "bytes": 10704
+    },
+    "cause/changes-percent.csv": {
+      "sha256": "a287bdc447a35b550275d1951cdd8334b2e0bba56c353c9ce0b8b1c5dfd079f5",
+      "bytes": 2822
+    },
+    "cause/groups.csv": {
+      "sha256": "a5b5285350e318503c9d5e58d9481696b49fca788c8da9315de5ece05e68a41e",
+      "bytes": 5231
+    },
+    "cause/receipt.json": {
+      "sha256": "49559797f939c46ee15f2914cd8871faabf89d9da8ab95640f346509deef132e",
+      "bytes": 829
+    },
+    "cause/source-comparison.json": {
+      "sha256": "6d879a719d45124d8e17a20255fdb768b30d8df10473064f8219f2502b835024",
+      "bytes": 2764
+    },
+    "cause/split_cpu.py": {
+      "sha256": "778e4d4e405f854c25b2ae1c0c2cf4a74992e1753ee33ee3f4a2d3a9337769ed",
+      "bytes": 2650
+    },
+    "changes-percent.csv": {
+      "sha256": "cca668581c581e06d2e0a1821a7fb38b34834a4bee161acb9e83a83ae416923a",
+      "bytes": 808
+    },
+    "cycles-percent.csv": {
+      "sha256": "6047266368ab8bfc2273aaf0072d5378e940736dce243c5991b0e438bac2cf43",
+      "bytes": 2500
+    },
+    "groups.csv": {
+      "sha256": "fdc0aea8871b4af0dbc6e7ba26a259f74eaabfb75aa0ba9477964cafbd65a17f",
+      "bytes": 1342
+    },
+    "post-run-context.json": {
+      "sha256": "3c097f255663d868d1b71ddf9ac1b22fc9a0dc623d3fb8e5253f09dcea81ea68",
+      "bytes": 564
+    },
+    "raw-manifest.json": {
+      "sha256": "91428efa4039f296468279545159490193af981fb9c42acae1ef65811231d906",
+      "bytes": 174085
+    },
+    "receipt.json": {
+      "sha256": "a0472ef64ad8d943718a67e0c2a2a546464da6254b6305ad69f90b07e990231c",
+      "bytes": 38874
+    },
+    "recompute.py": {
+      "sha256": "2ea292e1e409b28d18b0ae6afb6ca4e174f16c83e35255d7f0f71bced5be4c69",
+      "bytes": 18264
+    }
+  },
+  "scope": "Compact native TLS evidence; raw615MiB stays outside Git; fixture context differs from later container closure."
+}

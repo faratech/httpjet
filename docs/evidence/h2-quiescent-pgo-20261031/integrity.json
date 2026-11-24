@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "status": "complete base experiment; overall CPU target remains open",
+  "studies": {
+    "capacity": {
+      "arms": 72,
+      "measured": 14400000,
+      "warmup": 720000
+    },
+    "rate15000": {
+      "arms": 48,
+      "measured": 2880000,
+      "warmup": 240000
+    }
+  },
+  "sha256": {
+    "arms.csv": "d48c706163c02a58080b5126b9af37689e93093809e2108c0ebf151570d62a7c",
+    "build-gen.json": "0a387d5ce36b56465987ec088c78abbb7f66952a346f38417c9fd41878365b69",
+    "build-use.json": "0428f4f98cb49e67832deed91c8192daa1266efbf850d333ff861e74ef0db58c",
+    "capacity-inputs-after.json": "eb4a9c73c1f6388e9de97a22497eca57565009c1e3f11a5197ec671d5236d640",
+    "capacity-inputs-before.json": "eb4a9c73c1f6388e9de97a22497eca57565009c1e3f11a5197ec671d5236d640",
+    "capacity-plan.json": "8a867ea747e8872da4f5e0713621166d6d7b8181f139397d76bd4f50585dac11",
+    "capacity-run-status.json": "23cc32ae7cc1243646b4e1e958abac656fa8cbc481bcdf7276d56cacb68e1476",
+    "capacity-summary.json": "c2ccb875d2abb74ab8fa542485f630f73aeda2dbc3f61a1ba2617d3d1474ede8",
+    "coverage-inspection.json": "4cb85efa4c0af4afce879fca3335fcfe84b37aceca691572825e018bd1cae841",
+    "coverage-review.json": "920f9c197a49d9b20ef3687bf0f593b46a0181624d0d779df1ceb6b6624d7f06",
+    "gen-artifacts.json": "1000d9e5471cff67457aee56e2073cdfbaafb5530b95696b5d23805227f1feca",
+    "gen-fingerprint-audit.json": "5db37140c1de46149446b3d71107c7d9260cd9390d3e5ccb29b0fc6437cfbd68",
+    "h2-readiness-coverage.json": "ec3a9c02bc9f302ada6ccde1870237369204ba3db913f9ad701aaaf557e95c27",
+    "h2q-final-run.py": "1076e6aba54488b1b3ede822462437da8b37c6cd15bbfa6b4972febb36c6a518",
+    "h2q-final-run.sh": "b49c9292b6cc3c7f387fc4fd58cdec84a70b7154b2dc002ecb6f689469a035d1",
+    "h2q-final-summarize.py": "d9830cfa1c487ff1a05fe4e286f929d9ab3c8a83c5f2c2bf22878d9f4129b138",
+    "h2q-pgo-qualify.sh": "ef34523a7082fdab62033a40d7e3fc1c9f9d6d4362d50d21ab00109df2697a1f",
+    "independent-audit.json": "2c379f6fed232366b3301e0568026800b39bc3a43b042070b8d706c1a7f55288",
+    "merge-receipt.json": "8b04ce52411d9a348c92bbbc93e7356e7a49b913f01bf3d89fb04ba47ce14d2d",
+    "pgo-inputs.json": "1c81b39262cb21f750c4c9f0b3786e807cf80399853956f095b57963bc7a3e39",
+    "profile-use-warnings.json": "10d8507e2c47dd19a150f1b8ea393ff917a05b6a22e1fbebfcdfac57dfeeee14",
+    "qualification-inputs-after.json": "4821f1008101dbe2181e0542a5552bd32a85a54c9f0253e26e53799fd3fb7cb8",
+    "qualification-inputs-before.json": "4821f1008101dbe2181e0542a5552bd32a85a54c9f0253e26e53799fd3fb7cb8",
+    "qualification.json": "8d5e527b99e4136e82748b047b687b88a22b70b01301f38e015a3bab3de66b1b",
+    "rate-inputs-after.json": "f05f6ec09b6c441505dd29e99b482cdda324b264a1106dfb3ccc8451ae666d3c",
+    "rate-inputs-before.json": "f05f6ec09b6c441505dd29e99b482cdda324b264a1106dfb3ccc8451ae666d3c",
+    "rate-plan.json": "6267232f4ec1616398ab4d61f6f7eaa49090ee09c824ea032ec9b6ccbeb4ad6a",
+    "rate-run-status.json": "23cc32ae7cc1243646b4e1e958abac656fa8cbc481bcdf7276d56cacb68e1476",
+    "rate-summary.json": "f0f9aecba82ff3cdabf264aae1f5f57fa685bc47313d145ad80540e661b05e37",
+    "reference-qualification-boundary.json": "a1682aa4cd3c3e0a79b6ae3a7eb9f19e7d3c1b348971b58b2cafb94ea464f3de",
+    "source-binding.json": "48c9e47b0e6f5ad53c15eb2491df254533ad255b1c1b5cb30807dd0a6c407af1",
+    "use-artifacts.json": "d2b3f65e597e237005e10a0e9fb4ec7448c25eda57ee14878735cbe9f9206eef",
+    "use-fingerprint-audit.json": "836d0c8754b07469f231d9083e72a260ddfe1c79ff867478e4fc3365d21e09e5",
+    "use-warning-audit.json": "b24b5ba348b8600c34b1d8cd1e05b5a3fc8775cb19df010acf1c753238ff71cd"
+  },
+  "report_sha256": "fa1840d1a571dfa042f49f0166d056e6a867aa1b0df38066301108a8e14980c4",
+  "scope": "Copied sealed SINGULARITY evidence and local independent numerical audit. Raw perf/profile/address data is retained on SINGULARITY. New certificate experiment is excluded."
+}

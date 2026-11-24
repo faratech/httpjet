@@ -1,0 +1,123 @@
+{
+  "stage_exit": 0,
+  "setup_exit": 0,
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet": {
+      "bytes": 42968880,
+      "sha256": "e8efed0ee5a975956770ddb71e4a99d15f6fd0bb7bd811adea9d6144b2f5391e"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-h1": {
+      "bytes": 6086384,
+      "sha256": "9c68a6a3dd8177fcb8722db4ccfdfe19d601b4ae3fcd58479dcfd7493447de6d"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-beeper-observe": {
+      "bytes": 6085608,
+      "sha256": "5a1571dd758edef03225e260d0da84daae92b749bc6b3baf70cbce13b79e669c"
+    },
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-gen/httpjet-quic-steer": {
+      "bytes": 3870064,
+      "sha256": "4ddc29f40d9e4a8bfe69eb4bc68d97c2e515efb343d2bc1d70d5809d4dac1e4c"
+    }
+  },
+  "build": {
+    "stage": "gen",
+    "target": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen",
+    "rustflags": "-Ctarget-cpu=native -Cforce-frame-pointers=yes -Cprofile-generate=/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw",
+    "exit": 0,
+    "jobs": 2,
+    "profile": "release/opt3/thinLTO/codegen1/panic-abort/strip-debuginfo",
+    "features": [
+      "httpjet/beeper-h2-serve",
+      "httpjet/beeper-observer",
+      "httpjet/quic-bpf"
+    ],
+    "prebuilt_bpf": "/var/tmp/httpjet-continuation/integrated-f7555d80/objects",
+    "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/logs/build-gen.log",
+    "log_sha256": "9cce9261651d26f133d2796ac5d9b4fb28e929ce53ae04ed78a91c0f0747ce7e",
+    "scope": "build receipt only; no performance result"
+  },
+  "fingerprints": {
+    "httpjet": {
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/.fingerprint/httpjet-6b23fea7bf0cfa21/bin-httpjet.json",
+      "copy": "/var/tmp/httpjet-continuation/pgo-c6ac-preflight-v1/fingerprints/httpjet.json",
+      "sha256": "6a961278cfcd2393e729c1c2add7295b9e39109a18ea4d1679c2179fcf644182",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]"
+    },
+    "httpjet-beeper-h1": {
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/.fingerprint/hj-kernel-fastpath-54f82907388c4cdb/bin-httpjet-beeper-h1.json",
+      "copy": "/var/tmp/httpjet-continuation/pgo-c6ac-preflight-v1/fingerprints/httpjet-beeper-h1.json",
+      "sha256": "6a31659ba859d30f6cdc7eb980748ce072bc44fcdfdbc73c79cd69efa5b82992",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-observer\"]"
+    },
+    "httpjet-beeper-observe": {
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/.fingerprint/hj-kernel-fastpath-ba617a978080d964/bin-httpjet-beeper-observe.json",
+      "copy": "/var/tmp/httpjet-continuation/pgo-c6ac-preflight-v1/fingerprints/httpjet-beeper-observe.json",
+      "sha256": "220826025e87e96dbc61d680663cb38fd9e482812515b9cbbde432953d7416f3",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"beeper-h1-serve\", \"beeper-observer\"]"
+    },
+    "httpjet-quic-steer": {
+      "source": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/.fingerprint/hj-quic-steering-e79b598eb19caab5/bin-httpjet-quic-steer.json",
+      "copy": "/var/tmp/httpjet-continuation/pgo-c6ac-preflight-v1/fingerprints/httpjet-quic-steer.json",
+      "sha256": "9159f99bcbe59ef67377a017c08375037dcb0ca0e08db4c9592d9438458e5307",
+      "rustflags": [
+        "-Ctarget-cpu=native",
+        "-Cforce-frame-pointers=yes",
+        "-Cprofile-generate=/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw"
+      ],
+      "profile": 6536927300735754373,
+      "features": "[\"default\", \"loader\"]"
+    }
+  },
+  "verified_copied_bpf_objects": {
+    "observer": {
+      "sha256": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a",
+      "copies": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/build/hj-kernel-fastpath-180c8d156ccbc3ad/out/observer.bpf.o"
+      ]
+    },
+    "h1_ack_probe": {
+      "sha256": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+      "copies": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/build/hj-kernel-fastpath-180c8d156ccbc3ad/out/h1_ack_probe.bpf.o"
+      ]
+    },
+    "h1_serve": {
+      "sha256": "3c4768271e6c394adb183a04a1fc9e2f4e2324c6b95220024d715c423ba33263",
+      "copies": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/build/hj-kernel-fastpath-180c8d156ccbc3ad/out/h1_serve.bpf.o"
+      ]
+    },
+    "cid_steering": {
+      "sha256": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f",
+      "copies": [
+        "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen/release/build/hj-quic-steering-488dce9e2d66aaa0/out/cid_steering.bpf.o"
+      ]
+    }
+  },
+  "runtime_training_started": false,
+  "runtime_profile_count": 0,
+  "training_result_count": 0,
+  "excluded_build_only_profiles": 44,
+  "input_receipt": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/pgo-inputs.json",
+  "input_receipt_sha256": "0f6e8e3b62a2528d2a1cdbb4adee4e3a621b83ad987dae991c87a90c8524d946",
+  "gen_artifacts_sha256": "2538fca3a5a3900fd8a2979df578f3522f595eb64d8e439ec076d8f0f9fe2b78",
+  "stop_point": "instrumented build frozen; awaiting root follow-up before training"
+}

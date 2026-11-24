@@ -1,0 +1,47 @@
+{
+  "scope": "Local saved-data/source/recipe analysis only; no new runtime or cause proof",
+  "candidate_commit": "3946cd5eef75ac9b3993b082f7fbb7fca8bf30db",
+  "control_commit": "c07d345714d04d0fc9e0b7d41bafee3cbacc5e73",
+  "identical_trees": {
+    "vendor/monoio": {
+      "c7_git_tree": "8116c789b10f23b4f31eddd6c252d241cae49fb1",
+      "abf_git_tree": "8116c789b10f23b4f31eddd6c252d241cae49fb1"
+    },
+    "vendor/monoio-rustls": {
+      "c7_git_tree": "f61d8c7cd1a3cdb9c56e60a195ed387667afec3e",
+      "abf_git_tree": "f61d8c7cd1a3cdb9c56e60a195ed387667afec3e"
+    },
+    "crates/hj-tls": {
+      "c7_git_tree": "e377f610bf03ca17ac1a658614ef8a7d42172340",
+      "abf_git_tree": "e377f610bf03ca17ac1a658614ef8a7d42172340"
+    }
+  },
+  "candidate_source_sha256": {
+    "crates/hj-h2/src/server/read_ownership.rs": "7f80ce3b8eac7145b4fb4fd4c7518edcbfca7aef9c71833cd61198528d3f3e45",
+    "crates/hj-h2/src/server/mod.rs": "d22597d82005272c61d53cbbb1c50f622ce975964ef182154f6f3d9ed81bfa98",
+    "crates/hj-h2/src/server/recv.rs": "cbeeb9cefe7e60ac15d3fc30c1b8f06e99322f715845901c504e3c5b556b1944",
+    "crates/hj-h2/src/hpack/mod.rs": "6eb1f75873f97d9d97b4c106b98e103a4b9355fd35963924aefe977a3b1b0d19",
+    "crates/httpjet/src/uring/mod.rs": "897e6cbf86f4ffc9736b7acff8bc0eeeede08d7d5b262be415de9f496db3b899",
+    "crates/httpjet/Cargo.toml": "c2a82ad30d3a831e9eec46fb05d187d38aa851de1599a5fafc3bed0485d87738",
+    "crates/hj-h2/Cargo.toml": "40a32ebd15a24ae6536d9b99d697ce3e1d7f9d86492b82036025542917ae2dab",
+    "Cargo.lock": "29ba656f29d503e8f0614cf12f62cc9cd0c599700edf04d421f78248a0f5adce"
+  },
+  "build_receipt_sha256": {
+    "/var/tmp/httpjet-h2-repaired-pgo-warning-review-v1/raw/build-use.json": "44f68941d649dd068f969af81fce383bf42eb11a03ea70995a14ca382e1f1937",
+    "/var/tmp/httpjet-prod-c7-freeze-v3/singularity/pgo-v2/use-artifact.json": "10444ee894e297d0a2e960062a0f777ce6d35bf7912de6a884f29ecae5920a7b"
+  },
+  "crypto_builder_source_sha256": {
+    "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-sys-0.46.0/builder/main.rs": "8144aba9f6165a3f0dcb76547cf788d78fbcd4cd12a525f315fc6d4756ea19fb",
+    "/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-sys-0.46.0/builder/cc_builder.rs": "666465f770b0be77a1e4013c6f571469f30c07cfb2630d4dd9841944db6fef38"
+  },
+  "known_build_difference": {
+    "C7_CFLAGS_CXXFLAGS": "-march=native -fno-omit-frame-pointer -mno-omit-leaf-frame-pointer",
+    "ABF_CFLAGS_CXXFLAGS": "unset"
+  },
+  "not_established": [
+    "Effective AWS-LC C compiler argv/features/assembly/native object identity from retained evidence",
+    "CFLAGS causation",
+    "Inactive H2 owner/fence causation",
+    "Compatibility of a changed-native-C build with frozen Rust PGO until new unit/CFG checks"
+  ]
+}

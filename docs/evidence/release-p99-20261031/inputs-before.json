@@ -1,0 +1,70 @@
+{
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/bin-use/httpjet": {
+      "bytes": 23549352,
+      "sha256": "abf7a79c1eb9593c3af7e77e60c4aaf4a5b30873d0e2b989283c88b662db9c48"
+    }
+  },
+  "helper": {
+    "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper",
+    "sha256": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+    "instrumented": false,
+    "serving_abi": 5,
+    "helper_rpc_abi": 2,
+    "object_sha256": {
+      "h1_serve": "4bdf891e8a249de182c68714a48ae29ed1c6dbb1e43d90a063dfd8421932677b",
+      "observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a",
+      "h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+      "cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f"
+    },
+    "full_serving_elf_offset": 108898,
+    "input_sha256": {
+      "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+      "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bpf-objects.json": "9691918fff1ebe6d8903231f40e24b7f987808d58c36d5b355d95cc7b71d2829",
+      "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/provenance.json": "839a29a749231a806efe5acfcbbdf3439d969d4f57c5fb5bb273f14510cb6723",
+      "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/objects/h1_serve": "4bdf891e8a249de182c68714a48ae29ed1c6dbb1e43d90a063dfd8421932677b",
+      "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/objects/observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a",
+      "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/objects/h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+      "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/objects/cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f"
+    }
+  },
+  "tools": {
+    "scripts/integrated_bench.py": "823de4b84de075f163e715fd227c163df44a1eb5a8887d71aabf4f1bd7216432",
+    "scripts/http_engine_check.py": "6b7b239d1dfc07c2ae81efcf5ea597e2f402cff35a27b145fe70d36fd5004655",
+    "scripts/h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "scripts/bench_environment_run.py": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+    "scripts/bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "scripts/bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "scripts/bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe"
+  },
+  "docker": {
+    "endpoint": "unix:///var/run/docker.sock",
+    "id": "508f5add-b9bf-4f7c-afae-2ad292e77444",
+    "name": "SINGULARITY",
+    "running": []
+  },
+  "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda",
+  "files": {
+    "/var/tmp/h2r-exact-release-bench.py": "1055dbbb31af5ba9a2d3da1a3e54cd2868257c97c9090dd68f30cecce8eb4296",
+    "/var/tmp/h2r-pgo.py": "a53cde6cef97db96d98680434bc7692668ce1fee19a5d1536e53979d1f8622ef",
+    "/var/tmp/httpjet-continuation/exact-release-p99-v1/httpjet-release": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/bin-use/httpjet": "abf7a79c1eb9593c3af7e77e60c4aaf4a5b30873d0e2b989283c88b662db9c48",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+    "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced": "0cb400bd7a56df95a03219ff227195e2ca6168ca1cf98c02b8ce48ac5ffacca6",
+    "/var/tmp/httpjet-continuation/h3-bind-client-20261030/bin/httpjet-h3-load-bind": "afee4fd337ce7289c3a3122abba27fd3fa47605535d50f9b43aa4dff22e33a77",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/qualification-use-v1/qualification.json": "bb8850619fd76372f63da27fd665ea28c31152eb65e88d6c44bce53843a6f7d3",
+    "/var/tmp/httpjet-continuation/h2-repaired-final-bench-v1/tools/files.sha256": "610a1fcd94110760e51021c25027452824b7bc31132f2c4e410f6a807f9728c7",
+    "/var/tmp/httpjet-continuation/exact-release-p99-v1/release-receipt.json": "cb4833021dde23340f3ca3f702d59af6c8b606d016d03785a22b95485333ac8c",
+    "/var/tmp/httpjet-continuation/exact-release-p99-v1/release.tar.gz": "67695c65902e0437fbecffe8b94c502e98d635dff78aee5dcc604f3e9f5900c2",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/use-artifacts.json": "c6b54f0a96a66a3e2c61c04b0ae369fa4447b338d037429782fe804cc00e1c2a",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/use-fingerprint.json": "4d3c8d330fd96b4261c2207d051ef34d1e6d9b2c744509a4d2c92beae8acc11e",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/profile-use-warnings.json": "aba380b90a6c097fefe51d4847686cf7995443d098dbd89d96aaf1e0541b88ad",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/coverage-review.json": "d195ae2c4d494fde0f69c7488771e7e86eafebc2f831ea7c17c1a4c4b0c1d129",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/merge-receipt.json": "80d4725ef84c665fd11bae9cb07630c8bbe393fdfcbd9411f92aff74e523dab6",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/profile-inputs.json": "5d1cb9e292214ea62d47602cf51c86f55f688ce7b83d91180a6024f175bd27b7",
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/runtime.profdata": "488dccd263086c30c062fe2aab6e369ea4b658cfa291a5b20a9de03f128fe663"
+  }
+}

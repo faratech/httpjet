@@ -1,0 +1,309 @@
+{
+  "benchmark_valid": false,
+  "phase": "measured",
+  "protocol": "h2",
+  "url": "http://localhost:18488/asset.txt",
+  "request_uri": "http://localhost/asset.txt",
+  "connect": "127.0.0.2:18488",
+  "authority": "localhost",
+  "connections": 32,
+  "streams_per_connection": 4,
+  "threads": 6,
+  "warmup_requested": 10000,
+  "warmup_completed": 10000,
+  "warmup_succeeded": 10000,
+  "requested": 500000,
+  "completed": 125338,
+  "succeeded": 125334,
+  "failed": 4,
+  "unattempted": 374662,
+  "elapsed_secs": 0.655801609,
+  "successful_requests_per_sec": null,
+  "body_bytes": 1024,
+  "verified_body_bytes": 128342016,
+  "received_body_bytes": 128342016,
+  "expected_status": 200,
+  "status_counts": {
+    "200": 125334
+  },
+  "p50_us": 489.59999999999997,
+  "p99_us": 3949.6000000000004,
+  "max_us": 7954.902,
+  "errors": [
+    "measurement incomplete, response validation failed, or connection driver failed",
+    "measured request 125736 worker 40 connection 10: connection error: stream closed because of a broken pipe",
+    "measured request 125739 worker 43 connection 10: connection error: stream closed because of a broken pipe",
+    "measured request 126505 worker 41 connection 10: connection error: stream closed because of a broken pipe",
+    "measured request 126890 worker 42 connection 10: connection error: stream closed because of a broken pipe"
+  ],
+  "driver_errors": [
+    "connection error"
+  ],
+  "client_sockets": [
+    {
+      "connection": 0,
+      "local_address": "127.0.0.2:45023",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 1,
+      "local_address": "127.0.0.2:46057",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 2,
+      "local_address": "127.0.0.2:48263",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 3,
+      "local_address": "127.0.0.2:44629",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 4,
+      "local_address": "127.0.0.2:48369",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 5,
+      "local_address": "127.0.0.2:47641",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 6,
+      "local_address": "127.0.0.2:48429",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 7,
+      "local_address": "127.0.0.2:47711",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 8,
+      "local_address": "127.0.0.2:48367",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 9,
+      "local_address": "127.0.0.2:44773",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 10,
+      "local_address": "127.0.0.2:46827",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 11,
+      "local_address": "127.0.0.2:48663",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 12,
+      "local_address": "127.0.0.2:48051",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 13,
+      "local_address": "127.0.0.2:45419",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 14,
+      "local_address": "127.0.0.2:47425",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 15,
+      "local_address": "127.0.0.2:47391",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 16,
+      "local_address": "127.0.0.2:47405",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 17,
+      "local_address": "127.0.0.2:46279",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 18,
+      "local_address": "127.0.0.2:47827",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 19,
+      "local_address": "127.0.0.2:45307",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 20,
+      "local_address": "127.0.0.2:48137",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 21,
+      "local_address": "127.0.0.2:44743",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 22,
+      "local_address": "127.0.0.2:48531",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 23,
+      "local_address": "127.0.0.2:47291",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 24,
+      "local_address": "127.0.0.2:47731",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 25,
+      "local_address": "127.0.0.2:47771",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 26,
+      "local_address": "127.0.0.2:47579",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 27,
+      "local_address": "127.0.0.2:45799",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 28,
+      "local_address": "127.0.0.2:45985",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 29,
+      "local_address": "127.0.0.2:48615",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 30,
+      "local_address": "127.0.0.2:45173",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    },
+    {
+      "connection": 31,
+      "local_address": "127.0.0.2:45135",
+      "peer_address": "127.0.0.2:18488",
+      "tcp_nodelay": true,
+      "alpn": null,
+      "tls_version": null
+    }
+  ],
+  "h2_stream_window_bytes": 8388608,
+  "h2_connection_window_bytes": 67108864,
+  "h2_max_frame_bytes": 16384,
+  "measured_process_cpu_ticks": {
+    "user": 171,
+    "system": 115
+  },
+  "clock_ticks_per_second": 100,
+  "diagnostic_only": true
+}

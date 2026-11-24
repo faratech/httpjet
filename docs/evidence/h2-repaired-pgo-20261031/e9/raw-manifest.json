@@ -1,0 +1,1807 @@
+[
+  {
+    "path": "frozen-helper-provenance/bpf-objects.json",
+    "bytes": 653,
+    "sha256": "9691918fff1ebe6d8903231f40e24b7f987808d58c36d5b355d95cc7b71d2829"
+  },
+  {
+    "path": "frozen-helper-provenance/provenance.json",
+    "bytes": 2913,
+    "sha256": "839a29a749231a806efe5acfcbbdf3439d969d4f57c5fb5bb273f14510cb6723"
+  },
+  {
+    "path": "h2-pgo-rate-arms-v1.json",
+    "bytes": 567,
+    "sha256": "dcd93b695eec37e0f87d8448fb26fb9fdf5554bcf883ae691e27697602132a5e"
+  },
+  {
+    "path": "h2-pgo-rate-scope-v1.json",
+    "bytes": 479,
+    "sha256": "642e77c5b52cf5c878cd60ed45797e4200e1acc38bd8b4b7c661cde38467337e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/cpu-topology.txt",
+    "bytes": 476,
+    "sha256": "899cb2328cb6447fa93950181350098b2aecd1d6e2acafa2d297a57ee177ad0f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/content/.htaccess",
+    "bytes": 62,
+    "sha256": "d4b5a231730e4749d1aa3f798880d78969cb47ccf8c42839df023b1876969475"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/content/asset.txt",
+    "bytes": 1024,
+    "sha256": "94fc3785412c239bfc3abb736ab547c4b5443c3f5a80f97d6912cc3edd06318c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/content/cache-origin.txt",
+    "bytes": 1024,
+    "sha256": "94fc3785412c239bfc3abb736ab547c4b5443c3f5a80f97d6912cc3edd06318c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/root/conf/httpd_config.xml",
+    "bytes": 1651,
+    "sha256": "db063f68043923d5376bed0c3bf1339353b7cb79f426e0834fbe676f41a1446b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/root/conf/mime.properties",
+    "bytes": 126,
+    "sha256": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/root/conf/vhosts/default.xml",
+    "bytes": 495,
+    "sha256": "d894dfc65bb128dda115742befcc4c9d20845aece6f556625fba50bf198ad852"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/root/tls/fixture.crt",
+    "bytes": 1131,
+    "sha256": "339c6896eb7188548192beebaecea0862fab9d361859c211e64205d1081f53f3"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-pagecache/root/tls/fixture.key",
+    "bytes": 1704,
+    "sha256": "52ac1c21c2a6a4fb145f0193c853a4429443d704470b9ad4728ce302d3fd0cb1"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-static/content/asset.txt",
+    "bytes": 1024,
+    "sha256": "94fc3785412c239bfc3abb736ab547c4b5443c3f5a80f97d6912cc3edd06318c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-static/content/cache-origin.txt",
+    "bytes": 1024,
+    "sha256": "94fc3785412c239bfc3abb736ab547c4b5443c3f5a80f97d6912cc3edd06318c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-static/root/conf/httpd_config.xml",
+    "bytes": 1642,
+    "sha256": "b219a9bd3f3165a24a7f43d18bcf037aa7b3a9cf962ab360fd2ff91e37f7373c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-static/root/conf/mime.properties",
+    "bytes": 126,
+    "sha256": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-static/root/conf/vhosts/default.xml",
+    "bytes": 484,
+    "sha256": "dfeee84f489ab543f37ca4dbfaa8f89005f0a17fe881d35768724ecec9bff963"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-static/root/tls/fixture.crt",
+    "bytes": 1131,
+    "sha256": "7882325f47d7b04b414e4c993afa7d3f58113cc9ef83ab74b19fff99ada23277"
+  },
+  {
+    "path": "h2-pgo-rate-v1/fixture-static/root/tls/fixture.key",
+    "bytes": 1704,
+    "sha256": "1450067d99cc959f4216d56118dc67bc4f8e08be487b8b2053db956c4f82c5f9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/after.prom",
+    "bytes": 53712,
+    "sha256": "bdb00f814d637a4f1e9fbb07fd0b53c9e643f260146dd6c8b13eeb118e5737ed"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/before.prom",
+    "bytes": 53564,
+    "sha256": "2022b1c3c4066cfafe4391f9281c29e2662fd46e97a90c4ff6b540839f03e8e4"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/client-command.json",
+    "bytes": 918,
+    "sha256": "680d6561cc37d17c44a7fbadf8aa8e6b05726338089c49a9e9d5813cc25a89fb"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/client.json",
+    "bytes": 8328,
+    "sha256": "15e471cbd1b8c38fd7d97da79d6ef90fa6af8b88d72af30f4f2708e971f9c16c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/client.stdout",
+    "bytes": 8328,
+    "sha256": "15e471cbd1b8c38fd7d97da79d6ef90fa6af8b88d72af30f4f2708e971f9c16c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/correctness.json",
+    "bytes": 843,
+    "sha256": "9822c7d74815c40d9b9f57870118bc51f4898ed7de3ea932463f19b0dd28e980"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/latencies.tsv",
+    "bytes": 6138646,
+    "sha256": "64da7f891f2e93dd7414c4b96bc2a29eadf9fae35be271087ae3175bf5be80cc"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/logs/httpjet_access.log",
+    "bytes": 6960524,
+    "sha256": "4f99ad79cb7657ae42c6f5bdc7c070091263023808fa6cd09edd6ba295c63d4a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/result.json",
+    "bytes": 42324,
+    "sha256": "011d52f31aadc834319e5ceecc2276c9b3771b25f409632b39172194def5461a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/server-command.json",
+    "bytes": 530,
+    "sha256": "e8f5423c700734e60cafdec2e3132b8c3571cdff4cc295ac321c47f46d5cdb0b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "9658d8f724181cbf4fb0be1602f0e1d670079135c42e44ee159d43e0d27f3b70"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-1-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/after.prom",
+    "bytes": 54272,
+    "sha256": "f7591fcd1b48d636cfe02c0f724a8c1b3a8bd770a54bd64b068b4f4c1ac37e20"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/before.prom",
+    "bytes": 53991,
+    "sha256": "aef67672a408f976d78209bd13c8f59c20b4b8d5e3813aeae185cbbd7bbff367"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/client-command.json",
+    "bytes": 922,
+    "sha256": "e654a749f5e7fd22702b0e68775c198e0ac26aab42a3a6ac5956713d95974a8e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/client.json",
+    "bytes": 8344,
+    "sha256": "e5a9192babc722a715ef1d1757b02b9e0f7cc81f24431c785076959575a8f6a4"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/client.stdout",
+    "bytes": 8344,
+    "sha256": "e5a9192babc722a715ef1d1757b02b9e0f7cc81f24431c785076959575a8f6a4"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/correctness.json",
+    "bytes": 843,
+    "sha256": "a1aa6092e00ff10cdeb855db1518d7282cef3cdc7b762fb44175760692aface9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/latencies.tsv",
+    "bytes": 6117995,
+    "sha256": "a5c2cfc5c2944c62f336bb75882bb84b7bd19eb22c177ba5360f13f1b1d9e59b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/logs/httpjet_access.log",
+    "bytes": 6945676,
+    "sha256": "6762feceb673ff75dfadfde44a9207dfe6791101797cdd5ed167cc53d706bcfb"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/result.json",
+    "bytes": 51158,
+    "sha256": "40d3bef9ab394f5415f718028e055577e0d893fc89ba3b193a7726bf5e113f85"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/server-command.json",
+    "bytes": 839,
+    "sha256": "586eef063f494706a9ded5a93ab9ef5a027301bd53f2a9b7f60c34fab22b58d1"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "9ac52ea0ba2a5ae17704952582633b38ee7b8b171812a0a421b3ea5262b5d62d"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-2-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/after.prom",
+    "bytes": 54273,
+    "sha256": "b1f9dc3860b69aa62b1c4b25c6fa21bdd98ac4eeeeb43112bd9d997b85106a80"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/before.prom",
+    "bytes": 53989,
+    "sha256": "e1433091fc9413314379478c1d90f9cc7ee3f23135e8800b66f01628bced7ab1"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/client-command.json",
+    "bytes": 922,
+    "sha256": "dfad01a748d95493cd278fec97cd6de889d144cfc3ba30e46a172d70224544a3"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/client.json",
+    "bytes": 8361,
+    "sha256": "19c1b3b839bd9607df9be004e480b0d3d0e122c45c2bfae4ae3c0b2d93580b1a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/client.stdout",
+    "bytes": 8361,
+    "sha256": "19c1b3b839bd9607df9be004e480b0d3d0e122c45c2bfae4ae3c0b2d93580b1a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/correctness.json",
+    "bytes": 843,
+    "sha256": "5bb8715b0af71b8876654a993df84b4913df2799c401d3c8b9037b6567ac4e21"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/latencies.tsv",
+    "bytes": 6117059,
+    "sha256": "ceefae0f38969e0a415a82096aacb68a294238119e5e601ebe0850dd4d1ee86f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/logs/httpjet_access.log",
+    "bytes": 6959102,
+    "sha256": "a97c770117ea191f2bafb27137aa5f84a91d5d641830bb1eafa61943d7671f6e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/result.json",
+    "bytes": 51163,
+    "sha256": "269d09534ff18e53805ebb46b1fbaf45b4c514a116055c8a8ad4b07034b768bb"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/server-command.json",
+    "bytes": 838,
+    "sha256": "ea079e7679b6c6f65cada32149236b95a01453afdb3fada98a997749b807900c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "d6415e12213c793280d9458376fd7c5c20ccf5066155bf1ec915e3b03ad3b052"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-3-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/after.prom",
+    "bytes": 53712,
+    "sha256": "07fdf05b070e04d782207c342302235c2b005fd7205a04b2903e95c79a99c084"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/before.prom",
+    "bytes": 53564,
+    "sha256": "92993e3f1651e560f2289836b0178c9cf159f6a8293408cfb8901bfb140cf98d"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/client-command.json",
+    "bytes": 918,
+    "sha256": "a80d32577d277f58dcb339edaacb9b01efd3bf76a56f98d49824d99b91dda1d7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/client.json",
+    "bytes": 8344,
+    "sha256": "da80d03c40317b82f2349582cf03a0425641e50f1ae12234bf1b374fbc4b7fe7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/client.stdout",
+    "bytes": 8344,
+    "sha256": "da80d03c40317b82f2349582cf03a0425641e50f1ae12234bf1b374fbc4b7fe7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/correctness.json",
+    "bytes": 843,
+    "sha256": "a0e2e6e6145d66628a6c7493fc75158adfb52a0424199e0dfe525fb3c92be813"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/latencies.tsv",
+    "bytes": 6141553,
+    "sha256": "f80413aadec46a7b1576557bab11ad0572d1f0c57e7dd5159e31b141d51daff5"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/logs/httpjet_access.log",
+    "bytes": 6947898,
+    "sha256": "5210425c000a6483c2668a3a2dc0359367ba5f95fd400e299f4b8910cca19c4f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/result.json",
+    "bytes": 41599,
+    "sha256": "bc3590f1bbb5363bffd434bc710164ccab6cdfa413e79c9b7cafc41674b21dbe"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/server-command.json",
+    "bytes": 531,
+    "sha256": "0ad7875c9b9f0ef4e6aea13fa054846b807be4eb8f853063365900079ac99926"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "8fa764f746074856df9ceec6fb5a938676c1724d23684de70f32802da03b5bf0"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-1-4-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/after.prom",
+    "bytes": 53712,
+    "sha256": "207e77f210ca4231684e1182ab27db02be1ca0b765950b9a65a6730ed77fe2f2"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/before.prom",
+    "bytes": 53564,
+    "sha256": "6ae8002e02aff5da211d94c5a3941dea55dda2ac537179d434f341fbb0aa14e3"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/client-command.json",
+    "bytes": 918,
+    "sha256": "1d1366587ee0f4df03f9dd20a209acf3557a4b469578044c07188ef0ebe3f447"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/client.json",
+    "bytes": 8325,
+    "sha256": "c7d1ac93aaa555cf2a9c1bc31d232694871e0fafcf4500b4639dc5e7cebfb1b8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/client.stdout",
+    "bytes": 8325,
+    "sha256": "c7d1ac93aaa555cf2a9c1bc31d232694871e0fafcf4500b4639dc5e7cebfb1b8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/correctness.json",
+    "bytes": 843,
+    "sha256": "afcdca95799c4ed6a85aaa3d0dca8ddfb5060cb277072370394df3466f4222df"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/latencies.tsv",
+    "bytes": 6161517,
+    "sha256": "5d9731fc44df9b6a5fdb5302425cab4de88fb9cbe45695e03b9c1f2b76e119d7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/logs/httpjet_access.log",
+    "bytes": 6951215,
+    "sha256": "4a90bad5d00671d97ecf063fec32cc24f8c5c593dc9fff0b66b7941d5a382027"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/result.json",
+    "bytes": 42314,
+    "sha256": "e6aac52b7e10b076be780190b5f167c5fe5b28c156cfc10ce610d8020002ca41"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/server-command.json",
+    "bytes": 531,
+    "sha256": "62e7fc8486b3bccf9f5c1082f1767f7006ab3ebe7190640c83a1246d80a3c877"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "846d49066fc58096c95213decb02f354b4a458e382b166227eda3ee3e31c285b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-1-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/after.prom",
+    "bytes": 54220,
+    "sha256": "137b1599883bb820ee55c99faaf66de0b1808d02eecc8bcc49812d0f4ca8310a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/before.prom",
+    "bytes": 53989,
+    "sha256": "30ae645799455be694dd8358ec1480e79cacf1c13ab9fbbee4ae3cb9cd8e6ef1"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/client-command.json",
+    "bytes": 922,
+    "sha256": "99633e593946efaf8a3e225e84e7023ba69f9886effba570eefc50380babff64"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/client.json",
+    "bytes": 8347,
+    "sha256": "354e63f4a6ebbf46c95d894c970029b26906d844196fe2836d96812dc35efd75"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/client.stdout",
+    "bytes": 8347,
+    "sha256": "354e63f4a6ebbf46c95d894c970029b26906d844196fe2836d96812dc35efd75"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/correctness.json",
+    "bytes": 843,
+    "sha256": "cdb8e3845506b61b7d41496efb0370a1bb46bda1583f65b9ad17e86045d5ef04"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/latencies.tsv",
+    "bytes": 6120142,
+    "sha256": "8351f2e94145dc9c301be8b59e9c340de95df361e7525da9dd395b092f9e50e7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/logs/httpjet_access.log",
+    "bytes": 6959102,
+    "sha256": "da74adf4851b1011ac2c0d033f1ee99b22877162c1846548266be4046f19d0da"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/result.json",
+    "bytes": 51082,
+    "sha256": "c589a8f51716934516c5fcaac6335ce09608110f17a785f61ac6bd8503c0d908"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/server-command.json",
+    "bytes": 839,
+    "sha256": "b76ae8281696264502e5606eae8a1fe75635c10d57f82d8781420f6a27213b41"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "a7d309176d35ff71c8ad146fcfe37ae9d3c12657ba2f7d8d55f8960d7cbe7d4e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-2-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/after.prom",
+    "bytes": 54325,
+    "sha256": "8347889264670510c4c86d19fd5d54b75aa3e6ab3b02d35b1c80c0b2c33898a4"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/before.prom",
+    "bytes": 53992,
+    "sha256": "0df1965c7e9639e0d8507e9b7004b8afb532846dc06648d46e952a6504d16c46"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/client-command.json",
+    "bytes": 922,
+    "sha256": "8e97a10274a126e9519884c3398c046830768679c3f352aeba947421c240c3a0"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/client.json",
+    "bytes": 8366,
+    "sha256": "7e20788a120e0807cdfed337dfbf7394a9f64d75b4c10d5b4757ebc88cad8fe9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/client.stdout",
+    "bytes": 8366,
+    "sha256": "7e20788a120e0807cdfed337dfbf7394a9f64d75b4c10d5b4757ebc88cad8fe9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/correctness.json",
+    "bytes": 843,
+    "sha256": "aa6748326fd642ac2b0c07e15b368c5cb89104d49bda65e2511e6db5f1dd1f61"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/latencies.tsv",
+    "bytes": 6121762,
+    "sha256": "80228a54d9d236ce387479a0d234a465b41d2c584a2c59a5466df969320e6503"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/logs/httpjet_access.log",
+    "bytes": 6944071,
+    "sha256": "46761d0a8e57d70a9b94df2a5a00a2f0b51f6295231e4c322f88425c8952fb41"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/result.json",
+    "bytes": 51928,
+    "sha256": "488af5cc3163351f1365e8e6c988cf885e20488ead381eceee71765f6caf2932"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/server-command.json",
+    "bytes": 839,
+    "sha256": "6310b212a2bea8cb092dc10c247bc5fcd7eb0dd1e64f4ce2cd80c0b68a92da95"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "daf2d0947bcbb37ab98fbb5dd21e678d59d56057b9b48c5f75cb9b4334309691"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-3-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/after.prom",
+    "bytes": 53712,
+    "sha256": "08e6f92186ecec69f2444a575addd3590cca09bf86a0901626c45f21ca63c5fa"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/before.prom",
+    "bytes": 53564,
+    "sha256": "464a20158f27effacc8510f317886694a7c6fb6bbae75e520995c5d50aebcf29"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/client-command.json",
+    "bytes": 918,
+    "sha256": "c7fecb77325e7edba76fa4e130d209c95cfe50646239c68bbc88740a3bd1775c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/client.json",
+    "bytes": 8359,
+    "sha256": "702cb9bd684a3dfe20d4c5f15e7bda955d75406030570742f4e56e311c93c4a8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/client.stdout",
+    "bytes": 8359,
+    "sha256": "702cb9bd684a3dfe20d4c5f15e7bda955d75406030570742f4e56e311c93c4a8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/correctness.json",
+    "bytes": 843,
+    "sha256": "ea28ffee5551289094d8d72d81cc710d3f98ad7625dbc6ce86cb2b2dba61ad20"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/latencies.tsv",
+    "bytes": 6142804,
+    "sha256": "c1ecf1f4b8a36557662b2217072bb0d06882533b24def0070db59d74e32ea454"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/logs/httpjet_access.log",
+    "bytes": 6960524,
+    "sha256": "097d13339b973e84e8d29d76664ca74d3e3ec087d8b678f9c0010433871ac029"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/result.json",
+    "bytes": 42367,
+    "sha256": "95ecc125136c484173ee9a23c80582e7ab5012322b2620f14b4b1fae88bfab3d"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/server-command.json",
+    "bytes": 531,
+    "sha256": "c6ec5a0f0ada43525caa9d62093db04963687f68929a8d0d5303e373b2ddab49"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "03f8ca8a62ecfbbdf8723f9b5e2dfbfeeb1c4d0a91a5ffb5d37408ff2a9b9403"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-2-4-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/after.prom",
+    "bytes": 53712,
+    "sha256": "6cae5c3a9fc4db0fd3cd1a916a3dcb18e6045d1ff9e78f92eb35387cdcaf44cb"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/before.prom",
+    "bytes": 53564,
+    "sha256": "59b824c8cf06f295f5ebb0a487a5b263cca40c068bc266c91cf740bc7dfbe14f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/client-command.json",
+    "bytes": 918,
+    "sha256": "c99b3690a8d3607715fde2482326633dd84bf7f722ac207b6bddd29dc3b777e2"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/client.json",
+    "bytes": 8358,
+    "sha256": "5e7b66d7eeb61aca0b2fcec04e15ec9e064d89236232d4a021b5c6e8965d21b0"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/client.stdout",
+    "bytes": 8358,
+    "sha256": "5e7b66d7eeb61aca0b2fcec04e15ec9e064d89236232d4a021b5c6e8965d21b0"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/correctness.json",
+    "bytes": 843,
+    "sha256": "1a1b4eabed6c621fcf1ab3cf154c4435d7dd4ef447289f8b205fa4101c922cab"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/latencies.tsv",
+    "bytes": 6145790,
+    "sha256": "74ee8f1a9b759154835ed1fdf5768deb5215ff71a9a31c36a1475957115eda6a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/logs/httpjet_access.log",
+    "bytes": 6960203,
+    "sha256": "72f3d2ae5077be01fda034aeccee42ed7efd6cc442f722d8f5c9a0d803a052f5"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/result.json",
+    "bytes": 42372,
+    "sha256": "20e592b8a95658b9e7eb6ab7ef1ff3c19173a3b4851a9f032847733501a87655"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/server-command.json",
+    "bytes": 531,
+    "sha256": "6f779f1bfc3c43cabad713196b67f2635b65779b4d13d7edddbc41224db5ee2d"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "3aeccca3eb3773b535ad51ab10e484cee2cf98e0489fec7a06e8d70f713d4649"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-1-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/after.prom",
+    "bytes": 54272,
+    "sha256": "400ed072425e71189e248a6ef08a23ed196711b83f297f76a6a59b4a79d563a0"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/before.prom",
+    "bytes": 53992,
+    "sha256": "c99ba6f04e8d5f2659ba725d70c4feacb704fd09bfc19f3bb19ca9adff418a6f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/client-command.json",
+    "bytes": 922,
+    "sha256": "1a80a259acba7195a0e68b6558793e0408feb1ac15706204f1944be11df31f7f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/client.json",
+    "bytes": 8358,
+    "sha256": "b1f87d8246bf2134008722526b90039329ab82758e2db9053e47895380b1ef06"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/client.stdout",
+    "bytes": 8358,
+    "sha256": "b1f87d8246bf2134008722526b90039329ab82758e2db9053e47895380b1ef06"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/correctness.json",
+    "bytes": 843,
+    "sha256": "c1ed26e504bfca56977a1d7250a99c1b90cd916ddc61097d5459fcb5819682d7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/latencies.tsv",
+    "bytes": 6118055,
+    "sha256": "7bf59aa17e40d12e87459f2e9f49e13e211497094e1e32fffa1ee11e3775f2b9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/logs/httpjet_access.log",
+    "bytes": 6958944,
+    "sha256": "893062a35dd3a95ce3e55e32c2ee8935978983bb7ed704c25c22e1fe0e76adf2"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/result.json",
+    "bytes": 51956,
+    "sha256": "97faaeaab72b51d61d14143577636ed3ed13aff15cbd69429a9c280608bdf7bf"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/server-command.json",
+    "bytes": 839,
+    "sha256": "5a4da8687631b8300bc3e76bfcc623773d51a6f4e3bde341da9d01306c414a6e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "7d6d471b927d0ee5fb850d015e23f9bf4afc78455a8afe9c9b61af4ee4d3d70f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-2-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/after.prom",
+    "bytes": 54272,
+    "sha256": "646a2f6cbd7669ee0133abe389a1fcb2987880b37316b57a1b8be81169ea0a6a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/before.prom",
+    "bytes": 53990,
+    "sha256": "71f8ed760e1fc5c82d1128dddc61823e44f4fd7d9f37936e548e8fe8a6640940"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/client-command.json",
+    "bytes": 922,
+    "sha256": "2fc5ad06b283dd7ee2dea94af8d5f7ec0ffe363fd2876a790f83d6093a393ee2"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/client.json",
+    "bytes": 8359,
+    "sha256": "05791fd10de25311212e6df9e20cf4dbb43cc79e3aa516b66295f6660f93fe47"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/client.stdout",
+    "bytes": 8359,
+    "sha256": "05791fd10de25311212e6df9e20cf4dbb43cc79e3aa516b66295f6660f93fe47"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/correctness.json",
+    "bytes": 843,
+    "sha256": "03bc12eef80ab9e115f2dbc08c4898d727f450e6033242c3573b7bebfd74b13c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/latencies.tsv",
+    "bytes": 6118827,
+    "sha256": "d56197165d6818e3ecec865ace21845b6a6b6894735ac06d12fbb6876299a85b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/logs/httpjet_access.log",
+    "bytes": 6958139,
+    "sha256": "fb1c10f1c3a687300465525d8f6a56aa4be1eb136ed6ae7f0b8253806933297c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/result.json",
+    "bytes": 51626,
+    "sha256": "6f1cab99eb87241013757a78b4f5f77cafaf9830aa0796a9ce23cde1d782c13a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/server-command.json",
+    "bytes": 839,
+    "sha256": "3916e0d57cbe2cf2c5305ce9a917ab6b4163fe718e2facabe7273ab503951901"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "116cbaf22990b4048835480f84bf9d88f6613de1a0443dce9ef8ef98a71a995e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-3-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/after.prom",
+    "bytes": 53712,
+    "sha256": "7fc1a0edb2dd936602b66db1a58f8ca3ea24d9bb362c470b8efbffa33303793e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/before.prom",
+    "bytes": 53564,
+    "sha256": "2ba0bb9816f3ba1db8031e642fb9927ae271f3bb9474ffa8e2272142f8128314"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/client-command.json",
+    "bytes": 918,
+    "sha256": "c21b59c05b7a6df065914b8672d7ec72484e09092950c0bc3bf7cf7dfc85f99b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/client.json",
+    "bytes": 8364,
+    "sha256": "128bc765f2091d2a125fbf205a1fed85d65f8d329366e92ae0b61e4df7013658"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/client.stdout",
+    "bytes": 8364,
+    "sha256": "128bc765f2091d2a125fbf205a1fed85d65f8d329366e92ae0b61e4df7013658"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/correctness.json",
+    "bytes": 843,
+    "sha256": "8e216439704806ab2802d2ce40490f4ec273bed4c80f176f8437a1a88de0470d"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/latencies.tsv",
+    "bytes": 6140173,
+    "sha256": "4d8cd11682c3d88a252c8e82124439ef9a2edb6773d3598270aae8cb526b652b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/logs/httpjet_access.log",
+    "bytes": 6959454,
+    "sha256": "462397851d9a343c8c47c97656de22877b089514a6dee638e5a6a128f1e6a646"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/result.json",
+    "bytes": 42356,
+    "sha256": "55ffa636b9f3ce7243cd73c6d2708c21b21494a77bf6a3761428970794a6be4b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/server-command.json",
+    "bytes": 531,
+    "sha256": "459db7fe37d7dc29fbb214a3b660801a7f5732030fae4cf15acb0c4c0e0592de"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "ffdb7a7edd6d5a67b0db799eaffe06044c31f71649063dadcc8877935660731b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-pagecache-3-4-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/after.prom",
+    "bytes": 53684,
+    "sha256": "1d24f19d86e1d4ca77f352928ff65e346953d51fb69992bfc9febe074a9bdc4b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/before.prom",
+    "bytes": 53554,
+    "sha256": "56744f6b4d05a653d1fdb4fa568c9c398035e9c79aba4ed6077b56244496841e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/client-command.json",
+    "bytes": 909,
+    "sha256": "ffca7e129be2d67293fef2f47b26e3b4529495437ea2ec4082b405eb21ad0e1f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/client.json",
+    "bytes": 8316,
+    "sha256": "b61777ed97a4df0bc0cabdeec2ee907ce438d42657d9496c1f495c9b3282dd7e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/client.stdout",
+    "bytes": 8316,
+    "sha256": "b61777ed97a4df0bc0cabdeec2ee907ce438d42657d9496c1f495c9b3282dd7e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/correctness.json",
+    "bytes": 663,
+    "sha256": "692df20b3b46ca6393da360166f17b4f2b58f4cc0efc8905ff3f1d44d5ace458"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/latencies.tsv",
+    "bytes": 6137924,
+    "sha256": "591a8fa726e8d3c31c2647678e97a4e4d49334744818583526bb712a5a82532b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/logs/httpjet_access.log",
+    "bytes": 6953572,
+    "sha256": "014d6dc8cb6c82d2ff6c27bdf7c2086007e60b2966f55c47a36b988a1e7cfc2a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/result.json",
+    "bytes": 41349,
+    "sha256": "c22ee4076288730b52ee520dde954dc084eb3402eebb0bd1e259716e6b524cb6"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/server-command.json",
+    "bytes": 527,
+    "sha256": "2ad1dc6c15aab4f97a8f2b48aeed8b26ac5344e5582e874541f1d2bda67e6933"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "795fdc8c580ce55782e7f02f018015c40474f31dad09a5f70fdef074a5522237"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-1-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/after.prom",
+    "bytes": 54254,
+    "sha256": "21dad6f30ef980cbcd5cae5e8c0398afd0f91e39e827078e76995bf424a4424e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/before.prom",
+    "bytes": 53985,
+    "sha256": "6b05c9c8d987a16b24d9c521480ea0d7df353c2711b78d67b35f07ea74d1b5a7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/client-command.json",
+    "bytes": 913,
+    "sha256": "d08e7d14be6c88f4e7664f47a8790fe8486223ac9e1072ef06203d6db0152c3a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/client.json",
+    "bytes": 8359,
+    "sha256": "8135307e091aaf7eb0e474e0a03e6606604775cb14eab178d9b38ca849ab30ef"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/client.stdout",
+    "bytes": 8359,
+    "sha256": "8135307e091aaf7eb0e474e0a03e6606604775cb14eab178d9b38ca849ab30ef"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/correctness.json",
+    "bytes": 663,
+    "sha256": "58c3623ede82e4b51cb6fa58127380cb495a505b2bf6cea1d66162ba0fd43a85"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/latencies.tsv",
+    "bytes": 6117851,
+    "sha256": "f9f922c7b0b7905760e413d645ed5cfa836b4ff48606ea89769837c0af322297"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/logs/httpjet_access.log",
+    "bytes": 6955625,
+    "sha256": "edbf1c1337986904f3df4716f7aeb1bb16c20fd69f554d59ef31c260e6c824d0"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/result.json",
+    "bytes": 50945,
+    "sha256": "8a31ffdea32494a09afff4e9022716f4ceec24121981d92d3f6515cdfe662bc7"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/server-command.json",
+    "bytes": 833,
+    "sha256": "729bb6cd3b01989d6f6e55a6f22128f830f90003edf23a82b56c4144c60b4169"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "8f7b847f420d2fe1f6738c7aa86dea20ab2e4527deb242a42bed7ae1898e2239"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-2-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/after.prom",
+    "bytes": 54201,
+    "sha256": "481ffffdce37bdda84a97004dab9d566749e10b9088500cdc3474952696138dc"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/before.prom",
+    "bytes": 53985,
+    "sha256": "3b86ca9a65e42a294962308d493f3be84ce313912da99921e16600855ab0c650"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/client-command.json",
+    "bytes": 913,
+    "sha256": "e1797f78a8c2d91d0b5551291cde3b26d95a92f13abcad593b031a1e6519f196"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/client.json",
+    "bytes": 8323,
+    "sha256": "14637c4816b93129bd8626314d00a7aee9e47621e9cd3c928258777a3122b7ab"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/client.stdout",
+    "bytes": 8323,
+    "sha256": "14637c4816b93129bd8626314d00a7aee9e47621e9cd3c928258777a3122b7ab"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/correctness.json",
+    "bytes": 663,
+    "sha256": "eae5031476b8380b425d7a7142f97b467250b8d2121c3ec5b5f3363a11165dab"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/latencies.tsv",
+    "bytes": 6113904,
+    "sha256": "1c84fb3e2a7082d301fbbca444e3728dbf022ce1ef5415b141aff7785323b013"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/logs/httpjet_access.log",
+    "bytes": 6954983,
+    "sha256": "8c4c6c5a5781d101a5def1e14a6a18cd4df954ba1a0a245f49682850914e4f3d"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/result.json",
+    "bytes": 49789,
+    "sha256": "0227da3a86e94ea16419831e600c917d10f612638052fd74ea7be9ec4882a388"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/server-command.json",
+    "bytes": 833,
+    "sha256": "90b13410d2d0c36fca514e6f0ae2748060c7f2227662c99747a14710804c1966"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "e62a69af806ded5da23d50ef1d79b7ba87764acca1918745428e3875c74b6110"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-3-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/after.prom",
+    "bytes": 53684,
+    "sha256": "32ae04397263fb6677ff2875cbcd6329b11f86682097346fff669363778a4748"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/before.prom",
+    "bytes": 53554,
+    "sha256": "35d14f1c1a257b6e2ca738041b4348b557a1133d3a1c88e91be2393709d1dbef"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/client-command.json",
+    "bytes": 909,
+    "sha256": "f25a75bad99e082f64a550a12ad533c2ef7c820634900d687512eeacdd615571"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/client.json",
+    "bytes": 8327,
+    "sha256": "0af1ec97e6594a5c40cec309585054c48e4a521687b2a35b84b2b3b27f79e247"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/client.stdout",
+    "bytes": 8327,
+    "sha256": "0af1ec97e6594a5c40cec309585054c48e4a521687b2a35b84b2b3b27f79e247"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/correctness.json",
+    "bytes": 663,
+    "sha256": "a4b19261cbf2ffe71e20a576bf5432d1004c0261218d95abb8c800d1ea79cdb3"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/latencies.tsv",
+    "bytes": 6143095,
+    "sha256": "e0b26d5bcf0bd31a0a0393363f64234558a97625000679ab4663a62cb426271f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/logs/httpjet_access.log",
+    "bytes": 6959350,
+    "sha256": "703a88b3e49f22e6602c190d64e8c43129e7f1f7fb23ee58ea48eaf1d248073a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/result.json",
+    "bytes": 42108,
+    "sha256": "2b50538ef2309633b5f8a5a6c6289fa731d52ff19daade6eb8b0ebe2e02d27fa"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/server-command.json",
+    "bytes": 528,
+    "sha256": "1ff7cb6bde9bb3d3cd696fc828bf110f5f8c58c435bb33dea3c159d371b334df"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "282969ddbb8fbc32c64b66b8833ec39979eafbf31e3abc1e4474ba52cf03c44a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-1-4-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/after.prom",
+    "bytes": 53684,
+    "sha256": "50e5db2178331a26ede14c83fcd7ddc7028c8fc3211e039d918361e4ce8c94c5"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/before.prom",
+    "bytes": 53554,
+    "sha256": "292441c48d50c4cf07f7e168c49d52a840a6e053776c8c8d061c3f270c1241bc"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/client-command.json",
+    "bytes": 909,
+    "sha256": "9d3934ec4e35bf329ce631ba8936c98adb4012f8f040701ba03deab5489ee701"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/client.json",
+    "bytes": 8346,
+    "sha256": "5739063e0eecf1bf7935933aaaa8eb247030f2baefc1255d3dbd387416f57ac6"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/client.stdout",
+    "bytes": 8346,
+    "sha256": "5739063e0eecf1bf7935933aaaa8eb247030f2baefc1255d3dbd387416f57ac6"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/correctness.json",
+    "bytes": 663,
+    "sha256": "d2676602deed62613f2c115891fbf7467b0215322f80e0be1b26a5bc304a479b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/latencies.tsv",
+    "bytes": 6139430,
+    "sha256": "3c8f1be8923183f3fa703f41c55411b6cf7fa80a40e955c60ebf5e4d8e95d0b1"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/logs/httpjet_access.log",
+    "bytes": 6959350,
+    "sha256": "c7a1496a385208694123662676a1fad342f20c8217f3351431a47edb3b0553ba"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/result.json",
+    "bytes": 42135,
+    "sha256": "e26473fe00712eb5d9716a5fed076e00d9bceef7c725d01aa2c0b556712a7aa8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/server-command.json",
+    "bytes": 528,
+    "sha256": "bd9ea12fa3b7aea79dbd6e61d2370f71ed34603f6515fe78c738a6cc675af312"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "3c50854dedc9082f156b59fb3c118e2d6236f23698817d1a4e5ebf1df35fafe6"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-1-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/after.prom",
+    "bytes": 54253,
+    "sha256": "b2b3619ac49744567fded913c2bef65af035456f66c81b8e37cdc2c3315e8147"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/before.prom",
+    "bytes": 53984,
+    "sha256": "c8ca9b6f7a68a1c1b5b6737a4f59576f5309f350557972a00723032c60ba9dd8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/client-command.json",
+    "bytes": 911,
+    "sha256": "7b05604407bc7fb16eb3e08e1299f89cde91dfc46e6e9f2fc12fa4ca732d2a5e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/client.json",
+    "bytes": 8315,
+    "sha256": "aea1e96ea1aba617339a2c1d6266e9c411b6cd1e69c1203e19aae542abd6ab71"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/client.stdout",
+    "bytes": 8315,
+    "sha256": "aea1e96ea1aba617339a2c1d6266e9c411b6cd1e69c1203e19aae542abd6ab71"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/correctness.json",
+    "bytes": 662,
+    "sha256": "63559544dc76257e65be952a4d6d28fa59eb73619a714b55fb726a55d7fb111e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/latencies.tsv",
+    "bytes": 6112449,
+    "sha256": "4ce40fb10287c8d8a606b1ff577681a02ea34d21780a593d41d4ae9c4835d9e3"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/logs/httpjet_access.log",
+    "bytes": 6958086,
+    "sha256": "5f8e308dd87106b8f9c0269511e1736d2800a22168e401bc7f783af424159194"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/result.json",
+    "bytes": 52504,
+    "sha256": "cbe84eaf83a238f349b5f3167757c45e9f17b1afb0f132ff83b15595091e6f68"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/server-command.json",
+    "bytes": 831,
+    "sha256": "36eb89650ac4d8e1b81c6590fb5716b7113194cd45cb58471ebc83554635e1c9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "fee006bb9557b3d8fda06f5d4de061b065ffe02f60ca9f33da0e4872f97ec938"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-2-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/after.prom",
+    "bytes": 54200,
+    "sha256": "b42dbefd676b4c2b04318687ef3ff5cfebb710f4d12c6de05554084bec9aec1b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/before.prom",
+    "bytes": 53984,
+    "sha256": "7c2206f5459f1f813cd858925ea89ff352516a41581d68d73b268012c1e01d2b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/client-command.json",
+    "bytes": 913,
+    "sha256": "6102761df5152a4fadb0aa8e6af1930d6c981900bbed270e1476c1d95c24d9d6"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/client.json",
+    "bytes": 8316,
+    "sha256": "ef0f25054a60d127dc08ca7f377ba3d59b090c11f92fdfeec2e834da0dce2888"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/client.stdout",
+    "bytes": 8316,
+    "sha256": "ef0f25054a60d127dc08ca7f377ba3d59b090c11f92fdfeec2e834da0dce2888"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/correctness.json",
+    "bytes": 663,
+    "sha256": "df3f3cd829c8fd10b0f9ccdfcdb19e93dab2075ab554b0ab98ab3e78373b9911"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/latencies.tsv",
+    "bytes": 6113189,
+    "sha256": "52e04a00e7e2c10e3bd85c1c8a110ed52eece4d7c06e5da5322772f1cde36014"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/logs/httpjet_access.log",
+    "bytes": 6952629,
+    "sha256": "9e1070cd3390a0f671bc9e8e9035c118151396d57bf4b9b07addd1d27b5ec1fe"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/result.json",
+    "bytes": 51874,
+    "sha256": "0164c24d6e87d5393dd341b4c6990a83418bf01f12eeca6210c3b83a77c1e352"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/server-command.json",
+    "bytes": 833,
+    "sha256": "4c5ec928bcd6d93fd4ae1fd6c47dac2c3fe38ff382de05a4f857db2e8e543f0c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "7b52f384346bac80d9f4ad12f287673fabb782584e1313f6e892dc88cf0c08ea"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-3-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/after.prom",
+    "bytes": 53684,
+    "sha256": "df4874d89bc439075453f8a1303e244876c1e08997a56b5e49eae811f7608497"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/before.prom",
+    "bytes": 53554,
+    "sha256": "79693dc1e96e95df3943d725f79841318fe777bc901f21c66207feffc7560d5b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/client-command.json",
+    "bytes": 909,
+    "sha256": "76a0a22c5dded4426021a79b07b1843afbd745adc6e922950796d24010e780be"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/client.json",
+    "bytes": 8383,
+    "sha256": "e3de62ce99390c8864bb48e0a8c288bd10bdd5d8ee042c6844a2813e1254fbe5"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/client.stdout",
+    "bytes": 8383,
+    "sha256": "e3de62ce99390c8864bb48e0a8c288bd10bdd5d8ee042c6844a2813e1254fbe5"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/correctness.json",
+    "bytes": 663,
+    "sha256": "16c4f1abfb35da1460ad09ff04e149cf91e48d6e6969e0d6d2df19cf10bd3131"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/latencies.tsv",
+    "bytes": 6140761,
+    "sha256": "747841f3fcb0c9b9449408c423acd9f4e910869e3ad25116577a4a0a26ac845c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/logs/httpjet_access.log",
+    "bytes": 6959350,
+    "sha256": "e40fd8310fb230af64ebfde4c56e2fab542373ce047523ec9288e191f4fe7ce8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/result.json",
+    "bytes": 42161,
+    "sha256": "2b33c9ef0726ba65f4d014b4fd8c24c3847c3c8e36fa1030a879de892fca25b9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/server-command.json",
+    "bytes": 527,
+    "sha256": "d6ebaa87c6764cc078054c4e8af17230986a42a7eb6cf1943c19213b4fb9d0a4"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "b5a5d4f66d90f03770540b7141b963caf213f042ecd3cd439970f1eb0e88e797"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-2-4-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/after.prom",
+    "bytes": 53684,
+    "sha256": "7759bb6b63889880cfbb1cea9b31cfa61299751ab4de5c3ea874cc9ef70b9718"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/before.prom",
+    "bytes": 53554,
+    "sha256": "3a52b341d1a0375ae8449ae382d2d0f8a2bf9140da62c1eebfb14af5b2b7f60a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/client-command.json",
+    "bytes": 909,
+    "sha256": "39ea45f41b2ec203c742a271f518dcbcc469d0ec9dfda9fac6b69b5d8a24f7bb"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/client.json",
+    "bytes": 8370,
+    "sha256": "6615b0e204470706f3704758480904ad201a5d7b0bf76f3cded76c036f3c1aec"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/client.stdout",
+    "bytes": 8370,
+    "sha256": "6615b0e204470706f3704758480904ad201a5d7b0bf76f3cded76c036f3c1aec"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/correctness.json",
+    "bytes": 663,
+    "sha256": "117ce4ba8c86b11408d5cca4ea59881db8cf80bdadc259765c62bde70a3ff53a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/latencies.tsv",
+    "bytes": 6140848,
+    "sha256": "2be833c23b3a41039612b13d3a8d306c781da863075f78316073b5e27a65aa98"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/logs/httpjet_access.log",
+    "bytes": 6952609,
+    "sha256": "9200b8e941f581954a01ce86085700d507062a0ac6e45b2e46da5bb04946dab2"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/result.json",
+    "bytes": 42159,
+    "sha256": "5431b97f4909df533d96eea87ce05b63b68762b3d84fdc518b453d63f5b6d2ad"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/server-command.json",
+    "bytes": 528,
+    "sha256": "f5459a0a58d35bf14442c101c0f486a8e7712126003b77e7e23eb9459c95574e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "7526c8689f2021dbe2af3721acbbf40deb19a094c658ff246bcda1349c2c6486"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-1-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/after.prom",
+    "bytes": 54201,
+    "sha256": "5157272fc1dfffb6ea2be573583410363a341f237827cf9388c6a3804f13398c"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/before.prom",
+    "bytes": 53984,
+    "sha256": "e200a0bf2915c4ee51a57992712a46658dd4506ecf28e621c574dec10232196e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/client-command.json",
+    "bytes": 913,
+    "sha256": "3cec7887e8d50e01d4ab805e41bf21043bb7839c226b9125aca56e941b5019e9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/client.json",
+    "bytes": 8332,
+    "sha256": "0f46de371de3007da2f4caa2c7520f502cef25901b1e688b67c842d839607c95"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/client.stdout",
+    "bytes": 8332,
+    "sha256": "0f46de371de3007da2f4caa2c7520f502cef25901b1e688b67c842d839607c95"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/correctness.json",
+    "bytes": 663,
+    "sha256": "360596cf57ef04128bbec1804e67218c085947613b0e47f21df7447c14bc530f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/latencies.tsv",
+    "bytes": 6118593,
+    "sha256": "34db4c014b3e039383d62f905a940add81a6db96284dd2777b121ac7fd32bd38"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/logs/httpjet_access.log",
+    "bytes": 6958086,
+    "sha256": "5c91d2e8312da0e646650b68644f60917d9f67e0f9b2c8532ca82cac1b15c88d"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/result.json",
+    "bytes": 50613,
+    "sha256": "645bfa282485213adee0a9ae7d37c7a68cbd301529a1976a907aa43239ef2560"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/server-command.json",
+    "bytes": 833,
+    "sha256": "89433afe4398e7f9017c87a69db67a66f32bb374ffc4abceec069f373ecdc3b1"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "baa7e4a5066ae8c00e00ff066a45e54380ee1e11f3ee5a87b4ea56e5cede8067"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-2-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/after.prom",
+    "bytes": 54200,
+    "sha256": "8cbfb4c5162d546b5cfd7f7927faabce43c0ba8069af04122e5405369bb22968"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/before.prom",
+    "bytes": 53984,
+    "sha256": "65fb8311eb2b83f83de0a8f3d0bec6586ce1b6ef99a1933ddac5a53a3a448cc0"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/client-command.json",
+    "bytes": 911,
+    "sha256": "24098ac873c37a6ccf92ea6035fd06b873995fcf1eaa7ad77d6d98e887556825"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/client.json",
+    "bytes": 8311,
+    "sha256": "53d547e4be5e75f8c1934093405fee266a204b931442997ca6ee8fa448731aed"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/client.stdout",
+    "bytes": 8311,
+    "sha256": "53d547e4be5e75f8c1934093405fee266a204b931442997ca6ee8fa448731aed"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/correctness.json",
+    "bytes": 662,
+    "sha256": "645c4ede45e90330c1b9fe055b49f10f8603124189356aeeefb71896a596be2b"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/latencies.tsv",
+    "bytes": 6116021,
+    "sha256": "9027f7f0a9387caa57e6af35796ae24f7ed647a000e2a25d2152bf99e1561144"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/logs/httpjet_access.log",
+    "bytes": 6947065,
+    "sha256": "a628084a135384284cee118156fe063d9940b624dc1c165340cccade8809aad4"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/result.json",
+    "bytes": 52437,
+    "sha256": "9ed67b7e89cf11dbf6cf5f3c7cd3d4c0a19d8dbd0a72a5cd4f1a111f0f6d0196"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/server-command.json",
+    "bytes": 831,
+    "sha256": "5373a3b51030e0cdc0cfdeacaff7324aa290945b4282e9fe2c04bd79f3c06d52"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/server-exit.json",
+    "bytes": 33,
+    "sha256": "9510b732f40f4c0f2f693a04f07ffcc90b0dac5a2909542178517683fdf79de8"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-3-repaired/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/after.prom",
+    "bytes": 53684,
+    "sha256": "8ab45f1a9a706548f1d7fa7fc7ef03fc622de260e9ffbe5d3e684e660ece8c8a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/before.prom",
+    "bytes": 53554,
+    "sha256": "f0e467fb2043ff87a2ef8f0466ec55a10d394438e484fdbb1e8d75a470ceb61f"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/client-command.json",
+    "bytes": 909,
+    "sha256": "077f06ff93ea95bf5ae9dd3dbbc31a84fbd882da1ff034abb0ba641ccbaa6672"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/client.json",
+    "bytes": 8372,
+    "sha256": "ec7ba0b37a6350f6e760f39ade15160e070a69e7ceb44bd9b0579d06eea82c1a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/client.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/client.stdout",
+    "bytes": 8372,
+    "sha256": "ec7ba0b37a6350f6e760f39ade15160e070a69e7ceb44bd9b0579d06eea82c1a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/correctness.json",
+    "bytes": 663,
+    "sha256": "875ac88039877a537bf1c8435e5f5d4d7fcdd765ffcaee83e2556f5507f348f9"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/latencies.tsv",
+    "bytes": 6139887,
+    "sha256": "59ac6ed11a39e2c164d3cf1385c70613791becb23fad8e6151a3c974b2f2e876"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/logs/httpjet_access.log",
+    "bytes": 6959350,
+    "sha256": "652f07d8533763a95d1898f88eda37304ae0ef73777a1b3232fec833e522739e"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/logs/httpjet_error.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/result.json",
+    "bytes": 42148,
+    "sha256": "6a307e431d3383457a1dad3b74f8c6e900cc903dea9ece26325a9603b6b7126a"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/server-command.json",
+    "bytes": 528,
+    "sha256": "be2502b506b1f179e3642f2f6ed0ed60a33ba0f79b9a65ee78a43d8366005cc3"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/server-exit.json",
+    "bytes": 33,
+    "sha256": "d1766e7156d0b986dd6eea6681be1054c51eb1d79579fb833c39d1a3e438e302"
+  },
+  {
+    "path": "h2-pgo-rate-v1/h2c-static-3-4-native/server.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1/metadata.json",
+    "bytes": 3085,
+    "sha256": "3c537a7238350a758a2ddc27a9bb47068008772fe82b0a752f1b7c3c4591f3fa"
+  },
+  {
+    "path": "h2-pgo-rate-v1/results.json",
+    "bytes": 1205708,
+    "sha256": "de1a53308effc892c4b18437e64c50ab5ce2921fc8b0eb4bd64927e4371dc0b0"
+  },
+  {
+    "path": "h2-pgo-rate-v1-monitor/command.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "path": "h2-pgo-rate-v1-monitor/command.stdout",
+    "bytes": 3866,
+    "sha256": "045402b99b285276f56113400fbfed59aee0e7740e71d8795b7cae8bd5f0faf4"
+  },
+  {
+    "path": "h2-pgo-rate-v1-monitor/environment.jsonl",
+    "bytes": 15786,
+    "sha256": "64c13d5fa75b7e011b069edb6886b91089efc4d22e090820d130929392f79238"
+  }
+]

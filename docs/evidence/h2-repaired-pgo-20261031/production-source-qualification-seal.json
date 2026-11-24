@@ -1,0 +1,119 @@
+{
+  "schema": 1,
+  "passed": true,
+  "evidence_kind": "independent seal of retrieved qualification JSON receipts",
+  "scope": "Listed synthetic correctness scenarios only; no timing, performance, deployment or production-safety claim",
+  "qualification_sha256": "6ad5ab8331f41201555b0e569e45b13090ce208a18f14292dd30b35e6a4c3f78",
+  "before_sha256": "ae06dbaf41f524e041f553fa762bbb0724df2da9d8e5a4309a38dc6d958198b9",
+  "after_sha256": "ae06dbaf41f524e041f553fa762bbb0724df2da9d8e5a4309a38dc6d958198b9",
+  "before_after_identical": true,
+  "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda",
+  "json_receipts": 113,
+  "json_manifest_sha256": "0dd9dc1f783b6590f19abdc678bfe4480c3ac5d7039f5d8ecb43b7a2e9b544fd",
+  "raw_json_archive_sha256": "7ba211d7b8ad1fe70c1d7bd76b73927b88741f7e63b22762944b87213653a085",
+  "source_commit": "c07d345714d04d0fc9e0b7d41bafee3cbacc5e73",
+  "validation_limitation": "Non-JSON logs/latency blobs and live processes were not reread; log hashes and process cleanup claims are retained from the executed owned-run receipts.",
+  "binary_sha256": "24ccc3a889018e9c9a739ac1619da4f1c860f732dd3421c55daea2321e1fe12c",
+  "helper_used": false,
+  "commands": 4,
+  "wire_cells": [
+    {
+      "gate": "http",
+      "case": "h1s-pagecache-1-1-native",
+      "result_sha256": "8bda8ec45be55c967feeb9f9df190e5320fbe5bbbded57b8fd2dfb5b2fa8d044",
+      "exit_sha256": "fd8aa54c8e69f5b2567638fe7af2a0187ab8bb6dbe330b22c48636e7b4e89b99"
+    },
+    {
+      "gate": "http",
+      "case": "h2c-pagecache-1-1-native",
+      "result_sha256": "67e0b7cda5fbf152539eca5a3ebec06632970c8404f59467eb3b0d28cdd63e86",
+      "exit_sha256": "5bdfde4302b1ea55729fab20b65a8759a04e933af6cb032d733941e7607c0687"
+    },
+    {
+      "gate": "http",
+      "case": "h1s-static-1-1-native",
+      "result_sha256": "81c2f68a1fcc1707dc69263d2b8a4a8b1500d89085096b823080e931120265b4",
+      "exit_sha256": "2e5f0fa85effc301ba41d64d3c83f4ce26ffb634d13020febbf37c601895fd64"
+    },
+    {
+      "gate": "http",
+      "case": "h2-static-1-1-native",
+      "result_sha256": "3a561df8345d315ef24f4b0ffec5e016578fd8a930bcfb46c5fb84bd241feecd",
+      "exit_sha256": "359e0dc9ef682b567d7e34106791ce30db0b6206edf26997196bdbfd946bb814"
+    },
+    {
+      "gate": "http",
+      "case": "h2-range-1-1-native",
+      "result_sha256": "dd0f790d213842f4d668ce1f9121b2bd00ade87e7f249eed62e51b419404c18a",
+      "exit_sha256": "6874058e9bc305486b9291a1b94259aea627df77109e59d384f86ca5b06492e8"
+    },
+    {
+      "gate": "http",
+      "case": "h2c-range-1-1-native",
+      "result_sha256": "780c1e467c35dc7e5b9c6592f2efa1d6a8066573af85a48c5139eb9272777885",
+      "exit_sha256": "eda138382112698fa26e30c5f61d1770ee67c7755b3ac7ed6dcfea798eb85053"
+    },
+    {
+      "gate": "http",
+      "case": "h1-static-1-1-native",
+      "result_sha256": "e0a3a53309eeb6617a00212ae91e185aee6afdd1bd34102924992df48fd57c79",
+      "exit_sha256": "725339373bc5b1ce84782f9702aac4b32241ad3cc0a17a87c08bc5059d4e8ade"
+    },
+    {
+      "gate": "http",
+      "case": "h1-range-1-1-native",
+      "result_sha256": "12ba1db1d6490964934e57e817e13ea1f2ecb34178d1f0ca615c05f7adea6800",
+      "exit_sha256": "c4ace8245e0242b16429cdda68eaf84f18b643f5a8bec755fbd6e351d2be03bb"
+    },
+    {
+      "gate": "http",
+      "case": "h1-pagecache-1-1-native",
+      "result_sha256": "1dc92ada26ad66d058bba37177d376c557b641d1fc493ffdf60b255481f600be",
+      "exit_sha256": "8a90a28aaf3c2b686499754a38c5a0fa1f7226d55805aca5a33d667fc6ba84ea"
+    },
+    {
+      "gate": "http",
+      "case": "h1s-range-1-1-native",
+      "result_sha256": "d198cb76beccf1683b109d2bdb4cd23e5a922e55b09bf3c3021823e69aa61fde",
+      "exit_sha256": "55bded553c228a29dfd4f36e8033162053eb2a8c9986fec834c953904345d738"
+    },
+    {
+      "gate": "http",
+      "case": "h2c-static-1-1-native",
+      "result_sha256": "565b49ea6538facc0fb75c368a3ce2cb10cba346e91ded7f56c4440f17bb439e",
+      "exit_sha256": "5f2ddef843915c50b6e78c322e58d85a415b63e2360b0a735c6d53d71d3645d5"
+    },
+    {
+      "gate": "http",
+      "case": "h2-pagecache-1-1-native",
+      "result_sha256": "9c5e04303434ca7480da1535c478ae4b7a6d080243c4f12eaf3dfe1a410dd558",
+      "exit_sha256": "08669250de0e5d90e99bf4288ebf1df7cc84a7ae31cb83dac764d56b3ccab8fa"
+    },
+    {
+      "gate": "h3-all",
+      "case": "pagecache-1-1-baseline",
+      "result_sha256": "4c0d5a739885a224da9a96caff47be910235079cf613156e103fa82e668091dd",
+      "exit_sha256": "5b93e13a9ebcae04bd4844f3f8a51eb221007b4dfac4b391e253dd928e2d299b"
+    },
+    {
+      "gate": "h3-all",
+      "case": "static-1-1-baseline",
+      "result_sha256": "ff379c4aceeb16dd96c6dfda17513e71aacffc828dc3e5c986c7f34b3a0683c1",
+      "exit_sha256": "e23df3de91df6a3d7a7354de24109814a6d00b2fa79daff8cf170dae7cda2fc1"
+    },
+    {
+      "gate": "h3-range",
+      "case": "range-1-1-baseline",
+      "result_sha256": "98431b3732042a172db5449fe8edee4d13045a11c2f923ef5ecfecd5e22304c6",
+      "exit_sha256": "3031afec2c0208b274e438aea6dc86c21d8aefb557e34d37798bb552687010a1"
+    }
+  ],
+  "measured_responses": 15000,
+  "warmup_completed_responses": 1500,
+  "cache_gates": [
+    "cross-url",
+    "cross-scheme"
+  ],
+  "cache_cleanup_sha256": "94eae9ed06d27587f805ba8c8c981d88370c2c7392dd7e9258218f104c61508a",
+  "cache_cleanup_clean": true
+}

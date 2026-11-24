@@ -1,0 +1,318 @@
+{
+  "diagnostic_only": true,
+  "capture_and_body_validation_passed": true,
+  "compiler_overlap_observed": false,
+  "inputs_equal": true,
+  "ranking": [
+    "TCP/psock/workqueue and associated network scheduling are the largest observed remaining kernel stacks.",
+    "Owned BPF invocation stacks account for about5percent of nonidle samples; receive is larger than respond in elapsed runtime.",
+    "Readiness/poll stacks are below0.5percent of kernel-arm nonidle samples; no iterator helper appears in these samples."
+  ],
+  "arms": [
+    {
+      "arm": "h2c-pagecache-1-1-native",
+      "client_window_ns": [
+        23450160277393,
+        23460710794327
+      ],
+      "samples_in_window": 15869,
+      "nonidle_leaf_samples": 755,
+      "idle_leaf_samples": 15114,
+      "inclusive_overlapping_stack_samples": {
+        "scheduler_wakeup": 287,
+        "softirq": 177,
+        "tcp_psock_network": 338,
+        "timer": 5,
+        "io_uring": 173,
+        "poll_readiness": 28
+      },
+      "additional_overlapping_stack_samples": {
+        "conntrack": 22,
+        "process_one_work": 3,
+        "recvmsg": 65,
+        "io_poll": 26,
+        "sendmsg": 267,
+        "tcp_ack": 15
+      },
+      "contexts": {
+        "other": 51,
+        "pid0-context": 74,
+        "client": 443,
+        "web": 187
+      },
+      "client_tgid": 644359,
+      "sampled_client_tids": [
+        644359,
+        644360,
+        644361,
+        644362,
+        644363,
+        644364,
+        644365
+      ],
+      "sampled_client_tids_all_confirmed_by_fork_tgid": true,
+      "softirq_context_samples": {
+        "pid0-context": 23,
+        "web": 71,
+        "client": 83
+      },
+      "bpf_program_elapsed_counters": [],
+      "global_tcp_segments": {
+        "tcp_InSegs": 297293,
+        "tcp_OutSegs": 297291,
+        "tcp_RetransSegs": 0,
+        "tcp_TCPDSACKRecv": 0,
+        "softirq_net_rx": 297364
+      }
+    },
+    {
+      "arm": "h2c-pagecache-1-2-kernel",
+      "client_window_ns": [
+        23463095324117,
+        23474041662273
+      ],
+      "samples_in_window": 16477,
+      "nonidle_leaf_samples": 837,
+      "idle_leaf_samples": 15640,
+      "inclusive_overlapping_stack_samples": {
+        "scheduler_wakeup": 305,
+        "tcp_psock_network": 426,
+        "poll_readiness": 3,
+        "io_uring": 14,
+        "softirq": 197,
+        "owned_bpf_ancestor": 40,
+        "owned_bpf_leaf": 12,
+        "timer": 4
+      },
+      "additional_overlapping_stack_samples": {
+        "io_poll": 3,
+        "recvmsg": 37,
+        "sendmsg": 381,
+        "psock_backlog": 133,
+        "tcp_bpf_send": 128,
+        "process_one_work": 139,
+        "conntrack": 20,
+        "psock_receive": 84,
+        "tcp_ack": 21,
+        "queue_work": 12
+      },
+      "contexts": {
+        "pid0-context": 241,
+        "web": 46,
+        "client": 495,
+        "other": 54,
+        "helper": 1
+      },
+      "client_tgid": 644728,
+      "sampled_client_tids": [
+        644728,
+        644729,
+        644730,
+        644731,
+        644732,
+        644733,
+        644734
+      ],
+      "sampled_client_tids_all_confirmed_by_fork_tgid": true,
+      "softirq_context_samples": {
+        "client": 145,
+        "pid0-context": 51,
+        "other": 1
+      },
+      "bpf_program_elapsed_counters": [
+        {
+          "name": "h1_respond",
+          "id": 3752,
+          "calls": 0,
+          "elapsed_ns": 0,
+          "elapsed_us_per_full_span_response": 0.0
+        },
+        {
+          "name": "h2_receive",
+          "id": 3753,
+          "calls": 108394,
+          "elapsed_ns": 357965300,
+          "elapsed_us_per_full_span_response": 2.3094535483870966
+        },
+        {
+          "name": "h2_respond",
+          "id": 3754,
+          "calls": 108074,
+          "elapsed_ns": 230165000,
+          "elapsed_us_per_full_span_response": 1.4849354838709679
+        },
+        {
+          "name": "h1_receive",
+          "id": 3751,
+          "calls": 0,
+          "elapsed_ns": 0,
+          "elapsed_us_per_full_span_response": 0.0
+        }
+      ],
+      "global_tcp_segments": {
+        "tcp_InSegs": 226395,
+        "tcp_OutSegs": 226373,
+        "tcp_RetransSegs": 18,
+        "tcp_TCPDSACKRecv": 18,
+        "softirq_net_rx": 222567
+      }
+    },
+    {
+      "arm": "h2c-static-1-1-native",
+      "client_window_ns": [
+        23421998053914,
+        23432535169578
+      ],
+      "samples_in_window": 15873,
+      "nonidle_leaf_samples": 722,
+      "idle_leaf_samples": 15151,
+      "inclusive_overlapping_stack_samples": {
+        "softirq": 165,
+        "tcp_psock_network": 320,
+        "io_uring": 150,
+        "scheduler_wakeup": 280,
+        "timer": 8,
+        "poll_readiness": 17
+      },
+      "additional_overlapping_stack_samples": {
+        "sendmsg": 267,
+        "conntrack": 27,
+        "tcp_ack": 11,
+        "recvmsg": 43,
+        "io_poll": 11,
+        "process_one_work": 2
+      },
+      "contexts": {
+        "pid0-context": 76,
+        "web": 168,
+        "client": 434,
+        "other": 44
+      },
+      "client_tgid": 643622,
+      "sampled_client_tids": [
+        643622,
+        643623,
+        643624,
+        643625,
+        643626,
+        643627,
+        643628
+      ],
+      "sampled_client_tids_all_confirmed_by_fork_tgid": true,
+      "softirq_context_samples": {
+        "pid0-context": 23,
+        "client": 87,
+        "web": 55
+      },
+      "bpf_program_elapsed_counters": [],
+      "global_tcp_segments": {
+        "tcp_InSegs": 296649,
+        "tcp_OutSegs": 296648,
+        "tcp_RetransSegs": 0,
+        "tcp_TCPDSACKRecv": 0,
+        "softirq_net_rx": 296478
+      }
+    },
+    {
+      "arm": "h2c-static-1-2-kernel",
+      "client_window_ns": [
+        23434916499269,
+        23445855693360
+      ],
+      "samples_in_window": 16630,
+      "nonidle_leaf_samples": 818,
+      "idle_leaf_samples": 15812,
+      "inclusive_overlapping_stack_samples": {
+        "softirq": 199,
+        "scheduler_wakeup": 280,
+        "tcp_psock_network": 419,
+        "timer": 3,
+        "owned_bpf_ancestor": 41,
+        "io_uring": 8,
+        "owned_bpf_leaf": 13,
+        "bpf_pull_helper": 1,
+        "poll_readiness": 4,
+        "probe_read_helper": 1
+      },
+      "additional_overlapping_stack_samples": {
+        "psock_backlog": 126,
+        "tcp_bpf_send": 120,
+        "process_one_work": 132,
+        "sendmsg": 383,
+        "recvmsg": 22,
+        "conntrack": 17,
+        "psock_receive": 95,
+        "tcp_ack": 20,
+        "queue_work": 23
+      },
+      "contexts": {
+        "pid0-context": 245,
+        "client": 482,
+        "other": 57,
+        "web": 33,
+        "helper": 1
+      },
+      "client_tgid": 643947,
+      "sampled_client_tids": [
+        643947,
+        643948,
+        643949,
+        643950,
+        643951,
+        643952,
+        643953
+      ],
+      "sampled_client_tids_all_confirmed_by_fork_tgid": true,
+      "softirq_context_samples": {
+        "pid0-context": 52,
+        "client": 147
+      },
+      "bpf_program_elapsed_counters": [
+        {
+          "name": "h1_receive",
+          "id": 3745,
+          "calls": 0,
+          "elapsed_ns": 0,
+          "elapsed_us_per_full_span_response": 0.0
+        },
+        {
+          "name": "h1_respond",
+          "id": 3746,
+          "calls": 0,
+          "elapsed_ns": 0,
+          "elapsed_us_per_full_span_response": 0.0
+        },
+        {
+          "name": "h2_receive",
+          "id": 3747,
+          "calls": 110532,
+          "elapsed_ns": 311900800,
+          "elapsed_us_per_full_span_response": 2.0122632258064517
+        },
+        {
+          "name": "h2_respond",
+          "id": 3748,
+          "calls": 110352,
+          "elapsed_ns": 204420500,
+          "elapsed_us_per_full_span_response": 1.318841935483871
+        }
+      ],
+      "global_tcp_segments": {
+        "tcp_InSegs": 231530,
+        "tcp_OutSegs": 231520,
+        "tcp_RetransSegs": 9,
+        "tcp_TCPDSACKRecv": 9,
+        "softirq_net_rx": 226946
+      }
+    }
+  ],
+  "limits": [
+    "Single native/kernel observation per fixture; diagnostic instrumentation perturbs execution. No timing/performance gain or regression inferred.",
+    "99Hz cpu-clock:k includes idle; rankings exclude known idle leaf functions only. Stack family counts overlap and are not additive.",
+    "BPF run_time_ns is elapsed inclusive invocation/helper time and can include interruptions. Never add it to process CPU.",
+    "PID0 samples include process_one_work/sk_psock_backlog stacks. Zero PID does not mean idle; it prevents exclusive process ownership attribution.",
+    "Client identity uses explicit TGID/TID and recorded COMM/FORK relationships, not initial_tids as a complete inventory.",
+    "Only8 receive JIT leaf samples per kernel arm and4\u20135respond leaf samples; insufficient for reliable copy/hash instruction hot-spot ranking.",
+    "Global TCP counters include unrelated traffic and are not per-fixture socket attribution."
+  ]
+}

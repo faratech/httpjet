@@ -1,0 +1,17 @@
+{
+  "profile_sha256": "0ade3a4f73f5c085826de497088987d8d06b6617edda2fae28baf59a1269ede3",
+  "profile_inputs_sha256": "2299f4acf214de52f1b5214eed861bf74d8e78f3db7e02f373605b805d105d49",
+  "counts_log_sha256": "9b5b58808911e5a6853c5d30d434eac3ee368699f3a2d3267eb78d710039a317",
+  "accepted_for_profile_use": true,
+  "coverage_notes": "Root inspected the actual merged IR counts:29500 function records,5392 with nonzero blocks. All6 H2-specific readiness records have positive counts, including event/read_ready/new; two real quiescent park monomorphizations are active. H2 owner/drain/native H2,H1 kernel,H3,TLS and page response memo groups have positive counts. Exact55-arm synthetic cache/native/range/kernel/oversize inventory and55server+7helper profile attribution passed. This accepts profile use for this isolated experiment; uncommon error/PHP/production-site paths are not trained or qualified. Instrumented timing is excluded; final exact binaries need wire/lifecycle/cache qualification and independent uninstrumented performance.",
+  "inspections": {
+    "coverage-inspection.json": {
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/coverage-inspection.json",
+      "sha256": "4cb85efa4c0af4afce879fca3335fcfe84b37aceca691572825e018bd1cae841"
+    },
+    "h2-readiness-coverage.json": {
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/h2-readiness-coverage.json",
+      "sha256": "ec3a9c02bc9f302ada6ccde1870237369204ba3db913f9ad701aaaf557e95c27"
+    }
+  }
+}

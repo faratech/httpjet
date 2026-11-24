@@ -1,0 +1,395 @@
+{
+  "schema": 1,
+  "status": "reviewed_for_wire_qualification",
+  "binary_sha256": "abf7a79c1eb9593c3af7e77e60c4aaf4a5b30873d0e2b989283c88b662db9c48",
+  "binary_bytes": 23549352,
+  "source_commit": "3946cd5eef75ac9b3993b082f7fbb7fca8bf30db",
+  "source_manifest_sha256": "3e8cae5902506b565352185640ec3c8c48061fbc62f30957327b912a90de06cc",
+  "helper_sha256": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+  "helper_rebuilt": false,
+  "warnings_sha256": "aba380b90a6c097fefe51d4847686cf7995443d098dbd89d96aaf1e0541b88ad",
+  "build_use_log_sha256": "b0f63047967bcec3685be0ee9c8ab6b77f39a8da19a075ed6c9414cc4b7d6a05",
+  "counts_log_sha256": "3053209af1895ca24db75330f1f4773f063946ba471195f575dd632cb9989568",
+  "CFG_or_profile_hash_mismatches": 0,
+  "missing_function_warnings": 633,
+  "unit_counts": {
+    "hj_bpf.865e7329ced40ab8-cgu.0": 227,
+    "build_script_build.e31b35a81b1e24ca-cgu.0": 49,
+    "build_script_build.79dba6e2e08e3908-cgu.0": 60,
+    "build_script_build.c63130aa19486390-cgu.0": 99,
+    "build_script_build.e555cbf6fddf262a-cgu.0": 96,
+    "build_script_build.e555cbf6fddf262a-cgu.1": 96,
+    "httpjet.ebc26bf31cc18146-cgu.0": 6
+  },
+  "classification": {
+    "build_scripts": {
+      "hj_beeper": 49,
+      "hj_quic_steering": 60,
+      "hj_kernel_fastpath": 99,
+      "quinn_udp": 192
+    },
+    "hj_bpf_build_feature_unit": 227,
+    "auxiliary_fuzz_library_codec": 5,
+    "auxiliary_fuzz_library_RawVec_specialization": 1,
+    "served_bin_namespace": 0,
+    "hj_bpf_load_feature_unit": 0
+  },
+  "unit_mapping": {
+    "served_bin_codegen": "httpjet.d9bb256fba82bf17",
+    "auxiliary_lib_codegen": "httpjet.ebc26bf31cc18146",
+    "hj_bpf_build_codegen": "hj_bpf.865e7329ced40ab8",
+    "hj_bpf_load_codegen": "hj_bpf.14da2c80b67666d1",
+    "archive_metadata_observation": "ar t on the corresponding use rlibs matched these codegen-unit names; no binary executed."
+  },
+  "warning_details": [
+    {
+      "unit": "hj_bpf.865e7329ced40ab8-cgu.0",
+      "mangled": "_RINvMNtCskADBYZwJmSU_4core6optionINtB3_6OptionNtNtNtCs8ZKwes1zzDd_3std3ffi6os_str8OsStringE14unwrap_or_elseNCNvNtCsbxf35J47ayG_6hj_bpf5build7compiles_0EB1N_",
+      "demangled": "<core[efd5e57aef94d71e]::option::Option<std[68c81ae915296b05]::ffi::os_str::OsString>>::unwrap_or_else::<hj_bpf[865e7329ced40ab8]::build::compile::{closure#1}>",
+      "function_hash": 134732432456997524
+    },
+    {
+      "unit": "hj_bpf.865e7329ced40ab8-cgu.0",
+      "mangled": "_RINvMNtCskADBYZwJmSU_4core6resultINtB3_6ResultyNtNtNtB5_2io5error5ErrorE7map_errNtNtCsgFX3jaOk65H_5alloc6string6StringNCNvNtCsbxf35J47ayG_6hj_bpf5build7compile0EB1Y_",
+      "demangled": "<core[efd5e57aef94d71e]::result::Result<u64, core[efd5e57aef94d71e]::io::error::Error>>::map_err::<alloc[c23e483dde3f7cfb]::string::String, hj_bpf[865e7329ced40ab8]::build::compile::{closure#0}>",
+      "function_hash": 1063705162294680212
+    },
+    {
+      "unit": "hj_bpf.865e7329ced40ab8-cgu.0",
+      "mangled": "_RNCNvNtCsbxf35J47ayG_6hj_bpf5build7compile0B5_",
+      "demangled": "hj_bpf[865e7329ced40ab8]::build::compile::{closure#0}",
+      "function_hash": 948827209191132067
+    },
+    {
+      "unit": "hj_bpf.865e7329ced40ab8-cgu.0",
+      "mangled": "_RNCNvNtCsbxf35J47ayG_6hj_bpf5build7compiles_0B5_",
+      "demangled": "hj_bpf[865e7329ced40ab8]::build::compile::{closure#1}",
+      "function_hash": 742261418966908927
+    },
+    {
+      "unit": "hj_bpf.865e7329ced40ab8-cgu.0",
+      "mangled": "_RNvNtCsbxf35J47ayG_6hj_bpf5build7compile",
+      "demangled": "hj_bpf[865e7329ced40ab8]::build::compile",
+      "function_hash": 303185023296222637
+    },
+    {
+      "unit": "httpjet.ebc26bf31cc18146-cgu.0",
+      "mangled": "_RINvNvMs2_NtCsgFX3jaOk65H_5alloc7raw_vecINtB8_11RawVecInnerpE7reserve21do_reserve_and_handleNtNtBa_5alloc6GlobalECskeWpk5ebFWI_7httpjet",
+      "demangled": "<alloc[c23e483dde3f7cfb]::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc[c23e483dde3f7cfb]::alloc::Global>",
+      "function_hash": 753202733449284396
+    },
+    {
+      "unit": "httpjet.ebc26bf31cc18146-cgu.0",
+      "mangled": "_RNvMNtCskeWpk5ebFWI_7httpjet5codecNtB2_14ChunkedDecoder13next_line_end",
+      "demangled": "<httpjet[ebc26bf31cc18146]::codec::ChunkedDecoder>::next_line_end",
+      "function_hash": 948827213290633728
+    },
+    {
+      "unit": "httpjet.ebc26bf31cc18146-cgu.0",
+      "mangled": "_RNvMNtCskeWpk5ebFWI_7httpjet5codecNtB2_14ChunkedDecoder7advance",
+      "demangled": "<httpjet[ebc26bf31cc18146]::codec::ChunkedDecoder>::advance",
+      "function_hash": 1021170726032974281
+    },
+    {
+      "unit": "httpjet.ebc26bf31cc18146-cgu.0",
+      "mangled": "_RNvNtCskeWpk5ebFWI_7httpjet5codec13te_is_chunked",
+      "demangled": "httpjet[ebc26bf31cc18146]::codec::te_is_chunked",
+      "function_hash": 321806759602108471
+    },
+    {
+      "unit": "httpjet.ebc26bf31cc18146-cgu.0",
+      "mangled": "_RNvNtCskeWpk5ebFWI_7httpjet5codec16head_has_bare_lf",
+      "demangled": "httpjet[ebc26bf31cc18146]::codec::head_has_bare_lf",
+      "function_hash": 287486626971661737
+    },
+    {
+      "unit": "httpjet.ebc26bf31cc18146-cgu.0",
+      "mangled": "_RNvNtCskeWpk5ebFWI_7httpjet5codec16parse_chunk_size",
+      "demangled": "httpjet[ebc26bf31cc18146]::codec::parse_chunk_size",
+      "function_hash": 408462323105766661
+    }
+  ],
+  "profile": {
+    "functions": 29410,
+    "positive_functions": 4989,
+    "positive_serving_examples": [
+      {
+        "family": "H1 enrollment",
+        "mangled": "_RNvMs1_NtCsBqno8GWeAo_18hj_kernel_fastpath9h1_loaderNtB5_6Client11register_as",
+        "demangled": "<hj_kernel_fastpath[707ea960b8ab35a]::h1_loader::Client>::register_as",
+        "max_IR_block_count": 3537
+      },
+      {
+        "family": "H1 serving",
+        "mangled": "_RNCINvNtCsiGYAq7sC6bz_7httpjet5uring17handle_h1_bridgedNtNtNtNtCsdo0DfKJVZul_6monoio3net3tcp6stream9TcpStreamE0B6_",
+        "demangled": "httpjet[d9bb256fba82bf17]::uring::handle_h1_bridged::<monoio[9bee01c63820c5d7]::net::tcp::stream::TcpStream>::{closure#0}",
+        "max_IR_block_count": 12347000
+      },
+      {
+        "family": "H1 serving",
+        "mangled": "_RNCINvNtCsiGYAq7sC6bz_7httpjet5uring17handle_h1_bridgedINtNtCs2p7T7SofqwL_13monoio_rustls6stream6StreamNtNtB4_8directio17DirectWriteSocketNtNtNtNtCsajFikgJL2xZ_6rustls6server11server_conn10connection16ServerConnectionEE0B6_",
+        "demangled": "httpjet[d9bb256fba82bf17]::uring::handle_h1_bridged::<monoio_rustls[1c0408fc3a0250e1]::stream::Stream<httpjet[d9bb256fba82bf17]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>>::{closure#0}",
+        "max_IR_block_count": 12310400
+      },
+      {
+        "family": "H2 readiness",
+        "mangled": "_RNCNvNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h26wakeup10read_ready0B9_",
+        "demangled": "httpjet[d9bb256fba82bf17]::kernel_fastpath::h2::wakeup::read_ready::{closure#0}",
+        "max_IR_block_count": 4206
+      },
+      {
+        "family": "H2 readiness",
+        "mangled": "_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCNvNtNtNtCsiGYAq7sC6bz_7httpjet15kernel_fastpath2h26wakeup10read_ready0EBL_",
+        "demangled": "core[efd5e57aef94d71e]::ptr::drop_glue::<httpjet[d9bb256fba82bf17]::kernel_fastpath::h2::wakeup::read_ready::{closure#0}>",
+        "max_IR_block_count": 4194
+      },
+      {
+        "family": "H2 serving",
+        "mangled": "_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCINvNtCsalwd8mO8Ndp_5hj_h26server23serve_local_with_prefixNtNtNtNtCsdo0DfKJVZul_6monoio3net3tcp6stream9TcpStreamNCNCINvNtCsiGYAq7sC6bz_7httpjet5uring16serve_h2_bridgedB1y_E0s3_0NCNCB2s_s3_0s0_0E0EB2z_",
+        "demangled": "core[efd5e57aef94d71e]::ptr::drop_glue::<hj_h2[7884d9f237f4aca5]::server::serve_local_with_prefix<monoio[9bee01c63820c5d7]::net::tcp::stream::TcpStream, httpjet[d9bb256fba82bf17]::uring::serve_h2_bridged<monoio[9bee01c63820c5d7]::net::tcp::stream::TcpStream>::{closure#0}::{closure#5}, httpjet[d9bb256fba82bf17]::uring::serve_h2_bridged<monoio[9bee01c63820c5d7]::net::tcp::stream::TcpStream>::{closure#0}::{closure#5}::{closure#2}>::{closure#0}>",
+        "max_IR_block_count": 390
+      },
+      {
+        "family": "H2 serving",
+        "mangled": "_RINvNtCskADBYZwJmSU_4core3ptr9drop_glueNCINvNtCsalwd8mO8Ndp_5hj_h26server23serve_local_with_prefixINtNtCs2p7T7SofqwL_13monoio_rustls6stream6StreamNtNtNtCsiGYAq7sC6bz_7httpjet5uring8directio17DirectWriteSocketNtNtNtNtCsajFikgJL2xZ_6rustls6server11server_conn10connection16ServerConnectionENCNCINvB2o_16serve_h2_bridgedB1y_E0s3_0NCNCB4E_s3_0s0_0E0EB2q_",
+        "demangled": "core[efd5e57aef94d71e]::ptr::drop_glue::<hj_h2[7884d9f237f4aca5]::server::serve_local_with_prefix<monoio_rustls[1c0408fc3a0250e1]::stream::Stream<httpjet[d9bb256fba82bf17]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>, httpjet[d9bb256fba82bf17]::uring::serve_h2_bridged<monoio_rustls[1c0408fc3a0250e1]::stream::Stream<httpjet[d9bb256fba82bf17]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>>::{closure#0}::{closure#5}, httpjet[d9bb256fba82bf17]::uring::serve_h2_bridged<monoio_rustls[1c0408fc3a0250e1]::stream::Stream<httpjet[d9bb256fba82bf17]::uring::directio::DirectWriteSocket, rustls[782bb5f8943a719d]::server::server_conn::connection::ServerConnection>>::{closure#0}::{closure#5}::{closure#2}>::{closure#0}>",
+        "max_IR_block_count": 390
+      },
+      {
+        "family": "H3 serving",
+        "mangled": "_RNvNtNtCsiGYAq7sC6bz_7httpjet5uring2h312service_conn",
+        "demangled": "httpjet[d9bb256fba82bf17]::uring::h3::service_conn",
+        "max_IR_block_count": 7863392
+      },
+      {
+        "family": "H3 QPACK",
+        "mangled": "_RNvNtNtCsiGYAq7sC6bz_7httpjet5uring2h311qpack_field",
+        "demangled": "httpjet[d9bb256fba82bf17]::uring::h3::qpack_field",
+        "max_IR_block_count": 9009913
+      },
+      {
+        "family": "cache",
+        "mangled": "_RNvNtCsiGYAq7sC6bz_7httpjet7lscache16stored_file_body",
+        "demangled": "httpjet[d9bb256fba82bf17]::lscache::stored_file_body",
+        "max_IR_block_count": 82288
+      }
+    ],
+    "counter_interpretation": "Maximum IR block count, not function-call or request counts; positive examples are bounded synthetic coverage."
+  },
+  "actual_gen_use_identities": {
+    "bin": {
+      "gen": {
+        "rustc": 11835527281324007204,
+        "features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]",
+        "target": 6248963632557106312,
+        "profile": 6536927300735754373,
+        "path": 12872388799603138581,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-a55175e447e260a3/dep-bin-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/build-raw"
+        ]
+      },
+      "use": {
+        "rustc": 11835527281324007204,
+        "features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]",
+        "target": 6248963632557106312,
+        "profile": 6536927300735754373,
+        "path": 12872388799603138581,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-9975a2d0f4d82639/dep-bin-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-use=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/runtime.profdata",
+          "-Cllvm-args=-pgo-warn-missing-function"
+        ]
+      }
+    },
+    "aux_lib": {
+      "gen": {
+        "rustc": 11835527281324007204,
+        "features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]",
+        "target": 11350266134701595711,
+        "profile": 4651311442752216146,
+        "path": 15082379935308900531,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-dcc57b4ac43b2ced/dep-lib-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/build-raw"
+        ]
+      },
+      "use": {
+        "rustc": 11835527281324007204,
+        "features": "[\"beeper-h1-serve\", \"beeper-h2-serve\", \"beeper-observer\", \"kernel-fastpath\", \"quic-bpf\"]",
+        "target": 11350266134701595711,
+        "profile": 4651311442752216146,
+        "path": 15082379935308900531,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/httpjet-9f78b858825cad90/dep-lib-httpjet",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-use=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/runtime.profdata",
+          "-Cllvm-args=-pgo-warn-missing-function"
+        ]
+      }
+    },
+    "hjbpf_build": {
+      "gen": {
+        "rustc": 11835527281324007204,
+        "features": "[\"build\"]",
+        "target": 13441070328441754616,
+        "profile": 1351066838114518270,
+        "path": 3920798444359723351,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/hj-bpf-af5f2cb9f7bd61b2/dep-lib-hj_bpf",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/build-raw"
+        ]
+      },
+      "use": {
+        "rustc": 11835527281324007204,
+        "features": "[\"build\"]",
+        "target": 13441070328441754616,
+        "profile": 1351066838114518270,
+        "path": 3920798444359723351,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/hj-bpf-09370da5271d06c4/dep-lib-hj_bpf",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-use=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/runtime.profdata",
+          "-Cllvm-args=-pgo-warn-missing-function"
+        ]
+      }
+    },
+    "hjbpf_load": {
+      "gen": {
+        "rustc": 11835527281324007204,
+        "features": "[\"load\"]",
+        "target": 13441070328441754616,
+        "profile": 4651311442752216146,
+        "path": 3920798444359723351,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/hj-bpf-c74084bb7dcea615/dep-lib-hj_bpf",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-generate=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/build-raw"
+        ]
+      },
+      "use": {
+        "rustc": 11835527281324007204,
+        "features": "[\"load\"]",
+        "target": 13441070328441754616,
+        "profile": 4651311442752216146,
+        "path": 3920798444359723351,
+        "config": 9396254390672932401,
+        "compile_kind": 0,
+        "local": [
+          {
+            "CheckDepInfo": {
+              "dep_info": "release/.fingerprint/hj-bpf-b6b3313a282edd7e/dep-lib-hj_bpf",
+              "checksum": false
+            }
+          }
+        ],
+        "rustflags": [
+          "-Ctarget-cpu=native",
+          "-Cforce-frame-pointers=yes",
+          "-Cprofile-use=/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/runtime.profdata",
+          "-Cllvm-args=-pgo-warn-missing-function"
+        ]
+      }
+    }
+  },
+  "cflags_cxxflags": "unset in both captured build environments",
+  "conclusion": "Every missing warning maps to excluded build tooling or the auxiliary fuzz-library copy. No identified missing served-bin namespace; new H1 enrollment and H2 readiness functions have positive profiles. Gen/use identity fields match apart from intended PGO flags/dependency fingerprints. This is warning review only, not a wire/performance pass.",
+  "limitations": [
+    "App-only profiles do not profile the unchanged helper or kernel eBPF instructions.",
+    "Unexercised branches may retain zero counters; no complete production-coverage claim."
+  ],
+  "evidence_sha256": {
+    "build-gen.json": "767088b241e062529f79a4c8539da78c239308e4af6bd5d7db00b851e1e7ac06",
+    "build-use.json": "44f68941d649dd068f969af81fce383bf42eb11a03ea70995a14ca382e1f1937",
+    "build-use.log": "b0f63047967bcec3685be0ee9c8ab6b77f39a8da19a075ed6c9414cc4b7d6a05",
+    "coverage-review.json": "d195ae2c4d494fde0f69c7488771e7e86eafebc2f831ea7c17c1a4c4b0c1d129",
+    "gen-artifacts.json": "35cb13cf66be8c7b0a0a69d3e84ce61dadac60ce2dacd4405e94f8716a165592",
+    "gen-fingerprint.json": "5d4450acd8f83624d0cecbe6a54e1a1d7c5bc0598e56f786fa32e442fc8a2832",
+    "gen-hjbpf-af5f.json": "da38a613994fb459530c755257a3ad26148f301ff0121c164fd76bdfe0e1424d",
+    "gen-hjbpf-c740.json": "51841c9cbe6aec8917d66664d46576d83458ee2aadd93a64f6b56b57a3199687",
+    "gen-lib-fingerprint.json": "532f706f0f8e9a936136ff583794cf08c5dccb338377a2d119d23426516a647c",
+    "merge-receipt.json": "80d4725ef84c665fd11bae9cb07630c8bbe393fdfcbd9411f92aff74e523dab6",
+    "profile-counts.txt": "3053209af1895ca24db75330f1f4773f063946ba471195f575dd632cb9989568",
+    "profile-use-warnings.json": "aba380b90a6c097fefe51d4847686cf7995443d098dbd89d96aaf1e0541b88ad",
+    "use-artifacts.json": "c6b54f0a96a66a3e2c61c04b0ae369fa4447b338d037429782fe804cc00e1c2a",
+    "use-fingerprint-audit.json": "ba8c8cadd1fc58fcc26e90faadcc47ee57d39c6c232e2ececd40439081c68b83",
+    "use-fingerprint.json": "4d3c8d330fd96b4261c2207d051ef34d1e6d9b2c744509a4d2c92beae8acc11e",
+    "use-hjbpf-0937.json": "aeb4fc0478258b049431a12408f05d681d5e5d4a60802c1a4bf101e8da47e82a",
+    "use-hjbpf-b6b3.json": "cb80bb30558eda5a998d1261a3cda15f70b19706e16983f54a66b5e52751d7cf",
+    "use-lib-fingerprint.json": "b781955ba71d3ee4a4c56332f1e8b43a081f9b7e9f0291aebd4711ace1abd03a"
+  }
+}

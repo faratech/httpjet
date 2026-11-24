@@ -1,0 +1,544 @@
+{
+  "schema": 1,
+  "passed": true,
+  "performance_dataset_passed": true,
+  "arms": 24,
+  "measured_responses": 4800000,
+  "warmup_completed_responses": 120000,
+  "raw_latency_rows_verified": 4920000,
+  "PMU_thread_records_recomputed": 173,
+  "memory_process_samples_verified": 48,
+  "boot_id": "07a57341-882b-4a8b-8ab7-099d91374bda",
+  "app_sha256": "abf7a79c1eb9593c3af7e77e60c4aaf4a5b30873d0e2b989283c88b662db9c48",
+  "helpers_sha256": {
+    "frozen": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+    "control": "3b673b25efeb9c90ad6f615c6aa217899f113765175d27764188edf0cc6825d7",
+    "candidate": "8f230a145ab691f99ef00b862ff01bffbd002780363043f654a5d19626065501"
+  },
+  "initial_72_arm_receipt_sha256": "d68886b2f42e543ba580e6dd851be3739a5623d8d93a545d9566edf771b9e2ee",
+  "initial_72_arm_findings_retained": true,
+  "confirmation_scope": "Predeclared longer control/candidate ABBA study of H1-pagecache and H2c-static after mixed initial results; no frozen helper arms scheduled; initial72 and original failed qualification remain retained.",
+  "source_before_after_exact": true,
+  "changed_source_files": [
+    "crates/hj-bpf/src/load.rs",
+    "crates/hj-kernel-fastpath/probes/h1_ack_probe.rs",
+    "crates/hj-kernel-fastpath/src/h1_loader.rs"
+  ],
+  "source_manifests": {
+    "baseline": "6332a5a9c055edfce26e1d533b0116e2c453db89d46f02d97acb4d391e64f7dc",
+    "candidate": "82e31974d2586712d43d3999708568829e211eef64a48f5efed381b8be6894b9"
+  },
+  "original_qualification": {
+    "passed": false,
+    "completed": [
+      "fresh-baseline-core",
+      "h1-late",
+      "h1-h2-ua",
+      "h2-core",
+      "h2-certified"
+    ],
+    "error": "ValueError: h2-expiry failed/interrupted; inspect /var/tmp/httpjet-continuation/btf-startup-lifetime-v1/qualification-v2/logs/h2-expiry-command.json; cleanup pending=False; no further commands started",
+    "integrity_error": null
+  },
+  "followup_qualification": {
+    "all_outcomes_recorded": true,
+    "all_checks_passed": true,
+    "inputs_equal": true,
+    "outcomes": [
+      {
+        "name": "frozen-expiry",
+        "passed": true,
+        "exit": 0,
+        "error": null
+      },
+      {
+        "name": "control-expiry",
+        "passed": true,
+        "exit": 0,
+        "error": null
+      },
+      {
+        "name": "candidate-expiry",
+        "passed": true,
+        "exit": 0,
+        "error": null
+      },
+      {
+        "name": "candidate-lifecycle",
+        "passed": true,
+        "exit": 0,
+        "error": null
+      }
+    ]
+  },
+  "qualification_interpretation": "Original helper qualification remains failed at the expiry warm-hit stage; all four predeclared follow-up controls passed. This performance/data seal does not turn the original qualification into pass or establish a cause.",
+  "monitors": [
+    {
+      "job": "h1-pagecache",
+      "configuration": {
+        "event": "configuration",
+        "monotonic_ns": 41091612130191,
+        "unix_ns": 1793486928416800591,
+        "command": [
+          "python3",
+          "-B",
+          "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/tools/scripts/http_engine_check.py",
+          "--arms",
+          "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/confirmation-v1/h1-pagecache/arms.json",
+          "--client",
+          "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced",
+          "--protocols",
+          "h1",
+          "--cases",
+          "pagecache",
+          "--sequence",
+          "control,candidate,candidate,control",
+          "--rounds",
+          "3",
+          "--requests",
+          "200000",
+          "--warmup",
+          "5000",
+          "--size",
+          "1024",
+          "--rate",
+          "15000",
+          "--workers",
+          "1",
+          "--connections",
+          "32",
+          "--streams",
+          "4",
+          "--server-cpus",
+          "8",
+          "--client-cpus",
+          "0,2,4,6,12,14",
+          "--client-threads",
+          "6",
+          "--server-hardware-counters",
+          "--require-client-cpu-headroom",
+          "--results",
+          "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/confirmation-v1/h1-pagecache/measurements"
+        ],
+        "interval_seconds": 1.0,
+        "quiet_seconds": 10.0,
+        "observer_affinity": [
+          10
+        ],
+        "observer_sha256": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+        "scope": "sampled Linux compiler processes only; Windows host and sub-interval activity are unobserved"
+      },
+      "finished": {
+        "event": "finished",
+        "monotonic_ns": 41291107395245,
+        "unix_ns": 1793487127912065445,
+        "command_exit": 0,
+        "compiler_overlap_observed": false,
+        "unique_compilers": []
+      },
+      "sha256": "8b9f4ba7e764fd68f5ec822563992b5d97bcea541079548580c2cb6a020f53b2"
+    },
+    {
+      "job": "h2c-static",
+      "configuration": {
+        "event": "configuration",
+        "monotonic_ns": 41291171011745,
+        "unix_ns": 1793487127975682045,
+        "command": [
+          "python3",
+          "-B",
+          "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/tools/scripts/http_engine_check.py",
+          "--arms",
+          "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/confirmation-v1/h2c-static/arms.json",
+          "--client",
+          "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced",
+          "--protocols",
+          "h2c",
+          "--cases",
+          "static",
+          "--sequence",
+          "control,candidate,candidate,control",
+          "--rounds",
+          "3",
+          "--requests",
+          "200000",
+          "--warmup",
+          "5000",
+          "--size",
+          "1024",
+          "--rate",
+          "15000",
+          "--workers",
+          "1",
+          "--connections",
+          "32",
+          "--streams",
+          "4",
+          "--server-cpus",
+          "8",
+          "--client-cpus",
+          "0,2,4,6,12,14",
+          "--client-threads",
+          "6",
+          "--server-hardware-counters",
+          "--require-client-cpu-headroom",
+          "--results",
+          "/var/tmp/httpjet-continuation/btf-startup-lifetime-v1/confirmation-v1/h2c-static/measurements"
+        ],
+        "interval_seconds": 1.0,
+        "quiet_seconds": 10.0,
+        "observer_affinity": [
+          10
+        ],
+        "observer_sha256": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+        "scope": "sampled Linux compiler processes only; Windows host and sub-interval activity are unobserved"
+      },
+      "finished": {
+        "event": "finished",
+        "monotonic_ns": 41496720966041,
+        "unix_ns": 1793487333525636141,
+        "command_exit": 0,
+        "compiler_overlap_observed": false,
+        "unique_compilers": []
+      },
+      "sha256": "0659acbba7fee93ac16ada64021b3faaafe17189c3bd8878cd6d65fc555a472e"
+    }
+  ],
+  "owned_cleanups": [
+    {
+      "receipt": "/var/tmp/httpjet-btf-confirmation-independent-v1/raw/confirmation-v1/logs/h1-pagecache-command.json",
+      "sha256": "96175c50e9ea2f2d485118ff22cea279354878df5385be8518f4c282c1133789",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "receipt": "/var/tmp/httpjet-btf-confirmation-independent-v1/raw/confirmation-v1/logs/h2c-static-command.json",
+      "sha256": "6b57b1c261d8e097d3edd43867829c386aaac86e2dbc89eb55fb8cac84cbdff5",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "pinned_internal_inputs": [
+    {
+      "path": "confirmation.py",
+      "sha256": "8ab6a7dab1dfc7d4e041df44bd5a80874ee13e6098d598c5d8f3b55f742b9619"
+    },
+    {
+      "path": "tools/files.sha256",
+      "sha256": "89b0d617a8e0c50a964eb530bfcc54aaef61ecd8df5711a918c5285b1b3163c6"
+    },
+    {
+      "path": "build-v4.py",
+      "sha256": "3ee196e9be75155228b8dcfb0b7dafa079389ad13996df63d844c99facd5c81f"
+    },
+    {
+      "path": "candidate-build-v4/artifact.json",
+      "sha256": "554857b46905bcf14bfb30e5eef6cb36a764e7d96247757d047e17656d048adc"
+    },
+    {
+      "path": "candidate-build-v4/completion.json",
+      "sha256": "7031fa6164de3364179efa6938e7bccdf82da9bceb3d60eb6e63f8f09f0b4b65"
+    },
+    {
+      "path": "baseline-build-v2/artifact.json",
+      "sha256": "64c7dc8bcd4aa4c9e6f7f53bf244fa0aee30fd725fe82a9b190d85ad6af3db36"
+    },
+    {
+      "path": "baseline-build-v2/completion.json",
+      "sha256": "d6e4592f703667569423438f989498628a251a46c8712779d27f79251136a148"
+    },
+    {
+      "path": "qualification-v2/completion.json",
+      "sha256": "be1ce65051a3b5358a6482e0740d63a2799c80009f62fb68255c7cbb8bbf587e"
+    },
+    {
+      "path": "qualification-v2/inputs-before.json",
+      "sha256": "6134ee5041db6cda1a9023f8bf71ad135b597ca3f49afa02616018262502d840"
+    },
+    {
+      "path": "qualification-v2/inputs-after.json",
+      "sha256": "6134ee5041db6cda1a9023f8bf71ad135b597ca3f49afa02616018262502d840"
+    },
+    {
+      "path": "qualification-followup-v1/completion.json",
+      "sha256": "526e901bf04d1f3a267ace4f15fea676f465ab952f001ffb55d15c707a4fb3f0"
+    },
+    {
+      "path": "pss-smoke-v1/completion.json",
+      "sha256": "c4bf8a3798ed3c7fe800f9ad9cc1ce5f30423bb700f6071c1e53142ad5fdb1c1"
+    }
+  ],
+  "comparisons": [
+    {
+      "protocol": "h1",
+      "case": "pagecache",
+      "comparison": "candidate_vs_control",
+      "before_role": "control",
+      "after_role": "candidate",
+      "RPS": 0.0010234450658508365,
+      "process_cpu_us_R": -0.9345794392523032,
+      "web_cpu_us_R": -0.6329113924050667,
+      "helper_cpu_us_R": -16.666666666666664,
+      "client_cpu_us_R": -0.1616596651294322,
+      "user_instructions_R": 0.09600592120289075,
+      "user_cycles_R": 0.3668703441255694,
+      "VM_busy_us_R": -1.8546670720583691,
+      "scheduled_p99_us": 0.44561382623582446,
+      "service_p99_us": -1.7058486238532122,
+      "dispatch_lateness_p99_us": 0.6151311585334884,
+      "boundary_RSS_bytes": -11.285714285714288,
+      "RSS_bytes": -11.285714285714288,
+      "PSS_bytes": -12.235711148754625,
+      "private_bytes": -12.319091912344316,
+      "shared_bytes": 1.0019267822735989,
+      "web_RSS_bytes": -1.9936403587123563,
+      "web_PSS_bytes": -2.183529146592289,
+      "web_private_bytes": -2.2096530920060364,
+      "helper_RSS_bytes": -52.83884232168275,
+      "helper_PSS_bytes": -63.46884498480243,
+      "helper_private_bytes": -64.26235814579726
+    },
+    {
+      "protocol": "h2c",
+      "case": "static",
+      "comparison": "candidate_vs_control",
+      "before_role": "control",
+      "after_role": "candidate",
+      "RPS": -0.004159860698005335,
+      "process_cpu_us_R": 8.74635568513118,
+      "web_cpu_us_R": 9.226190476190466,
+      "helper_cpu_us_R": 19.999999999999996,
+      "client_cpu_us_R": 9.165976271203146,
+      "user_instructions_R": -0.8964395908712008,
+      "user_cycles_R": 12.156569095775316,
+      "VM_busy_us_R": 19.912745403552524,
+      "scheduled_p99_us": 6.91216730666131,
+      "service_p99_us": 9.426580266536245,
+      "dispatch_lateness_p99_us": 6.194991082267931,
+      "boundary_RSS_bytes": -10.991965112458557,
+      "RSS_bytes": -10.238200917295458,
+      "PSS_bytes": -11.063102492632314,
+      "private_bytes": -11.141146939563617,
+      "shared_bytes": 0.25725836089673937,
+      "web_RSS_bytes": -0.4996717484863966,
+      "web_PSS_bytes": -0.5381252102051648,
+      "web_private_bytes": -0.5369905350589121,
+      "helper_RSS_bytes": -52.13849287169043,
+      "helper_PSS_bytes": -62.88737717309145,
+      "helper_private_bytes": -64.06159769008661
+    }
+  ],
+  "paired_cycles": [
+    {
+      "protocol": "h1",
+      "case": "pagecache",
+      "comparison": "candidate_vs_control",
+      "cycle": 1,
+      "RPS": -0.000603935303555847,
+      "process_cpu_us_R": -0.9345794392523032,
+      "web_cpu_us_R": -0.9493670886075889,
+      "helper_cpu_us_R": 0.0,
+      "client_cpu_us_R": -1.5340211192163,
+      "user_instructions_R": 0.4961501680094349,
+      "user_cycles_R": -1.7154146617066268,
+      "VM_busy_us_R": 7.432432432432434,
+      "scheduled_p99_us": -0.5417582628223672,
+      "service_p99_us": -1.066589795330064,
+      "dispatch_lateness_p99_us": -0.4952298999442495,
+      "boundary_RSS_bytes": -10.854949937963465,
+      "RSS_bytes": -10.885805763073641,
+      "PSS_bytes": -11.704651162790702,
+      "private_bytes": -11.76763899276988,
+      "shared_bytes": 0.07748934521503159,
+      "web_RSS_bytes": -1.531350340496096,
+      "web_PSS_bytes": -1.6113190763870855,
+      "web_private_bytes": -1.6217824728463004,
+      "helper_RSS_bytes": -52.78128950695322,
+      "helper_PSS_bytes": -63.389637502372366,
+      "helper_private_bytes": -64.18139892390468,
+      "opposite_direction": "RPS;user_cycles_R;VM_busy_us_R;scheduled_p99_us;dispatch_lateness_p99_us"
+    },
+    {
+      "protocol": "h1",
+      "case": "pagecache",
+      "comparison": "candidate_vs_control",
+      "cycle": 2,
+      "RPS": -0.001155970014754537,
+      "process_cpu_us_R": -11.666666666666636,
+      "web_cpu_us_R": -11.331444759206788,
+      "helper_cpu_us_R": -28.57142857142857,
+      "client_cpu_us_R": -8.284489224338632,
+      "user_instructions_R": 0.31486709524648493,
+      "user_cycles_R": -11.858123342582838,
+      "VM_busy_us_R": -3.7849203965154565,
+      "scheduled_p99_us": -5.685195302703383,
+      "service_p99_us": -6.868356500408812,
+      "dispatch_lateness_p99_us": -6.430167424942623,
+      "boundary_RSS_bytes": -10.815873656301333,
+      "RSS_bytes": -10.815873656301333,
+      "PSS_bytes": -11.607274419326075,
+      "private_bytes": -11.658297726351242,
+      "shared_bytes": -0.5690440060698077,
+      "web_RSS_bytes": -1.43108917870991,
+      "web_PSS_bytes": -1.4638668706253188,
+      "web_private_bytes": -1.4558046019807924,
+      "helper_RSS_bytes": -52.883551903934276,
+      "helper_PSS_bytes": -63.510436432637576,
+      "helper_private_bytes": -64.30355427473583,
+      "opposite_direction": "RPS;user_cycles_R;scheduled_p99_us;dispatch_lateness_p99_us;shared_bytes"
+    },
+    {
+      "protocol": "h1",
+      "case": "pagecache",
+      "comparison": "candidate_vs_control",
+      "cycle": 3,
+      "RPS": 0.00518837696907859,
+      "process_cpu_us_R": 2.416918429003001,
+      "web_cpu_us_R": 2.4539877300613577,
+      "helper_cpu_us_R": 0.0,
+      "client_cpu_us_R": 2.234461511066943,
+      "user_instructions_R": -0.3325267530227327,
+      "user_cycles_R": 3.115427174211516,
+      "VM_busy_us_R": -10.507346825616848,
+      "scheduled_p99_us": 14.588096818721485,
+      "service_p99_us": 4.790756657742712,
+      "dispatch_lateness_p99_us": 11.832244803699176,
+      "boundary_RSS_bytes": -11.428571428571432,
+      "RSS_bytes": -11.428571428571432,
+      "PSS_bytes": -12.443621702604968,
+      "private_bytes": -12.552433216639859,
+      "shared_bytes": 2.313922097956045,
+      "web_RSS_bytes": -2.1579906391796744,
+      "web_PSS_bytes": -2.441796034898902,
+      "web_private_bytes": -2.503770739064859,
+      "helper_RSS_bytes": -52.54317857708762,
+      "helper_PSS_bytes": -63.13785224676314,
+      "helper_private_bytes": -63.929053402737615,
+      "opposite_direction": "process_cpu_us_R;web_cpu_us_R;client_cpu_us_R;user_instructions_R;service_p99_us"
+    },
+    {
+      "protocol": "h2c",
+      "case": "static",
+      "comparison": "candidate_vs_control",
+      "cycle": 1,
+      "RPS": -0.013485254880130082,
+      "process_cpu_us_R": 8.74635568513118,
+      "web_cpu_us_R": 9.226190476190466,
+      "helper_cpu_us_R": -14.28571428571428,
+      "client_cpu_us_R": 9.165976271203146,
+      "user_instructions_R": -0.6390097506385084,
+      "user_cycles_R": 13.389516210315833,
+      "VM_busy_us_R": 23.929146537842215,
+      "scheduled_p99_us": 6.711689565339918,
+      "service_p99_us": 9.426580266536245,
+      "dispatch_lateness_p99_us": 5.900467756823846,
+      "boundary_RSS_bytes": -11.77944862155389,
+      "RSS_bytes": -11.421209577024404,
+      "PSS_bytes": -12.317427126895952,
+      "private_bytes": -12.408850892632639,
+      "shared_bytes": 0.11009174311926717,
+      "web_RSS_bytes": -2.1984656911493095,
+      "web_PSS_bytes": -2.317995307928855,
+      "web_private_bytes": -2.3330077391239046,
+      "helper_RSS_bytes": -52.09083790133124,
+      "helper_PSS_bytes": -62.831106284527124,
+      "helper_private_bytes": -64.00538668718738,
+      "opposite_direction": "helper_cpu_us_R"
+    },
+    {
+      "protocol": "h2c",
+      "case": "static",
+      "comparison": "candidate_vs_control",
+      "cycle": 2,
+      "RPS": -0.0018998218287102908,
+      "process_cpu_us_R": 22.727272727272705,
+      "web_cpu_us_R": 23.076923076923084,
+      "helper_cpu_us_R": -2.220446049250313e-14,
+      "client_cpu_us_R": 16.183656324961106,
+      "user_instructions_R": -4.286559632768183,
+      "user_cycles_R": -0.14200144736475906,
+      "VM_busy_us_R": 13.457841252403169,
+      "scheduled_p99_us": 349.93045635489733,
+      "service_p99_us": 106.84740356822489,
+      "dispatch_lateness_p99_us": 374.59820605213105,
+      "boundary_RSS_bytes": -8.170650124673118,
+      "RSS_bytes": -7.935060197008392,
+      "PSS_bytes": -8.510113062225367,
+      "private_bytes": -8.564415549953564,
+      "shared_bytes": -1.0204081632653073,
+      "web_RSS_bytes": 2.7426717470856676,
+      "web_PSS_bytes": 2.952665670154464,
+      "web_private_bytes": 2.9778365596569323,
+      "helper_RSS_bytes": -52.26311667971809,
+      "helper_PSS_bytes": -62.83056290139781,
+      "helper_private_bytes": -63.97921878006543,
+      "opposite_direction": "helper_cpu_us_R;user_cycles_R;shared_bytes;web_RSS_bytes;web_PSS_bytes;web_private_bytes"
+    },
+    {
+      "protocol": "h2c",
+      "case": "static",
+      "comparison": "candidate_vs_control",
+      "cycle": 3,
+      "RPS": -0.00026652426041717803,
+      "process_cpu_us_R": 3.2573289902280145,
+      "web_cpu_us_R": 3.300330033003296,
+      "helper_cpu_us_R": 0.0,
+      "client_cpu_us_R": 5.045328411076322,
+      "user_instructions_R": -0.4423318326214565,
+      "user_cycles_R": 7.092906011021127,
+      "VM_busy_us_R": 1.9772117962466362,
+      "scheduled_p99_us": 1.3065575822763131,
+      "service_p99_us": 4.905610210050515,
+      "dispatch_lateness_p99_us": 0.825998784571147,
+      "boundary_RSS_bytes": -11.05685282192429,
+      "RSS_bytes": -12.365734576120724,
+      "PSS_bytes": -13.360860641008232,
+      "private_bytes": -13.454978438566002,
+      "shared_bytes": 0.07350238882763982,
+      "web_RSS_bytes": -3.1183893792399164,
+      "web_PSS_bytes": -3.298899726132709,
+      "web_private_bytes": -3.310797759320072,
+      "helper_RSS_bytes": -52.12482358475772,
+      "helper_PSS_bytes": -62.88308740068105,
+      "helper_private_bytes": -64.05858546926191,
+      "opposite_direction": ""
+    }
+  ],
+  "admission_waits": {
+    "control": 1205,
+    "candidate": 3516
+  },
+  "kernel_fraction_range": {
+    "control": [
+      0.9967609756097561,
+      0.9990731707317073
+    ],
+    "candidate": [
+      0.9971121951219513,
+      0.9990829268292682
+    ]
+  },
+  "EEXIST_log_lines": {
+    "control": 2,
+    "candidate": 0
+  },
+  "normalization": {
+    "CPU_PMU_VM_denominator": 205000,
+    "latency_denominator": 200000,
+    "tick_hz": 100,
+    "latency": "Scheduled arrival to completion; cell p99 is median of six arm p99 values, not pooled p99. Service/dispatch quantiles are separate.",
+    "process_CPU": "Server plus helper user+system across the whole client, including 5000 warmups; kernel/IRQ work charged elsewhere excluded.",
+    "VM_CPU": "All Linux CPUs, including clients, observer and unrelated work; Windows unobserved.",
+    "memory": "Post-measurement smaps_rollup only; per-process identity-checked raw kB fields converted to bytes. Process snapshots are sequential. RSS may double-count shared pages; PSS apportions shares. Unmapped kernel allocations excluded.",
+    "comparison": "Matched non-PGO control/candidate only in this confirmation. The frozen helper is pinned but unscheduled; its operational comparison remains in the retained initial 72-arm receipt."
+  },
+  "raw_manifest_sha256": "05fac64c253866f61aeb0c84c0009c3305c57f85acc1f51a6f16429d931e5aca",
+  "recompute_sha256": "1f251b0ac1f94aa8f76ee16ab9c9607915141951e65fdbe249d9e2eeb74b688c",
+  "outputs_sha256": {
+    "changes-percent.csv": "05988ea22bfb8f6aea5aa1a32e3d68e8af66fe78d43deb6f696f400abb6f6dbf",
+    "raw-manifest.json": "05fac64c253866f61aeb0c84c0009c3305c57f85acc1f51a6f16429d931e5aca",
+    "prior-72-receipt.json": "d68886b2f42e543ba580e6dd851be3739a5623d8d93a545d9566edf771b9e2ee",
+    "arms.csv": "e76c323dd62714c949b1b63c399f30cf68ae91c2e0badff7b0f2077be1a45fe1",
+    "groups.csv": "00447f24d515936476f38322a0b54cf994a10abe0bc8449527fdb75de2d12496",
+    "cycles-percent.csv": "12ede9815868f737f83c0dce1f9920d9966f6d471cdaeafa42e6dfbdfa348fba",
+    "memory-processes.csv": "2e0e64a6c85b36e802aeab7dc1aee008333e453fdf92fcbb50f6195197c4ede2"
+  }
+}

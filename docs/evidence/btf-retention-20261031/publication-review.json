@@ -1,0 +1,130 @@
+{
+  "scope": "Local artifact selection/recalculation only; no apps/builds/remote execution/source edits",
+  "passed": true,
+  "studies": [
+    {
+      "study": "initial72",
+      "source_receipt_sha256": "d68886b2f42e543ba580e6dd851be3739a5623d8d93a545d9566edf771b9e2ee",
+      "sealed_arms": 72,
+      "raw_rows_previously_audited": 4680000,
+      "group_medians_and_change_ratios_recomputed_from_compact_arm_CSV": true,
+      "raw_latency_files_reread_for_publication": false,
+      "cycle_rows_retained": 36,
+      "original_qualification_passed": false,
+      "four_followups_passed": true
+    },
+    {
+      "study": "confirmation24",
+      "source_receipt_sha256": "f591d74bac1fe86cf1aba49fee2a5043f7e0d64e8652b659590db2fd4c8a3fc8",
+      "sealed_arms": 24,
+      "raw_rows_previously_audited": 4920000,
+      "group_medians_and_change_ratios_recomputed_from_compact_arm_CSV": true,
+      "raw_latency_files_reread_for_publication": false,
+      "cycle_rows_retained": 6,
+      "original_qualification_passed": false,
+      "four_followups_passed": true
+    }
+  ],
+  "decision": "First candidate8f rejected and not promoted; stable research publication only",
+  "raw_data_publication": "No TSV, fixture TLS keys/certificates or archives copied; private raw manifests remain referenced by their original seals",
+  "selected_source_files": [
+    {
+      "path": "initial72/arms.csv",
+      "bytes": 23705,
+      "sha256": "1693c6278354a75962998b340624b638c064e646ff07776cbb7197d7672aad0b",
+      "source": "/var/tmp/httpjet-btf-lifetime-independent-v1/sealed-v1/arms.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "initial72/groups.csv",
+      "bytes": 4140,
+      "sha256": "a907813fbe56c60960b27e51dd4d37ad6e2872bc18ff42fd33d304ef4c8af8d1",
+      "source": "/var/tmp/httpjet-btf-lifetime-independent-v1/sealed-v1/groups.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "initial72/changes-percent.csv",
+      "bytes": 6013,
+      "sha256": "7410465c9c5c2f1af915813e109d893601942ba6f7c5f761945f1f1dafda4b05",
+      "source": "/var/tmp/httpjet-btf-lifetime-independent-v1/sealed-v1/changes-percent.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "initial72/cycles-percent.csv",
+      "bytes": 19278,
+      "sha256": "cf8bc8dba7bc0195c5240e48875131ebe204c832a398f8268ce82ef04595295d",
+      "source": "/var/tmp/httpjet-btf-lifetime-independent-v1/sealed-v1/cycles-percent.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "initial72/memory-processes.csv",
+      "bytes": 30429,
+      "sha256": "b846ec2ea620a41d1456e8b3234d5bb10df4d8723eba92c0fc5a40601696ceb0",
+      "source": "/var/tmp/httpjet-btf-lifetime-independent-v1/sealed-v1/memory-processes.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "initial72/receipt.json",
+      "bytes": 72749,
+      "sha256": "d68886b2f42e543ba580e6dd851be3739a5623d8d93a545d9566edf771b9e2ee",
+      "source": "/var/tmp/httpjet-btf-lifetime-independent-v1/sealed-v1/receipt.json",
+      "byte_identical": true
+    },
+    {
+      "path": "initial72/summary-seal.json",
+      "bytes": 294,
+      "sha256": "18798963f33527bdfc804e3716418bebcd6057645bf1c66521e3ae6756f7128d",
+      "source": "/var/tmp/httpjet-btf-lifetime-independent-v1/summary-seal.json",
+      "byte_identical": true
+    },
+    {
+      "path": "confirmation24/arms.csv",
+      "bytes": 8418,
+      "sha256": "e76c323dd62714c949b1b63c399f30cf68ae91c2e0badff7b0f2077be1a45fe1",
+      "source": "/var/tmp/httpjet-btf-confirmation-independent-v1/sealed-v1/arms.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "confirmation24/groups.csv",
+      "bytes": 1644,
+      "sha256": "00447f24d515936476f38322a0b54cf994a10abe0bc8449527fdb75de2d12496",
+      "source": "/var/tmp/httpjet-btf-confirmation-independent-v1/sealed-v1/groups.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "confirmation24/changes-percent.csv",
+      "bytes": 1347,
+      "sha256": "05988ea22bfb8f6aea5aa1a32e3d68e8af66fe78d43deb6f696f400abb6f6dbf",
+      "source": "/var/tmp/httpjet-btf-confirmation-independent-v1/sealed-v1/changes-percent.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "confirmation24/cycles-percent.csv",
+      "bytes": 3452,
+      "sha256": "12ede9815868f737f83c0dce1f9920d9966f6d471cdaeafa42e6dfbdfa348fba",
+      "source": "/var/tmp/httpjet-btf-confirmation-independent-v1/sealed-v1/cycles-percent.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "confirmation24/memory-processes.csv",
+      "bytes": 10257,
+      "sha256": "2e0e64a6c85b36e802aeab7dc1aee008333e453fdf92fcbb50f6195197c4ede2",
+      "source": "/var/tmp/httpjet-btf-confirmation-independent-v1/sealed-v1/memory-processes.csv",
+      "byte_identical": true
+    },
+    {
+      "path": "confirmation24/receipt.json",
+      "bytes": 20929,
+      "sha256": "f591d74bac1fe86cf1aba49fee2a5043f7e0d64e8652b659590db2fd4c8a3fc8",
+      "source": "/var/tmp/httpjet-btf-confirmation-independent-v1/sealed-v1/receipt.json",
+      "byte_identical": true
+    },
+    {
+      "path": "confirmation24/summary-seal.json",
+      "bytes": 621,
+      "sha256": "aa6860418dccbe420a56d903808e50295e0573de99d25bf1d34de09c4427fdd3",
+      "source": "/var/tmp/httpjet-btf-confirmation-independent-v1/summary-seal.json",
+      "byte_identical": true
+    }
+  ]
+}

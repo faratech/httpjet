@@ -1,0 +1,14 @@
+{
+  "checked_at_utc": "2026-10-30 15:56:35 UTC",
+  "source": "https://github.com/faratech/httpjet/releases/tag/v0.1.10-11",
+  "tag": "v0.1.10-11",
+  "release_updated_at": "2026-10-27T05:15:29Z",
+  "asset": {
+    "name": "httpjet-0.1.10-11-linux-amd64-static.tar.gz",
+    "digest": "sha256:67695c65902e0437fbecffe8b94c502e98d635dff78aee5dcc604f3e9f5900c2",
+    "size": 8470096,
+    "updated_at": "2026-10-27T05:15:21Z"
+  },
+  "expected_archive_sha256": "67695c65902e0437fbecffe8b94c502e98d635dff78aee5dcc604f3e9f5900c2",
+  "matches_existing_pinned_archive": true
+}

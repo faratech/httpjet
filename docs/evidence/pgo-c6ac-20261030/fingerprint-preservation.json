@@ -1,0 +1,22 @@
+{
+  "httpjet": {
+    "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/fingerprints/httpjet.json",
+    "sha256": "6a961278cfcd2393e729c1c2add7295b9e39109a18ea4d1679c2179fcf644182"
+  },
+  "httpjet-beeper-h1": {
+    "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/fingerprints/httpjet-beeper-h1.json",
+    "sha256": "6a31659ba859d30f6cdc7eb980748ce072bc44fcdfdbc73c79cd69efa5b82992"
+  },
+  "httpjet-beeper-observe": {
+    "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/fingerprints/httpjet-beeper-observe.json",
+    "sha256": "220826025e87e96dbc61d680663cb38fd9e482812515b9cbbde432953d7416f3"
+  },
+  "httpjet-quic-steer": {
+    "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/fingerprints/httpjet-quic-steer.json",
+    "sha256": "9159f99bcbe59ef67377a017c08375037dcb0ca0e08db4c9592d9438458e5307"
+  },
+  "rustc_info": {
+    "path": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/.rustc_info.json",
+    "sha256": "c2f40337a438b88ac4257a205824b9503c41a33320908bacb3f86c4fcae9bf3e"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "stage": "gen",
+  "target": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/target-gen",
+  "rustflags": "-Ctarget-cpu=native -Cforce-frame-pointers=yes -Cprofile-generate=/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-raw",
+  "exit": 0,
+  "jobs": 2,
+  "profile": "release/opt3/thinLTO/codegen1/panic-abort/strip-debuginfo",
+  "features": [
+    "httpjet/beeper-h2-serve",
+    "httpjet/beeper-observer",
+    "httpjet/quic-bpf"
+  ],
+  "prebuilt_bpf": "/var/tmp/httpjet-continuation/integrated-f7555d80/objects",
+  "log": "/var/tmp/httpjet-continuation/pgo-c6ac-v1/logs/build-gen.log",
+  "log_sha256": "9cce9261651d26f133d2796ac5d9b4fb28e929ce53ae04ed78a91c0f0747ce7e",
+  "scope": "build receipt only; no performance result"
+}

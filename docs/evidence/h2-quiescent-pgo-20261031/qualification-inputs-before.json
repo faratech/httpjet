@@ -1,0 +1,62 @@
+{
+  "source_runtime_commit_label": "39fad6a4c959147de0e80a2908681976fb2caf26",
+  "input_sha256": {
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/pgo-inputs.json": "1c81b39262cb21f750c4c9f0b3786e807cf80399853956f095b57963bc7a3e39",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-source-manifest.json": "7c66ac12e6e7f0861596ae5aba040a1e3c57e8866493a4873c78847363c31a71",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualified-inputs.json": "b10a7db343830a1c1b5667502ea5b3e7afd36dcc72cdea9608d044d41a2d10b8",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bpf-objects.json": "99e7ecf1de175d307f73f42920ba0cdef9954c2f6537a40fa6d9a8228db71cc5",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/use-artifacts.json": "d2b3f65e597e237005e10a0e9fb4ec7448c25eda57ee14878735cbe9f9206eef",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness-sha256.json": "d85fd53a2dba2b40088a688b9ac9663879e8e342840164443ba492cb57451418",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/build-use.json": "0428f4f98cb49e67832deed91c8192daa1266efbf850d333ff861e74ef0db58c",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/profile-use-warnings.json": "10d8507e2c47dd19a150f1b8ea393ff917a05b6a22e1fbebfcdfac57dfeeee14",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/runtime.profdata": "0ade3a4f73f5c085826de497088987d8d06b6617edda2fae28baf59a1269ede3",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/profile-inputs.json": "2299f4acf214de52f1b5214eed861bf74d8e78f3db7e02f373605b805d105d49",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/merge-receipt.json": "8b04ce52411d9a348c92bbbc93e7356e7a49b913f01bf3d89fb04ba47ce14d2d",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/coverage-review.json": "920f9c197a49d9b20ef3687bf0f593b46a0181624d0d779df1ceb6b6624d7f06",
+    "/var/tmp/h2q-pgo-common.sh": "05939c965ecbc4f7ca965885fc579b0472e1edfae9c8210badd00986b1d1425b",
+    "/var/tmp/h2q-pgo-qualify.sh": "ef34523a7082fdab62033a40d7e3fc1c9f9d6d4362d50d21ab00109df2697a1f",
+    "/var/tmp/httpjet-continuation/h3-bind-client-20261030/bin/httpjet-h3-load-bind": "afee4fd337ce7289c3a3122abba27fd3fa47605535d50f9b43aa4dff22e33a77",
+    "/var/tmp/hjc/httpjet-http-load-bind": "e5c21fa94ea72c965cd4cfea950977c2bb771a4a5842a58499a5b1355c758b8f",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/ua-arms.json": "38777d8d5ae870347844202d46352d14ac19c497d95f57a5cc42c02d9b9c65a9",
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/http-native-arms.json": "3745df847774b1328f69bdf7cc8a7c7cec384c28d53893b19950c1328ef1eeb9"
+  },
+  "use_artifacts": {
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet": {
+      "bytes": 23554456,
+      "sha256": "e9be9eca3c2fa6ad0f01e493696e1d3f74899345b81e705423e6c3a799112676"
+    },
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1": {
+      "bytes": 2462080,
+      "sha256": "b9b924c3eb6c59b688ccb857fd804d88b72b4a2e569485e2240f17af7d3a73b9"
+    },
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-observe": {
+      "bytes": 1961368,
+      "sha256": "68f1f01362b3d1dd584b61376412f457c330f67b3d869a35f17375870fd75254"
+    },
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-quic-steer": {
+      "bytes": 1321808,
+      "sha256": "7a96a79c5e5b807e9d21460e208bcdfad7cc9fb0c534ab4e32b663fc8b5a8587"
+    }
+  },
+  "qualification_harness_sha256": {
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe",
+    "scripts/beeper_h1_late_check.py": "c61bf80460adaa7c9ac6d6ef9a4a1e25127c75c0367df099679dd1141ae1b0ee",
+    "scripts/beeper_h1_serve_check.py": "4e6536f6136332745ec54031a9e5281af39b065af868fba1aa2a7662e37e2992",
+    "scripts/beeper_h2_expiry_check.py": "b6ce08ee5052fc0f529c7d148d61f8c5eb0be1b4a51c42af40bf5ab5d416bba5",
+    "scripts/beeper_h2_owner_lifecycle_check.py": "b840ec2f12781c68db609256853f437427e6aae7c6f35ba326f9dc05fb02241c",
+    "scripts/beeper_h2_serve_check.py": "56c54f61a8fa7550ab05b90930997c4e6a15ad9640a13e87f2bc7ae7fdb99ee7",
+    "scripts/beeper_native_check.py": "8439a7824a0a707a301996fc982dd398a1df007c133f7a64a8e0a74d6119737e",
+    "scripts/bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "scripts/bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "scripts/bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "scripts/cache_required_lab.py": "a6f28060db166001babbede1a004146243663235337c8293bef8a8b50d5caf48",
+    "scripts/cache_scheme_test.sh": "e5893c658acb8cc373e02668d022fe562c5c6b740bc48bd6d9fb874424270ad0",
+    "scripts/cache_xurl_test.sh": "dcc74c2315927d98baa212d97bb8522992992cac0131bad3e1771ab8bb168913",
+    "scripts/h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "scripts/h3_shutdown_check.py": "229e940bc82b9eb24e36df0bbb4f8848a0d00f2d0e7ac194f6abe7e1fa5d9b0e",
+    "scripts/http_engine_check.py": "7bd48ce75e71ff670a905c505722f87d3b26ea6603360c901394cac61c3eacd1"
+  },
+  "scope": "live correctness; no performance qualification"
+}

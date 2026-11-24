@@ -1,0 +1,7 @@
+{
+  "profile_sha256": "0ade3a4f73f5c085826de497088987d8d06b6617edda2fae28baf59a1269ede3",
+  "profile_inputs_sha256": "2299f4acf214de52f1b5214eed861bf74d8e78f3db7e02f373605b805d105d49",
+  "counts_log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/logs/profile-counts.txt",
+  "counts_log_sha256": "9b5b58808911e5a6853c5d30d434eac3ee368699f3a2d3267eb78d710039a317",
+  "scope": "merged verified runtime training profiles; no performance result"
+}

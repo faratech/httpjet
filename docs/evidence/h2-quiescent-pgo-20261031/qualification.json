@@ -1,0 +1,951 @@
+{
+  "schema": 1,
+  "passed": true,
+  "checks": [
+    {
+      "name": "inputs-before",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/inputs-before.json",
+      "receipt_sha256": "1e73e352a01bdcb41d0acd781a8c601d6489e6d8ef07b1fa0f6c0cd7cf358d55"
+    },
+    {
+      "name": "h1-late-readiness",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h1-late-readiness.json",
+      "receipt_sha256": "659ceda705f7cf6734f1a9f203a6fcd01117b4c3784dddf25b549e82e49e46b1"
+    },
+    {
+      "name": "h1-h2-ua",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h1-h2-ua.json",
+      "receipt_sha256": "861de96d4f7da7c08c60bc4a87299ae4e814e28764f8d1385d535f28842000c0"
+    },
+    {
+      "name": "h2-oversize",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-oversize.json",
+      "receipt_sha256": "8e5affa4d6a2d8153828eb4a0b465f0c3693d5c78ab71488ff47a57055d03427"
+    },
+    {
+      "name": "h2-expiry",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-expiry.json",
+      "receipt_sha256": "c3ccb7eb79e317696a26a6cc1d16d9a2379e50a1f02b4c5f63600fd28df95a31"
+    },
+    {
+      "name": "h2-lifecycle",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h2-lifecycle.json",
+      "receipt_sha256": "64cc6cc9d65e4c8b5ea5fea9b653a7f7dd94e763b8628d8b1f44df882ca4e743"
+    },
+    {
+      "name": "tls-smoke",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/tls-smoke.json",
+      "receipt_sha256": "ae896e0602f3813a9604d290024cbcb0535dddaaaa31e24b5d297c9c3f5c6180"
+    },
+    {
+      "name": "h3-shutdown",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h3-shutdown.json",
+      "receipt_sha256": "83814bfe0489d5c66a90426dffcc3693a94eaab212fe8ddfa96edf092da12db1"
+    },
+    {
+      "name": "cache-required",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/cache-required.json",
+      "receipt_sha256": "b4bb499addf2b4de785ac42fb62c21d03e4a8ec8b2589de0ffb687e2338526d8"
+    },
+    {
+      "name": "h3-gso20-batch1",
+      "passed": true,
+      "receipt_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/steps/h3-gso20-batch1.json",
+      "receipt_sha256": "2dfa3316c520b69a5508107036e77f5a32ae50ed141c74659b6efc4d729f8866"
+    }
+  ],
+  "recorded_at_utc": "2026-10-31T13:21:44.432553+00:00",
+  "original_exit": 0,
+  "final_integrity_exit": 0,
+  "scope": "post-PGO live correctness only; preflight rates are not performance evidence",
+  "source_runtime_commit_label": "39fad6a4c959147de0e80a2908681976fb2caf26",
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet": {
+      "bytes": 23554456,
+      "sha256": "e9be9eca3c2fa6ad0f01e493696e1d3f74899345b81e705423e6c3a799112676"
+    },
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1": {
+      "bytes": 2462080,
+      "sha256": "b9b924c3eb6c59b688ccb857fd804d88b72b4a2e569485e2240f17af7d3a73b9"
+    },
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-observe": {
+      "bytes": 1961368,
+      "sha256": "68f1f01362b3d1dd584b61376412f457c330f67b3d869a35f17375870fd75254"
+    },
+    "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-quic-steer": {
+      "bytes": 1321808,
+      "sha256": "7a96a79c5e5b807e9d21460e208bcdfad7cc9fb0c534ab4e32b663fc8b5a8587"
+    }
+  },
+  "expected_steps": [
+    "inputs-before",
+    "h1-late-readiness",
+    "h1-h2-ua",
+    "h2-oversize",
+    "h2-expiry",
+    "h2-lifecycle",
+    "tls-smoke",
+    "h3-shutdown",
+    "cache-required",
+    "h3-gso20-batch1"
+  ],
+  "steps": [
+    {
+      "name": "inputs-before",
+      "started_at_utc": "2026-10-31T13:19:33Z",
+      "finished_at_utc": "2026-10-31T13:19:35.687564+00:00",
+      "returncode": 0,
+      "command": [
+        "pgo_qual_integrity",
+        "before"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/inputs-before.log",
+      "log_sha256": "9a456a2f913c17964eceb21e4da8b46e28f5ae5f15b56f30c9a1c20fbe8e135c"
+    },
+    {
+      "name": "h1-late-readiness",
+      "started_at_utc": "2026-10-31T13:19:35Z",
+      "finished_at_utc": "2026-10-31T13:19:47.595015+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/beeper_h1_late_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1",
+        "--wakeup",
+        "readiness",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-late-readiness"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/h1-late-readiness.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "h1-h2-ua",
+      "started_at_utc": "2026-10-31T13:19:47Z",
+      "finished_at_utc": "2026-10-31T13:20:38.767538+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/beeper_h1_serve_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1",
+        "--arms",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/ua-arms.json",
+        "--hit-metric",
+        "httpjet_h1_kernel_successes_total",
+        "--h2-ua-corpus",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-h2-ua"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/h1-h2-ua.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "h2-oversize",
+      "started_at_utc": "2026-10-31T13:20:38Z",
+      "finished_at_utc": "2026-10-31T13:20:42.007056+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/beeper_h2_serve_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-oversize"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/h2-oversize.log",
+      "log_sha256": "dc13c73d7d90e7587d136eab4e64be12e238c74aeb474c68606fdf37febda503"
+    },
+    {
+      "name": "h2-expiry",
+      "started_at_utc": "2026-10-31T13:20:42Z",
+      "finished_at_utc": "2026-10-31T13:20:50.022244+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/beeper_h2_expiry_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-expiry"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/h2-expiry.log",
+      "log_sha256": "90568f4b05194d2619144acfc2fa6d50bf9e8fca9c36d7a2f1746c6c98333e4a"
+    },
+    {
+      "name": "h2-lifecycle",
+      "started_at_utc": "2026-10-31T13:20:50Z",
+      "finished_at_utc": "2026-10-31T13:20:57.297519+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.1",
+        "HJ_BENCH_BIND=127.0.0.1",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/beeper_h2_owner_lifecycle_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-lifecycle"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/h2-lifecycle.log",
+      "log_sha256": "295e5bf9646471011484f9b0823b46ebb20386a5e92cf1b82a447838141f3c73"
+    },
+    {
+      "name": "tls-smoke",
+      "started_at_utc": "2026-10-31T13:20:57Z",
+      "finished_at_utc": "2026-10-31T13:21:01.731588+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/http_engine_check.py",
+        "--arms",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/http-native-arms.json",
+        "--client",
+        "/var/tmp/hjc/httpjet-http-load-bind",
+        "--sequence",
+        "native",
+        "--protocols",
+        "h1s,h2",
+        "--cases",
+        "static,pagecache,range",
+        "--rounds",
+        "1",
+        "--size",
+        "1024",
+        "--requests",
+        "1000",
+        "--warmup",
+        "100",
+        "--workers",
+        "1",
+        "--server-cpus",
+        "8",
+        "--client-cpus",
+        "0,2,4,6,12,14",
+        "--client-threads",
+        "6",
+        "--connections",
+        "32",
+        "--streams",
+        "4",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/tls-smoke"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/tls-smoke.log",
+      "log_sha256": "0d6286a93a739a16d9d08659f5f39a2599349f416bfbbef83ebac0a46e965715"
+    },
+    {
+      "name": "h3-shutdown",
+      "started_at_utc": "2026-10-31T13:21:01Z",
+      "finished_at_utc": "2026-10-31T13:21:37.432980+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/h3_shutdown_check.py",
+        "--candidate",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--modes",
+        "legacy,accelerated",
+        "--cases",
+        "delivery,stop,unacked",
+        "--server-cpus",
+        "8",
+        "--source-commit",
+        "39fad6a4c959147de0e80a2908681976fb2caf26",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-shutdown"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/h3-shutdown.log",
+      "log_sha256": "232826ff87714fa49a5246b9588ed2a8aadd1f7c1fc461de8ec4ba870768e9e7"
+    },
+    {
+      "name": "cache-required",
+      "started_at_utc": "2026-10-31T13:21:37Z",
+      "finished_at_utc": "2026-10-31T13:21:38.750715+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/cache_required_lab.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--address",
+        "127.0.0.2",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/cache-required"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/cache-required.log",
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "h3-gso20-batch1",
+      "started_at_utc": "2026-10-31T13:21:38Z",
+      "finished_at_utc": "2026-10-31T13:21:42.852831+00:00",
+      "returncode": 0,
+      "command": [
+        "env",
+        "-i",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "PYTHONPATH=/var/tmp/httpjet-h3-tools/python",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "HJ_BENCH_ADDR=127.0.0.2",
+        "HJ_BENCH_BIND=127.0.0.2",
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/qualification-harness/scripts/h3_engine_check.py",
+        "--candidate",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--candidate-page-response-memo",
+        "--client",
+        "/var/tmp/httpjet-continuation/h3-bind-client-20261030/bin/httpjet-h3-load-bind",
+        "--sequence",
+        "accelerated",
+        "--case",
+        "all",
+        "--steering",
+        "off",
+        "--rounds",
+        "1",
+        "--candidate-arg=--h3-gso-segments=20",
+        "--candidate-arg=--h3-send-batch=1",
+        "--workers",
+        "1",
+        "--server-cpus",
+        "8",
+        "--client-cpus",
+        "0,2,4,6,12,14",
+        "--client-threads",
+        "6",
+        "--size",
+        "1024",
+        "--requests",
+        "1000",
+        "--warmup",
+        "100",
+        "--connections",
+        "32",
+        "--streams",
+        "4",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-gso20-batch1"
+      ],
+      "log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/h3-gso20-batch1.log",
+      "log_sha256": "76ca345bcc3e14a906f813456506ddc6cafa30efece85e37747f1ceec2135be1"
+    }
+  ],
+  "cleanup": [
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-late-readiness/native/cleanup.json",
+      "sha256": "a664f67d5b92aecd5a766ff2b84f90e9b5a76ed02a2d79c879bafa363377f583",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-late-readiness/native/exits.json",
+      "sha256": "ebd9473a8dce499b9772212abb7c51c08023e47fd27640127afca0833303b1ad",
+      "valid": true,
+      "summary": {
+        "server": 0,
+        "backend": -15
+      }
+    },
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-late-readiness/kernel/cleanup.json",
+      "sha256": "fbaf1b9367411f7fa86dab48aafcdeeea31e80325f927be788f0a84648c6d20e",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-late-readiness",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-late-readiness/kernel/exits.json",
+      "sha256": "ebd9473a8dce499b9772212abb7c51c08023e47fd27640127afca0833303b1ad",
+      "valid": true,
+      "summary": {
+        "server": 0,
+        "backend": -15
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-h2-ua/native/cleanup.json",
+      "sha256": "ebbc1c93dba23b8f1ac4552b57d0687e2418b2976a146953de1bbfa9d5a0daa3",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-h2-ua/native/exit.json",
+      "sha256": "0c479c6eb7d7850fd74ab0404806a720af099aba5ae55983bb4ce40451e8735d",
+      "valid": true,
+      "summary": {
+        "pid": 137008,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-h2-ua/polling/cleanup.json",
+      "sha256": "d99087a76014b0c4ecd4be428d7d88eec43307b6c95ef913835592bffd7ad6a2",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-h2-ua/polling/exit.json",
+      "sha256": "d9c3013ca655d1316147fc360003a48794b4b69d12c20958daa946b46a44d6cf",
+      "valid": true,
+      "summary": {
+        "pid": 137307,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-h2-ua/readiness/cleanup.json",
+      "sha256": "86ece8406cfd176bfe020a50b2f9fe69308c691f42875f465f83be9f7ef46b17",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h1-h2-ua",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h1-h2-ua/readiness/exit.json",
+      "sha256": "c5be4af5a9e769b273dc3c103fe5df0161765b154792bca013ce327aa8f62588",
+      "valid": true,
+      "summary": {
+        "pid": 137754,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-oversize/native/cleanup.json",
+      "sha256": "8ad49c638e8c256baaf3c66e6bef0cdda51dd262fbfc1620276064702d9bed0b",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-oversize/native/exit.json",
+      "sha256": "d2fdc0c2a5037e12563e77d982749da6453b28771e251e5ef74fb1e16713bcdb",
+      "valid": true,
+      "summary": {
+        "pid": 138055,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-oversize/kernel/cleanup.json",
+      "sha256": "58b8376944284caa66e6fc1549e811539f9cae27f9852fd86a56058bd9fea2ab",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-oversize",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-oversize/kernel/exit.json",
+      "sha256": "56476734b6778e9bb185a17f8151a886ef6610c45080fc81f088a05e817ca12c",
+      "valid": true,
+      "summary": {
+        "pid": 138060,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-expiry/native/cleanup.json",
+      "sha256": "689146c3b7da5030b57f83fdb469d3c3780f9068d95395942e45759befa315e2",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-expiry/native/exit.json",
+      "sha256": "03744e1995bdcde2b0908ecda3f7cc1d81b15c75356b0c6be2af51ac51cd813c",
+      "valid": true,
+      "summary": {
+        "pid": 138111,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-expiry/kernel/cleanup.json",
+      "sha256": "c18f210f9e80fff5e785d5c8da077b66d54367d23272116de400f67d0387fb3b",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-expiry",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-expiry/kernel/exit.json",
+      "sha256": "ecf54cbf22cb345adfd7756c1bf8b955828895e6c87ac3632bbc00dd4f338185",
+      "valid": true,
+      "summary": {
+        "pid": 138159,
+        "returncode": 0
+      }
+    },
+    {
+      "gate": "h2-lifecycle",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-lifecycle/fragmented-native-frame/cleanup.json",
+      "sha256": "11a22e1c38e2f32c39023755283304d5b0696667b9fdd965ead5c3dd7967be0e",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-lifecycle",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-lifecycle/web-graceful/cleanup.json",
+      "sha256": "377d3c149a947139212f57b847c567d709bf27bb7bb3ac8ff20c99633a4f79d1",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-lifecycle",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-lifecycle/helper-graceful/cleanup.json",
+      "sha256": "744c870f5314cd247bdd2839cec48b50d21480880714a35df63e14b137ae9fbb",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h2-lifecycle",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h2-lifecycle/helper-failure/cleanup.json",
+      "sha256": "7bb2ae3709622c7245bbb345c6ad3369711686918111ead62efb19ea7ca971be",
+      "valid": true,
+      "summary": {
+        "proved": true
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-shutdown/legacy-delivery/result.json",
+      "sha256": "f9d0bd81fec74888397cd3d63f588277e84f88fa32d6f893b38318e966d902b8",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 138557,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 47817
+          },
+          {
+            "kind": "tcp",
+            "port": 45151
+          },
+          {
+            "kind": "udp",
+            "port": 45151
+          },
+          {
+            "kind": "tcp",
+            "port": 45691
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-shutdown/legacy-stop/result.json",
+      "sha256": "3c46c43b1704b7c1cde9eff64d56998ac85bce53980a73634c91e92594e8d5d6",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 138635,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 48591
+          },
+          {
+            "kind": "tcp",
+            "port": 47933
+          },
+          {
+            "kind": "udp",
+            "port": 47933
+          },
+          {
+            "kind": "tcp",
+            "port": 47599
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-shutdown/legacy-unacked/result.json",
+      "sha256": "f2810a1ab208cd1293446a077010dae6b8c6db5881c1f24e9b9cab3698546ed6",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 138644,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 46731
+          },
+          {
+            "kind": "tcp",
+            "port": 48457
+          },
+          {
+            "kind": "udp",
+            "port": 48457
+          },
+          {
+            "kind": "tcp",
+            "port": 44793
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-shutdown/accelerated-delivery/result.json",
+      "sha256": "515bb7baeba388f3754d06f7fc3630927b5de3ef4cb521cf1fe46315d208d49d",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 138911,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 48485
+          },
+          {
+            "kind": "tcp",
+            "port": 45805
+          },
+          {
+            "kind": "udp",
+            "port": 45805
+          },
+          {
+            "kind": "tcp",
+            "port": 47589
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-shutdown/accelerated-stop/result.json",
+      "sha256": "b88275382aa441294deae2144bd2d46d5df9dda7802cc92a811525044df57a46",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 138920,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 46745
+          },
+          {
+            "kind": "tcp",
+            "port": 47655
+          },
+          {
+            "kind": "udp",
+            "port": 47655
+          },
+          {
+            "kind": "tcp",
+            "port": 46041
+          }
+        ]
+      }
+    },
+    {
+      "gate": "h3-shutdown",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-shutdown/accelerated-unacked/result.json",
+      "sha256": "708f073463c836618c0ce4384fbb7a28669f784f2092ae62130d36719cf6f86b",
+      "valid": true,
+      "summary": {
+        "passed": true,
+        "pid": 138972,
+        "process_reaped": true,
+        "cleanup_exit_code": 0,
+        "released_listeners": [
+          {
+            "kind": "tcp",
+            "port": 45515
+          },
+          {
+            "kind": "tcp",
+            "port": 47919
+          },
+          {
+            "kind": "udp",
+            "port": 47919
+          },
+          {
+            "kind": "tcp",
+            "port": 47131
+          }
+        ]
+      }
+    },
+    {
+      "gate": "cache-required",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/cache-required/cleanup.json",
+      "sha256": "9b51802c23c9407bf35d2c74ff7d63cccbc8b232b342cf702bcbe4f1635dfe1b",
+      "valid": true,
+      "summary": {
+        "clean": true,
+        "processes": [
+          {
+            "name": "server",
+            "pid": 139243,
+            "returncode": 0
+          },
+          {
+            "name": "backend",
+            "pid": 139241,
+            "returncode": 0
+          }
+        ],
+        "listeners": [
+          {
+            "address": "127.0.0.2",
+            "port": 17857,
+            "connect_errno": 111
+          },
+          {
+            "address": "127.0.0.2",
+            "port": 1223,
+            "connect_errno": 111
+          },
+          {
+            "address": "127.0.0.2",
+            "port": 6195,
+            "connect_errno": 111
+          },
+          {
+            "address": "127.0.0.1",
+            "port": 22032,
+            "connect_errno": 111
+          }
+        ]
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/tls-smoke/h1s-pagecache-1-1-native/server-exit.json",
+      "sha256": "e3864393263f2ef5d2feb8963d7cbdb1b9b2c4aaaf4b80f2a846aa744c3ee651",
+      "valid": true,
+      "summary": {
+        "pid": 138436,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/tls-smoke/h1s-range-1-1-native/server-exit.json",
+      "sha256": "e4906c03aad0df80037baaf5f8ead04be86363924a7c80c1c0cae0c19ff46d28",
+      "valid": true,
+      "summary": {
+        "pid": 138504,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/tls-smoke/h1s-static-1-1-native/server-exit.json",
+      "sha256": "2606f4f5e71f678c37040c2827b1f4cbd95422cda28042635aa2c6739232a94a",
+      "valid": true,
+      "summary": {
+        "pid": 138407,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/tls-smoke/h2-pagecache-1-1-native/server-exit.json",
+      "sha256": "8933eca4269dfae85ddb1ea73b94e0164a7b0461ca6276e4a696fe223400613b",
+      "valid": true,
+      "summary": {
+        "pid": 138450,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/tls-smoke/h2-range-1-1-native/server-exit.json",
+      "sha256": "1c9df9827c27043bae91363dbb90e1770871259a6d8565cac5fa9b4e1fe99f65",
+      "valid": true,
+      "summary": {
+        "pid": 138517,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "tls-smoke",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/tls-smoke/h2-static-1-1-native/server-exit.json",
+      "sha256": "2e2feac8f2595ca568bf0d88bda60520cbc38edb09f64c29c4ac70c7d2667e5f",
+      "valid": true,
+      "summary": {
+        "pid": 138421,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "h3-gso20-batch1",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-gso20-batch1/pagecache-1-1-accelerated/server-exit.json",
+      "sha256": "4c7c38eacca32baf8af3b33ef214e86bd9e893327571348ac61401d1dcd1118e",
+      "valid": true,
+      "summary": {
+        "pid": 139343,
+        "exit": 0
+      }
+    },
+    {
+      "gate": "h3-gso20-batch1",
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/h3-gso20-batch1/static-1-1-accelerated/server-exit.json",
+      "sha256": "5ead9dbcf3b3074fa8117a4efe41c7b1e853254992be818a47e7dc68bf3b24e3",
+      "valid": true,
+      "summary": {
+        "pid": 139285,
+        "exit": 0
+      }
+    }
+  ],
+  "cleanup_errors": [],
+  "before_after_inputs": {
+    "before": {
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/inputs-before.json",
+      "sha256": "4821f1008101dbe2181e0542a5552bd32a85a54c9f0253e26e53799fd3fb7cb8"
+    },
+    "after": {
+      "path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/inputs-after.json",
+      "sha256": "4821f1008101dbe2181e0542a5552bd32a85a54c9f0253e26e53799fd3fb7cb8"
+    }
+  },
+  "final_integrity_log": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/logs/inputs-after.log",
+  "live_artifacts_exercised": [
+    "httpjet",
+    "httpjet-beeper-h1"
+  ],
+  "hash_verified_artifacts": [
+    "httpjet",
+    "httpjet-beeper-h1",
+    "httpjet-beeper-observe",
+    "httpjet-quic-steer"
+  ]
+}

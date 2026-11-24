@@ -1,0 +1,28 @@
+{
+  "passed": true,
+  "arms": 120,
+  "process_snapshot_rows": 288,
+  "method": "Six-arm medians per role; two-arm medians per paired cycle. Memory is post-client process RSS, summed over server/helper where present.",
+  "sanity": "Every VmRSS/VmHWM positive integer; VmHWM>=VmRSS; snapshot sums match recorded aggregate; per-arm process identities unchanged.",
+  "sealed_input_receipt_sha256": "b9c25bc383cf28dd8c560758140110028e663ff0c2c122fc8aabb777019e87ec",
+  "input_result_hashes_verified": 120,
+  "limitations": [
+    "Summed RSS may double-count shared resident pages; this is not PSS, BPF map memory, kernel socket memory or system memory.",
+    "Summed process VmHWM values are individual high-water marks, not simultaneous aggregate peaks.",
+    "Short 1KiB/32-connection workload: no leak, long-run growth, many-connection or large-cache qualification.",
+    "Server/client CPU and /proc/stat snapshots broadly bracket the same whole client run but are sequential, with PMU setup/stop between boundaries. Component medians are not additive; do not treat VM minus process CPU as exact attributable kernel cost.",
+    "Whole-VM kernel network counters include unrelated traffic; no per-socket attribution. H3 JSON does not capture kernel_counters_delta; null is unmeasured, not zero."
+  ],
+  "outputs_sha256": {
+    "memory-groups.csv": "3e535258a06761033d47349518a6787755545fcb34397d2a85a8c140bc1b98e5",
+    "client-vm-arms.csv": "fa7141dc371e98b26e5e28da781b0fff38b93f17b52d5621f6ae1b11e23f56e5",
+    "inputs.json": "c29524ca28eb5fa50b74f18f645145745bdc2d8aef12fd6d2e7c4acd4985075b",
+    "memory-arms.csv": "6e4be4c28f9e8fd97ea362e4009358d675b606e403633586c99d27b46842a3c0",
+    "client-vm-cycles.csv": "1df3d7e7a6277e684d7210f41834b974379807d26a1233dd37cfc2ae7bd70ded",
+    "derive.py": "09423106b2666dd07f2d39bbe89095ed7560723bb505699353f6cf817703c6eb",
+    "memory-processes.csv": "d3badf1f19dced9adcfdafcab834a03e1c54d6dca9a82675598aaae8077ba5c7",
+    "network-counters.csv": "60a00a3b89ca9861cfbb41e2ad33568267b2defca94f97dcf57c86ebb609c8a5",
+    "memory-cycles.csv": "53529d30ba9f95060e0192eeac4cd819c5a53b21b5a2f898a1a339d5d039c769",
+    "client-vm-groups.csv": "12c463d8290869a994e61d4473b786d363c37d406f743b8e8eacf0a4118e320a"
+  }
+}

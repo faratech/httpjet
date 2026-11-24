@@ -1,0 +1,51 @@
+{
+  "passed": true,
+  "manifest_sha256": "eb62278d50bd6871f40c3be36382a1db5ad8615a41ed627748d9c9a8805e0eba",
+  "harness_manifest_sha256": "88e8cff03797636d9e3ce6afa34a31e0fd216fbd374d051fdc96073ed37422d7",
+  "harness_entries": 19,
+  "bound_harness_files": {
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h1_late_check.py": "c61bf80460adaa7c9ac6d6ef9a4a1e25127c75c0367df099679dd1141ae1b0ee",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h1_serve_check.py": "4e6536f6136332745ec54031a9e5281af39b065af868fba1aa2a7662e37e2992",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_certificate_check.py": "0feaa9b5372a7ad74cd1cc3c56b679caf52614a080cdb290b22742065239bba0",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_expiry_check.py": "b6ce08ee5052fc0f529c7d148d61f8c5eb0be1b4a51c42af40bf5ab5d416bba5",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_owner_lifecycle_check.py": "b840ec2f12781c68db609256853f437427e6aae7c6f35ba326f9dc05fb02241c",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_serve_check.py": "56c54f61a8fa7550ab05b90930997c4e6a15ad9640a13e87f2bc7ae7fdb99ee7",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_native_check.py": "8439a7824a0a707a301996fc982dd398a1df007c133f7a64a8e0a74d6119737e",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/cache_required_lab.py": "a6f28060db166001babbede1a004146243663235337c8293bef8a8b50d5caf48",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/cache_scheme_test.sh": "e5893c658acb8cc373e02668d022fe562c5c6b740bc48bd6d9fb874424270ad0",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/cache_xurl_test.sh": "dcc74c2315927d98baa212d97bb8522992992cac0131bad3e1771ab8bb168913",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/h3_shutdown_check.py": "229e940bc82b9eb24e36df0bbb4f8848a0d00f2d0e7ac194f6abe7e1fa5d9b0e",
+    "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/http_engine_check.py": "7bd48ce75e71ff670a905c505722f87d3b26ea6603360c901394cac61c3eacd1"
+  },
+  "executed_driver_sha256": "a218db3face810b3aff7562667ae0a55dcd36bc841a7931d7b150fd2c90a1265",
+  "qualification_sha256": "f5e2445624376015f1bf4c7766b3aa65a89c4e39a1606393405a394047f49de1",
+  "gen_sha256": "f2497b68c64653a06562285bc1f727a54fcb9fc1275627e7c1378d39156617e2",
+  "helper_sha256": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+  "cleanup": [
+    {
+      "arm": "native",
+      "cleanup_sha256": "4c119c07377956f22eae1388f309d66afb46b6b51919865b05b6ad6e85c233c0",
+      "exit_sha256": "e943d3bfb6274db63282c0a03f53dced810a102d381a5f1a7032c19333843ff5"
+    },
+    {
+      "arm": "polling",
+      "cleanup_sha256": "6e4c27bd07c377523048e9d25e38589e332a7678052928570c7fb525921079f1",
+      "exit_sha256": "b7d6c6b5b7a0ff23d2d649d647e159d305edc678eeb6b116f83eb907a6479f66"
+    },
+    {
+      "arm": "readiness",
+      "cleanup_sha256": "c058c7b0a603ce982570f58bf81ac6a85e02c88c08acc3c6926a61fe358898d5",
+      "exit_sha256": "82a9ad54298b4324ac3ffc1e39bd95d0d0b10f51e3b9fa57713c74b0fa192bde"
+    }
+  ],
+  "before_after_equal": true,
+  "corpus_rerun": false,
+  "scope": "Separate post-run audit binds the actual already-recorded pre/post fixture inputs; no driver edits, corpus execution or timing claim. Reference manifest supplies harness identity; actual GEN identity comes from frozen artifacts."
+}

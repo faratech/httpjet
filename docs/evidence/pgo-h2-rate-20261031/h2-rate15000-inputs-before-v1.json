@@ -1,0 +1,41 @@
+{
+  "pins": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet": "0ca04dcb8d3b9d07e02ac19658546d7882d6f2719c6937be2f259ca65eef83c5",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/bin-use/httpjet-beeper-h1": "1cce1f3ca5837e5d68b9be757438af28a88be789468372392bf6148a3987721d",
+    "/var/tmp/httpjet-continuation/baselines/v0.1.10-11/httpjet": "3b1ecbe1b5fd7a32e89547007d00628878b6135dc255b74811688cccca0858ec",
+    "/var/tmp/httpjet-http-paced-client-v2/bin/httpjet-http-load-paced": "0cb400bd7a56df95a03219ff227195e2ca6168ca1cf98c02b8ce48ac5ffacca6"
+  },
+  "input_sha256": {
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/rate-harness-sha256.json": "59af819f8911d7b78ea5435e0a5929fc1f5f5ded40abf31d705cae5cf5afef39",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/h2-rate15000-arms-v1.json": "dc035e0d74f27c459fa9acf3fbc316370bd18675e5b612e5fb42be5e0106b148",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/use-artifacts.json": "1474d50031c62b42093d1ca235c4b1987fb27810daad8dc927e0faa6b4c25617",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-use.json": "fe0a1b6af4f582526e46ea0c5919bc2acbcb7792806479514252ee41e2c96ff6",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/profile-use-warnings.json": "1780f06b082c167c97d97b754ce8419f80b043b5dfb3e0d3090a1b5f2ea0b403",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/pgo-inputs.json": "0f6e8e3b62a2528d2a1cdbb4adee4e3a621b83ad987dae991c87a90c8524d946",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/build-source-manifest.json": "966389d667bba3c9dab0b55d7178b30cd7c6d371b0edc3f25dbddfaf848c624c",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/merge-receipt.json": "6a6ba1addce99231f024716f100a5cd820271990814da985eb65a1d6e87e9917",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/coverage-review.json": "fe3c6f76a0c07235e165dec0a7bc0c7413897e7d7888393b45fa1f356360b887",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/profile-inputs.json": "fd92eb36357fb087cdd455586e770d39b4423feb186489f2f44ac8f6d10bf999",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/qualification-v2/qualification.json": "23b90b993a4d92f68a3645e7ec3307b57da5c5a34e3f06f771e746a68d7ce315",
+    "/var/tmp/pgo-c-common.sh": "520702a5887a9eb396feea0a097269423cf91b39ddc2a3947723547b5c6562fa",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/final-pgo-release-true-lo-v1/summary.json": "eb948cbf34f675472149d80543ea10a73c17b7f4f54408508764d6b88d13a034",
+    "/var/tmp/httpjet-continuation/pgo-c6ac-v1/final-pgo-release-true-lo-v1/final-integrity.json": "d8eedde98c889a6f8dd5f41d000a221220c08b44c02172a980587cf392ed8ff0",
+    "/var/tmp/pgo-c-h2-rate.sh": "775750688a1d83aedcc2515142e5aa41a510af5aa2df06c5de21005185fee374"
+  },
+  "harness_sha256": {
+    "packaging/debian/conf/httpd_config.xml": "5f040b2e7cb7b1471df20209953b601e138a632353564a8fdd8ed6578a9b6d55",
+    "packaging/debian/conf/mime.properties": "3ad6c4e778fa80864bef2d31c0a9a741173b39f4d7db4c5ff9ac069c990fb02e",
+    "packaging/debian/conf/vhosts/default.xml": "fba0f528b2b17ccb9c9c77342f337590d715792e44af81e8a4396510758235fe",
+    "scripts/bench_cpu.py": "cc45e5ad01f426c5672b143ac7446b0f8e498e27947f5451ff317c2046056bdf",
+    "scripts/bench_environment_run.py": "ddc9968d15a845e7e584fff5756546979a268e42b619c6812b8402ebe47b3dd2",
+    "scripts/bench_hw_counters.py": "243f2644b60c5df6dbe46ea79f39b073c11c2e7db60f99a0c422457f1a430f69",
+    "scripts/bench_syscall_counts.py": "b973d124b3fb4065be8e8c22341270321d7fc312ca6c41b4e59efe4aa226dea9",
+    "scripts/h3_engine_check.py": "534c38a4acd453c59dc21ced0b8cbf8885466f2cecc763eb2967a97151e2a4a2",
+    "scripts/http_engine_check.py": "7bd48ce75e71ff670a905c505722f87d3b26ea6603360c901394cac61c3eacd1"
+  },
+  "network": {
+    "server": "127.0.0.2",
+    "client_bind": "127.0.0.2"
+  },
+  "scope": "bounded offered-load comparison; process CPU includes server/helper user+system, not whole-server CPU"
+}

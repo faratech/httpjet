@@ -1,0 +1,369 @@
+{
+  "schema": 1,
+  "passed": false,
+  "checks": [
+    {
+      "name": "h2-core",
+      "command": [
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_serve_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-core"
+      ],
+      "started_utc": "2026-10-31T15:41:32.482319+00:00",
+      "pid": 308885,
+      "returncode": 0,
+      "log_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/logs/h2-core.log",
+      "log_sha256": "dc13c73d7d90e7587d136eab4e64be12e238c74aeb474c68606fdf37febda503",
+      "finished_utc": "2026-10-31T15:41:37.833446+00:00",
+      "passed": true,
+      "summary_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-core/summary.json",
+      "summary_sha256": "7b0810893505761deac1e9fe0d3c14d9d01859cda5ee41fade5ae18a3885597e",
+      "cleanup": [
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-core/native/cleanup.json",
+          "sha256": "a1be4b618774fc4471de7302dec1153493d0ac81ca94db9c8448b766cfbfac97"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-core/native/exit.json",
+          "sha256": "c04a6a69ab6d1c684a387eca6a3c3f2f5e50da1c18d5083e39e7e6bd80833ea7"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-core/kernel/cleanup.json",
+          "sha256": "d552201e645538462e8f8839cb294560e04de7a942be551560a8e68bf77541c2"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-core/kernel/exit.json",
+          "sha256": "5abdd71b57b94fd2857a022d0dad091b2ce434f2b661006262fffac9614cb6bd"
+        }
+      ]
+    },
+    {
+      "name": "certificate-base",
+      "command": [
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_certificate_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-base"
+      ],
+      "started_utc": "2026-10-31T15:41:37.843319+00:00",
+      "pid": 309105,
+      "returncode": 0,
+      "log_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/logs/certificate-base.log",
+      "log_sha256": "bebdf9acc18d1ebe70efb89d6d3b3ba9d693892feacd82fd4814360bea47787b",
+      "finished_utc": "2026-10-31T15:41:43.539161+00:00",
+      "passed": true,
+      "summary_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-base/summary.json",
+      "summary_sha256": "7962357714fbd3e9a36a2b01c6508c64995291cd6f9c2d934f0ad7263ebc4662",
+      "cleanup": [
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-base/native/cleanup.json",
+          "sha256": "930ce5e0ac42941d043d349e352d1787473c04de9596eae6bbebb847be52cb75"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-base/native/exit.json",
+          "sha256": "10469ec093b984b68a14fdcbad0b0cb8a24d238effd160c77554f6c43176ed77"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-base/kernel/cleanup.json",
+          "sha256": "6fd3d9a51219faf17785579acefcf9c4b8a6756b08fb914f9365d842dbc1e0cf"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-base/kernel/exit.json",
+          "sha256": "0fb0495828227ac83cd8694bde35a3fb1f04575fc15c38fa3901cf04dc6b2342"
+        }
+      ]
+    },
+    {
+      "name": "certificate-candidate",
+      "command": [
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_certificate_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-candidate",
+        "--require-dynamic-hits"
+      ],
+      "started_utc": "2026-10-31T15:41:43.549494+00:00",
+      "pid": 309316,
+      "returncode": 0,
+      "log_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/logs/certificate-candidate.log",
+      "log_sha256": "55f0cb4f60a96a6ac51d452f28bfefbd8fde485f46763be9b91289e19f8c1c42",
+      "finished_utc": "2026-10-31T15:41:54.153936+00:00",
+      "passed": true,
+      "summary_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-candidate/summary.json",
+      "summary_sha256": "eb5d44ea88836d4e926c697b28fe00dc6a72a5be671851454616f73028be73e5",
+      "cleanup": [
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-candidate/native/cleanup.json",
+          "sha256": "e6fbad6c99f99de42b45a05a184ea9fde0b47940efd60ee17c723e3da3df3a1d"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-candidate/native/exit.json",
+          "sha256": "1a48a3607d6a3350ea124b0a5cebaa080bdea802ea6549da8c3e1ea7c4de06f5"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-candidate/kernel/cleanup.json",
+          "sha256": "5da1b8b4db3fc71679a5d34c31a3e30f6905d6b5358b71d825bfcdd96a47628a"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/certificate-candidate/kernel/exit.json",
+          "sha256": "c92a548cfbbf91bb3c4dbf9fb84599cfb7d1b02db1461c89b3b380b472980356"
+        }
+      ]
+    },
+    {
+      "name": "h2-expiry",
+      "command": [
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_expiry_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-expiry"
+      ],
+      "started_utc": "2026-10-31T15:41:54.169233+00:00",
+      "pid": 309600,
+      "returncode": 0,
+      "log_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/logs/h2-expiry.log",
+      "log_sha256": "82b5e8de27877d58c449ab78dc54f982c50d088083b1ecf984670ffa3c6d509c",
+      "finished_utc": "2026-10-31T15:42:07.915119+00:00",
+      "passed": true,
+      "summary_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-expiry/summary.json",
+      "summary_sha256": "91ff509dece07a0e36ddf64d758447e42c2e97dfbdef9d7edc95a388ba5e0df3",
+      "cleanup": [
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-expiry/native/cleanup.json",
+          "sha256": "ee45fd87d504a174961d894d6ee4b1259f4b99407749fad71d95a27b50b3e601"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-expiry/native/exit.json",
+          "sha256": "7f78433d4af2aea67f9a300c885ce5b3f1fb1c841690cc8248ceb4cf824847ba"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-expiry/kernel/cleanup.json",
+          "sha256": "e4620ad3eb21ad4df46c73c2ad8df7d23908336568dbdded9a528d305eaf1c1b"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-expiry/kernel/exit.json",
+          "sha256": "beb64b3c06ca00e219f46ba2a0ddd02f888d87c2d2b99ffe3df36149329dbfd1"
+        }
+      ]
+    },
+    {
+      "name": "h2-lifecycle",
+      "command": [
+        "python3",
+        "-B",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness/scripts/beeper_h2_owner_lifecycle_check.py",
+        "--binary",
+        "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+        "--helper",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper",
+        "--results",
+        "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-lifecycle"
+      ],
+      "started_utc": "2026-10-31T15:42:07.920779+00:00",
+      "pid": 310045,
+      "returncode": 0,
+      "log_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/logs/h2-lifecycle.log",
+      "log_sha256": "3a71429ddf676ffc2198fd1dd4f93601522a7575f7704e74efa28604b23b4738",
+      "finished_utc": "2026-10-31T15:42:20.744998+00:00",
+      "passed": true,
+      "summary_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-lifecycle/summary.json",
+      "summary_sha256": "1d61b73a63a730432a61efd9339fb9c32174efe999f014a8b347e2b10ad73e8c",
+      "cleanup": [
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-lifecycle/fragmented-native-frame/cleanup.json",
+          "sha256": "b9cbb906d21b455f5abb08e7045615d37cf3f41836c2c1b7f5430110cb0d5791"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-lifecycle/web-graceful/cleanup.json",
+          "sha256": "0ad1a344e5f3a61eb43aa29eaa03c4561fb1335abeff2262b074483d171eef50"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-lifecycle/helper-graceful/cleanup.json",
+          "sha256": "7f6b09ae56406e0f56959f30735abb5bc16cd711b634678f4cbd58431e0970eb"
+        },
+        {
+          "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/h2-lifecycle/helper-failure/cleanup.json",
+          "sha256": "7073b4829f79761b0c9dd181a45a67493377bc7fe4e35e19b66333c39ab6e055"
+        }
+      ]
+    }
+  ],
+  "error": "AssertionError: h1-h2-ua exited 1; retained /var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/logs/h1-h2-ua.log",
+  "expected_checks": [
+    "h2-core",
+    "certificate-base",
+    "certificate-candidate",
+    "h2-expiry",
+    "h2-lifecycle",
+    "h1-h2-ua"
+  ],
+  "final_integrity_error": null,
+  "manifest_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-inputs.json",
+  "manifest_sha256": "eb62278d50bd6871f40c3be36382a1db5ad8615a41ed627748d9c9a8805e0eba",
+  "pending_cleanup_pid": null,
+  "base_qualification_sha256": "8d5e527b99e4136e82748b047b687b88a22b70b01301f38e015a3bab3de66b1b",
+  "inherited_checks": [
+    "tls-smoke",
+    "h3-shutdown",
+    "cache-required",
+    "h3-gso20-batch1"
+  ],
+  "qualified_inputs": {
+    "schema": 1,
+    "ready_for_qualification": true,
+    "server_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet",
+    "server_sha256": "e9be9eca3c2fa6ad0f01e493696e1d3f74899345b81e705423e6c3a799112676",
+    "helper_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bin/helper",
+    "helper_sha256": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+    "base_helper_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/bin-use/httpjet-beeper-h1",
+    "base_helper_sha256": "b9b924c3eb6c59b688ccb857fd804d88b72b4a2e569485e2240f17af7d3a73b9",
+    "h2_source_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/src/bpf/hj-bpf-kern/src/bin/h1_serve/h2.rs",
+    "h2_source_sha256": "0cd1e3a8796a283e963b9a5b4c905295d2810743a6b3f51f8b4d1e8e4782ab99",
+    "bpf_objects_root": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/objects",
+    "bpf_hashes": {
+      "observer": "cdb8a354258aa1bf53e0d6ac27af60d6e7da79ed3996b2eee2388834c0af3f0a",
+      "h1_ack_probe": "5fb787ec4727a65ba3957d57181d01cef79a61ce7d9feda9b34ecea88839bbef",
+      "h1_serve": "4bdf891e8a249de182c68714a48ae29ed1c6dbb1e43d90a063dfd8421932677b",
+      "cid_steering": "e4eb98df018ed64f33a96375d78b77dec29581306574e5e2f2cc72aa2a03aa9f"
+    },
+    "harness_root": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness",
+    "harness_manifest_path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/harness-sha256.json",
+    "harness_manifest_sha256": "88e8cff03797636d9e3ce6afa34a31e0fd216fbd374d051fdc96073ed37422d7",
+    "base_qualification_path": "/var/tmp/httpjet-continuation/h2-quiescent-v2/pgo-v1/final-qualification/qualification.json",
+    "base_qualification_sha256": "8d5e527b99e4136e82748b047b687b88a22b70b01301f38e015a3bab3de66b1b",
+    "build_receipts": [
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/baseline-immutability-after.json",
+        "sha256": "418f19676396f33034764011fe8a23bf7263a38164f139f8c530ae64da5630a9"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/baseline-immutability-before.json",
+        "sha256": "418f19676396f33034764011fe8a23bf7263a38164f139f8c530ae64da5630a9"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/baseline-unit-identities.json",
+        "sha256": "f42acc3df2190a11ab958d33d0550ff20448c5745206c0faf75463a2c360afa1"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/baseline-units/helper.json",
+        "sha256": "835d3c1a4f462176bf461263bfd203f9a80aa7ab5190746aadf901322f254727"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/baseline-units/serving-lib.json",
+        "sha256": "d840f85fdd5f98f16aedf9da94192dbf3cb42aba744f326b5fbdf8fe76ae85d5"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/bpf-objects.json",
+        "sha256": "9691918fff1ebe6d8903231f40e24b7f987808d58c36d5b355d95cc7b71d2829"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/build-bpf.json",
+        "sha256": "aca9b3c3cbfb22d448020026181541d9dcc979b13012af404aa2a825debaabc1"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/build-native-trial-identity.json",
+        "sha256": "b6b736e744b54dbcf8b0577eb870873bf5e7eab81ddb5226473809f3649fb021"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/build-native-trial.json",
+        "sha256": "30c9fed4040a014736d70cbbe4b394b074bc9ccca9997f29c8c9c9a00e078f8d"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/build-repair.py",
+        "sha256": "e8c97aa8134b81af6528033fa94a060e83d7fb52343b2d7eee59496f432bf0c0"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/fingerprints/bpf-h1_serve.json",
+        "sha256": "5bc4aff9620986424e0afa9b1f69f90aa04aa13e866c9d8654e559ad6260f9dc"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/fingerprints/build-native-trial-helper.json",
+        "sha256": "054a09686061a0562e3b5b173db7a23b617b57f8a9f7e18e2c958277569568a0"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/fingerprints/build-native-trial-serving-lib.json",
+        "sha256": "7ca65e3174e7ee664e551e6ed7f9a0ce1cf8863c04d0654f7bd329508b3e6232"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/fingerprints/helper.json",
+        "sha256": "054a09686061a0562e3b5b173db7a23b617b57f8a9f7e18e2c958277569568a0"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/format-check.json",
+        "sha256": "dcb5939f1acbf3e6036548e746332ead34e74b201955259224075dc109504ae9"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/kernel-source-binding.json",
+        "sha256": "8ddbc9070c0eef54665b1525a23c2907f8b7c1a7aa15c3b50001460d05c16c74"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/logs/build-bpf.log",
+        "sha256": "36efed5361aec52497e8db1e97debd2efa103f61905ed49df751a09ec9e10097"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/logs/build-native-trial.log",
+        "sha256": "114e8fcedc7224fcbdb174786e50ae48d16e4448db0f9a0b8d4fb55a78ec9d0f"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/logs/rustfmt-check.log",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/provenance.json",
+        "sha256": "839a29a749231a806efe5acfcbbdf3439d969d4f57c5fb5bb273f14510cb6723"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/repair.patch",
+        "sha256": "8cbacafb02c77aae31b36b94f0c09a46f13e51c0fe94e8d008851ef3e0013941"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/source-inputs.json",
+        "sha256": "e85ac1d55f03bb035af5d8b9ceb25fb30824b769f6603cf328ef46cfac136744"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/source-verification.json",
+        "sha256": "6dcc4b5a02736f8304bca270eb228dd899d2e5ae8ba0cdc6f6563fa0bda161a9"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/source.tar.gz",
+        "sha256": "dd9539a22d3a887ff9288381c5b35d843439d72806119d988aa05aa10add46f9"
+      },
+      {
+        "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/toolchain.json",
+        "sha256": "5af9bbd329046a8d9d42715f599334e62a9d78bcdcab9dd12c41b773fb9d32d1"
+      }
+    ]
+  },
+  "input_snapshots": {
+    "before": {
+      "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/inputs-before.json",
+      "sha256": "c93a199ae8a144e2812e74d9999daf17d736d6f5b32dcf1f5972206ed99de38b"
+    },
+    "after": {
+      "path": "/var/tmp/httpjet-continuation/h2-certified-linear-pull-v1/qualification-v1/inputs-after.json",
+      "sha256": "c93a199ae8a144e2812e74d9999daf17d736d6f5b32dcf1f5972206ed99de38b"
+    }
+  },
+  "scope": "Owned functional correctness only; no performance claim; no automatic retries."
+}

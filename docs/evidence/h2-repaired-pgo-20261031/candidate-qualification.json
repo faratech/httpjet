@@ -1,0 +1,40 @@
+{
+  "passed": true,
+  "completed": [
+    "h1-late",
+    "h1-h2-ua",
+    "h2-core",
+    "certificate-base",
+    "certificate-candidate",
+    "h2-expiry",
+    "h2-lifecycle",
+    "tls-smoke",
+    "h3-shutdown",
+    "cache-required",
+    "h3-delivery"
+  ],
+  "expected": [
+    "h1-late",
+    "h1-h2-ua",
+    "h2-core",
+    "certificate-base",
+    "certificate-candidate",
+    "h2-expiry",
+    "h2-lifecycle",
+    "tls-smoke",
+    "h3-shutdown",
+    "cache-required",
+    "h3-delivery"
+  ],
+  "error": null,
+  "integrity_error": null,
+  "artifacts": {
+    "/var/tmp/httpjet-continuation/h2-repaired-pgo-v1/bin-use/httpjet": {
+      "bytes": 23549352,
+      "sha256": "abf7a79c1eb9593c3af7e77e60c4aaf4a5b30873d0e2b989283c88b662db9c48"
+    }
+  },
+  "helper_sha256": "0e7be72d437dd255e332ec1f6bd05554ae91ac2f54844793b1fe08691b184f4e",
+  "source_commit": "3946cd5eef75ac9b3993b082f7fbb7fca8bf30db",
+  "scope": "frozen USE correctness only; corpus tools assert wire bodies, protocol behavior and owned cleanup; no timing claim"
+}
